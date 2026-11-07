@@ -12,7 +12,9 @@ use leveler_core::{BootId, SessionId};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{OwnershipStore, TaskOwner, TaskStore, TurnRepository};
+use leveler_storage::{
+    OwnershipStore, SessionInputRepository, TaskOwner, TaskStore, TurnRepository,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn isolate_global_config() {
@@ -944,4 +946,70 @@ async fn acknowledging_a_crash_window_leaves_the_session_to_whoever_runs_next() 
         .await
         .expect("A runs next while the acknowledging window stays open");
     assert_eq!(w.owner().await.boot, Some(w.a.boot()));
+}
+
+/// A durable input is promoted into a new turn only after a turn that durably
+/// started. When the crash window refuses a turn before its first admission,
+/// there is no turn for the input to belong to: promoting it again would spawn
+/// the same refused turn forever, and that spin would hold the session's
+/// admission slot so the acknowledgement that could unblock it is refused as
+/// "already has an active turn".
+#[tokio::test]
+async fn a_crash_gated_turn_does_not_re_promote_journaled_input() {
+    use leveler_client_protocol::{RuntimeEvent, UiMessageKind};
+    let w = two_windows().await;
+    let db = w.a.app.open_database().await.unwrap();
+    SessionInputRepository::new(&db)
+        .admit(
+            "steer-during-crashed-turn",
+            &w.session,
+            None,
+            "追加：完成后说明",
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    crashed_turn(&w.a.app, &w.session, true).await;
+
+    let mut events = w.a.client.subscribe_session(&w.session);
+    let refused = w.a.submit(&w.session).await;
+    assert!(
+        matches!(refused, Err(ClientError::RecoveryRequired(_))),
+        "{refused:?}"
+    );
+
+    // The refusal is one terminal. Behind it the runtime must stay quiet: no
+    // promoted turn may inherit the journaled row until a turn really starts.
+    let mut failures = 0;
+    let mut promoted = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(RuntimeEvent::TurnFailed { .. })) => failures += 1,
+            Ok(Ok(RuntimeEvent::UserMessageAdded { message, .. }))
+                if message.kind == Some(UiMessageKind::PendingInput) =>
+            {
+                promoted += 1;
+            }
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        failures <= 1,
+        "the refused turn was re-driven {failures} times"
+    );
+    assert_eq!(
+        promoted, 0,
+        "journaled input was promoted without a turn that started"
+    );
+    let pending = SessionInputRepository::new(&db)
+        .pending(&w.session)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "the input stays owed: {pending:?}");
 }

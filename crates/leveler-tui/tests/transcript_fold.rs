@@ -79,6 +79,7 @@ fn opened_bare() -> AppState {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     };
     reduce(
         &mut s,

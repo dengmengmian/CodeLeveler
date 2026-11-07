@@ -590,14 +590,35 @@ fn header_status_line(state: &AppState, width: usize) -> Line<'static> {
     let base_repo = repo_basename(&full_repo);
 
     let ver = format!(" v{version}");
+    // An imported session keeps its source identity on the header: the reader
+    // must not mistake this native continuation for the source agent's own
+    // runtime. It is part of the richest candidates and drops out only when the
+    // narrower header has room for nothing else.
+    let origin = state.foreign_origin.as_ref().map(|origin| {
+        format!(
+            "⟲ {} {}",
+            origin.tool.display_name(),
+            crate::foreign_session::short_native_id(&origin.native_id)
+        )
+    });
     // Richest → sparsest plain-text candidates; first that fits wins.
-    let texts = [
-        format!("CodeLeveler{ver} · {full_repo} ·  {branch}"),
-        format!("CodeLeveler{ver} · {base_repo} ·  {branch}"),
-        format!("CodeLeveler{ver} ·  {branch}"),
-        format!("CodeLeveler ·  {branch}"),
-        "CodeLeveler".to_string(),
-    ];
+    let texts: Vec<String> = match origin {
+        Some(origin) => vec![
+            format!("CodeLeveler{ver} · {origin} · {full_repo} ·  {branch}"),
+            format!("CodeLeveler{ver} · {origin} · {base_repo} ·  {branch}"),
+            format!("CodeLeveler{ver} · {origin} ·  {branch}"),
+            format!("CodeLeveler · {origin}"),
+            format!("CodeLeveler{ver}"),
+            "CodeLeveler".to_string(),
+        ],
+        None => vec![
+            format!("CodeLeveler{ver} · {full_repo} ·  {branch}"),
+            format!("CodeLeveler{ver} · {base_repo} ·  {branch}"),
+            format!("CodeLeveler{ver} ·  {branch}"),
+            format!("CodeLeveler ·  {branch}"),
+            "CodeLeveler".to_string(),
+        ],
+    };
 
     let chosen = texts
         .into_iter()

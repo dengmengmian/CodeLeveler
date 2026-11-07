@@ -76,6 +76,19 @@ impl From<AgentEvent> for EngineEvent {
                 exit_code,
                 stop,
             },
+            // Only the reverse projection (durable history → renderer) produces
+            // this variant. Mapping it back preserves the marker's one durable
+            // spelling instead of inventing a second encoding.
+            A::ToolOutcomeUnknown { id, name, preview } => EngineEvent::ToolCallFinished {
+                call_id: id,
+                name,
+                is_error: true,
+                preview,
+                agent_id: None,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            },
             A::BackgroundTaskStarted {
                 call_id,
                 task_id,

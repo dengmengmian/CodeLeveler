@@ -12,7 +12,9 @@ use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
 use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan};
-use super::snapshot::{MessageId, UiCheckpoint, UiMessage, UiSessionSnapshot, UiSessionSummary};
+use super::snapshot::{
+    MessageId, UiCheckpoint, UiInputState, UiMessage, UiSessionSnapshot, UiSessionSummary,
+};
 use super::wire_types::AnswerEffect;
 
 /// Severity for a transient notification .
@@ -305,6 +307,26 @@ pub enum RuntimeEvent {
     },
     /// A user message was appended to the transcript.
     UserMessageAdded { message: UiMessage },
+    /// The runtime accepted a mid-turn input and made it durable, but no model
+    /// round has received it yet.
+    ///
+    /// This is the ACK boundary: unlike [`Self::UserMessageAdded`], it does not
+    /// claim a transcript row exists. Every connected client paints the same
+    /// row from this event, not from the submitting client's optimism.
+    InputAdmitted { message: UiMessage },
+    /// A previously admitted input reached a terminal state.
+    ///
+    /// `Delivered` means its transcript row is durable (and `ordinal` locates
+    /// it); `Cancelled` means it never will be. A cancelled input is never
+    /// resurrected by a later turn.
+    InputSettled {
+        message_id: MessageId,
+        state: UiInputState,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u64>,
+    },
     /// A new assistant message began; deltas will target this id.
     AssistantMessageStarted { message_id: MessageId },
     /// A retry attempt began. Remove the prior transient message, if present,
@@ -443,6 +465,34 @@ pub enum RuntimeEvent {
     CheckpointCreated { checkpoint: UiCheckpoint },
     /// The list of stored sessions (spec §52).
     SessionList { sessions: Vec<UiSessionSummary> },
+    /// The locally discovered sessions of another coding agent, newest first.
+    /// `error` is present only when discovery itself could not run; an empty
+    /// `sessions` list with no error is a real "nothing found".
+    ForeignSessionList {
+        tool: crate::UiForeignTool,
+        sessions: Vec<crate::UiForeignSession>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// A foreign session was imported. `session_id` is the NEW native
+    /// CodeLeveler session; the source identity is carried so the client can
+    /// keep it visible after the view switches.
+    ForeignSessionImported {
+        tool: crate::UiForeignTool,
+        native_id: String,
+        session_id: leveler_core::SessionId,
+        /// A source/current-workspace mismatch the person should see before
+        /// trusting the continuation. Absent when the directories agree.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    /// A foreign session could not be imported. Nothing was created, and the
+    /// source file was not modified.
+    ForeignSessionImportFailed {
+        tool: crate::UiForeignTool,
+        native_id: String,
+        message: String,
+    },
     /// Context package info from an orchestrated run (spec §53).
     ContextUpdated {
         candidate_files: Vec<String>,
@@ -964,6 +1014,7 @@ mod tests {
             collaboration: None,
             execution_task: None,
             children: Vec::new(),
+            foreign_origin: None,
         }
     }
 

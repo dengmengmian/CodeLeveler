@@ -68,7 +68,11 @@ pub struct UiObservationRow {
     pub title: String,
     #[serde(default)]
     pub target: String,
-    /// running | ok | fail | info
+    /// running | ok | fail | unknown | info
+    ///
+    /// `unknown` is a terminal state of its own: the call's outcome could not
+    /// be established after a crash. It is neither success, failure, nor a
+    /// still-running call, and must not be collapsed into any of them.
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -242,8 +246,16 @@ pub struct UiToolAggregate {
     /// Finished with `is_error = false`.
     #[serde(default)]
     pub succeeded: u32,
-    /// Finished with `is_error = true`.
+    /// Finished with `is_error = true` and a reported result.
+    ///
+    /// A call whose outcome the crash window left unknown — even when the raw
+    /// finish row carries `is_error = true` because the client had to fill in
+    /// a shape — is counted in [`Self::unknown`], not here.
     pub failed: u32,
+    /// Finished with an outcome that could not be established (crash-window
+    /// acknowledgement marker). Unknown is not failure and not success.
+    #[serde(default)]
+    pub unknown: u32,
     /// `tool_call_started` with no matching `tool_call_finished`.
     #[serde(default)]
     pub unfinished: u32,

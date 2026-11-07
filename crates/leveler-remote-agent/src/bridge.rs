@@ -670,6 +670,8 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::QueryChildContribution { .. } => "query_child_contribution",
         ClientCommand::ListUnfinishedGoals { .. } => "list_unfinished_goals",
         ClientCommand::QuerySessionHistory { .. } => "query_session_history",
+        ClientCommand::ListForeignSessionsFor { .. } => "list_foreign_sessions_for",
+        ClientCommand::ImportForeignSession { .. } => "import_foreign_session",
         ClientCommand::ListAgents { .. } => "list_agents",
         ClientCommand::GetAgent { .. } => "get_agent",
         ClientCommand::CreateAgent { .. } => "create_agent",

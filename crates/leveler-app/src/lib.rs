@@ -18,6 +18,7 @@ pub mod doctor;
 /// through the same projection a live client received, instead of a second
 /// hand-written dialect that drifts from it.
 pub mod event_bridge;
+mod foreign_import;
 pub mod global_config;
 pub mod global_task_index;
 pub mod goal_discovery;
@@ -63,7 +64,7 @@ use leveler_project::{Layout, layout::yaml_files};
 use leveler_provider::{
     ModelConfigFile, ProviderConfig, ProviderRegistry, load_model_config, load_provider_config,
 };
-use leveler_storage::{Database, SessionRepository};
+use leveler_storage::{Database, ForeignSessionOriginRepository, SessionRepository};
 use leveler_tools::search::{
     DeepSeekSearchProvider, SearchProvider, SearchProviderKind, TavilySearchProvider,
 };
@@ -1258,6 +1259,62 @@ impl Application {
         self.mcp_tools.unavailable_reason().await
     }
 
+    /// The one reader tool an imported session gets.
+    ///
+    /// Bound to the exact source file recorded at import time. The origin row
+    /// is the only authority; an ordinary session has no row and therefore no
+    /// tool. A source that has since been deleted or replaced is not hidden
+    /// here — the tool reports that failure when it is called.
+    async fn foreign_session_tool(
+        &self,
+        session_scope: Option<&str>,
+    ) -> Option<Arc<dyn leveler_tools::tool::Tool>> {
+        let scope = session_scope?;
+        let db = match self.open_database().await {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "foreign-session origin could not be read; the history tool is unavailable"
+                );
+                return None;
+            }
+        };
+        let record = match ForeignSessionOriginRepository::new(&db).get(scope).await {
+            Ok(record) => record?,
+            Err(error) => {
+                tracing::warn!(
+                    session = %scope,
+                    %error,
+                    "foreign-session origin could not be read; the history tool is unavailable"
+                );
+                return None;
+            }
+        };
+        let Some(tool) = leveler_foreign_session::ForeignTool::parse(&record.tool) else {
+            tracing::warn!(
+                session = %scope,
+                tool = %record.tool,
+                "foreign-session origin names an unknown tool"
+            );
+            return None;
+        };
+        Some(Arc::new(
+            leveler_tools::tools::ForeignSessionHistoryTool::new(
+                leveler_foreign_session::ForeignSessionSummary {
+                    tool,
+                    native_id: record.native_id.clone(),
+                    title: record.native_id,
+                    cwd: record.source_cwd.map(std::path::PathBuf::from),
+                    branch: None,
+                    updated_at: record.imported_at,
+                    source_path: std::path::PathBuf::from(record.source_path),
+                    size_bytes: 0,
+                },
+            ),
+        ))
+    }
+
     /// Compose one turn's model-visible tool surface from what this host can
     /// actually do.
     ///
@@ -1352,6 +1409,12 @@ impl Application {
                 %error,
                 "scheduled-automation tools are unavailable in this process"
             ),
+        }
+        // An imported session gets the read-only history reader bound to its
+        // exact source file. Ordinary sessions have no origin row and gain
+        // nothing; the tool is capability, not a permission decision.
+        if let Some(tool) = self.foreign_session_tool(session_scope).await {
+            registry.register(tool);
         }
         let registry = if self.layout.primary_workspace().is_none() {
             registry.workspace_independent_subset()

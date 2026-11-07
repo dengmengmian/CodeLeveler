@@ -1298,8 +1298,8 @@ pub(crate) mod transcript_lines;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub(crate) use transcript_lines::{
-    USER_SHELL_STOP_ZONE, paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail,
-    turn_end_marker, user_shell_lines_with_copy, user_shell_output_room,
+    USER_SHELL_STOP_ZONE, input_state_line, paint_reasoning_rail, reasoning_rail_rows,
+    sub_agent_detail, turn_end_marker, user_shell_lines_with_copy, user_shell_output_room,
 };
 pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
@@ -1317,7 +1317,9 @@ pub(crate) use footer::{
     COMPOSER_MAX_ROWS, SHELL_COMPLETION_MAX_ROWS, composer_box_lines, composer_visible_rows,
     render_attachments, render_shell_completion, render_slash_popup,
 };
-use screens::{render_diff_screen, render_help_screen, render_sessions_screen};
+use screens::{
+    render_diff_screen, render_foreign_sessions_screen, render_help_screen, render_sessions_screen,
+};
 
 /// Render the whole screen.
 ///
@@ -1366,6 +1368,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Tools => render_tools_screen(frame, area, state),
         Screen::Diff => render_diff_screen(frame, area, state),
         Screen::Sessions => render_sessions_screen(frame, area, state),
+        Screen::ForeignSessions => render_foreign_sessions_screen(frame, area, state),
         Screen::Remote => render_remote_screen(frame, area, state),
         Screen::Activity => render_activity_screen(frame, area, state),
         Screen::ActivityList => render_background_list_screen(frame, area, state),
@@ -2503,6 +2506,7 @@ mod tests {
             Screen::Diff,
             Screen::Help,
             Screen::Sessions,
+            Screen::ForeignSessions,
             Screen::Activity,
         ] {
             let mut state = test_state();

@@ -1,8 +1,9 @@
-use leveler_client_protocol::{ClientCommand, CommandId, NotificationLevel};
+use leveler_client_protocol::{ClientCommand, CommandId, MessageId, NotificationLevel};
 
 use crate::action::Effect;
 use crate::screen::{BusyPolicy, Screen};
 use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
+use crate::transcript::InputDelivery;
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
@@ -108,43 +109,37 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         }
     }
     if state.is_busy() {
+        // Images have no mid-turn delivery lane: a steer is text only, and
+        // sending the text without them would detach the message from the
+        // picture the user staged. Say so and leave the draft untouched.
+        if !state.pending_attachments.is_empty() {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().steer_attachments_unsupported.to_string(),
+            });
+            return Vec::new();
+        }
+        if turn_input_held(state) {
+            return Vec::new();
+        }
+        // The product default: a message typed while a turn runs joins that
+        // turn at its next model round. The row appears immediately as
+        // Sending; only the runtime's admission answer promotes it to saved,
+        // and only its settlement says the model actually took it.
         let text = state.composer.take().trim().to_string();
         if text.is_empty() {
             return Vec::new();
         }
-        // A turn blocked on a background wait is not going to reach its
-        // terminal event on its own: the model asked to wait, and the bound may
-        // be minutes away. Queueing here would answer "现在进展怎么样了？" only
-        // after the wait expires. Enter therefore steers: the runtime hands the
-        // round back, the model answers from the task's real state, and the
-        // goal continues. Nothing about the observed process changes.
-        if crate::wait_status::project(state)
-            .is_some_and(|view| view.kind == crate::wait_status::WaitKind::BackgroundTask)
-        {
-            state.transcript.push_user_if_new(text.clone());
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message: state.t().steering_sent.to_string(),
-            });
-            let command = ClientCommand::SteerCurrentTurn {
-                session_id: state.session_id.clone(),
-                content: text,
-            };
-            return submit_turn_input(state, command);
-        }
-        // Hold it in 待发送 rather than sending it: the user decides which
-        // input steers the running turn, and when. Nothing unsent is shown in
-        // the conversation. Once this turn reaches its terminal event and the
-        // runtime is ready again, `drain_pending_input` sends it as the next
-        // turn — the queue is a continuation queue, not a draft box.
+        let message_id = MessageId::new(leveler_core::new_uuid_string());
         state
-            .pending_inputs
-            .push(crate::pending_inputs::PendingInput::queued(
-                text,
-                state.session_id.clone(),
-            ));
-        state.pending_selected = state.pending_inputs.len() - 1;
-        return Vec::new();
+            .transcript
+            .push_input(message_id.clone(), text.clone(), InputDelivery::Sending);
+        let command = ClientCommand::SteerCurrentTurn {
+            session_id: state.session_id.clone(),
+            content: text,
+            message_id: Some(message_id),
+        };
+        return submit_turn_input(state, command);
     }
     // Vision gate: block sending images to a non-vision model until the user
     // chooses how to proceed (spec §42). Handled before the request is built.
@@ -295,6 +290,7 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
         return Vec::new();
     }
     let content = item.text.clone();
+    let message_id = item.message_id.clone();
     if turn_input_held(state) {
         return Vec::new();
     }
@@ -302,6 +298,7 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
         ClientCommand::SteerCurrentTurn {
             session_id: state.session_id.clone(),
             content,
+            message_id: Some(message_id),
         }
     } else {
         // The runtime announces an admitted turn's message itself
@@ -321,6 +318,28 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
             crate::pending_inputs::PendingInputState::Submitting(command_id.clone());
     }
     effects
+}
+
+/// Move the composer's text into 待发送: the explicit "process after the
+/// running task" lane.
+///
+/// Ordinary Enter during a turn steers. This is the other choice, and it is
+/// only reachable by an explicit gesture (Tab with a typed message), so the
+/// two lanes never compete for the same keystroke. The item is client-local:
+/// it is not in the runtime's journal until the client actually sends it.
+pub(super) fn queue_for_after_turn(state: &mut AppState) -> Vec<Effect> {
+    let text = state.composer.take().trim().to_string();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    state
+        .pending_inputs
+        .push(crate::pending_inputs::PendingInput::queued(
+            text,
+            state.session_id.clone(),
+        ));
+    state.pending_selected = state.pending_inputs.len() - 1;
+    Vec::new()
 }
 
 /// Take the head of the 待发送 queue when the runtime is genuinely ready for
@@ -645,6 +664,19 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "output" => output_slash(state),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
+        // Exact id imports straight away; an omitted id opens that source's
+        // picker. Independent of native `/resume`: the import always creates a
+        // NEW CodeLeveler session.
+        "resume-claude" => crate::foreign_session::resume(
+            state,
+            command,
+            leveler_client_protocol::UiForeignTool::ClaudeCode,
+        ),
+        "resume-codex" => crate::foreign_session::resume(
+            state,
+            command,
+            leveler_client_protocol::UiForeignTool::Codex,
+        ),
         "restore" => {
             open_checkpoint_picker(state);
             Vec::new()
@@ -1018,11 +1050,12 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
     use crate::transcript::TranscriptItem;
     // Nothing to write if there is no actual dialogue yet — say so instead of
     // dropping an empty file.
-    let has_dialogue = state
-        .transcript
-        .items()
-        .iter()
-        .any(|i| matches!(i, TranscriptItem::User(_) | TranscriptItem::Assistant(_)));
+    let has_dialogue = state.transcript.items().iter().any(|i| {
+        matches!(
+            i,
+            TranscriptItem::User(_) | TranscriptItem::UserInput(_) | TranscriptItem::Assistant(_)
+        )
+    });
     if !has_dialogue {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
@@ -1088,6 +1121,11 @@ fn build_export_markdown(state: &AppState) -> String {
             TranscriptItem::User(text) => {
                 out.push_str("## 你\n\n");
                 out.push_str(text.trim());
+                out.push_str("\n\n");
+            }
+            TranscriptItem::UserInput(block) => {
+                out.push_str("## 你\n\n");
+                out.push_str(block.text.trim());
                 out.push_str("\n\n");
             }
             TranscriptItem::Assistant(block) => {
@@ -1295,6 +1333,9 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
                 let command = ClientCommand::SteerCurrentTurn {
                     session_id: state.session_id.clone(),
                     content,
+                    // A goal declaration has its own durable identity; it is
+                    // not one of the accepted-input journal rows.
+                    message_id: None,
                 };
                 return submit_turn_input(state, command);
             }

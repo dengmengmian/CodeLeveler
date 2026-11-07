@@ -24,6 +24,9 @@ pub struct TimedMessage {
     pub created_at: String,
     /// The serialized message.
     pub payload: String,
+    /// The accepted-input identity that produced this row, when it was an
+    /// admitted append. `None` for every other kind of message.
+    pub input_id: Option<String>,
 }
 
 /// Read/write access to the `session_messages` table.
@@ -196,6 +199,108 @@ impl<'a> MessageRepository<'a> {
         Ok(())
     }
 
+    /// Fenced append of one accepted input's transcript row. The journal
+    /// `pending -> consumed` transition and the row insert share one
+    /// `BEGIN IMMEDIATE` transaction, so no process death can leave the text
+    /// both out of the transcript and out of the pending queue.
+    ///
+    /// Returns the row's ordinal, or `None` when the input is no longer
+    /// pending (already consumed or cancelled). `None` stores nothing.
+    pub async fn append_input_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &leveler_core::TurnId,
+        input_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<Option<u64>, crate::OwnershipError> {
+        let redacted = crate::redact_json_payload_for_session(
+            "session message",
+            payload,
+            Some(session_id.as_str()),
+        )?;
+        let mut tx = begin_immediate(self.db.pool())
+            .await
+            .map_err(crate::OwnershipError::Storage)?;
+        let current: Option<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT owner_runtime_id, owner_epoch FROM tasks WHERE session_id = ?1 AND id = ?2",
+        )
+        .bind(session_id.as_str())
+        .bind(token.task_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        let owned = current.as_ref().is_some_and(|(runtime, epoch)| {
+            runtime.as_deref() == Some(token.runtime_id.as_str())
+                && *epoch == token.owner_epoch.get() as i64
+        });
+        if !owned {
+            drop(tx);
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM session_inputs WHERE session_id = ?1 AND id = ?2",
+        )
+        .bind(session_id.as_str())
+        .bind(input_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        if state.as_deref() != Some("pending") {
+            // Cancelled, already consumed, or never admitted: this input has
+            // no authority to write a transcript row.
+            tx.commit()
+                .await
+                .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+            return Ok(None);
+        }
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        sqlx::query(
+            "INSERT INTO session_messages \
+             (session_id, ordinal, payload, created_at, turn_id, input_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(session_id.as_str())
+        .bind(next)
+        .bind(&redacted)
+        .bind(now.to_rfc3339())
+        .bind(turn_id.as_str())
+        .bind(input_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        let settled = sqlx::query(
+            "UPDATE session_inputs \
+             SET state = 'consumed', turn_id = ?3, ordinal = ?4, settled_at = ?5 \
+             WHERE session_id = ?1 AND id = ?2 AND state = 'pending'",
+        )
+        .bind(session_id.as_str())
+        .bind(input_id)
+        .bind(turn_id.as_str())
+        .bind(next)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?
+        .rows_affected();
+        if settled != 1 {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "input left pending inside its consume transaction".into(),
+            )));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        Ok(Some(next as u64))
+    }
+
     /// Fenced, idempotent recovery projection for one turn's initiating user
     /// message. Identity is `(session_id, turn_id, role=user)`; the content is
     /// deliberately not compared because equal user text can start distinct
@@ -345,8 +450,8 @@ impl<'a> MessageRepository<'a> {
         session_id: &SessionId,
         since: Option<&str>,
     ) -> Result<Vec<TimedMessage>, StorageError> {
-        let rows: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT ordinal, created_at, payload FROM session_messages \
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT ordinal, created_at, payload, input_id FROM session_messages \
              WHERE session_id = ?1 AND (?2 IS NULL OR julianday(created_at) >= julianday(?2) OR julianday(created_at) IS NULL) ORDER BY ordinal ASC",
         )
         .bind(session_id.as_str())
@@ -355,10 +460,11 @@ impl<'a> MessageRepository<'a> {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(ordinal, created_at, payload)| TimedMessage {
+            .map(|(ordinal, created_at, payload, input_id)| TimedMessage {
                 ordinal: ordinal.max(0) as u64,
                 created_at,
                 payload,
+                input_id,
             })
             .collect())
     }
@@ -372,6 +478,23 @@ impl<'a> MessageRepository<'a> {
         .fetch_all(self.db.pool())
         .await?;
         Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
+    /// Load all message payloads with the accepted-input identity that
+    /// produced each one, in order. `None` for messages that were not an
+    /// admitted append (seed submits, assistant turns, tool results).
+    pub async fn load_with_input_ids(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<(String, Option<String>)>, StorageError> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT payload, input_id FROM session_messages \
+             WHERE session_id = ?1 ORDER BY ordinal ASC",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
     }
 
     /// The first user-role message text of every session, keyed by session id
@@ -656,6 +779,144 @@ mod tests {
         assert_eq!(
             texts.get(b.id.as_str()).map(String::as_str),
             Some("看下这张图")
+        );
+    }
+
+    #[tokio::test]
+    async fn append_input_consumes_the_journal_row_atomically() {
+        use crate::{SessionInputRepository, SessionInputState};
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id.clone());
+        let task = crate::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+            .await
+            .unwrap();
+        let token = crate::OwnershipStore::acquire(
+            &db,
+            &task,
+            &leveler_core::RuntimeId::new("rt"),
+            &leveler_core::BootId::new("boot"),
+            leveler_core::OwnerEpoch::UNOWNED,
+        )
+        .await
+        .unwrap();
+        let turn = crate::TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let repo = MessageRepository::new(&db);
+        let inputs = SessionInputRepository::new(&db);
+        inputs
+            .admit(
+                "input-1",
+                &session,
+                Some(&turn_id),
+                "还有管理员管理也没有",
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let ordinal = repo
+            .append_input_in_turn_owned(
+                &token,
+                &session,
+                &turn_id,
+                "input-1",
+                r#"{"role":"user","content":[{"type":"text","text":"还有管理员管理也没有"}]}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinal, Some(0));
+        assert_eq!(repo.load(&session).await.unwrap().len(), 1);
+        let row = inputs.load(&session, "input-1").await.unwrap().unwrap();
+        assert_eq!(row.state, SessionInputState::Consumed);
+        assert_eq!(row.ordinal, Some(0));
+
+        // A replay after the transition stores nothing: the input is no
+        // longer pending, so this is the exactly-once boundary.
+        let replay = repo
+            .append_input_in_turn_owned(
+                &token,
+                &session,
+                &turn_id,
+                "input-1",
+                r#"{"role":"user","content":[{"type":"text","text":"还有管理员管理也没有"}]}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, None);
+        assert_eq!(repo.load(&session).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_input_never_reaches_the_transcript() {
+        use crate::{SessionInputRepository, SessionInputState};
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id.clone());
+        let task = crate::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+            .await
+            .unwrap();
+        let token = crate::OwnershipStore::acquire(
+            &db,
+            &task,
+            &leveler_core::RuntimeId::new("rt"),
+            &leveler_core::BootId::new("boot"),
+            leveler_core::OwnerEpoch::UNOWNED,
+        )
+        .await
+        .unwrap();
+        let turn = crate::TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let repo = MessageRepository::new(&db);
+        let inputs = SessionInputRepository::new(&db);
+        inputs
+            .admit(
+                "input-1",
+                &session,
+                Some(&turn_id),
+                "cancel me",
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        inputs
+            .cancel_pending(&session, "turn cancelled", leveler_core::now())
+            .await
+            .unwrap();
+
+        let ordinal = repo
+            .append_input_in_turn_owned(
+                &token,
+                &session,
+                &turn_id,
+                "input-1",
+                r#"{"role":"user","content":[{"type":"text","text":"cancel me"}]}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinal, None);
+        assert!(repo.load(&session).await.unwrap().is_empty());
+        assert_eq!(
+            inputs
+                .load(&session, "input-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            SessionInputState::Cancelled
         );
     }
 

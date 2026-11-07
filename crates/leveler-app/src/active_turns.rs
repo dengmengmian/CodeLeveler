@@ -60,6 +60,9 @@ struct ActiveTurn {
     /// can change the session's NEXT model while this turn keeps running; the
     /// UI must be able to name what the live turn is using.
     run_model: Option<leveler_model::ModelRef>,
+    /// The accepted input this turn was promoted from, if any. A retry of the
+    /// same submission must not also queue it as a mid-turn steer.
+    seed_input_id: Option<String>,
 }
 
 /// The outcome of an atomic retirement decision.
@@ -155,6 +158,7 @@ impl ActiveTurns {
                 started_at: now,
                 last_activity_at: now,
                 run_model: None,
+                seed_input_id: None,
             },
         );
         Ok(TurnLease {
@@ -223,6 +227,29 @@ impl ActiveTurns {
         {
             turn.last_activity_at = Instant::now();
         }
+    }
+
+    /// Name the accepted input this turn starts from. Only the live turn can
+    /// own it: a late call after terminal publication is a no-op.
+    pub(crate) fn set_seed_input(&self, session_id: &SessionId, id: Option<String>) {
+        if let Some(turn) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(session_id)
+        {
+            turn.seed_input_id = id;
+        }
+    }
+
+    /// The accepted input this session's live turn will consume as its opening
+    /// message.
+    pub(crate) fn seed_input_id(&self, session_id: &SessionId) -> Option<String> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .and_then(|turn| turn.seed_input_id.clone())
     }
 
     /// Record which model this turn is actually using. A no-op after terminal

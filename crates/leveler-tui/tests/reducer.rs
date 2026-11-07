@@ -139,6 +139,7 @@ fn snapshot() -> UiSessionSnapshot {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 
@@ -8383,46 +8384,123 @@ fn a_task_cancelled_event_withdraws_resumability() {
     );
 }
 
-/// Enter while a turn runs holds the text in 待发送; it is not sent. Sending it
-/// (Tab to the list, Enter) steers the running turn: the text reaches the model
-/// at the next round, and the runtime falls back to an ordinary submission if
-/// the turn already finished, so nothing is lost.
+/// Enter while a turn runs is an append to that turn: the text is sent as a
+/// steer with a stable identity, shown at once, and never parked in 待发送.
 #[test]
-fn submitting_while_busy_holds_the_input_and_sending_it_steers_the_running_turn() {
+fn entering_while_busy_steers_the_running_turn() {
+    let mut s = busy_state();
+    s.composer.replace("改用另一个模块");
+    let (command, _) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    assert!(
+        matches!(
+            command,
+            ClientCommand::SteerCurrentTurn {
+                ref content,
+                message_id: Some(_),
+                ..
+            } if content == "改用另一个模块"
+        ),
+        "{command:?}"
+    );
+    assert!(
+        s.composer.is_empty(),
+        "the composer clears into the transcript"
+    );
+    assert!(
+        s.pending_inputs.is_empty(),
+        "the default is not the after-turn lane"
+    );
+    assert!(
+        format!("{:?}", s.transcript.items()).contains("改用另一个模块"),
+        "the append row is shown immediately"
+    );
+}
+
+/// Tab while a turn runs is the explicit 'process after this task' lane. The
+/// held item can still be sent early by the user's own Enter on the list.
+#[test]
+fn tab_while_busy_holds_the_input_for_after_the_turn() {
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
     assert!(
-        reduce(&mut s, key(KeyCode::Enter)).is_empty(),
+        reduce(&mut s, key(KeyCode::Tab)).is_empty(),
         "held, not sent"
     );
     assert!(s.composer.is_empty(), "the composer clears into 待发送");
+    assert_eq!(s.pending_inputs.len(), 1);
+    assert_eq!(s.pending_inputs[0].text, "改用另一个模块");
+    assert!(s.transcript.items().iter().all(
+        |item| !matches!(item, TranscriptItem::UserInput(block) if block.text == "改用另一个模块")
+    ));
+
     let effects = send_first_pending(&mut s);
-    assert_eq!(
-        submitted(&effects).0,
-        ClientCommand::SteerCurrentTurn {
-            session_id: SessionId::new("s1"),
-            content: "改用另一个模块".to_string(),
-        }
+    assert!(
+        matches!(
+            &effects[..],
+            [Effect::Submit { command: ClientCommand::SteerCurrentTurn { content, message_id: Some(_), .. }, .. }]
+                if content == "改用另一个模块"
+        ),
+        "{effects:?}"
     );
 }
 
 /// Tab from the composer to 待发送, then Enter on its selected item.
 fn send_first_pending(s: &mut AppState) -> Vec<Effect> {
-    reduce(s, key(KeyCode::Tab));
-    reduce(s, key(KeyCode::Up));
-    reduce(s, key(KeyCode::Up));
+    s.workbench_focus = leveler_tui::state::WorkbenchFocus::Pending;
+    s.pending_selected = 0;
     reduce(s, key(KeyCode::Enter))
 }
 
-/// A steer enters the conversation when the runtime admits it — not when it
-/// is typed, and not when it is sent.
+/// A steer row enters the conversation the moment the runtime admits it, and
+/// the later settlement updates that same row instead of adding a second one.
 #[test]
 fn steered_text_appears_in_the_conversation_once_admitted() {
+    use leveler_tui::transcript::InputDelivery;
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
-    reduce(&mut s, key(KeyCode::Enter));
-    let (_, command_id) = submitted(&send_first_pending(&mut s));
-    assert!(!format!("{:?}", s.transcript.items()).contains("改用另一个模块"));
+    let (command, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
+    let message_id = match command {
+        ClientCommand::SteerCurrentTurn {
+            message_id: Some(id),
+            ..
+        } => id,
+        other => panic!("expected an identified steer, got {other:?}"),
+    };
+    let count = |items: &[TranscriptItem]| {
+        items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::UserInput(block) if block.text == "改用另一个模块"))
+            .count()
+    };
+    assert_eq!(count(s.transcript.items()), 1);
+    assert!(matches!(
+        s.transcript.input_state(&message_id),
+        Some(InputDelivery::Sending)
+    ));
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::InputAdmitted {
+            message: UiMessage {
+                id: message_id.clone(),
+                role: UiRole::User,
+                text: "改用另一个模块".into(),
+                ordinal: None,
+                kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
+                images: 0,
+            },
+        }),
+    );
+    assert_eq!(
+        count(s.transcript.items()),
+        1,
+        "admission updates, never duplicates"
+    );
+    assert!(matches!(
+        s.transcript.input_state(&message_id),
+        Some(InputDelivery::Pending)
+    ));
+
     reduce(
         &mut s,
         Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
@@ -8430,11 +8508,30 @@ fn steered_text_appears_in_the_conversation_once_admitted() {
             snapshot: None,
         }),
     );
-    let text = format!("{:?}", s.transcript.items());
-    assert!(text.contains("改用另一个模块"), "{text}");
+    assert_eq!(
+        count(s.transcript.items()),
+        1,
+        "the ACK paints no second row"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::InputSettled {
+            message_id: message_id.clone(),
+            state: leveler_client_protocol::UiInputState::Delivered,
+            reason: String::new(),
+            ordinal: Some(1),
+        }),
+    );
+    assert_eq!(count(s.transcript.items()), 1);
+    assert!(matches!(
+        s.transcript.input_state(&message_id),
+        Some(InputDelivery::Delivered)
+    ));
 }
 
-/// Several held corrections are each sent on their own.
+/// Several appended corrections are each sent on their own, in order, with
+/// their own identity.
 #[test]
 fn several_steers_are_each_sent() {
     let mut s = busy_state();
@@ -8442,25 +8539,40 @@ fn several_steers_are_each_sent() {
         s.composer.replace(msg);
         reduce(&mut s, key(KeyCode::Enter));
     }
-    for msg in ["先改模块", "再加测试"] {
-        let effects = send_first_pending(&mut s);
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Submit { command: ClientCommand::SteerCurrentTurn { content, .. }, .. }] if content == msg
-            ),
-            "{effects:?}"
-        );
-        let (_, command_id) = submitted(&effects);
-        reduce(
-            &mut s,
-            Action::EffectCompleted(EffectCompletion::SubmissionDelivered {
-                command_id,
-                snapshot: None,
-            }),
-        );
-        reduce(&mut s, key(KeyCode::Esc));
-    }
+    let ids: Vec<leveler_client_protocol::MessageId> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::UserInput(block) => Some(block.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "the two identical-looking appends have real identities"
+    );
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(
+                |item| matches!(item, TranscriptItem::UserInput(block) if block.text == "先改模块")
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(
+                |item| matches!(item, TranscriptItem::UserInput(block) if block.text == "再加测试")
+            )
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -8525,8 +8637,7 @@ fn a_message_keeps_its_command_id_until_the_runtime_answers() {
 fn a_steer_is_a_tracked_submission() {
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
-    reduce(&mut s, key(KeyCode::Enter));
-    let (command, command_id) = submitted(&send_first_pending(&mut s));
+    let (command, command_id) = submitted(&reduce(&mut s, key(KeyCode::Enter)));
     assert!(matches!(command, ClientCommand::SteerCurrentTurn { .. }));
     assert_eq!(s.pending_submissions[0].command_id, command_id);
 }
@@ -8561,10 +8672,15 @@ fn an_unanswered_submission_holds_new_input_instead_of_driving_a_second_turn() {
     s.composer.replace("第二条");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "nothing may be sent: {effects:?}");
-    assert_eq!(s.pending_inputs.len(), 1, "the new input is kept in 待发送");
-    let effects = send_first_pending(&mut s);
-    assert!(effects.is_empty(), "nothing may be sent: {effects:?}");
-    assert!(s.pending_inputs[0].is_unsent(), "still held, still unsent");
+    assert_eq!(
+        s.composer.text(),
+        "第二条",
+        "the text stays in the composer while the earlier delivery is unknown"
+    );
+    assert!(
+        s.pending_inputs.is_empty(),
+        "an unanswered steer is not silently held in 待发送"
+    );
     let note = s
         .notification
         .as_ref()
@@ -9516,8 +9632,7 @@ fn steering_expands_large_paste_to_canonical_content() {
     let mut s = busy_state();
     typed(&mut s, "context: ");
     reduce(&mut s, Action::Paste(BIG_PASTE.into()));
-    reduce(&mut s, key(KeyCode::Enter));
-    let effects = send_first_pending(&mut s);
+    let effects = reduce(&mut s, key(KeyCode::Enter));
     let want = format!("context: {BIG_PASTE}");
     assert!(
         matches!(

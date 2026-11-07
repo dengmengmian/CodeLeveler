@@ -120,6 +120,10 @@ fn last_user_text(state: &AppState) -> Option<String> {
                 let line = sanitize(text.lines().next().unwrap_or(text));
                 (!line.is_empty()).then_some(line)
             }
+            TranscriptItem::UserInput(block) => {
+                let line = sanitize(block.text.lines().next().unwrap_or(&block.text));
+                (!line.is_empty()).then_some(line)
+            }
             _ => None,
         })
 }

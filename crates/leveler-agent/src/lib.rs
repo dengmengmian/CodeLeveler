@@ -32,8 +32,8 @@ pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AbortedFacts, AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome,
-    CompactionCheckpoint, ContinuationPolicy, DriveAborted, Executor, NoopSink, SteeringSource,
-    StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy,
+    CompactionCheckpoint, ContinuationPolicy, DriveAborted, Executor, NoopSink, PendingUserInput,
+    SteeringSource, StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy,
     auxiliary_budget_available, closeout,
 };
 pub use leveler_agent_core::{

@@ -454,19 +454,22 @@ impl<'a> EventLog<'a> {
             if last_completed.is_some_and(|completed| row.sequence < completed) {
                 continue;
             }
+            let event = decode_row(row)?;
+            if !event.is_user_acknowledged_crash_marker() {
+                continue;
+            }
             let EngineEvent::ToolCallFinished {
                 call_id,
                 name,
-                preview,
                 agent_id,
                 ..
-            } = decode_row(row)?
+            } = &event
             else {
                 continue;
             };
             // Only the top-level session's calls are the model's own rounds;
             // a child's acknowledged call is covered by its own recovery note.
-            if agent_id.is_some() || preview != crate::USER_ACKNOWLEDGED_CRASH_PREVIEW {
+            if agent_id.is_some() {
                 continue;
             }
             let arguments = rows
@@ -478,8 +481,8 @@ impl<'a> EventLog<'a> {
                         arguments,
                         agent_id: None,
                         ..
-                    }) if started == call_id
-                        && started_name == name
+                    }) if started == *call_id
+                        && started_name == *name
                         && start.turn_id == row.turn_id
                         && start.sequence < row.sequence =>
                     {

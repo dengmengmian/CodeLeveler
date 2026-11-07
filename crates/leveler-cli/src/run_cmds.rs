@@ -483,6 +483,15 @@ fn parse_handover_input(line: &str) -> Option<HandoverInput> {
 /// Reads handover commands from the terminal, when there is one. In a
 /// non-interactive process (piped stdin, CI, a test) this returns `None`, so
 /// the wait never blocks on input and never forces.
+///
+/// The reader must stop as soon as the wait releases the receiver: the same
+/// process starts the TUI after a successful handover, and a reader still
+/// blocked on stdin would consume the user's first message before the TUI can
+/// see it (observed in the busy-old-runtime dogfood). Crossterm's event source
+/// is shared with the TUI's `EventStream`, so stopping here leaves terminal
+/// input owned exactly once. `poll`/`read` work in cooked mode without taking
+/// the terminal over; `poll` gives the loop a bounded wait in which it can see
+/// the receiver closed.
 #[cfg(any(unix, windows))]
 fn spawn_handover_input() -> Option<tokio::sync::mpsc::UnboundedReceiver<HandoverInput>> {
     use std::io::IsTerminal;
@@ -492,14 +501,34 @@ fn spawn_handover_input() -> Option<tokio::sync::mpsc::UnboundedReceiver<Handove
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            if let Some(action) = parse_handover_input(&line)
-                && tx.send(action).is_err()
-            {
-                break;
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+        use std::time::Duration;
+
+        let mut line = String::new();
+        while !tx.is_closed() {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                // No usable terminal event source: stop reading instead of
+                // guessing at what the user wanted.
+                Err(_) => return,
+            }
+            let Ok(event) = event::read() else { return };
+            let Event::Key(key) = event else { continue };
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    if let Some(action) = parse_handover_input(&line)
+                        && tx.send(action).is_err()
+                    {
+                        return;
+                    }
+                    line.clear();
+                }
+                KeyCode::Char(ch) if !ch.is_control() => line.push(ch),
+                _ => {}
             }
         }
     });
@@ -780,6 +809,24 @@ fn format_ensure_error(host: &leveler_runtime_host::EnsureError) -> String {
                 lang.pick(
                     "未终止任何进程，也未取消任何任务；请手动退出旧版本后重新启动。",
                     "No process was terminated and no work was cancelled; exit the previous version manually and start again.",
+                ),
+            )
+        }
+        EnsureError::BuildMismatch { expected, observed } => {
+            let lang = HandoffLang::current();
+            format!(
+                "{}\n  {} {}\n  {} {}\n  {}",
+                lang.pick(
+                    "后台运行时与当前 CodeLeveler 不是同一次构建，无法接管。",
+                    "The background runtime and this CodeLeveler are different builds; it cannot be adopted.",
+                ),
+                lang.pick("当前应用", "app"),
+                expected.diagnostic(),
+                lang.pick("后台运行时", "runtime"),
+                observed.diagnostic(),
+                lang.pick(
+                    "未终止任何进程，也未取消任何任务；请重启 CodeLeveler 以使用当前版本。",
+                    "No process was terminated and no work was cancelled; restart CodeLeveler to use this build.",
                 ),
             )
         }
@@ -3064,6 +3111,29 @@ mod replacement_verification_tests {
             message.contains("someothersha") && message.contains("expected"),
             "the failure names both builds so it can be acted on: {message}"
         );
+    }
+
+    /// Two artifacts built from the SAME revision but different working-tree
+    /// deltas have identical `short()` strings. A refusal that prints only the
+    /// short form is the 2026-10-11 log: three fingerprints, one message.
+    /// The diagnostic must carry the digest half of the fingerprint.
+    #[test]
+    fn a_same_revision_different_artifact_names_the_fingerprint_digest() {
+        let expected = BuildIdentity {
+            version: "0.2.0-beta.1".into(),
+            revision: "samecommit".into(),
+            dirty: true,
+            fingerprint: "samecommit-00000000000000aa".into(),
+        };
+        let observed = BuildIdentity {
+            fingerprint: "samecommit-00000000000000bb".into(),
+            ..expected.clone()
+        };
+        let error = verify_replacement(Some(&observed), &expected)
+            .expect_err("different working-tree deltas are different artifacts");
+        let message = error.to_string();
+        assert!(message.contains("fp:00000000000000aa"), "{message}");
+        assert!(message.contains("fp:00000000000000bb"), "{message}");
     }
 
     /// A replacement that came up but says nothing about itself cannot be

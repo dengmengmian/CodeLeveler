@@ -145,6 +145,11 @@ pub enum RuntimeNoticeKind {
     /// inside it; the row itself is not the submitted input. The frame is the
     /// `/btw` mode contract and is classified as [`PromptAuthority::CoreContract`].
     SideQuestion,
+    /// The bounded briefing and continuation frame of a session imported from
+    /// another coding agent. The source agent's text is quoted evidence, not
+    /// this session's user intent, and its completion claims are not verified
+    /// facts.
+    ForeignSessionImport,
 }
 
 /// Why a transcript row exists.
@@ -364,6 +369,10 @@ fn classify_runtime_notice(notice: RuntimeNoticeKind) -> OriginClass {
         // edits and any change to the main task are not. The person's question
         // is quoted inside the same row and does not make the row user intent.
         RuntimeNoticeKind::SideQuestion => (PromptAuthority::CoreContract, false),
+        // Imported source evidence is advisory context. It describes work the
+        // user asked another agent to do; it is not this session's user intent
+        // and its claims are unverified.
+        RuntimeNoticeKind::ForeignSessionImport => (PromptAuthority::AdvisoryContext, false),
         RuntimeNoticeKind::ChildResumed
         | RuntimeNoticeKind::ChildLost
         | RuntimeNoticeKind::ChildRecovery

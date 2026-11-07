@@ -948,7 +948,7 @@ impl EventBridge {
                 // runtime never observed (and the transcript would count it
                 // as one). Leave the call without a terminal fact; the view
                 // presents that as unknown.
-                if preview == leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW {
+                if leveler_engine::is_user_acknowledged_crash_marker(&preview, is_error) {
                     return;
                 }
                 let _ = self.events.send(RuntimeEvent::ToolCallCompleted {

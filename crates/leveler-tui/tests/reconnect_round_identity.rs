@@ -61,6 +61,7 @@ fn idle_snapshot() -> UiSessionSnapshot {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 

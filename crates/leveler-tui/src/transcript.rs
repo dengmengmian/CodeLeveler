@@ -480,9 +480,40 @@ impl UserShellBlock {
     }
 }
 
+/// Where one user input stands on its way into the model's context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputDelivery {
+    /// Handed to the runtime by this client; no admission answer yet.
+    Sending,
+    /// Saved durably; no model round has taken it yet.
+    Pending,
+    /// Its transcript row exists and a model request included it.
+    Delivered,
+    /// Settled without delivery because the task was cancelled.
+    Cancelled(String),
+    /// Sent, but no answer proves whether the runtime admitted it.
+    Unknown,
+}
+
+/// One user message whose delivery state the runtime reports.
+///
+/// The identity is the runtime's (or, before its first answer, this client's).
+/// It is what makes the same input one row across the live event stream, a
+/// resumed snapshot, and a retried submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputBlock {
+    pub id: MessageId,
+    pub text: String,
+    pub state: InputDelivery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User(String),
+    /// A user message carrying a delivery state. Painted as the user's text
+    /// plus one short state line; the two lines are one record, so dedupe by
+    /// identity never separates them.
+    UserInput(UserInputBlock),
     Assistant(AssistantBlock),
     /// Model reasoning, persisted from the provider's own reasoning text. Live
     /// while streaming, immutable once done.
@@ -621,19 +652,76 @@ impl TranscriptState {
         self.push_user(text);
     }
 
-    /// Add an admitted steer unless the runtime already announced it in this
-    /// turn: a steer that arrived after its turn ended starts a new turn, whose
-    /// `UserMessageAdded` may precede the admission answer.
-    pub fn push_admitted_steer(&mut self, text: String) {
-        let announced = self
+    /// Whether a message with this identity is already in the transcript.
+    pub fn has_input(&self, id: &MessageId) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::UserInput(block) if &block.id == id))
+    }
+
+    /// Every user-input row with its delivery state, in transcript order.
+    pub fn inputs(&self) -> impl Iterator<Item = &UserInputBlock> {
+        self.items.iter().filter_map(|item| match item {
+            TranscriptItem::UserInput(block) => Some(block),
+            _ => None,
+        })
+    }
+
+    /// Add one user input with its delivery state, unless the identity is
+    /// already present. Identity — never text — is what deduplicates: two
+    /// genuinely identical messages stay two rows.
+    pub fn push_input(&mut self, id: MessageId, text: String, state: InputDelivery) -> bool {
+        if self.set_input_state(&id, state.clone()) {
+            return false;
+        }
+        self.bump();
+        self.close_tool_group();
+        self.items.push(TranscriptItem::UserInput(UserInputBlock {
+            id,
+            text,
+            state,
+        }));
+        true
+    }
+
+    /// Update the delivery state for `id`. Returns whether the identity was
+    /// known.
+    pub fn set_input_state(&mut self, id: &MessageId, state: InputDelivery) -> bool {
+        for item in &mut self.items {
+            if let TranscriptItem::UserInput(block) = item
+                && &block.id == id
+            {
+                if block.state != state {
+                    block.state = state;
+                    self.bump();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The delivery state currently painted for `id`, if the row exists.
+    pub fn input_state(&self, id: &MessageId) -> Option<&InputDelivery> {
+        self.items.iter().find_map(|item| match item {
+            TranscriptItem::UserInput(block) if &block.id == id => Some(&block.state),
+            _ => None,
+        })
+    }
+
+    /// Drop a locally painted input the runtime explicitly refused. Text the
+    /// runtime never admitted has no message to keep.
+    pub fn remove_input(&mut self, id: &MessageId) -> bool {
+        let Some(index) = self
             .items
             .iter()
-            .rev()
-            .take_while(|item| !matches!(item, TranscriptItem::TurnEnd(_)))
-            .any(|item| matches!(item, TranscriptItem::User(shown) if shown == &text));
-        if !announced {
-            self.push_user(text);
-        }
+            .position(|item| matches!(item, TranscriptItem::UserInput(block) if &block.id == id))
+        else {
+            return false;
+        };
+        self.bump();
+        self.items.remove(index);
+        true
     }
 
     pub fn push_error(&mut self, text: String) {

@@ -327,6 +327,7 @@ mod tests {
             collaboration: None,
             execution_task: None,
             children: Vec::new(),
+            foreign_origin: None,
         };
         let json =
             serde_json::to_string(&DownstreamMessage::Snapshot { session: snapshot }).unwrap();

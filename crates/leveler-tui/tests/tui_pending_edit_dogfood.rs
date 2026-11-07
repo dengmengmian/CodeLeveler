@@ -124,7 +124,7 @@ fn dogfood_pending_edit_mouse_restores_full_text_and_requeues_after_edit() {
                 rows.join("\n")
             );
             assert!(reduce(&mut s, Action::TextInput(" EDITED".into())).is_empty());
-            assert!(key(&mut s, KeyCode::Enter).is_empty());
+            assert!(key(&mut s, KeyCode::Tab).is_empty());
             assert!(s.composer.is_empty());
             assert_eq!(s.pending_inputs.len(), 2);
             assert_eq!(s.pending_inputs[1].text, format!("{original} EDITED"));

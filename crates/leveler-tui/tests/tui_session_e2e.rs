@@ -90,6 +90,7 @@ fn opened() -> AppState {
                 collaboration: None,
                 execution_task: None,
                 children: Vec::new(),
+                foreign_origin: None,
             },
         }),
     );
@@ -535,6 +536,7 @@ fn tui_trace_queries_durable_observatory_and_esc_returns() {
                     calls: 40,
                     succeeded: 40,
                     failed: 0,
+                    unknown: 0,
                     unfinished: 0,
                     total_ms: Some(1840),
                     avg_ms: Some(46),
@@ -693,9 +695,9 @@ fn tui_trace_ignores_legacy_observability_loaded_without_query_id() {
     );
 }
 
-/// A message written while a turn runs is held in 待发送, and the moment that
-/// turn reaches its terminal event it becomes the next turn on its own — with
-/// no keystroke, and without ever reading as `状态未知` while it only waited.
+/// Tab explicitly holds a message in 待发送 while a turn runs. The moment that
+/// turn reaches its terminal event, the message becomes the next turn on its
+/// own, without ever reading as `状态未知` while it only waited.
 #[test]
 fn a_queued_message_continues_as_the_next_turn_when_the_runtime_is_ready() {
     let mut s = opened();
@@ -729,12 +731,13 @@ fn a_queued_message_continues_as_the_next_turn_when_the_runtime_is_ready() {
         }),
     );
 
-    // While it runs, the user writes the follow-up.
+    // While it runs, Tab explicitly queues the follow-up for the next turn.
     typed(&mut s, "完事之后提交远端。");
     assert!(
-        enter(&mut s).is_empty(),
-        "a busy turn holds the follow-up, it does not send it"
+        reduce(&mut s, key(KeyCode::Tab)).is_empty(),
+        "Tab holds the follow-up without sending it"
     );
+    assert_eq!(s.pending_inputs.len(), 1, "Tab creates one queued input");
     let held = screen(&mut s);
     let row = held
         .lines()

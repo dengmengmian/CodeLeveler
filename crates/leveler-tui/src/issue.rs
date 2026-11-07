@@ -145,8 +145,8 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
                 state
                     .t()
                     .runtime_version_meta
-                    .replacen("{}", &expected.short(), 1)
-                    .replacen("{}", &build.short(), 1),
+                    .replacen("{}", &expected.diagnostic(), 1)
+                    .replacen("{}", &build.diagnostic(), 1),
             )
         });
         issues.push(Issue {

@@ -13,6 +13,7 @@ leveler-core = { workspace = true }
 leveler-model = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-context = { workspace = true }
+leveler-foreign-session = { workspace = true }
 leveler-project = { workspace = true }
 leveler-lsp = { workspace = true }
 leveler-browser = { workspace = true }

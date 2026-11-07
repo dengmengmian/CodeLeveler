@@ -43,6 +43,7 @@ leveler-update = { workspace = true }
 leveler-web = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+crossterm = { workspace = true }
 toml_edit = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

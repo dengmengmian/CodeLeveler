@@ -10,6 +10,7 @@ use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, Session
 use leveler_model::{ModelRef, ThinkingLevel};
 
 use super::media::AttachmentRef;
+use super::snapshot::MessageId;
 use super::{ApprovalDecision, PermissionProfile};
 
 /// Why a runtime is being asked to retire.
@@ -77,15 +78,27 @@ pub enum ClientCommand {
         attachments: Vec<AttachmentRef>,
     },
     /// Steer the turn that is already running: the text is injected at the top
-    /// of the next round instead of waiting for the turn to end.
+    /// of the next round instead of waiting for the turn to end. This is the
+    /// default meaning of Enter while a turn runs.
     ///
-    /// Distinct from queuing a follow-up (which `SubmitMessage` does while
-    /// busy): a correction like "actually use the other module" is worthless
-    /// once the work is finished. Ignored when no turn is running — the caller
-    /// should submit normally in that case.
+    /// The runtime persists the text before it acknowledges the command. A
+    /// turn that ends before the next round still delivers it as a new turn,
+    /// so it is never silently dropped. A correction like "actually use the
+    /// other module" is worthless once the work is finished, which is why it
+    /// joins the running turn rather than a later one.
+    ///
+    /// When no turn is running the runtime starts one with the same text, so
+    /// the busy/idle race in the client cannot lose the message.
+    ///
+    /// `message_id` is the client's stable identity for this input. The
+    /// runtime echoes it in `InputAdmitted` and every later state event, so a
+    /// retry cannot create a second row and a client can update the exact row
+    /// it drew. Legacy clients omit it; the runtime generates one.
     SteerCurrentTurn {
         session_id: SessionId,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<MessageId>,
     },
     /// Run an explicit goal task. Unlike ordinary chat messages, this enables
     /// goal-mode completion (`update_goal`) in the agent loop.
@@ -291,6 +304,21 @@ pub enum ClientCommand {
     /// Ask for the session list and route the response only to the requesting
     /// session's event stream.
     RequestSessionListFor { requester_session_id: SessionId },
+    /// List the locally stored sessions of another coding agent, newest first.
+    /// Read-only: discovery never opens a picker entry into CodeLeveler, and
+    /// the answer is a [`crate::RuntimeEvent::ForeignSessionList`] routed to
+    /// the requesting session.
+    ListForeignSessionsFor {
+        requester_session_id: SessionId,
+        tool: crate::UiForeignTool,
+    },
+    /// Import one foreign session by exact native id and continue its work in a
+    /// NEW CodeLeveler session. The source file is read, never modified.
+    ImportForeignSession {
+        requester_session_id: SessionId,
+        tool: crate::UiForeignTool,
+        native_id: String,
+    },
     /// Start a FRESH session and switch the requester's view to it, leaving
     /// the current one intact in the session list.
     ///
@@ -592,6 +620,14 @@ impl ClientCommand {
             }
             | ClientCommand::RequestSessionListFor {
                 requester_session_id,
+            }
+            | ClientCommand::ListForeignSessionsFor {
+                requester_session_id,
+                ..
+            }
+            | ClientCommand::ImportForeignSession {
+                requester_session_id,
+                ..
             }
             | ClientCommand::NewSessionFor {
                 requester_session_id,

@@ -838,6 +838,7 @@ async fn steering_goal_command_upgrades_the_running_chat_turn() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: session.clone(),
             content: "/goal drive the goal now".to_string(),
+            message_id: None,
         })
         .await
         .unwrap();
@@ -951,6 +952,7 @@ async fn a_busy_goal_declaration_is_durable_with_the_axis() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: session.clone(),
             content: "/goal 持久化的目标".to_string(),
+            message_id: None,
         })
         .await
         .unwrap();
@@ -1108,6 +1110,7 @@ async fn a_mid_turn_upgrade_resumes_as_its_goal() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: session.clone(),
             content: "/goal 升级后的目标".to_string(),
+            message_id: None,
         })
         .await
         .unwrap();

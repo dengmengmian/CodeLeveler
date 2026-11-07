@@ -21,7 +21,7 @@ pub mod window;
 
 pub use engine::{
     EngineBoot, NewSession, NewSessionAxes, TaskEngine, TaskExecution, TaskTerminal,
-    USER_ACKNOWLEDGED_CRASH_PREVIEW, acknowledge_crash_window,
+    USER_ACKNOWLEDGED_CRASH_PREVIEW, acknowledge_crash_window, is_user_acknowledged_crash_marker,
 };
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,

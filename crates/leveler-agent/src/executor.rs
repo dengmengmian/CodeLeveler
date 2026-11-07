@@ -136,6 +136,18 @@ pub enum AgentEvent {
         /// intentionally unaffected.
         execution_status: Option<leveler_execution::ToolExecutionStatus>,
     },
+    /// A tool call's outcome could not be established after a process crash.
+    ///
+    /// The call may have run and produced a side effect before the runtime
+    /// died; nothing was replayed. This is not a failure, not a success, and
+    /// not a cancellation. It is emitted only when replaying a user-
+    /// acknowledged crash-window marker from durable history — never by a live
+    /// tool run, which always reports a real [`AgentEvent::ToolResult`].
+    ToolOutcomeUnknown {
+        id: String,
+        name: String,
+        preview: String,
+    },
     /// A tool call started a background task, as the spawn's structured
     /// metadata reported it.
     ///
@@ -1199,6 +1211,18 @@ impl SubAgentExecutionPolicies {
     }
 }
 
+/// One user input the host already accepted durably.
+///
+/// The id is the host's stable identity for the input; it is the same value
+/// the user saw acknowledged and the same value the transcript row is keyed
+/// by. `None` is a legacy host whose queue has no durable identity — those
+/// still append, but cannot be settled atomically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUserInput {
+    pub id: Option<String>,
+    pub text: String,
+}
+
 /// Where mid-turn user input comes from.
 ///
 /// A correction like "actually use the other module" is worthless once the work
@@ -1209,6 +1233,35 @@ pub trait SteeringSource: Send + Sync {
     /// Take everything queued since the last call. Returning empty is the
     /// normal case and must be cheap.
     fn take_pending(&self) -> Vec<String>;
+
+    /// Take queued inputs with their durable identities.
+    ///
+    /// The executor prefers this over [`Self::take_pending`] so a host that
+    /// owns a journal can settle the exact row it delivered. The default keeps
+    /// legacy hosts working: their text has no identity and appends normally.
+    fn take_pending_inputs(&self) -> Vec<PendingUserInput> {
+        self.take_pending()
+            .into_iter()
+            .map(|text| PendingUserInput { id: None, text })
+            .collect()
+    }
+
+    /// The input was written to the transcript in this turn, at `ordinal`
+    /// when the sink reported one. A host that owns a journal publishes the
+    /// delivered state here; it must not be called for an input whose append
+    /// failed or was skipped.
+    fn input_consumed(&self, _id: &str, _ordinal: Option<u64>) {}
+
+    /// The durable input this turn was started from, when the host promoted an
+    /// accepted append into a fresh turn.
+    ///
+    /// The executor then writes the opening user message through
+    /// [`TranscriptSink::append_input`] instead of `append`, so the transcript
+    /// row and the journal settlement commit together and a crash between them
+    /// cannot leave a delivered-looking row with nothing in the model context.
+    fn seed_input_id(&self) -> Option<String> {
+        None
+    }
 
     /// Whether this turn has been declared a Goal mid-flight. The runtime
     /// writes it when `/goal <task>` arrives while the turn already runs; the
@@ -1350,6 +1403,8 @@ pub struct Executor {
     policy: TurnPolicy,
     /// Mid-turn user input, when the host offers any.
     steering: Option<Arc<dyn SteeringSource>>,
+    /// Durable identity of the input this turn was promoted from.
+    seed_input_id: Option<String>,
     runtime: Arc<dyn ModelRuntime>,
     registry: Arc<ToolRegistry>,
     /// Tools that became available after this turn's surface was composed (an
@@ -1531,6 +1586,7 @@ impl Executor {
             clarifier: Arc::new(AutoClarify),
             policy: TurnPolicy::default(),
             steering: None,
+            seed_input_id: None,
             depth: 0,
             agent_role: AgentRole::Default,
             write_allowlist: None,
@@ -1937,6 +1993,12 @@ impl Executor {
         self
     }
 
+    /// Bind the turn's opening user message to an accepted journal row.
+    pub fn with_seed_input_id(mut self, id: Option<String>) -> Self {
+        self.seed_input_id = id;
+        self
+    }
+
     pub fn with_goal_mode(mut self, on: bool) -> Self {
         self.policy.goal_mode = on;
         self
@@ -2103,6 +2165,7 @@ impl Executor {
             // A sub-agent runs a self-contained task; steering belongs to the
             // top-level turn the user is watching.
             steering: None,
+            seed_input_id: None,
             policy: TurnPolicy {
                 // Loop shape comes from the role's resolved policy…
                 max_parallel_tools: child_policy.max_parallel_tools,
@@ -2811,6 +2874,37 @@ impl Executor {
         .await
     }
 
+    /// Write the turn's opening user message.
+    ///
+    /// A promoted append has a journal row already: the atomic append is the
+    /// only path that may mark it delivered, and a refused append (cancelled
+    /// before the turn reached the model) aborts the turn instead of writing
+    /// the text anyway.
+    async fn append_seed(
+        &self,
+        sink: &mut dyn TranscriptSink,
+        message: &Message,
+    ) -> Result<(), AgentError> {
+        if self.depth == 0
+            && let Some(id) = self.seed_input_id.as_deref()
+        {
+            if let Some(ordinal) = sink
+                .append_input(id, message)
+                .await
+                .map_err(AgentError::from)?
+            {
+                if let Some(source) = &self.steering {
+                    source.input_consumed(id, Some(ordinal));
+                }
+                return Ok(());
+            }
+            return Err(AgentError::Cancelled);
+        }
+        sink.append(std::slice::from_ref(message))
+            .await
+            .map_err(AgentError::from)
+    }
+
     async fn run_with_content_and_objective_tracked(
         &self,
         content: Vec<ContentPart>,
@@ -2830,7 +2924,7 @@ impl Executor {
             }
         };
         let seed = vec![Message::from_parts(Role::User, content, Some(origin))];
-        sink.append(&seed).await.map_err(AgentError::from)?;
+        self.append_seed(sink, &seed[0]).await?;
         let mut facts = AbortedFacts::default();
         self.drive(
             seed,
@@ -2959,9 +3053,7 @@ impl Executor {
         });
         let user = Message::from_parts(Role::User, content, Some(origin));
         // Persist only the new user message; prior + system are not re-stored.
-        sink.append(std::slice::from_ref(&user))
-            .await
-            .map_err(AgentError::from)?;
+        self.append_seed(sink, &user).await?;
 
         let control = self.turn_control_context(&request, &request, false);
         let mut seed = prior;

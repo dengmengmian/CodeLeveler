@@ -120,6 +120,7 @@ fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionS
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 

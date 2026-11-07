@@ -393,6 +393,10 @@ export type RuntimeEvent =
   | { type: 'attachment_processing_failed'; command_id?: CommandId | null; error: string }
   /** A user message was appended to the transcript. */
   | { type: 'user_message_added'; message: UiMessage }
+  /** The runtime accepted a mid-turn input and made it durable, but no model round has received it yet. This is the ACK boundary: unlike [`Self::UserMessageAdded`], it does not claim a transcript row exists. Every connected client paints the same row from this event, not from the submitting client's optimism. */
+  | { type: 'input_admitted'; message: UiMessage }
+  /** A previously admitted input reached a terminal state. `Delivered` means its transcript row is durable (and `ordinal` locates it); `Cancelled` means it never will be. A cancelled input is never resurrected by a later turn. */
+  | { type: 'input_settled'; message_id: MessageId; ordinal?: number | null; reason?: string; state: UiInputState }
   /** A new assistant message began; deltas will target this id. */
   | { type: 'assistant_message_started'; message_id: MessageId }
   /** A retry attempt began. Remove the prior transient message, if present, and clear its reasoning before applying new deltas. */
@@ -435,6 +439,12 @@ export type RuntimeEvent =
   | { type: 'checkpoint_created'; checkpoint: UiCheckpoint }
   /** The list of stored sessions (spec §52). */
   | { type: 'session_list'; sessions: UiSessionSummary[] }
+  /** The locally discovered sessions of another coding agent, newest first. `error` is present only when discovery itself could not run; an empty `sessions` list with no error is a real "nothing found". */
+  | { type: 'foreign_session_list'; error?: string | null; sessions: UiForeignSession[]; tool: UiForeignTool }
+  /** A foreign session was imported. `session_id` is the NEW native CodeLeveler session; the source identity is carried so the client can keep it visible after the view switches. */
+  | { type: 'foreign_session_imported'; native_id: string; session_id: SessionId; tool: UiForeignTool; warning?: string | null }
+  /** A foreign session could not be imported. Nothing was created, and the source file was not modified. */
+  | { type: 'foreign_session_import_failed'; message: string; native_id: string; tool: UiForeignTool }
   /** Context package info from an orchestrated run (spec §53). */
   | { type: 'context_updated'; candidate_files: string[]; estimated_tokens: number }
   /** The runtime folded conversation history: `from` transcript messages became `to`. A stable product fact — clients own the wording and the locale; the runtime does not send prose for this. */
@@ -1150,6 +1160,38 @@ export interface UiFinding {
   symbol?: string | null;
 }
 
+/** The durable source identity of an imported CodeLeveler session. */
+export interface UiForeignOrigin {
+  imported_at: string;
+  native_id: string;
+  /** Working directory recorded by the source session, when present. */
+  source_cwd?: string | null;
+  /** The exact source file the read-only history tool addresses. The client shows this as provenance; it never rewrites it. */
+  source_path: string;
+  tool: UiForeignTool;
+}
+
+/** One locally discovered source session, as a picker needs it. */
+export interface UiForeignSession {
+  branch?: string | null;
+  /** Working directory recorded by the source session. */
+  cwd?: string | null;
+  /** The source agent's own session id. */
+  native_id: string;
+  size_bytes: number;
+  title: string;
+  tool: UiForeignTool;
+  /** RFC 3339 UTC, derived from the source file. */
+  updated_at: string;
+}
+
+/** The agent whose local session store is read. */
+export type UiForeignTool =
+  /** Anthropic Claude Code. */
+  | 'claude_code'
+  /** OpenAI Codex. */
+  | 'codex';
+
 export interface UiGlobalTaskIndex {
   source_errors: UiGlobalTaskSourceError[];
   tasks: UiGlobalTaskSummary[];
@@ -1210,6 +1252,13 @@ export interface UiHistoryEntry {
   turn_start?: boolean;
 }
 
+/** The terminal state of an accepted mid-turn input. */
+export type UiInputState =
+  /** The input's transcript row is durable and was part of a model request. */
+  | 'delivered'
+  /** The task was cancelled before the input was delivered. */
+  | 'cancelled';
+
 /** How much the runtime can prove about an interrupted tool call's owner. */
 export type UiInterruptedCallState =
   /** The runtime that owned the turn is provably gone, so the call is no longer executing here. Its side effect may still have completed, or left an orphaned process; the outcome is unknown either way. */
@@ -1257,7 +1306,13 @@ export interface UiMessage {
 /** A message whose role does not say who wrote it. */
 export type UiMessageKind =
   /** Written by the runtime into the model's context as a user-role turn — a child's settlement, a lost or resumed delegation — not typed by the user. Render it as a runtime notice, never as user input. */
-  | 'runtime_notice';
+  | 'runtime_notice'
+  /** Typed by the user while a turn ran, accepted durably, and not yet in any model request. Joins the running turn at its next round. */
+  | 'pending_input'
+  /** Typed by the user while a turn ran, accepted durably, and now part of the transcript and a model request. */
+  | 'delivered_input'
+  /** Accepted, then settled without delivery because the user cancelled the task. It must stay visible as such and must never run later. */
+  | 'cancelled_input';
 
 /** One provider/model's share of a report. Requests are grouped by the provider key and the model id actually sent on the wire, so switching models mid-session splits here instead of blending. */
 export interface UiModelUsage {
@@ -1308,7 +1363,7 @@ export interface UiObservationRow {
   /** Safe inspect fields only (no raw args, no prompt, no secrets). */
   fields?: UiObservationField[];
   sequence: number;
-  /** running | ok | fail | info */
+  /** running | ok | fail | unknown | info `unknown` is a terminal state of its own: the call's outcome could not be established after a crash. It is neither success, failure, nor a still-running call, and must not be collapsed into any of them. */
   status: string;
   target?: string;
   title: string;
@@ -1444,6 +1499,8 @@ export interface UiSessionSnapshot {
   execution_task?: UiExecutionTask | null;
   /** Typed in-flight terminalization stage. Present only while the runtime still owns an active turn after the final assistant message. */
   finalization_stage?: FinalizationStage | null;
+  /** Where this session came from when it was created by importing another agent's session. Additive: absent on an ordinary native session and on runtimes that predate import. */
+  foreign_origin?: UiForeignOrigin | null;
   goal: string;
   history?: UiSessionHistory | null;
   id: SessionId;
@@ -1541,7 +1598,7 @@ export interface UiToolAggregate {
   avg_ms?: number | null;
   calls: number;
   class: ObservationClass;
-  /** Finished with `is_error = true`. */
+  /** Finished with `is_error = true` and a reported result. A call whose outcome the crash window left unknown — even when the raw finish row carries `is_error = true` because the client had to fill in a shape — is counted in [`Self::unknown`], not here. */
   failed: number;
   name: string;
   /** Finished with `is_error = false`. */
@@ -1549,6 +1606,8 @@ export interface UiToolAggregate {
   total_ms?: number | null;
   /** `tool_call_started` with no matching `tool_call_finished`. */
   unfinished?: number;
+  /** Finished with an outcome that could not be established (crash-window acknowledgement marker). Unknown is not failure and not success. */
+  unknown?: number;
 }
 
 /** One tool's timing on a shared, turn-local runtime timeline. Live sources and replay sources use the same persisted monotonic execution facts. Wall-clock timestamps never stand in for missing execution boundaries. Absence means unknown, never an assumed zero. The start coordinate lets clients measure overlapping calls as a span instead of adding durations. */
@@ -1655,8 +1714,8 @@ export type ClientCommand =
   | { type: 'request_away_summary'; session_id: SessionId }
   /** Submit a user message; the runtime drives a turn in the given session. */
   | { type: 'submit_message'; attachments?: AttachmentRef[]; content: string; session_id: SessionId }
-  /** Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. Distinct from queuing a follow-up (which `SubmitMessage` does while busy): a correction like "actually use the other module" is worthless once the work is finished. Ignored when no turn is running — the caller should submit normally in that case. */
-  | { type: 'steer_current_turn'; content: string; session_id: SessionId }
+  /** Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. This is the default meaning of Enter while a turn runs. The runtime persists the text before it acknowledges the command. A turn that ends before the next round still delivers it as a new turn, so it is never silently dropped. A correction like "actually use the other module" is worthless once the work is finished, which is why it joins the running turn rather than a later one. When no turn is running the runtime starts one with the same text, so the busy/idle race in the client cannot lose the message. `message_id` is the client's stable identity for this input. The runtime echoes it in `InputAdmitted` and every later state event, so a retry cannot create a second row and a client can update the exact row it drew. Legacy clients omit it; the runtime generates one. */
+  | { type: 'steer_current_turn'; content: string; message_id?: MessageId | null; session_id: SessionId }
   /** Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop. */
   | { type: 'run_goal'; content: string; require_new_turn?: boolean; session_id: SessionId }
   /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. The client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it. */
@@ -1709,6 +1768,10 @@ export type ClientCommand =
   | { type: 'request_session_list' }
   /** Ask for the session list and route the response only to the requesting session's event stream. */
   | { type: 'request_session_list_for'; requester_session_id: SessionId }
+  /** List the locally stored sessions of another coding agent, newest first. Read-only: discovery never opens a picker entry into CodeLeveler, and the answer is a [`crate::RuntimeEvent::ForeignSessionList`] routed to the requesting session. */
+  | { type: 'list_foreign_sessions_for'; requester_session_id: SessionId; tool: UiForeignTool }
+  /** Import one foreign session by exact native id and continue its work in a NEW CodeLeveler session. The source file is read, never modified. */
+  | { type: 'import_foreign_session'; native_id: string; requester_session_id: SessionId; tool: UiForeignTool }
   /** Start a FRESH session and switch the requester's view to it, leaving the current one intact in the session list. This is what `/clear` does. Wiping the current session in place would be destructive and unrecoverable (it takes the checkpoints with it), which is why that shape needed a confirmation; starting a new session loses nothing, so it needs none. */
   | { type: 'new_session_for'; requester_session_id: SessionId }
   /** Open a stored session, loading its transcript into the view. */

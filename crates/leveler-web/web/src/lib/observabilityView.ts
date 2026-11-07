@@ -14,7 +14,7 @@ import type {
 } from '../types/protocol';
 
 export type ExecKind = 'model' | 'tool' | 'agent' | 'recovery' | 'system' | 'terminal';
-export type ExecStatus = 'running' | 'ok' | 'fail' | 'info';
+export type ExecStatus = 'running' | 'ok' | 'fail' | 'unknown' | 'info';
 
 export interface ExecStep {
   sequence: number;
@@ -89,7 +89,14 @@ const KIND: Record<ObservationClass, ExecKind> = {
 };
 
 function asStatus(raw: string): ExecStatus {
-  if (raw === 'running' || raw === 'ok' || raw === 'fail' || raw === 'info') return raw;
+  if (
+    raw === 'running' ||
+    raw === 'ok' ||
+    raw === 'fail' ||
+    raw === 'unknown' ||
+    raw === 'info'
+  )
+    return raw as ExecStatus;
   return 'info';
 }
 

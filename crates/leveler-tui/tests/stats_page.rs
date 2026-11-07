@@ -96,6 +96,7 @@ fn opened() -> AppState {
                 collaboration: None,
                 execution_task: None,
                 children: Vec::new(),
+                foreign_origin: None,
             },
         }),
     );

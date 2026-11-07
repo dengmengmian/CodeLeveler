@@ -119,6 +119,9 @@ impl RuntimeLifecycleState {
                 }
             }
             EnsureError::LegacyMigrationRefused { .. } => Self::MigrationFailed,
+            // A different build answered and cannot be adopted by this client.
+            // The runtime is untouched and a human must restart the client.
+            EnsureError::BuildMismatch { .. } => Self::Incompatible,
             EnsureError::ReadyTimeout { .. } | EnsureError::StartupFailed { .. } => {
                 Self::Unresponsive
             }

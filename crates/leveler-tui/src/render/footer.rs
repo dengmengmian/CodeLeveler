@@ -902,10 +902,19 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         // runs the interrupt shares the row, and once it ends the key that
         // reaches the item is the only thing left to say.
         if state.is_busy() {
-            format!(
-                "Tab {} · Esc {} · Ctrl+C {}",
-                t.pending_inputs_hint, t.hint_interrupt, t.hint_cancel
-            )
+            // A typed draft makes Tab the "after this task" choice; an empty
+            // composer makes it the way into the held list.
+            if !state.composer.is_empty() && state.pending_attachments.is_empty() {
+                format!(
+                    "Tab {} · Esc {} · Ctrl+C {}",
+                    t.pending_input_after_turn, t.hint_interrupt, t.hint_cancel
+                )
+            } else {
+                format!(
+                    "Tab {} · Esc {} · Ctrl+C {}",
+                    t.pending_inputs_hint, t.hint_interrupt, t.hint_cancel
+                )
+            }
         } else {
             // Enter and Delete belong to the list, not to the composer this
             // row sits under; Tab is what gets there, and the focused list
@@ -949,7 +958,15 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
             t.user_shell_background, t.user_shell_stop
         )
     } else if state.is_busy() {
-        format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
+        // A typed message can still be routed the other way, explicitly.
+        if !state.composer.is_empty() && state.pending_attachments.is_empty() {
+            format!(
+                "Tab {} · Esc {} · Ctrl+C {}",
+                t.pending_input_after_turn, t.hint_interrupt, t.hint_cancel
+            )
+        } else {
+            format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
+        }
     } else if state.input_mode == crate::shell_mode::InputMode::Shell {
         // Shell Mode changes where Enter goes and adds deterministic Tab.
         t.shell_completion_hint.to_string()
@@ -1035,6 +1052,14 @@ pub(crate) fn user_turn_summaries(state: &AppState) -> Vec<(usize, String)> {
         .filter_map(|item| match item {
             TranscriptItem::User(text) => {
                 let one = text.lines().next().unwrap_or(text).trim();
+                if one.is_empty() {
+                    None
+                } else {
+                    Some(one.to_string())
+                }
+            }
+            TranscriptItem::UserInput(block) => {
+                let one = block.text.lines().next().unwrap_or(&block.text).trim();
                 if one.is_empty() {
                     None
                 } else {

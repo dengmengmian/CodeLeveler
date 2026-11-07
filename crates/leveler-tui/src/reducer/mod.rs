@@ -584,16 +584,37 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             });
         }
         EffectCompletion::SubmissionUnconfirmed { command_id } => {
+            let mut posted_steer_id = None;
             if let Some(pending) = state
                 .pending_submissions
                 .iter_mut()
                 .find(|pending| pending.command_id == command_id)
             {
                 pending.unconfirmed = true;
+                if let ClientCommand::SteerCurrentTurn {
+                    message_id: Some(id),
+                    ..
+                } = &pending.command
+                {
+                    posted_steer_id = Some(id.clone());
+                }
                 state.notification = Some(Notification {
                     level: NotificationLevel::Warning,
                     message: state.t().submission_unconfirmed.to_string(),
                 });
+            }
+            // The row this client painted must not keep claiming "sending":
+            // no answer proves whether the runtime has the text. A runtime
+            // admission that already arrived is a stronger fact and stands.
+            if let Some(id) = posted_steer_id
+                && state
+                    .transcript
+                    .input_state(&id)
+                    .is_some_and(|state| matches!(state, crate::transcript::InputDelivery::Sending))
+            {
+                state
+                    .transcript
+                    .set_input_state(&id, crate::transcript::InputDelivery::Unknown);
             }
             if let Some(item) = pending_input_for(state, &command_id) {
                 item.state = crate::pending_inputs::PendingInputState::DeliveryUnknown(command_id);
@@ -610,15 +631,13 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             if let Some(snapshot) = snapshot_for_current_session(state, snapshot) {
                 runtime_apply::apply_session_confirmation(state, snapshot, settled_after_dispatch);
             }
-            // Admitted: the 待发送 item becomes conversation. A steer has no
-            // runtime message event of its own, so this is where it enters; an
-            // admitted new turn announces its message (`UserMessageAdded`).
+            // Admitted: the 待发送 item leaves the local queue. Its message is
+            // already in the transcript under the runtime's identity — the
+            // admission event painted it, so this is not where a second row is
+            // created.
             if let Some(index) = pending_input_index(state, &command_id) {
-                let item = state.pending_inputs.remove(index);
+                state.pending_inputs.remove(index);
                 forget_pending_input_row(state);
-                if matches!(pending.command, ClientCommand::SteerCurrentTurn { .. }) {
-                    state.transcript.push_admitted_steer(item.text);
-                }
             }
             if pending.unconfirmed {
                 state.notification = Some(Notification {
@@ -659,8 +678,29 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 None => {}
             }
             // The old input stays in the conversation, never in the composer:
-            // it may have run, and one Enter would run it again.
-            if let Some(text) = submit::turn_input_text(&pending.command)
+            // it may have run, and one Enter would run it again. A steered
+            // message already has its identity-bearing row; an outcome this
+            // client could not confirm is recorded on that row.
+            let mut recorded = false;
+            if let ClientCommand::SteerCurrentTurn {
+                message_id: Some(id),
+                ..
+            } = &pending.command
+                && state.transcript.input_state(id).is_some_and(|state| {
+                    matches!(
+                        state,
+                        crate::transcript::InputDelivery::Sending
+                            | crate::transcript::InputDelivery::Unknown
+                    )
+                })
+            {
+                state
+                    .transcript
+                    .set_input_state(id, crate::transcript::InputDelivery::Unknown);
+                recorded = true;
+            }
+            if !recorded
+                && let Some(text) = submit::turn_input_text(&pending.command)
                 && !state
                     .transcript
                     .items()
@@ -712,6 +752,23 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                     false
                 }
                 None => {
+                    // A locally painted row the runtime refused never became a
+                    // message. Remove only that unproven row: an admission or
+                    // settlement already observed is a fact and stays.
+                    if let ClientCommand::SteerCurrentTurn {
+                        message_id: Some(id),
+                        ..
+                    } = &pending.command
+                        && state.transcript.input_state(id).is_some_and(|state| {
+                            matches!(
+                                state,
+                                crate::transcript::InputDelivery::Sending
+                                    | crate::transcript::InputDelivery::Unknown
+                            )
+                        })
+                    {
+                        state.transcript.remove_input(id);
+                    }
                     submit::restore_turn_input(state, pending.command);
                     true
                 }
@@ -2349,6 +2406,19 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             crate::suggestion::accept(state);
             touch_slash_filter(state);
         }
+        // A typed message while a turn runs: Tab is the explicit "process
+        // after this task" lane. Ordinary Enter hands the same text to the
+        // running task instead. Completion and the ghost already claimed
+        // their cases above; an empty composer still cycles focus below.
+        KeyCode::Tab
+            if !btw
+                && state.is_busy()
+                && state.workbench_focus == WorkbenchFocus::Input
+                && !state.composer.is_empty()
+                && state.pending_attachments.is_empty() =>
+        {
+            return submit::queue_for_after_turn(state);
+        }
         // No completion popup and no ghost: Tab cycles the workbench regions.
         // A live running command earns a stop right after the transcript's
         // scroll, so the contextual `x` is reachable without the mouse.
@@ -3202,6 +3272,8 @@ mod child_identity_tests;
 mod command_row_tests;
 #[cfg(test)]
 mod context_refresh_tests;
+#[cfg(test)]
+mod foreign_session_tests;
 #[cfg(test)]
 mod history_replay_tests;
 #[cfg(test)]

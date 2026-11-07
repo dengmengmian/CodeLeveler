@@ -126,7 +126,7 @@
       }
     },
     {
-      "description": "Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end.\n\nDistinct from queuing a follow-up (which `SubmitMessage` does while busy): a correction like \"actually use the other module\" is worthless once the work is finished. Ignored when no turn is running — the caller should submit normally in that case.",
+      "description": "Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. This is the default meaning of Enter while a turn runs.\n\nThe runtime persists the text before it acknowledges the command. A turn that ends before the next round still delivers it as a new turn, so it is never silently dropped. A correction like \"actually use the other module\" is worthless once the work is finished, which is why it joins the running turn rather than a later one.\n\nWhen no turn is running the runtime starts one with the same text, so the busy/idle race in the client cannot lose the message.\n\n`message_id` is the client's stable identity for this input. The runtime echoes it in `InputAdmitted` and every later state event, so a retry cannot create a second row and a client can update the exact row it drew. Legacy clients omit it; the runtime generates one.",
       "type": "object",
       "required": [
         "content",
@@ -136,6 +136,16 @@
       "properties": {
         "content": {
           "type": "string"
+        },
+        "message_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "session_id": {
           "$ref": "#/definitions/SessionId"
@@ -735,6 +745,56 @@
           "type": "string",
           "enum": [
             "request_session_list_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "List the locally stored sessions of another coding agent, newest first. Read-only: discovery never opens a picker entry into CodeLeveler, and the answer is a [`crate::RuntimeEvent::ForeignSessionList`] routed to the requesting session.",
+      "type": "object",
+      "required": [
+        "requester_session_id",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "list_foreign_sessions_for"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Import one foreign session by exact native id and continue its work in a NEW CodeLeveler session. The source file is read, never modified.",
+      "type": "object",
+      "required": [
+        "native_id",
+        "requester_session_id",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "native_id": {
+          "type": "string"
+        },
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "import_foreign_session"
           ]
         }
       }
@@ -1586,6 +1646,10 @@
     },
     "CommandId": {
       "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
+      "type": "string"
+    },
+    "MessageId": {
+      "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
       "type": "string"
     },
     "ModelRef": {
@@ -2482,6 +2546,25 @@
       "enum": [
         "project",
         "user"
+      ]
+    },
+    "UiForeignTool": {
+      "description": "The agent whose local session store is read.",
+      "oneOf": [
+        {
+          "description": "Anthropic Claude Code.",
+          "type": "string",
+          "enum": [
+            "claude_code"
+          ]
+        },
+        {
+          "description": "OpenAI Codex.",
+          "type": "string",
+          "enum": [
+            "codex"
+          ]
+        }
       ]
     },
     "UiUsageScope": {

@@ -45,6 +45,7 @@ mod continuation;
 mod contribution;
 mod event;
 mod failure;
+mod foreign;
 mod global_tasks;
 mod goal_command;
 mod goals;
@@ -82,6 +83,7 @@ pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding
 pub use failure::{
     FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
 };
+pub use foreign::{UiForeignOrigin, UiForeignSession, UiForeignTool};
 pub use goal_command::{GoalCommand, parse_goal_command};
 pub use skills::{
     UiShadowedSkill, UiSkillDetail, UiSkillEntry, UiSkillProblem, UiSkillScope, UiSkillSource,
@@ -114,7 +116,7 @@ pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
     UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiBackgroundTaskRecord,
-    UiBackgroundTaskState, UiCheckpoint, UiExecutionTask, UiInterruptedCallState,
+    UiBackgroundTaskState, UiCheckpoint, UiExecutionTask, UiInputState, UiInterruptedCallState,
     UiInterruptedToolCall, UiMessage, UiMessageKind, UiRole, UiSessionHistory, UiSessionSnapshot,
     UiSessionSummary, UiTaskDeclaration, UiThinkingAccess, UiThinkingState, UiToolTiming,
     UiTurnBlocker, UiUserShell,

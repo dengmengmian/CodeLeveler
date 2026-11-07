@@ -1107,6 +1107,22 @@ fn render_cacheable_unit(
             push_user_turn(text, theme, width, &mut out);
             copy = user_copy_rows(text, width);
         }
+        TranscriptItem::UserInput(block) => {
+            // The user's text is copyable; its one-line delivery state is
+            // chrome and never part of a selection.
+            push_user_turn(&block.text, theme, width, &mut out);
+            out.push(crate::render::input_state_line(
+                &block.state,
+                theme,
+                width,
+                t,
+            ));
+            copy = user_copy_rows(&block.text, width);
+            copy.push(crate::selection::PlainRow {
+                skip: true,
+                ..Default::default()
+            });
+        }
         TranscriptItem::Assistant(block) => {
             // Prose is communication: always in full, never a click target.
             let (lines, rows) = assistant_render_with_copy(block, theme, width);

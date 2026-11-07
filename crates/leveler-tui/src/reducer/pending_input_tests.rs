@@ -1,10 +1,14 @@
-//! 待发送: input written while a turn runs is held in the bottom control area,
-//! sent one item at a time on the user's say-so, and enters the conversation
-//! only once the runtime admits it. Once the running turn reaches its terminal
-//! event and the runtime is ready, the FIFO head advances on its own.
+//! 待发送: the explicit "process after the running task" lane. A message typed
+//! while a turn runs goes to that turn on Enter; Tab is what holds it here.
+//! Held items are sent one at a time on the user's say-so and enter the
+//! conversation only when the runtime admits them. Once the running turn
+//! reaches its terminal event and the runtime is ready, the FIFO head advances
+//! on its own.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use leveler_client_protocol::{ClientCommand, CommandId, RuntimeEvent, RuntimeStatus, SessionId};
+use leveler_client_protocol::{
+    ClientCommand, CommandId, MessageId, RuntimeEvent, RuntimeStatus, SessionId,
+};
 
 use super::reduce;
 use crate::action::{Action, Effect, EffectCompletion};
@@ -42,15 +46,97 @@ fn type_and_enter(s: &mut AppState, text: &str) -> Vec<Effect> {
     key(s, KeyCode::Enter)
 }
 
+/// The explicit after-turn lane: a typed message plus Tab.
+fn type_and_tab(s: &mut AppState, text: &str) -> Vec<Effect> {
+    s.composer.replace(text.to_string());
+    key(s, KeyCode::Tab)
+}
+
 fn user_messages(s: &AppState) -> Vec<String> {
     s.transcript
         .items()
         .iter()
         .filter_map(|i| match i {
             TranscriptItem::User(t) => Some(t.clone()),
+            TranscriptItem::UserInput(block) => Some(block.text.clone()),
             _ => None,
         })
         .collect()
+}
+
+/// Admission and consumption can be emitted by different runtime threads.
+/// A late admission must not erase the terminal fact already displayed.
+#[test]
+fn a_late_input_admission_preserves_its_terminal_state() {
+    use crate::transcript::InputDelivery;
+    use leveler_client_protocol::{UiInputState, UiMessage, UiMessageKind, UiRole};
+
+    for (settled, expected) in [
+        (UiInputState::Delivered, InputDelivery::Delivered),
+        (
+            UiInputState::Cancelled,
+            InputDelivery::Cancelled("task cancelled".into()),
+        ),
+    ] {
+        let mut s = state();
+        let id = MessageId::new("late-admission");
+        let message = UiMessage {
+            id: id.clone(),
+            role: UiRole::User,
+            text: "one instruction".into(),
+            ordinal: None,
+            kind: Some(UiMessageKind::PendingInput),
+            images: 0,
+        };
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::InputAdmitted {
+                message: message.clone(),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::InputSettled {
+                message_id: id.clone(),
+                state: settled,
+                reason: "task cancelled".into(),
+                ordinal: Some(1),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::InputAdmitted { message }),
+        );
+
+        assert_eq!(s.transcript.input_state(&id), Some(&expected));
+        assert_eq!(s.transcript.inputs().count(), 1);
+    }
+}
+
+#[test]
+fn an_input_admission_resolves_an_unknown_submission() {
+    use crate::transcript::InputDelivery;
+    use leveler_client_protocol::{UiMessage, UiMessageKind, UiRole};
+
+    let mut s = state();
+    let id = MessageId::new("unknown-submission");
+    s.transcript
+        .push_input(id.clone(), "one instruction".into(), InputDelivery::Unknown);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::InputAdmitted {
+            message: UiMessage {
+                id: id.clone(),
+                role: UiRole::User,
+                text: "one instruction".into(),
+                ordinal: None,
+                kind: Some(UiMessageKind::PendingInput),
+                images: 0,
+            },
+        }),
+    );
+    assert_eq!(s.transcript.input_state(&id), Some(&InputDelivery::Pending));
+    assert_eq!(s.transcript.inputs().count(), 1);
 }
 
 fn texts(s: &AppState) -> Vec<String> {
@@ -85,9 +171,9 @@ fn enter_during_a_background_wait_steers_the_running_turn() {
     assert_eq!(user_messages(&s), vec!["现在进展怎么样了？"]);
 }
 
-/// The queue is unchanged for a turn that is making progress on its own.
+/// The ordinary busy default is a steer, whatever the turn is doing.
 #[test]
-fn enter_during_an_ordinary_busy_turn_still_queues() {
+fn enter_during_an_ordinary_busy_turn_steers() {
     let mut s = state();
     s.transcript.push_tool_started(
         leveler_client_protocol::ToolCallId::new("c1"),
@@ -99,8 +185,53 @@ fn enter_during_an_ordinary_busy_turn_still_queues() {
         None,
     );
     let effects = type_and_enter(&mut s, "顺便加一句");
-    assert!(effects.is_empty(), "{effects:?}");
-    assert_eq!(texts(&s), vec!["顺便加一句"]);
+    let (command, _) = submitted(&effects);
+    assert!(
+        matches!(
+            command,
+            ClientCommand::SteerCurrentTurn {
+                ref content,
+                message_id: Some(_),
+                ..
+            } if content == "顺便加一句"
+        ),
+        "{command:?}"
+    );
+    assert!(texts(&s).is_empty(), "a steer is not a queued draft");
+    assert_eq!(user_messages(&s), vec!["顺便加一句"]);
+}
+
+/// Identity, never text, is what deduplicates. The same sentence sent twice
+/// while a turn runs is two independent instructions, each with its own id.
+#[test]
+fn two_identical_steers_are_two_rows() {
+    let mut s = state();
+    let first = type_and_enter(&mut s, "再检查一次。");
+    let (first_command, _) = submitted(&first);
+    let first_id = match &first_command {
+        ClientCommand::SteerCurrentTurn {
+            message_id: Some(id),
+            ..
+        } => id.clone(),
+        other => panic!("{other:?}"),
+    };
+    let second = type_and_enter(&mut s, "再检查一次。");
+    let (second_command, _) = submitted(&second);
+    let second_id = match &second_command {
+        ClientCommand::SteerCurrentTurn {
+            message_id: Some(id),
+            ..
+        } => id.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(first_id, second_id, "each send gets its own identity");
+    let ids: Vec<MessageId> = s
+        .transcript
+        .inputs()
+        .map(|input| input.id.clone())
+        .collect();
+    assert_eq!(ids, vec![first_id, second_id]);
+    assert_eq!(user_messages(&s), vec!["再检查一次。", "再检查一次。"]);
 }
 
 fn submitted(effects: &[Effect]) -> (ClientCommand, CommandId) {
@@ -117,7 +248,7 @@ fn submitted(effects: &[Effect]) -> (ClientCommand, CommandId) {
 
 fn stage_three(s: &mut AppState) {
     for text in ["结果如何？", "如果失败先不要修改配置", "先别继续了"] {
-        assert!(type_and_enter(s, text).is_empty(), "staging sends nothing");
+        assert!(type_and_tab(s, text).is_empty(), "staging sends nothing");
     }
 }
 
@@ -129,7 +260,7 @@ fn send_from_keyboard(s: &mut AppState, index: usize) -> Vec<Effect> {
 }
 
 #[test]
-fn enter_while_a_turn_runs_holds_the_input_instead_of_sending_it() {
+fn tab_while_a_turn_runs_holds_the_input_for_after_it() {
     let mut s = state();
     stage_three(&mut s);
     assert_eq!(
@@ -159,18 +290,46 @@ fn any_item_can_be_sent_and_it_stays_until_the_runtime_admits_it() {
     let mut s = state();
     stage_three(&mut s);
     let (command, id) = submitted(&send_from_keyboard(&mut s, 2));
-    assert_eq!(
-        command,
-        ClientCommand::SteerCurrentTurn {
-            session_id: SessionId::new("s1"),
-            content: "先别继续了".into(),
-        }
+    assert!(
+        matches!(
+            command,
+            ClientCommand::SteerCurrentTurn {
+                ref content,
+                message_id: Some(_),
+                ..
+            } if content == "先别继续了"
+        ),
+        "{command:?}"
     );
+    let message_id = match &command {
+        ClientCommand::SteerCurrentTurn {
+            message_id: Some(id),
+            ..
+        } => id.clone(),
+        other => panic!("a busy send must carry its identity: {other:?}"),
+    };
     assert_eq!(
         s.pending_inputs[2].state,
         PendingInputState::Submitting(id.clone())
     );
     assert!(user_messages(&s).is_empty(), "sent is not admitted");
+
+    // The runtime's admission is the first fact that puts the text into the
+    // conversation, under the identity the client sent.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::InputAdmitted {
+            message: leveler_client_protocol::UiMessage {
+                id: message_id,
+                role: leveler_client_protocol::UiRole::User,
+                text: "先别继续了".into(),
+                ordinal: None,
+                kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
+                images: 0,
+            },
+        }),
+    );
+    assert_eq!(user_messages(&s), vec!["先别继续了"]);
 
     reduce(
         &mut s,
@@ -180,25 +339,37 @@ fn any_item_can_be_sent_and_it_stays_until_the_runtime_admits_it() {
         }),
     );
     assert_eq!(texts(&s), vec!["结果如何？", "如果失败先不要修改配置"]);
-    assert_eq!(user_messages(&s), vec!["先别继续了"]);
+    assert_eq!(
+        user_messages(&s),
+        vec!["先别继续了"],
+        "the command answer must not add a second row"
+    );
 }
 
 /// The turn a steer aimed at can end first; the runtime then starts a turn
-/// with it and announces the message itself. Admission must not add it twice.
+/// with it and announces the message itself under the SAME identity. Admission
+/// must not add it twice.
 #[test]
 fn a_steer_that_became_a_new_turn_is_shown_once() {
     let mut s = state();
     stage_three(&mut s);
-    let (_, id) = submitted(&send_from_keyboard(&mut s, 0));
+    let (command, id) = submitted(&send_from_keyboard(&mut s, 0));
+    let message_id = match &command {
+        ClientCommand::SteerCurrentTurn {
+            message_id: Some(id),
+            ..
+        } => id.clone(),
+        other => panic!("a busy send must carry its identity: {other:?}"),
+    };
     reduce(
         &mut s,
         Action::Runtime(leveler_client_protocol::RuntimeEvent::UserMessageAdded {
             message: leveler_client_protocol::UiMessage {
-                id: leveler_client_protocol::MessageId::new("u1"),
+                id: message_id.clone(),
                 role: leveler_client_protocol::UiRole::User,
                 text: "结果如何？".into(),
                 ordinal: None,
-                kind: None,
+                kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
                 images: 0,
             },
         }),
@@ -217,7 +388,27 @@ fn a_steer_that_became_a_new_turn_is_shown_once() {
 fn an_unanswered_send_stays_and_says_its_outcome_is_unknown() {
     let mut s = state();
     stage_three(&mut s);
-    let (_, id) = submitted(&send_from_keyboard(&mut s, 0));
+    let (command, id) = submitted(&send_from_keyboard(&mut s, 0));
+    let message_id = match &command {
+        ClientCommand::SteerCurrentTurn {
+            message_id: Some(id),
+            ..
+        } => id.clone(),
+        other => panic!("a busy send must carry its identity: {other:?}"),
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::InputAdmitted {
+            message: leveler_client_protocol::UiMessage {
+                id: message_id,
+                role: leveler_client_protocol::UiRole::User,
+                text: "结果如何？".into(),
+                ordinal: None,
+                kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
+                images: 0,
+            },
+        }),
+    );
     reduce(
         &mut s,
         Action::EffectCompleted(EffectCompletion::SubmissionUnconfirmed {
@@ -299,14 +490,47 @@ fn a_refused_send_stays_in_the_list_marked_failed_and_the_composer_is_untouched(
     assert!(!send_from_keyboard(&mut s, 1).is_empty());
 }
 
+/// A recovery stop refuses the turn, not the user's text. The draft stays in
+/// the composer, and the only way forward must be reachable without destroying
+/// it: `/recover` is a local command and only parses at the start of the
+/// composer, so a message telling the user to type it next to their preserved
+/// draft is a dead end. The refusal presents the same explicit acknowledgement
+/// `/recover` opens; cancel remains the default.
+#[test]
+fn a_recovery_refusal_keeps_the_draft_and_opens_the_acknowledgement() {
+    let mut s = state();
+    s.status = RuntimeStatus::Idle;
+    s.interrupted_tool_calls = vec![leveler_client_protocol::UiInterruptedToolCall {
+        call_id: "call-1".into(),
+        tool: "shell_command".into(),
+        pending_approval: false,
+        state: leveler_client_protocol::UiInterruptedCallState::Unknown,
+    }];
+    let (_, id) = submitted(&type_and_enter(&mut s, "等一下再做"));
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SubmissionRejected {
+            command_id: id,
+            message: "recovery".into(),
+            recovery: true,
+            snapshot: None,
+        }),
+    );
+    assert_eq!(s.composer.text(), "等一下再做");
+    assert!(
+        matches!(s.overlay, Some(crate::overlay::Overlay::ConfirmRecovery(_))),
+        "the only way forward must not require clearing the preserved draft"
+    );
+}
+
 /// A refused head pauses the FIFO queue instead of being skipped: retrying it
 /// automatically would loop, and jumping over it would reorder the user's own
 /// messages. Deleting it lets the next queued item advance.
 #[test]
 fn a_refused_head_pauses_the_queue_until_the_user_decides() {
     let mut s = state();
-    type_and_enter(&mut s, "A");
-    type_and_enter(&mut s, "B");
+    type_and_tab(&mut s, "A");
+    type_and_tab(&mut s, "B");
     let (_, id) = submitted(&send_from_keyboard(&mut s, 0));
     reduce(
         &mut s,
@@ -505,7 +729,7 @@ fn an_unknown_send_is_labelled_in_its_row() {
 fn a_long_list_is_bounded_and_names_what_it_hides() {
     let mut s = state();
     for i in 1..=9 {
-        type_and_enter(&mut s, &format!("第 {i} 条"));
+        type_and_tab(&mut s, &format!("第 {i} 条"));
     }
     let lines = render(&mut s, 100, 30);
     assert!(row_of(&lines, "待发送 · 9").is_some(), "{lines:#?}");
@@ -570,6 +794,7 @@ fn idle_snapshot() -> leveler_client_protocol::UiSessionSnapshot {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 
@@ -591,7 +816,7 @@ fn admitted_message(text: &str) -> RuntimeEvent {
 #[test]
 fn a_completed_turn_advances_the_queue_as_the_next_user_turn() {
     let mut s = state();
-    type_and_enter(&mut s, "完事之后提交远端。");
+    type_and_tab(&mut s, "完事之后提交远端。");
     assert_eq!(s.pending_inputs.len(), 1, "queued, not sent");
     assert!(s.pending_submissions.is_empty());
 
@@ -632,7 +857,7 @@ fn a_completed_turn_advances_the_queue_as_the_next_user_turn() {
 #[test]
 fn a_queued_input_is_not_sent_while_a_turn_is_still_running() {
     let mut s = state();
-    type_and_enter(&mut s, "别急");
+    type_and_tab(&mut s, "别急");
     assert!(reduce(&mut s, Action::Resize(120, 40)).is_empty());
     assert!(matches!(
         s.pending_inputs[0].state,
@@ -648,12 +873,12 @@ fn a_queued_input_is_not_sent_while_a_turn_is_still_running() {
 #[test]
 fn a_terminal_turn_does_not_advance_the_queue_while_input_is_in_flight() {
     let mut s = state();
-    type_and_enter(&mut s, "先改模块");
+    type_and_tab(&mut s, "先改模块");
     // A steer is in flight and unanswered. It becomes item 0 (`Submitting`).
     let (_, steer_id) = submitted(&send_from_keyboard(&mut s, 0));
     // Back to the composer to write the follow-up.
     s.workbench_focus = WorkbenchFocus::Input;
-    type_and_enter(&mut s, "完事之后提交远端。");
+    type_and_tab(&mut s, "完事之后提交远端。");
     assert_eq!(texts(&s), vec!["先改模块", "完事之后提交远端。"]);
 
     // Terminal event, but the in-flight submission keeps the runtime busy.
@@ -702,7 +927,7 @@ fn a_terminal_turn_does_not_advance_the_queue_while_input_is_in_flight() {
 #[test]
 fn the_same_ready_window_submits_a_queued_input_only_once() {
     let mut s = state();
-    type_and_enter(&mut s, "A");
+    type_and_tab(&mut s, "A");
     let mut submitted_ids = Vec::new();
 
     submitted_ids.extend(submits(&reduce(
@@ -736,7 +961,7 @@ fn the_same_ready_window_submits_a_queued_input_only_once() {
 fn the_queue_advances_strictly_fifo() {
     let mut s = state();
     for text in ["A", "B", "C"] {
-        type_and_enter(&mut s, text);
+        type_and_tab(&mut s, text);
     }
     for text in ["A", "B", "C"] {
         let effects = reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
@@ -767,7 +992,7 @@ fn the_queue_advances_strictly_fifo() {
 #[test]
 fn a_queued_item_is_not_labelled_unknown() {
     let mut s = state();
-    type_and_enter(&mut s, "完事之后提交远端。");
+    type_and_tab(&mut s, "完事之后提交远端。");
     assert!(s.pending_inputs[0].is_queued());
     let lines = render(&mut s, 100, 40);
     let row = row_of(&lines, "› 完事之后提交远端。").expect("the queued row");
@@ -780,7 +1005,7 @@ fn a_queued_item_is_not_labelled_unknown() {
 #[test]
 fn only_an_attempted_delivery_reads_as_unknown() {
     let mut s = state();
-    type_and_enter(&mut s, "A");
+    type_and_tab(&mut s, "A");
     let queued = render(&mut s, 100, 40);
     let row = row_of(&queued, "› A").unwrap();
     assert!(!queued[row].contains("状态未知"));
@@ -806,7 +1031,7 @@ fn only_an_attempted_delivery_reads_as_unknown() {
 #[test]
 fn a_queued_input_is_not_sent_into_another_session() {
     let mut s = state();
-    type_and_enter(&mut s, "A");
+    type_and_tab(&mut s, "A");
     assert_eq!(s.pending_inputs[0].session_id, SessionId::new("s1"));
 
     // The user opens another idle session. The queue is shared bottom-control
@@ -838,7 +1063,7 @@ fn a_queued_input_is_not_sent_into_another_session() {
 #[test]
 fn a_reconnect_does_not_resend_an_admitted_input() {
     let mut s = state();
-    type_and_enter(&mut s, "A");
+    type_and_tab(&mut s, "A");
     let (_, id) = submitted(&reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::TurnCompleted),
@@ -860,4 +1085,115 @@ fn a_reconnect_does_not_resend_an_admitted_input() {
     );
     assert!(submits(&effects).is_empty(), "must not resend: {effects:?}");
     assert!(s.pending_inputs.is_empty(), "replay must not resurrect it");
+}
+
+/// A reopened client sees accepted-but-undelivered input even though the
+/// event history cannot contain it: the journal row has no transcript event,
+/// so rebuilding from history must not erase the snapshot's journal projection.
+#[test]
+fn a_snapshot_keeps_its_pending_input_across_history_replacement() {
+    let mut s = state();
+    let message =
+        |id: &str, text: &str, ordinal: Option<u64>, kind| leveler_client_protocol::UiMessage {
+            id: MessageId::new(id),
+            role: leveler_client_protocol::UiRole::User,
+            text: text.into(),
+            ordinal,
+            kind,
+            images: 0,
+        };
+    let mut snapshot = idle_snapshot();
+    snapshot.messages = vec![
+        message("m0", "原来的任务", Some(0), None),
+        message(
+            "pending-1",
+            "增加管理员管理。",
+            None,
+            Some(leveler_client_protocol::UiMessageKind::PendingInput),
+        ),
+    ];
+    // The event history is non-empty, so the snapshot path replaces the
+    // message-built transcript with the replayed one.
+    snapshot.history = Some(leveler_client_protocol::UiSessionHistory {
+        entries: vec![leveler_client_protocol::UiHistoryEntry {
+            turn_elapsed_ms: 0,
+            turn_start: true,
+            event: RuntimeEvent::UserMessageAdded {
+                message: message("m0", "原来的任务", Some(0), None),
+            },
+        }],
+        omitted_turns: 0,
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
+    assert!(
+        user_messages(&s).contains(&"增加管理员管理。".to_string()),
+        "the journal row must survive history replacement: {:?}",
+        user_messages(&s)
+    );
+}
+
+/// The history answer is a snapshot taken before it arrives. A journal input
+/// this client already drew is newer than that answer; replacing the
+/// transcript with the replay must not erase it.
+#[test]
+fn a_history_answer_does_not_erase_a_newer_pending_input() {
+    let mut s = state();
+    s.status = RuntimeStatus::Idle;
+    let mut snapshot = idle_snapshot();
+    snapshot.messages = vec![leveler_client_protocol::UiMessage {
+        id: MessageId::new("pending-1"),
+        role: leveler_client_protocol::UiRole::User,
+        text: "增加管理员管理。".into(),
+        ordinal: None,
+        kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
+        images: 0,
+    }];
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
+    assert!(
+        user_messages(&s).contains(&"增加管理员管理。".to_string()),
+        "the snapshot paints the accepted input"
+    );
+    let query_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Send(ClientCommand::QuerySessionHistory {
+                query_id: Some(query_id),
+                ..
+            }) => Some(query_id.clone()),
+            _ => None,
+        })
+        .expect("opening an idle session asks for its history");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: Some(query_id),
+            session_id: SessionId::new("s1"),
+            entries: vec![leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 0,
+                turn_start: true,
+                event: RuntimeEvent::UserMessageAdded {
+                    message: leveler_client_protocol::UiMessage {
+                        id: MessageId::new("m0"),
+                        role: leveler_client_protocol::UiRole::User,
+                        text: "原来的任务".into(),
+                        ordinal: Some(0),
+                        kind: None,
+                        images: 0,
+                    },
+                },
+            }],
+            omitted_turns: 0,
+        }),
+    );
+    assert!(
+        user_messages(&s).contains(&"增加管理员管理。".to_string()),
+        "a stale history answer must not erase the accepted input: {:?}",
+        user_messages(&s)
+    );
 }

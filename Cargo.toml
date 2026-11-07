@@ -27,6 +27,7 @@ members = [
     "crates/leveler-win-local-ipc",
     "crates/leveler-runtime-host",
     "crates/leveler-media",
+    "crates/leveler-foreign-session",
     "crates/leveler-browser",
     "crates/leveler-cua",
     "crates/leveler-native",
@@ -77,6 +78,7 @@ leveler-relay = { version = "1.0.23", path = "services/leveler-relay" }
 leveler-local-transport = { version = "1.0.23", path = "crates/leveler-local-transport" }
 leveler-runtime-host = { version = "1.0.23", path = "crates/leveler-runtime-host" }
 leveler-media = { version = "1.0.23", path = "crates/leveler-media" }
+leveler-foreign-session = { version = "1.0.23", path = "crates/leveler-foreign-session" }
 leveler-browser = { version = "1.0.23", path = "crates/leveler-browser" }
 leveler-cua = { version = "1.0.23", path = "crates/leveler-cua" }
 leveler-native = { version = "1.0.23", path = "crates/leveler-native" }

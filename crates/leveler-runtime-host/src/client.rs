@@ -206,12 +206,11 @@ pub fn verify_replacement(
     }
     match classify_runtime(reported, expected) {
         RuntimeConsistency::Current => Ok(()),
-        RuntimeConsistency::Outdated { runtime, expected } => anyhow::bail!(
-            "the local runtime started as {} but this CodeLeveler is {}; \
-             the runtime was not replaced correctly",
-            runtime.short(),
-            expected.short()
-        ),
+        RuntimeConsistency::Outdated { runtime, expected } => Err(EnsureError::BuildMismatch {
+            expected,
+            observed: runtime,
+        }
+        .into()),
         RuntimeConsistency::ConfigChanged => {
             anyhow::bail!("the replacement runtime loaded a different configuration generation")
         }
@@ -439,6 +438,22 @@ pub enum EnsureError {
         socket.display()
     )]
     LegacyMigrationRefused { socket: PathBuf, reason: String },
+    /// The runtime that answered is a different artifact from this client.
+    ///
+    /// Typed, not prose: the revive loop must be able to recognise a stable
+    /// build conflict without parsing a sentence. Both identities are carried
+    /// because the diagnosis needs the side that refused as well as the side
+    /// that was expected.
+    #[error(
+        "the local runtime started as {} but this CodeLeveler is {}; \
+         the runtime was not replaced correctly",
+        observed.diagnostic(),
+        expected.diagnostic()
+    )]
+    BuildMismatch {
+        expected: leveler_core::BuildIdentity,
+        observed: leveler_core::BuildIdentity,
+    },
     #[error(
         "runtime did not become ready within {seconds}s ({observation:?}); log: {}",
         log_path.display()
@@ -989,8 +1004,8 @@ pub async fn reconcile_runtime_generation(
         RuntimeConsistency::Unknown => Err(EnsureError::UnknownGeneration.into()),
         RuntimeConsistency::Outdated { runtime, expected } => {
             tracing::info!(
-                runtime = %runtime.short(),
-                expected = %expected.short(),
+                runtime = %runtime.diagnostic(),
+                expected = %expected.diagnostic(),
                 "local runtime is a different build; asking it to retire"
             );
             retire_runtime(&client, socket_path, RestartReason::BuildMismatch, ui).await?;
@@ -1160,6 +1175,18 @@ pub struct DaemonReviver {
     /// transport to report it: the attach stays refused, but a known-different
     /// generation is a fact the user needs in order to restart.
     observed_build: std::sync::Mutex<Option<leveler_client_protocol::BuildIdentity>>,
+    /// A revival that cannot make progress by trying again.
+    ///
+    /// `ensure_default_runtime` retires a different-build runtime it finds and
+    /// spawns a replacement from `launch.executable`. When this client is a
+    /// stale process, that replacement is the NEW binary on disk, so
+    /// verification refuses it — and the next attempt retires that runtime and
+    /// spawns yet another, forever. The 2026-10-09 logs are 137 such attempts
+    /// in 6.7 minutes. The record pins the exact conflict (client build,
+    /// observed build + pid, launch artifact) so an unchanged conflict is
+    /// reported without touching the runtime; a change to any of those facts
+    /// clears it and revival is attempted again.
+    conflict: std::sync::Mutex<Option<BuildConflict>>,
     /// One revival at a time. The request path and the event-stream reconnect
     /// path revive the same runtime, and `ensure_default_runtime` only probes
     /// the endpoint once at its start: two concurrent revivals each spawn a
@@ -1167,6 +1194,92 @@ pub struct DaemonReviver {
     /// whatever bookkeeping its caller keeps about the process it launched.
     /// Serialized, the second caller adopts the first one's daemon instead.
     gate: tokio::sync::Mutex<()>,
+}
+
+/// Identity of the artifact a revival re-executes. `len` plus `modified` is a
+/// portable change detector; the endpoint's own build+pid is the primary
+/// signal and this only answers "was the launch file replaced?".
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(any(unix, windows))]
+impl LaunchStamp {
+    fn of(path: &Path) -> Self {
+        let metadata = std::fs::metadata(path).ok();
+        Self {
+            path: path.to_path_buf(),
+            len: metadata.as_ref().map(std::fs::Metadata::len).unwrap_or(0),
+            modified: metadata.as_ref().and_then(|m| m.modified().ok()),
+        }
+    }
+}
+
+/// A stable build conflict, kept as one record so repeated attempts log and
+/// report the same correlation id instead of looking like fresh failures.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone)]
+struct BuildConflict {
+    expected: leveler_core::BuildIdentity,
+    observed: leveler_core::BuildIdentity,
+    /// Diagnostic only: the instance that answered when the conflict was
+    /// recorded. A later restart serving the SAME build does not clear it.
+    observed_pid: Option<u32>,
+    launch: LaunchStamp,
+    correlation: String,
+    attempts: u32,
+    first_seen: std::time::Instant,
+}
+
+/// What a probe of the endpoint proved.
+///
+/// `Absent` and `Unknown` are deliberately different facts: an endpoint with no
+/// listener can be retried, while a probe that timed out proves nothing and
+/// must not become a reason to replace a runtime.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone)]
+enum RuntimeObservation {
+    /// The endpoint answered with this process instance and build.
+    Serving {
+        pid: u32,
+        build: leveler_client_protocol::BuildIdentity,
+    },
+    /// There is no listener at the endpoint.
+    Absent,
+    /// The probe failed: whether a runtime exists was not established.
+    Unknown,
+}
+
+/// Whether a recorded conflict still describes reality. Only a fact that could
+/// resolve the conflict is a reason to try again: the client build (not
+/// possible without a restart, but stated), the launch artifact, an absent
+/// runtime, or a runtime that now serves a different build.
+///
+/// A pid change alone does NOT clear it. A restarted instance that still serves
+/// the same unconvertible build is the same conflict — retrying would retire it
+/// and respawn from the same artifact, which is exactly the loop this record
+/// exists to stop (observed live: a new pid every ~10s). A probe that cannot
+/// verify the runtime is also NOT a change: replacing on an unproven absence is
+/// the unsafe direction.
+#[cfg(any(unix, windows))]
+fn build_conflict_still_applies(
+    recorded: &BuildConflict,
+    expected: &leveler_core::BuildIdentity,
+    launch: &LaunchStamp,
+    observed: &RuntimeObservation,
+) -> bool {
+    if recorded.expected != *expected || recorded.launch != *launch {
+        return false;
+    }
+    match observed {
+        RuntimeObservation::Serving { build, .. } => *build == recorded.observed,
+        RuntimeObservation::Absent => false,
+        RuntimeObservation::Unknown => true,
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -1177,6 +1290,7 @@ impl DaemonReviver {
             launch,
             ui,
             observed_build: std::sync::Mutex::new(None),
+            conflict: std::sync::Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
         }
     }
@@ -1187,17 +1301,87 @@ impl DaemonReviver {
 impl RuntimeReviver for DaemonReviver {
     async fn revive(&self) -> Result<(), String> {
         let _gate = self.gate.lock().await;
+        let recorded = self.conflict.lock().unwrap().clone();
+        if let Some(recorded) = recorded {
+            let expected = leveler_core::BuildIdentity::current();
+            let launch = LaunchStamp::of(&self.launch.executable);
+            let observed = observe_runtime_identity(&self.layout).await;
+            if build_conflict_still_applies(&recorded, &expected, &launch, &observed) {
+                let mut updated = recorded;
+                updated.attempts = updated.attempts.saturating_add(1);
+                tracing::warn!(
+                    correlation = %updated.correlation,
+                    attempt = updated.attempts,
+                    elapsed_secs = updated.first_seen.elapsed().as_secs(),
+                    expected = %updated.expected.diagnostic(),
+                    observed = %updated.observed.diagnostic(),
+                    observed_pid = ?updated.observed_pid,
+                    observation = ?observed,
+                    launch = %updated.launch.path.display(),
+                    "runtime build conflict is unchanged; replacement is not re-attempted"
+                );
+                *self.observed_build.lock().unwrap() = Some(updated.observed.clone());
+                *self.conflict.lock().unwrap() = Some(updated.clone());
+                let error = EnsureError::BuildMismatch {
+                    expected: updated.expected,
+                    observed: updated.observed,
+                };
+                return Err(self.ui.render_ensure_error(&error));
+            }
+            tracing::info!(
+                correlation = %recorded.correlation,
+                "runtime build conflict no longer applies; revival may be attempted again"
+            );
+            *self.conflict.lock().unwrap() = None;
+        }
+
         let result = ensure_default_runtime(&self.layout, &self.launch, self.ui.clone()).await;
-        // A failed revival can leave a runtime that is answering but is a
-        // different build. Observe it now, while it is still the process that
-        // answered the failed ensure: the transport reports the identity and
-        // the UI can tell the user to restart. Success clears any stale
-        // observation, so only the current attempt can be reported.
-        let observed = match &result {
-            Ok(_) => None,
-            Err(_) => observe_runtime_build(&self.layout).await,
-        };
-        *self.observed_build.lock().unwrap() = observed;
+        match &result {
+            Ok(_) => {
+                *self.observed_build.lock().unwrap() = None;
+                *self.conflict.lock().unwrap() = None;
+            }
+            Err(error) => {
+                // A mismatch is the only failure that a retry cannot resolve:
+                // every attempt retires the runtime that just answered and
+                // spawns another from the same artifact. Pin it instead.
+                if let Some(EnsureError::BuildMismatch { expected, observed }) =
+                    error.downcast_ref::<EnsureError>()
+                {
+                    let observed_pid = match observe_runtime_identity(&self.layout).await {
+                        RuntimeObservation::Serving { pid, build } if build == *observed => {
+                            Some(pid)
+                        }
+                        _ => None,
+                    };
+                    *self.observed_build.lock().unwrap() = Some(observed.clone());
+                    let conflict = BuildConflict {
+                        expected: expected.clone(),
+                        observed: observed.clone(),
+                        observed_pid,
+                        launch: LaunchStamp::of(&self.launch.executable),
+                        correlation: leveler_core::new_uuid_string(),
+                        attempts: 1,
+                        first_seen: std::time::Instant::now(),
+                    };
+                    tracing::warn!(
+                        correlation = %conflict.correlation,
+                        expected = %expected.diagnostic(),
+                        observed = %observed.diagnostic(),
+                        observed_pid = ?conflict.observed_pid,
+                        launch = %self.launch.executable.display(),
+                        "runtime build conflict detected; pausing replacement until the observed runtime or launch artifact changes"
+                    );
+                    *self.conflict.lock().unwrap() = Some(conflict);
+                } else {
+                    // A transient failure keeps no conflict: the runtime may
+                    // still be starting, busy with work worth preserving, or
+                    // gone by the next attempt.
+                    *self.observed_build.lock().unwrap() =
+                        observe_runtime_build(&self.layout).await;
+                }
+            }
+        }
         result.map(|_probe_client| ()).map_err(|error| {
             error
                 .downcast_ref::<EnsureError>()
@@ -1212,14 +1396,42 @@ impl RuntimeReviver for DaemonReviver {
 }
 
 /// Ask the endpoint for the build it is serving, without attaching or sending
-/// a command. `None` means nothing was proven.
+/// a command. `Unknown` means nothing was proven.
 #[cfg(any(unix, windows))]
 async fn observe_runtime_build(layout: &Layout) -> Option<leveler_client_protocol::BuildIdentity> {
-    let client = probe_default_runtime(&layout.socket_path()).await.ok()??;
-    LocalRuntimeService::runtime_info(&client)
-        .await
-        .ok()
-        .map(|info| info.build)
+    match observe_runtime_identity(layout).await {
+        RuntimeObservation::Serving { build, .. } => Some(build),
+        RuntimeObservation::Absent | RuntimeObservation::Unknown => None,
+    }
+}
+
+/// The process serving the endpoint and the build it reports.
+///
+/// A failed probe is NOT an absent runtime: a timeout or a handshake error
+/// leaves the runtime's existence unproven, and the conflict policy must not
+/// replace anything on that basis.
+#[cfg(any(unix, windows))]
+async fn observe_runtime_identity(layout: &Layout) -> RuntimeObservation {
+    let socket = layout.socket_path();
+    let client = match tokio::time::timeout(
+        DEFAULT_DAEMON_CONNECT_TIMEOUT,
+        LocalSocketRuntimeClient::connect(&socket),
+    )
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
+            return RuntimeObservation::Absent;
+        }
+        Ok(Err(_)) | Err(_) => return RuntimeObservation::Unknown,
+    };
+    match LocalRuntimeService::runtime_info(&client).await {
+        Ok(info) => RuntimeObservation::Serving {
+            pid: info.pid,
+            build: info.build,
+        },
+        Err(_) => RuntimeObservation::Unknown,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1290,6 +1502,153 @@ mod probe_tests {
                 "{garbage:?} must not disable the budget"
             );
         }
+    }
+}
+
+/// Whether a recorded build conflict must suppress another replacement
+/// attempt. Each fact is a separate re-trigger condition: a changed launch
+/// artifact may be the build this client expects, an absent runtime can be
+/// started again, a runtime that now serves a different build may be the one
+/// this client expects, and a changed client build means this is a new
+/// generation. None of them is a permanent abandonment: all of them clear the
+/// record and let the next attempt observe reality again. An unverifiable
+/// runtime and a same-build restart are not changes.
+#[cfg(all(test, unix))]
+mod build_conflict_tests {
+    use super::*;
+
+    fn build(revision: &str, fingerprint: &str) -> leveler_core::BuildIdentity {
+        leveler_core::BuildIdentity {
+            version: "1.0.23".into(),
+            revision: revision.into(),
+            dirty: true,
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    fn conflict(dir: &Path) -> BuildConflict {
+        let launch = dir.join("leveler");
+        std::fs::write(&launch, b"build-one").unwrap();
+        BuildConflict {
+            expected: build("samecommit", "samecommit-00000000000000aa"),
+            observed: build("samecommit", "samecommit-00000000000000bb"),
+            observed_pid: Some(4242),
+            launch: LaunchStamp::of(&launch),
+            correlation: "corr-1".into(),
+            attempts: 1,
+            first_seen: std::time::Instant::now(),
+        }
+    }
+
+    fn serving(pid: u32, build: &leveler_core::BuildIdentity) -> RuntimeObservation {
+        RuntimeObservation::Serving {
+            pid,
+            build: build.clone(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_conflict_suppresses_the_next_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        assert!(build_conflict_still_applies(
+            &recorded,
+            &recorded.expected,
+            &launch,
+            &serving(4242, &recorded.observed),
+        ));
+    }
+
+    /// The 2026-10-11 shape: same revision, same short string, different
+    /// artifact. A same-pid runtime serving the other fingerprint is a
+    /// different conflict and must be re-evaluated, not merged.
+    #[test]
+    fn a_same_short_different_fingerprint_runtime_clears_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        let other = build("samecommit", "samecommit-00000000000000cc");
+        assert!(!build_conflict_still_applies(
+            &recorded,
+            &recorded.expected,
+            &launch,
+            &serving(4242, &other),
+        ));
+    }
+
+    /// A pid change is not progress when the replacement still serves the same
+    /// unconvertible build. Observed live: keying on the pid let the reviver
+    /// retire and respawn the same wrong artifact every ~10s while the pin
+    /// reported a fresh conflict each time.
+    #[test]
+    fn a_restarted_runtime_serving_the_same_build_keeps_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        assert!(build_conflict_still_applies(
+            &recorded,
+            &recorded.expected,
+            &launch,
+            &serving(9001, &recorded.observed),
+        ));
+    }
+
+    /// A probe that cannot establish what is running must not be read as an
+    /// absent runtime: replacing on an unproven observation is unsafe.
+    #[test]
+    fn an_unverifiable_runtime_keeps_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        assert!(build_conflict_still_applies(
+            &recorded,
+            &recorded.expected,
+            &launch,
+            &RuntimeObservation::Unknown,
+        ));
+    }
+
+    #[test]
+    fn an_absent_runtime_clears_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        assert!(!build_conflict_still_applies(
+            &recorded,
+            &recorded.expected,
+            &launch,
+            &RuntimeObservation::Absent,
+        ));
+    }
+
+    #[test]
+    fn a_replaced_launch_artifact_clears_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        std::fs::write(&recorded.launch.path, b"a different build").unwrap();
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        assert_ne!(launch, recorded.launch);
+        assert!(!build_conflict_still_applies(
+            &recorded,
+            &recorded.expected,
+            &launch,
+            &serving(4242, &recorded.observed),
+        ));
+    }
+
+    #[test]
+    fn a_changed_client_build_clears_the_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = conflict(dir.path());
+        let launch = LaunchStamp::of(&recorded.launch.path);
+        let restarted_client = build("samecommit", "samecommit-00000000000000dd");
+        assert!(!build_conflict_still_applies(
+            &recorded,
+            &restarted_client,
+            &launch,
+            &serving(4242, &recorded.observed),
+        ));
     }
 }
 

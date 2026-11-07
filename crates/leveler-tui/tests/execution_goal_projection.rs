@@ -81,6 +81,7 @@ fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
         collaboration: Some("chat".to_string()),
         execution_task: task,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 

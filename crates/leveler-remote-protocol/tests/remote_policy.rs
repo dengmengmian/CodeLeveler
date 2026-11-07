@@ -215,6 +215,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             ClientCommand::SteerCurrentTurn {
                 session_id: session(),
                 content: "prefer tests".to_string(),
+                message_id: None,
             },
             true,
         ),
@@ -506,6 +507,23 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
         (
             "reload_config",
             ClientCommand::ReloadConfig { query_id: None },
+            false,
+        ),
+        (
+            "list_foreign_sessions_for",
+            ClientCommand::ListForeignSessionsFor {
+                requester_session_id: session(),
+                tool: leveler_client_protocol::UiForeignTool::ClaudeCode,
+            },
+            false,
+        ),
+        (
+            "import_foreign_session",
+            ClientCommand::ImportForeignSession {
+                requester_session_id: session(),
+                tool: leveler_client_protocol::UiForeignTool::Codex,
+                native_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            },
             false,
         ),
         ("quit", ClientCommand::Quit, false),

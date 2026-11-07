@@ -1873,6 +1873,65 @@ mod transport {
         }
     }
 
+    /// Whether `build` is a KNOWN identity that differs from this process's
+    /// own. An unknown build proves nothing and is not treated as foreign, so
+    /// an older daemon that cannot report an identity keeps its old behaviour.
+    fn build_is_foreign(build: &leveler_client_protocol::BuildIdentity) -> bool {
+        let expected = leveler_client_protocol::BuildIdentity::current();
+        expected.is_known() && build.is_known() && !expected.matches(build)
+    }
+
+    /// Pacing for an event-stream reattach that keeps failing for the SAME
+    /// reason.
+    ///
+    /// A fixed 200ms retry turns one stable conflict into a log flood — the
+    /// 2026-10-09 logs are 137 "revival failed" lines in 6.7 minutes — and
+    /// keeps asking the runtime host to perform a replacement that cannot
+    /// succeed. The interval doubles only while the failure signature is
+    /// identical. A different error, a different observed build, or a
+    /// successful subscribe resets it, so a genuinely new situation is still
+    /// acted on immediately.
+    pub(crate) struct RetryPace {
+        signature: Option<String>,
+        delay: Duration,
+        attempts: u32,
+    }
+
+    impl RetryPace {
+        const INITIAL: Duration = Duration::from_millis(200);
+        const MAX: Duration = Duration::from_secs(5);
+
+        pub(crate) fn new() -> Self {
+            Self {
+                signature: None,
+                delay: Self::INITIAL,
+                attempts: 0,
+            }
+        }
+
+        /// The interval to wait before the next attempt. `signature` must
+        /// describe the failure in a form that is stable across repeats of the
+        /// same condition; anything that varies per attempt would defeat the
+        /// pacing.
+        pub(crate) fn next(&mut self, signature: String) -> Duration {
+            if self.signature.as_deref() == Some(signature.as_str()) {
+                self.attempts = self.attempts.saturating_add(1);
+                self.delay = (self.delay * 2).min(Self::MAX);
+            } else {
+                self.signature = Some(signature);
+                self.delay = Self::INITIAL;
+                self.attempts = 1;
+            }
+            self.delay
+        }
+
+        pub(crate) fn reset(&mut self) {
+            self.signature = None;
+            self.delay = Self::INITIAL;
+            self.attempts = 0;
+        }
+    }
+
     async fn subscription_loop(
         endpoint: Endpoint,
         mut stream: ClientStream,
@@ -1886,6 +1945,9 @@ mod transport {
         // it is the only fact that separates a runtime restart from a benign
         // stream reset.
         let mut live = runtime_identity(&endpoint).await;
+        // Pacing belongs to THIS stream's reattach sequence: a fresh
+        // subscription starts at the initial interval again.
+        let mut pace = RetryPace::new();
         // The first observation is not a reconnect: it only tells the client
         // which build serves it. A known-different build is the version
         // mismatch presentation state; unknown is not a change.
@@ -1926,10 +1988,36 @@ mod transport {
             }
 
             while !shutdown.is_cancelled() {
-                match open_subscription_deadline(&endpoint, session_id.clone(), client_kind).await {
-                    Ok(new_stream) => {
+                // Subscribing proves the endpoint ANSWERS, not that it is this
+                // build. A live daemon of another build keeps answering, and
+                // the revival path — the only other place that compares build
+                // identity — is never reached on a successful subscribe.
+                // Adopting it here would bypass that gate; refusing keeps the
+                // conflict visible and lets the reviver re-evaluate its pin.
+                let opened =
+                    match open_subscription_deadline(&endpoint, session_id.clone(), client_kind)
+                        .await
+                    {
+                        Ok(new_stream) => match runtime_identity(&endpoint).await {
+                            Some((_, build)) if build_is_foreign(&build) => {
+                                let _ = events.send(RuntimeEvent::RuntimeBuildObserved {
+                                    runtime_build: build.clone(),
+                                });
+                                Err(TransportError::Unavailable(format!(
+                                    "the runtime serving this endpoint is a different build: {}",
+                                    build.diagnostic()
+                                )))
+                            }
+                            identity => Ok((new_stream, identity)),
+                        },
+                        Err(error) => Err(error),
+                    };
+                match opened {
+                    Ok((new_stream, reconnected)) => {
                         stream = new_stream;
-                        let reconnected = runtime_identity(&endpoint).await;
+                        // The stream is back: the next break is a new
+                        // situation and must not inherit this one's delay.
+                        pace.reset();
                         let runtime_build = reconnected
                             .as_ref()
                             .map(|(_, build)| build.clone())
@@ -1997,26 +2085,41 @@ mod transport {
                     // endpoint gets another attempt, not a competitor — the
                     // same distinction `request` makes.
                     Err(error) => {
-                        if matches!(error, TransportError::NoAnswer { .. }) {
-                            tracing::warn!(%error, "local runtime did not answer; retrying without reviving");
-                        } else if let Some(reviver) = reviver.get()
-                            && let Err(error) = reviver.revive().await
-                        {
-                            tracing::warn!(%error, "local runtime revival failed; retrying");
-                            // A refusal can be based on a real observation
-                            // of the runtime that answered (a different
-                            // build). Report that fact even though the
-                            // attach stays refused; otherwise the client
-                            // knows something is wrong and tells the user
-                            // nothing.
-                            if let Some(runtime_build) = reviver.observed_build() {
-                                let _ = events
-                                    .send(RuntimeEvent::RuntimeBuildObserved { runtime_build });
+                        let signature = if matches!(error, TransportError::NoAnswer { .. }) {
+                            format!("no-answer:{error}")
+                        } else if let Some(reviver) = reviver.get() {
+                            match reviver.revive().await {
+                                Ok(()) => format!("not-subscribed:{error}"),
+                                Err(revive_error) => {
+                                    // A refusal can be based on a real
+                                    // observation of the runtime that
+                                    // answered (a different build). Report
+                                    // that fact even though the attach stays
+                                    // refused; otherwise the client knows
+                                    // something is wrong and tells the user
+                                    // nothing.
+                                    if let Some(runtime_build) = reviver.observed_build() {
+                                        let _ = events.send(RuntimeEvent::RuntimeBuildObserved {
+                                            runtime_build,
+                                        });
+                                    }
+                                    format!("revive:{revive_error}")
+                                }
                             }
-                        }
+                        } else {
+                            format!("not-subscribed:{error}")
+                        };
+                        let delay = pace.next(signature.clone());
+                        tracing::warn!(
+                            session = session_id.as_ref().map(SessionId::as_str),
+                            attempt = pace.attempts,
+                            next_delay_ms = delay.as_millis() as u64,
+                            failure = %signature,
+                            "local runtime reattach failed; backing off"
+                        );
                         tokio::select! {
                             _ = shutdown.cancelled() => return,
-                            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                            _ = tokio::time::sleep(delay) => {}
                         }
                     }
                 }
@@ -2495,6 +2598,7 @@ mod tests {
                     collaboration: None,
                     execution_task: None,
                     children: Vec::new(),
+                    foreign_origin: None,
                 })),
             }
         }
@@ -3831,6 +3935,64 @@ mod tests {
             observed, other,
             "a refused attach must still report which build answered"
         );
+    }
+
+    /// A runtime that answers is not necessarily THIS build. When the endpoint
+    /// is taken over by a live daemon of another build, subscribing succeeds
+    /// and the revival path — the only place that checks build identity — never
+    /// runs. Without an explicit gate the client silently adopts the foreign
+    /// runtime and drives it; that also keeps the build-conflict pin from ever
+    /// being re-evaluated, so restoring the launcher could not recover.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_runtime_of_a_different_build_is_never_adopted_by_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(ReconnectRuntime::new(7001));
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let mut rx = client.subscribe_session(&SessionId::new("s1"));
+        await_subscribed(&runtime, &mut rx).await;
+
+        let mut other = leveler_client_protocol::BuildIdentity::current();
+        other.revision = "3333333333333333333333333333333333333333".into();
+        other.fingerprint = "a-live-different-build".into();
+        runtime.set_build(other.clone());
+        runtime.reset_stream();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reported = None;
+        let mut adopted = false;
+        let mut resynced = false;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(RuntimeEvent::RuntimeBuildObserved { runtime_build })) => {
+                    reported = Some(runtime_build);
+                }
+                Ok(Ok(RuntimeEvent::RuntimeReconnected { .. })) => adopted = true,
+                Ok(Ok(RuntimeEvent::SessionOpened { .. })) => resynced = true,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !adopted,
+            "a reconnect must not adopt a runtime of a different build"
+        );
+        assert!(
+            !resynced,
+            "a refused attach must not resync a session from the foreign runtime"
+        );
+        assert_eq!(
+            reported,
+            Some(other),
+            "refusing the attach must still report which build answers"
+        );
+        shutdown.cancel();
     }
 
     /// The old code dropped a failed post-reconnect snapshot on the floor and
@@ -5383,5 +5545,106 @@ mod tests {
 
         second_shutdown.cancel();
         second_task.await.unwrap().unwrap();
+    }
+
+    /// The pacing policy in isolation: identical failures double up to a
+    /// ceiling; a new failure or a successful attach starts over immediately.
+    #[test]
+    fn identical_failures_back_off_and_a_new_failure_resets_the_delay() {
+        let mut pace = super::transport::RetryPace::new();
+        let delays: Vec<u64> = (0..6)
+            .map(|_| pace.next("same".into()).as_millis() as u64)
+            .collect();
+        assert_eq!(delays, vec![200, 400, 800, 1600, 3200, 5000]);
+        assert_eq!(pace.next("same".into()).as_millis(), 5000);
+        assert_eq!(
+            pace.next("different".into()).as_millis(),
+            200,
+            "a changed failure signature is a new situation"
+        );
+        pace.reset();
+        assert_eq!(pace.next("same".into()).as_millis(), 200);
+    }
+
+    /// A reviver that always refuses with the SAME error, recording when it
+    /// was asked. The refusal is stable, so the transport must slow down; the
+    /// 2026-10-09 logs show the opposite (137 identical failures in 6.7
+    /// minutes) and that is what this locks out.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct CountingFailingReviver {
+        calls: std::sync::atomic::AtomicUsize,
+        at: Mutex<Vec<std::time::Instant>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl RuntimeReviver for CountingFailingReviver {
+        async fn revive(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.at.lock().unwrap().push(std::time::Instant::now());
+            Err("the same stable refusal".to_string())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_repeated_identical_refusal_backs_off_instead_of_hammering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = tokio::spawn(server.serve(shutdown.clone()));
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let reviver = Arc::new(CountingFailingReviver::default());
+        client.set_reviver(reviver.clone());
+        let mut events = client.subscribe();
+
+        // Wait until the stream is ATTACHED: only a break of an attached
+        // stream enters the revival path this test measures.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(RuntimeEvent::RuntimeBuildObserved { .. }) = events.recv().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the subscription never attached");
+
+        shutdown.cancel();
+        let _ = serve.await;
+
+        // Initial delay 200ms, then 400ms, then 800ms.
+        tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+        let at = reviver.at.lock().unwrap().clone();
+        assert!(
+            at.len() >= 2,
+            "the reviver must still be retried while the fault persists"
+        );
+        assert!(
+            at.len() <= 4,
+            "a stable conflict must not be retried every 200ms: {} attempts in 1.4s",
+            at.len()
+        );
+        let gaps: Vec<_> = at.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            gaps[0] >= std::time::Duration::from_millis(150),
+            "the first repeat waits 200ms, observed {:?}",
+            gaps[0]
+        );
+        if let Some(second) = gaps.get(1) {
+            assert!(
+                *second >= std::time::Duration::from_millis(350),
+                "the second repeat waits 400ms, observed {second:?}"
+            );
+        }
+        assert!(
+            reviver.calls.load(std::sync::atomic::Ordering::SeqCst) == at.len(),
+            "the recorded attempts are the calls the reviver received"
+        );
     }
 }

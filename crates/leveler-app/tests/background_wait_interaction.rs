@@ -301,6 +301,7 @@ async fn a_steer_during_a_background_wait_is_answered_without_ending_the_task() 
         .send(ClientCommand::SteerCurrentTurn {
             session_id: f.session.clone(),
             content: "现在进展怎么样了？".into(),
+            message_id: None,
         })
         .await
         .unwrap();
@@ -377,6 +378,7 @@ async fn two_steers_during_a_wait_both_reach_the_same_turn() {
             .send(ClientCommand::SteerCurrentTurn {
                 session_id: f.session.clone(),
                 content: message.into(),
+                message_id: None,
             })
             .await
             .unwrap();
@@ -446,6 +448,7 @@ async fn an_exit_racing_a_steer_keeps_the_result_and_the_message() {
                 .send(ClientCommand::SteerCurrentTurn {
                     session_id: session,
                     content: "进展如何？".into(),
+                    message_id: None,
                 })
                 .await
         }
@@ -531,6 +534,7 @@ async fn a_terminal_fact_after_the_steered_turn_reaches_the_next_request() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: f.session.clone(),
             content: "Status?".into(),
+            message_id: None,
         })
         .await
         .unwrap();
@@ -654,6 +658,7 @@ async fn a_steer_landing_after_the_last_round_is_still_delivered() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: f.session.clone(),
             content: "现在进展怎么样了？".into(),
+            message_id: None,
         })
         .await
         .unwrap();
@@ -682,6 +687,7 @@ async fn a_steer_landing_after_the_last_round_is_still_delivered() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: f.session.clone(),
             content: "最后一句：结果如何？".into(),
+            message_id: None,
         })
         .await
         .unwrap();

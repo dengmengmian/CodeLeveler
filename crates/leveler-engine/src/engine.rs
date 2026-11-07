@@ -679,6 +679,32 @@ pub const USER_ACKNOWLEDGED_CRASH_PREVIEW: &str = "user-acknowledged crash recov
                                                      interrupted call's outcome is unknown and \
                                                      the call was not replayed";
 
+/// Whether a `ToolCallFinished` row is the recovery-control marker written by
+/// [`acknowledge_crash_window`], not a tool terminal.
+///
+/// The marker is encoded with `is_error: true` for backward compatibility with
+/// histories written before this distinction existed; that flag describes the
+/// old encoding, not the call's result. The call's outcome remains unknown and
+/// nothing was replayed. Every consumer that projects raw events must ask this
+/// question before it maps `is_error` to success or failure.
+pub fn is_user_acknowledged_crash_marker(preview: &str, is_error: bool) -> bool {
+    is_error && preview == USER_ACKNOWLEDGED_CRASH_PREVIEW
+}
+
+impl EngineEvent {
+    /// Whole-event form of [`is_user_acknowledged_crash_marker`].
+    pub fn is_user_acknowledged_crash_marker(&self) -> bool {
+        matches!(
+            self,
+            EngineEvent::ToolCallFinished {
+                preview,
+                is_error,
+                ..
+            } if is_user_acknowledged_crash_marker(preview, *is_error)
+        )
+    }
+}
+
 /// Close every dangling tool call of a session with an explicit
 /// user-acknowledged marker (an errored `ToolCallFinished`, never a fake
 /// success), so a resume blocked by `RecoveryConfirmationRequired` can
@@ -979,6 +1005,55 @@ mod multi_turn_session_tests {
             6,
             "snapshot(3) + raw[wm..](3): the duplicate round after the \
              watermark must survive the merge: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod crash_recovery_marker_tests {
+    use super::*;
+
+    fn finished(preview: &str, is_error: bool) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            call_id: "c1".into(),
+            name: "apply_patch".into(),
+            is_error,
+            preview: preview.into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }
+    }
+
+    #[test]
+    fn the_user_acknowledged_marker_is_recognised_as_recovery_control() {
+        assert!(
+            finished(USER_ACKNOWLEDGED_CRASH_PREVIEW, true).is_user_acknowledged_crash_marker()
+        );
+        assert!(is_user_acknowledged_crash_marker(
+            USER_ACKNOWLEDGED_CRASH_PREVIEW,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_real_tool_failure_is_not_a_recovery_marker() {
+        let failure = finished("tool error: permission denied", true);
+        assert!(!failure.is_user_acknowledged_crash_marker());
+        assert!(!is_user_acknowledged_crash_marker(
+            "tool error: permission denied",
+            true
+        ));
+    }
+
+    /// The legacy field is part of the marker's encoding. A success row that
+    /// happened to carry the same text is a corrupt/normal result, not the
+    /// acknowledgement fact.
+    #[test]
+    fn a_success_row_with_the_marker_text_is_not_an_acknowledgement() {
+        assert!(
+            !finished(USER_ACKNOWLEDGED_CRASH_PREVIEW, false).is_user_acknowledged_crash_marker()
         );
     }
 }

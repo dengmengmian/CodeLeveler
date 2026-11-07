@@ -572,6 +572,20 @@ impl leveler_storage::MessageStore for FailingMessages {
             leveler_storage::StorageError::InvalidData("injected transcript failure".into()),
         ))
     }
+
+    async fn append_input_in_turn_owned(
+        &self,
+        _: &leveler_core::OwnershipToken,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+        _: &str,
+        _: &str,
+        _: leveler_core::Timestamp,
+    ) -> Result<Option<u64>, leveler_storage::OwnershipError> {
+        Err(leveler_storage::OwnershipError::Storage(
+            leveler_storage::StorageError::InvalidData("injected transcript failure".into()),
+        ))
+    }
 }
 
 /// Failure injection A/B at the engine level: when the atomic terminal commit

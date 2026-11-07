@@ -141,7 +141,7 @@ fn input_recovery_search_mouse_cannot_send_covered_pending_input() {
     let mut s = state();
     s.status = RuntimeStatus::Busy;
     reduce(&mut s, Action::TextInput("待发送".into()));
-    key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+    key(&mut s, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(s.pending_inputs.len(), 1);
     s.pending_hits.push(crate::pending_inputs::PendingInputHit {
         row: 20,
@@ -209,6 +209,7 @@ fn input_recovery_session_switch_from_btw_clears_main_undo() {
                 collaboration: None,
                 execution_task: None,
                 children: Vec::new(),
+                foreign_origin: None,
             },
         }),
     );
@@ -258,7 +259,7 @@ fn pending_edit_returns_unsent_text_to_composer_without_sending() {
         assert!(s.pending_submissions.is_empty());
         assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
         reduce(&mut s, Action::TextInput("！".into()));
-        assert!(key(&mut s, KeyCode::Enter, KeyModifiers::NONE).is_empty());
+        assert!(key(&mut s, KeyCode::Tab, KeyModifiers::NONE).is_empty());
         assert_eq!(s.pending_inputs[0].text, "中文\n继续编辑！");
         assert!(s.pending_inputs[0].is_queued());
     }
@@ -398,4 +399,98 @@ fn pending_edit_preserves_attachment_only_draft() {
     assert_eq!(s.pending_attachments, vec![attachment]);
     assert_eq!(s.pending_inputs.len(), 1);
     assert!(s.notification.is_some());
+}
+
+fn snapshot(status: &str) -> leveler_client_protocol::UiSessionSnapshot {
+    leveler_client_protocol::UiSessionSnapshot {
+        history: None,
+        id: SessionId::new("input-recovery"),
+        repository: Some("/repo".into()),
+        task_status: None,
+        task_terminal: None,
+        goal: "interactive session".into(),
+        model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
+        mode: leveler_client_protocol::PermissionProfile::Assisted,
+        branch: Some("main".into()),
+        status: status.into(),
+        finalization_stage: None,
+        messages: Vec::new(),
+        pending_interactions: Vec::new(),
+        available_models: Vec::new(),
+        vision: false,
+        last_sequence: None,
+        latest_turn_ordinal: None,
+        active_tools: Vec::new(),
+        interrupted_tool_calls: Vec::new(),
+        active_background_tasks: Vec::new(),
+        background_tasks: Vec::new(),
+        plan: None,
+        diff: None,
+        checkpoints: Vec::new(),
+        recaps: Vec::new(),
+        user_shells: Vec::new(),
+        completion_report: None,
+        thinking: None,
+        work_profile: None,
+        collaboration: None,
+        execution_task: None,
+        children: Vec::new(),
+        foreign_origin: None,
+    }
+}
+
+/// The daemon died with a command in flight. Its restart reports the session
+/// idle, but the client kept drawing the command's heartbeat: the footer said
+/// `命令运行中` forever while no turn owned it. A same-session snapshot is the
+/// authority that settles every transient status the missing terminal left.
+#[test]
+fn an_idle_resync_snapshot_settles_the_activity_of_an_interrupted_turn() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::CommandProgress {
+            label: "python3 -m unittest".into(),
+            elapsed_ms: 21_000,
+        }),
+    );
+    assert!(s.activity.is_some());
+    assert_eq!(s.activity_elapsed_secs, Some(21));
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot("interrupted"),
+        }),
+    );
+    assert_eq!(s.status, RuntimeStatus::Idle);
+    assert!(
+        s.activity.is_none(),
+        "no command runs after the turn is gone: {:?}",
+        s.activity
+    );
+    assert_eq!(s.activity_elapsed_secs, None);
+}
+
+/// The same settlement must not erase a command that is still running: a
+/// resync snapshot that reports the turn alive keeps its activity and clock.
+#[test]
+fn a_running_resync_snapshot_keeps_live_command_activity() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::CommandProgress {
+            label: "python3 -m unittest".into(),
+            elapsed_ms: 21_000,
+        }),
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot("running"),
+        }),
+    );
+    assert_eq!(s.status, RuntimeStatus::Busy);
+    assert!(s.activity.is_some());
+    assert_eq!(s.activity_elapsed_secs, Some(21));
 }
