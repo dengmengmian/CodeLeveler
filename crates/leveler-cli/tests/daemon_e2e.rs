@@ -593,6 +593,44 @@ async fn host_refuses_to_replace_an_old_build_it_cannot_verify_body() {
     let _ = tokio::time::timeout(Duration::from_secs(5), old_server).await;
 }
 
+/// Two clients start the runtime together. The election loser must adopt the
+/// winner inside the ensure deadline, and both clients must see one process.
+#[test]
+fn two_clients_starting_together_adopt_one_runtime() {
+    leveler_test_support::bounded_test(
+        "two_clients_starting_together_adopt_one_runtime",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        two_clients_starting_together_adopt_one_runtime_body,
+    );
+}
+
+async fn two_clients_starting_together_adopt_one_runtime_body() {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, _guard) = detached_host_launch(&env);
+    let ui: Arc<dyn HandoffUi> = Arc::new(SilentHandoffUi);
+    let (first, second) = tokio::join!(
+        ensure_default_runtime(&layout, &launch, ui.clone()),
+        ensure_default_runtime(&layout, &launch, ui),
+    );
+    let first = first.expect("the first client reaches a runtime");
+    let second = second.expect("the racing client adopts the same runtime");
+    let first_info = LocalRuntimeService::runtime_info(&first).await.unwrap();
+    let second_info = LocalRuntimeService::runtime_info(&second).await.unwrap();
+    assert_eq!(
+        first_info.pid, second_info.pid,
+        "the two clients attached to different runtimes"
+    );
+    assert_eq!(first_info.runtime_id, second_info.runtime_id);
+    assert!(first_info.pid > 0);
+    let killed = Command::new("kill")
+        .arg("-KILL")
+        .arg(first_info.pid.to_string())
+        .status()
+        .expect("kill the elected runtime");
+    assert!(killed.success());
+}
+
 async fn host_starts_adopts_and_revives_a_real_daemon_body() {
     let env = test_env("http://127.0.0.1:9");
     let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);

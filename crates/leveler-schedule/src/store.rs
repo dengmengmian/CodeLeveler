@@ -1700,9 +1700,16 @@ impl ScheduleStore {
         row.as_ref().map(run_from_row).transpose()
     }
 
-    /// Create the next future occurrence from the rule itself. Missed slots
-    /// are skipped, never generated in a burst, and the unique
-    /// `(definition, scheduled_for)` key makes this safe to call twice.
+    /// Create the next occurrence from the rule's own grid.
+    ///
+    /// The successor is `next_after` the latest materialized slot, not
+    /// `next_after` the moment the previous run happened to finish. A slot
+    /// that is already in the future is left alone, so a pass cannot stack
+    /// a second future slot. `queue-one` keeps at most one pending demand
+    /// while an earlier one is still waiting. A successor older than the
+    /// misfire grace is not backfilled: the dispatcher was absent, and the
+    /// misfire policy owns that gap rather than a burst of catch-up slots.
+    /// The unique `(definition, scheduled_for)` key makes a double call safe.
     pub async fn ensure_next_occurrence(
         &self,
         definition: &ScheduleDefinition,
@@ -1711,20 +1718,45 @@ impl ScheduleStore {
         if !definition.enabled {
             return Ok(None);
         }
-        let Some(next) = definition.trigger.next_after(now)? else {
-            return Ok(None);
-        };
+        if definition.overlap == OverlapPolicy::QueueOne {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM schedule_occurrences \
+                 WHERE definition_id = ? AND state = 'pending'",
+            )
+            .bind(definition.id.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+            if pending > 0 {
+                return Ok(None);
+            }
+        }
         let last: Option<String> = sqlx::query_scalar(
             "SELECT MAX(scheduled_for) FROM schedule_occurrences WHERE definition_id = ?",
         )
         .bind(definition.id.as_str())
         .fetch_one(&self.pool)
         .await?;
-        if let Some(last) = last.as_deref().map(parse_timestamp).transpose()?
+        let last = last.as_deref().map(parse_timestamp).transpose()?;
+        if let Some(last) = last
+            && last > now
+        {
+            return Ok(None);
+        }
+        let base = last.unwrap_or(now);
+        let Some(mut next) = definition.trigger.next_after(base)? else {
+            return Ok(None);
+        };
+        let grace = chrono::Duration::from_std(definition.misfire_grace)
+            .unwrap_or_else(|_| chrono::Duration::zero());
+        if next <= now && now.signed_duration_since(next) > grace {
+            let Some(live) = definition.trigger.next_after(now)? else {
+                return Ok(None);
+            };
+            next = live;
+        }
+        if let Some(last) = last
             && next <= last
         {
-            // A future slot already exists. The store keeps at most one;
-            // this also makes the call idempotent after a crash.
             return Ok(None);
         }
         let id = OccurrenceId::generate();
@@ -1748,6 +1780,66 @@ impl ScheduleStore {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(occurrence_from_row).transpose()
+    }
+
+    /// Leave a delivered shell for a later dispatch pass to observe.
+    ///
+    /// The claim lease is cleared so lease recovery cannot mark a live shell
+    /// unknown just because this process returned to the OS scheduler. The
+    /// deadline is the run's own timeout. Nothing here delivers the command
+    /// again.
+    pub async fn release_shell_observation(
+        &self,
+        run_id: &RunId,
+        deadline: DateTime<Utc>,
+    ) -> Result<bool, ScheduleError> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE schedule_runs SET deadline_at = ? \
+             WHERE id = ? AND state IN ('dispatching', 'running') AND delivered_at IS NOT NULL",
+        )
+        .bind(timestamp(deadline))
+        .bind(run_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE schedule_occurrences SET lease_expires_at = NULL \
+                 WHERE state = 'claimed' AND id = \
+                 (SELECT occurrence_id FROM schedule_runs WHERE id = ?)",
+            )
+            .bind(run_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Delivered shell runs whose terminal record is still unread.
+    ///
+    /// Agent handoffs are excluded: they carry `handed_off_at` and are
+    /// observed by the agent reconciler. A shell row here was accepted by
+    /// the runtime and must not be delivered again.
+    pub async fn observable_shell_runs(&self) -> Result<Vec<HandedOffRun>, ScheduleError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {RUN_COLUMNS} FROM {RUN_FROM} \
+             JOIN schedule_definitions d ON d.id = r.definition_id \
+             WHERE d.action = 'shell' AND r.state IN ('dispatching', 'running') \
+               AND r.delivered_at IS NOT NULL AND r.deadline_at IS NOT NULL \
+               AND r.handed_off_at IS NULL \
+             ORDER BY r.delivered_at, r.id"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        let runs: Vec<ScheduleRun> = rows.iter().map(run_from_row).collect::<Result<_, _>>()?;
+        let mut observing = Vec::with_capacity(runs.len());
+        for run in runs {
+            if let Some(definition) = self.definition(&run.definition_id).await? {
+                observing.push(HandedOffRun { run, definition });
+            }
+        }
+        Ok(observing)
     }
 }
 
@@ -2177,6 +2269,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_ensure_keeps_the_interval_grid_while_a_run_is_active() {
+        let store = store().await;
+        let anchor = leveler_core::now() - chrono::Duration::seconds(1);
+        let created = store
+            .create_definition(grid_definition(
+                anchor,
+                Duration::from_secs(60),
+                OverlapPolicy::AllowConcurrent,
+                SessionPolicy::Fresh,
+            ))
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_due(leveler_core::now(), Duration::from_secs(30), 4)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let late = anchor + chrono::Duration::seconds(150);
+        let next = store
+            .ensure_next_occurrence(&created, late)
+            .await
+            .unwrap()
+            .expect("the grid successor");
+        assert_eq!(
+            next.scheduled_for,
+            at_storage_precision(anchor + chrono::Duration::seconds(60)),
+            "the next slot follows the rule, not the previous run's finish time"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_one_keeps_a_single_pending_demand_while_a_run_is_active() {
+        let store = store().await;
+        let anchor = leveler_core::now() - chrono::Duration::seconds(1);
+        let created = store
+            .create_definition(grid_definition(
+                anchor,
+                Duration::from_secs(60),
+                OverlapPolicy::QueueOne,
+                SessionPolicy::Continue,
+            ))
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_due(leveler_core::now(), Duration::from_secs(30), 4)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let queued = store
+            .ensure_next_occurrence(&created, anchor + chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("one queued slot");
+        assert_eq!(
+            queued.scheduled_for,
+            at_storage_precision(anchor + chrono::Duration::seconds(60))
+        );
+        let again = store
+            .ensure_next_occurrence(&created, anchor + chrono::Duration::seconds(150))
+            .await
+            .unwrap();
+        assert!(again.is_none(), "queue-one must not accumulate: {again:?}");
+        let pending = store
+            .occurrences(&created.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|occurrence| occurrence.state == OccurrenceState::Pending)
+            .count();
+        assert_eq!(pending, 1);
+    }
+
+    #[tokio::test]
+    async fn skip_if_running_records_a_due_slot_that_was_materialized_during_the_run() {
+        let store = store().await;
+        let anchor = leveler_core::now() - chrono::Duration::seconds(1);
+        let created = store
+            .create_definition(grid_definition(
+                anchor,
+                Duration::from_secs(60),
+                OverlapPolicy::SkipIfRunning,
+                SessionPolicy::Continue,
+            ))
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_due(leveler_core::now(), Duration::from_secs(120), 4)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let due = store
+            .ensure_next_occurrence(&created, anchor + chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("the next trigger exists before it is due");
+        let skipped = store
+            .reconcile_overlaps(due.scheduled_for + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(skipped, 1);
+        let runs = store.runs(Some(&created.id), 10).await.unwrap();
+        assert!(
+            runs.iter().any(|run| run.state == RunState::Skipped),
+            "a due trigger during an active run is recorded skipped: {runs:?}"
+        );
+        let pending = store
+            .occurrences(&created.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|occurrence| occurrence.state == OccurrenceState::Pending)
+            .count();
+        assert_eq!(
+            pending, 1,
+            "the following grid slot replaces the skipped one"
+        );
+    }
+
+    #[tokio::test]
     async fn weekly_and_cron_definitions_round_trip() {
         let store = store().await;
         let weekly = ScheduleTrigger::Weekly {
@@ -2204,6 +2415,24 @@ mod tests {
         };
         assert!(store.create_definition(definition(trigger)).await.is_err());
         assert!(store.definitions().await.unwrap().is_empty());
+    }
+
+    /// Schedule instants round-trip through RFC3339 milliseconds.
+    fn at_storage_precision(value: DateTime<Utc>) -> DateTime<Utc> {
+        parse_timestamp(&timestamp(value)).expect("storage timestamp")
+    }
+
+    fn grid_definition(
+        anchor: DateTime<Utc>,
+        every: Duration,
+        overlap: OverlapPolicy,
+        session_policy: SessionPolicy,
+    ) -> NewScheduleDefinition {
+        let mut definition = definition(ScheduleTrigger::Every { anchor, every });
+        definition.overlap = overlap;
+        definition.session_policy = session_policy;
+        definition.misfire_grace = Duration::from_secs(180);
+        definition
     }
 
     fn definition(trigger: ScheduleTrigger) -> NewScheduleDefinition {
