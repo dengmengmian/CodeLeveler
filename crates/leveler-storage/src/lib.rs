@@ -13,6 +13,7 @@ mod database;
 mod engine_stores;
 mod event_repo;
 mod event_store;
+mod foreign_session_repo;
 mod goal_checkpoint_store;
 mod goal_store;
 mod message_repo;
@@ -21,6 +22,7 @@ mod model_request_repo;
 mod ownership_store;
 mod resource_grant_store;
 mod session_facts;
+mod session_input_repo;
 mod session_repo;
 mod session_store;
 mod task_creation_store;
@@ -36,6 +38,7 @@ pub use database::{Database, StorageError, peek_repository};
 pub use engine_stores::EngineStores;
 pub use event_repo::{EVENT_SCHEMA_VERSION, EventHeader, EventRecord, EventRepository};
 pub use event_store::{EventStore, MemoryEventStore};
+pub use foreign_session_repo::{ForeignSessionOriginRecord, ForeignSessionOriginRepository};
 pub use goal_checkpoint_store::{
     GoalCheckpointRecord, GoalCheckpointStore, MemoryGoalCheckpointStore, NewGoalCheckpoint,
 };
@@ -52,6 +55,7 @@ pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,
 };
 pub use session_facts::SessionFacts;
+pub use session_input_repo::{SessionInputRecord, SessionInputRepository, SessionInputState};
 pub use session_repo::{
     SessionEdit, SessionEditResult, SessionRecord, SessionRepository, SessionSettingsSnapshot,
 };

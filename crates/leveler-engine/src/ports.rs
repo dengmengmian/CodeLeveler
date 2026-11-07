@@ -205,6 +205,26 @@ pub trait TranscriptSink: Send {
 
     async fn append(&mut self, messages: &[Message]) -> Result<(), PortError>;
 
+    /// Append one user input that the host already accepted durably, and
+    /// settle its journal row in the same persistence boundary.
+    ///
+    /// `Ok(Some(ordinal))` means the transcript row is durable and the input
+    /// is `consumed` at that ordinal. `Ok(None)` means the input was cancelled
+    /// or already consumed while the caller was preparing the round: nothing
+    /// was written, and the input must not enter the model's context.
+    ///
+    /// The default exists for non-journalled sinks (tests, in-memory
+    /// harnesses); it has no journal ordinal to report. Durable sinks override
+    /// it with an atomic implementation.
+    async fn append_input(
+        &mut self,
+        _input_id: &str,
+        message: &Message,
+    ) -> Result<Option<u64>, PortError> {
+        self.append(std::slice::from_ref(message)).await?;
+        Ok(None)
+    }
+
     /// Previously committed terminal results, including messages already
     /// folded out of the live context.
     async fn delivered_background_task_ids(&mut self) -> Result<Vec<String>, PortError> {

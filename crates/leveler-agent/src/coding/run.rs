@@ -2057,6 +2057,32 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
+        self.chat_with_origin(
+            session_id,
+            spec,
+            content,
+            TranscriptOrigin::UserInput,
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    /// [`Self::chat`] with an explicit transcript origin.
+    ///
+    /// The origin is durable provenance: it says whether the row was submitted
+    /// by the person or written by the harness. A caller that replays imported
+    /// context must use this form so the model and every later reader see the
+    /// same authority the writer intended.
+    pub async fn chat_with_origin(
+        &self,
+        session_id: &SessionId,
+        spec: &TaskSpec,
+        content: Vec<leveler_model::ContentPart>,
+        origin: TranscriptOrigin,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<TaskReport, EngineError> {
         // A Chat turn keeps the session's activated packs: the enable answered
         // "tools available on the following request", and dropping it here is
         // what made the next turn's catalog contradict the tool list the model
@@ -2124,11 +2150,8 @@ impl CodingRuntime {
             lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
         let prior_epoch_open = self.prior_epoch_open(session_id).await?;
-        let initiating_message = Message::from_parts(
-            Role::User,
-            content.clone(),
-            Some(TranscriptOrigin::UserInput),
-        );
+        let initiating_message =
+            Message::from_parts(Role::User, content.clone(), Some(origin.clone()));
         let terminal_cancellation = cancellation.clone();
         // The pre-request context fold appends its `ContextSnapshot` (or
         // checkpoint) fact to the log from inside the turn, where the engine's
@@ -2198,7 +2221,7 @@ impl CodingRuntime {
                             TurnInput::Content {
                                 prior,
                                 content,
-                                origin: TranscriptOrigin::UserInput,
+                                origin,
                             },
                             prior_epoch_open,
                             session_id.clone(),

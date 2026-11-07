@@ -91,6 +91,25 @@ impl BuildIdentity {
             format!("{} ({rev})", self.version)
         }
     }
+
+    /// The diagnostic form: [`Self::short`] plus the fingerprint digest.
+    ///
+    /// `short()` cannot separate two artifacts built from the same revision
+    /// whose working-tree deltas differ — the exact ambiguity that made the
+    /// 2026-10-11 logs unreconcilable. Anywhere two identities are compared or
+    /// reported together (conflict errors, recovery decisions, the TUI's
+    /// version issue), use this form. Output stays compact: only the digest
+    /// half of `<revision>-<digest>` is appended.
+    pub fn diagnostic(&self) -> String {
+        let short = self.short();
+        match self
+            .known_fingerprint()
+            .and_then(|fingerprint| fingerprint.rsplit_once('-').map(|(_, digest)| digest))
+        {
+            Some(digest) if !digest.is_empty() => format!("{short} fp:{digest}"),
+            _ => short,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +234,63 @@ mod tests {
                 .short()
                 .ends_with("-dirty)")
         );
+    }
+
+    /// The 2026-10-11 incident, as a unit: two builds reported the same
+    /// version, revision and dirty bit, but different fingerprints. `short()`
+    /// printed the SAME string for both, so a diagnostic that named only the
+    /// short form could not distinguish the two sides of a build conflict.
+    ///
+    /// `short()` stays compact for narrow UI; `diagnostic()` is the form used
+    /// wherever two identities must be told apart.
+    #[test]
+    fn diagnostics_distinguish_artifacts_the_short_form_confuses() {
+        let first = fp(
+            "1.0.13",
+            "bef153a37e04",
+            true,
+            "bef153a37e04-1111111111111111",
+        );
+        let second = fp(
+            "1.0.13",
+            "bef153a37e04",
+            true,
+            "bef153a37e04-2222222222222222",
+        );
+
+        assert_eq!(
+            first.short(),
+            second.short(),
+            "premise: the compact form is ambiguous for this pair"
+        );
+        assert_ne!(
+            first.diagnostic(),
+            second.diagnostic(),
+            "the diagnostic form must separate two artifacts the short form merges"
+        );
+        assert!(
+            first.diagnostic().contains("1111111111111111")
+                && second.diagnostic().contains("2222222222222222"),
+            "the fingerprint digest is what separates them: {} / {}",
+            first.diagnostic(),
+            second.diagnostic()
+        );
+    }
+
+    /// A build from before fingerprints existed has none to print, so its
+    /// diagnostic form is the short form — never an invented digest.
+    #[test]
+    fn a_legacy_identity_has_no_fingerprint_in_its_diagnostic_form() {
+        let legacy = id("1.0.13", "bef153a37e04", false);
+        assert_eq!(legacy.diagnostic(), legacy.short());
+        assert!(!legacy.diagnostic().contains("fp:"));
+    }
+
+    /// An unreported identity must not print a made-up fingerprint either.
+    #[test]
+    fn an_unreported_identity_has_no_fingerprint_in_its_diagnostic_form() {
+        let unknown = BuildIdentity::default();
+        assert_eq!(unknown.diagnostic(), unknown.short());
+        assert!(!unknown.diagnostic().contains("fp:"));
     }
 }

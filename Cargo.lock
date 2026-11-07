@@ -2026,6 +2026,7 @@ dependencies = [
  "leveler-cua",
  "leveler-engine",
  "leveler-execution",
+ "leveler-foreign-session",
  "leveler-lifecycle",
  "leveler-local-transport",
  "leveler-media",
@@ -2082,6 +2083,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "console",
+ "crossterm",
  "futures",
  "getrandom 0.2.17",
  "iana-time-zone",
@@ -2236,6 +2238,17 @@ dependencies = [
  "tree-sitter-bash",
  "url",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "leveler-foreign-session"
+version = "1.0.23"
+dependencies = [
+ "leveler-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2531,6 +2544,7 @@ dependencies = [
  "leveler-core",
  "leveler-cua",
  "leveler-execution",
+ "leveler-foreign-session",
  "leveler-lsp",
  "leveler-media",
  "leveler-model",

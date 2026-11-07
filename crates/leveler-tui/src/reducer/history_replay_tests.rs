@@ -80,6 +80,7 @@ fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 

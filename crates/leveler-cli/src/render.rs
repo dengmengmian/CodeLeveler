@@ -68,6 +68,16 @@ fn render_event_text(event: AgentEvent) {
             };
             println!("  {mark} {name}: {}", console::style(preview).dim());
         }
+        // Unknown is its own terminal state: not a failure mark, not a success
+        // mark, and never a cue to retry (the call may already have taken
+        // effect).
+        AgentEvent::ToolOutcomeUnknown { name, preview, .. } => {
+            println!(
+                "  {} {name}: {}",
+                console::style("?").yellow(),
+                console::style(preview).dim()
+            );
+        }
         AgentEvent::WorkspaceSnapshot { .. } => {}
         AgentEvent::Usage { .. } => {}
         AgentEvent::Compacted { from, to } => {
@@ -363,6 +373,11 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "stop": stop,
             "execution_status": execution_status,
         }),
+        AgentEvent::ToolOutcomeUnknown { id, name, preview } => serde_json::json!({
+            // No `is_error`: the outcome was never observed. A consumer that
+            // counted `tool_result` failures must not see this as one.
+            "type": "tool_outcome_unknown", "id": id, "tool": name, "preview": preview,
+        }),
         AgentEvent::WorkspaceSnapshot { call_id, snapshot } => serde_json::json!({
             "type": "workspace_snapshot", "call_id": call_id, "snapshot": snapshot,
         }),
@@ -563,6 +578,22 @@ mod jsonl_tests {
         assert_eq!(line["execution_status"], "completed");
         assert_eq!(line["exit_code"], 101);
         assert!(line["stop"].is_null());
+    }
+
+    /// Telemetry must not count a crash-window acknowledgement as a tool
+    /// failure: the line has no `is_error` at all, only the honest unknown
+    /// type. Rewriting it as `tool_result` would resurrect the old confusion.
+    #[test]
+    fn an_unknown_outcome_line_is_not_a_failed_tool_result() {
+        let line = event_jsonl(AgentEvent::ToolOutcomeUnknown {
+            id: "c9".into(),
+            name: "apply_patch".into(),
+            preview: leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW.into(),
+        });
+        assert_eq!(line["type"], "tool_outcome_unknown");
+        assert_eq!(line["id"], "c9");
+        assert_eq!(line["tool"], "apply_patch");
+        assert!(line.get("is_error").is_none());
     }
 
     /// A timeout and a cancellation are execution failures, and the line says

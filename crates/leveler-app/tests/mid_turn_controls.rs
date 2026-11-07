@@ -252,6 +252,7 @@ async fn a_steer_sent_during_a_chat_turn_reaches_the_conversation() {
         .send(ClientCommand::SteerCurrentTurn {
             session_id: session.clone(),
             content: "also keep the API stable".into(),
+            message_id: None,
         })
         .await
         .unwrap();

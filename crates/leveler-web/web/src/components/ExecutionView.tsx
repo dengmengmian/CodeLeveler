@@ -10,6 +10,7 @@ import { projectObservability, type ExecStep } from '../lib/observabilityView';
 function glyph(step: ExecStep): string {
   if (step.status === 'ok') return '✓';
   if (step.status === 'fail') return '✗';
+  if (step.status === 'unknown') return '◇';
   if (step.status === 'running') return '●';
   return '·';
 }

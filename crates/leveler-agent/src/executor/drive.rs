@@ -2468,10 +2468,25 @@ impl AgentHarness for Drive<'_> {
         // model is asked anything: a correction that arrives after the work
         // is done is worthless. Empty is the normal case.
         if let Some(source) = &self.executor.steering {
-            for text in source.take_pending() {
-                let text = text.trim();
+            for input in source.take_pending_inputs() {
+                let text = input.text.trim();
                 if text.is_empty() {
                     continue;
+                }
+                let message = Message::user_input(text);
+                // A journalled input is appended and settled in one durable
+                // transaction. `false` means the user cancelled it while this
+                // round was being prepared: it must not enter the context.
+                match input.id.as_deref() {
+                    Some(id) => match self.sink.append_input(id, &message).await? {
+                        Some(ordinal) => source.input_consumed(id, Some(ordinal)),
+                        // Cancelled (or already consumed) while this round was
+                        // being prepared: it must not enter the context.
+                        None => continue,
+                    },
+                    None => {
+                        self.sink.append(std::slice::from_ref(&message)).await?;
+                    }
                 }
                 // A user message during an active goal is user authority over
                 // the scope (it may narrow or add a requirement). Keep it with
@@ -2479,8 +2494,6 @@ impl AgentHarness for Drive<'_> {
                 if let Some(binder) = self.executor.goal_binder() {
                     binder.append_amendment(text).await?;
                 }
-                let message = Message::user_input(text);
-                self.sink.append(std::slice::from_ref(&message)).await?;
                 messages.push(message);
             }
         }

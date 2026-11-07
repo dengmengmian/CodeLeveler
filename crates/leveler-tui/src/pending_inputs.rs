@@ -9,7 +9,7 @@
 //! turn-input delivery (`pending_submissions`, one `CommandId`, at-least-once
 //! retries); nothing here is a second delivery path.
 
-use leveler_client_protocol::{CommandId, SessionId};
+use leveler_client_protocol::{CommandId, MessageId, SessionId};
 
 /// One staged input and where its delivery stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,10 @@ pub struct PendingInput {
     /// manually or by the automatic drain — into whichever session is on
     /// screen now.
     pub session_id: SessionId,
+    /// Stable identity for this input once it is sent as a steer. Created with
+    /// the item, not per attempt, so a retry after an unconfirmed submission
+    /// cannot create a second runtime row.
+    pub message_id: MessageId,
 }
 
 /// Where a staged input stands.
@@ -53,6 +57,7 @@ impl PendingInput {
             text: text.into(),
             state: PendingInputState::Queued,
             session_id,
+            message_id: MessageId::new(leveler_core::new_uuid_string()),
         }
     }
 
@@ -182,9 +187,9 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState, termin
             )
         } else {
             let label = match &item.state {
-                // The section header already says 待发送; a queued item has no
-                // outcome to report yet, so it gets no status column at all.
-                PendingInputState::Queued => "",
+                // The section header says 待发送; the per-item line names the
+                // choice the user made when staging it.
+                PendingInputState::Queued => t.pending_input_after_turn,
                 PendingInputState::Submitting(_) => t.pending_input_sending,
                 PendingInputState::DeliveryUnknown(_) => t.pending_input_unknown,
                 PendingInputState::Failed(_) => t.pending_input_failed,

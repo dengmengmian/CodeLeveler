@@ -338,6 +338,10 @@ fn project_window(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiObservationRo
             }
             if let EngineEvent::ToolCallFinished { call_id, .. } = ev
                 && let Some((idx, start_seq)) = open.remove(call_id)
+                // An acknowledged unknown outcome has no observed end: the
+                // marker was written after a restart. Pairing it with the
+                // start would fabricate a duration the runtime never saw.
+                && !ev.is_user_acknowledged_crash_marker()
                 && let (Some(start_ms), Some(end_ms)) = (
                     parse_millis(&decoded[idx].0.created_at),
                     parse_millis(&rec.created_at),
@@ -381,13 +385,21 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             call_id,
             name,
             is_error,
+            preview,
             agent_id,
             ..
         } => (
             classify_tool(name),
             name.clone(),
             String::new(),
-            if *is_error { "fail" } else { "ok" }.into(),
+            if leveler_engine::is_user_acknowledged_crash_marker(preview, *is_error) {
+                "unknown"
+            } else if *is_error {
+                "fail"
+            } else {
+                "ok"
+            }
+            .into(),
             vec![
                 ("Call".into(), call_id.clone()),
                 ("Tool".into(), name.clone()),
@@ -627,6 +639,7 @@ fn aggregate_tools(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiToolAggregat
         calls: u32,
         succeeded: u32,
         failed: u32,
+        unknown: u32,
         unfinished: u32,
         total_ms: u64,
         timed: u32,
@@ -657,21 +670,27 @@ fn aggregate_tools(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiToolAggregat
                 call_id,
                 name,
                 is_error,
+                preview,
                 agent_id,
                 ..
             } => {
+                let known = !leveler_engine::is_user_acknowledged_crash_marker(preview, *is_error);
                 let key = (call_id.clone(), agent_id.clone());
                 if let Some((start_name, start_ms)) = open.remove(&key) {
                     let acc = by_name.entry(start_name.clone()).or_insert_with(|| {
                         order.push(start_name.clone());
                         Acc::default()
                     });
-                    if *is_error {
+                    if !known {
+                        acc.unknown += 1;
+                    } else if *is_error {
                         acc.failed += 1;
                     } else {
                         acc.succeeded += 1;
                     }
-                    if let (Some(start), Some(end)) = (start_ms, parse_millis(&rec.created_at)) {
+                    if known
+                        && let (Some(start), Some(end)) = (start_ms, parse_millis(&rec.created_at))
+                    {
                         acc.total_ms += end.saturating_sub(start) as u64;
                         acc.timed += 1;
                     }
@@ -681,7 +700,9 @@ fn aggregate_tools(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiToolAggregat
                         Acc::default()
                     });
                     acc.calls += 1;
-                    if *is_error {
+                    if !known {
+                        acc.unknown += 1;
+                    } else if *is_error {
                         acc.failed += 1;
                     } else {
                         acc.succeeded += 1;
@@ -713,6 +734,7 @@ fn aggregate_tools(decoded: &[(EventRecord, EngineEvent)]) -> Vec<UiToolAggregat
                 calls: acc.calls,
                 succeeded: acc.succeeded,
                 failed: acc.failed,
+                unknown: acc.unknown,
                 unfinished: acc.unfinished,
                 total_ms: if acc.timed > 0 {
                     Some(acc.total_ms)
@@ -832,10 +854,22 @@ fn relations_for(decoded: &[(EventRecord, EngineEvent)], seq: i64) -> Vec<UiEven
                     {
                         out.push(rel(rec.sequence, "pair_start", "tool started"));
                     }
-                    EngineEvent::ToolCallFinished { call_id: id, .. }
-                        if id == call_id && rec.sequence != seq =>
-                    {
-                        out.push(rel(rec.sequence, "pair_end", "tool finished"));
+                    EngineEvent::ToolCallFinished {
+                        call_id: id,
+                        is_error,
+                        preview,
+                        ..
+                    } if id == call_id && rec.sequence != seq => {
+                        out.push(rel(
+                            rec.sequence,
+                            "pair_end",
+                            if leveler_engine::is_user_acknowledged_crash_marker(preview, *is_error)
+                            {
+                                "outcome unknown"
+                            } else {
+                                "tool finished"
+                            },
+                        ));
                     }
                     _ => {}
                 }
@@ -1344,6 +1378,83 @@ mod tests {
         assert_eq!(read.unfinished, 1);
         assert_eq!(read.total_ms, None);
         assert_eq!(read.avg_ms, None);
+    }
+
+    fn acknowledged_tool_end(id: &str, name: &str) -> EngineEvent {
+        EngineEvent::ToolCallFinished {
+            exit_code: None,
+            stop: None,
+            call_id: id.into(),
+            name: name.into(),
+            is_error: true,
+            preview: leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW.into(),
+            agent_id: None,
+            applied_diff: None,
+        }
+    }
+
+    /// The user's recovery acknowledgement is a control fact, not a tool
+    /// result. The raw row is encoded with `is_error = true` for backward
+    /// compatibility, so a projection that reads the flag alone reports a
+    /// failure the runtime never observed. The trace must say UNKNOWN, and the
+    /// aggregate must count it in neither `failed` nor `succeeded`.
+    #[tokio::test]
+    async fn an_acknowledged_unknown_call_is_not_a_failure() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "recover", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        persist(&db, &sid, tool_start("c1", "apply_patch")).await;
+        persist(&db, &sid, acknowledged_tool_end("c1", "apply_patch")).await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let finished = loaded
+            .window
+            .iter()
+            .find(|row| row.event_type == "tool_call_finished")
+            .expect("the marker row is part of the durable window");
+        assert_eq!(
+            finished.status, "unknown",
+            "an acknowledged unknown outcome is not a failure: {finished:?}"
+        );
+        assert_eq!(
+            finished.duration_ms, None,
+            "time until acknowledgement is not tool execution time"
+        );
+
+        let edit = by_name(&loaded.tools, "apply_patch");
+        assert_eq!(edit.calls, 1);
+        assert_eq!(edit.succeeded, 0);
+        assert_eq!(edit.failed, 0, "unknown must not be counted as failed");
+        assert_eq!(edit.unknown, 1, "the projection reports the unknown count");
+        assert_eq!(
+            edit.unfinished, 0,
+            "the recovery window is closed; the call is not dangling"
+        );
+        assert_eq!(edit.total_ms, None);
+        assert_eq!(edit.avg_ms, None);
+    }
+
+    /// A REAL failed tool result keeps its failure semantics next to the
+    /// unknown one — the distinction is between the two rows, not a blanket
+    /// reinterpretation of errors.
+    #[tokio::test]
+    async fn a_real_failure_next_to_an_acknowledged_call_stays_a_failure() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "mixed", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        persist(&db, &sid, tool_start("c1", "apply_patch")).await;
+        persist(&db, &sid, acknowledged_tool_end("c1", "apply_patch")).await;
+        persist(&db, &sid, tool_start("c2", "apply_patch")).await;
+        persist(&db, &sid, tool_end("c2", "apply_patch", true)).await;
+
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let edit = by_name(&loaded.tools, "apply_patch");
+        assert_eq!(edit.calls, 2);
+        assert_eq!(edit.failed, 1);
+        assert_eq!(edit.unknown, 1);
+        assert_eq!(edit.succeeded, 0);
     }
 
     fn agent_start(id: &str, nickname: &str, role: &str, task: &str) -> EngineEvent {

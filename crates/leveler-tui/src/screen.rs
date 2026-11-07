@@ -13,6 +13,10 @@ pub enum Screen {
     Tools,
     Diff,
     Sessions,
+    /// `/resume-claude` / `/resume-codex`: the locally stored sessions of one
+    /// other coding agent. Enter continues the selected source's work in a NEW
+    /// native session; the page never resumes that agent's runtime.
+    ForeignSessions,
     /// The `/remote` invite: a QR to scan, and the fingerprint to compare.
     Remote,
     /// First-class Activity Detail (background task or child agent).
@@ -311,6 +315,24 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::IdleOnly,
     ),
+    // Cross-agent continuation: read another coding agent's local session and
+    // continue it in a NEW native session. Omitting the id opens that source's
+    // picker. `Always`: the current turn keeps running; the import owns a new
+    // session of its own.
+    slash(
+        "/resume-claude",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    slash(
+        "/resume-codex",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Input
     slash(
         "/attach",
@@ -530,6 +552,8 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/context" => s.context,
         "/usage" => s.usage,
         "/sessions" => s.sessions,
+        "/resume-claude" => s.resume_claude,
+        "/resume-codex" => s.resume_codex,
         "/restore" | "/checkpoint" | "/rewind" => s.restore,
         "/fork" => s.fork,
         "/compact" => s.compact,
@@ -854,6 +878,8 @@ mod surface_tests {
                 "/output",
                 "/export",
                 "/new",
+                "/resume-claude",
+                "/resume-codex",
                 "/attach",
                 "/theme",
                 "/web",
@@ -1358,6 +1384,9 @@ mod reachability_tests {
             Screen::Tools => Some("Ctrl+T — reducer/mod.rs toggle_screen"),
             Screen::Diff => Some("Ctrl+D / `/diff` — screen_nav::open_diff_screen"),
             Screen::Sessions => Some("`/sessions` — screen_nav::open_sessions_screen"),
+            Screen::ForeignSessions => {
+                Some("`/resume-claude` / `/resume-codex` — reducer/submit.rs")
+            }
             Screen::Remote => Some("`/remote` — reducer/mod.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
             Screen::ActivityList => Some(
@@ -1384,6 +1413,7 @@ mod reachability_tests {
             Screen::Tools,
             Screen::Diff,
             Screen::Sessions,
+            Screen::ForeignSessions,
             Screen::Remote,
             Screen::Activity,
             Screen::ActivityList,

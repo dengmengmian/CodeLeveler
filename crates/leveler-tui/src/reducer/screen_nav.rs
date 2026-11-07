@@ -40,6 +40,7 @@ fn scroll_screen_key(state: &mut AppState, key: &KeyEvent, line_keys: bool) -> b
 pub(super) fn move_list_cursor(state: &mut AppState, delta: isize) {
     let len = match state.active_screen {
         Screen::Sessions => state.sessions.len(),
+        Screen::ForeignSessions => state.foreign_sessions.sessions.len(),
         Screen::Diff => state.diff.as_ref().map(|d| d.files.len()).unwrap_or(0),
         Screen::Tools => state
             .transcript
@@ -54,6 +55,7 @@ pub(super) fn move_list_cursor(state: &mut AppState, delta: isize) {
     }
     let current = match state.active_screen {
         Screen::Sessions => state.sessions_selected,
+        Screen::ForeignSessions => state.foreign_sessions.selected,
         Screen::Diff => state.diff_selected,
         Screen::Tools => state.tools_screen.selected,
         _ => return,
@@ -65,6 +67,7 @@ pub(super) fn move_list_cursor(state: &mut AppState, delta: isize) {
     };
     match state.active_screen {
         Screen::Sessions => state.sessions_selected = next,
+        Screen::ForeignSessions => state.foreign_sessions.selected = next,
         Screen::Diff => state.diff_selected = next,
         Screen::Tools => state.tools_screen.selected = next,
         _ => {}
@@ -78,7 +81,9 @@ pub(super) fn move_list_cursor(state: &mut AppState, delta: isize) {
 /// same split the jobs list already uses between its list and its log.
 pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
     match state.active_screen {
-        Screen::Sessions | Screen::Diff | Screen::Tools => move_list_cursor(state, notches),
+        Screen::Sessions | Screen::ForeignSessions | Screen::Diff | Screen::Tools => {
+            move_list_cursor(state, notches)
+        }
         Screen::Team => crate::multi_agent::select_team_delta(state, notches),
         Screen::Issue => crate::issue::move_selection(state, notches),
         Screen::Trace => state.trace.move_sel(notches),
@@ -127,6 +132,12 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
         Screen::Sessions => {
             if let Ok(index) = key.parse::<usize>() {
                 state.sessions_selected = index;
+            }
+        }
+        Screen::ForeignSessions => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.foreign_sessions.selected =
+                    index.min(state.foreign_sessions.sessions.len().saturating_sub(1));
             }
         }
         Screen::Diff => {
@@ -264,6 +275,13 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 _ => {}
             }
         }
+        Screen::ForeignSessions => match key.code {
+            KeyCode::Esc => return back(state),
+            KeyCode::Up | KeyCode::Char('k') => crate::foreign_session::move_selection(state, -1),
+            KeyCode::Down | KeyCode::Char('j') => crate::foreign_session::move_selection(state, 1),
+            KeyCode::Enter => return crate::foreign_session::import_selected(state),
+            _ => {}
+        },
         Screen::Output => return super::output_screen_key(state, &key),
         Screen::Activity => match key.code {
             KeyCode::Esc => return back(state),

@@ -1174,6 +1174,20 @@ impl leveler_storage::MessageStore for CountingMessageStore {
             .await
     }
 
+    async fn append_input_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+        input_id: &str,
+        payload: &str,
+        now: leveler_core::Timestamp,
+    ) -> Result<Option<u64>, leveler_storage::OwnershipError> {
+        self.inner
+            .append_input_in_turn_owned(token, session_id, turn_id, input_id, payload, now)
+            .await
+    }
+
     async fn load(
         &self,
         session_id: &leveler_core::SessionId,

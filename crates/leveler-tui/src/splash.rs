@@ -19,6 +19,7 @@ pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
         matches!(
             item,
             TranscriptItem::User(_)
+                | TranscriptItem::UserInput(_)
                 | TranscriptItem::Assistant(_)
                 | TranscriptItem::ToolGroup(_)
                 | TranscriptItem::SubAgent(_)

@@ -39,14 +39,17 @@ use leveler_model::{
     ThinkingAccess, ThinkingCapabilities, ThinkingLevel, ToolChoice, TranscriptOrigin,
     resolve_reasoning_effort,
 };
-use leveler_storage::{MessageRepository, SessionRepository};
+use leveler_storage::{
+    ForeignSessionOriginRepository, MessageRepository, SessionInputRepository, SessionInputState,
+    SessionRepository,
+};
 
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
     AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
-    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiInterruptedCallState,
-    UiInterruptedToolCall, UiMessage, UiPlan, UiPlanState, UiRole, UiSessionSnapshot,
-    UiSessionSummary, UiThinkingAccess, UiThinkingState,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiForeignOrigin, UiForeignTool,
+    UiInputState, UiInterruptedCallState, UiInterruptedToolCall, UiMessage, UiMessageKind, UiPlan,
+    UiPlanState, UiRole, UiSessionSnapshot, UiSessionSummary, UiThinkingAccess, UiThinkingState,
 };
 
 /// Whether a turn auto-approves risky actions. True when the session opted in
@@ -552,9 +555,10 @@ pub struct InProcessRuntimeClient {
     /// handling it has ended without settling it — so a `dispatching` receipt
     /// of this boot that is not in here will never be settled by this boot.
     in_flight: InFlightCommands,
-    /// Text the user sent while a turn was already running, per session.
-    /// Drained by the agent loop at the top of each round.
-    steering: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    /// Input the user sent while a turn was already running, per session.
+    /// Every entry has a durable journal row and is drained by the agent loop
+    /// at the top of a round; the journal, not this map, is the authority.
+    steering: Arc<Mutex<HashMap<SessionId, Vec<leveler_agent::PendingUserInput>>>>,
     /// A `/goal` declaration that arrived while a turn was already running.
     /// The durable axis is written first; this is the in-flight handoff that
     /// lets the RUNNING executor pick the declaration up at its next round
@@ -747,7 +751,14 @@ struct GoalSteer {
 /// session's running children's cancellation handles.
 struct SessionSteering {
     session_id: SessionId,
-    queues: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    queues: Arc<Mutex<HashMap<SessionId, Vec<leveler_agent::PendingUserInput>>>>,
+    /// Session-scoped stream that receives the delivered settlement. The
+    /// executor appends the transcript row; this is how the client learns the
+    /// exact input it drew reached the model.
+    events: crate::event_bridge::RuntimeEventSender,
+    /// The accepted input this turn consumes as its opening message, when the
+    /// host promoted one. It must not also be drained as a steer.
+    seed: Option<String>,
     goal: Arc<Mutex<GoalSteer>>,
     children: ChildCancels,
     tool_calls: ChildCancels,
@@ -779,12 +790,32 @@ impl SessionSteering {
 
 impl leveler_agent::SteeringSource for SessionSteering {
     fn take_pending(&self) -> Vec<String> {
+        self.take_pending_inputs()
+            .into_iter()
+            .map(|input| input.text)
+            .collect()
+    }
+
+    fn take_pending_inputs(&self) -> Vec<leveler_agent::PendingUserInput> {
         self.queues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&self.session_id)
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    fn input_consumed(&self, id: &str, ordinal: Option<u64>) {
+        let _ = self.events.send(RuntimeEvent::InputSettled {
+            message_id: MessageId::new(id),
+            state: UiInputState::Delivered,
+            reason: String::new(),
+            ordinal,
+        });
+    }
+
+    fn seed_input_id(&self) -> Option<String> {
+        self.seed.clone()
     }
 
     fn goal_requested(&self) -> bool {
@@ -2324,6 +2355,296 @@ impl InProcessRuntimeClient {
             .map_err(|error| ClientError::Runtime(error.to_string()))
     }
 
+    /// `/resume-claude` / `/resume-codex` with no id: list this project's
+    /// sessions from the source agent's local store for the picker.
+    ///
+    /// Discovery is bounded by the adapter crate (newest first, age and count
+    /// caps) and reads the source store without writing to it.
+    async fn handle_list_foreign_sessions(
+        &self,
+        requester_session_id: SessionId,
+        tool: UiForeignTool,
+    ) -> Result<(), ClientError> {
+        let adapter = crate::foreign_import::adapter_tool(tool);
+        let environment = self.app.environment.clone();
+        let cwd = self
+            .app
+            .layout
+            .primary_workspace()
+            .map(|path| path.to_path_buf());
+        let listed = tokio::task::spawn_blocking(move || {
+            let root = leveler_foreign_session::default_root(adapter, &environment)
+                .ok_or_else(|| "无法确定用户主目录（HOME / USERPROFILE 未设置）".to_string())?;
+            leveler_foreign_session::discover(
+                adapter,
+                &root,
+                cwd.as_deref(),
+                leveler_foreign_session::MAX_SESSIONS_PER_SOURCE,
+                std::time::SystemTime::now(),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await;
+        let event = match listed {
+            Ok(Ok(sessions)) => RuntimeEvent::ForeignSessionList {
+                tool,
+                sessions: sessions
+                    .iter()
+                    .map(crate::foreign_import::ui_session)
+                    .collect(),
+                error: None,
+            },
+            Ok(Err(error)) => RuntimeEvent::ForeignSessionList {
+                tool,
+                sessions: Vec::new(),
+                error: Some(error),
+            },
+            Err(error) => RuntimeEvent::ForeignSessionList {
+                tool,
+                sessions: Vec::new(),
+                error: Some(format!("本地扫描线程失败: {error}")),
+            },
+        };
+        let _ = self.events_for(&requester_session_id).send(event);
+        Ok(())
+    }
+
+    /// Import one foreign session and continue it in a NEW native session.
+    ///
+    /// The source is read once in a blocking thread (find + bounded digest),
+    /// then never trusted again: the history tool re-reads the exact file on
+    /// demand. Nothing is replayed and no source file is written.
+    async fn handle_import_foreign_session(
+        &self,
+        requester_session_id: SessionId,
+        tool: UiForeignTool,
+        native_id: String,
+    ) -> Result<(), ClientError> {
+        let adapter = crate::foreign_import::adapter_tool(tool);
+        let environment = self.app.environment.clone();
+        let id = native_id.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let root = leveler_foreign_session::default_root(adapter, &environment)
+                .ok_or_else(|| "无法确定用户主目录（HOME / USERPROFILE 未设置）".to_string())?;
+            let summary = leveler_foreign_session::find(adapter, &root, &id)
+                .map_err(|error| error.to_string())?;
+            let digest =
+                leveler_foreign_session::digest(&summary).map_err(|error| error.to_string())?;
+            Ok::<_, String>((summary, digest))
+        })
+        .await;
+        let (summary, digest) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(message)) => {
+                self.send_foreign_import_failure(&requester_session_id, tool, native_id, message);
+                return Ok(());
+            }
+            Err(error) => {
+                self.send_foreign_import_failure(
+                    &requester_session_id,
+                    tool,
+                    native_id,
+                    format!("读取线程失败: {error}"),
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = match self.runtime_config(&requester_session_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                self.send_foreign_import_failure(
+                    &requester_session_id,
+                    tool,
+                    native_id,
+                    format!("无法读取当前会话配置: {error}"),
+                );
+                return Ok(());
+            }
+        };
+        let Some(model) = config
+            .model
+            .clone()
+            .or_else(|| self.app.configured_default_model())
+        else {
+            self.send_foreign_import_failure(
+                &requester_session_id,
+                tool,
+                native_id,
+                "当前没有可用模型；先配置模型再导入".to_string(),
+            );
+            return Ok(());
+        };
+        config.model = Some(model.clone());
+        // Imported work is evidence, not a goal declaration: the continuation
+        // starts in Chat and the person can promote it with `/goal`.
+        config.collaboration = leveler_lifecycle::CollaborationMode::Chat
+            .as_str()
+            .to_string();
+        let title: String = digest
+            .summary
+            .title
+            .trim()
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        let title = if title.is_empty() {
+            format!("继续 {} 会话", tool.display_name())
+        } else {
+            title
+        };
+        let session_id = match self
+            .app
+            .create_daemon_session(
+                Some(&model),
+                &title,
+                config.mode,
+                leveler_lifecycle::CollaborationMode::Chat,
+                false,
+            )
+            .await
+        {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.send_foreign_import_failure(
+                    &requester_session_id,
+                    tool,
+                    native_id,
+                    format!("新建会话失败: {error}"),
+                );
+                return Ok(());
+            }
+        };
+
+        let warning = crate::foreign_import::cwd_mismatch(
+            summary.cwd.as_deref(),
+            self.app.layout.primary_workspace(),
+        );
+        let source_cwd = summary.cwd.as_ref().map(|cwd| cwd.display().to_string());
+        let prepared: Result<(), String> = async {
+            self.persist_runtime_config(&session_id, config.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let db = self
+                .app
+                .open_database()
+                .await
+                .map_err(|error| error.to_string())?;
+            ForeignSessionOriginRepository::new(&db)
+                .insert(
+                    session_id.as_str(),
+                    tool.as_str(),
+                    &summary.native_id,
+                    &summary.source_path.display().to_string(),
+                    source_cwd.as_deref(),
+                    leveler_core::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let text = crate::foreign_import::briefing(
+                &digest,
+                &leveler_core::now().to_rfc3339(),
+                warning.as_deref(),
+            );
+            let message = Message::user(
+                text,
+                TranscriptOrigin::RuntimeNotice {
+                    notice: leveler_model::RuntimeNoticeKind::ForeignSessionImport,
+                },
+            );
+            let payload = serde_json::to_string(&message).map_err(|error| error.to_string())?;
+            MessageRepository::new(&db)
+                .append(&session_id, &[payload], leveler_core::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        .await;
+        if let Err(message) = prepared {
+            self.discard_session(&session_id).await;
+            self.send_foreign_import_failure(&requester_session_id, tool, native_id, message);
+            return Ok(());
+        }
+
+        let _ = self
+            .events_for(&requester_session_id)
+            .send(RuntimeEvent::ForeignSessionImported {
+                tool,
+                native_id,
+                session_id: session_id.clone(),
+                warning,
+            });
+        let _ = self.events.send(RuntimeEvent::SessionList {
+            sessions: self.list_sessions().await?,
+        });
+        match self.snapshot(&session_id).await {
+            Ok(session) => {
+                let _ = self
+                    .events_for(&requester_session_id)
+                    .send(RuntimeEvent::SessionOpened { session });
+            }
+            Err(error) => {
+                self.notify_error(
+                    &requester_session_id,
+                    format!("会话已导入，但无法打开新会话: {error}；它已保留在会话列表中"),
+                );
+                return Ok(());
+            }
+        }
+
+        // The continuation turn carries only the harness directive; the
+        // briefing above is already durable and arrives as prior context.
+        let admission = match self.active.admit(&session_id) {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.notify_error(
+                    &session_id,
+                    format!("会话已导入，但接续回合无法启动: {error}；新会话已保留，可手动继续"),
+                );
+                return Ok(());
+            }
+        };
+        self.checkpoint_before_turn(&session_id, "导入会话").await;
+        let parts = vec![ContentPart::Text {
+            text: crate::foreign_import::CONTINUATION_DIRECTIVE.to_string(),
+        }];
+        let accepted = self.spawn_content_turn(
+            session_id.clone(),
+            parts,
+            TranscriptOrigin::RuntimeNotice {
+                notice: leveler_model::RuntimeNoticeKind::ForeignSessionImport,
+            },
+            admission,
+            config,
+            model,
+        );
+        if let Err(error) = await_turn_acceptance(accepted).await {
+            self.notify_error(
+                &session_id,
+                format!("会话已导入，但接续回合启动失败: {error}；新会话已保留，可手动继续"),
+            );
+        }
+        Ok(())
+    }
+
+    fn send_foreign_import_failure(
+        &self,
+        requester_session_id: &SessionId,
+        tool: UiForeignTool,
+        native_id: String,
+        message: String,
+    ) {
+        let _ =
+            self.events_for(requester_session_id)
+                .send(RuntimeEvent::ForeignSessionImportFailed {
+                    tool,
+                    native_id,
+                    message,
+                });
+    }
+
     async fn persist_runtime_config(
         &self,
         session_id: &SessionId,
@@ -2982,6 +3303,8 @@ impl InProcessRuntimeClient {
         text: &str,
         retitle: bool,
         images: usize,
+        message_id: Option<MessageId>,
+        seed_input_id: Option<String>,
     ) -> Result<crate::active_turns::TurnLease, ClientError> {
         self.auxiliary_assists.cancel(session_id);
         let admission = self
@@ -2992,19 +3315,208 @@ impl InProcessRuntimeClient {
             self.retitle_placeholder_session(session_id, text).await;
         }
         self.checkpoint_before_turn(session_id, text).await;
+        // The lease knows which accepted input this turn consumes before the
+        // executor exists. A retry of the same submission can then tell
+        // "already promoted" from "still waiting as a steer".
+        self.active
+            .set_seed_input(session_id, seed_input_id.clone());
+        let kind = seed_input_id.as_ref().map(|_| UiMessageKind::PendingInput);
         let _ = self
             .events_for(session_id)
             .send(RuntimeEvent::UserMessageAdded {
                 message: UiMessage {
-                    id: MessageId::new(leveler_core::new_uuid_string()),
+                    id: message_id
+                        .unwrap_or_else(|| MessageId::new(leveler_core::new_uuid_string())),
                     role: UiRole::User,
                     text: text.to_string(),
                     ordinal: None,
-                    kind: None,
+                    kind,
                     images,
                 },
             });
+        // Accepted-but-undelivered input from an earlier turn (a crash, or an
+        // ending that raced the last round) belongs to this one. The seed is
+        // excluded: the executor consumes that row as the opening message.
+        self.hydrate_pending_inputs(session_id, seed_input_id.as_deref())
+            .await;
         Ok(admission)
+    }
+
+    /// Every journaled input still awaiting delivery, oldest first.
+    async fn pending_input_rows(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<leveler_storage::SessionInputRecord>, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        SessionInputRepository::new(&db)
+            .pending(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))
+    }
+
+    /// Put journaled input back into the live handoff for the turn about to
+    /// start. The journal is durable across process death; this is the one
+    /// place that turns those rows back into deliverable input.
+    async fn hydrate_pending_inputs(&self, session_id: &SessionId, except: Option<&str>) {
+        let rows = match self.pending_input_rows(session_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                // The rows stay durable; a later turn hydrates them. Log the
+                // reason instead of pretending the turn has them.
+                tracing::warn!(
+                    session = session_id.as_str(),
+                    error = %error,
+                    "could not hydrate accepted input; it remains journaled"
+                );
+                return;
+            }
+        };
+        let mut hydrated = false;
+        for row in rows {
+            if Some(row.id.as_str()) == except {
+                continue;
+            }
+            self.enqueue_input(session_id, row.id, row.content);
+            hydrated = true;
+        }
+        if hydrated {
+            self.signal_pending_input(session_id);
+        }
+    }
+
+    /// Add one durable input to a session's live handoff. Idempotent by id, so
+    /// a retried admission and a journal re-hydration cannot deliver it twice.
+    fn enqueue_input(&self, session_id: &SessionId, id: String, text: String) {
+        let mut queues = self
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = queues.entry(session_id.clone()).or_default();
+        if queue
+            .iter()
+            .any(|input| input.id.as_deref() == Some(id.as_str()))
+        {
+            return;
+        }
+        queue.push(leveler_agent::PendingUserInput { id: Some(id), text });
+    }
+
+    /// Persist one accepted append. The ACK for its command is written only
+    /// after this returns, so a crash after acknowledgement always leaves a
+    /// row Resume can find.
+    async fn admit_input(
+        &self,
+        session_id: &SessionId,
+        id: &str,
+        content: &str,
+    ) -> Result<leveler_storage::SessionInputRecord, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        SessionInputRepository::new(&db)
+            .admit(id, session_id, None, content, leveler_core::now())
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))
+    }
+
+    fn emit_input_admitted(&self, session_id: &SessionId, id: &str, text: &str) {
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::InputAdmitted {
+                message: UiMessage {
+                    id: MessageId::new(id),
+                    role: UiRole::User,
+                    text: text.to_string(),
+                    ordinal: None,
+                    kind: Some(UiMessageKind::PendingInput),
+                    images: 0,
+                },
+            });
+    }
+
+    fn emit_input_settled(
+        &self,
+        session_id: &SessionId,
+        id: &str,
+        state: UiInputState,
+        reason: &str,
+        ordinal: Option<u64>,
+    ) {
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::InputSettled {
+                message_id: MessageId::new(id),
+                state,
+                reason: reason.to_string(),
+                ordinal,
+            });
+    }
+    /// Settle one pending input as cancelled. `None` means it was already
+    /// delivered or cancelled: a late cancel must not rewrite history.
+    async fn cancel_input(
+        &self,
+        session_id: &SessionId,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<leveler_storage::SessionInputRecord>, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        SessionInputRepository::new(&db)
+            .cancel(session_id, id, reason, leveler_core::now())
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))
+    }
+
+    /// Settle every still-pending input of a cancelled task. The rows stay as
+    /// an audit trail; the live queue is cleared so nothing can be handed to a
+    /// later turn. Input already delivered is untouched.
+    async fn cancel_pending_inputs(&self, session_id: &SessionId, reason: &str) {
+        self.steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        let settled = match self.app.open_database().await {
+            Ok(db) => {
+                SessionInputRepository::new(&db)
+                    .cancel_pending(session_id, reason, leveler_core::now())
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session = session_id.as_str(),
+                    error = %error,
+                    "could not settle pending input after a cancel"
+                );
+                return;
+            }
+        };
+        match settled {
+            Ok(rows) => {
+                for row in rows {
+                    self.emit_input_settled(
+                        session_id,
+                        &row.id,
+                        UiInputState::Cancelled,
+                        &row.reason,
+                        None,
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                session = session_id.as_str(),
+                error = %error,
+                "could not settle pending input after a cancel"
+            ),
+        }
     }
 
     /// Input the user typed while a turn ran and that no round consumed.
@@ -3062,36 +3574,65 @@ impl InProcessRuntimeClient {
             }
             return;
         }
-        let pending = self
-            .steering
+        // The journal is the authority, not the in-memory queue. Dropping the
+        // queue first is lossless (every entry has a row) and stops the next
+        // turn from delivering an entry that this path also promotes.
+        self.steering
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id)
-            .unwrap_or_default();
-        let text = pending
-            .iter()
-            .map(|item| item.trim())
-            .filter(|item| !item.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if text.is_empty() {
+            .remove(session_id);
+        let pending = match self.pending_input_rows(session_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    session = session_id.as_str(),
+                    error = %error,
+                    "could not read accepted input after a turn; it stays journaled"
+                );
+                return;
+            }
+        };
+        if pending.is_empty() {
             return;
         }
-        let result = Box::pin(self.send(ClientCommand::SubmitMessage {
-            session_id: session_id.clone(),
-            content: text,
-            attachments: Vec::new(),
-        }))
+        // Another client started work in this window. It owns the turn now:
+        // hand the rows to it instead of racing admission. They stay journaled
+        // until that turn actually appends them.
+        if self.active.is_running(session_id) {
+            for row in &pending {
+                self.enqueue_input(session_id, row.id.clone(), row.content.clone());
+            }
+            self.signal_pending_input(session_id);
+            return;
+        }
+        // Promote exactly one row as the next turn's opening message, so its
+        // transcript row consumes that journal row atomically. stage_turn
+        // hydrates the rest as separate steers; nothing is joined with "\n".
+        let seed = pending[0].clone();
+        let result = Box::pin(self.handle_submit_message(
+            session_id.clone(),
+            seed.content.clone(),
+            Vec::new(),
+            None,
+            Some(seed.id.clone()),
+        ))
         .await;
-        if result.is_err() {
-            // A turn is already running again: hand the text back so that turn
-            // consumes it at its next round instead of losing it.
-            self.steering
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(session_id.clone())
-                .or_default()
-                .extend(pending);
+        if let Err(error) = result {
+            // Nothing is lost: the rows are still pending. A running turn gets
+            // them as steers; otherwise they wait for the next submission or
+            // Resume, which hydrates them from the journal.
+            for row in &pending {
+                self.enqueue_input(session_id, row.id.clone(), row.content.clone());
+            }
+            if self.active.is_running(session_id) {
+                self.signal_pending_input(session_id);
+            } else {
+                tracing::warn!(
+                    session = session_id.as_str(),
+                    error = %error,
+                    "accepted input could not start a turn; it stays journaled for Resume"
+                );
+            }
         }
     }
 
@@ -3141,6 +3682,8 @@ impl InProcessRuntimeClient {
         Arc::new(SessionSteering {
             session_id: session_id.clone(),
             queues: self.steering.clone(),
+            events: self.events_for(session_id),
+            seed: self.active.seed_input_id(session_id),
             goal: self.goal_state_for(session_id),
             children: self.child_cancels.clone(),
             tool_calls: self.tool_call_cancels.clone(),
@@ -3551,7 +4094,14 @@ impl InProcessRuntimeClient {
                 return rx;
             }
         };
-        self.spawn_content_turn(session_id, parts, admission, config, model)
+        self.spawn_content_turn(
+            session_id,
+            parts,
+            TranscriptOrigin::UserInput,
+            admission,
+            config,
+            model,
+        )
     }
 
     fn spawn_goal_turn(
@@ -3636,13 +4186,21 @@ impl InProcessRuntimeClient {
                     )
                     .await
                 };
-                if let Some(tx) = accepted_tx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    let _ = tx.send(Err(turn_rejection(&result)));
-                }
+                // `TurnStarted` is the only consumer of the acceptance
+                // sender. Still holding it after the turn returned means the
+                // turn never reached durable admission.
+                let started = {
+                    let mut slot = accepted_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match slot.take() {
+                        Some(tx) => {
+                            let _ = tx.send(Err(turn_rejection(&result)));
+                            false
+                        }
+                        None => true,
+                    }
+                };
                 // A cancel is the user saying stop: pending text is not
                 // delivered as a new turn. Every other ending owes the person
                 // an answer to what they typed.
@@ -3665,7 +4223,11 @@ impl InProcessRuntimeClient {
                 client
                     .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
-                if !user_cancelled {
+                // Only a turn that durably started can owe its journaled
+                // input a promotion. Re-promoting after a turn that never
+                // started repeats the same refusal without end, and the spin
+                // holds the admission slot its own recovery needs.
+                if started && !user_cancelled {
                     client.deliver_unconsumed_input(&session_id).await;
                 }
                 // Session-owned background reap moved to the engine's terminal
@@ -3725,7 +4287,9 @@ impl InProcessRuntimeClient {
         }
         let config = self.runtime_config(&session_id).await?;
         let model = require_model(&config, &session_id)?;
-        let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
+        let cancel = self
+            .stage_turn(&session_id, &content, true, 0, None, None)
+            .await?;
         let accepted = self.spawn_goal_turn(session_id, content, cancel, config, model);
         await_turn_acceptance(accepted).await
     }
@@ -3822,12 +4386,18 @@ impl InProcessRuntimeClient {
         content: String,
         attachments: Vec<AttachmentRef>,
         _origin: Option<&CommandId>,
+        seed_input_id: Option<String>,
     ) -> Result<(), ClientError> {
+        // A promoted append is already the user's instruction for this turn.
+        // Re-parsing it as `/goal` or a continuation would turn the text they
+        // typed into a control command a second time.
+        let promoted = seed_input_id.is_some();
         // `/goal` is product semantics, not a client feature. A client that
         // does not parse slash commands (Desktop, an older build, a steering
         // message) still reaches the same durable axis and the same executor
         // profile through this one parse.
-        if attachments.is_empty()
+        if !promoted
+            && attachments.is_empty()
             && let Some(command) = leveler_client_protocol::parse_goal_command(&content)
         {
             use leveler_client_protocol::GoalCommand;
@@ -3854,7 +4424,8 @@ impl InProcessRuntimeClient {
         // same one the closeout honors: `继续阶段 2` is the user's own
         // instruction, and the goal is re-entered by identity (same acceptance,
         // same plan evidence).
-        if attachments.is_empty()
+        if !promoted
+            && attachments.is_empty()
             && !collaboration_routes_submit_to_goal(&config.collaboration)
             && leveler_lifecycle::authorizes_continuation(&content)
             && let Some(goal) = self.paused_running_goal(&session_id).await?
@@ -3872,8 +4443,16 @@ impl InProcessRuntimeClient {
         // a model that cannot read an image is told so, never handed the text
         // with the picture removed.
         self.refuse_unreadable_images(&model, &attachments).await?;
+        let seed_message_id = seed_input_id.as_deref().map(MessageId::new);
         let cancel = self
-            .stage_turn(&session_id, &content, true, image_count(&attachments))
+            .stage_turn(
+                &session_id,
+                &content,
+                true,
+                image_count(&attachments),
+                seed_message_id,
+                seed_input_id,
+            )
             .await?;
         // CollaborationMode is the single source of turn profile:
         // goal → goal_mode / update_goal path; chat|plan → content turn.
@@ -3907,7 +4486,7 @@ impl InProcessRuntimeClient {
         // No continuation intent: the client mislabelled an ordinary message.
         let Some(continuation) = leveler_client_protocol::parse_continuation(&content) else {
             return self
-                .handle_submit_message(session_id, content, Vec::new(), origin)
+                .handle_submit_message(session_id, content, Vec::new(), origin, None)
                 .await;
         };
         // Continuation intent is not enough: the runtime must also own a
@@ -3927,7 +4506,7 @@ impl InProcessRuntimeClient {
             ContinuationState::NotResumable => {
                 // Nothing to resume: the same text is a normal message.
                 return self
-                    .handle_submit_message(session_id, content, Vec::new(), origin)
+                    .handle_submit_message(session_id, content, Vec::new(), origin, None)
                     .await;
             }
         }
@@ -3968,7 +4547,9 @@ impl InProcessRuntimeClient {
             .map_err(|error| ClientError::Runtime(error.to_string()))?
             .as_str()
             .to_string();
-        let cancel = self.stage_turn(&session_id, &content, false, 0).await?;
+        let cancel = self
+            .stage_turn(&session_id, &content, false, 0, None, None)
+            .await?;
         // A resume continues the execution whose model is on the session row,
         // not the current default: a configuration reload must not silently
         // move an interrupted task onto another model. Name that model so the
@@ -4223,13 +4804,21 @@ impl InProcessRuntimeClient {
                     )
                     .await
                 };
-                if let Some(tx) = accepted_tx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    let _ = tx.send(Err(turn_rejection(&result)));
-                }
+                // `TurnStarted` is the only consumer of the acceptance
+                // sender. Still holding it after the turn returned means the
+                // turn never reached durable admission.
+                let started = {
+                    let mut slot = accepted_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match slot.take() {
+                        Some(tx) => {
+                            let _ = tx.send(Err(turn_rejection(&result)));
+                            false
+                        }
+                        None => true,
+                    }
+                };
                 // A cancel is the user saying stop: pending text is not
                 // delivered as a new turn. Every other ending owes the person
                 // an answer to what they typed.
@@ -4248,7 +4837,11 @@ impl InProcessRuntimeClient {
                 client
                     .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
-                if !user_cancelled {
+                // Only a turn that durably started can owe its journaled
+                // input a promotion. Re-promoting after a turn that never
+                // started repeats the same refusal without end, and the spin
+                // holds the admission slot its own recovery needs.
+                if started && !user_cancelled {
                     client.deliver_unconsumed_input(&session_id).await;
                 }
             });
@@ -4972,6 +5565,7 @@ impl InProcessRuntimeClient {
         &self,
         session_id: SessionId,
         parts: Vec<ContentPart>,
+        origin: TranscriptOrigin,
         admission: crate::active_turns::TurnLease,
         config: SessionRuntimeConfig,
         model: ModelRef,
@@ -5031,6 +5625,7 @@ impl InProcessRuntimeClient {
                         &model,
                         mode,
                         parts,
+                        origin,
                         approver,
                         clarifier,
                         sandbox,
@@ -5041,13 +5636,21 @@ impl InProcessRuntimeClient {
                     )
                     .await
                 };
-                if let Some(tx) = accepted_tx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    let _ = tx.send(Err(turn_rejection(&result)));
-                }
+                // `TurnStarted` is the only consumer of the acceptance
+                // sender. Still holding it after the turn returned means the
+                // turn never reached durable admission.
+                let started = {
+                    let mut slot = accepted_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match slot.take() {
+                        Some(tx) => {
+                            let _ = tx.send(Err(turn_rejection(&result)));
+                            false
+                        }
+                        None => true,
+                    }
+                };
                 // A cancel is the user saying stop: pending text is not
                 // delivered as a new turn. Every other ending owes the person
                 // an answer to what they typed.
@@ -5069,7 +5672,11 @@ impl InProcessRuntimeClient {
                 client
                     .publish_routes_after_turn(&session_id, &axis_at_start)
                     .await;
-                if !user_cancelled {
+                // Only a turn that durably started can owe its journaled
+                // input a promotion. Re-promoting after a turn that never
+                // started repeats the same refusal without end, and the spin
+                // holds the admission slot its own recovery needs.
+                if started && !user_cancelled {
                     client.deliver_unconsumed_input(&session_id).await;
                 }
             });
@@ -5348,7 +5955,7 @@ impl InProcessRuntimeClient {
                     self.handle_resume_task(session_id, content, Some(origin))
                         .await
                 } else {
-                    self.handle_submit_message(session_id, content, attachments, Some(origin))
+                    self.handle_submit_message(session_id, content, attachments, Some(origin), None)
                         .await
                 }
             }
@@ -5553,7 +6160,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 {
                     self.handle_resume_task(session_id, content, None).await
                 } else {
-                    self.handle_submit_message(session_id, content, attachments, None)
+                    self.handle_submit_message(session_id, content, attachments, None, None)
                         .await
                 }
             }
@@ -5683,7 +6290,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let config = self.runtime_config(&session_id).await?;
                 let model = require_model(&config, &session_id)?;
                 self.persist_goal_declaration(&session_id, &goal).await?;
-                let cancel = self.stage_turn(&session_id, &goal, false, 0).await?;
+                let cancel = self
+                    .stage_turn(&session_id, &goal, false, 0, None, None)
+                    .await?;
                 let accepted = self.spawn_goal_turn(session_id, goal, cancel, config, model);
                 await_turn_acceptance(accepted).await
             }
@@ -5691,14 +6300,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::SteerCurrentTurn {
                 session_id,
                 content,
+                message_id,
             } => {
-                if self.active.is_running(&session_id) {
-                    // A steer is also an input surface for `/goal`. The
-                    // terminal already forwards it here when the user types
-                    // `/goal` during a turn; every other client reaches the
-                    // same branch by sending the text as a steer.
-                    if let Some(command) = leveler_client_protocol::parse_goal_command(&content) {
-                        use leveler_client_protocol::GoalCommand;
+                // `/goal` is control input with its own durable declaration;
+                // it is not a plain append and never enters the input journal.
+                if let Some(command) = leveler_client_protocol::parse_goal_command(&content) {
+                    use leveler_client_protocol::GoalCommand;
+                    if self.active.is_running(&session_id) {
                         return match command {
                             GoalCommand::Run(task) => self.steer_into_goal(session_id, task).await,
                             GoalCommand::Clear => self.clear_goal_axis(session_id).await,
@@ -5709,26 +6317,117 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             )),
                         };
                     }
-                    self.steering
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .entry(session_id.clone())
-                        .or_default()
-                        .push(content);
-                    self.signal_pending_input(&session_id);
+                    return Box::pin(self.handle_submit_message(
+                        session_id,
+                        content,
+                        Vec::new(),
+                        None,
+                        None,
+                    ))
+                    .await;
+                }
+                let content = content.trim().to_string();
+                if content.is_empty() {
+                    return Err(ClientError::Runtime(
+                        "empty input is not accepted as an instruction".into(),
+                    ));
+                }
+                let id = message_id
+                    .map(|id| id.as_str().to_string())
+                    .unwrap_or_else(leveler_core::new_uuid_string);
+                // Durable before the ACK. A retry with the same id finds the
+                // same row instead of creating a second instruction.
+                let row = self.admit_input(&session_id, &id, &content).await?;
+                let text = row.content.clone();
+                match row.state {
+                    SessionInputState::Consumed => {
+                        self.emit_input_admitted(&session_id, &id, &text);
+                        self.emit_input_settled(
+                            &session_id,
+                            &id,
+                            UiInputState::Delivered,
+                            "",
+                            row.ordinal,
+                        );
+                        return Ok(());
+                    }
+                    SessionInputState::Cancelled => {
+                        self.emit_input_admitted(&session_id, &id, &text);
+                        self.emit_input_settled(
+                            &session_id,
+                            &id,
+                            UiInputState::Cancelled,
+                            &row.reason,
+                            None,
+                        );
+                        return Ok(());
+                    }
+                    SessionInputState::Pending => {}
+                }
+                // Announce the durable row before making it available to an
+                // executor. Another subscribed client has no optimistic row;
+                // it must see admission before a fast round settles the input.
+                self.emit_input_admitted(&session_id, &id, &text);
+                if self.active.is_running(&session_id) {
+                    // A retry of the submission that STARTED this turn is
+                    // already its opening message; queueing it again would
+                    // deliver the same row twice.
+                    if self.active.seed_input_id(&session_id).as_deref() != Some(id.as_str()) {
+                        self.enqueue_input(&session_id, id.clone(), text.clone());
+                        self.signal_pending_input(&session_id);
+                    }
                     return Ok(());
                 }
                 // The turn ended between the client deciding to steer and this
                 // arriving — a real race, because the client's "busy" view lags
-                // the runtime by one event. Dropping the text here would lose
-                // what the user typed, so fall through to an ordinary
-                // submission and start a new turn with it.
-                return Box::pin(self.send(ClientCommand::SubmitMessage {
-                    session_id,
-                    content,
-                    attachments: Vec::new(),
-                }))
-                .await;
+                // the runtime by one event. The row is already durable, so the
+                // text becomes the next turn's opening message instead of a
+                // second, differently-identified submission.
+                match Box::pin(self.handle_submit_message(
+                    session_id.clone(),
+                    text.clone(),
+                    Vec::new(),
+                    None,
+                    Some(id.clone()),
+                ))
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error)
+                        if matches!(&error, ClientError::Runtime(message)
+                            if message.contains("already has an active turn")) =>
+                    {
+                        // A turn was admitted in the same window. It owns the
+                        // input, and the journal row makes the handoff safe.
+                        if self.active.seed_input_id(&session_id).as_deref() != Some(id.as_str()) {
+                            self.enqueue_input(&session_id, id.clone(), text.clone());
+                            self.signal_pending_input(&session_id);
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        // No turn was ever durably admitted for it. Settle the
+                        // row so a later turn cannot run what the client was
+                        // told failed; the client still holds the text.
+                        if let Ok(Some(settled)) = self
+                            .cancel_input(
+                                &session_id,
+                                &id,
+                                "the turn could not start, so the input was not admitted",
+                            )
+                            .await
+                        {
+                            self.emit_input_settled(
+                                &session_id,
+                                &settled.id,
+                                UiInputState::Cancelled,
+                                &settled.reason,
+                                None,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
             }
 
             ClientCommand::RequestDiff {
@@ -5782,6 +6481,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         sessions: self.list_sessions().await?,
                     });
                 Ok(())
+            }
+            ClientCommand::ListForeignSessionsFor {
+                requester_session_id,
+                tool,
+            } => {
+                self.handle_list_foreign_sessions(requester_session_id, tool)
+                    .await
+            }
+            ClientCommand::ImportForeignSession {
+                requester_session_id,
+                tool,
+                native_id,
+            } => {
+                self.handle_import_foreign_session(requester_session_id, tool, native_id)
+                    .await
             }
             ClientCommand::OpenSession { session_id } => {
                 if let Ok(session) = self.snapshot(&session_id).await {
@@ -6044,6 +6758,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 Ok(())
             }
             ClientCommand::CancelCurrentTurn { session_id } => {
+                // Accepted input that never reached a model is settled with
+                // the task it belonged to; it must not resurrect in a later
+                // turn. This runs before the token so an input the executor
+                // is appending right now either wins (it was delivered) or
+                // loses (it is cancelled).
+                self.cancel_pending_inputs(&session_id, "当前任务已取消")
+                    .await;
                 if !self.cancel_active(&session_id) {
                     // No owned live turn: recover a possible orphan left by an
                     // earlier process. Never race the active executor's own
@@ -6053,6 +6774,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 Ok(())
             }
             ClientCommand::CancelTask { session_id } => {
+                self.cancel_pending_inputs(&session_id, "任务已取消").await;
                 // A running turn carries the flag to its terminal, so the
                 // engine records `cancelled` (not resumable `interrupted`).
                 // With nothing running, commit that terminal here.
@@ -6782,14 +7504,39 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let record = settings.session;
 
         let payloads = MessageRepository::new(&db)
-            .load(session_id)
+            .load_with_input_ids(session_id)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        let messages = payloads
+        let mut messages: Vec<UiMessage> = payloads
             .iter()
             .enumerate()
-            .filter_map(|(i, p)| ui_message_at(p, Some(i as u64)))
+            .filter_map(|(i, (payload, input_id))| {
+                ui_message_at(payload, Some(i as u64), input_id.as_deref())
+            })
             .collect();
+        // Journal rows that are not in the transcript yet (or never will be)
+        // are still part of what the user typed. A reopened client must see
+        // them, with the same identity the live events used.
+        let journal = SessionInputRepository::new(&db)
+            .all(session_id)
+            .await
+            .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        for row in journal {
+            let kind = match row.state {
+                SessionInputState::Pending => UiMessageKind::PendingInput,
+                SessionInputState::Cancelled => UiMessageKind::CancelledInput,
+                // Its transcript row already carries this identity.
+                SessionInputState::Consumed => continue,
+            };
+            messages.push(UiMessage {
+                id: MessageId::new(row.id),
+                role: UiRole::User,
+                text: row.content,
+                ordinal: None,
+                kind: Some(kind),
+                images: 0,
+            });
+        }
 
         let mut available_models = self.app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
@@ -6977,6 +7724,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             &hosted_terminal,
         )
         .await?;
+        let foreign_origin = project_foreign_origin(&db, session_id).await;
 
         Ok(UiSessionSnapshot {
             history,
@@ -7025,6 +7773,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             collaboration: Some(config.collaboration.clone()),
             execution_task,
             children,
+            foreign_origin,
         })
     }
 }
@@ -8337,6 +9086,7 @@ async fn compact_conversation(
         else {
             return false;
         };
+        let foreign_origin = project_foreign_origin(&db, session_id).await;
         let _ = events.send(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
                 history: None,
@@ -8381,6 +9131,7 @@ async fn compact_conversation(
                 // not have.
                 execution_task: None,
                 children: Vec::new(),
+                foreign_origin,
             },
         });
     }
@@ -8496,7 +9247,7 @@ async fn reset_session_task_epoch_db(
 /// Deserialize a persisted `Message` payload into a `UiMessage`, or `None` for
 /// tool/empty messages that have nothing to render.
 fn ui_message(payload: &str) -> Option<UiMessage> {
-    ui_message_at(payload, None)
+    ui_message_at(payload, None, None)
 }
 
 /// `ordinal` is the persisted append position of this payload in the message
@@ -8511,7 +9262,47 @@ fn image_count(attachments: &[AttachmentRef]) -> usize {
         .count()
 }
 
-fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
+/// The durable source identity of an imported session, for a client snapshot.
+///
+/// The origin table is the only authority. A read failure is reported as
+/// "not imported" rather than blocking the whole snapshot: losing the badge
+/// must not cost the client the session it is opening.
+async fn project_foreign_origin(
+    db: &leveler_storage::Database,
+    session_id: &SessionId,
+) -> Option<UiForeignOrigin> {
+    let record = match ForeignSessionOriginRepository::new(db)
+        .get(session_id.as_str())
+        .await
+    {
+        Ok(record) => record?,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id.as_str(),
+                %error,
+                "foreign-session origin could not be read"
+            );
+            return None;
+        }
+    };
+    let Some(tool) = UiForeignTool::parse(&record.tool) else {
+        tracing::warn!(
+            session_id = %session_id.as_str(),
+            tool = %record.tool,
+            "foreign-session origin names an unknown tool"
+        );
+        return None;
+    };
+    Some(UiForeignOrigin {
+        tool,
+        native_id: record.native_id,
+        source_path: record.source_path,
+        source_cwd: record.source_cwd,
+        imported_at: record.imported_at,
+    })
+}
+
+fn ui_message_at(payload: &str, ordinal: Option<u64>, input_id: Option<&str>) -> Option<UiMessage> {
     let message: leveler_model::Message = serde_json::from_str(payload).ok()?;
     // Same rule as history replay: a protocol repair is model context, not a
     // snapshot row. Filtering the sentence would also hide user-authored English.
@@ -8535,15 +9326,29 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
     if text.trim().is_empty() && images == 0 {
         return None;
     }
-    // Only the runtime's own notices: a user-role message whose first line is
-    // exactly one of the headers the runtime writes.
+    // Only the runtime's own notices: origin says so for every row written
+    // with a notice origin; the header list still covers legacy rows written
+    // before origins were recorded.
     let kind = (role == UiRole::User
-        && text.lines().next().is_some_and(|first| {
-            leveler_agent::RUNTIME_NOTICE_HEADERS.contains(&first.trim_end())
-        }))
+        && (message
+            .origin
+            .as_ref()
+            .is_some_and(|origin| matches!(origin, TranscriptOrigin::RuntimeNotice { .. }))
+            || text.lines().next().is_some_and(|first| {
+                leveler_agent::RUNTIME_NOTICE_HEADERS.contains(&first.trim_end())
+            })))
     .then_some(leveler_client_protocol::UiMessageKind::RuntimeNotice);
+    // A row written from the accepted-input journal keeps the identity the
+    // client saw at admission. That is what makes a Resumed row the same row,
+    // not a second one with a fresh uuid.
+    let kind = match input_id {
+        Some(_) if role == UiRole::User => Some(UiMessageKind::DeliveredInput),
+        _ => kind,
+    };
     Some(UiMessage {
-        id: MessageId::new(leveler_core::new_uuid_string()),
+        id: input_id
+            .map(MessageId::new)
+            .unwrap_or_else(|| MessageId::new(leveler_core::new_uuid_string())),
         role,
         text,
         ordinal,
@@ -8699,6 +9504,8 @@ mod child_cancel_tests {
         let steering = SessionSteering {
             session_id: session.clone(),
             queues: Arc::new(Mutex::new(HashMap::new())),
+            events: tokio::sync::broadcast::channel(32).0.into(),
+            seed: None,
             goal: Arc::new(Mutex::new(GoalSteer::default())),
             children: children.clone(),
             tool_calls: Arc::new(Mutex::new(HashMap::new())),

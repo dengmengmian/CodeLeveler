@@ -173,6 +173,7 @@ impl ExecutorFactory {
         .with_permission_rules_path(self.permission_rules_path.clone())
         .with_hook_runner(self.hook_runner.clone())
         .with_steering_opt(self.steering.clone())
+        .with_seed_input_id(self.steering.as_ref().and_then(|s| s.seed_input_id()))
         .with_commit_co_author(self.commit_co_author)
         .with_execution_controls(resolved.max_parallel_tools)
         .with_sub_agent_policies(child_policies)

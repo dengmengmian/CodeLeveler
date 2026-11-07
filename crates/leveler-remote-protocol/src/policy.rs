@@ -229,6 +229,15 @@ impl RemotePolicy {
                 reason: "runtime configuration is host-local",
             },
 
+            // Another agent's session store is host-local history. A paired
+            // device cannot enumerate it, and importing it would hand that
+            // history to a client that cannot see the files.
+            ClientCommand::ListForeignSessionsFor { .. }
+            | ClientCommand::ImportForeignSession { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "another agent's local session store is host-local",
+            },
+
             // Destructive or history-rewriting, with no remote confirmation UX
             // yet to make them safe.
             ClientCommand::DeleteSession { .. }

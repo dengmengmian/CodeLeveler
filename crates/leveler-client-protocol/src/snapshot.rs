@@ -182,6 +182,7 @@ mod tests {
             collaboration: None,
             execution_task: None,
             children: Vec::new(),
+            foreign_origin: None,
         };
         // Unset axes stay off the wire (old-client compatibility).
         let value = serde_json::to_value(&snap).unwrap();
@@ -259,6 +260,7 @@ mod tests {
             collaboration: None,
             execution_task: None,
             children: Vec::new(),
+            foreign_origin: None,
         };
         let value = serde_json::to_value(&snap).unwrap();
         assert!(value.get("thinking").is_none(), "{value}");
@@ -314,6 +316,26 @@ pub enum UiMessageKind {
     /// a child's settlement, a lost or resumed delegation — not typed by the
     /// user. Render it as a runtime notice, never as user input.
     RuntimeNotice,
+    /// Typed by the user while a turn ran, accepted durably, and not yet in
+    /// any model request. Joins the running turn at its next round.
+    PendingInput,
+    /// Typed by the user while a turn ran, accepted durably, and now part of
+    /// the transcript and a model request.
+    DeliveredInput,
+    /// Accepted, then settled without delivery because the user cancelled the
+    /// task. It must stay visible as such and must never run later.
+    CancelledInput,
+}
+
+/// The terminal state of an accepted mid-turn input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiInputState {
+    /// The input's transcript row is durable and was part of a model request.
+    Delivered,
+    /// The task was cancelled before the input was delivered.
+    Cancelled,
 }
 
 /// The runtime's self-description, served to clients for identity
@@ -858,6 +880,11 @@ pub struct UiSessionSnapshot {
     /// Every delegated child of this session, oldest first, from durable storage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<crate::UiChildAgent>,
+    /// Where this session came from when it was created by importing another
+    /// agent's session. Additive: absent on an ordinary native session and on
+    /// runtimes that predate import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_origin: Option<crate::UiForeignOrigin>,
 }
 
 /// The durable task a Chat session owes, as projected for a client that is

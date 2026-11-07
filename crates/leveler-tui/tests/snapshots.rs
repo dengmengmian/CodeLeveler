@@ -50,6 +50,7 @@ fn session_snapshot(collaboration: Option<String>) -> UiSessionSnapshot {
         collaboration,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     }
 }
 

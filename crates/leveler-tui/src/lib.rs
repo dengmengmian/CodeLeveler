@@ -32,6 +32,7 @@ pub mod conversation;
 mod diff_view;
 pub mod external_editor;
 pub mod fold;
+pub mod foreign_session;
 pub mod help;
 pub mod history_search;
 pub mod i18n;

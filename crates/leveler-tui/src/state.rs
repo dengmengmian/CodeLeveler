@@ -450,6 +450,13 @@ pub struct AppState {
     /// Stored sessions and cursor for the Sessions screen (spec §52).
     pub sessions: Vec<UiSessionSummary>,
     pub sessions_selected: usize,
+    /// `/resume-claude` / `/resume-codex`: the source picker's projection.
+    pub foreign_sessions: crate::foreign_session::ForeignSessionsView,
+    /// Where this session came from when it was created by importing another
+    /// coding agent's session. The runtime snapshot is the authority; the
+    /// header shows it so an imported continuation never reads as a session of
+    /// that other agent's own runtime.
+    pub foreign_origin: Option<leveler_client_protocol::UiForeignOrigin>,
     pub context_tokens: u32,
     /// Latest model-reported input/output tokens for the current conversation.
     /// The status line and the footer read this last request. The turn receipt
@@ -816,6 +823,8 @@ impl AppState {
             vision: false,
             sessions: Vec::new(),
             sessions_selected: 0,
+            foreign_sessions: crate::foreign_session::ForeignSessionsView::default(),
+            foreign_origin: None,
             context_tokens: 0,
             token_input: 0,
             token_output: 0,

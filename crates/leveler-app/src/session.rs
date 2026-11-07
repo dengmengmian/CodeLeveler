@@ -78,6 +78,23 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             parallel,
             model_step,
         },
+        // The acknowledgement marker is a recovery-control fact, not a tool
+        // terminal. `is_error` on that row is the legacy encoding, so it must
+        // not reach a renderer as a failed result.
+        EngineEvent::ToolCallFinished {
+            call_id,
+            name,
+            is_error,
+            preview,
+            agent_id: None,
+            ..
+        } if leveler_engine::is_user_acknowledged_crash_marker(&preview, is_error) => {
+            AgentEvent::ToolOutcomeUnknown {
+                id: call_id,
+                name,
+                preview,
+            }
+        }
         EngineEvent::ToolCallFinished {
             call_id,
             name,
@@ -423,6 +440,7 @@ async fn run_collaboration_turn(
     session_id: &leveler_core::SessionId,
     spec: &TaskSpec,
     content: Vec<ContentPart>,
+    origin: leveler_model::TranscriptOrigin,
     observer: &mut (dyn FnMut(EngineEvent) + Send),
     cancellation: CancellationToken,
 ) -> Result<TaskReport, EngineError> {
@@ -432,7 +450,7 @@ async fn run_collaboration_turn(
             .await
     } else {
         engine
-            .chat(session_id, spec, content, observer, cancellation)
+            .chat_with_origin(session_id, spec, content, origin, observer, cancellation)
             .await
     }
 }
@@ -866,6 +884,7 @@ impl Application {
             vec![ContentPart::Text {
                 text: goal.to_string(),
             }],
+            leveler_model::TranscriptOrigin::UserInput,
             observer,
             cancellation,
         )
@@ -889,6 +908,10 @@ impl Application {
         model: &ModelRef,
         mode: PermissionProfile,
         content: Vec<ContentPart>,
+        // Durable provenance of this turn's input row. An interactive
+        // submission is `UserInput`; an imported-session continuation is a
+        // harness notice and must never be attributed to the person.
+        origin: leveler_model::TranscriptOrigin,
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
@@ -930,6 +953,7 @@ impl Application {
             session_id,
             &spec,
             content,
+            origin,
             observer,
             cancellation,
         )
@@ -1298,6 +1322,52 @@ mod tests {
             Some(PermissionProfile::RequestApproval)
         );
         assert_eq!(mode_from_str("bogus"), None);
+    }
+
+    /// The old reverse projection read `is_error` alone, so a recovery
+    /// acknowledgement reached the headless renderer and JSONL telemetry as a
+    /// real tool failure. The marker must project to the dedicated unknown
+    /// variant, and the preview is preserved rather than replaced.
+    #[test]
+    fn acknowledged_crash_marker_projects_to_unknown_not_failure() {
+        let marker = EngineEvent::ToolCallFinished {
+            call_id: "c1".into(),
+            name: "apply_patch".into(),
+            is_error: true,
+            preview: leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW.into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        };
+        match engine_event_to_agent(marker) {
+            Some(AgentEvent::ToolOutcomeUnknown { id, name, preview }) => {
+                assert_eq!(id, "c1");
+                assert_eq!(name, "apply_patch");
+                assert_eq!(preview, leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW);
+            }
+            other => panic!("marker must not project to a tool result: {other:?}"),
+        }
+    }
+
+    /// A real failed call keeps failing; the marker rule is not a blanket
+    /// reinterpretation of `is_error`.
+    #[test]
+    fn a_real_tool_failure_still_projects_to_a_failed_result() {
+        let failed = EngineEvent::ToolCallFinished {
+            call_id: "c2".into(),
+            name: "apply_patch".into(),
+            is_error: true,
+            preview: "patch did not apply".into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        };
+        match engine_event_to_agent(failed) {
+            Some(AgentEvent::ToolResult { is_error, .. }) => assert!(is_error),
+            other => panic!("a reported failure must stay a tool result: {other:?}"),
+        }
     }
 }
 

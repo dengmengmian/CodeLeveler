@@ -371,6 +371,86 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
     state.screen_rows = hits;
 }
 
+pub(super) fn render_foreign_sessions_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let t = state.t();
+    let title = match state.foreign_sessions.tool {
+        Some(leveler_client_protocol::UiForeignTool::Codex) => t.screen_resume_codex,
+        _ => t.screen_resume_claude,
+    };
+    let page = crate::secondary::SecondaryPage {
+        title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.foreign_sessions_footer_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
+    let width = layout.content.width.max(1) as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    if state.foreign_sessions.sessions.is_empty() {
+        // Loading, a failed scan and a real empty result are three different
+        // claims; only the last one may say "nothing found".
+        let (text, color) = if let Some(error) = &state.foreign_sessions.error {
+            (error.as_str(), theme.status.error)
+        } else if state.foreign_sessions.loading {
+            (t.foreign_sessions_loading, theme.text.secondary)
+        } else {
+            (t.foreign_sessions_empty, theme.text.secondary)
+        };
+        for piece in wrap(&sanitize_terminal_line(text), width) {
+            lines.push(Line::from(Span::styled(piece, Style::default().fg(color))));
+        }
+    }
+    for (index, session) in state.foreign_sessions.sessions.iter().enumerate() {
+        let selected = index == state.foreign_sessions.selected;
+        // The row's key is its index: this page's cursor is positional, and a
+        // click selects the row that was painted.
+        rows.push((lines.len(), index.to_string()));
+        let cursor = if selected { "› " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
+            Span::styled(
+                truncate_display(
+                    &sanitize_terminal_line(&session.title),
+                    width.saturating_sub(2),
+                ),
+                Style::default().fg(if selected {
+                    theme.accent.primary
+                } else {
+                    theme.text.primary
+                }),
+            ),
+        ]));
+        // The source id stays on the row: it is the identity `/resume-* <id>`
+        // takes, and the thing the person must not confuse with this native
+        // session's own id.
+        let mut meta = format!("{} · {}", session.native_id, session.updated_at);
+        if let Some(cwd) = &session.cwd {
+            meta.push_str(" · ");
+            meta.push_str(cwd);
+        }
+        if let Some(branch) = &session.branch {
+            meta.push_str(" · ⎇ ");
+            meta.push_str(branch);
+        }
+        let meta = sanitize_terminal_line(&meta);
+        lines.push(Line::from(Span::styled(
+            format!("  {}", truncate_display(&meta, width.saturating_sub(2))),
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    let focus = rows
+        .get(state.foreign_sessions.selected)
+        .map(|(line, _)| *line)
+        .unwrap_or(0);
+    let mut hits = Vec::new();
+    crate::render::render_list_rows(frame, layout.content, lines, &rows, focus, theme, &mut hits);
+    state.screen_rows = hits;
+}
+
 #[cfg(test)]
 mod search_tests {
     use super::*;

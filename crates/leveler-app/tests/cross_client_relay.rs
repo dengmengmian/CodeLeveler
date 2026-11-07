@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{
-    ClientCommand, CommandEnvelope, InteractiveRuntimeClient,
-    PermissionProfile as WirePermissionProfile, RuntimeEvent,
+    ClientCommand, CommandEnvelope, InteractiveRuntimeClient, MessageId,
+    PermissionProfile as WirePermissionProfile, RuntimeEvent, UiMessage, UiMessageKind,
 };
 use leveler_core::{CommandId, SessionId};
 use leveler_execution::PermissionProfile;
@@ -403,6 +403,113 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
         via_socket.status, via_in_process.status,
         "the two clients disagree on session status — state has forked"
     );
+
+    cancel_inflight_turn(&h, &session).await;
+    shutdown.cancel();
+    let _ = task.await;
+}
+
+/// A steer accepted by the runtime is one identity and one state for every
+/// client. One client must not paint a local optimistic row and sell it as the
+/// session's truth while another client is shown a different one.
+#[tokio::test]
+async fn a_steer_has_one_identity_and_state_for_both_clients() {
+    let h = harness().await;
+
+    let server = LocalSocketServer::bind(&h.socket, h.runtime.clone())
+        .await
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let socket_client = LocalSocketRuntimeClient::connect(&h.socket).await.unwrap();
+
+    let bootstrap = socket_client
+        .create_session(CreateSessionRequest {
+            request_id: None,
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "shared steer".to_string(),
+            model: None,
+            mode: WirePermissionProfile::RequestApproval,
+        })
+        .await
+        .unwrap();
+    let session = bootstrap.session.id.clone();
+
+    // Both clients subscribe before the command, so neither can miss it.
+    let mut in_process_events = h.runtime.subscribe_session(&session);
+    let mut socket_events = socket_client.subscribe_session(&session);
+
+    // Start a turn that stays running: the model endpoint is unreachable, so
+    // the turn parks in its retry loop until this test cancels it.
+    socket_client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "LONG_TASK".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for_session_status(&h, &session, "running").await;
+    wait_for_message(&h.app, &session, "LONG_TASK", "the opening message").await;
+
+    let id = MessageId::new("steer-identity-1");
+    socket_client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: session.clone(),
+            content: "ADD_ADMIN".to_string(),
+            message_id: Some(id.clone()),
+        })
+        .await
+        .unwrap();
+
+    async fn wait_for_admitted(
+        rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+        id: &MessageId,
+        who: &str,
+    ) -> UiMessage {
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(RuntimeEvent::InputAdmitted { message }) if message.id == *id => {
+                        return message;
+                    }
+                    Ok(_) => continue,
+                    Err(error) => panic!("{who} stream closed before InputAdmitted: {error}"),
+                }
+            }
+        })
+        .await;
+        match found {
+            Ok(message) => message,
+            Err(_) => panic!("{who} never observed InputAdmitted for {id}"),
+        }
+    }
+
+    let via_socket_event = wait_for_admitted(&mut socket_events, &id, "the socket client").await;
+    let via_process_event =
+        wait_for_admitted(&mut in_process_events, &id, "the runtime client").await;
+    assert_eq!(via_socket_event.id, via_process_event.id);
+    assert_eq!(via_socket_event.text, "ADD_ADMIN");
+    assert_eq!(via_socket_event.kind, Some(UiMessageKind::PendingInput));
+
+    // The snapshot is the second read path. It must carry the same identity
+    // and the same not-yet-delivered state for both clients.
+    let via_socket = socket_client.snapshot(&session).await.unwrap();
+    let via_in_process = h.runtime.snapshot(&session).await.unwrap();
+    for (who, snapshot) in [
+        ("the socket client", &via_socket),
+        ("the runtime client", &via_in_process),
+    ] {
+        let row = snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .unwrap_or_else(|| panic!("{who} snapshot lacks the pending steer {id}"));
+        assert_eq!(row.text, "ADD_ADMIN");
+        assert_eq!(row.kind, Some(UiMessageKind::PendingInput));
+    }
 
     cancel_inflight_turn(&h, &session).await;
     shutdown.cancel();

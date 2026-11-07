@@ -247,6 +247,8 @@ impl SignalCollector {
             | AgentEvent::AssistantText { .. }
             | AgentEvent::ToolCall { .. }
             | AgentEvent::ToolResult { .. }
+            // An unknown outcome is user-visible feedback, never a failure.
+            | AgentEvent::ToolOutcomeUnknown { .. }
             | AgentEvent::PlanUpdated { .. }
             | AgentEvent::CommandProgress { .. }
             | AgentEvent::SubAgentStarted { .. }

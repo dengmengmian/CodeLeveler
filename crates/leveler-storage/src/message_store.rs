@@ -96,6 +96,22 @@ pub trait MessageStore: Send + Sync {
         payload: &str,
         now: Timestamp,
     ) -> Result<bool, crate::OwnershipError>;
+
+    /// Fenced append that also settles the durable input journal row.
+    ///
+    /// `Some(ordinal)` means the transcript row and the `pending -> consumed`
+    /// transition committed together. `None` means the input was cancelled or
+    /// already consumed: nothing was written, and the caller must keep it out
+    /// of the model's context.
+    async fn append_input_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        input_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<Option<u64>, crate::OwnershipError>;
 }
 
 /// The engine-facing model-request telemetry contract.
@@ -200,6 +216,20 @@ impl MessageStore for Database {
     ) -> Result<bool, crate::OwnershipError> {
         MessageRepository::new(self)
             .ensure_initiating_message_owned(token, session_id, turn_id, payload, now)
+            .await
+    }
+
+    async fn append_input_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        input_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<Option<u64>, crate::OwnershipError> {
+        MessageRepository::new(self)
+            .append_input_in_turn_owned(token, session_id, turn_id, input_id, payload, now)
             .await
     }
 }
@@ -358,6 +388,35 @@ impl MessageStore for MemoryMessageStore {
                 Ok(true)
             })
             .and_then(|r| r.map_err(crate::OwnershipError::Storage))
+    }
+
+    async fn append_input_in_turn_owned(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        _input_id: &str,
+        payload: &str,
+        _now: Timestamp,
+    ) -> Result<Option<u64>, crate::OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                "memory message store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                self.append_records(session_id, turn_id, &[payload.to_string()])?;
+                let ordinal = self
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(stored_session, _, _)| stored_session == session_id.as_str())
+                    .count() as u64;
+                Ok(ordinal.saturating_sub(1))
+            })
+            .and_then(|r| r.map(Some).map_err(crate::OwnershipError::Storage))
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {

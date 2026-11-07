@@ -8,8 +8,8 @@ use crate::fold::DisplayMode;
 use crate::i18n::{Locale, UiText};
 use crate::theme::Theme;
 use crate::transcript::{
-    AssistantBlock, AssistantKind, ThoughtBlock, ToolStatus, TranscriptItem, TurnEndBlock,
-    TurnEndStatus,
+    AssistantBlock, AssistantKind, InputDelivery, ThoughtBlock, ToolStatus, TranscriptItem,
+    TurnEndBlock, TurnEndStatus,
 };
 
 use super::text::wrap;
@@ -392,6 +392,35 @@ pub(crate) fn user_copy_rows(text: &str, width: usize) -> Vec<crate::selection::
     rows
 }
 
+/// One short line under a user message, naming where that message stands.
+///
+/// Deliberately one line and no detail: the transcript already says what the
+/// text is, and the reader only needs to know whether the running task took it.
+pub(crate) fn input_state_line(
+    state: &InputDelivery,
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+) -> Line<'static> {
+    let (glyph, label, color) = match state {
+        InputDelivery::Sending => ("·", t.input_state_sending, theme.text.muted),
+        InputDelivery::Pending => ("·", t.input_state_pending, theme.text.muted),
+        InputDelivery::Delivered => ("·", t.input_state_delivered, theme.text.secondary),
+        InputDelivery::Cancelled(_) => ("✗", t.input_state_cancelled, theme.status.warning),
+        InputDelivery::Unknown => ("?", t.input_state_unknown, theme.status.warning),
+    };
+    let prefix = format!("{USER_PROMPT_INDENT}{glyph} ");
+    let budget = width
+        .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
+        .max(1);
+    let shown = crate::render::truncate_display(label, budget);
+    let style = Style::default().fg(color);
+    Line::from(vec![
+        Span::styled(prefix, style),
+        Span::styled(shown, style),
+    ])
+}
+
 /// Render one transcript item to styled lines (no leading separator).
 pub fn item_render(
     item: &TranscriptItem,
@@ -403,6 +432,10 @@ pub fn item_render(
     let mut out: Vec<Line<'static>> = Vec::new();
     match item {
         TranscriptItem::User(text) => push_user_turn(text, theme, wrap_width, &mut out),
+        TranscriptItem::UserInput(block) => {
+            push_user_turn(&block.text, theme, wrap_width, &mut out);
+            out.push(input_state_line(&block.state, theme, wrap_width, t));
+        }
         TranscriptItem::Assistant(block) => {
             out.extend(assistant_render(block, theme, wrap_width));
         }

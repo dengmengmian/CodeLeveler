@@ -530,6 +530,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_input_migrations_upgrade_old_stores_without_losing_history() {
+        use crate::{
+            MessageRepository, SessionInputRepository, SessionInputState, SessionRepository,
+        };
+
+        // These are genuine SQLx histories, including checksums, rather than
+        // tables whose migration version was edited to simulate an old binary.
+        for applied in [0, 48, 49, 50, 51] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sessions.db");
+            if applied != 0 {
+                let mut conn = create_legacy_database(&path, applied + 1).await;
+                sqlx::query("INSERT INTO sessions (id, repository, goal, status, model, state, created_at, updated_at) VALUES ('legacy','/r','keep history','completed','provider/model','complete','t','t')")
+                    .execute(&mut conn).await.unwrap();
+                sqlx::query("INSERT INTO session_messages (session_id, ordinal, payload, created_at) VALUES ('legacy',0,'{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"keep this message\"}]}','t')")
+                    .execute(&mut conn).await.unwrap();
+                if applied >= 49 {
+                    sqlx::query("INSERT INTO foreign_session_origins (session_id,tool,native_id,source_path,imported_at) VALUES ('legacy','test','native','/source','t')")
+                        .execute(&mut conn).await.unwrap();
+                }
+                if applied >= 50 {
+                    for (id, state, ordinal) in [
+                        ("waiting", "pending", None),
+                        ("delivered", "consumed", Some(0_i64)),
+                        ("cancelled", "cancelled", None),
+                    ] {
+                        sqlx::query("INSERT INTO session_inputs (id,session_id,content,state,ordinal,created_at) VALUES (?1,'legacy',?1,?2,?3,'t')")
+                            .bind(id).bind(state).bind(ordinal).execute(&mut conn).await.unwrap();
+                    }
+                }
+                if applied == 51 {
+                    sqlx::query("UPDATE session_messages SET input_id='delivered' WHERE session_id='legacy'")
+                        .execute(&mut conn).await.unwrap();
+                }
+                sqlx::Connection::close(conn).await.unwrap();
+            }
+
+            let db = Database::connect(&path).await.unwrap();
+            let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(version, 51, "starting with migration {applied}");
+            let session = leveler_core::SessionId::new("legacy");
+            if applied != 0 {
+                let stored = SessionRepository::new(&db)
+                    .get(&session)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.goal, "keep history");
+                let messages = MessageRepository::new(&db)
+                    .load_with_input_ids(&session)
+                    .await
+                    .unwrap();
+                assert_eq!(messages.len(), 1);
+                assert!(messages[0].0.contains("keep this message"));
+                assert_eq!(
+                    messages[0].1.as_deref(),
+                    (applied == 51).then_some("delivered")
+                );
+            }
+            if applied >= 49 {
+                let native: String = sqlx::query_scalar(
+                    "SELECT native_id FROM foreign_session_origins WHERE session_id='legacy'",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(native, "native");
+            }
+            let inputs = SessionInputRepository::new(&db);
+            if applied >= 50 {
+                let rows = inputs.all(&session).await.unwrap();
+                assert_eq!(rows.len(), 3);
+                assert_eq!(inputs.pending(&session).await.unwrap()[0].id, "waiting");
+                assert_eq!(
+                    inputs
+                        .load(&session, "cancelled")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    SessionInputState::Cancelled
+                );
+                assert_eq!(
+                    inputs
+                        .load(&session, "delivered")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .ordinal,
+                    Some(0)
+                );
+            } else {
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_inputs")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+            let journal = inputs.all(&session).await.unwrap();
+            let messages = MessageRepository::new(&db)
+                .load_with_input_ids(&session)
+                .await
+                .unwrap();
+            let history: Vec<(i64, Vec<u8>, bool, String, i64)> = sqlx::query_as("SELECT version,checksum,success,installed_on,execution_time FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(db.pool()).await.unwrap();
+            db.pool().close().await;
+            let reopened = Database::connect(&path).await.unwrap();
+            let after: Vec<(i64, Vec<u8>, bool, String, i64)> = sqlx::query_as("SELECT version,checksum,success,installed_on,execution_time FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(reopened.pool()).await.unwrap();
+            assert_eq!(
+                after, history,
+                "reopening must not rewrite migration history"
+            );
+            assert_eq!(
+                SessionInputRepository::new(&reopened)
+                    .all(&session)
+                    .await
+                    .unwrap(),
+                journal,
+                "reopening must preserve every journal state and identity"
+            );
+            assert_eq!(
+                MessageRepository::new(&reopened)
+                    .load_with_input_ids(&session)
+                    .await
+                    .unwrap(),
+                messages
+            );
+            assert!(
+                sqlx::query("PRAGMA foreign_key_check")
+                    .fetch_all(reopened.pool())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            reopened.pool().close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn append_input_migrations_reject_a_binary_missing_an_applied_version() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let incomplete = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version != 49)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        let error = incomplete.run(db.pool()).await.unwrap_err();
+        assert!(
+            matches!(error, sqlx::migrate::MigrateError::VersionMissing(49)),
+            "{error}"
+        );
+        // Failure must leave the real store usable by the matching binary.
+        run_migrations(db.pool()).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version BETWEEN 49 AND 51 AND success=TRUE")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
     async fn reconnecting_a_file_db_keeps_data_and_remigrates_idempotently() {
         let dir = std::env::temp_dir().join(format!(
             "leveler-db-remigrate-{}-{}",

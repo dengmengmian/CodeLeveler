@@ -176,11 +176,20 @@ fn unsettled_tool_calls(
             EngineEvent::ToolCallFinished {
                 call_id,
                 is_error,
+                preview,
                 agent_id: Some(agent),
                 ..
             } if agent == child => {
                 if let Some((_, call)) = calls.iter_mut().find(|(id, _)| id == call_id) {
-                    call.finished = Some(*is_error);
+                    // The crash-window acknowledgement only records that the
+                    // outcome is unknown. Its compatibility `is_error` flag is
+                    // not a tool result and must not reach the child as one.
+                    call.finished =
+                        if leveler_engine::is_user_acknowledged_crash_marker(preview, *is_error) {
+                            None
+                        } else {
+                            Some(*is_error)
+                        };
                 }
             }
             _ => {}
@@ -238,6 +247,37 @@ fn recovery_note(
 mod tests {
     use super::*;
 
+    fn child_call(started: bool, is_error: bool, preview: &str, child: &str) -> (i64, EngineEvent) {
+        if started {
+            (
+                1,
+                EngineEvent::ToolCallStarted {
+                    call_id: "c1".into(),
+                    name: "apply_patch".into(),
+                    arguments: "{}".into(),
+                    parallel: false,
+                    risk: None,
+                    agent_id: Some(child.into()),
+                    model_step: None,
+                },
+            )
+        } else {
+            (
+                2,
+                EngineEvent::ToolCallFinished {
+                    call_id: "c1".into(),
+                    name: "apply_patch".into(),
+                    is_error,
+                    preview: preview.into(),
+                    agent_id: Some(child.into()),
+                    applied_diff: None,
+                    exit_code: None,
+                    stop: None,
+                },
+            )
+        }
+    }
+
     #[test]
     fn the_note_names_an_unknown_outcome_rather_than_assuming_one() {
         let note = recovery_note(
@@ -255,5 +295,38 @@ mod tests {
         );
         assert!(note.contains("re-claimed"), "{note}");
         assert!(note.contains("outcome unknown"), "{note}");
+    }
+
+    /// A user-acknowledged crash marker is recovery control, not a failed
+    /// tool terminal: a resumed child must still be told the outcome is
+    /// unknown, or it will assume its write failed when it may have landed.
+    #[test]
+    fn an_acknowledged_unknown_outcome_stays_unknown_for_a_resumed_child() {
+        let decoded = vec![
+            child_call(true, false, "", "child-1"),
+            child_call(
+                false,
+                true,
+                leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW,
+                "child-1",
+            ),
+        ];
+        let calls = unsettled_tool_calls(&decoded, "child-1", None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].finished, None,
+            "an acknowledged unknown outcome must not be replayed as an error"
+        );
+    }
+
+    /// The control: a real errored result is still reported as an error.
+    #[test]
+    fn a_real_child_error_is_still_an_error() {
+        let decoded = vec![
+            child_call(true, false, "", "child-1"),
+            child_call(false, true, "patch rejected", "child-1"),
+        ];
+        let calls = unsettled_tool_calls(&decoded, "child-1", None);
+        assert_eq!(calls[0].finished, Some(true));
     }
 }

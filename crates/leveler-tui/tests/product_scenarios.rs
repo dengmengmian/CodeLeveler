@@ -98,6 +98,7 @@ fn opened(goal: &str) -> AppState {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     };
     reduce(
         &mut s,
@@ -756,6 +757,7 @@ fn s10_resume() {
         collaboration: None,
         execution_task: None,
         children: Vec::new(),
+        foreign_origin: None,
     };
     reduce(
         &mut s,

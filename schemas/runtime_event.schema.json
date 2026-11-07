@@ -373,6 +373,59 @@
       }
     },
     {
+      "description": "The runtime accepted a mid-turn input and made it durable, but no model round has received it yet.\n\nThis is the ACK boundary: unlike [`Self::UserMessageAdded`], it does not claim a transcript row exists. Every connected client paints the same row from this event, not from the submitting client's optimism.",
+      "type": "object",
+      "required": [
+        "message",
+        "type"
+      ],
+      "properties": {
+        "message": {
+          "$ref": "#/definitions/UiMessage"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "input_admitted"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A previously admitted input reached a terminal state.\n\n`Delivered` means its transcript row is durable (and `ordinal` locates it); `Cancelled` means it never will be. A cancelled input is never resurrected by a later turn.",
+      "type": "object",
+      "required": [
+        "message_id",
+        "state",
+        "type"
+      ],
+      "properties": {
+        "message_id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "ordinal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reason": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/UiInputState"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "input_settled"
+          ]
+        }
+      }
+    },
+    {
       "description": "A new assistant message began; deltas will target this id.",
       "type": "object",
       "required": [
@@ -910,6 +963,99 @@
           "type": "string",
           "enum": [
             "session_list"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The locally discovered sessions of another coding agent, newest first. `error` is present only when discovery itself could not run; an empty `sessions` list with no error is a real \"nothing found\".",
+      "type": "object",
+      "required": [
+        "sessions",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiForeignSession"
+          }
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "foreign_session_list"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A foreign session was imported. `session_id` is the NEW native CodeLeveler session; the source identity is carried so the client can keep it visible after the view switches.",
+      "type": "object",
+      "required": [
+        "native_id",
+        "session_id",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "native_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "foreign_session_imported"
+          ]
+        },
+        "warning": {
+          "description": "A source/current-workspace mismatch the person should see before trusting the continuation. Absent when the directories agree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A foreign session could not be imported. Nothing was created, and the source file was not modified.",
+      "type": "object",
+      "required": [
+        "message",
+        "native_id",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "native_id": {
+          "type": "string"
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "foreign_session_import_failed"
           ]
         }
       }
@@ -4007,6 +4153,59 @@
           }
         },
         {
+          "description": "The runtime accepted a mid-turn input and made it durable, but no model round has received it yet.\n\nThis is the ACK boundary: unlike [`Self::UserMessageAdded`], it does not claim a transcript row exists. Every connected client paints the same row from this event, not from the submitting client's optimism.",
+          "type": "object",
+          "required": [
+            "message",
+            "type"
+          ],
+          "properties": {
+            "message": {
+              "$ref": "#/definitions/UiMessage"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_admitted"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A previously admitted input reached a terminal state.\n\n`Delivered` means its transcript row is durable (and `ordinal` locates it); `Cancelled` means it never will be. A cancelled input is never resurrected by a later turn.",
+          "type": "object",
+          "required": [
+            "message_id",
+            "state",
+            "type"
+          ],
+          "properties": {
+            "message_id": {
+              "$ref": "#/definitions/MessageId"
+            },
+            "ordinal": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/definitions/UiInputState"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "input_settled"
+              ]
+            }
+          }
+        },
+        {
           "description": "A new assistant message began; deltas will target this id.",
           "type": "object",
           "required": [
@@ -4544,6 +4743,99 @@
               "type": "string",
               "enum": [
                 "session_list"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The locally discovered sessions of another coding agent, newest first. `error` is present only when discovery itself could not run; an empty `sessions` list with no error is a real \"nothing found\".",
+          "type": "object",
+          "required": [
+            "sessions",
+            "tool",
+            "type"
+          ],
+          "properties": {
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/UiForeignSession"
+              }
+            },
+            "tool": {
+              "$ref": "#/definitions/UiForeignTool"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "foreign_session_list"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A foreign session was imported. `session_id` is the NEW native CodeLeveler session; the source identity is carried so the client can keep it visible after the view switches.",
+          "type": "object",
+          "required": [
+            "native_id",
+            "session_id",
+            "tool",
+            "type"
+          ],
+          "properties": {
+            "native_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/definitions/SessionId"
+            },
+            "tool": {
+              "$ref": "#/definitions/UiForeignTool"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "foreign_session_imported"
+              ]
+            },
+            "warning": {
+              "description": "A source/current-workspace mismatch the person should see before trusting the continuation. Absent when the directories agree.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A foreign session could not be imported. Nothing was created, and the source file was not modified.",
+          "type": "object",
+          "required": [
+            "message",
+            "native_id",
+            "tool",
+            "type"
+          ],
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "native_id": {
+              "type": "string"
+            },
+            "tool": {
+              "$ref": "#/definitions/UiForeignTool"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "foreign_session_import_failed"
               ]
             }
           }
@@ -8252,6 +8544,102 @@
         }
       }
     },
+    "UiForeignOrigin": {
+      "description": "The durable source identity of an imported CodeLeveler session.",
+      "type": "object",
+      "required": [
+        "imported_at",
+        "native_id",
+        "source_path",
+        "tool"
+      ],
+      "properties": {
+        "imported_at": {
+          "type": "string"
+        },
+        "native_id": {
+          "type": "string"
+        },
+        "source_cwd": {
+          "description": "Working directory recorded by the source session, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_path": {
+          "description": "The exact source file the read-only history tool addresses. The client shows this as provenance; it never rewrites it.",
+          "type": "string"
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        }
+      }
+    },
+    "UiForeignSession": {
+      "description": "One locally discovered source session, as a picker needs it.",
+      "type": "object",
+      "required": [
+        "native_id",
+        "size_bytes",
+        "title",
+        "tool",
+        "updated_at"
+      ],
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory recorded by the source session.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "native_id": {
+          "description": "The source agent's own session id.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "title": {
+          "type": "string"
+        },
+        "tool": {
+          "$ref": "#/definitions/UiForeignTool"
+        },
+        "updated_at": {
+          "description": "RFC 3339 UTC, derived from the source file.",
+          "type": "string"
+        }
+      }
+    },
+    "UiForeignTool": {
+      "description": "The agent whose local session store is read.",
+      "oneOf": [
+        {
+          "description": "Anthropic Claude Code.",
+          "type": "string",
+          "enum": [
+            "claude_code"
+          ]
+        },
+        {
+          "description": "OpenAI Codex.",
+          "type": "string",
+          "enum": [
+            "codex"
+          ]
+        }
+      ]
+    },
     "UiGlobalTaskIndex": {
       "type": "object",
       "required": [
@@ -8471,6 +8859,25 @@
         }
       }
     },
+    "UiInputState": {
+      "description": "The terminal state of an accepted mid-turn input.",
+      "oneOf": [
+        {
+          "description": "The input's transcript row is durable and was part of a model request.",
+          "type": "string",
+          "enum": [
+            "delivered"
+          ]
+        },
+        {
+          "description": "The task was cancelled before the input was delivered.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        }
+      ]
+    },
     "UiInterruptedCallState": {
       "description": "How much the runtime can prove about an interrupted tool call's owner.",
       "oneOf": [
@@ -8645,6 +9052,27 @@
           "type": "string",
           "enum": [
             "runtime_notice"
+          ]
+        },
+        {
+          "description": "Typed by the user while a turn ran, accepted durably, and not yet in any model request. Joins the running turn at its next round.",
+          "type": "string",
+          "enum": [
+            "pending_input"
+          ]
+        },
+        {
+          "description": "Typed by the user while a turn ran, accepted durably, and now part of the transcript and a model request.",
+          "type": "string",
+          "enum": [
+            "delivered_input"
+          ]
+        },
+        {
+          "description": "Accepted, then settled without delivery because the user cancelled the task. It must stay visible as such and must never run later.",
+          "type": "string",
+          "enum": [
+            "cancelled_input"
           ]
         }
       ]
@@ -8845,7 +9273,7 @@
           "format": "int64"
         },
         "status": {
-          "description": "running | ok | fail | info",
+          "description": "running | ok | fail | unknown | info\n\n`unknown` is a terminal state of its own: the call's outcome could not be established after a crash. It is neither success, failure, nor a still-running call, and must not be collapsed into any of them.",
           "type": "string"
         },
         "target": {
@@ -9433,6 +9861,17 @@
             }
           ]
         },
+        "foreign_origin": {
+          "description": "Where this session came from when it was created by importing another agent's session. Additive: absent on an ordinary native session and on runtimes that predate import.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiForeignOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "goal": {
           "type": "string"
         },
@@ -9841,7 +10280,7 @@
           "$ref": "#/definitions/ObservationClass"
         },
         "failed": {
-          "description": "Finished with `is_error = true`.",
+          "description": "Finished with `is_error = true` and a reported result.\n\nA call whose outcome the crash window left unknown — even when the raw finish row carries `is_error = true` because the client had to fill in a shape — is counted in [`Self::unknown`], not here.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
@@ -9866,6 +10305,13 @@
         },
         "unfinished": {
           "description": "`tool_call_started` with no matching `tool_call_finished`.",
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "unknown": {
+          "description": "Finished with an outcome that could not be established (crash-window acknowledgement marker). Unknown is not failure and not success.",
           "default": 0,
           "type": "integer",
           "format": "uint32",

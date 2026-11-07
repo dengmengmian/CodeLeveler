@@ -761,6 +761,50 @@ async fn acknowledged_crash_window_unblocks_resume() {
         .expect("resume must proceed after explicit acknowledgement");
 }
 
+/// Repeating the confirmation changes nothing: the first call closes the
+/// dangling call, the second finds nothing to close and appends no row. A
+/// duplicate terminal would make one interrupted call look like several and
+/// would give the model two recovery facts for one unknown outcome.
+#[tokio::test]
+async fn acknowledging_the_crash_window_twice_closes_nothing_the_second_time() {
+    let (engine, db, dir) = harness(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(
+        &db,
+        &engine,
+        &session,
+        "read_file",
+        serde_json::json!({"path": "README.md"}).to_string(),
+    )
+    .await;
+
+    assert_eq!(engine.acknowledge_crash_window(&session).await.unwrap(), 1);
+    assert_eq!(
+        engine.acknowledge_crash_window(&session).await.unwrap(),
+        0,
+        "a repeated acknowledgement must not append another terminal"
+    );
+
+    let events = recorded_events(&db, &session).await;
+    let markers = events
+        .iter()
+        .filter(|event| event.is_user_acknowledged_crash_marker())
+        .count();
+    assert_eq!(markers, 1, "one interrupted call, one recovery fact");
+
+    let log = EventLog::new(&db, session.clone());
+    assert!(
+        log.dangling_tool_calls().await.unwrap().is_empty(),
+        "the acknowledged call is closed for snapshot reconstruction"
+    );
+    let acknowledged = log.acknowledged_crash_calls().await.unwrap();
+    assert_eq!(acknowledged.len(), 1);
+    assert_eq!(acknowledged[0].call_id, "c1");
+    assert_eq!(acknowledged[0].name, "read_file");
+}
+
 /// The model must see the recovery fact, not just the user. The interrupted
 /// call's tool result was never persisted, so without this notice the next
 /// turn re-drives the same request blind — and may repeat a side effect the

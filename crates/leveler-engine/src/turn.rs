@@ -403,6 +403,31 @@ impl TranscriptSink for TurnSink {
         self.append_payloads(&payloads).await
     }
 
+    async fn append_input(
+        &mut self,
+        input_id: &str,
+        message: &Message,
+    ) -> Result<Option<u64>, PortError> {
+        let payload =
+            serde_json::to_string(message).map_err(|e| PortError::Persistence(e.to_string()))?;
+        self.messages
+            .append_input_in_turn_owned(
+                &self.token,
+                &self.session_id,
+                &self.turn_id,
+                input_id,
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|e| match e {
+                leveler_storage::OwnershipError::Stale { .. } => {
+                    PortError::StaleOwnership(e.to_string())
+                }
+                other => PortError::Persistence(other.to_string()),
+            })
+    }
+
     async fn append_partial_response(&mut self, text: &str) -> Result<(), PortError> {
         let message = Message::interrupted_response(text);
         let mut payload =

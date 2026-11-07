@@ -514,8 +514,17 @@ pub(crate) async fn load_goal_verification_runs(
                 call_id,
                 is_error,
                 exit_code,
+                preview,
                 ..
             } => {
+                // A user-acknowledged crash-window marker is recovery
+                // control, not a tool terminal. Its `is_error: true` exists
+                // only for compatibility with older histories; replaying it
+                // would turn an Unknown outcome into failed evidence.
+                if leveler_engine::is_user_acknowledged_crash_marker(&preview, is_error) {
+                    calls.remove(&call_id);
+                    continue;
+                }
                 if let Some((name, arguments, model_step)) = calls.remove(&call_id)
                     && let Some(label) =
                         crate::executor::goal_verification::command_label(&name, &arguments)
@@ -1118,5 +1127,110 @@ mod background_result_run_tests {
     fn a_non_command_call_has_no_run() {
         let calls = started(&[("call-1", "read_file", serde_json::json!({"path":"a"}), 1)]);
         assert!(background_result_run(&calls, "call-1", false, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod goal_verification_replay_tests {
+    use super::*;
+    use leveler_storage::{Database, EngineStores, SessionRecord, SessionRepository};
+
+    /// One goal window whose only command call ended with `finished`.
+    async fn goal_with_one_call(
+        is_error: bool,
+        exit_code: Option<i32>,
+        preview: &str,
+    ) -> (EngineStores, SessionId, leveler_core::GoalId) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let goal = leveler_core::GoalId::new("goal-replay");
+        let payload = serde_json::json!({
+            "version": 2,
+            "initiating_message": null,
+            "objective": ObjectiveAnchor::from_user_message("verify"),
+            "continuation_root_turn_id": null,
+            "goal_id": goal,
+        })
+        .to_string();
+        let stores = EngineStores::from_database(&db);
+        let turn = stores
+            .turns
+            .start(&session, "goal", Some(&payload), leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let started = EngineEvent::ToolCallStarted {
+            call_id: "call-1".into(),
+            name: "shell_command".into(),
+            arguments: serde_json::json!({"cmd": "cargo test"}).to_string(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(3),
+        };
+        stores
+            .events
+            .append(
+                &session,
+                Some(&turn_id),
+                "tool_call_started",
+                &serde_json::to_string(&started).unwrap(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let finished = EngineEvent::ToolCallFinished {
+            call_id: "call-1".into(),
+            name: "shell_command".into(),
+            is_error,
+            preview: preview.into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code,
+            stop: None,
+        };
+        stores
+            .events
+            .append(
+                &session,
+                Some(&turn_id),
+                "tool_call_finished",
+                &serde_json::to_string(&finished).unwrap(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        (stores, session, goal)
+    }
+
+    /// A crash-window acknowledgement is recovery control, not a tool result:
+    /// replaying it as a failed verification run would tell a resumed goal its
+    /// last command failed when its outcome is unknown.
+    #[tokio::test]
+    async fn an_acknowledged_unknown_outcome_is_not_a_failed_verification_run() {
+        let (stores, session, goal) =
+            goal_with_one_call(true, None, leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW).await;
+        let runs = load_goal_verification_runs(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert!(
+            runs.is_empty(),
+            "an unknown outcome is not verification evidence, got {runs:?}"
+        );
+    }
+
+    /// The control: a command that really failed is still a failed run, so
+    /// the fix above cannot silently drop real evidence.
+    #[tokio::test]
+    async fn a_real_failed_command_is_still_a_failed_verification_run() {
+        let (stores, session, goal) = goal_with_one_call(true, Some(1), "boom").await;
+        let runs = load_goal_verification_runs(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].label, "cargo test");
+        assert!(!runs[0].ok);
     }
 }

@@ -1,13 +1,13 @@
 use leveler_client_protocol::{
-    NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, UiPlanState, UiRole,
-    UiSessionSnapshot,
+    NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, UiInputState, UiPlanState,
+    UiRole, UiSessionSnapshot,
 };
 
 use crate::overlay::Overlay;
 use crate::overlay::approval::ApprovalOverlay;
 use crate::overlay::clarification::ClarificationOverlay;
 use crate::state::{AppState, Notification, PendingInteraction};
-use crate::transcript::TurnEndStatus;
+use crate::transcript::{InputDelivery, TurnEndStatus};
 
 /// Record which build is serving this client. Only two KNOWN identities can
 /// disagree: an unknown one proves nothing and must neither raise nor clear a
@@ -240,17 +240,76 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             });
         }
         RuntimeEvent::UserMessageAdded { message } => {
+            let kind = message.kind;
             let shown = state.message_with_images(message.images, &message.text);
-            if message.kind == Some(leveler_client_protocol::UiMessageKind::RuntimeNotice) {
+            match kind {
                 // The runtime authored this into the model's context on the user
                 // transport role; the person did not write it. It gets the
                 // runtime-notice presentation, never the user author bar — and
                 // it is never reasoning, so it is never a Thought.
-                if !shown.trim().is_empty() {
-                    state.transcript.push_note(shown);
+                Some(leveler_client_protocol::UiMessageKind::RuntimeNotice) => {
+                    if !shown.trim().is_empty() {
+                        state.transcript.push_note(shown);
+                    }
                 }
-            } else {
-                state.transcript.push_user_if_new(shown);
+                // An accepted input carries a durable identity the whole
+                // lifecycle shares. Painting by that identity — never by text —
+                // is what keeps a retried or replayed announcement one row.
+                Some(leveler_client_protocol::UiMessageKind::PendingInput) => {
+                    state
+                        .transcript
+                        .push_input(message.id, shown, InputDelivery::Pending);
+                }
+                Some(leveler_client_protocol::UiMessageKind::DeliveredInput) => {
+                    state
+                        .transcript
+                        .push_input(message.id, shown, InputDelivery::Delivered);
+                }
+                Some(leveler_client_protocol::UiMessageKind::CancelledInput) => {
+                    state.transcript.push_input(
+                        message.id,
+                        shown,
+                        InputDelivery::Cancelled(String::new()),
+                    );
+                }
+                None => state.transcript.push_user_if_new(shown),
+            }
+        }
+        RuntimeEvent::InputAdmitted { message } => {
+            // Admission and consumption can be emitted by different runtime
+            // threads. A late admission cannot undo a terminal journal fact;
+            // an unknown submission can still become confirmed as pending.
+            if !matches!(
+                state.transcript.input_state(&message.id),
+                Some(InputDelivery::Delivered | InputDelivery::Cancelled(_))
+            ) {
+                let shown = state.message_with_images(message.images, &message.text);
+                state
+                    .transcript
+                    .push_input(message.id, shown, InputDelivery::Pending);
+            }
+        }
+        RuntimeEvent::InputSettled {
+            message_id,
+            state: settled,
+            reason,
+            ..
+        } => {
+            // A live client already drew this input at admission. A client that
+            // subscribed later learns the text from the snapshot; this event is
+            // then only a state refinement for a row it does not have, and the
+            // snapshot remains the authority.
+            match settled {
+                UiInputState::Delivered => {
+                    state
+                        .transcript
+                        .set_input_state(&message_id, InputDelivery::Delivered);
+                }
+                UiInputState::Cancelled => {
+                    state
+                        .transcript
+                        .set_input_state(&message_id, InputDelivery::Cancelled(reason));
+                }
             }
         }
         RuntimeEvent::AssistantMessageStarted { message_id } => {
@@ -1413,6 +1472,74 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // state; the next snapshot resolves it from the log.
             replace_active_background_tasks(state, &tasks, &[]);
         }
+        RuntimeEvent::ForeignSessionList {
+            tool,
+            sessions,
+            error,
+        } => {
+            // A late answer for a source the page is no longer showing belongs
+            // to no one on screen; applying it would replace the list under
+            // the reader.
+            if state.foreign_sessions.tool != Some(tool) {
+                return;
+            }
+            state.foreign_sessions.loading = false;
+            state.foreign_sessions.sessions = sessions;
+            state.foreign_sessions.error = error;
+            state.foreign_sessions.selected = state
+                .foreign_sessions
+                .selected
+                .min(state.foreign_sessions.sessions.len().saturating_sub(1));
+        }
+        RuntimeEvent::ForeignSessionImported {
+            tool,
+            native_id,
+            warning,
+            ..
+        } => {
+            state.foreign_sessions.importing = false;
+            state.foreign_sessions.tool = None;
+            state.foreign_sessions.sessions.clear();
+            state.foreign_sessions.error = None;
+            // The new native session owns the view; `SessionOpened` follows
+            // with its snapshot.
+            if state.active_screen == crate::screen::Screen::ForeignSessions {
+                state.active_screen = crate::screen::Screen::Conversation;
+                state.screen_scroll = 0;
+            }
+            // The runtime's warning prose is not this client's copy; the only
+            // import warning is a source/workspace mismatch, and the exact
+            // source directory is carried by the durable briefing.
+            let t = state.t();
+            let (level, template) = if warning.is_some() {
+                (NotificationLevel::Warning, t.foreign_imported_mismatch)
+            } else {
+                (NotificationLevel::Info, t.foreign_imported)
+            };
+            let message = template
+                .replacen("{}", tool.display_name(), 1)
+                .replacen("{}", &native_id, 1);
+            state.notification = Some(Notification { level, message });
+        }
+        RuntimeEvent::ForeignSessionImportFailed {
+            tool,
+            native_id,
+            message,
+        } => {
+            // The picker stays: the source itself may still be importable, and
+            // another row can be tried. Only the in-flight guard is released.
+            state.foreign_sessions.importing = false;
+            let text = state
+                .t()
+                .foreign_import_failed
+                .replacen("{}", tool.display_name(), 1)
+                .replacen("{}", &native_id, 1)
+                .replacen("{}", &message, 1);
+            state.notification = Some(Notification {
+                level: NotificationLevel::Error,
+                message: text,
+            });
+        }
     }
 }
 
@@ -2019,7 +2146,29 @@ fn restore_history(
     if !keep_in_flight {
         scratch.transcript.finalize_in_flight();
     }
+    // A history answer is a snapshot taken earlier than the replay. Input the
+    // live transcript admitted or settled after that snapshot is newer than
+    // it, and only the runtime can settle it; erasing the row because the
+    // replay cannot carry it would make an accepted message vanish. Rows the
+    // replay produced itself win, so a consumed input never regresses to
+    // pending.
+    let journal_held: Vec<_> = state
+        .transcript
+        .inputs()
+        .filter(|input| {
+            matches!(
+                input.state,
+                InputDelivery::Pending | InputDelivery::Cancelled(_)
+            )
+        })
+        .map(|input| (input.id.clone(), input.text.clone(), input.state.clone()))
+        .collect();
     state.transcript.replace_with(scratch.transcript);
+    for (id, text, delivery) in journal_held {
+        if !state.transcript.has_input(&id) {
+            state.transcript.push_input(id, text, delivery);
+        }
+    }
     // The rebuilt transcript has its own positions; an index from the previous
     // transcript would name another entry.
 }
@@ -2072,6 +2221,9 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     if let Some(collaboration) = &session.collaboration {
         state.collaboration = collaboration.clone();
     }
+    // Provenance belongs to the opened session, not to the client: an ordinary
+    // native session clears whatever the previous session showed.
+    state.foreign_origin = session.foreign_origin.clone();
 }
 
 /// What a snapshot is allowed to do to the view's transcript.
@@ -2239,6 +2391,15 @@ fn apply_session_with(
             .any(|pending| pending.command.session_id() == Some(&session.id))
     {
         state.status = RuntimeStatus::Busy;
+    }
+    // A resync snapshot settles whatever transient status the missing
+    // terminal left behind (a daemon restart reports the interrupted turn as
+    // no longer running). Without this the footer kept drawing that turn's
+    // command heartbeat — `命令运行中` — forever, with no turn owning it. Only
+    // Replace rebuilds the view; a confirmation (KeepLive) was captured as a
+    // command was admitted and must not erase activity of the live turn.
+    if adoption == TranscriptAdoption::Replace && state.status != RuntimeStatus::Busy {
+        clear_activity(state);
     }
 
     // A snapshot that IS the view (opening a session, resyncing after events
@@ -2430,6 +2591,35 @@ fn apply_session_with(
                 if message.kind == Some(leveler_client_protocol::UiMessageKind::RuntimeNotice) =>
             {
                 state.transcript.push_note(message.text.clone());
+            }
+            // Accepted input keeps its journal identity across Resume: the
+            // row a client drew live is the row it reopens here.
+            UiRole::User
+                if message.kind == Some(leveler_client_protocol::UiMessageKind::PendingInput) =>
+            {
+                state.transcript.push_input(
+                    message.id.clone(),
+                    message.text.clone(),
+                    InputDelivery::Pending,
+                );
+            }
+            UiRole::User
+                if message.kind == Some(leveler_client_protocol::UiMessageKind::DeliveredInput) =>
+            {
+                state.transcript.push_input(
+                    message.id.clone(),
+                    message.text.clone(),
+                    InputDelivery::Delivered,
+                );
+            }
+            UiRole::User
+                if message.kind == Some(leveler_client_protocol::UiMessageKind::CancelledInput) =>
+            {
+                state.transcript.push_input(
+                    message.id.clone(),
+                    message.text.clone(),
+                    InputDelivery::Cancelled(String::new()),
+                );
             }
             UiRole::User => state.transcript.push_user(message.text.clone()),
             UiRole::Assistant => {

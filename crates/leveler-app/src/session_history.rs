@@ -24,8 +24,12 @@ pub const HISTORY_TURNS_MAX: usize = 100;
 /// One durable fact in time order: an engine event or a message the user sent.
 enum Fact {
     Event(Box<EngineEvent>),
-    /// A user message: its text, and how many images it carried.
-    User(String, usize),
+    /// A user message: its text, how many images it carried, and the accepted
+    /// input identity the runtime admitted it under (an append), if any.
+    User(String, usize, Option<MessageId>),
+    /// A runtime notice with no event equivalent that must stay visible when
+    /// the session is reopened (the imported-session briefing).
+    Notice(String),
     /// A host-marked incomplete raw response; identity is its transcript row.
     PartialAssistant(MessageId, String),
 }
@@ -100,6 +104,7 @@ pub async fn load_session_history(
             transcript_fact(
                 &m.payload,
                 MessageId::new(format!("{session_id}-partial-{}", m.ordinal)),
+                m.input_id.as_deref(),
             )
             .map(|fact| (parse_time(&m.created_at), fact))
         })
@@ -127,7 +132,7 @@ pub async fn load_session_history(
         facts.push((at, Fact::Event(Box::new(event))));
         if let Some(message) = rebuilt {
             let (text, images) = user_input(&message);
-            facts.push((at, Fact::User(text, images)));
+            facts.push((at, Fact::User(text, images, None)));
         }
     }
     facts.extend(messages);
@@ -179,14 +184,31 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
             _ => 0,
         };
         let produced = match fact {
-            Fact::User(text, images) => vec![RuntimeEvent::UserMessageAdded {
+            Fact::User(text, images, input_id) => vec![RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    // An accepted append keeps the identity its admission
+                    // answered with. A seed submit has no journal identity and
+                    // keeps the historical fresh id.
+                    id: input_id
+                        .clone()
+                        .unwrap_or_else(|| MessageId::new(leveler_core::new_uuid_string())),
+                    role: UiRole::User,
+                    text,
+                    ordinal: None,
+                    // The transcript row proves the input was consumed, which
+                    // is the delivery state a reopened client must see.
+                    kind: input_id.map(|_| leveler_client_protocol::UiMessageKind::DeliveredInput),
+                    images,
+                },
+            }],
+            Fact::Notice(text) => vec![RuntimeEvent::UserMessageAdded {
                 message: UiMessage {
                     id: MessageId::new(leveler_core::new_uuid_string()),
                     role: UiRole::User,
                     text,
                     ordinal: None,
-                    kind: None,
-                    images,
+                    kind: Some(leveler_client_protocol::UiMessageKind::RuntimeNotice),
+                    images: 0,
                 },
             }],
             Fact::PartialAssistant(id, text) => vec![
@@ -262,9 +284,12 @@ fn is_live_only(event: &RuntimeEvent) -> bool {
 /// Interrupted replies have only a raw row: replay that row as its own
 /// display block, leaving the authoritative turn terminal unchanged. The host-owned JSON boolean,
 /// never a phrase in the body, distinguishes this path from normal messages.
-fn transcript_fact(payload: &str, id: MessageId) -> Option<Fact> {
+fn transcript_fact(payload: &str, id: MessageId, input_id: Option<&str>) -> Option<Fact> {
     if let Some((text, images)) = user_text(payload) {
-        return Some(Fact::User(text, images));
+        return Some(Fact::User(text, images, input_id.map(MessageId::new)));
+    }
+    if let Some(text) = import_briefing_text(payload) {
+        return Some(Fact::Notice(text));
     }
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
     if value.get("incomplete").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -291,6 +316,15 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
     if message.is_protocol_repair() {
         return None;
     }
+    // A runtime notice is harness context, never the person's input. Origin
+    // says so for every row written with one; the header and prefix checks
+    // below still cover legacy rows and compaction summaries.
+    if matches!(
+        message.origin.as_ref(),
+        Some(leveler_model::TranscriptOrigin::RuntimeNotice { .. })
+    ) {
+        return None;
+    }
     let (text, images) = user_input(&message);
     let first = text.lines().next().unwrap_or("").trim_end();
     // A message that was only a picture has no text; replaying it as nothing
@@ -302,6 +336,26 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
         return None;
     }
     Some((text, images))
+}
+
+/// The imported-session briefing, which has no event that describes it: the
+/// person must still see where this conversation came from after a reopen.
+/// Other runtime notices stay event-backed and are not duplicated here.
+fn import_briefing_text(payload: &str) -> Option<String> {
+    let message: leveler_model::Message = serde_json::from_str(payload).ok()?;
+    let imported = message.role == leveler_model::Role::User
+        && matches!(
+            message.origin.as_ref(),
+            Some(leveler_model::TranscriptOrigin::RuntimeNotice {
+                notice: leveler_model::RuntimeNoticeKind::ForeignSessionImport,
+            })
+        );
+    if !imported {
+        return None;
+    }
+    let text = message.text_content();
+    text.starts_with(crate::foreign_import::BRIEFING_HEADER)
+        .then_some(text)
 }
 
 /// What a user-authored message carries: its text and how many images.
@@ -551,6 +605,89 @@ mod tests {
                         finished: true
                     }
                 ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_acknowledged_crash_marker_replays_without_a_failed_tool_terminal() {
+        // Histories written before the Unknown distinction existed encode the
+        // user's acknowledgement as `ToolCallFinished { is_error: true }`.
+        // Replaying that row as a failure would rewrite what the user saw.
+        let (db, sid) = session().await;
+        let t0 = now();
+        let turn_id = TurnId::generate();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(10),
+            EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+                model_step: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(20),
+            EngineEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                is_error: true,
+                preview: leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW.into(),
+                agent_id: None,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(30),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Interrupted,
+                reason: Some("runtime stopped".into()),
+                failure: None,
+                stop: None,
+                warnings: Vec::new(),
+            },
+        )
+        .await;
+
+        // Load twice: replay must be stable and must not invent a terminal.
+        for _ in 0..2 {
+            let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+            assert!(
+                entries.iter().any(|entry| matches!(
+                    &entry.event,
+                    RuntimeEvent::ToolCallStarted { id, .. } if id.as_str() == "c1"
+                )),
+                "the interrupted call must still replay"
+            );
+            assert!(
+                !entries.iter().any(|entry| matches!(
+                    &entry.event,
+                    RuntimeEvent::ToolCallCompleted { id, .. } if id.as_str() == "c1"
+                )),
+                "an acknowledged unknown outcome has no terminal fact to replay"
             );
         }
     }

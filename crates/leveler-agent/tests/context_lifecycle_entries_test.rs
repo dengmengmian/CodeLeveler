@@ -433,6 +433,94 @@ async fn chat_folds_when_the_briefing_is_produced() {
     );
 }
 
+/// A crash-window acknowledgement is a recovery fact, not a failed tool
+/// result. Compaction may fold older rounds, but the model must still receive
+/// the "outcome unknown / not replayed" notice, and no synthesized tool result
+/// may stand in for the interrupted call.
+#[tokio::test]
+async fn compaction_keeps_an_acknowledged_unknown_outcome_unknown() {
+    let h = harness(vec![text("answer after recovery")], Summary::Produced).await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+    seed_soft_pressure_history(&h.db, &session).await;
+
+    // A history written before the Unknown distinction existed: the user's
+    // acknowledgement is encoded as an errored finish.
+    let log = leveler_engine::EventLog::new(&h.db, session.clone());
+    log.append(
+        None,
+        EngineEvent::ToolCallStarted {
+            call_id: "c1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"program":"sh","args":["-c","touch ran"]}"#.into(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: None,
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    log.append(
+        None,
+        EngineEvent::ToolCallFinished {
+            call_id: "c1".into(),
+            name: "run_command".into(),
+            is_error: true,
+            preview: leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW.into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "continue after the interruption".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat continues after the acknowledgement");
+
+    assert!(
+        h.runtime.summary_requests() > 0,
+        "the entry attempted the fold"
+    );
+    let mains = h.runtime.main_requests();
+    let seen = mains[0]
+        .messages
+        .iter()
+        .map(Message::text_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        seen.contains("outcome unknown"),
+        "missing unknown fact:\n{seen}"
+    );
+    assert!(
+        seen.contains("not replayed"),
+        "missing replay fact:\n{seen}"
+    );
+    assert!(
+        !mains[0].messages.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(part, ContentPart::ToolResult { result } if result.call_id.as_str() == "c1")
+            })
+        }),
+        "the interrupted call's outcome must not be synthesized as a tool result"
+    );
+}
+
 /// Test F — a task cancelled WHILE the compaction summary is in flight must
 /// propagate: chat records an interrupted turn instead of continuing to a
 /// model request as if the summary had merely failed.
