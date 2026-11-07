@@ -34,6 +34,38 @@
 
 需要多个候选实现时，可用 `leveler run "任务" --parallel 3`。这要求 Git 工作区干净且已有提交，会创建分支和 worktree、提交通过验证的候选，并集成回当前分支。
 
+## 定时自动化
+
+`leveler schedule` 把定义保存在 `~/.leveler/state/schedules.db`。定义属于当前用户，每个定义在它指定的工作区运行（默认是当前仓库）。创建一个每日 shell 运行：
+
+```sh
+leveler schedule add --name nightly --command "cargo test" --daily 02:00 --timezone Asia/Shanghai --grant-unattended
+```
+
+选择一个动作（`--command`、`--native-action ID` 配合 `--native-input JSON`，或 `--agent-goal TEXT`）和一个触发器（`--at RFC3339`、`--every SECONDS`、`--daily HH:MM`、`--weekly mon,wed --local-time HH:MM`，或 `--cron "..."` 配合 `--timezone IANA`）。其余策略由 `--session-policy continue|fresh`、`--overlap skip-if-running|queue-one|allow-concurrent`（后者要求 `fresh`）、`--misfire skip|run-once` 与 `--misfire-grace SECONDS`、`--timeout SECONDS` 设置。
+
+无人值守的运行需要 `--grant-unattended`；动作会向工作区外发送或修改内容时，再加 `--allow-external-side-effects`。修改动作、工作区、触发器、权限模式或该选择会使授权失效：用 `leveler schedule grant <id> [--allow-external-side-effects]` 为新身份重新授权。Full 权限不能替代授权。
+
+`leveler schedule list|show|update|runs|pause|resume|run-now|cancel|remove` 查看和管理定义。`leveler schedule dispatch` 执行一轮；`leveler schedule serve` 在前台持续调度。macOS 上 `leveler schedule enable` 注册 launchd agent，Windows 上注册当前用户的 Task Scheduler 任务；`disable` 与 `uninstall` 移除注册，`status` 与 `wakeups` 报告注册，`doctor` 列出诊断项。Linux 没有唤醒后端，会如实报告；可用 `serve` 或由系统调度器调用 `dispatch`。
+
+TUI 中用 `/schedules` 打开定义列表、详情和编辑表单。Agent 通过 `schedule_inspect` 与 `schedule_manage` 工具执行同样的操作。
+
+## 原生动作与桌面操作
+
+`leveler native capabilities` 报告 macOS 的 Mail 或 Windows 的 Outlook 是否已安装、正在运行、已登录，以及是否允许被自动化。`leveler native action` 不经过模型执行一个确定性动作：
+
+```sh
+leveler native action --action mail.draft.create --to you@example.com --subject "周报" --body-file report.txt
+```
+
+动作包括 `mail.draft.create`、`mail.send.open_ui`、`mail.send.submit` 和 `mail.sent.check`。超时或无法识别的结果会报告为 `unknown`，不会重试。macOS 需要目标应用的自动化权限；未解决的授权弹窗会报告为 `unknown`，而不是替用户假设答案。
+
+面向模型的工具是 `native_capabilities`、`native_action`、`native_verify`、`computer_observe` 和 `computer_act`。桌面操作在 macOS 需要辅助功能与屏幕录制权限（Windows 使用 UI Automation），权限状态在调用时报告，每个观察引用在动作前都会对实时界面重新校验。只有编译进对应平台后端时这些工具才会出现；Linux 两者都没有。
+
+## 接续 Claude Code 或 Codex 会话
+
+在 TUI 中，`/resume-claude` 与 `/resume-codex` 列出当前工作区的本机会话；直接给出会话 ID 可跳过选择器。CodeLeveler 只读访问源存储，把选中的会话导入为一个新的原生会话，并附带一份有界简报继续工作。简报引用任务和源会话结束时的状态，不复制整份对话。工作区不一致会在导入前报告；另一个 Agent 的声明（包括「已完成」）在对照当前工作区验证前仍是未验证的。模型可以用 `foreign_session_history` 工具读取原始对话。
+
 ## 浏览器与搜索
 
 浏览器自动化支持 Chrome、Edge 和 Chromium。Safari 需要打开 Remote Automation，并在配置的 `[browser]` 下设置 `default = "safari"`；Safari 无法提供控制台或网络检查。
