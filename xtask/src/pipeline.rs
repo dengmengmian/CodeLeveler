@@ -696,14 +696,22 @@ fn start(host: &dyn Host, repo: &Path, env: &Env, opts: &PublishOpts) -> Result<
     let snap = git::snapshot(host, repo)?;
     git::require_clean(&snap)?;
     if let Some(existing) = state::read_current(repo) {
-        return Err(Fail::new(
-            "RELEASE_IN_PROGRESS",
-            format!(
-                "{existing} is still in progress\n\
-                 finish it with ./dev publish --resume, or inspect it with ./dev publish --status\n\
-                 a second release would share this lab, this lock and this version number"
-            ),
-        ));
+        // A PASS transaction finished the release it describes. CURRENT stays
+        // behind as the last transaction's pointer, so its presence alone says
+        // nothing about whether a release is still running; only the recorded
+        // status does. A missing or unreadable state stays fail-closed.
+        let finished = state::read_state(repo, &existing)?
+            .is_some_and(|transaction| transaction.status == Status::Pass);
+        if !finished {
+            return Err(Fail::new(
+                "RELEASE_IN_PROGRESS",
+                format!(
+                    "{existing} is still in progress\n\
+                     finish it with ./dev publish --resume, or inspect it with ./dev publish --status\n\
+                     a second release would share this lab, this lock and this version number"
+                ),
+            ));
+        }
     }
     let plan = plan(host, repo, env, opts)?;
     let remote_tags = exec::ok_stdout(
