@@ -67,6 +67,8 @@ leveler-chat-*.md
 # Local internal documentation, not part of the public source tree.
 /docs/ARCHITECTURE.md
 /docs/ARCHITECTURE.zh-CN.md
+/docs/CUA_IMPLEMENTATION.md
+/docs/WELCOME_IMPLEMENTATION_PROMPT.zh-CN.md
 /assets/brand/README.md
 /crates/leveler-storage/migrations/README.md
 /crates/leveler-web/README.md
