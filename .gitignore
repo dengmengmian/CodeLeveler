@@ -56,6 +56,14 @@ leveler-chat-*.md
 # Legacy screenshot scratch
 .shots*/
 
+# Local acceptance evidence: dated reports and one-off harnesses that point at
+# machine-local archives, not part of the public source tree.
+/docs/validation/
+/scripts/append_instruction_*.py
+/scripts/identity_recovery_dogfood.py
+/scripts/tests/test_append_instruction_*.py
+/testdata/append-instruction-dogfood/
+
 # Local internal documentation, not part of the public source tree.
 /docs/ARCHITECTURE.md
 /docs/ARCHITECTURE.zh-CN.md
