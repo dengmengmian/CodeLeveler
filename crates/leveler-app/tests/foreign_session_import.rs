@@ -250,7 +250,11 @@ fn claude_tool_result(id: &str, cwd: &Path, call_id: &str, text: &str) -> String
 fn write_claude(project: &Path, id: &str, modified: SystemTime, lines: &[String]) {
     let path = project.join(format!("{id}.jsonl"));
     fs::write(&path, lines.join("\n") + "\n").unwrap();
-    fs::File::open(&path)
+    // Windows refuses SetFileTime on a read-only handle, while Unix accepts
+    // it; opening for write is what makes the fixture portable.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
         .unwrap()
         .set_modified(modified)
         .unwrap();
