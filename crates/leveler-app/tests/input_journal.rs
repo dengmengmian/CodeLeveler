@@ -210,6 +210,24 @@ async fn snapshot(
     }
 }
 
+/// Events that close a turn. `turn_finalizing` is not one of them: it is
+/// emitted while the turn still owns its admission slot, so a test that
+/// treats it as the end can submit into a session the runtime still considers
+/// busy.
+fn is_turn_terminal(event: &RuntimeEvent) -> bool {
+    matches!(
+        event,
+        RuntimeEvent::TurnCompleted
+            | RuntimeEvent::TurnCompletedWithWarnings { .. }
+            | RuntimeEvent::TurnAnswered
+            | RuntimeEvent::TurnPaused { .. }
+            | RuntimeEvent::TurnTruncated { .. }
+            | RuntimeEvent::TurnIncomplete { .. }
+            | RuntimeEvent::TurnFailed { .. }
+            | RuntimeEvent::TurnCancelled
+    )
+}
+
 async fn wait_for_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -218,11 +236,7 @@ async fn wait_for_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEven
             .await
             .expect("the turn ends")
             .expect("event stream open");
-        let kind = serde_json::to_value(&event).unwrap()["type"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if kind.starts_with("turn_") && kind != "turn_progress" && kind != "turn_started" {
+        if is_turn_terminal(&event) {
             return;
         }
     }
