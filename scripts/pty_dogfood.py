@@ -667,7 +667,10 @@ class Env:
 
 
 def make_env(provider: str, mock) -> "Env":
-    return Env(provider, mock)
+    # The daemon's Unix socket lives under LEVELER_HOME/run/sockets; the
+    # default macOS temp root is long enough to overflow SUN_LEN. `--transport
+    # daemon` is exactly the case the short root exists for.
+    return Env(provider, mock, short=(TRANSPORT == "daemon"))
 
 
 def boot(
