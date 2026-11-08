@@ -3128,7 +3128,8 @@ impl CodingRuntime {
         // have received the final frame. Taking a new ownership or starting a
         // turn here would both re-drive the model and make the answer a
         // transaction side effect.
-        if !asks_for_new_work
+        if instruction.is_none()
+            && !asks_for_new_work
             && lineage.goal_id.is_none()
             && matches!(lineage.kind, ResumeTurnKind::Chat)
             && let Some(delivery) = self.committed_chat_delivery(session_id).await?
