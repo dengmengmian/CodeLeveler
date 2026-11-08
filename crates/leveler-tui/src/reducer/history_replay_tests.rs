@@ -807,6 +807,101 @@ fn bookkeeping_after_the_answer_reads_the_same_live_and_replayed() {
     }
 }
 
+/// The real session `9a1230c9` shape: the model's first closeout was refused,
+/// then accepted. The refusal stays in history, and the accepted closeout is
+/// the last goal row — live and after reopening the session. A replay must
+/// reach the same conclusion from event order, not from a flag only the live
+/// path sets.
+#[test]
+fn a_closeout_accepted_after_a_refusal_survives_history_replay() {
+    let goal = |id: &str, ok: bool, preview: &str, summary: &str| -> [RuntimeEvent; 2] {
+        [
+            RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "update_goal".into(),
+                arguments: serde_json::json!({"status": "complete", "summary": summary})
+                    .to_string(),
+                parallel: false,
+                model_step: Some(2),
+                answer_effect: Some(AnswerEffect::Bookkeeping),
+            },
+            RuntimeEvent::ToolCallCompleted {
+                id: ToolCallId::new(id),
+                ok,
+                preview: preview.into(),
+                duration_ms: 4,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            },
+        ]
+    };
+    let mut events = vec![RuntimeEvent::UserMessageAdded {
+        message: message(UiRole::User, "在 README.md 末尾追加一行 Verified."),
+    }];
+    events.extend(goal(
+        "g1",
+        false,
+        "[goal_refused:requirements_refused]\nruntime account",
+        "测试运行完成",
+    ));
+    events.extend(goal(
+        "g2",
+        true,
+        "Goal completed.",
+        "README 追加 Verified.，测试实跑 2 个",
+    ));
+    events.push(RuntimeEvent::TurnCompleted);
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(
+        &mut replayed,
+        vec![message(UiRole::User, "在 README.md 末尾追加一行 Verified.")],
+    );
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    for (label, s) in [("live", &live), ("replayed", &replayed)] {
+        let lines: Vec<String> = crate::conversation::build::build_conversation_lines(s, 120)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .collect();
+        let refused = lines
+            .iter()
+            .position(|l| l.contains("目标未更新：用户要求的条件尚未全部满足"));
+        let accepted = lines
+            .iter()
+            .position(|l| l.contains("完成：README 追加 Verified."));
+        assert!(refused.is_some(), "{label}: the refusal stays: {lines:#?}");
+        assert!(
+            accepted.is_some(),
+            "{label}: the accepted closeout is visible: {lines:#?}"
+        );
+        assert!(
+            accepted > refused,
+            "{label}: the acceptance is the last goal state: {lines:#?}"
+        );
+    }
+}
+
 /// Browser parity: the per-call action label (`打开页面`, `读取页面`) is
 /// presentation derived from the call's own arguments, so history must rebuild
 /// it exactly as the live turn showed it. A real dogfood caught the live run

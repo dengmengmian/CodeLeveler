@@ -228,6 +228,123 @@ fn a_refused_closeout_states_the_gate_the_runtime_named() {
     }
 }
 
+/// The real session `9a1230c9` shape: the model's closeout was refused, then
+/// accepted. The refusal stays in history, and the accepted closeout must be
+/// the LAST goal row — otherwise the turn reads as still refused even though
+/// the runtime settled the goal.
+#[test]
+fn an_accepted_closeout_after_a_refused_one_is_visible() {
+    use leveler_client_protocol::ToolCallId;
+
+    let mut state = state();
+    let refused = ToolCallId::new("goal-refused");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: refused.clone(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({"status": "complete", "summary": "测试运行完成"})
+                .to_string(),
+            parallel: false,
+            model_step: Some(3),
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: refused,
+            ok: false,
+            preview: "[goal_refused:requirements_refused]\nupdate_goal(complete) was refused"
+                .into(),
+            duration_ms: 1,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+
+    let accepted = ToolCallId::new("goal-accepted");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: accepted.clone(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({
+                "status": "complete",
+                "summary": "README 追加 Verified.，测试实跑 2 个并交付答案"
+            })
+            .to_string(),
+            parallel: false,
+            model_step: Some(9),
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: accepted,
+            ok: true,
+            preview: "Goal completed.".into(),
+            duration_ms: 1,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+
+    let screen = screen(&mut state, 120);
+    let painted: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        painted.contains("目标未更新：用户要求的条件尚未全部满足"),
+        "the refusal stays in history: {screen}"
+    );
+    assert!(
+        painted.contains("完成：README追加Verified.，测试实跑2个并交付答案"),
+        "the accepted closeout is the last goal state and must be visible: {screen}"
+    );
+}
+
+/// An accepted closeout with no refused attempt before it is ordinary
+/// bookkeeping; the transcript does not grow a row for it.
+#[test]
+fn an_ordinary_accepted_closeout_stays_out_of_the_transcript() {
+    use leveler_client_protocol::ToolCallId;
+
+    let mut state = state();
+    let id = ToolCallId::new("goal-ok");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: id.clone(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({"status": "complete", "summary": "done"}).to_string(),
+            parallel: false,
+            model_step: Some(4),
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id,
+            ok: true,
+            preview: "Goal completed.".into(),
+            duration_ms: 1,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+
+    let screen = screen(&mut state, 120);
+    let painted: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !painted.contains("目标收尾"),
+        "ordinary closeout bookkeeping stays hidden: {screen}"
+    );
+}
+
 fn screen(state: &mut AppState, width: u16) -> String {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

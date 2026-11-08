@@ -222,6 +222,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         }
     }
 

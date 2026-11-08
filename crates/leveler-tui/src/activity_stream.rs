@@ -1611,7 +1611,7 @@ pub(crate) fn is_conversation_visible(call: &ToolCallBlock) -> bool {
     // Silent tools (exploration probes, goal bookkeeping) stay out unless they
     // failed — a failure is always user-facing.
     match activity_visibility(&call.name, &call.arguments) {
-        ActivityVisibility::Silent => call.status == ToolStatus::Failed,
+        ActivityVisibility::Silent => call.status == ToolStatus::Failed || call.supersedes_refusal,
         ActivityVisibility::Normal | ActivityVisibility::Important => true,
     }
 }
@@ -3914,6 +3914,7 @@ pub(crate) fn child_activity_lines(
             expanded: false,
             stop: StopRequest::None,
             applied_diff: None,
+            supersedes_refusal: false,
         })
         .collect::<Vec<_>>();
     // Only the newest call can still be in flight. A call the child moved past
@@ -4124,6 +4125,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         }
     }
 
@@ -7699,6 +7701,7 @@ mod compact_command_tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         }
     }
 

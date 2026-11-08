@@ -3726,6 +3726,7 @@ mod tests {
                 batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
+                supersedes_refusal: false,
             }],
             open: false,
             display: crate::fold::DisplayMode::Collapsed,
@@ -4700,6 +4701,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         }
     }
 
@@ -4884,6 +4886,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let lines = tool_render(&item, true);
         let joined = lines.iter().map(line_str).collect::<Vec<_>>().join("\n");
@@ -4912,6 +4915,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let folded = tool_render(&item, false);
         let text = folded
@@ -4949,6 +4953,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let lines = tool_render(&item, false);
         let text = lines
@@ -4992,6 +4997,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         // Collapsed head is width-clipped (may end with …).
         let collapsed = tool_render(&item, false);
