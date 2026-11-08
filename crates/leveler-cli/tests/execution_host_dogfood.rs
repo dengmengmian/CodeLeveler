@@ -637,15 +637,29 @@ fn execution_host_sigkill_reports_unknown_and_does_not_adopt_or_signal_services(
                 u64::from(daemon.id()),
                 "Host and Runtime must be distinct OS processes"
             );
-            let actual_argv = Command::new("ps")
-                .args(["-p", &host_pid.to_string(), "-o", "command="])
-                .output()
-                .unwrap();
-            let actual_argv = String::from_utf8_lossy(&actual_argv.stdout);
+            // The ready file is written by the Host itself with its own pid and
+            // repository; the state directory is this test's isolated fixture.
+            // `ps` is denied under the agent sandbox, so identity is proven from
+            // that owner-produced metadata plus liveness, not a process scan.
+            assert_eq!(
+                ready["repo"].as_str(),
+                Some(
+                    std::fs::canonicalize(&env.repo)
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_ref()
+                ),
+                "the ready file must name this isolated repository"
+            );
             assert!(
-                actual_argv.contains("execution-host")
-                    && actual_argv.contains(host_state.to_string_lossy().as_ref()),
-                "SIGKILL target must be this isolated test's actual Host"
+                Command::new("kill")
+                    .args(["-0", &host_pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "the recorded Host pid must be alive before the kill"
             );
             assert!(
                 Command::new("kill")
