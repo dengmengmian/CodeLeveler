@@ -1625,7 +1625,12 @@ fn degraded_host_unavailable_runs_local_and_is_never_labelled_durable() {
                     .unwrap();
             }
             let script = format!(
-                "echo LOCAL_RAN_{nonce}; echo LOCAL_SIDE_{nonce} >> local-side.log; exit 0"
+                // Keep the local run alive when the runtime is killed: the
+                // point of the case is a task whose completion the degraded
+                // runtime cannot vouch for. Without the sleep the command can
+                // finish first, and a platform that commits the completion
+                // before the kill would turn this race into a false failure.
+                "echo LOCAL_RAN_{nonce}; echo LOCAL_SIDE_{nonce} >> local-side.log; sleep 30"
             );
             mock.push(spawn_response("local-spawn", &script)).await;
             mock.push(final_response("The local fallback command completed."))
