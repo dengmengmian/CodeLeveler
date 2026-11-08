@@ -34,11 +34,12 @@ use super::{
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::executor::goal_scope;
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, COMMIT_TASK_TOOL, GrantScope, PermissionRequestOutcome,
-    REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
-    UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
-    commit_task_tool_definition, escalation_action, escalation_missing_axis_message,
-    is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
+    CLAIM_WRITE_SCOPE_TOOL, COMMIT_TASK_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope,
+    PermissionRequestOutcome, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL,
+    TurnPermissionGrants, UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants,
+    claim_write_scope_tool_definition, commit_task_tool_definition, escalation_action,
+    escalation_missing_axis_message, get_goal_scope_tool_definition, is_escalatable_tool,
+    is_user_input_tool, parse_escalation, parse_permission_request,
     permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
@@ -661,6 +662,13 @@ impl Executor {
         // Goal mode: the model resolves the objective explicitly.
         if self.goal_mode() {
             tools.push(update_goal_tool_definition());
+        }
+        if self.goal_mode()
+            || self
+                .goal_binder()
+                .is_some_and(|binder| binder.bound().is_some())
+        {
+            tools.push(get_goal_scope_tool_definition());
         }
         tools
     }
@@ -2505,7 +2513,7 @@ async fn retained_facts_after_fold(
         }
         if requirements.len() > 8 {
             text.push_str(&format!(
-                "…and {} more effective requirements the Gate still enforces.\n",
+                "…and {} more effective requirements the Gate still enforces; call get_goal_scope to read them.\n",
                 requirements.len() - 8
             ));
         }
@@ -3899,6 +3907,86 @@ impl AgentHarness for Drive<'_> {
             // runtime does not infer it from the user's words. Binding is
             // durable (goal row + turn WAL + budget scope) because the work
             // may outlive this process.
+            if call.name == GET_GOAL_SCOPE_TOOL {
+                let offset = call
+                    .arguments
+                    .get("offset")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let limit = call
+                    .arguments
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 50) as usize;
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: GET_GOAL_SCOPE_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: true,
+                    model_step: Some(model_steps),
+                });
+                let scope = match self.executor.goal_binder() {
+                    Some(binder) => binder.scope().await?,
+                    None => None,
+                };
+                let (content, is_error) = match scope {
+                    Some(scope) => {
+                        let requirements = goal_scope::extract(&scope.objective, &scope.amendments);
+                        let (slice, start) = goal_scope::page(&requirements, offset, limit);
+                        let end = start + slice.len();
+                        let mut text = format!(
+                            "Effective acceptance: {} requirement(s), showing {}..{} of {}.
+",
+                            requirements.len(),
+                            start,
+                            end,
+                            requirements.len()
+                        );
+                        for requirement in slice {
+                            text.push_str(&format!(
+                                "- {} [{}] {}
+",
+                                requirement.id,
+                                requirement.kind.label(),
+                                requirement.text
+                            ));
+                        }
+                        if end < requirements.len() {
+                            text.push_str(&format!(
+                                "More requirements exist: call get_goal_scope with offset={end}.
+"
+                            ));
+                        }
+                        let (text, _) = leveler_core::sanitize_model_visible(&text);
+                        (text, false)
+                    }
+                    None => (
+                        "No committed goal exists for this turn; there is no effective \
+                         acceptance set to read."
+                            .to_string(),
+                        true,
+                    ),
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: GET_GOAL_SCOPE_TOOL.to_string(),
+                    is_error,
+                    preview: preview(&content),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content,
+                        is_error,
+                    },
+                });
+                continue;
+            }
             if call.name == COMMIT_TASK_TOOL && self.executor.depth == 0 {
                 (self.observer)(AgentEvent::ToolCall {
                     id: call.id.as_str().to_string(),

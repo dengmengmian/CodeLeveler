@@ -273,6 +273,40 @@ pub(crate) const COMMIT_TASK_TOOL: &str = "commit_task";
 /// work. The runtime never classifies the user's text for it: no keyword,
 /// length, tool count or round count decides this — the model reads the
 /// request's meaning and expected result.
+/// The name of the read-only effective-scope tool.
+pub(crate) const GET_GOAL_SCOPE_TOOL: &str = "get_goal_scope";
+
+/// Read-only paging over the **effective** acceptance set the Gate uses.
+/// It is the discoverable escape hatch when the compaction facts block only
+/// expands the first eight requirements.
+pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GET_GOAL_SCOPE_TOOL.to_string(),
+        description: "Read the current effective acceptance set for this committed goal, page by \
+            page. The completion Gate uses exactly this set. Call it when the retained-facts \
+            block says more requirements exist than it expanded, or before declaring completion \
+            when the task has many explicit deliverables. Read-only; it never changes the goal."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Zero-based index of the first requirement to return (default 0)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "Maximum requirements to return (default 20)."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
 pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Declare that the user's request is execution work this turn must carry \
