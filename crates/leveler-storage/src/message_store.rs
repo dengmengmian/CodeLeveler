@@ -73,6 +73,15 @@ pub trait MessageStore: Send + Sync {
         Ok(all.into_iter().skip(from as usize).collect())
     }
 
+    /// One turn's transcript payloads, in append order. Recovery uses this to
+    /// relate durable tool events to the exact turn rows that should carry
+    /// their results.
+    async fn load_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<Vec<String>, StorageError>;
+
     /// Fenced append: the ownership check and the inserts share one atomic
     /// persistence boundary. A stale runtime cannot extend the transcript.
     async fn append_in_turn_owned(
@@ -186,6 +195,16 @@ impl MessageStore for Database {
     ) -> Result<Vec<String>, StorageError> {
         MessageRepository::new(self)
             .load_from(session_id, from)
+            .await
+    }
+
+    async fn load_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<Vec<String>, StorageError> {
+        MessageRepository::new(self)
+            .load_for_turn(session_id, turn_id)
             .await
     }
 
@@ -442,6 +461,21 @@ impl MessageStore for MemoryMessageStore {
             .iter()
             .filter(|(sid, _, _)| sid == session_id.as_str())
             .skip(from as usize)
+            .map(|(_, _, payload)| payload.clone())
+            .collect())
+    }
+
+    async fn load_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sid, tid, _)| sid == session_id.as_str() && tid == turn_id.as_str())
             .map(|(_, _, payload)| payload.clone())
             .collect())
     }

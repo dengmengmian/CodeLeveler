@@ -1829,12 +1829,19 @@ impl<'a> Drive<'a> {
         // marker and before the turn/task terminals. A crash in the terminal
         // commit window must recover THIS text, not ask the model again.
         if delivered {
+            leveler_core::test_crash::point("before_delivery_committed");
+            let transcript_ordinal = self.sink.watermark().await?;
             (self.observer)(AgentEvent::DeliveryCommitted {
                 text: final_text.clone(),
                 stop: reason,
                 model_steps,
                 modified_files: self.modified_files.clone(),
+                transcript_ordinal,
             });
+            // Mechanical bar: the pump has persisted every canonical event
+            // emitted so far before the terminal path continues.
+            self.settlements_durable().await?;
+            leveler_core::test_crash::point("after_delivery_durable");
         }
         (self.observer)(AgentEvent::Finished(final_text.clone()));
         self.enter_finalization();
@@ -3259,6 +3266,25 @@ impl AgentHarness for Drive<'_> {
                     }
                     (StopReason::Answered, None)
                 };
+            // A Chat answer is a formal delivery, not just a transient
+            // `Finished`: the same durable fact Goal settlement already
+            // records. It is emitted before the turn/task terminals and bound
+            // to the transcript prefix that produced it, so a crash in the
+            // terminal window recovers this answer instead of asking the
+            // model for a second one.
+            if !self.executor.goal_mode() && matches!(&stop_reason, StopReason::Answered) {
+                leveler_core::test_crash::point("before_delivery_committed");
+                let transcript_ordinal = self.sink.watermark().await?;
+                (self.observer)(AgentEvent::DeliveryCommitted {
+                    text: self.last_text.clone(),
+                    stop: stop_reason,
+                    model_steps,
+                    modified_files: self.modified_files.clone(),
+                    transcript_ordinal,
+                });
+                self.settlements_durable().await?;
+                leveler_core::test_crash::point("after_delivery_durable");
+            }
             self.flush_epoch(rt);
 
             self.settle_finalization_dependencies(rt, messages).await?;
@@ -6020,7 +6046,15 @@ impl AgentHarness for Drive<'_> {
         // Flush spend BEFORE transcript persistence: tools already ran, so
         // a sink I/O failure must not drop this batch's command/file totals.
         self.flush_epoch(rt);
+        // Cross-plane completion barrier: the durable ToolCallFinished facts
+        // must exist before the transcript row that carries their results.
+        // Without it a crash could leave the transcript asserting an exchange
+        // the event plane never recorded (or the reverse), which is the F-05
+        // window recovery cannot reconcile from one plane alone.
+        self.settlements_durable().await?;
+        leveler_core::test_crash::point("after_tool_finished_before_transcript");
         self.sink.append(&[assistant, tool_message]).await?;
+        leveler_core::test_crash::point("after_transcript_before_next_round");
         if let Some(delivered) = self.delivered_background_tasks.as_mut() {
             delivered.extend(observed_terminal_tasks);
         }

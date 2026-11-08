@@ -1440,6 +1440,7 @@ mod bridge_tests {
             stop: leveler_lifecycle::StopReason::Completed,
             model_steps: 2,
             modified_files: Vec::new(),
+            transcript_ordinal: Some(4),
         });
         assert_eq!(
             drain(&mut rx),

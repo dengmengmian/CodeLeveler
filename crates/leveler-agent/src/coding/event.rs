@@ -28,11 +28,13 @@ impl From<AgentEvent> for EngineEvent {
                 stop,
                 model_steps,
                 modified_files,
+                transcript_ordinal,
             } => EngineEvent::DeliveryCommitted {
                 text,
                 stop,
                 model_steps,
                 modified_files,
+                transcript_ordinal,
             },
             A::ToolCall {
                 id,

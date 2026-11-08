@@ -165,12 +165,15 @@ impl TerminalStore for FailNextFinish {
 
 struct Runtime {
     responses: Mutex<VecDeque<ModelResponse>>,
+    /// Every request the harness actually sent, for context assertions.
+    requests: Mutex<Vec<ModelRequest>>,
 }
 
 impl Runtime {
     fn new(responses: Vec<ModelResponse>) -> Self {
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
+            requests: Mutex::new(Vec::new()),
         }
     }
 }
@@ -195,9 +198,10 @@ fn profile() -> ModelProfile {
 impl ModelRuntime for Runtime {
     async fn generate(
         &self,
-        _request: ModelRequest,
+        request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        self.requests.lock().unwrap().push(request);
         self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
         })
@@ -1008,4 +1012,452 @@ async fn resuming_an_already_completed_task_is_refused_without_a_model_call() {
         "a refused resume buys no model call"
     );
     assert_eq!(assistant_texts(&fx).await, vec![ANSWER.to_string()]);
+}
+
+// ── ordinary Chat delivery (F-04) ──────────────────────────────────────────
+
+async fn chat_fixture(script: Vec<ModelResponse>) -> Fixture {
+    let fx = fixture(script).await;
+    SessionRepository::new(&fx.db)
+        .set_turn_collaboration(&fx.session, "chat", leveler_core::now())
+        .await
+        .unwrap();
+    fx
+}
+
+async fn chat_turn(
+    fx: &Fixture,
+    coding: &CodingRuntime,
+    spec: &TaskSpec,
+    observed: &mut Vec<EngineEvent>,
+) -> Result<leveler_agent::coding::TaskReport, leveler_engine::EngineError> {
+    let content = vec![ContentPart::Text {
+        text: "implement the counting feature".to_string(),
+    }];
+    coding
+        .chat_with_origin(
+            &fx.session,
+            spec,
+            content,
+            leveler_model::TranscriptOrigin::UserInput,
+            &mut |event| observed.push(event),
+            CancellationToken::new(),
+        )
+        .await
+}
+
+/// A Chat answer is a formal delivery too. Cutting the task terminal after the
+/// turn left `DeliveryCommitted` durable; resume must replay that answer and
+/// commit the terminal without asking the model again.
+#[tokio::test]
+async fn a_crash_between_a_chat_answer_and_its_task_terminal_delivers_it_once() {
+    let fx = chat_fixture(vec![text(ANSWER), text(DUPLICATE)]).await;
+    fx.terminal.inject();
+    let spec = spec(&fx);
+
+    let first = chat_turn(&fx, &fx.coding, &spec, &mut Vec::new()).await;
+    first.expect_err("the injected task-terminal failure must surface");
+    assert_eq!(model_requests(&fx).await, 1);
+    assert_eq!(
+        assistant_texts(&fx).await.last().map(String::as_str),
+        Some(ANSWER)
+    );
+    let after_crash = events(&fx).await;
+    assert!(
+        after_crash
+            .iter()
+            .any(|event| matches!(event, EngineEvent::DeliveryCommitted { .. })),
+        "a Chat answer must leave a durable delivery: {after_crash:?}"
+    );
+    assert_eq!(turn_terminals(&after_crash), 1);
+    assert_eq!(task_terminals(&after_crash), 0);
+
+    let recovered = fresh_coding(&fx);
+    let mut observed = Vec::new();
+    let report = recovered
+        .resume(
+            &fx.session,
+            &spec,
+            &mut |event| observed.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the Chat delivery resumes");
+
+    assert_eq!(report.stop_reason, StopReason::Answered);
+    assert_eq!(report.final_text, ANSWER);
+    assert_eq!(
+        model_requests(&fx).await,
+        1,
+        "recovering a durable Chat delivery must not ask the model again"
+    );
+    assert_eq!(
+        assistant_texts(&fx).await,
+        vec![ANSWER.to_string()],
+        "the answer must not be written twice"
+    );
+    let after = events(&fx).await;
+    assert_eq!(task_terminals(&after), 1);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::DeliveryCommitted { .. }))
+            .count(),
+        1,
+        "observer replay must not append a second delivery fact"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::DeliveryCommitted { .. }))
+            .count(),
+        1
+    );
+}
+
+/// The same Chat cut one commit earlier: the delivery is durable and neither
+/// the turn nor the task terminal is. Recovery closes the open turn from the
+/// delivery facts themselves.
+#[tokio::test]
+async fn a_crash_inside_a_chat_turn_terminal_delivers_it_once() {
+    let fx = chat_fixture(vec![text(ANSWER), text(DUPLICATE)]).await;
+    fx.terminal.inject_turn();
+    let spec = spec(&fx);
+
+    chat_turn(&fx, &fx.coding, &spec, &mut Vec::new())
+        .await
+        .expect_err("the injected turn-terminal failure must surface");
+    let after_crash = events(&fx).await;
+    assert!(
+        after_crash
+            .iter()
+            .any(|event| matches!(event, EngineEvent::DeliveryCommitted { .. }))
+    );
+    assert_eq!(turn_terminals(&after_crash), 0);
+    assert_eq!(task_terminals(&after_crash), 0);
+
+    let recovered = fresh_coding(&fx);
+    let report = recovered
+        .resume(&fx.session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("the open Chat delivery turn resumes");
+
+    assert_eq!(report.final_text, ANSWER);
+    assert_eq!(model_requests(&fx).await, 1);
+    let after = events(&fx).await;
+    assert_eq!(turn_terminals(&after), 1);
+    assert_eq!(task_terminals(&after), 1);
+    assert_eq!(assistant_texts(&fx).await, vec![ANSWER.to_string()]);
+}
+
+// ── event/transcript cross-plane window (F-05) ─────────────────────────────
+
+/// Refuses the transcript batch that carries a tool result, simulating a
+/// process death after `ToolCallFinished` was durable and before
+/// `sink.append(&[assistant, tool_message])` committed. Every other message
+/// append delegates. The panic is the test's "unclean exit": it unwinds the
+/// turn before any terminal commits.
+struct FailToolTranscriptAppend {
+    inner: Arc<dyn leveler_storage::MessageStore>,
+    armed: Arc<AtomicBool>,
+    /// How many tool batches to let through before the armed one.
+    skip: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl leveler_storage::MessageStore for FailToolTranscriptAppend {
+    async fn append_in_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .append_in_turn(session_id, turn_id, payloads, now)
+            .await
+    }
+
+    async fn append_in_turn_owned(
+        &self,
+        token: &OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payloads: &[String],
+        now: Timestamp,
+    ) -> Result<(), OwnershipError> {
+        let is_tool_batch = payloads
+            .iter()
+            .any(|payload| payload.contains("\"role\":\"tool\""));
+        if is_tool_batch && self.armed.load(Ordering::SeqCst) {
+            let skip = self.skip.load(Ordering::SeqCst);
+            if skip == 0 && self.armed.swap(false, Ordering::SeqCst) {
+                panic!("injected death before the tool transcript batch");
+            }
+            if skip > 0 {
+                self.skip.store(skip - 1, Ordering::SeqCst);
+            }
+        }
+        self.inner
+            .append_in_turn_owned(token, session_id, turn_id, payloads, now)
+            .await
+    }
+
+    async fn ensure_initiating_message_owned(
+        &self,
+        token: &OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<bool, OwnershipError> {
+        self.inner
+            .ensure_initiating_message_owned(token, session_id, turn_id, payload, now)
+            .await
+    }
+
+    async fn append_input_in_turn_owned(
+        &self,
+        token: &OwnershipToken,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        input_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<Option<u64>, OwnershipError> {
+        self.inner
+            .append_input_in_turn_owned(token, session_id, turn_id, input_id, payload, now)
+            .await
+    }
+
+    async fn load(&self, session_id: &SessionId) -> Result<Vec<String>, StorageError> {
+        self.inner.load(session_id).await
+    }
+
+    async fn load_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<Vec<String>, StorageError> {
+        self.inner.load_for_turn(session_id, turn_id).await
+    }
+}
+
+/// A finished tool whose transcript batch was lost must be reconstructed from
+/// the durable event, not re-executed. The resumed model sees the recorded
+/// result and does not issue a second side effect.
+#[tokio::test]
+async fn a_finished_tool_without_its_transcript_result_is_reconstructed() {
+    let mut fx = fixture(vec![
+        tool_call(
+            "c1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn added() {}\n*** End Patch"
+            }),
+        ),
+        declared_answer(),
+    ])
+    .await;
+    std::fs::create_dir_all(fx.dir.path().join("src")).unwrap();
+    std::fs::write(fx.dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    fx.coding.engine.stores.messages = Arc::new(FailToolTranscriptAppend {
+        inner: Arc::new(fx.db.clone()),
+        armed: armed.clone(),
+        skip: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let spec = spec(&fx);
+
+    let first = std::panic::AssertUnwindSafe(fx.coding.run(
+        &fx.session,
+        &spec,
+        &mut |_| {},
+        CancellationToken::new(),
+    ))
+    .catch_unwind()
+    .await;
+    assert!(
+        first.is_err(),
+        "the injected transcript death must stop the run"
+    );
+    assert!(
+        !armed.load(Ordering::SeqCst),
+        "the injection must have fired"
+    );
+
+    // The exact cut: the finished event is durable, the tool transcript row is
+    // not, and no terminal decided the turn.
+    let after_crash = events(&fx).await;
+    assert!(
+        after_crash
+            .iter()
+            .any(|event| matches!(event, EngineEvent::ToolCallFinished { call_id, .. } if call_id == "c1")),
+        "the tool result must be durable before the transcript"
+    );
+    assert_eq!(turn_terminals(&after_crash), 0);
+    assert_eq!(task_terminals(&after_crash), 0);
+    let before = MessageRepository::new(&fx.db)
+        .load(&fx.session)
+        .await
+        .unwrap();
+    assert!(
+        !before
+            .iter()
+            .any(|payload| payload.contains("\"call_id\":\"c1\"")),
+        "the transcript batch must not be durable: {before:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\npub fn added() {}\n",
+        "the tool side effect happened exactly once"
+    );
+    assert_eq!(model_requests(&fx).await, 1);
+
+    // Recovery reconstructs the exchange from the durable event, then asks the
+    // model once for its next step with that result in context.
+    let recovered = fresh_coding(&fx);
+    let mut observed = Vec::new();
+    let report = recovered
+        .resume(
+            &fx.session,
+            &spec,
+            &mut |event| observed.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resume reconstructs the lost tool result");
+
+    assert_eq!(report.final_text, ANSWER);
+    assert_eq!(
+        model_requests(&fx).await,
+        2,
+        "one request made the call, one resumed after the reconstructed result"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\npub fn added() {}\n",
+        "recovery must not execute the tool a second time"
+    );
+    let transcript = MessageRepository::new(&fx.db)
+        .load(&fx.session)
+        .await
+        .unwrap();
+    let tool_rows: Vec<&String> = transcript
+        .iter()
+        .filter(|payload| {
+            payload.contains("\"role\":\"tool\"") && payload.contains("\"call_id\":\"c1\"")
+        })
+        .collect();
+    assert_eq!(tool_rows.len(), 1, "exactly one recovered exchange for c1");
+    assert!(
+        tool_rows[0].contains("recovery"),
+        "the recovered result must name the gap: {}",
+        tool_rows[0]
+    );
+    let requests = fx.runtime.requests.lock().unwrap();
+    let saw_recovered = requests.iter().any(|request| {
+        request.messages.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolResult { result }
+                        if result.call_id.as_str() == "c1" && result.content.contains("recovery")
+                )
+            })
+        })
+    });
+    assert!(
+        saw_recovered,
+        "the resumed model request must carry the reconstructed result"
+    );
+}
+
+/// T8: two rounds reuse the same provider call id, and only the second round's
+/// transcript batch is lost. The relation is by occurrence count, not by set
+/// membership, so recovery must reconstruct exactly the missing occurrence.
+#[tokio::test]
+async fn duplicate_call_ids_across_rounds_recover_the_missing_occurrence_once() {
+    let mut fx = fixture(vec![
+        tool_call(
+            "dup",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n+pub fn first() {}\n*** End Patch"
+            }),
+        ),
+        tool_call(
+            "dup",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n pub fn old() {}\n pub fn first() {}\n+pub fn second() {}\n*** End Patch"
+            }),
+        ),
+        declared_answer(),
+    ])
+    .await;
+    std::fs::create_dir_all(fx.dir.path().join("src")).unwrap();
+    std::fs::write(fx.dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    fx.coding.engine.stores.messages = Arc::new(FailToolTranscriptAppend {
+        inner: Arc::new(fx.db.clone()),
+        armed: armed.clone(),
+        skip: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+    });
+    let spec = spec(&fx);
+
+    let first = std::panic::AssertUnwindSafe(fx.coding.run(
+        &fx.session,
+        &spec,
+        &mut |_| {},
+        CancellationToken::new(),
+    ))
+    .catch_unwind()
+    .await;
+    assert!(first.is_err(), "the second tool batch must be cut");
+    let after_crash = events(&fx).await;
+    assert_eq!(
+        after_crash
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::ToolCallFinished { call_id, .. } if call_id == "dup"))
+            .count(),
+        2,
+        "both rounds finished durably"
+    );
+    let transcript = MessageRepository::new(&fx.db)
+        .load(&fx.session)
+        .await
+        .unwrap();
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|payload| payload.contains("\"call_id\":\"dup\""))
+            .count(),
+        1,
+        "only the first round's result was written"
+    );
+
+    let recovered = fresh_coding(&fx);
+    let report = recovered
+        .resume(&fx.session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("the missing duplicate occurrence is reconstructed");
+    assert_eq!(report.final_text, ANSWER);
+    let transcript = MessageRepository::new(&fx.db)
+        .load(&fx.session)
+        .await
+        .unwrap();
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|payload| payload.contains("\"call_id\":\"dup\""))
+            .count(),
+        2,
+        "exactly one missing occurrence is appended"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\npub fn first() {}\npub fn second() {}\n",
+        "both real edits survive and neither is repeated"
+    );
 }

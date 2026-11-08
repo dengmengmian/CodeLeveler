@@ -15,6 +15,7 @@ pub mod ids;
 pub mod ownership;
 pub mod resource_grant;
 pub mod secret;
+pub mod test_crash;
 pub mod text;
 pub mod time;
 

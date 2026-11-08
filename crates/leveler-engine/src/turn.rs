@@ -1229,6 +1229,7 @@ impl TurnRunner<'_> {
                     "could not commit the turn terminal: {error}"
                 ))
             })?;
+        leveler_core::test_crash::point("after_turn_terminal");
         observer(event);
         if let Some(settling_started) = settling_started {
             tracing::debug!(
