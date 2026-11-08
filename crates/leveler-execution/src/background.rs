@@ -664,7 +664,7 @@ impl BackgroundTaskRegistry {
             supervisor_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retain_process_facts: false,
             hosted_monitors: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            runner: CommandRunner::with_environment(environment),
+            runner: CommandRunner::with_environment(environment).without_parent_death_signal(),
             lifecycle_events,
         }
     }
