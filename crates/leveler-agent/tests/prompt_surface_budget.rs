@@ -1003,7 +1003,11 @@ async fn progressive_initial_surface_inventory() {
         catalog_tokens + control_tokens < 1000,
         "capability discovery exceeded its budget"
     );
-    assert_eq!(initial.tools.len(), 18, "pinned initial surface grew");
+    // 19 (was 18): a Goal turn offers `get_goal_scope`, the on-demand reader
+    // for the part of the effective acceptance set the prompt does not inline.
+    // It replaces a silent truncation with a tool call, so the one added
+    // definition buys back the scope the model would otherwise miss.
+    assert_eq!(initial.tools.len(), 19, "pinned initial surface grew");
     // 7000 (was 6800): the Goal completion contract now carries the
     // mechanical `verification` evidence field the runtime checks. That is
     // ~100 tokens on a surface already pinned; the alternative — a completion
@@ -1012,8 +1016,13 @@ async fn progressive_initial_surface_inventory() {
     // `requirements` accounting that stops a model from completing the user's
     // enumerated scope with only part of it done. The field is only sent on a
     // completion claim; the schema text is the fixed part.
+    // 7500 (was 7300): the `get_goal_scope` definition (about 140 tokens)
+    // reads the acceptance requirements the prompt had to truncate. The
+    // alternative is a model that cannot see the full effective scope at all;
+    // keeping the budget at the old number would trade a real capability for
+    // 140 tokens.
     assert!(
-        schema_tokens <= 7300,
+        schema_tokens <= 7500,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());
