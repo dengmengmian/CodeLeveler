@@ -2443,6 +2443,16 @@ impl Drive<'_> {
                         is_error,
                     },
                 });
+                // Test-only: a crash here leaves the first parallel result
+                // durable and the rest of the group unreported. The flush is
+                // paid only when the crash harness armed this exact point;
+                // normal runs never reach the kill path.
+                if leveler_core::test_crash::is_armed("during_parallel_fold")
+                    && let Some(barrier) = &self.executor.event_barrier
+                {
+                    barrier.flush().await?;
+                }
+                leveler_core::test_crash::point("during_parallel_fold");
             }
         }
         jobs.clear();

@@ -128,6 +128,27 @@ fn probe_call(id: &str) -> ModelResponse {
     }
 }
 
+fn parallel_reads() -> ModelResponse {
+    let call = |id: &str, path: &str| ContentPart::ToolCall {
+        call: ToolCall {
+            id: leveler_core::ToolCallId::new(id),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        },
+    };
+    ModelResponse {
+        request_id: leveler_core::RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![call("r1", "a.txt"), call("r2", "b.txt")],
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
 fn declared_answer() -> ModelResponse {
     ModelResponse {
         request_id: leveler_core::RequestId::generate(),
@@ -290,6 +311,7 @@ fn scenario_script(scenario: &str) -> (Vec<ModelResponse>, bool) {
         "tool_after_finished" => vec![probe_call("p1"), text(ANSWER)],
         "tool_after_transcript" => vec![probe_call("p1"), text(ANSWER)],
         "tool_during_transcript" => vec![probe_call("p1"), text(ANSWER)],
+        "parallel_reads_partial" => vec![parallel_reads(), text(ANSWER)],
         other => panic!("unknown scenario {other}"),
     };
     (script, goal)
@@ -425,6 +447,8 @@ async fn prepare(scenario: &str, point: &str) -> (tempfile::TempDir, SessionId, 
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
     std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    std::fs::write(dir.path().join("workspace/a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.path().join("workspace/b.txt"), "beta\n").unwrap();
     let status = spawn_child(scenario, dir.path(), point);
     assert!(
         killed_by_sigkill(status),
@@ -726,4 +750,80 @@ async fn transcript_without_a_next_round_resumes_from_the_durable_result() {
         .expect("the turn resumes from the durable transcript");
     assert_eq!(report.final_text, ANSWER);
     assert_eq!(side_effects(&side), 1, "the tool is not repeated");
+}
+
+/// T7: a parallel read group is cut during the fold. One result is already
+/// durable; the other is not. Recovery reconstructs the finished one, marks
+/// the unfinished one as an interrupted observation (not a success), and the
+/// read-only call is safe to re-issue.
+#[tokio::test]
+async fn a_partial_parallel_group_keeps_the_finished_fact_and_never_fakes_the_rest() {
+    let (dir, session, db) = prepare("parallel_reads_partial", "during_parallel_fold").await;
+    let after_crash = events(&db, &session).await;
+    let finished: Vec<String> = after_crash
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::ToolCallFinished { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished.len(),
+        1,
+        "exactly one parallel result was durable: {finished:?}"
+    );
+    let transcript = MessageRepository::new(&db).load(&session).await.unwrap();
+    assert!(
+        !transcript
+            .iter()
+            .any(|payload| payload.contains("\"role\":\"tool\"")),
+        "the transcript batch was not written: {transcript:?}"
+    );
+
+    // The unfinished read is conservatively unknown; acknowledge the crash
+    // window, then resume. This is the product's existing recovery contract.
+    let first = resume(dir.path(), &db, &session, vec![])
+        .await
+        .expect_err("the unfinished call must stop for acknowledgement");
+    assert!(
+        matches!(
+            first,
+            leveler_engine::EngineError::RecoveryConfirmationRequired { .. }
+        ),
+        "unexpected error: {first}"
+    );
+    acknowledge(&db, &session).await;
+    let report = resume(dir.path(), &db, &session, vec![text(ANSWER)])
+        .await
+        .expect("the partial group resumes");
+    assert_eq!(report.final_text, ANSWER);
+    let transcript = MessageRepository::new(&db).load(&session).await.unwrap();
+    let tool_rows: Vec<&String> = transcript
+        .iter()
+        .filter(|payload| payload.contains("\"role\":\"tool\""))
+        .collect();
+    assert_eq!(
+        tool_rows.len(),
+        2,
+        "both calls are represented, one as a result and one as unknown: {tool_rows:?}"
+    );
+    let finished_row = tool_rows
+        .iter()
+        .find(|row| row.contains(&finished[0]))
+        .expect("the durable parallel result is reconstructed");
+    assert!(
+        finished_row.contains("alpha") && finished_row.contains("\"is_error\":false"),
+        "the durable result keeps its real content: {finished_row}"
+    );
+    let unfinished = if finished[0] == "r1" { "r2" } else { "r1" };
+    let unfinished_row = tool_rows
+        .iter()
+        .find(|row| row.contains(unfinished))
+        .expect("the unfinished call has an explicit row");
+    assert!(
+        unfinished_row.contains("\"is_error\":true")
+            && (unfinished_row.contains("outcome is unknown")
+                || unfinished_row.contains("not replayed")),
+        "the unfinished call must stay unknown, never success: {unfinished_row}"
+    );
 }
