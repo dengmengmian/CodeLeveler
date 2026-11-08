@@ -683,12 +683,13 @@ fn format_snap(snap: &leveler_execution::BackgroundTaskSnapshot) -> String {
     };
     let mut text = format!(
         "task_id: {}\nstatus: {status}\nprogram: {}\nargs: {:?}\nexit_code: {:?}\n\
-         duration_ms: {}\nsilent_ms: {}\noutput_bytes: {}\n\
+         signal: {:?}\nduration_ms: {}\nsilent_ms: {}\noutput_bytes: {}\n\
          lifetime: {} (stopped when {})\n",
         snap.id,
         snap.program,
         snap.args,
         snap.exit_code,
+        snap.signal,
         snap.duration_ms,
         snap.silent_ms,
         snap.output_bytes,
@@ -724,8 +725,9 @@ fn background_result(
         "program": snap.program,
         "args": snap.args,
         "task_id": snap.id,
-        "ok": exited && snap.exit_code == Some(0),
+        "ok": exited && snap.exit_code == Some(0) && snap.signal.is_none(),
         "exit_code": snap.exit_code,
+        "signal": snap.signal,
     }))
 }
 
@@ -752,8 +754,8 @@ fn format_wait_delta(
         BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
     ) {
         text.push_str(&format!(
-            " exit_code: {:?} duration_ms: {}",
-            snap.exit_code, snap.duration_ms
+            " exit_code: {:?} signal: {:?} duration_ms: {}",
+            snap.exit_code, snap.signal, snap.duration_ms
         ));
     }
     if dropped_bytes > 0 {

@@ -67,6 +67,70 @@ pub struct HostedTask {
     /// [`TaskLoss::process`] says whether a workload may still exist.
     #[serde(default)]
     pub loss: Option<TaskLoss>,
+    /// The committed completion record for a terminal task this host observed.
+    ///
+    /// Written together with the terminal snapshot in one atomic archive
+    /// replacement; absent for a task whose exit the host never observed. A
+    /// record is never synthesized from a `Unknown` convergence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CompletionRecord>,
+}
+
+/// The durable identity and bounded result of one observed exit.
+///
+/// The host, not the runtime, owns this fact: it is produced from the child
+/// handle the host waited on, and committed to the same atomic archive as the
+/// snapshot. The digest makes repeated reads and repeated recoveries comparable
+/// without trusting a mutable log field.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionRecord {
+    /// Stable digest of the terminal fact. Identical across re-reads, so a
+    /// repeated observation can prove it is the same result and not a new one.
+    pub result_id: String,
+    pub status: BackgroundTaskStatus,
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<i32>,
+    /// Bytes retained in the durable log at commit.
+    pub output_bytes: u64,
+    /// Whether earlier output was dropped by the bounded log.
+    pub output_truncated: bool,
+    pub completed_at_ms: u64,
+}
+
+impl CompletionRecord {
+    fn of(
+        task_id: &str,
+        snapshot: &BackgroundTaskSnapshot,
+        completed_at_ms: u64,
+    ) -> CompletionRecord {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(task_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", snapshot.status).as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", snapshot.exit_code).as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", snapshot.signal).as_bytes());
+        hasher.update([0]);
+        hasher.update(snapshot.log.as_bytes());
+        hasher.update([0]);
+        hasher.update(completed_at_ms.to_string().as_bytes());
+        CompletionRecord {
+            result_id: hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            status: snapshot.status,
+            exit_code: snapshot.exit_code,
+            signal: snapshot.signal,
+            output_bytes: snapshot.log.len() as u64,
+            output_truncated: snapshot.log_truncated,
+            completed_at_ms,
+        }
+    }
 }
 
 impl HostedTask {
@@ -210,6 +274,11 @@ enum Request {
         owner: String,
         writer: String,
         lifetime: BackgroundTaskLifetime,
+        /// Durable attribution of the tool call and goal that admitted this
+        /// process. Persisted with the started fact, so a runtime that never
+        /// received the spawn reply can still attribute the task.
+        #[serde(default)]
+        origin: crate::BackgroundTaskOrigin,
     },
     Get {
         id: String,
@@ -576,6 +645,31 @@ fn process_presence(pid: Option<u32>) -> ProcessPresence {
     }
 }
 
+/// Evidence about a *recovered* task's process, using its durable start token.
+///
+/// A live group probe alone cannot tell the recorded workload from a recycled
+/// pid. The token is therefore checked first. A mismatch proves the recorded
+/// process is gone; it still never authorizes a signal to whatever holds the id
+/// now, and any surviving group member keeps the answer conservative.
+fn task_process_presence(task: &HostedTask) -> ProcessPresence {
+    let Some(pid) = task.snapshot.pid else {
+        return ProcessPresence::Unobservable;
+    };
+    let Some(expected) = task.snapshot.start_identity.as_deref() else {
+        // No start token: a pid is not identity. Presence may still be probed
+        // for a conservative "may exist" answer, never for adoption or kill.
+        return process_presence(Some(pid));
+    };
+    match crate::process_identity::verify_process_identity(pid, expected) {
+        crate::process_identity::ProcessIdentity::Matches => process_presence(Some(pid)),
+        // The recorded leader is gone. A group or session member may still
+        // exist; only its absence proves the whole workload is over.
+        crate::process_identity::ProcessIdentity::Exited
+        | crate::process_identity::ProcessIdentity::Mismatch { .. } => process_presence(Some(pid)),
+        crate::process_identity::ProcessIdentity::Unknown => ProcessPresence::Unobservable,
+    }
+}
+
 /// Reconcile the durable records of a host that is provably gone.
 ///
 /// The lifecycle lock is the authority: `serve` holds it for the host's whole
@@ -625,7 +719,7 @@ fn recover_dead_host(config: &ExecutionHostConfig) -> Result<Option<HostRecovery
     };
     for task in tasks.iter_mut().filter(|task| task.is_live()) {
         let previous = task.snapshot.status;
-        let process = process_presence(task.snapshot.pid);
+        let process = task_process_presence(task);
         recovery.tasks.push(RecoveredTask {
             task_id: task.snapshot.id.clone(),
             program: task.snapshot.program.clone(),
@@ -636,6 +730,9 @@ fn recover_dead_host(config: &ExecutionHostConfig) -> Result<Option<HostRecovery
         task.snapshot.status = BackgroundTaskStatus::Unknown;
         task.snapshot.duration_ms = observed_at_ms.saturating_sub(task.started_at_ms);
         task.finished_at_ms = Some(observed_at_ms);
+        // No exit was observed, so there is no completion to keep — and a
+        // previously written record would be a fabrication if it survived.
+        task.result = None;
         task.loss = Some(TaskLoss {
             observed_at_ms,
             previous,
@@ -1010,6 +1107,7 @@ impl ExecutionHostClient {
         owner: &str,
         writer: &str,
         lifetime: BackgroundTaskLifetime,
+        origin: crate::BackgroundTaskOrigin,
     ) -> Result<BackgroundTaskSnapshot, SpawnError> {
         // A legacy host predates the `Runtime` owner tag and only admits
         // `Session`/`Persistent`. `Persistent` is its exact name for the same
@@ -1028,6 +1126,7 @@ impl ExecutionHostClient {
                 owner: owner.into(),
                 writer: writer.into(),
                 lifetime,
+                origin,
             })
             .await
             .map_err(SpawnError::OutcomeUnknown)?
@@ -1251,6 +1350,14 @@ impl Host {
                     observed_pid.or_else(|| records.get(id).and_then(|t| t.process_id));
                 let finished_at_ms =
                     terminal.then_some(e.started_at_ms.saturating_add(snapshot.duration_ms));
+                // The completion record is derived from the same read as the
+                // terminal snapshot, so it cannot describe a different exit.
+                let result = match finished_at_ms {
+                    Some(completed_at_ms) if terminal => {
+                        Some(CompletionRecord::of(id, &snapshot, completed_at_ms))
+                    }
+                    _ => None,
+                };
                 records.insert(
                     id.clone(),
                     HostedTask {
@@ -1265,6 +1372,7 @@ impl Host {
                         log_prefix_len,
                         // This host observed the entry; the exit fact is its own.
                         loss: None,
+                        result,
                     },
                 );
             }
@@ -1348,6 +1456,7 @@ impl Host {
                 owner,
                 writer,
                 lifetime,
+                origin,
             } => {
                 if !id.starts_with("host-")
                     || id.len() != 37
@@ -1358,10 +1467,11 @@ impl Host {
                 }
                 let fingerprint = {
                     use sha2::{Digest, Sha256};
-                    format!(
-                        "{:x}",
-                        Sha256::digest(serde_json::to_vec(&request).map_err(|e| e.to_string())?)
-                    )
+                    let mut hasher = Sha256::new();
+                    hasher.update(serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+                    hasher.update([0]);
+                    hasher.update(serde_json::to_vec(&origin).map_err(|e| e.to_string())?);
+                    format!("{:x}", hasher.finalize())
                 };
                 let mut entries = self.entries.lock().await;
                 if let Some(e) = entries.get(&id) {
@@ -1421,11 +1531,12 @@ impl Host {
                 let scope = request.write_scope.clone();
                 if !matches!(
                     lifetime,
-                    BackgroundTaskLifetime::Runtime
+                    BackgroundTaskLifetime::Goal
+                        | BackgroundTaskLifetime::Runtime
                         | BackgroundTaskLifetime::Session
                         | BackgroundTaskLifetime::Persistent
                 ) {
-                    return Err("only Runtime/Session/Persistent lifetimes may be hosted".into());
+                    return Err("unsupported lifetime for a hosted task".into());
                 }
                 let started_at_ms = wall_ms();
                 // Intent is durable before any OS spawn. A crash here is explicitly unknown,
@@ -1442,13 +1553,16 @@ impl Host {
                 atomic_json(&self.config.state_dir.join("intents.json"), &*intents)?;
                 let local = match self
                     .registry
-                    .spawn_for_writer(
+                    .spawn_with_origin(
                         *request,
                         None,
                         Some(&owner),
                         &writer,
+                        // The host's own registry is never itself hosted; the
+                        // public lifetime is carried by `Entry` and projected
+                        // from it. Runtime also prevents recursive hosting.
                         BackgroundTaskLifetime::Runtime,
-                        None,
+                        origin,
                     )
                     .await
                 {
@@ -1746,17 +1860,43 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
     let mut events = host.registry.subscribe();
     host.persist().await?;
     atomic_json(&host.config.state_dir.join("ready.json"), &ready)?;
+    // Lifecycle boundaries (started/terminal) are durable immediately; a
+    // chatty command's output is committed on a bounded cadence instead of one
+    // atomic archive replacement per line. A crash between ticks can lose the
+    // newest output tail, never the exit fact: every terminal observation goes
+    // through `get_owned`, which forces a write before it is acknowledged.
     let persistence = host.clone();
     tokio::spawn(async move {
+        const PERSIST_INTERVAL: Duration = Duration::from_millis(200);
+        let mut ticker = tokio::time::interval(PERSIST_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut dirty = false;
         loop {
-            let event = tokio::select! { _=persistence.shutdown.cancelled()=>break, event=events.recv()=>event };
-            match event {
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            tokio::select! {
+                _ = persistence.shutdown.cancelled() => break,
+                _ = ticker.tick(), if dirty => {
                     if let Err(e) = persistence.persist().await {
                         tracing::error!("Execution Host persistence failed: {e}");
                     }
+                    dirty = false;
                 }
-                Err(_) => break,
+                event = events.recv() => match event {
+                    Ok(event) => {
+                        dirty = true;
+                        if matches!(
+                            event,
+                            crate::BackgroundTaskEvent::Started { .. }
+                                | crate::BackgroundTaskEvent::Exited { .. }
+                        ) {
+                            if let Err(e) = persistence.persist().await {
+                                tracing::error!("Execution Host persistence failed: {e}");
+                            }
+                            dirty = false;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => dirty = true,
+                    Err(_) => break,
+                },
             }
         }
     });
@@ -2156,6 +2296,7 @@ mod tests {
                 "session",
                 "parent",
                 BackgroundTaskLifetime::Persistent,
+                crate::BackgroundTaskOrigin::default(),
             )
             .await
             .unwrap();
@@ -2199,6 +2340,7 @@ mod tests {
                 "session",
                 "parent",
                 BackgroundTaskLifetime::Persistent,
+                crate::BackgroundTaskOrigin::default(),
             )
             .await
             .unwrap();
@@ -2218,6 +2360,7 @@ mod tests {
                 "session",
                 "parent",
                 BackgroundTaskLifetime::Persistent,
+                crate::BackgroundTaskOrigin::default(),
             )
             .await
             .unwrap();
@@ -2302,7 +2445,8 @@ mod tests {
                     changed,
                     "session",
                     "parent",
-                    BackgroundTaskLifetime::Persistent
+                    BackgroundTaskLifetime::Persistent,
+                    crate::BackgroundTaskOrigin::default()
                 )
                 .await
                 .is_err()
@@ -2418,6 +2562,7 @@ mod tests {
                     "logs-session",
                     "parent",
                     BackgroundTaskLifetime::Persistent,
+                    crate::BackgroundTaskOrigin::default(),
                 )
                 .await
                 .unwrap();
@@ -2956,6 +3101,100 @@ mod tests {
         assert_eq!(loss.process, ProcessPresence::Gone);
         assert!(task.finished_at_ms.is_some());
         assert!(task.settlement_proven());
+        assert!(
+            task.result.is_none(),
+            "a lost host never observed an exit, so it cannot have a completion record"
+        );
+    }
+
+    /// A completion record is derived only from an exit this host observed.
+    /// Recovery must delete one that a crash could not have proven, and the
+    /// digest must be stable across equal reads but change with the fact.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_drops_a_completion_it_cannot_prove() {
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live group");
+        let live_pid = live.id();
+        let mut record = task_record(&config, "host-fabricated", "Running", live_pid);
+        // A bogus start token is exactly the shape a reused pid presents. It
+        // must never authorize a signal, and the fabricated completion must be
+        // discarded because this host never observed this task exit.
+        record["snapshot"]["start_identity"] = serde_json::json!("not-the-current-process");
+        record["result"] = serde_json::json!({
+            "result_id": "fabricated",
+            "status": "Exited",
+            "exit_code": 0,
+            "output_bytes": 0,
+            "output_truncated": false,
+            "completed_at_ms": 1
+        });
+        atomic_json(&config.state_dir.join("tasks.json"), &vec![record]).unwrap();
+
+        let probed = ExecutionHostClient::probe(&config).await.unwrap();
+        assert!(probed.client.is_none());
+        let recovery = probed.recovery.expect("the live record is converged");
+        assert_eq!(recovery.tasks.len(), 1);
+        assert_eq!(recovery.tasks[0].process, ProcessPresence::Present);
+        let records = HostRecords::read(&config.state_dir).unwrap();
+        let task = records.task("host-fabricated").unwrap();
+        assert_eq!(task.snapshot.status, BackgroundTaskStatus::Unknown);
+        assert!(
+            task.result.is_none(),
+            "recovery cannot keep an exit it did not see"
+        );
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(live_pid as i32), None).is_ok(),
+            "a mismatched start token never authorizes a signal"
+        );
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(live_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = live.wait();
+    }
+
+    /// The result identity is content-bound and stable: a re-read of the same
+    /// terminal fact yields the same id, while any change to the fact does not.
+    #[test]
+    fn a_completion_result_identity_is_stable_and_content_bound() {
+        let snapshot: BackgroundTaskSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "host-result",
+            "program": "sh",
+            "args": ["-c", "exit 7"],
+            "cwd": "/tmp",
+            "status": "Exited",
+            "exit_code": 7,
+            "log": "[stdout] COMPLETED\n",
+            "duration_ms": 10,
+            "owner_scope": "session",
+            "output_bytes": 20
+        }))
+        .unwrap();
+        let first = CompletionRecord::of("host-result", &snapshot, 100);
+        let repeated = CompletionRecord::of("host-result", &snapshot, 100);
+        assert_eq!(first, repeated, "the same fact must keep the same identity");
+        let mut changed = snapshot.clone();
+        changed.log.push_str("later");
+        assert_ne!(
+            first.result_id,
+            CompletionRecord::of("host-result", &changed, 100).result_id,
+            "different output is a different result"
+        );
+        assert_ne!(
+            first.result_id,
+            CompletionRecord::of("host-other", &snapshot, 100).result_id,
+            "the task identity is part of the result"
+        );
     }
 
     /// A record whose process group still exists is not adopted, not signalled
