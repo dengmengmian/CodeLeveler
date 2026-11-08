@@ -9233,6 +9233,24 @@ async fn commit_compaction_epoch(
     summary: Message,
     compacted_from: usize,
 ) -> Result<(), anyhow::Error> {
+    // Make the manual fold carry the same durable breadcrumb as the automatic
+    // one. It is the marker the post-compaction context uses to inject the
+    // deterministic facts block, so a `/compact` does not degrade to a summary
+    // with no execution facts.
+    let summary = leveler_model::Message {
+        origin: Some(TranscriptOrigin::CompactionSummary {
+            delivered_background_tasks: Vec::new(),
+        }),
+        role: leveler_model::Role::User,
+        content: vec![leveler_model::ContentPart::Text {
+            text: format!(
+                "{} to fit the window: `/compact` folded the earlier history.]\n\n{}",
+                leveler_model::COMPACTION_BREADCRUMB_MARKER,
+                summary.text_content()
+            ),
+        }],
+        route: None,
+    };
     let payload =
         serde_json::to_string(&summary).map_err(|e| anyhow::anyhow!("序列化摘要出错: {e}"))?;
     let mut events = vec![
@@ -9977,6 +9995,25 @@ mod context_ops_tests {
             compacted,
             vec![(12, 1)],
             "one durable compaction fact, counting what it replaced"
+        );
+        let snapshot = EventRepository::new(&db)
+            .load(&id)
+            .await
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find_map(
+                |row| match leveler_engine::EngineEvent::from_payload(&row.payload).ok()? {
+                    leveler_engine::EngineEvent::ContextSnapshot { messages, .. } => Some(messages),
+                    _ => None,
+                },
+            )
+            .expect("context snapshot");
+        assert!(
+            snapshot.iter().any(|message| message
+                .text_content()
+                .contains(leveler_model::COMPACTION_BREADCRUMB_MARKER)),
+            "the manual fold must be recognizable as a compaction context: {snapshot:?}"
         );
     }
 

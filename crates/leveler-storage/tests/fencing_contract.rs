@@ -11,8 +11,9 @@ use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
 use leveler_storage::{
     Database, EventStore, GoalState, GoalStore, GoalTerminalUpdate, MemoryEventStore,
     MemoryGoalStore, MemoryMessageStore, MemoryOwnershipState, MemoryOwnershipStore,
-    MemorySessionStore, MemoryTerminalStore, MemoryTurnStore, MessageStore, OwnershipError,
-    OwnershipStore, SessionRecord, SessionStore, TaskOwner, TerminalStore, TurnStore,
+    MemorySessionStore, MemoryTerminalStore, MemoryTurnStore, MessageRepository, MessageStore,
+    OwnershipError, OwnershipStore, SessionRecord, SessionStore, TaskOwner, TerminalStore,
+    TurnStore,
 };
 
 struct Ports<'a> {
@@ -631,4 +632,75 @@ async fn memory_fenced_writes_honor_the_contract() {
         &current,
     )
     .await;
+}
+
+/// F-24: `/compact` removes transcript rows but must not make the reaper
+/// re-project an input the journal already consumed. The consume transaction
+/// inserts the row and marks the journal in one commit, so a missing row plus
+/// a consumed journal can only be an epoch cut.
+#[tokio::test]
+async fn a_consumed_input_is_not_reprojected_after_an_epoch_cut() {
+    let db = Database::connect_in_memory().await.unwrap();
+    let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+    let session = SessionId::new(record.id.clone());
+    SessionStore::create(&db, &record).await.unwrap();
+    let task = leveler_storage::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+        .await
+        .unwrap();
+    let token = OwnershipStore::acquire(
+        &db,
+        &task,
+        &RuntimeId::new("rt-a"),
+        &leveler_core::BootId::new("test-boot"),
+        OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+    let turn = TurnStore::start(&db, &session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+    let turn_id = leveler_core::TurnId::new(turn.id);
+    let user = r#"{"role":"user","content":[{"type":"text","text":"long task"}]}"#;
+    leveler_storage::SessionInputRepository::new(&db)
+        .admit(
+            "in-1",
+            &session,
+            Some(&turn_id),
+            "long task",
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    db.append_input_in_turn_owned(
+        &token,
+        &session,
+        &turn_id,
+        "in-1",
+        user,
+        leveler_core::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(MessageStore::count(&db, &session).await.unwrap(), 1);
+
+    // `/compact`: the transcript is replaced by a summary row with no turn id.
+    MessageRepository::new(&db)
+        .truncate_after(&session, 0)
+        .await
+        .unwrap();
+    assert_eq!(MessageStore::count(&db, &session).await.unwrap(), 0);
+
+    let inserted = db
+        .ensure_initiating_message_owned(&token, &session, &turn_id, user, leveler_core::now())
+        .await
+        .unwrap();
+    assert!(
+        !inserted,
+        "a consumed journal row proves the projection existed; the epoch cut removed it"
+    );
+    assert_eq!(
+        MessageStore::count(&db, &session).await.unwrap(),
+        0,
+        "the reaper must not resurrect compacted history"
+    );
 }

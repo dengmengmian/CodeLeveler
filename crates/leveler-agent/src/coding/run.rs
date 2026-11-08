@@ -231,6 +231,135 @@ fn goal_profile(spec: &TaskSpec) -> TurnProfile {
     }
 }
 
+/// Marker of the deterministic facts block. A block is rebuilt from durable
+/// state on every request, so it is never accumulated across folds.
+const COMPACTION_FACTS_MARKER: &str = "## Retained execution facts";
+/// Hard bound on the block. The block is a projection, not history; when the
+/// active facts exceed it, the least critical tail is truncated explicitly.
+const MAX_COMPACTION_FACTS_CHARS: usize = 3_500;
+
+struct CompactionFactsInput<'a> {
+    objective: Option<&'a str>,
+    acceptance: &'a [String],
+    amendments: &'a [String],
+    plan: Option<&'a leveler_lifecycle::PlanState>,
+    progress: Option<&'a leveler_lifecycle::ProgressLedger>,
+    verification: &'a [crate::executor::goal_verification::VerificationRun],
+    dangling: &'a [(String, String)],
+    background: &'a [(String, String, String)],
+}
+
+/// Render the bounded deterministic facts a post-compaction request must keep.
+///
+/// The model summary remains the only carrier of free-form history; these
+/// facts come from durable owners (goal row, plan/progress events, verification
+/// runs, tool-event dangling calls, background registry) and are re-derived
+/// every time, so a fold cannot silently drop them or make an old one linger.
+fn render_compaction_facts(input: &CompactionFactsInput<'_>) -> Option<String> {
+    let mut out = String::new();
+    out.push_str(COMPACTION_FACTS_MARKER);
+    out.push_str(" (deterministic, not the model summary)\n");
+    if let Some(objective) = input.objective.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("Task objective: {}\n", clip(objective, 400)));
+    }
+    if !input.acceptance.is_empty() {
+        out.push_str("Acceptance checks that still govern this task:\n");
+        for check in input.acceptance.iter().take(6) {
+            out.push_str(&format!("- {}\n", clip(check, 200)));
+        }
+    }
+    if !input.amendments.is_empty() {
+        out.push_str(
+            "User instructions, oldest to newest (a later instruction supersedes an earlier one):\n",
+        );
+        let start = input.amendments.len().saturating_sub(8);
+        for amendment in &input.amendments[start..] {
+            out.push_str(&format!("- {}\n", clip(amendment, 240)));
+        }
+    }
+    if let Some(plan) = input.plan {
+        let open = plan.open_steps();
+        if !open.is_empty() {
+            out.push_str("Open plan steps (the runtime still expects these):\n");
+            for step in open.iter().take(10) {
+                out.push_str(&format!(
+                    "- [{}] {}\n",
+                    step.status.as_str(),
+                    clip(&step.step, 180)
+                ));
+            }
+        }
+    }
+    if let Some(progress) = input.progress {
+        out.push_str(&format!(
+            "Execution so far: phase={:?}, model_steps={}, commands={}, modified_files={}\n",
+            progress.phase,
+            progress.cumulative_model_steps,
+            progress.cumulative_commands,
+            progress.cumulative_modified_files
+        ));
+        if !progress.cumulative_modified_paths.is_empty() {
+            out.push_str(&format!(
+                "Modified paths: {}\n",
+                progress
+                    .cumulative_modified_paths
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if !input.verification.is_empty() {
+        out.push_str("Verification evidence (recorded mutation count matters):\n");
+        let start = input.verification.len().saturating_sub(5);
+        for run in &input.verification[start..] {
+            out.push_str(&format!(
+                "- `{}` {} (step {}, mutations {})\n",
+                clip(&run.label, 160),
+                if run.ok { "passed" } else { "failed" },
+                run.model_step,
+                run.mutation_ops
+            ));
+        }
+    }
+    if !input.dangling.is_empty() {
+        out.push_str("Unknown tool outcomes (may have run; do not retry a side effect blind):\n");
+        for (name, call_id) in input.dangling.iter().take(5) {
+            out.push_str(&format!("- {name} ({call_id})\n"));
+        }
+    }
+    if !input.background.is_empty() {
+        out.push_str("Background tasks owned by this task:\n");
+        for (id, status, lifetime) in input.background.iter().take(5) {
+            out.push_str(&format!("- {id} {status} ({lifetime})\n"));
+        }
+    }
+    if out.lines().count() <= 1 {
+        return None;
+    }
+    if out.len() > MAX_COMPACTION_FACTS_CHARS {
+        let cut = out
+            .char_indices()
+            .take_while(|(index, _)| *index <= MAX_COMPACTION_FACTS_CHARS)
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        out.truncate(cut);
+        out.push_str("\n…[facts truncated to the context budget]\n");
+    }
+    Some(out)
+}
+
+fn clip(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max_chars).collect();
+    format!("{clipped}…")
+}
+
 /// The Coding harness's answer to "is the prior domain state still open?".
 ///
 /// This is the harness's judgement over its own vocabulary: a finished epoch is
@@ -1189,6 +1318,141 @@ impl CodingRuntime {
         })
     }
 
+    /// Build the bounded deterministic facts message from the current durable
+    /// owners. `None` when there is nothing to retain.
+    async fn compaction_facts_message(
+        &self,
+        session_id: &SessionId,
+        goal_id: Option<&leveler_core::GoalId>,
+        log: &EventLog<'_>,
+        objective: Option<&str>,
+    ) -> Result<Option<leveler_model::Message>, EngineError> {
+        let stores = &self.engine.stores;
+        let goal = if let Some(id) = goal_id {
+            stores.goals.get(id).await?
+        } else {
+            let task = stores.tasks.task_for_session(session_id).await?;
+            match task {
+                Some(task) => {
+                    let mut running = stores
+                        .goals
+                        .for_task(&task)
+                        .await?
+                        .into_iter()
+                        .filter(|goal| goal.state == leveler_storage::GoalState::Running);
+                    match (running.next(), running.next()) {
+                        (Some(goal), None) => Some(goal),
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        };
+        let plan =
+            crate::coding::turn::last_persisted_plan(stores.events.as_ref(), session_id).await?;
+        let progress =
+            crate::coding::turn::last_persisted_progress(stores.events.as_ref(), session_id)
+                .await?;
+        let verification = if let Some(goal) = goal.as_ref() {
+            crate::coding::turn::load_goal_verification_runs(stores, session_id, &goal.id).await?
+        } else {
+            Vec::new()
+        };
+        let dangling: Vec<(String, String)> = log
+            .dangling_tool_calls()
+            .await?
+            .into_iter()
+            .take(5)
+            .map(|call| (call.name, call.call_id))
+            .collect();
+        let background: Vec<(String, String, String)> =
+            match self.factory.tool_context.session_scope.as_deref() {
+                Some(scope) => self
+                    .factory
+                    .background_tasks
+                    .active_snapshots_for_scope(scope)
+                    .await
+                    .into_iter()
+                    .take(5)
+                    .map(|snap| {
+                        (
+                            snap.id,
+                            format!("{:?}", snap.status).to_lowercase(),
+                            snap.lifetime.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+        let objective = goal
+            .as_ref()
+            .map(|goal| goal.objective.as_str())
+            .or(objective);
+        let input = CompactionFactsInput {
+            objective,
+            acceptance: goal
+                .as_ref()
+                .map(|goal| goal.acceptance.as_slice())
+                .unwrap_or(&[]),
+            amendments: goal
+                .as_ref()
+                .map(|goal| goal.amendments.as_slice())
+                .unwrap_or(&[]),
+            plan: plan.as_ref(),
+            progress: progress.as_ref(),
+            verification: &verification,
+            dangling: &dangling,
+            background: &background,
+        };
+        let Some(text) = render_compaction_facts(&input) else {
+            return Ok(None);
+        };
+        // The facts are model-visible text assembled from durable rows; the
+        // same Phase 2A boundary applies here as to any other projection.
+        let (text, _) = leveler_core::sanitize_model_visible(&text);
+        Ok(Some(leveler_model::Message::text(
+            leveler_model::Role::System,
+            text,
+        )))
+    }
+
+    /// Insert the facts block after the summary/goal checkpoint (or after the
+    /// leading system prompt) and drop any previous block, so a second fold
+    /// replaces rather than accumulates.
+    async fn with_compaction_facts(
+        &self,
+        mut messages: Vec<leveler_model::Message>,
+        session_id: &SessionId,
+        goal_id: Option<&leveler_core::GoalId>,
+        log: &EventLog<'_>,
+        objective: Option<&str>,
+    ) -> Result<Vec<leveler_model::Message>, EngineError> {
+        let Some(facts) = self
+            .compaction_facts_message(session_id, goal_id, log, objective)
+            .await?
+        else {
+            return Ok(messages);
+        };
+        messages.retain(|message| !message.text_content().contains(COMPACTION_FACTS_MARKER));
+        let at = messages
+            .iter()
+            .position(|message| {
+                let text = message.text_content();
+                text.contains(leveler_model::COMPACTION_BREADCRUMB_MARKER)
+                    || text.starts_with("[GOAL CHECKPOINT]")
+            })
+            .map(|index| index + 1)
+            .or_else(|| {
+                messages
+                    .iter()
+                    .position(|message| message.role == leveler_model::Role::System)
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(0);
+        messages.insert(at, facts);
+        Ok(messages)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn assembled_prior(
         &self,
@@ -1219,13 +1483,11 @@ impl CodingRuntime {
                 )
                 .await?
         {
-            return Ok(leveler_context::compact_messages(
-                &prior,
-                usize::MAX,
-                u64::MAX,
-                None,
-                objective,
-            ));
+            let prior =
+                leveler_context::compact_messages(&prior, usize::MAX, u64::MAX, None, objective);
+            return self
+                .with_compaction_facts(prior, session_id, Some(&scope.goal_id), log, objective)
+                .await;
         }
         let policy = self.resolved_context_policy().await?;
         // Build the executor once: its tool surface and its control context are
@@ -1283,13 +1545,28 @@ impl CodingRuntime {
         if context.compacted {
             log.append(None, context.snapshot_event(), observer).await?;
         }
-        Ok(leveler_context::compact_messages(
+        let compacted = context.compacted;
+        let prior = leveler_context::compact_messages(
             &context.prior,
             usize::MAX,
             u64::MAX,
             None,
             objective,
-        ))
+        );
+        if compacted
+            || checkpoint_scope.is_some()
+            || prior.iter().any(|message| {
+                message
+                    .text_content()
+                    .contains(leveler_model::COMPACTION_BREADCRUMB_MARKER)
+            })
+        {
+            let goal_id = checkpoint_scope.map(|scope| &scope.goal_id);
+            return self
+                .with_compaction_facts(prior, session_id, goal_id, log, objective)
+                .await;
+        }
+        Ok(prior)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3249,6 +3526,21 @@ impl CodingRuntime {
                 return result;
             }
         };
+        // A resumed Goal window (and any resume whose transcript already
+        // carries a compaction/checkpoint boundary) gets the deterministic
+        // facts projection. It is rebuilt from durable owners here, so a
+        // compacted summary never becomes the only carrier of the objective,
+        // plan, verification or unknown tool facts.
+        let objective_text = lineage.objective.text().to_string();
+        let prior = self
+            .with_compaction_facts(
+                prior,
+                session_id,
+                lineage.goal_id.as_ref(),
+                &log,
+                Some(objective_text.as_str()),
+            )
+            .await?;
         let runner = TurnRunner {
             stores: &self.engine.stores,
             token: token.clone(),
@@ -5276,5 +5568,84 @@ mod continuation_rule_tests {
             None,
             None
         ));
+    }
+}
+
+#[cfg(test)]
+mod compaction_facts_tests {
+    use super::{
+        COMPACTION_FACTS_MARKER, CompactionFactsInput, MAX_COMPACTION_FACTS_CHARS,
+        render_compaction_facts,
+    };
+
+    fn render(
+        objective: Option<&str>,
+        acceptance: &[String],
+        amendments: &[String],
+        progress: Option<&leveler_lifecycle::ProgressLedger>,
+    ) -> Option<String> {
+        render_compaction_facts(&CompactionFactsInput {
+            objective,
+            acceptance,
+            amendments,
+            plan: None,
+            progress,
+            verification: &[],
+            dangling: &[],
+            background: &[],
+        })
+    }
+
+    #[test]
+    fn the_facts_block_names_the_objective_acceptance_and_ordered_constraints() {
+        let acceptance = vec!["tests pass".to_string()];
+        let amendments = vec![
+            "use an env var".to_string(),
+            "do not edit config".to_string(),
+        ];
+        let text = render(Some("ship the feature"), &acceptance, &amendments, None).unwrap();
+        assert!(text.starts_with(COMPACTION_FACTS_MARKER), "{text}");
+        assert!(text.contains("ship the feature"));
+        assert!(text.contains("tests pass"));
+        let first = text.find("use an env var").unwrap();
+        let later = text.find("do not edit config").unwrap();
+        assert!(first < later, "oldest-to-newest order is preserved: {text}");
+        assert!(text.contains("later instruction supersedes"));
+    }
+
+    #[test]
+    fn no_durable_facts_means_no_block() {
+        assert!(render(None, &[], &[], None).is_none());
+    }
+
+    #[test]
+    fn a_large_fact_set_is_bounded_and_says_so() {
+        let amendments: Vec<String> = (0..80)
+            .map(|index| format!("instruction {index} {}", "x".repeat(400)))
+            .collect();
+        let text = render(Some("objective"), &[], &amendments, None).unwrap();
+        assert!(
+            text.len() <= MAX_COMPACTION_FACTS_CHARS + 64,
+            "facts block must stay bounded: {}",
+            text.len()
+        );
+        // The per-section caps usually keep the block under the hard bound;
+        // when it does exceed it, the renderer truncates explicitly.
+        if text.len() > MAX_COMPACTION_FACTS_CHARS {
+            assert!(text.contains("facts truncated to the context budget"));
+        }
+    }
+
+    #[test]
+    fn progress_facts_are_included_without_raw_tool_output() {
+        let progress = leveler_lifecycle::ProgressLedger {
+            cumulative_commands: 7,
+            cumulative_modified_files: 2,
+            cumulative_modified_paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+            ..Default::default()
+        };
+        let text = render(Some("task"), &[], &[], Some(&progress)).unwrap();
+        assert!(text.contains("commands=7"), "{text}");
+        assert!(text.contains("src/a.rs, src/b.rs"), "{text}");
     }
 }
