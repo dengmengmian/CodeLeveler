@@ -67,12 +67,21 @@ Example (add a function after an existing one):
 Every hunk is planned before the first write, so a hunk that fails to match
 fails the whole call and nothing is written. Commits use compare-and-swap; if a
 later commit conflicts, earlier commits are rolled back without overwriting the
-conflicting writer, and a rollback conflict is surfaced loudly."#;
+conflicting writer, and a rollback conflict is surfaced loudly.
+
+[REDACTED] in a new line or Add File is refused because it is the runtime's
+placeholder for a hidden secret, not file bytes. Set
+allow_redacted_literal: true only when the user explicitly asked for that
+literal text."#;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
     /// The full patch document, starting with `*** Begin Patch`.
     patch: String,
+    /// Set only when the user explicitly asked for the literal text
+    /// [REDACTED] in a new line or new file. Defaults to false.
+    #[serde(default)]
+    allow_redacted_literal: bool,
 }
 
 /// A resolved filesystem operation, computed before anything is written.
@@ -153,14 +162,24 @@ async fn verify_removed(path: &PathBuf) -> Result<(), ToolError> {
     }
 }
 
-async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailure> {
+async fn commit_op(
+    context: &ToolContext,
+    op: Op,
+    allow_redacted_literal: bool,
+) -> Result<Applied, CommitFailure> {
     match op {
         Op::Replace {
             path,
             expected,
             content,
-        } => match crate::workspace::WorkspaceEditor::replace(context, &path, &expected, &content)
-            .await
+        } => match crate::workspace::WorkspaceEditor::replace(
+            context,
+            &path,
+            &expected,
+            &content,
+            allow_redacted_literal,
+        )
+        .await
         {
             Ok(crate::workspace::Commit::Written(receipt)) => Ok(Applied::Replaced {
                 path,
@@ -177,7 +196,14 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
             Err(error) => Err(CommitFailure::Infrastructure(error)),
         },
         Op::Create { path, content } => {
-            match crate::workspace::WorkspaceEditor::create(context, &path, &content).await {
+            match crate::workspace::WorkspaceEditor::create(
+                context,
+                &path,
+                &content,
+                allow_redacted_literal,
+            )
+            .await
+            {
                 Ok(crate::workspace::Commit::Written(receipt)) => Ok(Applied::Created {
                     path,
                     content,
@@ -274,7 +300,8 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
                 ..
             } => (
                 path,
-                crate::workspace::WorkspaceEditor::replace(context, path, after, before).await?,
+                crate::workspace::WorkspaceEditor::replace(context, path, after, before, true)
+                    .await?,
             ),
             Applied::Created { path, content, .. } => (
                 path,
@@ -292,6 +319,7 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
                     path,
                     content,
                     Some(permissions.clone()),
+                    true,
                 )
                 .await?,
             ),
@@ -698,6 +726,23 @@ impl Tool for ApplyPatchTool {
             }
         }
 
+        // Materialization preflight: reject every runtime placeholder before
+        // the first file changes, so a multi-file patch cannot apply half of
+        // its content and then discover the guard on a later file.
+        if !input.allow_redacted_literal {
+            for op in &ops {
+                let content = match op {
+                    Op::Replace { content, .. } | Op::Create { content, .. } => Some(content),
+                    Op::Remove { .. } => None,
+                };
+                if let Some(content) = content
+                    && let Err(message) = crate::workspace::ensure_materializable(content, false)
+                {
+                    return Ok(ToolOutput::error(message));
+                }
+            }
+        }
+
         // Commit phase — now that everything resolved, write to disk through the
         // shared lock + compare-and-swap engine (same as `replace`): an in-place
         // Update refuses if the file moved on disk since the plan phase read it,
@@ -705,7 +750,7 @@ impl Tool for ApplyPatchTool {
         // checkpointed just before it is first modified (spec §28).
         let mut applied = Vec::new();
         for op in ops {
-            match commit_op(&context, op).await {
+            match commit_op(&context, op, input.allow_redacted_literal).await {
                 Ok(operation) => applied.push(operation),
                 Err(failure) => {
                     if let Err(rollback_error) = rollback_applied(&context, &applied).await {
@@ -866,6 +911,7 @@ mod tests {
                 path: created.clone(),
                 content: "own-create".into(),
             },
+            true,
         )
         .await
         .ok()
@@ -881,6 +927,7 @@ mod tests {
                 expected: "before".into(),
                 permissions,
             },
+            true,
         )
         .await
         .ok()
@@ -895,6 +942,7 @@ mod tests {
                 expected: "before".into(),
                 content: "after".into(),
             },
+            true,
         )
         .await
         .ok()
@@ -907,7 +955,8 @@ mod tests {
                     path: second.clone(),
                     expected: "second-before".into(),
                     content: "changed".into()
-                }
+                },
+                true,
             )
             .await
             .is_err()
@@ -926,6 +975,7 @@ mod tests {
                 expected: "before".into(),
                 content: "after".into(),
             },
+            true,
         )
         .await
         .ok()
@@ -1908,6 +1958,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// F-02: Add File and pure-new lines with the runtime placeholder are
+    /// refused before any file is created; the explicit literal escape works.
+    #[tokio::test]
+    async fn placeholder_add_and_new_line_are_refused_unless_literal() {
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("config.txt", "KEEP=1\n")],
+        );
+        let add = "*** Begin Patch\n*** Add File: new.env\n+API_TOKEN=[REDACTED]\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": add }),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!dir.join("new.env").exists());
+
+        let update = "*** Begin Patch\n*** Update File: config.txt\n@@\n KEEP=1\n+API_TOKEN=[REDACTED]\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": update }),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.txt")).unwrap(),
+            "KEEP=1\n"
+        );
+
+        let literal = "*** Begin Patch\n*** Add File: literal.txt\n+[REDACTED]\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": literal, "allow_redacted_literal": true }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("literal.txt")).unwrap(),
+            "[REDACTED]\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn rejects_out_of_workspace() {
         let (context, dir) = ctx();
@@ -1921,6 +2023,63 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// INV-03: the placeholder guard is a preflight for the whole patch, not a
+    /// per-file check. One bad file must leave every other file untouched —
+    /// otherwise a multi-file patch could damage a secret and still report the
+    /// caller a partial result.
+    #[tokio::test]
+    async fn a_multi_file_patch_with_a_placeholder_writes_nothing() {
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("keep.txt", "keep\n")],
+        );
+        let patch = "*** Begin Patch\n\
+                     *** Add File: clean.txt\n+clean\n\
+                     *** Add File: leak.env\n+API_TOKEN=[REDACTED]\n\
+                     *** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!dir.join("clean.txt").exists());
+        assert!(!dir.join("leak.env").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// INV-03: rollback restores bytes captured before the patch, and those
+    /// bytes may legitimately contain the placeholder. The materialization
+    /// guard belongs to new content the model asked for; it must never block
+    /// the undo path, or a failed patch could leave a changed workspace.
+    #[tokio::test]
+    async fn rollback_restores_placeholder_bytes_without_the_materialization_guard() {
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("secret.env", "TOKEN=real-value\n")],
+        );
+        let path = dir.join("secret.env").canonicalize().unwrap();
+        let applied = Applied::Replaced {
+            path: path.clone(),
+            before: "TOKEN=[REDACTED]\n".into(),
+            after: "TOKEN=real-value\n".into(),
+            receipt: None,
+        };
+        rollback_applied(&context, &[applied]).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "TOKEN=[REDACTED]\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
