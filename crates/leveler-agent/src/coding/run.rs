@@ -240,7 +240,7 @@ const MAX_COMPACTION_FACTS_CHARS: usize = 3_500;
 
 struct CompactionFactsInput<'a> {
     objective: Option<&'a str>,
-    acceptance: &'a [String],
+    effective: &'a [crate::executor::goal_scope::Requirement],
     amendments: &'a [String],
     plan: Option<&'a leveler_lifecycle::PlanState>,
     progress: Option<&'a leveler_lifecycle::ProgressLedger>,
@@ -262,10 +262,21 @@ fn render_compaction_facts(input: &CompactionFactsInput<'_>) -> Option<String> {
     if let Some(objective) = input.objective.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str(&format!("Task objective: {}\n", clip(objective, 400)));
     }
-    if !input.acceptance.is_empty() {
-        out.push_str("Acceptance checks that still govern this task:\n");
-        for check in input.acceptance.iter().take(6) {
-            out.push_str(&format!("- {}\n", clip(check, 200)));
+    if !input.effective.is_empty() {
+        out.push_str("Effective acceptance (the Gate uses exactly this set):\n");
+        for requirement in input.effective.iter().take(8) {
+            out.push_str(&format!(
+                "- {} [{}] {}\n",
+                requirement.id,
+                requirement.kind.label(),
+                clip(&requirement.text, 200)
+            ));
+        }
+        if input.effective.len() > 8 {
+            out.push_str(&format!(
+                "…and {} more effective requirements the Gate still enforces.\n",
+                input.effective.len() - 8
+            ));
         }
     }
     if !input.amendments.is_empty() {
@@ -1388,12 +1399,13 @@ impl CodingRuntime {
             .as_ref()
             .map(|goal| goal.objective.as_str())
             .or(objective);
+        let effective = goal
+            .as_ref()
+            .map(|goal| crate::executor::goal_scope::extract(&goal.objective, &goal.amendments))
+            .unwrap_or_default();
         let input = CompactionFactsInput {
             objective,
-            acceptance: goal
-                .as_ref()
-                .map(|goal| goal.acceptance.as_slice())
-                .unwrap_or(&[]),
+            effective: &effective,
             amendments: goal
                 .as_ref()
                 .map(|goal| goal.amendments.as_slice())
@@ -5578,15 +5590,25 @@ mod compaction_facts_tests {
         render_compaction_facts,
     };
 
+    fn requirement(text: &str) -> crate::executor::goal_scope::Requirement {
+        crate::executor::goal_scope::Requirement {
+            id: "R1".into(),
+            text: text.into(),
+            kind: crate::executor::goal_scope::RequirementKind::Named,
+            source: crate::executor::goal_scope::RequirementSource::Objective,
+            target: None,
+        }
+    }
+
     fn render(
         objective: Option<&str>,
-        acceptance: &[String],
+        effective: &[crate::executor::goal_scope::Requirement],
         amendments: &[String],
         progress: Option<&leveler_lifecycle::ProgressLedger>,
     ) -> Option<String> {
         render_compaction_facts(&CompactionFactsInput {
             objective,
-            acceptance,
+            effective,
             amendments,
             plan: None,
             progress,
@@ -5598,7 +5620,7 @@ mod compaction_facts_tests {
 
     #[test]
     fn the_facts_block_names_the_objective_acceptance_and_ordered_constraints() {
-        let acceptance = vec!["tests pass".to_string()];
+        let acceptance = vec![requirement("tests pass")];
         let amendments = vec![
             "use an env var".to_string(),
             "do not edit config".to_string(),
@@ -5607,6 +5629,7 @@ mod compaction_facts_tests {
         assert!(text.starts_with(COMPACTION_FACTS_MARKER), "{text}");
         assert!(text.contains("ship the feature"));
         assert!(text.contains("tests pass"));
+        assert!(text.contains("the Gate uses exactly this set"), "{text}");
         let first = text.find("use an env var").unwrap();
         let later = text.find("do not edit config").unwrap();
         assert!(first < later, "oldest-to-newest order is preserved: {text}");
@@ -5647,5 +5670,80 @@ mod compaction_facts_tests {
         let text = render(Some("task"), &[], &[], Some(&progress)).unwrap();
         assert!(text.contains("commands=7"), "{text}");
         assert!(text.contains("src/a.rs, src/b.rs"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod effective_acceptance_facts_tests {
+    use super::{COMPACTION_FACTS_MARKER, CompactionFactsInput, render_compaction_facts};
+    use crate::executor::goal_scope::{Requirement, RequirementKind, RequirementSource, extract};
+
+    fn req(id: usize, text: &str) -> Requirement {
+        Requirement {
+            id: format!("R{id}"),
+            text: text.into(),
+            kind: RequirementKind::Named,
+            source: RequirementSource::Objective,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn more_than_eight_effective_requirements_are_not_claimed_as_complete() {
+        let effective: Vec<Requirement> = (0..10)
+            .map(|i| req(i, &format!("deliverable-{i}")))
+            .collect();
+        let text = render_compaction_facts(&CompactionFactsInput {
+            objective: Some("task"),
+            effective: &effective,
+            amendments: &[],
+            plan: None,
+            progress: None,
+            verification: &[],
+            dangling: &[],
+            background: &[],
+        })
+        .unwrap();
+        assert!(text.starts_with(COMPACTION_FACTS_MARKER));
+        assert!(text.contains("deliverable-7"), "{text}");
+        assert!(
+            !text.contains("deliverable-8"),
+            "only eight are expanded: {text}"
+        );
+        assert!(
+            text.contains("…and 2 more effective requirements"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn facts_render_the_same_effective_set_as_the_gate() {
+        let effective = extract(
+            "创建 config.yaml、setup.py。",
+            &["config.yaml 改用环境变量完成。".to_string()],
+        );
+        let text = render_compaction_facts(&CompactionFactsInput {
+            objective: Some("创建 config.yaml、setup.py。"),
+            effective: &effective,
+            amendments: &[],
+            plan: None,
+            progress: None,
+            verification: &[],
+            dangling: &[],
+            background: &[],
+        })
+        .unwrap();
+        assert!(
+            !effective
+                .iter()
+                .any(|requirement| requirement.text.contains("config.yaml")),
+            "the effective set must not contain the replaced deliverable: {effective:?}"
+        );
+        assert_eq!(
+            text.matches("config.yaml").count(),
+            1,
+            "only the historical objective may mention it: {text}"
+        );
+        assert!(text.contains("Effective acceptance"), "{text}");
     }
 }
