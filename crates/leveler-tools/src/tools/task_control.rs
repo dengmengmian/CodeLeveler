@@ -1354,14 +1354,45 @@ impl Tool for KillTaskTool {
             )
             .await
         {
-            Ok(snap) => Ok(
-                ToolOutput::ok(format_snap(&snap)).with_metadata(serde_json::json!({
-                    "terminal_task_id": snap.status.is_terminal().then_some(&snap.id),
-                })),
-            ),
+            Ok(snap) => Ok(kill_result(&snap)),
             Err(e) => Ok(ToolOutput::error(e)),
         }
     }
+}
+
+/// A stop request is accepted, not proof that the process is gone. Report the
+/// two states distinctly instead of the old success-shaped "killing" snapshot:
+/// `Killing` is explicitly unconfirmed, and only a terminal status is
+/// `confirmed`. The model must be able to decide whether it may assume the
+/// process stopped (CANCEL-05/CANCEL-06, F-37).
+fn kill_result(snap: &leveler_execution::BackgroundTaskSnapshot) -> ToolOutput {
+    let status = match snap.status {
+        BackgroundTaskStatus::Running => "running",
+        BackgroundTaskStatus::Killing => "killing",
+        BackgroundTaskStatus::Exited => "exited",
+        BackgroundTaskStatus::Killed => "killed",
+        BackgroundTaskStatus::Unknown => "unknown",
+    };
+    let confirmed = snap.status.is_terminal();
+    let lead = if confirmed {
+        format!(
+            "Background task `{}` is stopped (status: {status}).",
+            snap.id
+        )
+    } else {
+        format!(
+            "Stop REQUESTED for background task `{}`; termination is NOT confirmed yet \
+             (status: {status}). The process may still be running. Use get_task or wait_task \
+             before assuming it stopped or that its files/ports are free; a later kill_task is \
+             an idempotent status read.",
+            snap.id
+        )
+    };
+    ToolOutput::ok(format!("{lead}\n{}", format_snap(snap))).with_metadata(serde_json::json!({
+        "terminal_task_id": confirmed.then_some(snap.id.as_str()),
+        "termination": if confirmed { "confirmed" } else { "requested_unconfirmed" },
+        "status": status,
+    }))
 }
 
 // Every test here drives background mutations through a POSIX `sh -c` + git
@@ -3547,5 +3578,48 @@ mod tests {
             own.metadata["modified_files"],
             serde_json::json!(["own.txt"])
         );
+    }
+}
+
+#[cfg(test)]
+mod kill_result_tests {
+    use super::*;
+
+    fn snap(status: &str) -> leveler_execution::BackgroundTaskSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id": "t1",
+            "program": "sleep",
+            "args": ["30"],
+            "cwd": "/tmp",
+            "status": status,
+            "exit_code": null,
+            "log": "",
+            "duration_ms": 0,
+            "owner_scope": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unconfirmed_stop_never_reads_as_success() {
+        let out = kill_result(&snap("Killing"));
+        assert!(!out.is_error);
+        assert!(out.content.contains("NOT confirmed"), "{}", out.content);
+        assert!(
+            out.content.contains("may still be running"),
+            "{}",
+            out.content
+        );
+        assert_eq!(out.metadata["termination"], "requested_unconfirmed");
+        assert!(out.metadata["terminal_task_id"].is_null());
+    }
+
+    #[test]
+    fn a_terminal_status_is_a_confirmed_stop() {
+        let out = kill_result(&snap("Killed"));
+        assert!(!out.is_error);
+        assert!(out.content.contains("is stopped"), "{}", out.content);
+        assert_eq!(out.metadata["termination"], "confirmed");
+        assert_eq!(out.metadata["terminal_task_id"], "t1");
     }
 }

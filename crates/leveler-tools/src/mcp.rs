@@ -273,7 +273,23 @@ impl McpClient {
             Ok(Err(_)) => Err("MCP 响应通道关闭".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(format!("MCP 请求 `{method}` 超时"))
+                // Best effort: the protocol has a cancellation notification.
+                // Sending it does not prove the server stopped; the request
+                // may already have produced a side effect, so the outcome
+                // stays Unknown.
+                let cancelled = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": { "requestId": id, "reason": "timeout" },
+                });
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    self.write_line(&cancelled),
+                )
+                .await;
+                Err(format!(
+                    "UNKNOWN_OUTCOME:MCP 请求 `{method}` 超时；请求可能已送达服务端并产生副作用，结果未知，未自动重试"
+                ))
             }
         }
     }
@@ -293,6 +309,26 @@ impl McpClient {
             .map_err(|e| e.to_string())?;
         stdin.flush().await.map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Best-effort `notifications/cancelled` for every in-flight request.
+    /// A cancellation notification is a request to stop, never confirmation
+    /// that the server stopped or that the call had no side effect.
+    pub async fn cancel_pending(&self, reason: &str) {
+        let ids: Vec<u64> = self.pending.lock().await.keys().copied().collect();
+        for id in ids {
+            self.pending.lock().await.remove(&id);
+            let cancelled = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": id, "reason": reason },
+            });
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                self.write_line(&cancelled),
+            )
+            .await;
+        }
     }
 
     /// List the server's tools, following `nextCursor` up to 64 pages.
@@ -493,7 +529,6 @@ impl Tool for McpTool {
             ));
         }
         let unrestricted = context.policy.unrestricted_execution();
-        let http = matches!(self.link, McpLink::Http(_));
         let call = async {
             match &self.link {
                 McpLink::Stdio(client) => {
@@ -513,7 +548,7 @@ impl Tool for McpTool {
                     client
                         .call_tool(&self.remote_name, input)
                         .await
-                        .map_err(|reason| format!("MCP 调用失败:{reason}"))
+                        .map_err(stdio_call_error)
                 }
                 McpLink::Http(session) => match session.call_tool(&self.remote_name, input).await {
                     mcp_http::CallOutcome::Done(text) => Ok(text),
@@ -527,11 +562,12 @@ impl Tool for McpTool {
         let out = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
-                return Ok(ToolOutput::error(if http {
-                    "MCP 调用已取消。请求可能已送达服务端，结果未知，未自动重试。"
-                } else {
-                    "MCP 调用已取消。"
-                }));
+                if let McpLink::Stdio(client) = &self.link {
+                    client.cancel_pending("user cancelled").await;
+                }
+                return Ok(ToolOutput::error(
+                    "MCP 调用已取消。请求可能已送达服务端，结果未知，未自动重试。",
+                ));
             }
             r = call => r,
         };
@@ -539,6 +575,16 @@ impl Tool for McpTool {
             Ok(text) => Ok(ToolOutput::ok(text)),
             Err(reason) => Ok(ToolOutput::error(reason)),
         }
+    }
+}
+
+/// A stdio call error is a confirmed failure only when the client knows the
+/// request did not produce an outcome. A timeout/cancel is Unknown: the server
+/// may have executed it, and the model must not retry a side effect blind.
+fn stdio_call_error(reason: String) -> String {
+    match reason.strip_prefix("UNKNOWN_OUTCOME:") {
+        Some(unknown) => format!("MCP 调用结果未知:{unknown}"),
+        None => format!("MCP 调用失败:{reason}"),
     }
 }
 
@@ -904,5 +950,26 @@ for line in sys.stdin:
     fn exposed_name_is_prefixed() {
         // A tool from server "fs" named "read" is exposed as mcp__fs__read.
         assert_eq!(exposed_tool_name("fs", "read"), "mcp__fs__read");
+    }
+}
+
+#[cfg(test)]
+mod stdio_outcome_tests {
+    use super::stdio_call_error;
+
+    #[test]
+    fn a_timeout_is_unknown_not_a_confirmed_failure() {
+        let text = stdio_call_error(
+            "UNKNOWN_OUTCOME:MCP 请求 `tools/call` 超时；请求可能已送达服务端".to_string(),
+        );
+        assert!(text.starts_with("MCP 调用结果未知:"), "{text}");
+        assert!(!text.contains("调用失败"), "{text}");
+    }
+
+    #[test]
+    fn an_explicit_error_stays_a_confirmed_failure() {
+        let text = stdio_call_error("server rejected arguments".to_string());
+        assert!(text.starts_with("MCP 调用失败:"), "{text}");
+        assert!(!text.contains("未知"), "{text}");
     }
 }
