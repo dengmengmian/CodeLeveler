@@ -1320,6 +1320,12 @@ pub(crate) fn child_working_directory(path: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct CommandRunner {
     environment: std::sync::Arc<leveler_core::EnvSnapshot>,
+    /// Linux: tie the child to this process with `PR_SET_PDEATHSIG`. The
+    /// supervisor of background work turns it off: a supervised workload must
+    /// outlive a crash of the process that requested it — and of the host that
+    /// spawned it — so the next host can adopt and observe it. A foreground
+    /// command keeps it: nobody adopts an orphaned shell.
+    parent_death_signal: bool,
 }
 
 impl Default for CommandRunner {
@@ -1332,11 +1338,22 @@ impl CommandRunner {
     pub fn new() -> Self {
         Self {
             environment: std::sync::Arc::new(leveler_core::environment().clone()),
+            parent_death_signal: true,
         }
     }
 
     pub fn with_environment(environment: std::sync::Arc<leveler_core::EnvSnapshot>) -> Self {
-        Self { environment }
+        Self {
+            environment,
+            parent_death_signal: true,
+        }
+    }
+
+    /// Keep a supervised child alive when its spawning process dies. See the
+    /// field note; background supervision is the only caller.
+    pub fn without_parent_death_signal(mut self) -> Self {
+        self.parent_death_signal = false;
+        self
     }
 
     /// The immutable environment snapshot every child is built from.
@@ -1666,7 +1683,9 @@ impl CommandRunner {
             if pty.is_none() {
                 cmd.process_group(0);
             }
-            set_parent_death_signal(&mut cmd);
+            if self.parent_death_signal {
+                set_parent_death_signal(&mut cmd);
+            }
             let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {
                 program: request.program.clone(),
                 source,
