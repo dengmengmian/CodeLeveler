@@ -4159,6 +4159,16 @@ impl CodingRuntime {
                 .await
                 .map_err(EngineError::Config)?;
         }
+        // A Goal turn reopens a crashed session exactly like a chat/resume turn:
+        // the durable log can hold a started tool call whose result never
+        // reached the transcript. Rebuild the transcript-plane result from the
+        // event plane, then stop on a side-effecting dangling call instead of
+        // replaying it. Both are the canonical readers the other interactive
+        // paths use; a turn with nothing to reconcile is a no-op.
+        self.reconcile_event_transcript(&runner.token, &runner.session_id, log, observer)
+            .await?;
+        self.recover_crash_window(log, observer, &cancellation)
+            .await?;
         // Multi-turn Goal: inject bounded session history so follow-ups can
         // resolve deictic references ("刚才那个超时"). The objective is the
         // goal RECORD's: a recovered declaration and the turn's instruction

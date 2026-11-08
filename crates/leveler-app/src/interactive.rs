@@ -9237,9 +9237,19 @@ async fn commit_compaction_epoch(
     // one. It is the marker the post-compaction context uses to inject the
     // deterministic facts block, so a `/compact` does not degrade to a summary
     // with no execution facts.
+    //
+    // The rows this transaction deletes are also the only record that some
+    // background task results were already delivered. Rebuilding the origin
+    // must carry the identities the caller computed from the history being
+    // replaced, or the next admission injects every one of them again.
+    let delivered_background_tasks = summary
+        .origin
+        .as_ref()
+        .map(|origin| origin.delivered_background_task_ids().to_vec())
+        .unwrap_or_default();
     let summary = leveler_model::Message {
         origin: Some(TranscriptOrigin::CompactionSummary {
-            delivered_background_tasks: Vec::new(),
+            delivered_background_tasks,
         }),
         role: leveler_model::Role::User,
         content: vec![leveler_model::ContentPart::Text {
@@ -10014,6 +10024,41 @@ mod context_ops_tests {
                 .text_content()
                 .contains(leveler_model::COMPACTION_BREADCRUMB_MARKER)),
             "the manual fold must be recognizable as a compaction context: {snapshot:?}"
+        );
+    }
+
+    /// The `/compact` transaction deletes the rows that recorded a background
+    /// task result. Their task identities are the only durable evidence that
+    /// the fact already reached this transcript, so the rebuilt breadcrumb must
+    /// keep the ones the caller computed. Dropping them makes the next
+    /// admission inject the same terminal result again.
+    #[tokio::test]
+    async fn manual_compact_keeps_delivered_background_facts() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id.clone());
+        let summary = Message::user(
+            "对话摘要（已压缩历史）：done",
+            TranscriptOrigin::CompactionSummary {
+                delivered_background_tasks: vec!["bg-1".to_string()],
+            },
+        );
+
+        commit_compaction_epoch(&db, &id, summary, 12)
+            .await
+            .unwrap();
+
+        let rows = MessageRepository::new(&db).load(&id).await.unwrap();
+        assert_eq!(rows.len(), 1, "the summary is the whole new transcript");
+        let stored: Message = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            stored
+                .origin
+                .as_ref()
+                .map(TranscriptOrigin::delivered_background_task_ids),
+            Some(&["bg-1".to_string()][..]),
+            "the manual fold must keep the delivered background-task identities: {stored:?}"
         );
     }
 
