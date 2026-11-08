@@ -37,6 +37,19 @@ pub trait ExecutionFence: Send + Sync {
     async fn ensure_current(&self) -> Result<(), String>;
 }
 
+/// What a `commit_task` declaration asserts about the running goal.
+///
+/// This is an explicit model decision, never inferred from keywords or from the
+/// mere existence of one running goal. `None` means the model did not say, and
+/// the binder refuses to guess when the objective differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRelation {
+    /// This work belongs to the running goal.
+    Continue,
+    /// This is an independent task with its own objective/acceptance/budget.
+    New,
+}
+
 /// The durable scope of a Goal turn.
 ///
 /// `objective` is the user's request verbatim; `acceptance` is the model's
@@ -79,6 +92,7 @@ pub trait GoalBinder: Send + Sync {
         &self,
         objective: &str,
         acceptance: &[String],
+        relation: Option<TaskRelation>,
     ) -> Result<leveler_core::GoalId, PortError>;
 
     /// The durable scope of the goal this turn serves, once it has one.

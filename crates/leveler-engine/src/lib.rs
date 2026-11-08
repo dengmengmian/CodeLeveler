@@ -36,7 +36,8 @@ pub use log::{
 };
 pub use ports::{
     ChildToolEvent, EventBarrier, ExecutionFence, GoalBinder, LostChild, LostChildNote,
-    LostChildVoice, ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TranscriptSink,
+    LostChildVoice, ModelCallKind, ModelRequestRecord, PortError, ResumedChild, TaskRelation,
+    TranscriptSink,
 };
 pub use reaper::{
     ReapConflict, ReapOutcome, ReapRefusal, ReapScope, ReapedSession, reap_after_restart,

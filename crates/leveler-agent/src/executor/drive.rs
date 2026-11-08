@@ -2672,7 +2672,7 @@ impl AgentHarness for Drive<'_> {
                     binder.append_amendment(&declaration).await?;
                     binder.discard_declaration(&declaration).await?;
                 } else {
-                    binder.bind(&declaration, &[]).await?;
+                    binder.bind(&declaration, &[], None).await?;
                 }
             }
             let tools = self.executor.request_tool_definitions();
@@ -3826,6 +3826,41 @@ impl AgentHarness for Drive<'_> {
                             })
                             .collect()
                     });
+                let relation = match call
+                    .arguments
+                    .get("task_relation")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("continue") => Some(leveler_engine::TaskRelation::Continue),
+                    Some("new") => Some(leveler_engine::TaskRelation::New),
+                    Some(other) => {
+                        (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
+                            execution_status: None,
+                            id: call.id.as_str().to_string(),
+                            name: COMMIT_TASK_TOOL.to_string(),
+                            is_error: true,
+                            preview: preview(&format!(
+                                "commit_task `task_relation` must be \"continue\" or \"new\", \
+                                 not `{other}`"
+                            )),
+                            applied_diff: None,
+                        });
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: format!(
+                                    "commit_task `task_relation` must be \"continue\" or \"new\", \
+                                     not `{other}`"
+                                ),
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                    None => None,
+                };
                 let (ok, content) = if self.executor.goal_mode() {
                     (
                         false,
@@ -3927,7 +3962,7 @@ impl AgentHarness for Drive<'_> {
                     } else {
                         match self.executor.goal_binder().cloned() {
                             Some(binder) => {
-                                match binder.bind(&goal_objective, &acceptance).await {
+                                match binder.bind(&goal_objective, &acceptance, relation).await {
                                     Ok(goal) => {
                                         self.commit_refusal = None;
                                         self.registration_refused = None;

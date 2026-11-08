@@ -309,6 +309,11 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                     "minItems": 1,
                     "maxItems": 20,
                     "description": "Concrete checks that will prove the objective. Every deliverable the user enumerated needs its own check; a commit that drops one is refused."
+                },
+                "task_relation": {
+                    "type": "string",
+                    "enum": ["continue", "new"],
+                    "description": "Required when this task already owes a running goal and the objective differs: \"continue\" joins that goal (the user is extending the same work), \"new\" starts an independent task with its own objective, acceptance and budget. Omit only when no goal is running or the objective is identical; the runtime refuses to guess."
                 }
             },
             "required": ["objective", "acceptance"],
