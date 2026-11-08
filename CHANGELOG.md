@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.0.25] - 2026-11-09
+
+- Input integrity has one boundary. Secrets are classified by value instead of by field name, so PEM blocks, `DB_PASS`, JSON/YAML credentials and `Authorization` values are redacted while code identifiers, prose and JSON keys stay byte-identical; a placeholder can no longer be written back to disk through `write_file`, an added file or a new patch line.
+- A turn's durable facts and its transcript can no longer disagree. A durable delivery precedes every turn terminal, a crash between an executed tool and its transcript recovers as an explicit unknown instead of a silent replay, and repeated terminal submissions are idempotent by turn identity.
+- `※ 回顾` is durable: one review is stored per settled turn (migration 0052), and replay or reconnect shows the same text without another model call.
+- Background work is supervised. Every background task has a durable identity and result; a runtime crash keeps the original task id and its process start identity, and a recovered task is observed rather than spawned again.
+- MCP outcomes distinguish success, failure, timeout, cancellation and transport loss. An unknown outcome is reported as unknown and is never retried blindly.
+- Steering and compaction keep order and identity: a mid-turn instruction survives compaction and resume, a status question adds no goal scope, and `run --resume` sends its instruction through the production amendment path.
+- The resident runtime bounds idle session event streams, so long-running scheduled automation no longer grows memory without bound.
+- The release page records the 24-hour soak status and any conditional-release reason, so an unfinished soak is never shown as passed.
+
 ## [1.0.24] - 2026-11-07
 
 - Durable scheduled automation. `leveler schedule add` stores a definition in `~/.leveler/state/schedules.db` with one workspace, one action, one trigger and its policies. Actions are a shell command, a typed native action, or an agent goal. Triggers are a one-off RFC 3339 instant, a fixed interval, a daily time, selected weekdays, or a five-field cron expression in an IANA timezone. Session policy is `continue` or `fresh`; overlap is `skip-if-running`, `queue-one` or `allow-concurrent` (`allow-concurrent` requires `fresh`); a missed slot is `skip` or `run-once` within a grace window. Runs are claimed under a renewable lease, and an expired lease settles `unknown` instead of retrying. `list`, `show`, `update`, `grant`, `revoke-grant`, `runs`, `pause`, `resume`, `run-now`, `cancel` and `remove` manage the definition; `dispatch` runs one pass and `serve` is the resident dispatcher. The TUI `/schedules` page, the Web UI and the desktop Automation page use the same runtime facts, and the model-facing `schedule_inspect` / `schedule_manage` tools manage the same definitions without creating a second authority.

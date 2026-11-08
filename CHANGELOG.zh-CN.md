@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.0.25] - 2026-11-09
+
+- 输入完整性只有一个边界。Secret 按值而不是按字段名判定：PEM 块、`DB_PASS`、JSON/YAML 凭据与 `Authorization` 值会被脱敏，而代码标识符、普通文本和 JSON 键保持逐字节不变；占位符不再能通过 `write_file`、新增文件或补丁新增行写回磁盘。
+- 回合的持久事实与 transcript 不再可能不一致。每次终态前都有持久投递事实；工具已执行而 transcript 未落盘时崩溃，恢复为明确的 unknown 而不是静默重放；同一回合的重复终态提交按回合身份幂等。
+- `※ 回顾` 已持久化：每个已结算回合保存一条回顾（迁移 0052），重放或重连显示同一文本，不再触发新的模型调用。
+- 后台任务由运行时监督。每个后台任务都有持久身份与结果；运行时崩溃后保留原任务 id 与进程启动身份，恢复时观察原任务而不是重新拉起。
+- MCP 结果区分成功、失败、超时、取消与传输断开。结果未知时如实报告 unknown，不会盲目重试。
+- Steer 与 compaction 保持顺序和身份：回合中途的指令在 compaction 与 resume 后仍然保留，状态问题不会扩展 Goal 范围，`run --resume` 的指令走正式 amendment 路径。
+- 常驻运行时为闲置会话的事件流设置上限，长时间运行的定时自动化不再无限增长内存。
+- 发版页面记录 24 小时 Soak 状态与有条件发版原因，未完成的 Soak 不会被显示为通过。
+
 ## [1.0.24] - 2026-11-07
 
 - 持久化定时自动化。`leveler schedule add` 在 `~/.leveler/state/schedules.db` 中保存定义：一个工作区、一个动作、一个触发器和对应策略。动作可以是 shell 命令、类型化原生动作或 Agent 目标。触发器支持一次性 RFC 3339 时刻、固定间隔、每日时刻、指定星期，或按 IANA 时区求值的五段 cron 表达式。会话策略为 `continue` 或 `fresh`；重叠策略为 `skip-if-running`、`queue-one` 或 `allow-concurrent`（后者要求 `fresh`）；错过槽位按宽限期执行 `skip` 或 `run-once`。运行通过可续租约认领，租约过期记为 `unknown`，不会重试。`list`、`show`、`update`、`grant`、`revoke-grant`、`runs`、`pause`、`resume`、`run-now`、`cancel`、`remove` 管理定义；`dispatch` 执行一轮，`serve` 是常驻调度器。TUI 的 `/schedules` 页面、Web UI 和桌面端自动化页面读取同一份运行时事实；面向模型的 `schedule_inspect` / `schedule_manage` 工具管理同一批定义，不建立第二套权威。
