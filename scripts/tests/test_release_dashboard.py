@@ -157,6 +157,45 @@ class RewrittenHistoryTest(unittest.TestCase):
         self.assertEqual(dashboard.change_rows(record)["Features"]["total"], 0)
 
 
+class SoakSectionTest(unittest.TestCase):
+    def test_an_in_progress_soak_is_never_rendered_as_pass(self):
+        record = record_with()
+        record["state"].update(
+            {
+                "version": "1.0.25",
+                "release_id": "v1.0.25",
+                "candidate_sha": "b" * 40,
+                "previous_release": "v1.0.24",
+            }
+        )
+        record["post_release"] = {
+            "soak": {
+                "status": "IN PROGRESS",
+                "headline": "24-hour Soak: IN PROGRESS — Conditional Release",
+                "run_id": "soak-20261108T161607Z-8a456f",
+                "code_sha": "b" * 40,
+                "started_at": "2026-11-08T16:16:07Z",
+                "elapsed": "1h 02m",
+                "target": "86400 s",
+                "verdict": "PENDING",
+                "note": "continues after publication",
+            },
+            "conditional_release": {
+                "status": "CONDITIONAL READY FOR RELEASE",
+                "reason": "only the 24-hour duration is unfinished",
+                "risk": "soak may still find a defect",
+                "rollback": "forward patch or restore pre-upgrade state",
+            },
+        }
+        page = dashboard.render_version(record)
+        self.assertIn("24-hour Soak: IN PROGRESS — Conditional Release", page)
+        self.assertNotIn("24-hour Soak: PASS", page)
+        self.assertIn("CONDITIONAL READY FOR RELEASE", page)
+        self.assertIn("restore pre-upgrade state", page)
+        _, status, _ = card(record, "24-hour Soak")
+        self.assertEqual(status, "IN PROGRESS")
+
+
 class MeasuredPerformanceTest(unittest.TestCase):
     def test_operator_measurements_render_beside_the_gate_comparison(self):
         # The gate records "not comparable" when its lab baseline has no L4
