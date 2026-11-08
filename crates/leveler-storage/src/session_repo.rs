@@ -699,7 +699,14 @@ impl<'a> SessionRepository<'a> {
             .bind(id.as_str())
             .execute(self.db.pool())
             .await?;
-        Ok(result.rows_affected() > 0)
+        let deleted = result.rows_affected() > 0;
+        if deleted {
+            // The registry is process-local and holds plaintext values only to
+            // keep later prose durable-safe. A deleted session can never be
+            // resumed, so its values must not outlive the row.
+            leveler_core::clear_session_secrets(id.as_str());
+        }
+        Ok(deleted)
     }
 }
 
@@ -1012,6 +1019,31 @@ mod tests {
         assert_eq!(repo.list().await.unwrap()[0].repository, None);
         assert!(repo.delete(&id).await.unwrap());
         assert!(repo.get(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_clears_its_secret_registry() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        leveler_core::clear_session_secrets(id.as_str());
+        leveler_core::register_session_secrets(
+            id.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: "hunter2-abc".into(),
+                key: "password".into(),
+            }],
+        );
+        assert_eq!(
+            leveler_core::secret::registered_secret_count(id.as_str()),
+            1
+        );
+        assert!(SessionRepository::new(&db).delete(&id).await.unwrap());
+        assert_eq!(
+            leveler_core::secret::registered_secret_count(id.as_str()),
+            0
+        );
     }
 
     #[tokio::test]

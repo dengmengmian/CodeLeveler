@@ -120,7 +120,13 @@ impl<'a> SessionInputRepository<'a> {
         content: &str,
         now: Timestamp,
     ) -> Result<SessionInputRecord, StorageError> {
-        let content = leveler_core::redact_secrets(content);
+        // One value-position sanitizer owns user input. The legacy whole-line
+        // scrubber rewrote source identifiers (let password = config.password;)
+        // before the model ever saw the request.
+        let (content, found) = leveler_core::sanitize_model_visible(content);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
         sqlx::query(
             "INSERT INTO session_inputs \
              (id, session_id, turn_id, content, state, reason, ordinal, created_at) \
@@ -411,6 +417,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// F-01: the input journal uses the same value-position sanitizer as the
+    /// model-visible tool boundary. Ordinary code survives; a real secret is
+    /// hidden and registered for later prose.
+    #[tokio::test]
+    async fn user_input_keeps_code_and_hides_secret() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session_id = session(&db).await;
+        let repo = SessionInputRepository::new(&db);
+        let code = "let password = config.password;\npub password: String,";
+        let admitted = repo
+            .admit("code", &session_id, None, code, leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(admitted.content, code);
+
+        let secret = "API_PASSWORD=hunter2-abc";
+        let admitted = repo
+            .admit("secret", &session_id, None, secret, leveler_core::now())
+            .await
+            .unwrap();
+        assert!(
+            !admitted.content.contains("hunter2-abc"),
+            "{}",
+            admitted.content
+        );
+        assert!(admitted.content.contains("API_PASSWORD"));
+        assert!(!leveler_core::SECRET_PLACEHOLDER.is_empty());
+        leveler_core::clear_session_secrets(session_id.as_str());
     }
 
     /// A consumed input keeps the exact transcript ordinal that its message
