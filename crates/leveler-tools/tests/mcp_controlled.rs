@@ -27,6 +27,8 @@ for line in sys.stdin:
         mode=req['params'].get('arguments',{}).get('mode','write')
         side()
         if mode=='sleep': time.sleep(3)
+        if mode=='ignore': time.sleep(1.0)
+        if mode=='drop': os._exit(0)
         if mode=='exit': sys.exit(0)
         res={'content':[{'type':'text','text':'ok:'+mode}],'isError':False}
     else:
@@ -178,5 +180,70 @@ async fn m3_user_cancel_is_unknown_and_does_not_replay_the_side_effect() {
         std::fs::read_to_string(&f.counter).unwrap(),
         "x",
         "the server had already executed the side effect once"
+    );
+}
+
+#[tokio::test]
+async fn m5_server_ignores_cancel_and_still_writes_once() {
+    unsafe { std::env::set_var("LEVELER_TEST_MCP_TIMEOUT_MS", "400") };
+    let f = fixture();
+    let tool = tool(&f).await;
+    let out = tool
+        .execute(
+            serde_json::json!({"mode":"ignore"}),
+            ctx(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(out.content.contains("未知"), "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(&f.counter).unwrap(),
+        "x",
+        "the server ignored cancellation and executed once"
+    );
+    unsafe { std::env::remove_var("LEVELER_TEST_MCP_TIMEOUT_MS") };
+}
+
+#[tokio::test]
+async fn m7_stdio_drop_after_send_is_unknown_and_not_retried() {
+    let f = fixture();
+    let tool = tool(&f).await;
+    let out = tool
+        .execute(
+            serde_json::json!({"mode":"drop"}),
+            ctx(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(&f.counter).unwrap(),
+        "x",
+        "the side effect happened before the transport drop"
+    );
+}
+
+#[tokio::test]
+async fn m9_two_calls_with_the_same_shape_are_two_side_effects() {
+    let f = fixture();
+    let tool = tool(&f).await;
+    for _ in 0..2 {
+        let out = tool
+            .execute(
+                serde_json::json!({"mode":"write"}),
+                ctx(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+    }
+    assert_eq!(
+        std::fs::read_to_string(&f.counter).unwrap(),
+        "xx",
+        "each explicit call is a distinct execution; nothing is merged"
     );
 }
