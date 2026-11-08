@@ -193,6 +193,16 @@ impl<'a> MessageRepository<'a> {
             .await
             .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
         }
+        // Test-only crash point INSIDE the uncommitted batch: a real kill here
+        // must leave no partial transcript, proving the batch atomicity that
+        // T5 relies on. Only the assistant/tool batch is a target; the user
+        // row append must not fire it. Normal runs never reach the kill path.
+        if payloads
+            .iter()
+            .any(|payload| payload.contains("\"role\":\"tool\""))
+        {
+            leveler_core::test_crash::point("during_transcript_commit");
+        }
         tx.commit()
             .await
             .map_err(|e| crate::OwnershipError::Storage(e.into()))?;

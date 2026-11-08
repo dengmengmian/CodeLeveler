@@ -289,6 +289,7 @@ fn scenario_script(scenario: &str) -> (Vec<ModelResponse>, bool) {
         "tool_during_effect" => vec![probe_call("p1"), text(ANSWER)],
         "tool_after_finished" => vec![probe_call("p1"), text(ANSWER)],
         "tool_after_transcript" => vec![probe_call("p1"), text(ANSWER)],
+        "tool_during_transcript" => vec![probe_call("p1"), text(ANSWER)],
         other => panic!("unknown scenario {other}"),
     };
     (script, goal)
@@ -671,6 +672,43 @@ async fn finished_tool_without_transcript_is_reconstructed_and_not_replayed() {
             payload.contains("\"call_id\":\"p1\"") && payload.contains("recovery")
         }),
         "the recovered exchange must be in the transcript: {transcript:?}"
+    );
+}
+
+/// T5: the process dies inside the transcript batch's transaction. The batch
+/// is one COMMIT, so no partial assistant/tool exchange can survive; the
+/// durable finished event lets recovery reconstruct it once.
+#[tokio::test]
+async fn a_kill_inside_the_transcript_transaction_leaves_no_partial_batch() {
+    let (dir, session, db) = prepare("tool_during_transcript", "during_transcript_commit").await;
+    let side = dir.path().join("side-effects.log");
+    assert_eq!(side_effects(&side), 1);
+    let transcript = MessageRepository::new(&db).load(&session).await.unwrap();
+    assert!(
+        !transcript
+            .iter()
+            .any(|payload| payload.contains("\"role\":\"tool\"")),
+        "an uncommitted batch must leave no tool row: {transcript:?}"
+    );
+    let after_crash = events(&db, &session).await;
+    assert!(
+        after_crash
+            .iter()
+            .any(|event| matches!(event, EngineEvent::ToolCallFinished { call_id, .. } if call_id == "p1")),
+        "the finished event is durable before the transcript commit"
+    );
+
+    let report = resume(dir.path(), &db, &session, vec![text(ANSWER)])
+        .await
+        .expect("the transaction cut is reconstructed");
+    assert_eq!(report.final_text, ANSWER);
+    assert_eq!(side_effects(&side), 1, "the tool is not repeated");
+    let transcript = MessageRepository::new(&db).load(&session).await.unwrap();
+    assert!(
+        transcript
+            .iter()
+            .any(|payload| payload.contains("\"call_id\":\"p1\"") && payload.contains("recovery")),
+        "the recovered exchange is written once: {transcript:?}"
     );
 }
 
