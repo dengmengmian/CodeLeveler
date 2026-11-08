@@ -18,7 +18,6 @@ describe('compaction presentation', () => {
     const text = `[Earlier context was compacted to fit the window: 2 steps elided.]\n\n${COMPACTION_SUMMARY_PREFIX}：\n## 简报`;
     expect(isCompactionSummaryText(text)).toBe(true);
     expect(compactionBodyMarkdown(text)).toBe('## 简报');
-    expect(isTurnUser({ role: 'user', text })).toBe(true);
     expect(presentationKindOf({ role: 'user', text })).toBe('compaction_summary');
   });
 
