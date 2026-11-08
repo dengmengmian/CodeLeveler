@@ -387,11 +387,12 @@ impl<'a> SessionRepository<'a> {
                 return Ok(SessionEditResult::Conflict(sequence));
             }
         }
-        let (sql, value, pending, field) = match edit {
+        let (sql, value, pending, field, column) = match edit {
             SessionEdit::Title(value) => (
                 "UPDATE sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
                 None,
+                "goal",
                 "goal",
             ),
             SessionEdit::Model(value) => (
@@ -401,17 +402,20 @@ impl<'a> SessionRepository<'a> {
                 Some(value.as_str()),
                 None,
                 "model",
+                "model",
             ),
             SessionEdit::Permission(value) => (
                 "UPDATE sessions SET mode = ?2, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
                 None,
                 "mode",
+                "mode",
             ),
             SessionEdit::Thinking(value) => (
                 "UPDATE sessions SET thinking = ?2, updated_at = ?3 WHERE id = ?1",
                 value.as_deref(),
                 None,
+                "thinking",
                 "thinking",
             ),
             // Leaving or changing the axis drops any declaration made for the
@@ -423,6 +427,7 @@ impl<'a> SessionRepository<'a> {
                 Some(value.as_str()),
                 None,
                 "collaboration",
+                "collaboration",
             ),
             SessionEdit::GoalDeclaration {
                 collaboration,
@@ -433,8 +438,19 @@ impl<'a> SessionRepository<'a> {
                 Some(collaboration.as_str()),
                 Some(objective.as_str()),
                 "collaboration",
+                "collaboration",
             ),
         };
+        // The event is an audit record, not just a UI invalidation: record what
+        // the value was and what it became. `column` is a static literal from
+        // the match above, never user input.
+        let old: Option<String> = sqlx::query_scalar::<_, Option<String>>(&format!(
+            "SELECT {column} FROM sessions WHERE id = ?1"
+        ))
+        .bind(id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
         let changed = {
             let mut query = sqlx::query(sql)
                 .bind(id.as_str())
@@ -450,9 +466,19 @@ impl<'a> SessionRepository<'a> {
                 "session {id} not found for metadata edit"
             )));
         }
-        let payload =
-            serde_json::json!({"type": "session_metadata_changed", "payload": {"field": field}})
-                .to_string();
+        let mut change = serde_json::json!({
+            "field": field,
+            "from": old,
+            "to": value,
+        });
+        if let SessionEdit::GoalDeclaration { objective, .. } = edit {
+            change["pending_goal"] = serde_json::Value::String(objective.clone());
+        }
+        let payload = serde_json::json!({
+            "type": "session_metadata_changed",
+            "payload": change,
+        })
+        .to_string();
         sqlx::query("INSERT INTO events (id, session_id, sequence, type, payload, created_at, schema_version) VALUES (?1, ?2, ?3, 'session_metadata_changed', ?4, ?5, ?6)")
             .bind(leveler_core::EventId::generate().as_str()).bind(id.as_str()).bind(sequence + 1)
             .bind(payload).bind(now.to_rfc3339()).bind(crate::event_repo::EVENT_SCHEMA_VERSION)
@@ -754,6 +780,7 @@ mod tests {
         let repo = SessionRepository::new(&db);
         repo.create(&record).await.unwrap();
         let observed = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        let before_mode = observed.mode.clone();
         let other = SessionRecord::without_workspace("other", "m", leveler_core::now());
         let other_id = SessionId::new(other.id.clone());
         repo.create(&other).await.unwrap();
@@ -792,6 +819,22 @@ mod tests {
             repo.settings_snapshot(&id).await.unwrap().unwrap().mode,
             "full_access"
         );
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE session_id = ?1 \
+             AND type = 'session_metadata_changed' ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let change: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(change["payload"]["field"], "mode");
+        assert_eq!(
+            change["payload"]["from"].as_str(),
+            Some(before_mode.as_str()),
+            "old mode must be recorded: {payload}"
+        );
+        assert_eq!(change["payload"]["to"], "full_access");
         for expected in [-1, 3] {
             assert_eq!(
                 repo.edit_at_version(
@@ -1232,6 +1275,69 @@ mod tests {
             repo.pending_goal(&id).await.unwrap().as_deref(),
             Some("next objective")
         );
+    }
+
+    /// A same-value update is still a real state transition: the audit row
+    /// must say so rather than implying nothing was written.
+    #[tokio::test]
+    async fn same_value_metadata_edit_records_from_and_to() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::without_workspace("same value", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        repo.create(&record).await.unwrap();
+        repo.edit_at_version(
+            &id,
+            0,
+            &SessionEdit::Permission("full_access".into()),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        repo.edit_at_version(
+            &id,
+            1,
+            &SessionEdit::Permission("full_access".into()),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE session_id = ?1 \
+             AND type = 'session_metadata_changed' ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let change: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(change["payload"]["field"], "mode");
+        assert_eq!(change["payload"]["from"], "full_access");
+        assert_eq!(change["payload"]["to"], "full_access");
+    }
+
+    /// Events written before `from`/`to` existed are still readable: the
+    /// snapshot only needs the log version, and the payload stays valid JSON.
+    #[tokio::test]
+    async fn legacy_metadata_event_without_from_to_remains_readable() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::without_workspace("legacy event", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        repo.create(&record).await.unwrap();
+        crate::EventRepository::new(&db)
+            .append(
+                &id,
+                None,
+                "session_metadata_changed",
+                r#"{"type":"session_metadata_changed","payload":{"field":"mode"}}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        assert_eq!(snapshot.sequence, Some(1));
+        assert!(!snapshot.mode.is_empty());
     }
 
     #[tokio::test]
