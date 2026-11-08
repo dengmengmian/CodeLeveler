@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Incremental fingerprint for streamed file reads.
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +53,11 @@ pub struct FileStateTracker {
     /// object must be one entry, or a stale-write check can be bypassed by
     /// changing how the path is written.
     seen: Mutex<HashMap<PathBuf, u64>>,
+    /// A resumed process has no in-memory observations. When set, an existing
+    /// file with no observation is NOT "untracked and therefore writable": it
+    /// is an unknown version, and the writer must read it again first. New
+    /// files are still creatable; a fresh process keeps the old behavior.
+    require_observation: AtomicBool,
 }
 
 impl FileStateTracker {
@@ -61,6 +67,19 @@ impl FileStateTracker {
         let mut fingerprint = ContentFingerprint::default();
         fingerprint.update(content);
         fingerprint.finish()
+    }
+
+    /// Mark this tracker as belonging to a resumed execution window. From then
+    /// on an unobserved existing file is an unknown version; the model must
+    /// read it before overwriting. This closes the resume fail-open without
+    /// persisting file contents or blocking new-file creation.
+    pub fn set_require_observation(&self, require: bool) {
+        self.require_observation.store(require, Ordering::SeqCst);
+    }
+
+    /// Whether unobserved paths are treated as unknown versions.
+    pub fn require_observation(&self) -> bool {
+        self.require_observation.load(Ordering::SeqCst)
     }
 
     /// Record the contents of `path` as the agent now knows them. Call after a
@@ -88,7 +107,10 @@ impl FileStateTracker {
     pub fn is_stale(&self, path: &Path, current: &[u8]) -> bool {
         match self.seen.lock().unwrap().get(path) {
             Some(&known) => known != Self::fingerprint(current),
-            None => false,
+            // Untracked is normally "the agent never claimed to know it".
+            // After a restart the observation was lost, not absent: fail
+            // closed and require a fresh read before an overwrite.
+            None => self.require_observation(),
         }
     }
 }
@@ -126,6 +148,18 @@ mod tests {
         let tracker = FileStateTracker::default();
         tracker.record_fingerprint(Path::new("a.rs"), fingerprint);
         assert!(!tracker.is_stale(Path::new("a.rs"), bytes));
+    }
+
+    #[test]
+    fn a_resumed_tracker_requires_an_observation_before_an_overwrite() {
+        let t = FileStateTracker::default();
+        t.set_require_observation(true);
+        assert!(
+            t.is_stale(Path::new("a.rs"), b"old bytes"),
+            "an unobserved existing file is an unknown version after resume"
+        );
+        t.record(Path::new("a.rs"), b"old bytes");
+        assert!(!t.is_stale(Path::new("a.rs"), b"old bytes"));
     }
 
     #[test]

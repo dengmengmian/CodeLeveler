@@ -42,7 +42,10 @@ impl Scripted {
             "commit_task",
             serde_json::json!({
                 "objective": USER_REQUEST,
-                "acceptance": ["go test ./... 通过", "MCP 读写工具与页面能力一致"]
+                "acceptance": ["go test ./... 通过", "MCP 读写工具与页面能力一致"],
+                // Existing suite: a re-commit of a task that already owes a
+                // goal is an explicit continuation, not a silent adoption.
+                "task_relation": "continue"
             }),
         )
     }
@@ -1049,7 +1052,11 @@ fn spec_for(fx: &Fixture, goal: &str) -> TaskSpec {
 fn commit_with(acceptance: Vec<&str>, objective: &str) -> Scripted {
     Scripted::Tool(
         "commit_task",
-        serde_json::json!({"objective": objective, "acceptance": acceptance}),
+        serde_json::json!({
+            "objective": objective,
+            "acceptance": acceptance,
+            "task_relation": "continue"
+        }),
     )
 }
 
@@ -2567,4 +2574,163 @@ async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
         "an accepted completion with a boundary is still a completion: {report:?}"
     );
     std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// F-11: a second commit with a different objective and no explicit relation
+/// must be refused, not silently adopted into the running goal.
+#[tokio::test]
+async fn a_commit_without_a_relation_is_refused_instead_of_silently_adopting() {
+    let fx = fixture(
+        vec![
+            Scripted::commit(),
+            Scripted::Text("第一阶段完成，后面的还没做。"),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": "把清单剩下的部分做完",
+                    "acceptance": ["stage-2.txt 存在"]
+                }),
+            ),
+            Scripted::Text("还在继续。"),
+        ],
+        false,
+    )
+    .await;
+    fx.runtime.cancel_after.store(2, Ordering::SeqCst);
+    let first = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: USER_REQUEST.into(),
+            }],
+            &mut |_| {},
+            fx.cancel.clone(),
+        )
+        .await;
+    assert!(first.is_err(), "the interrupted window reports no success");
+    let owed = goal_records(&fx).await;
+    assert_eq!(owed.len(), 1);
+    let goal_id = owed[0].id.clone();
+    let acceptance = owed[0].acceptance.clone();
+    let objective = owed[0].objective.clone();
+
+    let mut events = Vec::new();
+    let _ = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: "把清单剩下的部分做完".into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await;
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "no second goal may be opened without an explicit relation: {goals:?}"
+    );
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].objective, objective);
+    assert_eq!(
+        goals[0].acceptance, acceptance,
+        "the old acceptance must not be replaced or widened"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::ToolCallFinished {
+                name,
+                is_error: true,
+                preview,
+                ..
+            } if name == "commit_task" && preview.contains("task_relation_required")
+        )),
+        "the refusal must name the missing relation: {events:?}"
+    );
+}
+
+/// F-11: an explicit `new` relation opens an independent goal with its own
+/// objective/acceptance; the old running goal is untouched.
+#[tokio::test]
+async fn an_explicit_new_relation_opens_an_independent_goal() {
+    let fx = fixture(
+        vec![
+            Scripted::commit(),
+            Scripted::Text("第一阶段完成，后面的还没做。"),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": "把清单剩下的部分做完",
+                    "acceptance": ["stage-2.txt 存在"],
+                    "task_relation": "new"
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({"status": "blocked", "summary": "independent task paused"}),
+            ),
+            Scripted::Text("独立任务暂时阻塞。"),
+        ],
+        false,
+    )
+    .await;
+    fx.runtime.cancel_after.store(2, Ordering::SeqCst);
+    let first = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: USER_REQUEST.into(),
+            }],
+            &mut |_| {},
+            fx.cancel.clone(),
+        )
+        .await;
+    assert!(first.is_err(), "the interrupted window reports no success");
+    let old = goal_records(&fx).await;
+    assert_eq!(old.len(), 1);
+    let old_id = old[0].id.clone();
+    let old_acceptance = old[0].acceptance.clone();
+
+    let _ = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: "把清单剩下的部分做完".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        2,
+        "an explicit new task gets its own goal: {goals:?}"
+    );
+    let old = goals.iter().find(|goal| goal.id == old_id).unwrap();
+    assert_eq!(old.acceptance, old_acceptance, "the old task is untouched");
+    assert_eq!(
+        old.state,
+        leveler_storage::GoalState::Running,
+        "the old goal still owes its work"
+    );
+    let new = goals.iter().find(|goal| goal.id != old_id).unwrap();
+    assert_eq!(new.objective, "把清单剩下的部分做完");
+    assert_eq!(new.acceptance, vec!["stage-2.txt 存在".to_string()]);
+    assert_ne!(
+        new.acceptance, old.acceptance,
+        "the new task must not inherit the old acceptance"
+    );
 }

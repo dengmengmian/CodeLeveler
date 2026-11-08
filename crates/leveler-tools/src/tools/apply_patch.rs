@@ -2132,3 +2132,48 @@ mod alias_identity_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod resume_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_resumed_window_must_read_before_patching_an_existing_file() {
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("a.txt", "old\n")],
+        );
+        context.execution.file_state.set_require_observation(true);
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch";
+        let refused = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_error, "{}", refused.content);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
+
+        crate::tools::read_file::ReadFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt"}),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let allowed = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

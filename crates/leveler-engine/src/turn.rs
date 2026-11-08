@@ -579,7 +579,12 @@ fn binder_ownership_error(error: leveler_storage::OwnershipError) -> PortError {
 
 #[async_trait::async_trait]
 impl crate::ports::GoalBinder for TurnGoalBinder {
-    async fn bind(&self, objective: &str, acceptance: &[String]) -> Result<GoalId, PortError> {
+    async fn bind(
+        &self,
+        objective: &str,
+        acceptance: &[String],
+        relation: Option<crate::ports::TaskRelation>,
+    ) -> Result<GoalId, PortError> {
         if let Some(bound) = self
             .bound
             .lock()
@@ -611,14 +616,41 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             .filter(|goal| goal.state == leveler_storage::GoalState::Running)
             .collect();
         let same_objective = running.iter().find(|goal| goal.objective == objective);
-        // ONE task owes ONE goal. When nothing was declared and the task already
-        // owes exactly one goal, this commitment is about that work: opening a
-        // sibling would split one intent across two identities, restart the
-        // acceptance checks it was committed against, and make the count of
-        // work windows a half-truth. A model's restatement of the objective is
-        // not evidence of a new task; an explicit declaration is, and that case
-        // is settled above by the pending declaration.
-        let adopted = same_objective.is_none() && pending.is_none() && running.len() == 1;
+        // A user declaration (`/goal`) is explicit intent: reuse the same
+        // objective or open the declared goal. Without such a declaration, a
+        // running goal may only be joined when the model explicitly says
+        // `continue`. The old rule adopted the single running goal for any
+        // restated objective, which silently merged an unrelated new task into
+        // the old acceptance. `new` opens an independent goal; `None` refuses
+        // to guess.
+        let adopted = same_objective.is_none()
+            && pending.is_none()
+            && running.len() == 1
+            && relation == Some(crate::ports::TaskRelation::Continue);
+        if same_objective.is_none() && pending.is_none() && !running.is_empty() {
+            match relation {
+                Some(crate::ports::TaskRelation::Continue) if running.len() != 1 => {
+                    return Err(PortError::Persistence(format!(
+                        "task_relation_ambiguous: {} goals are running for this task; name the \
+                         goal or declare task_relation \"new\"",
+                        running.len()
+                    )));
+                }
+                None => {
+                    return Err(PortError::Persistence(format!(
+                        "task_relation_required: this task already owes a running goal ({}). \
+                         Set task_relation=\"continue\" to add this work to it, or \
+                         task_relation=\"new\" to start an independent task with its own \
+                         objective, acceptance and budget. The runtime will not guess.",
+                        running
+                            .first()
+                            .map(|goal| goal.id.as_str())
+                            .unwrap_or("<unknown>")
+                    )));
+                }
+                _ => {}
+            }
+        }
         let existing = same_objective.or_else(|| adopted.then(|| &running[0]));
         let goal = match existing {
             Some(goal) => goal.id.clone(),

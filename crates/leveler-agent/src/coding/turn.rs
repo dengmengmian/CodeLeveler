@@ -220,6 +220,13 @@ pub async fn drive_turn(
             TurnInput::Content { .. } => Vec::new(),
         });
 
+    // A resumed execution has no in-process file observations. Existing files
+    // it wants to overwrite are unknown versions: require a fresh read first.
+    // New files remain creatable; a fresh turn keeps the old behavior.
+    if resumes_task_epoch {
+        executor.set_require_file_observation(true);
+    }
+
     if let (Some(context), Some(scope)) = (checkpoint_context, checkpoint_scope) {
         executor = executor.with_compaction_checkpoint(Arc::new(CodingCompactionCheckpoint::new(
             context.engine,

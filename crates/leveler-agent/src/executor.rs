@@ -2024,6 +2024,15 @@ impl Executor {
     /// Only a turn that did NOT start in Goal mode needs it: a mid-turn
     /// `/goal` declaration must open a real goal and bind the running turn to
     /// it, or the "Goal" the executor follows exists only in memory.
+    /// A resumed window has no in-process file observations; existing files it
+    /// overwrites must be observed again. See `FileStateTracker`.
+    pub(crate) fn set_require_file_observation(&mut self, require: bool) {
+        self.tool_context
+            .execution
+            .file_state
+            .set_require_observation(require);
+    }
+
     pub(crate) fn with_goal_binder(mut self, binder: Arc<dyn leveler_engine::GoalBinder>) -> Self {
         self.goal_binder = Some(binder);
         self

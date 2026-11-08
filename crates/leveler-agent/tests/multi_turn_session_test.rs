@@ -2265,3 +2265,110 @@ async fn a_heavy_recent_tail_never_pushes_the_goal_request_past_capacity() {
         "the goal anchor survives the checkpoint cut"
     );
 }
+
+/// F-18 resume: a file observed only in the previous process is an unknown
+/// version after restart. The patch is refused and the external edit survives;
+/// after a fresh read in the resumed window the same patch is allowed.
+#[tokio::test]
+async fn resume_requires_a_fresh_read_before_patching_a_previously_observed_file() {
+    let h = harness(vec![
+        // First window: read, then answer.
+        tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        text("read the file"),
+        // Resumed window: try to patch without reading.
+        tool_call(
+            "w1",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn old() {}\n+pub fn new_fn() {}\n*** End Patch"
+            }),
+        ),
+        text("patch refused"),
+        // Second resumed window: read first, then patch.
+        tool_call("r2", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        tool_call(
+            "w2",
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn old() {}\n+pub fn new_fn() {}\n*** End Patch"
+            }),
+        ),
+        text("patched after a fresh read"),
+    ])
+    .await;
+    let s = spec(&h, "resume stale write");
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "read src/lib.rs".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // An outside writer keeps the patch's context line but changes the file.
+    std::fs::write(
+        h.dir.path().join("src/lib.rs"),
+        "pub fn old() {}\n// external edit\n",
+    )
+    .unwrap();
+
+    let mut first = Vec::new();
+    let _ = h
+        .engine
+        .resume_with_instruction(
+            &session,
+            &s,
+            Message::user_input("patch it"),
+            &mut |event| first.push(event),
+            CancellationToken::new(),
+        )
+        .await;
+    let stale = first.iter().find_map(|event| match event {
+        EngineEvent::ToolCallFinished {
+            preview,
+            is_error: true,
+            ..
+        } if preview.contains("changed since you read it") => Some(preview.clone()),
+        _ => None,
+    });
+    assert!(
+        stale.is_some(),
+        "a pre-resume observation must not authorize a stale patch: {first:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn old() {}\n// external edit\n",
+        "the external edit survives"
+    );
+
+    let mut second = Vec::new();
+    h.engine
+        .resume_with_instruction(
+            &session,
+            &s,
+            Message::user_input("read then patch it"),
+            &mut |event| second.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        second.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolCallFinished {
+                is_error: false,
+                ..
+            }
+        )),
+        "a fresh read makes the patch valid again: {second:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn new_fn() {}\n// external edit\n"
+    );
+}

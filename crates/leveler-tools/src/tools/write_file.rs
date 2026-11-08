@@ -494,3 +494,69 @@ mod alias_identity_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod resume_observation_tests {
+    use super::*;
+
+    /// After a resume the tracker is empty. An existing file is an unknown
+    /// version, not an untracked one: overwrite requires a fresh read. New
+    /// files are still creatable.
+    #[tokio::test]
+    async fn a_resumed_window_must_read_before_overwriting_an_existing_file() {
+        let (ctx, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("a.txt", "old\n")],
+        );
+        ctx.execution.file_state.set_require_observation(true);
+        let refused = WriteFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt", "content": "new\n"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            refused.content.contains("changed since you read it"),
+            "{}",
+            refused.content
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
+
+        let created = WriteFileTool
+            .execute(
+                serde_json::json!({"path": "new.txt", "content": "fresh\n"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !created.is_error,
+            "a new file has no prior observation to verify: {}",
+            created.content
+        );
+
+        crate::tools::read_file::ReadFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let allowed = WriteFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt", "content": "new\n"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
