@@ -22,6 +22,22 @@ pub fn point(name: &str) {
     let _ = name;
 }
 
+/// Whether the harness armed exactly this point. Debug-only; false in a
+/// release build. Used to add the extra durability step a crash test needs
+/// without paying for it on a normal run.
+pub fn is_armed(name: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("LEVELER_TEST_CRASH_POINT").ok().as_deref() == Some(name)
+            && std::env::var_os("LEVELER_TEST_CRASH_MARKER").is_some()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 #[cfg(debug_assertions)]
 fn crash(name: &str) {
     let armed = std::env::var("LEVELER_TEST_CRASH_POINT").ok();
