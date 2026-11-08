@@ -425,6 +425,7 @@ fn a_replayed_clarification_shows_the_answers_with_no_active_focus() {
         "questions": [
             {"header": "数据策略", "question": "数据策略方式", "kind": "single",
              "options": ["保留 demo fallback", "删除全部 mock"]},
+            {"header": "未登录态", "question": "未登录时怎么展示？", "kind": "text"},
         ],
     })
     .to_string();
@@ -454,13 +455,123 @@ fn a_replayed_clarification_shows_the_answers_with_no_active_focus() {
         "a replayed answer must never re-open the interaction"
     );
     let frame = rendered(&mut s, 100, 30);
-    assert!(frame.contains("需要你的选择"), "{frame}");
-    assert!(frame.contains("保留 demo fallback"), "{frame}");
-    assert!(frame.contains("展示登录引导"), "{frame}");
+    assert!(frame.contains("● 用户已回答 Agent 的问题："), "{frame}");
+    assert!(
+        frame.contains("· 数据策略方式 → 保留 demo fallback"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("· 未登录时怎么展示？ → 展示登录引导"),
+        "{frame}"
+    );
     assert!(
         !frame.contains('❯'),
         "history has no focus cursor:\n{frame}"
     );
+}
+
+/// Submitting the interaction is not delivery. Until the runtime completes the
+/// tool call, the transcript keeps the running question row and must not claim
+/// the user already answered.
+#[test]
+fn the_summary_appears_only_after_the_answer_is_delivered() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "request_user_input".into(),
+            arguments: serde_json::json!({
+                "question": "选哪个？",
+                "options": ["A", "B"],
+            })
+            .to_string(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    open(
+        &mut s,
+        UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            "选哪个？",
+            vec!["A".into(), "B".into()],
+        ),
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendInteraction {
+                command: ClientCommand::AnswerClarification { .. },
+                ..
+            }
+        )),
+        "the answer is sent, not shown as delivered: {effects:?}"
+    );
+    let before = rendered(&mut s, 100, 30);
+    assert!(
+        !before.contains("用户已回答"),
+        "submission is not delivery:\n{before}"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "A".into(),
+            duration_ms: 10,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+    let after = rendered(&mut s, 100, 30);
+    assert!(after.contains("用户已回答"), "{after}");
+    assert!(after.contains("选哪个？ → A"), "{after}");
+}
+
+/// A repeated completion event is a replay of the same fact, not a second
+/// answer. The transcript is addressed by the call id, so the record stays
+/// one record.
+#[test]
+fn a_repeated_delivery_event_does_not_duplicate_the_record() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "request_user_input".into(),
+            arguments: serde_json::json!({
+                "question": "选哪个？",
+                "options": ["A", "B"],
+            })
+            .to_string(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    let completed = RuntimeEvent::ToolCallCompleted {
+        id: ToolCallId::new("t1"),
+        ok: true,
+        preview: "B".into(),
+        duration_ms: 10,
+        applied_diff: None,
+        exit_code: None,
+        stop: None,
+    };
+    reduce(&mut s, Action::Runtime(completed.clone()));
+    reduce(&mut s, Action::Runtime(completed));
+    let frame = rendered(&mut s, 100, 30);
+    assert_eq!(
+        frame.matches("用户已回答").count(),
+        1,
+        "the same delivery must not add a second record:\n{frame}"
+    );
+    assert_eq!(frame.matches("选哪个？").count(), 1, "{frame}");
 }
 
 #[test]

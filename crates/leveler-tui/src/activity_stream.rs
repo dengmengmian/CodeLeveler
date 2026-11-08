@@ -815,6 +815,11 @@ fn push_expanded_detail(
     if !expanded {
         return;
     }
+    // The answered clarification's own rows are already the result. Rendering
+    // the tool detail below them would print the same answer a second time.
+    if is_clarification_call(call) && answered_questions(call).is_some() {
+        return;
+    }
     if activity_visibility(&call.name, &call.arguments) == ActivityVisibility::Silent
         && call.status != ToolStatus::Failed
     {
@@ -1707,7 +1712,9 @@ fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
             i = j;
             continue;
         }
-        if let Some(id) = call.batch {
+        // A clarification owns its own first-level record; a batch tree would
+        // put a branch in front of the `●` anchor and indent the answer.
+        if let Some(id) = call.batch.filter(|_| !is_clarification_call(call)) {
             // Render-adjacent members of the SAME observed burst.
             let mut members = vec![call];
             let mut j = i + 1;
@@ -1717,7 +1724,7 @@ fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
                     j += 1;
                     continue;
                 }
-                if next.batch == Some(id) {
+                if next.batch == Some(id) && !is_clarification_call(next) {
                     members.push(next);
                     j += 1;
                 } else {
@@ -1778,7 +1785,10 @@ fn merge_runs(units: Vec<StreamUnit<'_>>) -> Vec<StreamUnit<'_>> {
             out.push(unit);
             continue;
         };
-        if is_shell_call(call) {
+        // A clarification is a first-level record with its own anchor, not a
+        // child of a tool-named run. Two questions back to back must not grow
+        // a `└─` branch in front of either answer.
+        if is_shell_call(call) || is_clarification_call(call) {
             out.push(StreamUnit::Single(call));
             continue;
         }
@@ -1879,6 +1889,13 @@ fn unit_lines(
     // must not state the question a second time while that card is on screen.
     question_card_open: bool,
 ) -> Vec<Line<'static>> {
+    // A clarification that was actually delivered renders as its own compact
+    // Q&A record instead of a tool row. The same projection is used live and
+    // when the turn is replayed from the durable tool call, so the record has
+    // one rendering path and no second store.
+    if let Some(lines) = answered_clarification_lines(call, theme, width, t) {
+        return lines;
+    }
     // Plan/goal guard rejections carry internal English validation text for the
     // model — show a warning glyph and a localized note instead. Other failures
     // are real errors: the result row shows the first error line.
@@ -3053,6 +3070,30 @@ fn failed_patch_target(preview: Option<&str>) -> Option<String> {
     }
 }
 
+/// How a clarification ended without a user answer, as the runtime states it
+/// in the tool result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnansweredKind {
+    TimedOut,
+    Unattended,
+    Skipped,
+}
+
+/// Read the runtime's "no user reply" notes. Only `Answered` speaks for the
+/// user; these three must never become an answered summary.
+fn unanswered_kind(preview: &str) -> Option<UnansweredKind> {
+    let preview = preview.trim_start();
+    if preview.starts_with("The user did not respond in time") {
+        Some(UnansweredKind::TimedOut)
+    } else if preview.starts_with("No user is available to answer") {
+        Some(UnansweredKind::Unattended)
+    } else if preview.starts_with("The user saw this question and chose to skip it") {
+        Some(UnansweredKind::Skipped)
+    } else {
+        None
+    }
+}
+
 /// What happened to a question the user did not answer, in their words — the
 /// result otherwise carries the runtime's note to the model
 /// (`leveler_agent` `handle_clarification`). `None` for a real answer.
@@ -3060,15 +3101,11 @@ fn unanswered_question_note<'a>(call: &ToolCallBlock, t: &'a UiText) -> Option<&
     if !is_user_decision_call(call) || call.status != ToolStatus::Ok {
         return None;
     }
-    let preview = call.preview.as_deref()?.trim_start();
-    if preview.starts_with("The user did not respond in time") {
-        Some(t.question_timed_out)
-    } else if preview.starts_with("No user is available to answer") {
-        Some(t.question_unattended)
-    } else if preview.starts_with("The user saw this question and chose to skip it") {
-        Some(t.question_skipped)
-    } else {
-        None
+    match unanswered_kind(call.preview.as_deref()?) {
+        Some(UnansweredKind::TimedOut) => Some(t.question_timed_out),
+        Some(UnansweredKind::Unattended) => Some(t.question_unattended),
+        Some(UnansweredKind::Skipped) => Some(t.question_skipped),
+        None => None,
     }
 }
 
@@ -3079,6 +3116,315 @@ fn is_user_decision_call(call: &ToolCallBlock) -> bool {
         crate::tool_taxonomy::lookup(&call.name).map(|e| e.kind),
         Some(crate::tool_taxonomy::ToolKind::AskUser)
     )
+}
+
+/// Whether this call is the clarification tool itself. `request_permissions`
+/// shares the `AskUser` taxonomy kind but is a permission decision, not a
+/// question with a `→` answer.
+fn is_clarification_call(call: &ToolCallBlock) -> bool {
+    matches!(call.name.as_str(), "request_user_input" | "ask_user")
+}
+
+/// One question of a delivered clarification and the answer the user gave.
+struct AnsweredQuestion {
+    question: String,
+    answer: String,
+}
+
+/// The compact Q&A record the transcript keeps after a clarification is
+/// delivered.
+///
+/// The durable tool call already carries both halves: its `arguments` hold the
+/// questions the model asked and its result holds the answer the user gave.
+/// This reads that one record — no second state, no extra event — so live
+/// rendering, history replay and resume all project the same rows.
+fn answered_questions(call: &ToolCallBlock) -> Option<Vec<AnsweredQuestion>> {
+    if !is_clarification_call(call) || call.status != ToolStatus::Ok {
+        return None;
+    }
+    let preview = call
+        .preview
+        .as_deref()?
+        .trim_matches('\n')
+        .trim_end_matches('\r');
+    if preview.trim().is_empty() || unanswered_kind(preview).is_some() {
+        return None;
+    }
+    let arguments: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    let pairs = match arguments
+        .get("questions")
+        .and_then(|value| value.as_array())
+    {
+        Some(items) if !items.is_empty() => structured_questions_answers(items, preview),
+        _ => {
+            let question = arguments
+                .get("question")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if question.is_empty() {
+                Vec::new()
+            } else {
+                vec![AnsweredQuestion {
+                    question: sanitize_multiline(question),
+                    answer: sanitize_multiline(preview),
+                }]
+            }
+        }
+    };
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// Pair each structured question with its answer.
+///
+/// A multi-question answer is composed as one `header: answer` line per
+/// question, in question order. The header is what the runtime sent, or the
+/// short prompt the overlay derives when it sent none — the same rule the
+/// interaction used, so the answer can be attributed back to the question the
+/// user actually saw.
+fn structured_questions_answers(
+    items: &[serde_json::Value],
+    preview: &str,
+) -> Vec<AnsweredQuestion> {
+    let prompts: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|item| {
+            let question = item
+                .get("question")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            let header = item
+                .get("header")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            let prompt = if question.is_empty() {
+                header
+            } else {
+                question
+            };
+            (!prompt.is_empty()).then(|| (header.to_string(), prompt.to_string()))
+        })
+        .collect();
+    let headers: Vec<String> = prompts
+        .iter()
+        .map(|(header, question)| clarification_display_header(header, question))
+        .collect();
+    // The composed answer identifies each answer by its label. When two
+    // questions share a label the text cannot say which answer is whose, so
+    // the generic row (which keeps the answer verbatim) is the honest surface.
+    let mut unique = std::collections::HashSet::new();
+    if !headers.iter().all(|header| unique.insert(header)) {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = preview.split('\n').collect();
+    let mut answers = Vec::new();
+    let mut cursor = 0usize;
+    for (index, (_, question)) in prompts.iter().enumerate() {
+        let prefix = format!("{}:", headers[index]);
+        // Never attach a following answer to a question the preview does not
+        // name: a record that stopped matching its questions is left to the
+        // generic tool row instead of showing a confident wrong pairing.
+        let Some(start) = (cursor..lines.len()).find(|line| lines[*line].starts_with(&prefix))
+        else {
+            break;
+        };
+        // The next question's labelled line ends this answer. A free-text
+        // answer may itself contain newlines, so the boundary is the label,
+        // never the line count.
+        let end = headers
+            .iter()
+            .skip(index + 1)
+            .find_map(|header| {
+                let next = format!("{header}:");
+                (start + 1..lines.len()).find(|line| lines[*line].starts_with(&next))
+            })
+            .unwrap_or(lines.len());
+        let mut answer = lines[start]
+            .strip_prefix(&prefix)
+            .unwrap_or("")
+            .trim_start()
+            .to_string();
+        for line in &lines[start + 1..end] {
+            answer.push('\n');
+            answer.push_str(line);
+        }
+        answers.push(AnsweredQuestion {
+            question: sanitize_multiline(question),
+            answer: sanitize_multiline(answer.trim_end()),
+        });
+        cursor = end;
+    }
+    // A partial pairing is a mismatch, not a shorter answer. Falling back to
+    // the generic tool row keeps every asked question on the record instead of
+    // showing a confident subset.
+    if answers.len() == prompts.len() {
+        answers
+    } else {
+        Vec::new()
+    }
+}
+
+/// The tab label the clarification overlay derives for a question with no
+/// `header`: the first non-empty prompt line, short enough for a tab.
+const CLARIFY_HEADER_MAX_DISPLAY: usize = 8;
+
+fn clarification_display_header(header: &str, question: &str) -> String {
+    let header = header.trim();
+    if !header.is_empty() {
+        return header.to_string();
+    }
+    let first = question
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    truncate_display(first, CLARIFY_HEADER_MAX_DISPLAY)
+}
+
+/// Flatten terminal controls while preserving the record's own line breaks.
+fn sanitize_multiline(text: &str) -> String {
+    text.split('\n')
+        .map(crate::render::text::sanitize_terminal_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The compact answered-question record: a heading and one `· question → answer`
+/// row per question.
+fn answered_clarification_lines(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+) -> Option<Vec<Line<'static>>> {
+    let questions = answered_questions(call)?;
+    let mut out = Vec::new();
+    out.extend(wrapped_style_lines(
+        &[
+            (Style::default().fg(theme.accent.primary), "● ".to_string()),
+            (
+                Style::default().fg(theme.ink(Ink::Prose)),
+                t.question_answered_title.to_string(),
+            ),
+        ],
+        width,
+        Span::raw(""),
+        Span::raw("  "),
+    ));
+    for pair in questions {
+        out.extend(wrapped_style_lines(
+            &[
+                (Style::default().fg(theme.text.secondary), pair.question),
+                (Style::default().fg(theme.ink(Ink::Meta)), " → ".to_string()),
+                (Style::default().fg(theme.ink(Ink::Prose)), pair.answer),
+            ],
+            width,
+            Span::styled("  · ", Style::default().fg(theme.ink(Ink::Subtle))),
+            Span::raw("    "),
+        ));
+    }
+    Some(out)
+}
+
+/// Wrap styled segments to display width, keeping every row inside `width`.
+///
+/// The question and its answer are one paragraph: a short pair stays on one
+/// row, and a long one wraps with a hanging indent under the `·`. Each visual
+/// row carries the style of the segment it came from, so the question stays
+/// secondary, the arrow stays chrome and the answer stays normal even across a
+/// wrap. Width is measured in terminal cells, never chars (CJK is two).
+fn wrapped_style_lines(
+    segments: &[(Style, String)],
+    width: usize,
+    first_prefix: Span<'static>,
+    cont_prefix: Span<'static>,
+) -> Vec<Line<'static>> {
+    let first_width = UnicodeWidthStr::width(first_prefix.content.as_ref());
+    let cont_width = UnicodeWidthStr::width(cont_prefix.content.as_ref());
+    let prefix_width = first_width.max(cont_width);
+    // A terminal narrower than the hanging prefix cannot fit it. Dropping the
+    // prefix keeps the text inside the screen; truncating it would not.
+    let (first_prefix, cont_prefix, prefix_width) = if width > prefix_width {
+        (first_prefix, cont_prefix, prefix_width)
+    } else {
+        (Span::raw(""), Span::raw(""), 0)
+    };
+    let avail = width.saturating_sub(prefix_width).max(1);
+    let mut text = String::new();
+    let mut bounds = Vec::with_capacity(segments.len());
+    for (style, part) in segments {
+        let start = text.len();
+        text.push_str(part);
+        bounds.push((start, text.len(), *style));
+    }
+    wrapped_ranges(&text, avail)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end))| {
+            let mut spans = Vec::with_capacity(bounds.len() + 1);
+            spans.push(if index == 0 {
+                first_prefix.clone()
+            } else {
+                cont_prefix.clone()
+            });
+            for (segment_start, segment_end, style) in &bounds {
+                let from = (*segment_start).max(start);
+                let to = (*segment_end).min(end);
+                if from < to {
+                    spans.push(Span::styled(text[from..to].to_string(), *style));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The byte ranges of the visual rows `textwrap` produces for `text`.
+///
+/// `textwrap` returns the row strings but not where they sat. Re-locating each
+/// row in the remaining source recovers the offsets without re-implementing
+/// its CJK- and word-aware wrapping, so styles can be sliced per row.
+fn wrapped_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
+    if text.is_empty() {
+        return vec![(0, 0)];
+    }
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for logical in text.split('\n') {
+        if logical.is_empty() {
+            out.push((offset, offset));
+            offset += 1;
+            continue;
+        }
+        let pieces = textwrap::wrap(logical, width);
+        let mut rest = logical;
+        let mut rest_start = offset;
+        for piece in pieces {
+            let piece = piece.into_owned();
+            let Some(start) = rest.find(piece.as_str()) else {
+                // Defensive: a wrapper that rewrote a row must not lose the
+                // rest of it or panic the renderer.
+                if !rest.is_empty() {
+                    out.push((rest_start, rest_start + rest.len()));
+                }
+                break;
+            };
+            let from = rest_start + start;
+            let to = from + piece.len();
+            out.push((from, to));
+            let end = start.saturating_add(piece.len()).min(rest.len());
+            rest = &rest[end..];
+            rest_start += end;
+        }
+        offset += logical.len() + 1;
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
 }
 
 /// Whether this call is the agent LOOKING AROUND — a read, a search, a symbol
@@ -5987,17 +6333,362 @@ mod tests {
         c.preview = Some("回退到主组".into());
         let text = render_group_text(&group(vec![c]), 100, Locale::Zh).join("\n");
         assert!(
-            text.contains("询问"),
-            "the row names the interaction: {text}"
+            text.contains("● 用户已回答 Agent 的问题："),
+            "the row names the completed interaction once: {text}"
         );
         assert!(
-            text.contains("light_group"),
-            "the question stays on the record: {text}"
+            !text.contains("询问"),
+            "the completed record is not also a tool row: {text}"
         );
         assert!(
-            text.contains("回退到主组"),
-            "the answer stays on the record: {text}"
+            text.contains("  · light_group 未配置时该怎么办? → 回退到主组"),
+            "the question and answer share one row: {text}"
         );
+    }
+
+    fn clarification_call(
+        arguments: serde_json::Value,
+        preview: impl Into<String>,
+    ) -> ToolCallBlock {
+        let mut call = call("request_user_input", &arguments.to_string(), ToolStatus::Ok);
+        call.preview = Some(preview.into());
+        call
+    }
+
+    fn clarification_text(
+        arguments: serde_json::Value,
+        preview: impl Into<String>,
+        width: usize,
+        locale: Locale,
+    ) -> Vec<String> {
+        render_group_text(
+            &group(vec![clarification_call(arguments, preview)]),
+            width,
+            locale,
+        )
+    }
+
+    #[test]
+    fn a_multi_choice_and_custom_answer_are_shown_as_they_were_given() {
+        let text = clarification_text(
+            serde_json::json!({
+                "question": "需要你的选择",
+                "questions": [
+                    {
+                        "header": "验证范围",
+                        "question": "需要跑哪些验证？",
+                        "kind": "multi",
+                        "options": ["单元测试", "TUI 测试", "workspace test"],
+                    },
+                    {
+                        "header": "未登录态",
+                        "question": "未登录时怎么展示？",
+                        "kind": "text",
+                    },
+                ],
+            }),
+            "验证范围: 单元测试, TUI 测试\n未登录态: 展示登录引导",
+            120,
+            Locale::Zh,
+        )
+        .join("\n");
+        assert!(
+            text.contains("  · 需要跑哪些验证？ → 单元测试, TUI 测试"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  · 未登录时怎么展示？ → 展示登录引导"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn questions_keep_the_order_the_model_asked_them_in() {
+        let text = clarification_text(
+            serde_json::json!({
+                "questions": [
+                    {"header": "第一问", "question": "第一问？", "kind": "single", "options": ["A"]},
+                    {"header": "第二问", "question": "第二问？", "kind": "single", "options": ["B"]},
+                ],
+            }),
+            "第一问: A\n第二问: B",
+            100,
+            Locale::Zh,
+        )
+        .join("\n");
+        let first = text.find("第一问？").expect("first question");
+        let second = text.find("第二问？").expect("second question");
+        assert!(first < second, "the original order survives: {text}");
+    }
+
+    /// A free-text answer can contain line breaks. They belong to the one
+    /// question, not to a second unanswered question.
+    #[test]
+    fn a_multiline_answer_stays_with_its_question() {
+        let text = clarification_text(
+            serde_json::json!({
+                "questions": [
+                    {"header": "部署步骤", "question": "部署步骤？", "kind": "text"},
+                ],
+            }),
+            "部署步骤: 第一步：备份\n第二步：重建",
+            120,
+            Locale::Zh,
+        )
+        .join("\n");
+        assert!(text.contains("部署步骤？ → 第一步：备份"), "{text}");
+        assert!(text.contains("第二步：重建"), "{text}");
+    }
+
+    /// The question is secondary ink and the answer is normal ink. The arrow is
+    /// chrome between them, so a reader can tell the two apart at a glance.
+    #[test]
+    fn the_question_is_secondary_and_the_answer_is_normal_ink() {
+        let theme = Theme::dark();
+        let mut c = call(
+            "request_user_input",
+            r#"{"question":"用哪种方式？","options":["公网 IP","内网"]}"#,
+            ToolStatus::Ok,
+        );
+        c.preview = Some("公网 IP".into());
+        let lines = render_group(
+            &group(vec![c]),
+            &theme,
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            0,
+            None,
+            false,
+        );
+        let pair = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("用哪种方式？"))
+            })
+            .expect("the answer row");
+        let question = pair
+            .spans
+            .iter()
+            .find(|span| span.content.contains("用哪种方式？"))
+            .unwrap();
+        let answer = pair
+            .spans
+            .iter()
+            .find(|span| span.content.contains("公网 IP"))
+            .unwrap();
+        assert_eq!(question.style.fg, Some(theme.text.secondary));
+        assert_eq!(answer.style.fg, Some(theme.ink(Ink::Prose)));
+    }
+
+    /// The summary must fit a narrow terminal without a row outgrowing it —
+    /// including when Chinese and ASCII mix.
+    #[test]
+    fn a_long_mixed_answer_wraps_inside_the_terminal_width() {
+        let question = "生产库已有旧 Schema 和订单数据，如何处理？";
+        let answer = "备份后重建（推荐），并在迁移完成后对账一次 order_total 与 payment_total";
+        for width in [120usize, 60, 36, 24, 16] {
+            let lines = clarification_text(
+                serde_json::json!({"question": question, "options": [answer]}),
+                answer,
+                width,
+                Locale::Zh,
+            );
+            assert!(!lines.is_empty(), "width {width} lost the summary");
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= width,
+                    "width {width} overflowed: {line:?}\n{lines:#?}"
+                );
+            }
+            let joined = lines.join("\n");
+            let squeezed: String = joined.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(squeezed.contains("生产库已有旧"), "width {width}: {joined}");
+            assert!(squeezed.contains("order_total"), "width {width}: {joined}");
+        }
+    }
+
+    /// A tab label the model never set is derived exactly as the overlay
+    /// derived it, so the composed `header: answer` line still maps back to the
+    /// full question when the session is replayed.
+    #[test]
+    fn a_question_without_a_header_uses_the_derived_tab_label() {
+        let question = "生产库已有旧 Schema 和订单数据，如何处理？";
+        let header = truncate_display(question, 8);
+        let text = clarification_text(
+            serde_json::json!({
+                "questions": [{"question": question, "kind": "text"}],
+            }),
+            format!("{header}: 备份后重建（推荐）"),
+            120,
+            Locale::Zh,
+        )
+        .join("\n");
+        assert!(text.contains(question), "{text}");
+        assert!(text.contains("备份后重建（推荐）"), "{text}");
+    }
+
+    /// Terminal controls in an answer must not reach the cell buffer. The line
+    /// keeps its text; the escape, carriage return and tab are flattened.
+    #[test]
+    fn control_characters_in_an_answer_cannot_break_the_row() {
+        let answer = "备份\u{1b}[31m后\r重建\t完成";
+        let text = clarification_text(
+            serde_json::json!({"question": "怎么处理？", "options": [answer]}),
+            answer,
+            100,
+            Locale::Zh,
+        )
+        .join("\n");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\r'), "{text:?}");
+        assert!(!text.contains('\t'), "{text:?}");
+        assert!(text.contains("备份"), "{text}");
+        assert!(text.contains("重建"), "{text}");
+    }
+
+    /// The legacy single-question shape accepts a typed answer beside its
+    /// options; the record shows the text the user actually entered.
+    #[test]
+    fn a_legacy_custom_answer_shows_what_the_user_typed() {
+        let text = clarification_text(
+            serde_json::json!({"question": "选哪个？", "options": ["A", "B"]}),
+            "3，其余不变",
+            100,
+            Locale::Zh,
+        )
+        .join("\n");
+        assert!(text.contains("选哪个？ → 3，其余不变"), "{text}");
+    }
+
+    /// Two questions with the same derived label make the composed answer
+    /// ambiguous. The generic row keeps every answer verbatim instead of
+    /// attaching one to the wrong question.
+    #[test]
+    fn duplicate_labels_do_not_guess_an_answer_pairing() {
+        let text = clarification_text(
+            serde_json::json!({
+                "questions": [
+                    {"header": "配置", "question": "第一项配置？", "kind": "text"},
+                    {"header": "配置", "question": "第二项配置？", "kind": "text"},
+                ],
+            }),
+            "配置: A\n配置: B",
+            100,
+            Locale::Zh,
+        )
+        .join("\n");
+        assert!(!text.contains("用户已回答"), "{text}");
+        assert!(text.contains('A') && text.contains('B'), "{text}");
+    }
+
+    /// Two separate clarifications in one turn are two records, each with its
+    /// own anchor. They are not merged into a tool run with `└─` children.
+    #[test]
+    fn two_clarifications_keep_separate_first_level_records() {
+        let first = clarification_call(
+            serde_json::json!({"question": "第一步选哪个？", "options": ["A", "B"]}),
+            "A",
+        );
+        let second = clarification_call(
+            serde_json::json!({"question": "第二步选哪个？", "options": ["C", "D"]}),
+            "D",
+        );
+        let mut second = second;
+        second.id = ToolCallId::new("second");
+        let text = render_group_text(&group(vec![first, second]), 100, Locale::Zh).join("\n");
+        assert_eq!(text.matches("用户已回答").count(), 2, "{text}");
+        assert!(text.contains("第一步选哪个？ → A"), "{text}");
+        assert!(text.contains("第二步选哪个？ → D"), "{text}");
+        assert!(!text.contains('└'), "no tool-run branch: {text}");
+    }
+
+    /// Even if the runtime stamps two clarifications into one observed burst,
+    /// each keeps its own `●` anchor instead of becoming a `├─`/`└─` child.
+    #[test]
+    fn a_batched_clarification_keeps_its_first_level_anchor() {
+        let mut first = clarification_call(
+            serde_json::json!({"question": "第一问？", "options": ["A"]}),
+            "A",
+        );
+        first.batch = Some(1);
+        let mut second = clarification_call(
+            serde_json::json!({"question": "第二问？", "options": ["B"]}),
+            "B",
+        );
+        second.batch = Some(1);
+        second.id = ToolCallId::new("second");
+        let text = render_group_text(&group(vec![first, second]), 100, Locale::Zh).join("\n");
+        assert_eq!(text.matches("用户已回答").count(), 2, "{text}");
+        assert!(!text.contains('├'), "{text}");
+        assert!(!text.contains('└'), "{text}");
+    }
+
+    /// Rendering the same durable call twice produces the same rows; a
+    /// reconnect or a re-render cannot grow a second summary.
+    #[test]
+    fn rendering_the_same_answered_call_twice_is_idempotent() {
+        let c = clarification_call(
+            serde_json::json!({"question": "选哪个？", "options": ["A", "B"]}),
+            "B",
+        );
+        let group = group(vec![c]);
+        let first = render_group_text(&group, 100, Locale::Zh);
+        let second = render_group_text(&group, 100, Locale::Zh);
+        assert_eq!(first, second);
+        assert_eq!(first.join("\n").matches("用户已回答").count(), 1);
+    }
+
+    /// A skip, timeout or unattended question is not an answer. It keeps the
+    /// existing warning row and never claims the user answered.
+    #[test]
+    fn an_unanswered_question_never_becomes_an_answered_summary() {
+        for preview in [
+            "The user did not respond in time — this is NOT a user reply.",
+            "No user is available to answer in this unattended run — this is NOT a user reply.",
+            "The user saw this question and chose to skip it; proceed using your best judgment.",
+        ] {
+            let text = clarification_text(
+                serde_json::json!({"question": "选哪个？", "options": ["A", "B"]}),
+                preview,
+                100,
+                Locale::Zh,
+            )
+            .join("\n");
+            assert!(
+                !text.contains("用户已回答"),
+                "an unanswered question claimed success: {text}"
+            );
+        }
+    }
+
+    /// A failed clarification has no delivered answer and keeps the failure row.
+    #[test]
+    fn a_failed_clarification_is_not_an_answered_summary() {
+        let mut c = call(
+            "request_user_input",
+            r#"{"question":"选哪个？","options":["A","B"]}"#,
+            ToolStatus::Failed,
+        );
+        c.preview = Some("runtime error: superseded".into());
+        let text = render_group_text(&group(vec![c]), 100, Locale::Zh).join("\n");
+        assert!(!text.contains("用户已回答"), "{text}");
+    }
+
+    /// `request_permissions` shares the AskUser taxonomy kind but is a
+    /// permission decision, not a question with a `→` answer.
+    #[test]
+    fn a_permission_request_is_not_rendered_as_a_question_answer() {
+        let mut c = call(
+            "request_permissions",
+            r#"{"action":"network","reason":"fetch docs"}"#,
+            ToolStatus::Ok,
+        );
+        c.preview = Some("approved".into());
+        let text = render_group_text(&group(vec![c]), 100, Locale::Zh).join("\n");
+        assert!(!text.contains("用户已回答"), "{text}");
     }
 
     /// A question nobody answered is not an answer: no ✓, and the row says

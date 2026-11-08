@@ -434,6 +434,9 @@ pub struct UiText {
     pub question_timed_out: &'static str,
     pub question_unattended: &'static str,
     pub question_skipped: &'static str,
+    /// The heading over a successfully answered clarification's question/answer
+    /// rows. It states only what the runtime proved: the reply was delivered.
+    pub question_answered_title: &'static str,
     /// The contextual hint while a running command row holds the keyboard
     /// focus: enter toggles its output, `x` stops that execution.
     pub command_focus_hint: &'static str,
@@ -1820,6 +1823,7 @@ static ZH: UiText = UiText {
     question_timed_out: "未回复（已超时）",
     question_unattended: "无人回答（非交互运行）",
     question_skipped: "已跳过",
+    question_answered_title: "用户已回答 Agent 的问题：",
     command_focus_hint: "Enter 展开 · x 停止",
     activity_focus_hint: "Enter 查看",
     command_output_hidden: "前 {} 行未显示",
@@ -2890,6 +2894,7 @@ static EN: UiText = UiText {
     question_timed_out: "not answered (timed out)",
     question_unattended: "nobody to answer (unattended run)",
     question_skipped: "skipped",
+    question_answered_title: "User answered the Agent's questions:",
     command_focus_hint: "Enter expand · x stop",
     activity_focus_hint: "Enter open",
     command_output_hidden: "{} earlier lines hidden",
