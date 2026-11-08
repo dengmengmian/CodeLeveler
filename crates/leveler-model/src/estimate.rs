@@ -29,9 +29,11 @@
 //! Per-message role framing and JSON envelope structure. No provider this
 //! harness speaks to has been measured for those, and inventing a constant
 //! would only make the calibration fixtures pass against a number nobody
-//! observed. The estimator is a lower bound on the provider's prompt count;
-//! the provider's own `prompt_tokens` is the authority once a request was
-//! made.
+//! observed. The estimator is an approximation, not a bound: it is
+//! conservative for code/diff-shaped tool results (2.5 bytes/token) and can
+//! overestimate whitespace-heavy tool output such as SQL or logs. The
+//! provider's own `prompt_tokens` is the authority once a request was made;
+//! calibrate against measured traffic, not a single session.
 
 use crate::message::{ContentPart, Message, ToolDefinition};
 

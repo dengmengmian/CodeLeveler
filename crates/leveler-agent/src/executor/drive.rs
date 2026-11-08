@@ -337,7 +337,7 @@ pub(crate) struct Drive<'a> {
     /// provider's own prompt count instead of being recomputed offline.
     last_projected_input_tokens: Option<u64>,
     /// The provider's own prompt count for that same request, when it reported
-    /// one. The estimator is a documented LOWER bound (role framing and JSON
+    /// one. The estimator is an approximation (role framing and JSON
     /// envelopes are not priced); this is the only measurement of the gap, so
     /// the next request's pressure is judged with it instead of pretending the
     /// estimate is the whole truth.
