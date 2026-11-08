@@ -144,17 +144,20 @@ fn key(code: KeyCode) -> Action {
 }
 
 fn frame(state: &mut AppState, label: &str) -> String {
-    const W: u16 = 96;
-    const H: u16 = 30;
-    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    frame_at(state, label, 96, 30)
+}
+
+fn frame_at(state: &mut AppState, label: &str, width: u16, height: u16) -> String {
+    let (w, h) = (width, height);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| leveler_tui::render::render(f, state))
         .unwrap();
     let buf = term.backend().buffer();
     let mut out = format!("\n===== {label} =====\n");
-    for y in 0..H {
+    for y in 0..h {
         let mut line = String::new();
         let mut x = 0u16;
-        while x < W {
+        while x < w {
             let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
             line.push_str(sym);
             x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
@@ -165,6 +168,31 @@ fn frame(state: &mut AppState, label: &str) -> String {
         }
     }
     out
+}
+
+/// The delivered clarification's compact record, exactly once. The question is
+/// the model's own prompt and the answer is what the TUI submitted, joined by
+/// `→` on one row.
+fn assert_summary(frame: &str) {
+    assert_eq!(
+        frame.matches("● 用户已回答 Agent 的问题：").count(),
+        1,
+        "the answered summary must appear exactly once:\n{frame}"
+    );
+    for pair in [
+        "数据策略怎么定？ → 删除全部 mock",
+        "需要跑哪些验证？ → 单元测试, TUI 测试",
+        "未登录时怎么展示？ → 展示登录引导",
+    ] {
+        assert!(
+            frame.contains(pair),
+            "the record is missing {pair:?}:\n{frame}"
+        );
+    }
+    assert!(
+        !frame.contains("询问  需要你的选择"),
+        "the old tool row is replaced by the record:\n{frame}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -280,7 +308,19 @@ compatibility:
                 | RuntimeEvent::TurnCancelled
         );
         println!("[event] {}", short(&event));
+        let clarification_delivered = matches!(
+            &event,
+            RuntimeEvent::ToolCallCompleted { id, .. } if id.as_str() == "call-clarify"
+        );
         reduce(&mut state, Action::Runtime(event));
+
+        // The tool result is the delivery boundary: as soon as the runtime
+        // completes the clarification call, the compact record is history.
+        if clarification_delivered {
+            let delivered_frame = frame_at(&mut state, "clarification delivered", 120, 60);
+            println!("{delivered_frame}");
+            assert_summary(&delivered_frame);
+        }
 
         let clarifying = matches!(&state.overlay, Some(Overlay::Clarification(_)));
         if clarifying && !drove {
@@ -368,6 +408,86 @@ compatibility:
     }
     assert!(drove, "the clarification never reached the TUI");
     assert!(sent_answers);
+
+    // The agent's later prose must not overwrite the record: the terminal
+    // frame still carries the answer summary, and only one of it.
+    let settled_frame = frame_at(&mut state, "turn settled", 120, 60);
+    println!("{settled_frame}");
+    assert!(
+        settled_frame.contains("已按你的选择处理"),
+        "the agent continued after the answer:\n{settled_frame}"
+    );
+    assert_summary(&settled_frame);
+
+    // Resume as a fresh client/view: the durable history is the only source
+    // for the transcript, exactly as a reopened session loads it.
+    let resumed_snapshot = client.snapshot(&session).await.unwrap();
+    let mut resumed = tui_state(session.clone());
+    let effects = reduce(
+        &mut resumed,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: resumed_snapshot,
+        }),
+    );
+    let query_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Send(ClientCommand::QuerySessionHistory {
+                query_id: Some(query_id),
+                ..
+            }) => Some(query_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(leveler_client_protocol::CommandId::generate);
+    resumed.history_query = Some(query_id.clone());
+    let mut history_rx = client.subscribe_session(&session);
+    client
+        .issue(
+            session.clone(),
+            ClientCommand::QuerySessionHistory {
+                session_id: session.clone(),
+                query_id: Some(query_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let loaded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match history_rx.recv().await {
+                Ok(event) => {
+                    let ours = matches!(
+                        &event,
+                        RuntimeEvent::SessionHistoryLoaded {
+                            query_id: Some(loaded_id),
+                            session_id,
+                            ..
+                        } if loaded_id == &query_id && session_id == &session
+                    );
+                    if ours {
+                        break event;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(error) => panic!("history stream ended: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the resumed session loads its history");
+    reduce(&mut resumed, Action::Runtime(loaded.clone()));
+    assert!(
+        resumed.overlay.is_none(),
+        "a delivered question must not reopen on resume"
+    );
+    let resumed_frame = frame_at(&mut resumed, "resumed", 120, 60);
+    println!("{resumed_frame}");
+    assert_summary(&resumed_frame);
+
+    // Replaying the same history again (reconnect / refresh) replaces the
+    // transcript; it must not append a second summary.
+    reduce(&mut resumed, Action::Runtime(loaded));
+    let replayed_again = frame_at(&mut resumed, "replayed again", 120, 60);
+    assert_summary(&replayed_again);
 
     // The model was actually handed the decisions: the request after the
     // answer carries the tool result, which is the composed answer.

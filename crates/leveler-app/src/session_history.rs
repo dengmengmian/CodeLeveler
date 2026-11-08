@@ -692,6 +692,100 @@ mod tests {
         }
     }
 
+    /// The answered-question record is rebuilt from the clarification tool
+    /// call, so the durable source of both halves must keep the storage
+    /// redaction contract: a secret in the question or the answer is scrubbed
+    /// before it can re-appear after a resume.
+    #[tokio::test]
+    async fn a_clarification_record_replays_from_redacted_durable_data() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        let secret = "hunter2-summary-secret";
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(10),
+            EngineEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "request_user_input".into(),
+                arguments: serde_json::json!({
+                    "question": format!("连接串用哪个？ password: {secret}"),
+                    "options": ["主库"],
+                })
+                .to_string(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+                model_step: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(20),
+            EngineEvent::ToolCallFinished {
+                call_id: "c1".into(),
+                name: "request_user_input".into(),
+                is_error: false,
+                preview: format!("密码 password: {secret}"),
+                agent_id: None,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(30),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: Vec::new(),
+            },
+        )
+        .await;
+
+        for _ in 0..2 {
+            let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+            let serialized = serde_json::to_string(&entries).unwrap();
+            assert!(
+                !serialized.contains(secret),
+                "the durable record leaked a secret: {serialized}"
+            );
+            assert!(
+                entries.iter().any(|entry| matches!(
+                    &entry.event,
+                    RuntimeEvent::ToolCallStarted { id, arguments, .. }
+                        if id.as_str() == "c1" && arguments.contains("[REDACTED]")
+                )),
+                "the question's redacted record must replay: {entries:#?}"
+            );
+            assert!(
+                entries.iter().any(|entry| matches!(
+                    &entry.event,
+                    RuntimeEvent::ToolCallCompleted { id, preview, .. }
+                        if id.as_str() == "c1" && preview.contains("[REDACTED]")
+                )),
+                "the answer's redacted record must replay: {entries:#?}"
+            );
+        }
+    }
+
     async fn session() -> (Database, SessionId) {
         let db = Database::connect_in_memory().await.unwrap();
         let rec = SessionRecord::new("/repo", "history", "m/x", now());
