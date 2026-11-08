@@ -1008,6 +1008,74 @@ async fn answered_chat_does_not_spend_the_next_tasks_command_budget() {
     assert_eq!(progress.cumulative_model_steps, second.model_steps);
 }
 
+/// The same snapshot must not be persisted twice in one turn, while the first
+/// snapshot of the NEXT turn must still be published even when its ledger
+/// happens to match: a turn is an execution boundary, not a payload.
+#[tokio::test]
+async fn progress_snapshots_are_deduped_but_turn_boundaries_remain() {
+    let h = harness(vec![text("first"), text("second")]).await;
+    let s = spec(&h, "progress boundary");
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut first = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "first turn".into(),
+            }],
+            &mut |e| first.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first chat");
+    let mut second = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "second turn".into(),
+            }],
+            &mut |e| second.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second chat");
+
+    let ledgers = |events: &[EngineEvent]| -> Vec<leveler_lifecycle::ProgressLedger> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::ProgressUpdated { ledger } => Some(ledger.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = ledgers(&first);
+    let second = ledgers(&second);
+    assert!(!first.is_empty(), "first turn published no progress");
+    assert!(!second.is_empty(), "second turn published no progress");
+    for window in first.windows(2) {
+        assert_ne!(
+            window[0], window[1],
+            "identical progress snapshots were published twice in one turn"
+        );
+    }
+    for window in second.windows(2) {
+        assert_ne!(
+            window[0], window[1],
+            "identical progress snapshots were published twice in one turn"
+        );
+    }
+    assert_ne!(
+        first.last(),
+        second.first(),
+        "the next turn's first snapshot is an execution boundary and must not be deduped away"
+    );
+}
+
 #[tokio::test]
 async fn answered_status_chat_does_not_reset_a_running_goals_command_budget() {
     let h = harness(vec![
@@ -1201,6 +1269,15 @@ async fn an_unfinished_goal_resume_keeps_its_command_budget() {
         EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
             if call_id.as_str() == "extra-command" && preview.contains("1-command budget is exhausted")
     )));
+    let resumed_progress = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger),
+            _ => None,
+        })
+        .expect("a resumed turn must publish its own progress snapshot");
+    assert_eq!(resumed_progress.cumulative_commands, 1);
 }
 
 /// A later active snapshot cannot reopen a completed task's budget, including

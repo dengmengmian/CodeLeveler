@@ -218,6 +218,10 @@ pub(crate) struct Drive<'a> {
     staged_scoped_rules: std::collections::HashSet<String>,
     progress_caps: ProgressCaps,
     progress: ProgressLedger,
+    /// Last ledger published to the observer. Progress is a snapshot, not an
+    /// event stream: persisting the same snapshot twice creates duplicate
+    /// `progress_updated` rows for one state change.
+    last_progress_emitted: Option<ProgressLedger>,
     epoch_model_steps_at_start: u32,
     epoch_tokens_at_start: u64,
     epoch_estimated_at_start: u64,
@@ -799,6 +803,10 @@ impl Executor {
         // it did; a seeded continuation must not begin inside the closeout it
         // was issued to get out of.
         progress.closing = false;
+        // A child-recovery notice below publishes a progress snapshot before
+        // the Drive exists. Remember it so the first `emit_progress` does not
+        // publish the same ledger again.
+        let mut progress_emitted = false;
 
         // Product steer: top-level runs see keep-vs-delegate once. Parallel
         // keywords are not required — ordinary implementation goals must still
@@ -843,6 +851,7 @@ impl Executor {
             observer(AgentEvent::ProgressUpdated {
                 ledger: progress.clone(),
             });
+            progress_emitted = true;
             sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
             observer(AgentEvent::runtime_injection(
@@ -878,6 +887,7 @@ impl Executor {
             observer(AgentEvent::ProgressUpdated {
                 ledger: progress.clone(),
             });
+            progress_emitted = true;
             // Durable like every other injected turn — the record was just
             // cleared, so the note is the only remaining truth.
             sink.append(std::slice::from_ref(&note)).await?;
@@ -917,6 +927,7 @@ impl Executor {
             scoped_paths,
             staged_scoped_rules: std::collections::HashSet::new(),
             progress_caps: ProgressCaps::default(),
+            last_progress_emitted: progress_emitted.then(|| progress.clone()),
             epoch_model_steps_at_start: progress.cumulative_model_steps,
             epoch_tokens_at_start: progress.cumulative_model_tokens,
             epoch_estimated_at_start: progress.cumulative_estimated_model_tokens,
@@ -1066,9 +1077,7 @@ impl Executor {
             }
             harness.enter_finalization();
             let detail = exhaustion.stop_detail();
-            (harness.observer)(AgentEvent::ProgressUpdated {
-                ledger: harness.progress.clone(),
-            });
+            harness.emit_progress();
             (harness.observer)(AgentEvent::Finished(detail.clone()));
             result = Ok(AgentOutcome::drive_budget_exhausted(
                 detail,
@@ -1183,6 +1192,22 @@ impl<'a> Drive<'a> {
         });
     }
 
+    /// Publish the current ledger only when it actually changed.
+    ///
+    /// A `ProgressUpdated` is a full snapshot. Two emissions with the same
+    /// ledger are one state, and persisting both produced duplicate
+    /// `progress_updated` rows (90 identical adjacent pairs in the audited
+    /// session) that clients had to ignore.
+    fn emit_progress(&mut self) {
+        if self.last_progress_emitted.as_ref() == Some(&self.progress) {
+            return;
+        }
+        self.last_progress_emitted = Some(self.progress.clone());
+        (self.observer)(AgentEvent::ProgressUpdated {
+            ledger: self.progress.clone(),
+        });
+    }
+
     /// Write absolute epoch spend into the ledger so continue/resume seeds the
     /// same totals (including tool-phase command/file increments after the
     /// last model stream), and publish it.
@@ -1200,9 +1225,7 @@ impl<'a> Drive<'a> {
             rt.cost_spent_micros(),
             &self.modified_files,
         );
-        (self.observer)(AgentEvent::ProgressUpdated {
-            ledger: self.progress.clone(),
-        });
+        self.emit_progress();
     }
 
     /// Persist a model call the kernel already folded into the run's spend.
@@ -1563,9 +1586,7 @@ impl<'a> Drive<'a> {
             });
             launched.push(child.clone());
         }
-        (self.observer)(AgentEvent::ProgressUpdated {
-            ledger: self.progress.clone(),
-        });
+        self.emit_progress();
         if !launched.is_empty() {
             let note = Message::user(
                 crate::sub_agent::resumed_children_note(&launched),
@@ -1630,9 +1651,7 @@ impl<'a> Drive<'a> {
                 other => (self.observer)(other),
             }
         }
-        (self.observer)(AgentEvent::ProgressUpdated {
-            ledger: self.progress.clone(),
-        });
+        self.emit_progress();
         self.settlements_durable().await?;
         match settlement_error {
             Some(error) => Err(error),
@@ -1804,9 +1823,7 @@ impl<'a> Drive<'a> {
         // Epoch terminal: next Content turn must not inherit Closing state.
         if matches!(reason, StopReason::Completed | StopReason::Blocked) {
             self.progress.enter_closed();
-            (self.observer)(AgentEvent::ProgressUpdated {
-                ledger: self.progress.clone(),
-            });
+            self.emit_progress();
         }
         // The delivery decision is durable before the transient `Finished`
         // marker and before the turn/task terminals. A crash in the terminal
@@ -1862,9 +1879,7 @@ impl<'a> Drive<'a> {
         fallback: &str,
     ) -> Result<AgentOutcome, AgentError> {
         self.progress.enter_closed();
-        (self.observer)(AgentEvent::ProgressUpdated {
-            ledger: self.progress.clone(),
-        });
+        self.emit_progress();
         let final_text = if self.last_text.trim().is_empty() {
             fallback.to_string()
         } else {
@@ -2521,9 +2536,7 @@ impl AgentHarness for Drive<'_> {
         {
             self.flush_epoch(rt);
             self.progress.budget_scope = Some(goal_id.to_string());
-            (self.observer)(AgentEvent::ProgressUpdated {
-                ledger: self.progress.clone(),
-            });
+            self.emit_progress();
         }
         // Mid-turn user input goes in at the top of the round, before the
         // model is asked anything: a correction that arrives after the work
@@ -2599,9 +2612,7 @@ impl AgentHarness for Drive<'_> {
             for source in &injected {
                 push_unique_path(&mut self.progress.scoped_rule_sources, source);
             }
-            (self.observer)(AgentEvent::ProgressUpdated {
-                ledger: self.progress.clone(),
-            });
+            self.emit_progress();
             (self.observer)(AgentEvent::runtime_injection(
                 crate::executor::RuntimeInjectionKind::ScopedRules,
                 model_steps,
@@ -3032,9 +3043,7 @@ impl AgentHarness for Drive<'_> {
             // that the goal is still active.
             if let CloseoutAction::ContinueGoal = action {
                 self.progress.note_no_progress_round(model_steps);
-                (self.observer)(AgentEvent::ProgressUpdated {
-                    ledger: self.progress.clone(),
-                });
+                self.emit_progress();
                 (self.observer)(AgentEvent::AdvisoryStarted {
                     kind: AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
                 });
@@ -3064,9 +3073,7 @@ impl AgentHarness for Drive<'_> {
                 // ticks the no-progress bound. It never spends the one-shot
                 // protocol-repair budget, and it never names a step as "next".
                 self.progress.note_no_progress_round(model_steps);
-                (self.observer)(AgentEvent::ProgressUpdated {
-                    ledger: self.progress.clone(),
-                });
+                self.emit_progress();
                 (self.observer)(AgentEvent::AdvisoryStarted {
                     kind: AdvisoryKind::CloseoutNudge(CloseoutReason::PlanUnresolved),
                 });
@@ -3096,9 +3103,7 @@ impl AgentHarness for Drive<'_> {
                 // coverage. That refusal settled the CONTRACT, not the user's
                 // request: the turn may not end as though the work were done.
                 self.progress.note_no_progress_round(model_steps);
-                (self.observer)(AgentEvent::ProgressUpdated {
-                    ledger: self.progress.clone(),
-                });
+                self.emit_progress();
                 (self.observer)(AgentEvent::AdvisoryStarted {
                     kind: AdvisoryKind::CloseoutNudge(CloseoutReason::TaskUnregistered),
                 });
@@ -3202,9 +3207,7 @@ impl AgentHarness for Drive<'_> {
                     // goal. That is blocked, not a stall — and it is reported
                     // as such, since nothing re-drives a turn on its own.
                     self.progress.enter_closed();
-                    (self.observer)(AgentEvent::ProgressUpdated {
-                        ledger: self.progress.clone(),
-                    });
+                    self.emit_progress();
                     (
                         StopReason::Blocked,
                         Some("user denied a required permission; goal left unresolved".to_string()),
@@ -3231,9 +3234,7 @@ impl AgentHarness for Drive<'_> {
                     {
                         self.progress.enter_closed();
                     }
-                    (self.observer)(AgentEvent::ProgressUpdated {
-                        ledger: self.progress.clone(),
-                    });
+                    self.emit_progress();
                     let reason = match action {
                         CloseoutAction::Stall(reason) => reason,
                         _ => CloseoutReason::GoalUnresolved,
@@ -3254,9 +3255,7 @@ impl AgentHarness for Drive<'_> {
                         self.progress.enter_closed();
                     }
                     if self.progress.human_boundary_seen() {
-                        (self.observer)(AgentEvent::ProgressUpdated {
-                            ledger: self.progress.clone(),
-                        });
+                        self.emit_progress();
                     }
                     (StopReason::Answered, None)
                 };
@@ -4700,9 +4699,7 @@ impl AgentHarness for Drive<'_> {
                             requested.network,
                             requested.repository_git || requested.unrestricted_fs,
                         );
-                        (self.observer)(AgentEvent::ProgressUpdated {
-                            ledger: self.progress.clone(),
-                        });
+                        self.emit_progress();
                     }
                     _ => {}
                 }
@@ -4910,9 +4907,7 @@ impl AgentHarness for Drive<'_> {
                             requested.network,
                             requested.repository_git || requested.unrestricted_fs,
                         );
-                        (self.observer)(AgentEvent::ProgressUpdated {
-                            ledger: self.progress.clone(),
-                        });
+                        self.emit_progress();
                     }
                     _ => {}
                 }
@@ -5744,9 +5739,7 @@ impl AgentHarness for Drive<'_> {
                 } else {
                     task.clone()
                 };
-                (self.observer)(AgentEvent::ProgressUpdated {
-                    ledger: self.progress.clone(),
-                });
+                self.emit_progress();
                 let (profile_id, profile_role, read_only) = profile.trace_fields();
                 let spec = leveler_lifecycle::ChildSpawnSpec {
                     title,
@@ -5844,9 +5837,7 @@ impl AgentHarness for Drive<'_> {
                         role.label(),
                         files.join(",")
                     ));
-                    (self.observer)(AgentEvent::ProgressUpdated {
-                        ledger: self.progress.clone(),
-                    });
+                    self.emit_progress();
                     let scope_line = if files.is_empty() {
                         String::new()
                     } else {
@@ -6094,9 +6085,7 @@ impl AgentHarness for Drive<'_> {
                     // an executed tool would. It is still bounded by the
                     // recovery budget below.
                     self.progress.note_progress(model_steps);
-                    (self.observer)(AgentEvent::ProgressUpdated {
-                        ledger: self.progress.clone(),
-                    });
+                    self.emit_progress();
                 }
                 self.goal_gate_recovery_rounds = self.goal_gate_recovery_rounds.saturating_add(1);
                 // A nested goal drive (a host-built sub-goal) has the same
@@ -6114,9 +6103,7 @@ impl AgentHarness for Drive<'_> {
                 }
             } else {
                 self.progress.note_no_progress_round(model_steps);
-                (self.observer)(AgentEvent::ProgressUpdated {
-                    ledger: self.progress.clone(),
-                });
+                self.emit_progress();
                 if self
                     .progress
                     .should_hard_stop_no_progress(self.progress_caps)
