@@ -88,9 +88,11 @@ impl LocalSocketServer {
     pub async fn serve(mut self, shutdown: CancellationToken) -> Result<(), TransportError> {
         let child_shutdown = shutdown.child_token();
         let mut tasks = tokio::task::JoinSet::new();
+        let mut reap = super::connection_reaper();
         let result = loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break Ok(()),
+                _ = reap.tick() => super::reap_finished_connections(&mut tasks),
                 accepted = self.listener.connect() => {
                     if let Err(error) = accepted { break Err(error.into()); }
                     // Replace before dispatch: the pipe namespace and ownership
@@ -112,6 +114,7 @@ impl LocalSocketServer {
                             tracing::debug!(%error, "local pipe connection ended");
                         }
                     });
+                    super::reap_finished_connections(&mut tasks);
                 }
             }
         };

@@ -1032,8 +1032,6 @@ mod transport {
         }
     }
 
-    /// A bound local runtime server.
-    #[cfg(unix)]
     /// A completed connection task keeps its whole future allocation — for a
     /// snapshot that is several kilobytes — until it is joined. A resident
     /// daemon serves one request per connection, so a `JoinSet` that is only
@@ -1049,6 +1047,8 @@ mod transport {
         while tasks.try_join_next().is_some() {}
     }
 
+    /// A bound local runtime server.
+    #[cfg(unix)]
     pub struct LocalSocketServer {
         path: PathBuf,
         socket_device: u64,
