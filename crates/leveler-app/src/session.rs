@@ -245,11 +245,13 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             stop,
             model_steps,
             modified_files,
+            transcript_ordinal,
         } => AgentEvent::DeliveryCommitted {
             text,
             stop,
             model_steps,
             modified_files,
+            transcript_ordinal,
         },
         EngineEvent::RunFinished { text } => AgentEvent::Finished(text),
         // Engine lifecycle & strategy events: persisted; engine-aware
@@ -1280,6 +1282,7 @@ mod tests {
                 stop: leveler_lifecycle::StopReason::Completed,
                 model_steps: 3,
                 modified_files: vec!["src/main.rs".into()],
+                transcript_ordinal: Some(7),
             },
             &mut observer,
         );
@@ -1292,7 +1295,7 @@ mod tests {
         assert_eq!(events.len(), 2, "delivery fact must reach the CLI observer");
         assert!(matches!(
             &events[0],
-            AgentEvent::DeliveryCommitted { text, stop, model_steps, modified_files }
+            AgentEvent::DeliveryCommitted { text, stop, model_steps, modified_files, .. }
             if text == "Verified answer"
                 && *stop == leveler_lifecycle::StopReason::Completed
                 && *model_steps == 3

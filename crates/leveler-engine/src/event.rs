@@ -683,6 +683,12 @@ pub enum EngineEvent {
         model_steps: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modified_files: Vec<String>,
+        /// The session transcript boundary (exclusive next ordinal) at which
+        /// the accepted answer sits. It binds the delivery to the exact
+        /// message prefix instead of comparing answer text; `None` on rows
+        /// written before the binding existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_ordinal: Option<u64>,
     },
 
     // ── kernel: approvals / clarifications ──────────────────────────────

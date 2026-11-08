@@ -347,6 +347,11 @@ pub enum AgentEvent {
         stop: StopReason,
         model_steps: u32,
         modified_files: Vec<String>,
+        /// The turn's transcript boundary (exclusive next ordinal) when the
+        /// delivery was accepted. It binds the answer to the exact message
+        /// prefix the model produced, so recovery never has to compare answer
+        /// text. `None` on rows written before the binding existed.
+        transcript_ordinal: Option<u64>,
     },
     /// The loop finished with a final answer.
     Finished(String),

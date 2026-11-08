@@ -279,6 +279,7 @@ impl Executor {
         {
             return Err(AdmitError::Fatal(error.into()));
         }
+        leveler_core::test_crash::point("after_tool_started_durable");
         let mut pending_always: Option<PendingStandingGrant> = None;
         let mut resolved = match self
             .authorize_with_cancellation(

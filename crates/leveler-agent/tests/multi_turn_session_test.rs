@@ -1578,6 +1578,14 @@ impl leveler_storage::MessageStore for CountingMessageStore {
             .await
     }
 
+    async fn load_for_turn(
+        &self,
+        session_id: &leveler_core::SessionId,
+        turn_id: &leveler_core::TurnId,
+    ) -> Result<Vec<String>, leveler_storage::StorageError> {
+        self.inner.load_for_turn(session_id, turn_id).await
+    }
+
     async fn ensure_initiating_message_owned(
         &self,
         token: &leveler_core::OwnershipToken,

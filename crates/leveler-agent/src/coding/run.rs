@@ -5,20 +5,23 @@
 //! decisions here — what a Coding task IS, when it is concluded, what gets
 //! verified, whether a reviewer runs — belong to the domain and live here.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_core::{SessionId, TurnId};
+use leveler_core::{SessionId, ToolCallId, TurnId};
 use leveler_engine::{
     EngineError, EngineEvent, EventLog, ExecutionKind, TaskEngine, TaskOutcome, TurnKind,
     TurnRunner,
 };
 use leveler_execution::{Approver, Clarifier, PermissionProfile};
 use leveler_lifecycle::{AgentState, PlanState, ProgressLedger, SessionStatus, StopReason};
-use leveler_model::{ContentPart, Message, Role, RuntimeNoticeKind, TranscriptOrigin};
+use leveler_model::{
+    ContentPart, Message, Role, RuntimeNoticeKind, ToolCall, ToolResultContent, TranscriptOrigin,
+};
 #[cfg(test)]
 use leveler_storage::EventStore;
 
@@ -122,6 +125,9 @@ struct UncommittedDelivery {
     stop: StopReason,
     model_steps: u32,
     modified_files: Vec<String>,
+    /// The transcript boundary (exclusive next ordinal) the accepted answer
+    /// belongs to. `None` on deliveries written before the binding existed.
+    transcript_ordinal: Option<u64>,
     /// The delivery's turn has no `TurnFinished`: the crash hit inside the
     /// turn's own terminal commit, so recovery must close that turn first.
     /// Otherwise only the task terminal is missing.
@@ -1838,6 +1844,9 @@ impl CodingRuntime {
                 .finish_task(token, session_id, terminal, observer)
                 .await;
         }
+        if settled.is_ok() {
+            leveler_core::test_crash::point("after_task_terminal");
+        }
         if let Some(started) = publishing_phase {
             tracing::debug!(
                 session = %session_id,
@@ -2116,8 +2125,9 @@ impl CodingRuntime {
         // had just been given. Nothing goal-scoped is loaded: a Chat turn owns
         // no goal at start.
         // A chat turn tolerates the odd unreadable legacy row (it only loses
-        // context), unlike resume which must reconstruct exactly.
-        let raw = self.load_request_transcript(session_id, None, None).await?;
+        // context), unlike resume which must reconstruct exactly. The load
+        // happens after crash reconciliation so reconstructed results are in
+        // the context of this very turn.
         let token = self
             .engine
             .start_task(
@@ -2135,6 +2145,11 @@ impl CodingRuntime {
             session_id.clone(),
             token.clone(),
         );
+        // A finished tool whose transcript row was lost is reconstructed from
+        // the durable event before the context is loaded; a transcript result
+        // whose finished event was lost closes the event plane.
+        self.reconcile_event_transcript(&token, session_id, &log, observer)
+            .await?;
         // Reconcile the crash window before continuing — the interactive path
         // is how a crashed session normally gets reopened (TUI/Web), and a
         // dangling call means the workspace may already carry a side effect
@@ -2143,6 +2158,7 @@ impl CodingRuntime {
         // acknowledgement.
         self.recover_crash_window(&log, observer, &cancellation)
             .await?;
+        let raw = self.load_request_transcript(session_id, None, None).await?;
         // Long-goal P3: over the fold threshold the continuation runs from a
         // durable checkpoint (fresh existing one, or one cut right here)
         // instead of replayed old history. Under the threshold — or with no
@@ -2420,7 +2436,8 @@ impl CodingRuntime {
     async fn uncommitted_delivery(
         &self,
         session_id: &SessionId,
-        goal_id: &leveler_core::GoalId,
+        expected_goal: Option<&leveler_core::GoalId>,
+        allow_committed: bool,
     ) -> Result<Option<UncommittedDelivery>, EngineError> {
         let rows = self.engine.stores.events.load(session_id).await?;
         let Some(at) = rows
@@ -2431,10 +2448,13 @@ impl CodingRuntime {
         };
         let delivery = &rows[at];
         // A task terminal after the delivery means the delivery was already
-        // committed; there is nothing left to recover.
-        if rows[at + 1..]
-            .iter()
-            .any(|row| row.event_type == "task_finished")
+        // committed. Recovery normally has nothing left to do, but a client
+        // that missed the final frame may still ask: `allow_committed` reads
+        // the same delivery back for replay without appending anything.
+        if !allow_committed
+            && rows[at + 1..]
+                .iter()
+                .any(|row| row.event_type == "task_finished")
         {
             return Ok(None);
         }
@@ -2443,11 +2463,19 @@ impl CodingRuntime {
             stop,
             model_steps,
             modified_files,
+            transcript_ordinal,
         } = EngineEvent::from_payload(&delivery.payload)?
         else {
             return Ok(None);
         };
-        if text.trim().is_empty() || !matches!(stop, StopReason::Completed | StopReason::Blocked) {
+        // Goal deliveries end Completed or Blocked; an ordinary Chat answer is
+        // Answered. Anything else is not a formal delivery and must not be
+        // recovered as one (DEL-07).
+        let stop_is_delivery = match expected_goal {
+            Some(_) => matches!(stop, StopReason::Completed | StopReason::Blocked),
+            None => matches!(stop, StopReason::Answered),
+        };
+        if text.trim().is_empty() || !stop_is_delivery {
             return Ok(None);
         }
         let Some(turn_id) = delivery.turn_id.as_deref() else {
@@ -2477,7 +2505,7 @@ impl CodingRuntime {
         let Ok(lineage) = leveler_engine::decode_turn_continuation(payload) else {
             return Ok(None);
         };
-        if lineage.goal_id.as_ref() != Some(goal_id) {
+        if lineage.goal_id.as_ref() != expected_goal {
             return Ok(None);
         }
         // Two crash cuts share this record: after the turn terminal (only the
@@ -2553,9 +2581,40 @@ impl CodingRuntime {
             stop,
             model_steps,
             modified_files,
+            transcript_ordinal,
             turn_open,
             review,
         }))
+    }
+
+    /// The delivery of the newest Chat turn when both terminals are already
+    /// durable. A resume with no new instruction must not re-drive the model
+    /// for an answer the harness already accepted; it replays that answer so
+    /// a client that missed the final frame can still receive it.
+    async fn committed_chat_delivery(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<UncommittedDelivery>, EngineError> {
+        let Some(delivery) = self.uncommitted_delivery(session_id, None, true).await? else {
+            return Ok(None);
+        };
+        if delivery.turn_open {
+            return Ok(None);
+        }
+        let rows = self.engine.stores.events.load(session_id).await?;
+        let Some(at) = rows
+            .iter()
+            .rposition(|row| row.event_type == "delivery_committed")
+        else {
+            return Ok(None);
+        };
+        if !rows[at + 1..]
+            .iter()
+            .any(|row| row.event_type == "task_finished")
+        {
+            return Ok(None);
+        }
+        Ok(Some(delivery))
     }
 
     /// Close the delivery turn a crash left open, before its task terminal.
@@ -2755,6 +2814,41 @@ impl CodingRuntime {
         if lineage_was_chat && (lineage.goal_id.is_some() || (goal_axis && pending.is_some())) {
             lineage.kind = ResumeTurnKind::Goal;
         }
+        let asks_for_new_work = instruction.as_ref().is_some_and(|message| {
+            !is_bare_legacy_continuation(message)
+                || message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, leveler_model::ContentPart::Image { .. }))
+        });
+        // A fully committed Chat delivery is replayed, not regenerated. This
+        // is the D6 cut: the task terminal is durable but the client may not
+        // have received the final frame. Taking a new ownership or starting a
+        // turn here would both re-drive the model and make the answer a
+        // transaction side effect.
+        if !asks_for_new_work
+            && lineage.goal_id.is_none()
+            && matches!(lineage.kind, ResumeTurnKind::Chat)
+            && let Some(delivery) = self.committed_chat_delivery(session_id).await?
+        {
+            observer(EngineEvent::DeliveryCommitted {
+                text: delivery.text.clone(),
+                stop: delivery.stop,
+                model_steps: delivery.model_steps,
+                modified_files: delivery.modified_files.clone(),
+                transcript_ordinal: delivery.transcript_ordinal,
+            });
+            observer(EngineEvent::RunFinished {
+                text: delivery.text.clone(),
+            });
+            return Ok(TaskReport::new(
+                TaskOutcome::Completed,
+                delivery.text,
+                delivery.modified_files,
+                delivery.stop,
+                delivery.model_steps,
+            ));
+        }
         let token = self
             .engine
             .mark_running(session_id, AgentState::Execute)
@@ -2835,17 +2929,12 @@ impl CodingRuntime {
         // is already the answer the user is owed. A resume that carries a new
         // instruction asks for new work, so only a bare continuation (or no
         // instruction at all) recovers the recorded answer.
-        let asks_for_new_work = instruction.as_ref().is_some_and(|message| {
-            !is_bare_legacy_continuation(message)
-                || message
-                    .content
-                    .iter()
-                    .any(|part| matches!(part, leveler_model::ContentPart::Image { .. }))
-        });
         if pending.is_none()
             && !asks_for_new_work
             && let Some(goal_id) = lineage.goal_id.clone()
-            && let Some(delivery) = self.uncommitted_delivery(session_id, &goal_id).await?
+            && let Some(delivery) = self
+                .uncommitted_delivery(session_id, Some(&goal_id), false)
+                .await?
         {
             tracing::info!(
                 %session_id,
@@ -2861,6 +2950,7 @@ impl CodingRuntime {
                 stop: delivery.stop,
                 model_steps: delivery.model_steps,
                 modified_files: delivery.modified_files.clone(),
+                transcript_ordinal: delivery.transcript_ordinal,
             });
             observer(EngineEvent::RunFinished {
                 text: delivery.text.clone(),
@@ -2902,6 +2992,55 @@ impl CodingRuntime {
                 session_id,
                 &result,
                 Some(&goal_id),
+                spec.coding.repository.as_deref(),
+                observer,
+                &cancellation,
+            )
+            .await?;
+            return result;
+        }
+        // The same cut on an ordinary Chat turn. A Chat answer has no goal to
+        // bind the recovery to, so the turn identity and the durable delivery
+        // are the whole evidence. Replay that answer and commit the missing
+        // terminals; never ask the model for a second one.
+        if pending.is_none()
+            && !asks_for_new_work
+            && lineage.goal_id.is_none()
+            && matches!(lineage.kind, ResumeTurnKind::Chat)
+            && let Some(delivery) = self.uncommitted_delivery(session_id, None, false).await?
+        {
+            tracing::info!(
+                %session_id,
+                turn = %delivery.turn_id.as_str(),
+                "recovering the Chat delivery the crashed terminal commit never published"
+            );
+            observer(EngineEvent::DeliveryCommitted {
+                text: delivery.text.clone(),
+                stop: delivery.stop,
+                model_steps: delivery.model_steps,
+                modified_files: delivery.modified_files.clone(),
+                transcript_ordinal: delivery.transcript_ordinal,
+            });
+            observer(EngineEvent::RunFinished {
+                text: delivery.text.clone(),
+            });
+            if delivery.turn_open {
+                self.close_recovered_turn(&token, session_id, &delivery, observer)
+                    .await?;
+            }
+            let report = TaskReport::new(
+                TaskOutcome::Completed,
+                delivery.text,
+                delivery.modified_files,
+                delivery.stop,
+                delivery.model_steps,
+            );
+            let result = Ok(report);
+            self.finish_from_result(
+                &token,
+                session_id,
+                &result,
+                None,
                 spec.coding.repository.as_deref(),
                 observer,
                 &cancellation,
@@ -2993,6 +3132,12 @@ impl CodingRuntime {
         {
             observer(event);
         }
+        // Event/transcript consistency before the model context is loaded:
+        // a tool result whose `ToolCallFinished` is durable must not be lost
+        // from the resumed conversation, and a transcript result must not look
+        // dangling. This appends only reconstructed facts (never runs a tool).
+        self.reconcile_event_transcript(&token, session_id, &log, observer)
+            .await?;
         let raw = self
             .load_request_transcript(session_id, Some("transcript"), checkpoint_scope.as_ref())
             .await?;
@@ -3279,6 +3424,267 @@ impl CodingRuntime {
                 call_id: call.call_id,
                 tool: call.name,
             });
+        }
+        Ok(())
+    }
+
+    /// Reconcile the event plane with the transcript plane before a resume
+    /// loads the model context.
+    ///
+    /// The fatal F-05 window is `ToolCallFinished` durable, transcript batch
+    /// not: the tool may already have had a side effect, but the model has
+    /// seen no result, so a resume that only checks "dangling" calls misses it
+    /// and can repeat the effect. This compares the turn's durable call
+    /// identities with the tool results actually written for that turn:
+    ///
+    /// - a finished call with no transcript result gets a recovered
+    ///   assistant/tool exchange built from the durable event, with an
+    ///   explicit note that the effect may have happened and the output may be
+    ///   truncated;
+    /// - a started call whose result IS in the transcript but whose
+    ///   `ToolCallFinished` never committed gets that event appended, so the
+    ///   dangling check does not demand confirmation for a known result.
+    ///
+    /// Call ids can repeat across rounds (providers do not promise uniqueness),
+    /// so calls are paired FIFO and compared by occurrence count, not by set
+    /// membership. Nothing here executes a tool or asks the model anything.
+    async fn reconcile_event_transcript(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+        log: &EventLog<'_>,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+    ) -> Result<(), EngineError> {
+        struct Started {
+            call_id: String,
+            name: String,
+            arguments: serde_json::Value,
+            model_step: u32,
+            sequence: i64,
+        }
+        struct Finished {
+            call_id: String,
+            name: String,
+            is_error: bool,
+            preview: String,
+        }
+        let turns = self
+            .engine
+            .stores
+            .turns
+            .list_for_session(session_id)
+            .await?;
+        let Some(turn) = turns
+            .iter()
+            .rev()
+            .find(|turn| turn.status == "running" || turn.status == "interrupted")
+        else {
+            return Ok(());
+        };
+        let turn_id = TurnId::new(turn.id.clone());
+        let rows = self.engine.stores.events.load(session_id).await?;
+        let mut started: Vec<Started> = Vec::new();
+        let mut finished: Vec<Finished> = Vec::new();
+        for row in rows
+            .iter()
+            .filter(|row| row.turn_id.as_deref() == Some(turn.id.as_str()))
+        {
+            match EngineEvent::from_payload(&row.payload) {
+                // Delegated calls have their own transcript path; the parent
+                // turn's messages are the subject here.
+                Ok(EngineEvent::ToolCallStarted {
+                    call_id,
+                    name,
+                    arguments,
+                    model_step,
+                    agent_id: None,
+                    ..
+                }) => started.push(Started {
+                    call_id,
+                    name,
+                    arguments: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
+                    model_step: model_step.unwrap_or(0),
+                    sequence: row.sequence,
+                }),
+                Ok(EngineEvent::ToolCallFinished {
+                    call_id,
+                    name,
+                    is_error,
+                    preview,
+                    agent_id: None,
+                    ..
+                }) => finished.push(Finished {
+                    call_id,
+                    name,
+                    is_error,
+                    preview,
+                }),
+                _ => {}
+            }
+        }
+        let payloads = self
+            .engine
+            .stores
+            .messages
+            .load_for_turn(session_id, &turn_id)
+            .await?;
+        let mut actual: Vec<(String, String, bool)> = Vec::new();
+        for payload in &payloads {
+            let Ok(message) = serde_json::from_str::<Message>(payload) else {
+                continue;
+            };
+            for part in message.content {
+                if let ContentPart::ToolResult { result } = part {
+                    actual.push((
+                        result.call_id.as_str().to_string(),
+                        result.content,
+                        result.is_error,
+                    ));
+                }
+            }
+        }
+        // FIFO pairing: the oldest unmatched started call owns each finished
+        // result. Multiple rounds may reuse one provider id; order is stable.
+        let mut used = vec![false; started.len()];
+        let mut paired: Vec<(usize, &Finished)> = Vec::new();
+        for call in &finished {
+            if let Some(index) = started.iter().enumerate().position(|(index, start)| {
+                !used[index] && start.call_id == call.call_id && start.name == call.name
+            }) {
+                used[index] = true;
+                paired.push((index, call));
+            }
+        }
+        let mut actual_counts: HashMap<&str, usize> = HashMap::new();
+        for (call_id, _, _) in &actual {
+            *actual_counts.entry(call_id.as_str()).or_default() += 1;
+        }
+        let mut expected_counts: HashMap<&str, usize> = HashMap::new();
+        let mut missing: Vec<(usize, &Finished)> = Vec::new();
+        for (index, call) in &paired {
+            let seen = expected_counts.entry(call.call_id.as_str()).or_default();
+            *seen += 1;
+            if actual_counts
+                .get(call.call_id.as_str())
+                .copied()
+                .unwrap_or(0)
+                < *seen
+            {
+                missing.push((*index, call));
+            }
+        }
+        // Reconstruct each missing call in its own round, in call order. Only
+        // the missing calls are written, so an already-persisted round is
+        // never duplicated.
+        missing.sort_by_key(|(index, _)| (started[*index].model_step, started[*index].sequence));
+        let mut groups: Vec<Vec<(usize, &Finished)>> = Vec::new();
+        for item in missing {
+            match groups.last_mut() {
+                Some(group) if started[group[0].0].model_step == started[item.0].model_step => {
+                    group.push(item);
+                }
+                _ => groups.push(vec![item]),
+            }
+        }
+        for group in groups {
+            let assistant = Message {
+                role: Role::Assistant,
+                content: group
+                    .iter()
+                    .map(|(index, _)| ContentPart::ToolCall {
+                        call: ToolCall {
+                            id: ToolCallId::new(started[*index].call_id.clone()),
+                            name: started[*index].name.clone(),
+                            arguments: started[*index].arguments.clone(),
+                        },
+                    })
+                    .collect(),
+                origin: None,
+                route: None,
+            };
+            let tool = Message {
+                role: Role::Tool,
+                content: group
+                    .iter()
+                    .map(|(index, call)| {
+                        let has_output = !call.preview.trim().is_empty();
+                        let content = if has_output {
+                            format!(
+                                "[recovery] this tool finished but its transcript result was lost \
+                                 in an unclean exit. The effect may already have happened; do not \
+                                 run it again only to recover the output. Recorded output \
+                                 (possibly truncated):\n{}",
+                                call.preview
+                            )
+                        } else {
+                            "[recovery] this tool finished but its transcript result was lost in \
+                             an unclean exit and no output was recorded. The effect may already \
+                             have happened; its real outcome is unknown. Check the workspace \
+                             before repeating a side-effecting call."
+                                .to_string()
+                        };
+                        ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: ToolCallId::new(started[*index].call_id.clone()),
+                                content,
+                                // An empty recording is an unknown result, never a success.
+                                is_error: call.is_error || !has_output,
+                            },
+                        }
+                    })
+                    .collect(),
+                origin: None,
+                route: None,
+            };
+            let payloads = [
+                serde_json::to_string(&assistant).map_err(|error| {
+                    EngineError::Corrupt(format!("could not encode a recovered tool call: {error}"))
+                })?,
+                serde_json::to_string(&tool).map_err(|error| {
+                    EngineError::Corrupt(format!(
+                        "could not encode a recovered tool result: {error}"
+                    ))
+                })?,
+            ];
+            self.engine
+                .stores
+                .messages
+                .append_in_turn_owned(token, session_id, &turn_id, &payloads, leveler_core::now())
+                .await
+                .map_err(|error| {
+                    EngineError::Corrupt(format!(
+                        "could not persist the recovered tool exchange: {error}"
+                    ))
+                })?;
+        }
+        // Reverse relation: the transcript result is durable but the finished
+        // event never committed. Recording that event from the transcript is a
+        // mechanical fact, not a replay.
+        for (index, start) in started.iter().enumerate() {
+            if used[index] {
+                continue;
+            }
+            if finished.iter().any(|call| call.call_id == start.call_id) {
+                // An ambiguous duplicate id: leave it to the dangling check.
+                continue;
+            }
+            let Some((_, content, is_error)) = actual
+                .iter()
+                .find(|(call_id, _, _)| call_id == &start.call_id)
+            else {
+                continue;
+            };
+            let event = EngineEvent::ToolCallFinished {
+                call_id: start.call_id.clone(),
+                name: start.name.clone(),
+                is_error: *is_error,
+                preview: content.chars().take(2_000).collect(),
+                agent_id: None,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            };
+            log.append(Some(&turn_id), event, observer).await?;
         }
         Ok(())
     }

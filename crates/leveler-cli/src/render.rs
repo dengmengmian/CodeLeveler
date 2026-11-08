@@ -338,12 +338,14 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             stop,
             model_steps,
             modified_files,
+            transcript_ordinal,
         } => serde_json::json!({
             "type": "delivery_committed",
             "text": text,
             "stop": stop,
             "model_steps": model_steps,
             "modified_files": modified_files,
+            "transcript_ordinal": transcript_ordinal,
         }),
         AgentEvent::ToolCall {
             id,
@@ -531,6 +533,7 @@ mod jsonl_tests {
                 stop: leveler_lifecycle::StopReason::Completed,
                 model_steps: 3,
                 modified_files: vec!["src/main.rs".into()],
+                transcript_ordinal: Some(7),
             })
             .expect("headless delivery event");
         let line = event_jsonl(event);

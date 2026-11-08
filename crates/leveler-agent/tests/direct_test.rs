@@ -547,6 +547,14 @@ impl leveler_storage::MessageStore for FailingMessages {
         Ok(Vec::new())
     }
 
+    async fn load_for_turn(
+        &self,
+        _: &leveler_core::SessionId,
+        _: &leveler_core::TurnId,
+    ) -> Result<Vec<String>, leveler_storage::StorageError> {
+        Ok(Vec::new())
+    }
+
     async fn append_in_turn_owned(
         &self,
         _: &leveler_core::OwnershipToken,
