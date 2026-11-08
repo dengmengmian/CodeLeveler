@@ -363,6 +363,29 @@ impl<'a> MessageRepository<'a> {
                 .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
             return Ok(false);
         }
+        // F-24: a `/compact` epoch cut removes the transcript row but must not
+        // make the reaper restore it. The input journal is the durable proof
+        // that this turn's initiating input was already admitted AND projected
+        // (the consume transaction inserts the row and marks the journal in one
+        // commit). If it is consumed, a missing row can only mean an epoch cut,
+        // so re-inserting would resurrect history the user compacted and break
+        // the summary-only epoch. Legacy turns with no journal row keep the
+        // old repair behavior.
+        let consumed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM session_inputs \
+             WHERE session_id = ?1 AND turn_id = ?2 AND state = 'consumed')",
+        )
+        .bind(session_id.as_str())
+        .bind(turn_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+        if consumed {
+            tx.commit()
+                .await
+                .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
+            return Ok(false);
+        }
         let next: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
         )
