@@ -695,7 +695,7 @@ fn mcp_map(
 
 /// Never let a credential reach a log line, a notification or an error body.
 fn redact(message: &str) -> String {
-    leveler_core::redact_secrets(message)
+    leveler_core::sanitize_model_visible(message).0
 }
 
 #[cfg(test)]
