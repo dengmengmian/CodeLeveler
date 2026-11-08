@@ -722,6 +722,34 @@ impl BackgroundTaskRegistry {
         crate::execution_host::ExecutionHostClient::connect(config).await
     }
 
+    /// Settle one terminal hosted record, but only when its exit is proven.
+    ///
+    /// `Unknown` is terminal, not proof: a lost host that could still own the
+    /// workload must keep its write reservation. Only the host's own exit fact
+    /// or recovery's `Gone` evidence authorizes the one-time diff, and a
+    /// recovery-proven exit carries the loss note instead of pretending it was
+    /// observed at process exit.
+    async fn settle_hosted_terminal(&self, task_id: &str) -> Result<bool, String> {
+        let config = self
+            .execution_host
+            .as_ref()
+            .ok_or("persistent execution is not configured")?;
+        let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
+        let Some(record) = records.task(task_id) else {
+            return Ok(false);
+        };
+        if !record.settlement_proven() {
+            return Ok(false);
+        }
+        let journal = self.journal()?;
+        if record.loss.is_some() {
+            journal.reconcile_lost(task_id).await?;
+        } else {
+            journal.reconcile(task_id).await?;
+        }
+        Ok(true)
+    }
+
     /// Reconcile process facts without launching a new host.
     ///
     /// A terminal record is settled only when its exit is proven: either the
@@ -921,7 +949,13 @@ impl BackgroundTaskRegistry {
             if let Some(client) = probe.client {
                 for mut task in client.list().await? {
                     if task.settlement_proven() {
-                        match self.journal()?.reconcile(&task.snapshot.id).await {
+                        let journal = self.journal()?;
+                        let settled = if task.loss.is_some() {
+                            journal.reconcile_lost(&task.snapshot.id).await
+                        } else {
+                            journal.reconcile(&task.snapshot.id).await
+                        };
+                        match settled {
                             Ok(_) => {
                                 client
                                     .acknowledge(
@@ -2201,13 +2235,19 @@ impl BackgroundTaskRegistry {
                 client.get_owned(id, owner).await?
             };
             if task.status.is_terminal() {
-                match self.journal()?.reconcile(id).await {
-                    Ok(_) => {
+                match self.settle_hosted_terminal(id).await {
+                    Ok(true) => {
                         if unrestricted {
                             client.acknowledge_unrestricted(id).await?;
                         } else {
                             client.acknowledge(id, owner).await?;
                         };
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            task = %id,
+                            "terminal hosted fact is not proven; write reservation retained"
+                        );
                     }
                     Err(error) if reconciliation_in_progress(&error) => {
                         tracing::debug!(
@@ -3040,11 +3080,17 @@ impl BackgroundTaskRegistry {
                 None => client.kill_unrestricted(id).await?,
             };
             if task.status.is_terminal() {
-                match self.journal()?.reconcile(id).await {
-                    Ok(_) => match owner {
+                match self.settle_hosted_terminal(id).await {
+                    Ok(true) => match owner {
                         Some(owner) => client.acknowledge(id, owner).await?,
                         None => client.acknowledge_unrestricted(id).await?,
                     },
+                    Ok(false) => {
+                        tracing::warn!(
+                            task = %id,
+                            "stop fact is not a proven exit; write reservation retained"
+                        );
+                    }
                     Err(error) if reconciliation_in_progress(&error) => {
                         tracing::debug!(
                             task = %id,

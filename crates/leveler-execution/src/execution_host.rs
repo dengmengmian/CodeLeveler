@@ -730,8 +730,12 @@ fn recover_dead_host(config: &ExecutionHostConfig) -> Result<Option<HostRecovery
         task.snapshot.status = BackgroundTaskStatus::Unknown;
         task.snapshot.duration_ms = observed_at_ms.saturating_sub(task.started_at_ms);
         task.finished_at_ms = Some(observed_at_ms);
-        // No exit was observed, so there is no completion to keep — and a
-        // previously written record would be a fabrication if it survived.
+        // No completion was committed, so no exit fact may survive the
+        // convergence. A partially observed code or signal in a Running record
+        // is not a terminal truth: the CompletionRecord is the commit point,
+        // and presenting a code beside `Unknown` would invent one.
+        task.snapshot.exit_code = None;
+        task.snapshot.signal = None;
         task.result = None;
         task.loss = Some(TaskLoss {
             observed_at_ms,
@@ -828,30 +832,59 @@ impl ExecutionHostClient {
     /// state stays unknown. A ready file answered by its own metadata (for
     /// example an incompatible major) is never residue.
     pub async fn probe(config: &ExecutionHostConfig) -> Result<HostProbe, String> {
-        let ready_path = config.state_dir.join("ready.json");
-        if ready_path.exists() {
-            return match Self::connect_classified(config.clone()).await {
-                Ok(client) => Ok(HostProbe {
-                    client: Some(client),
-                    recovery: None,
-                }),
-                Err(ConnectFailure::Metadata(error)) => Err(error),
-                Err(ConnectFailure::Refused(error)) => match recover_dead_host(config)? {
-                    Some(recovery) => Ok(HostProbe {
-                        client: None,
-                        recovery: Some(recovery),
-                    }),
-                    None => Err(error),
-                },
-            };
+        // A refused endpoint may coincide with another reader's recovery pass.
+        // The lifecycle lock then makes our own attempt return "not mine to
+        // recover", which is not a read failure: wait for that owner to finish
+        // and re-read. This keeps the first observation after a host loss from
+        // surfacing a transient "unavailable" error to the user.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready_path = config.state_dir.join("ready.json");
+            if ready_path.exists() {
+                match Self::connect_classified(config.clone()).await {
+                    Ok(client) => {
+                        return Ok(HostProbe {
+                            client: Some(client),
+                            recovery: None,
+                        });
+                    }
+                    Err(ConnectFailure::Metadata(error)) => return Err(error),
+                    Err(ConnectFailure::Refused(error)) => {
+                        match recover_dead_host(config)? {
+                            Some(recovery) => {
+                                return Ok(HostProbe {
+                                    client: None,
+                                    recovery: Some(recovery),
+                                });
+                            }
+                            None if !ready_path.exists() => {
+                                // Another pass converged the residue while we
+                                // waited for the lock; the archive is now the
+                                // durable inventory.
+                                return Ok(HostProbe {
+                                    client: None,
+                                    recovery: None,
+                                });
+                            }
+                            None => {
+                                if tokio::time::Instant::now() >= deadline {
+                                    return Err(error);
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // No endpoint, but a crash before readiness (or a spawn that never
+            // recorded its fact) can still leave records no host will resolve.
+            let recovery = recover_dead_host(config)?;
+            return Ok(HostProbe {
+                client: None,
+                recovery,
+            });
         }
-        // No endpoint, but a crash before readiness (or a spawn that never
-        // recorded its fact) can still leave records no host will resolve.
-        let recovery = recover_dead_host(config)?;
-        Ok(HostProbe {
-            client: None,
-            recovery,
-        })
     }
     pub async fn connect(config: ExecutionHostConfig) -> Result<Self, String> {
         Self::connect_classified(config)
@@ -1321,6 +1354,39 @@ fn wall_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+/// Debug-build crash injection for the two non-atomic spawn windows and the
+/// exit window before the completion record is durable.
+///
+/// A test cannot time a host SIGKILL against an internal write reliably. In a
+/// debug build only, the host can be told to die at one exact point: the point
+/// name and a marker path must both be present, and the marker makes the
+/// injection one-shot so the replacement host in the same test survives. A
+/// release build does not contain these points at all.
+#[cfg(debug_assertions)]
+fn debug_fault(point: &str) {
+    if std::env::var("LEVELER_EXECUTION_HOST_FAULT").as_deref() != Ok(point) {
+        return;
+    }
+    let Some(marker) = std::env::var_os("LEVELER_EXECUTION_HOST_FAULT_MARKER") else {
+        return;
+    };
+    let marker = std::path::PathBuf::from(marker);
+    if marker.exists() || std::fs::write(&marker, point).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // A real, unwinding-free death: cleanup and the persistence loop must
+        // not get a chance to turn the injected window into a durable fact.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(std::process::id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    #[cfg(not(unix))]
+    std::process::abort();
+}
 struct Host {
     registry: BackgroundTaskRegistry,
     entries: Mutex<HashMap<String, Entry>>,
@@ -1389,6 +1455,15 @@ impl Host {
     async fn persisted_tasks(&self) -> Result<Vec<HostedTask>, String> {
         let _serialization = self.persistence.lock().await;
         let tasks = self.tasks().await?;
+        #[cfg(debug_assertions)]
+        if tasks.iter().any(|task| {
+            matches!(
+                task.snapshot.status,
+                BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
+            )
+        }) {
+            debug_fault("before-terminal-persist");
+        }
         atomic_json(&self.config.state_dir.join("tasks.json"), &tasks)?;
         Ok(tasks)
     }
@@ -1551,6 +1626,8 @@ impl Host {
                     started_at_ms,
                 });
                 atomic_json(&self.config.state_dir.join("intents.json"), &*intents)?;
+                #[cfg(debug_assertions)]
+                debug_fault("after-intent");
                 let local = match self
                     .registry
                     .spawn_with_origin(
@@ -1573,6 +1650,8 @@ impl Host {
                         return Ok(Reply::SpawnRejected(error));
                     }
                 };
+                #[cfg(debug_assertions)]
+                debug_fault("after-spawn");
                 entries.insert(
                     id.clone(),
                     Entry {
@@ -1883,11 +1962,16 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
                 event = events.recv() => match event {
                     Ok(event) => {
                         dirty = true;
+                        let exited = matches!(&event, crate::BackgroundTaskEvent::Exited { .. });
                         if matches!(
-                            event,
+                            &event,
                             crate::BackgroundTaskEvent::Started { .. }
                                 | crate::BackgroundTaskEvent::Exited { .. }
                         ) {
+                            #[cfg(debug_assertions)]
+                            if exited {
+                                debug_fault("after-exit-event");
+                            }
                             if let Err(e) = persistence.persist().await {
                                 tracing::error!("Execution Host persistence failed: {e}");
                             }
@@ -3016,6 +3100,132 @@ mod tests {
             !config.state_dir.join("ready.json").exists(),
             "residue of a provably dead host is not state"
         );
+    }
+
+    /// A record that never committed a completion has no terminal exit fact.
+    /// A partially observed code/signal must not survive beside `Unknown`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_clears_a_partial_exit_fact_it_did_not_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        let pid = exited_group_leader();
+        write_archive_tasks(&config, &[("host-partial", "Running", pid)]);
+        let path = config.state_dir.join("tasks.json");
+        let mut records: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        records[0]["snapshot"]["exit_code"] = serde_json::json!(3);
+        records[0]["snapshot"]["signal"] = serde_json::json!(15);
+        records[0]["result"] = serde_json::json!({
+            "result_id": "fabricated", "status": "Exited", "exit_code": 3,
+            "output_bytes": 0, "output_truncated": false, "completed_at_ms": 1
+        });
+        std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+
+        let probed = ExecutionHostClient::probe(&config).await.unwrap();
+        assert!(
+            probed.recovery.is_some(),
+            "the running record must converge"
+        );
+        let recovered: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(recovered[0]["snapshot"]["status"], "Unknown");
+        assert!(
+            recovered[0]["snapshot"]["exit_code"].is_null(),
+            "an uncommitted exit code must not survive: {recovered:?}"
+        );
+        assert!(
+            recovered[0]["snapshot"]["signal"].is_null(),
+            "an uncommitted signal must not survive: {recovered:?}"
+        );
+        assert!(
+            recovered[0]["result"].is_null(),
+            "a completion that was never committed must not survive: {recovered:?}"
+        );
+        assert_eq!(recovered[0]["loss"]["previous"], "Running");
+        assert_eq!(recovered[0]["loss"]["process"], "Gone");
+    }
+
+    /// Two readers can race the same recovery pass. A lock this reader cannot
+    /// take means another owner is converging the same residue, not that the
+    /// host is unreachable; every caller must still get a durable answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_probes_of_a_lost_host_all_converge() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        write_archive_tasks(&config, &[("host-raced", "Running", exited_group_leader())]);
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let config = config.clone();
+            readers.push(tokio::spawn(async move {
+                ExecutionHostClient::probe(&config).await
+            }));
+        }
+        let mut recovered = 0;
+        for reader in readers {
+            let probe = reader
+                .await
+                .unwrap()
+                .expect("a concurrent recovery pass is not a read failure");
+            assert!(probe.client.is_none());
+            recovered += usize::from(probe.recovery.is_some());
+        }
+        assert!(
+            recovered >= 1,
+            "at least one reader must converge the residue"
+        );
+        let records: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(config.state_dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert_eq!(records[0]["snapshot"]["status"], "Unknown");
+        assert!(!config.state_dir.join("ready.json").exists());
+    }
+
+    /// Boot recovery is linear in the number of historical records and stays
+    /// bounded at the scale a long-lived repository actually reaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_of_a_hundred_historical_records_stays_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        let records: Vec<serde_json::Value> = (0..100)
+            .map(|index| {
+                let id = format!("host-history-{index}");
+                let mut record = task_record(&config, &id, "Running", exited_group_leader());
+                record["started_at_ms"] = serde_json::json!(index);
+                record
+            })
+            .collect();
+        std::fs::write(
+            config.state_dir.join("tasks.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let probed = ExecutionHostClient::probe(&config).await.unwrap();
+        let elapsed = started.elapsed();
+        let recovery = probed.recovery.expect("the residue must be converged");
+        assert_eq!(recovery.tasks.len(), 100);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "100 historical records took {elapsed:?}"
+        );
+        let recovered: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(config.state_dir.join("tasks.json")).unwrap())
+                .unwrap();
+        assert!(
+            recovered
+                .iter()
+                .all(|record| record["snapshot"]["status"] == "Unknown"),
+            "every unproven historical record must converge"
+        );
+        eprintln!("PERF recovery_100_records_ms={}", elapsed.as_millis());
     }
 
     /// Each record is judged on its own evidence: one finished workload and one
