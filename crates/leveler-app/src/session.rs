@@ -39,7 +39,7 @@ fn goal_from_content(content: &[ContentPart]) -> String {
 /// the eval collectors (`run_in_session_bounded`, `eval_signals`). Never add
 /// a UI path through here: the mapping is deliberately lossy (engine-only
 /// facts return `None`).
-fn forward_engine_event(event: EngineEvent, observer: &mut (dyn FnMut(AgentEvent) + Send)) {
+pub fn forward_engine_event(event: EngineEvent, observer: &mut (dyn FnMut(AgentEvent) + Send)) {
     if let Some(agent_event) = engine_event_to_agent(event) {
         observer(agent_event);
     }
