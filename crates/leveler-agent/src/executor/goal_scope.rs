@@ -380,6 +380,20 @@ const WAIVER_GUARDS: &[&str] = &[
 /// A later user amendment may explicitly waive a requirement; that removal is
 /// the user's authority and is applied here. No model-authored text reaches
 /// this function — both inputs come from persisted user turns.
+/// Explicit replacement verbs. These are the user's own statement that the
+/// named earlier deliverable is being retired, not a guess: the verb must be
+/// present and the pre-verb clause must name a requirement the objective
+/// actually contributed. A plain addition has none of these, so it stays
+/// additive.
+const REPLACEMENT_MARKERS: &[&str] = &["改成", "改为", "改用", "替换为", "换成", "instead of"];
+
+fn split_replacement(text: &str) -> Option<(&str, &str)> {
+    REPLACEMENT_MARKERS.iter().find_map(|marker| {
+        text.find(marker)
+            .map(|position| (&text[..position], &text[position + marker.len()..]))
+    })
+}
+
 pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement> {
     let mut collected: Vec<(String, RequirementKind, RequirementSource, Option<String>)> =
         Vec::new();
@@ -387,6 +401,32 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
 
     let mut tests_demanded = test_demanded(objective);
     for amendment in amendments {
+        // An explicit replacement retires the earlier deliverable named before
+        // the verb. The durable amendment keeps its full text for history; only
+        // this projection treats the pre-verb clause as the replaced scope.
+        // If no existing requirement is named, nothing is removed and the whole
+        // amendment is processed normally — no free-floating deletion.
+        let mut effective_amendment = amendment.as_str();
+        let mut replaced_tests = false;
+        if let Some((replaced, rest)) = split_replacement(amendment) {
+            let mut removed = false;
+            for clause in replaced.split([',', '，', '。', ';', '；']) {
+                if clause.trim().is_empty() {
+                    continue;
+                }
+                let before = collected.len();
+                collected.retain(|(text, _, _, _)| !mentioned(text, clause));
+                removed |= collected.len() < before;
+            }
+            if removed || mentions_tests(replaced) {
+                if mentions_tests(replaced) {
+                    tests_demanded = false;
+                    replaced_tests = true;
+                }
+                effective_amendment = rest;
+            }
+        }
+        let amendment = effective_amendment;
         // A question is not a scope instruction by itself. "测试通过了吗？" asks
         // about the work; reading it as a NEW test demand would let a status
         // question change the acceptance the paused goal must still satisfy.
@@ -442,12 +482,12 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
             .chain(asked)
             .collect::<Vec<_>>()
             .join("\n");
-        if test_demanded(&kept) {
+        if test_demanded(&kept) && !replaced_tests {
             tests_demanded = true;
         }
         collect_segments(
             &kept,
-            &RequirementSource::Amendment(amendment.clone()),
+            &RequirementSource::Amendment(amendment.to_string()),
             &mut collected,
         );
     }
@@ -5207,5 +5247,67 @@ mod tests {
                 "the user's own phrase must always be an acceptable check: {phrase}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod effective_acceptance_tests {
+    use super::*;
+
+    fn texts(requirements: &[Requirement]) -> Vec<String> {
+        requirements.iter().map(|r| r.text.clone()).collect()
+    }
+
+    #[test]
+    fn an_explicit_replacement_retires_the_old_deliverable() {
+        let requirements = extract(
+            "创建 config.yaml、setup.py，完成配置功能。",
+            &["config.yaml 改用环境变量完成。".to_string()],
+        );
+        let found = texts(&requirements);
+        assert!(
+            !found.iter().any(|text| text.contains("config.yaml")),
+            "the replaced deliverable must not remain in the gate: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_addition_keeps_the_original_deliverable() {
+        let requirements = extract(
+            "创建 config.yaml、setup.py，完成配置功能。",
+            &["补充错误处理和日志。".to_string()],
+        );
+        let found = texts(&requirements);
+        assert!(
+            found.iter().any(|text| text.contains("config.yaml")),
+            "an addition must not retire the original: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_without_a_named_target_changes_nothing() {
+        let requirements = extract(
+            "创建 config.yaml、setup.py，完成配置功能。",
+            &["改用环境变量完成。".to_string()],
+        );
+        let found = texts(&requirements);
+        assert!(
+            found.iter().any(|text| text.contains("config.yaml")),
+            "without a named target the runtime must not guess: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_test_replacement_retires_the_test_requirement() {
+        let requirements = extract(
+            "实现全部接口并通过测试。",
+            &["测试改用静态检查，不再跑测试。".to_string()],
+        );
+        assert!(
+            !requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "{requirements:?}"
+        );
     }
 }
