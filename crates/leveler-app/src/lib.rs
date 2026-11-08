@@ -53,6 +53,7 @@ pub use interactive::ui_thinking_state;
 pub use parallel::ParallelEditOutcome;
 pub use runtime_identity::{RuntimeIdentityError, load_or_create_runtime_id};
 pub use session::engine_event_to_agent;
+pub use session::forward_engine_event;
 pub use vcs::ShipOptions;
 
 use std::sync::{Arc, OnceLock};

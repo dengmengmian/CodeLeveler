@@ -1892,13 +1892,20 @@ fn format_resumable_hint(sessions: &[(String, String, String)]) -> Option<String
 pub(crate) async fn cmd_run_resume(
     layout: Layout,
     id: String,
+    instruction: Option<String>,
     mode: Option<RunMode>,
     auto_approve: bool,
     confirm_recovery: bool,
     output: OutputFormat,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Resume reloads collaboration and active capabilities from durable state.
-    let app = Application::assemble(layout)?;
+    let mut app = Application::assemble(layout)?;
+    // The same eval-only seams a fresh `run` reads must apply to the resumed
+    // turn; otherwise the resumed session runs under a different context
+    // policy than the run that produced it. Production env is unset.
+    if let Some(overrides) = eval_env_overrides()? {
+        app = app.with_execution_overrides(overrides);
+    }
     let session_id = leveler_core::SessionId::new(id.clone());
 
     // The row is the axis SoT; an unreadable row falls back to the product
@@ -1940,14 +1947,35 @@ pub(crate) async fn cmd_run_resume(
     let cancellation = CancellationToken::new();
     spawn_interrupt_handler(cancellation.clone());
 
-    let result = app
-        .resume_session(
-            &session_id,
-            approver,
-            &mut |e| render_event(e, output),
-            cancellation,
-        )
-        .await;
+    let result = match instruction.filter(|text| !text.trim().is_empty()) {
+        Some(text) => {
+            // The same production continuation path the interactive client
+            // uses: the text becomes this turn's user input and, for a running
+            // goal, a durable amendment before the turn runs.
+            app.resume_in_session_with_instruction(
+                &session_id,
+                leveler_model::Message::user_input(text),
+                approver,
+                std::sync::Arc::new(leveler_agent::AutoClarify),
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &mut |event| {
+                    leveler_app::forward_engine_event(event, &mut |e| render_event(e, output))
+                },
+                cancellation,
+            )
+            .await
+        }
+        None => {
+            app.resume_session(
+                &session_id,
+                approver,
+                &mut |e| render_event(e, output),
+                cancellation,
+            )
+            .await
+        }
+    };
 
     finish(result, &id, output, execution)
 }

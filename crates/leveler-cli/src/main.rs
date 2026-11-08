@@ -403,8 +403,19 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             // `--resume <id>` continues an interrupted non-interactive run
             // (headless event stream); it does not take a fresh task.
             if let Some(id) = resume {
-                return cmd_run_resume(layout, id, mode, auto_approve, confirm_recovery, output)
-                    .await;
+                // A task alongside `--resume` is the user's continuation /
+                // goal-revision instruction; it must reach the durable turn and
+                // the goal amendments, never be silently dropped.
+                return cmd_run_resume(
+                    layout,
+                    id,
+                    task,
+                    mode,
+                    auto_approve,
+                    confirm_recovery,
+                    output,
+                )
+                .await;
             }
             let task = task.ok_or_else(|| {
                 anyhow::anyhow!("a task is required (or pass --resume <id> to continue a run)")
