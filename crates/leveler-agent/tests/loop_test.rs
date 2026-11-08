@@ -9213,9 +9213,12 @@ async fn source_code_mentioning_credentials_reaches_the_model_intact() {
             "source line was rewritten on the way to the model: {line:?}"
         );
     }
+    // The tool definitions legitimately describe the `[REDACTED]` placeholder
+    // (the write-back guard refuses to write it). What must never happen is
+    // that placeholder replacing the user's own source text.
     assert!(
-        !sent.contains("[REDACTED]"),
-        "ordinary code must not be redacted at all"
+        !sent.contains("pub password: [REDACTED]") && !sent.contains("let password = [REDACTED]"),
+        "ordinary code must not be redacted"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
