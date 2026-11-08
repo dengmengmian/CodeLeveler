@@ -283,7 +283,11 @@ impl McpClient {
         }
         match tokio::time::timeout(request_timeout(), rx).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("MCP 响应通道关闭".to_string()),
+            Ok(Err(_)) => Err(
+                "UNKNOWN_OUTCOME:MCP 响应通道在请求发出后关闭；服务端可能已执行，\
+                 结果未知，未自动重试"
+                    .to_string(),
+            ),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 // Best effort: the protocol has a cancellation notification.
@@ -597,6 +601,9 @@ impl Tool for McpTool {
 fn stdio_call_error(reason: String) -> String {
     match reason.strip_prefix("UNKNOWN_OUTCOME:") {
         Some(unknown) => format!("MCP 调用结果未知:{unknown}"),
+        None if reason.contains("连接已关闭") => {
+            format!("MCP 调用结果未知:{reason}；请求可能在服务端执行，未自动重试")
+        }
         None => format!("MCP 调用失败:{reason}"),
     }
 }
