@@ -411,6 +411,8 @@ export type RuntimeEvent =
   | { type: 'reasoning_completed'; elapsed_ms: number }
   /** The assistant message is complete. */
   | { type: 'assistant_message_completed'; message_id: MessageId }
+  /** The runtime named the text it accepted as this turn's delivery. The text is already on screen as an assistant message. This event does not append another copy. It tells the client which existing block is the answer, so a later progress note cannot take that place when the turn ends. `text` is the runtime's published delivery, compared by exact trimmed equality — not a guess about length or wording. */
+  | { type: 'delivery_committed'; text: string }
   /** The assistant has produced its final response, while the runtime is still settling the task before its one authoritative terminal event. */
   | { type: 'turn_finalizing'; stage: FinalizationStage }
   /** Coarse progress label from the runtime, shown in the status line. */
