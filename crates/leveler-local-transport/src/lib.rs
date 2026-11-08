@@ -1034,6 +1034,21 @@ mod transport {
 
     /// A bound local runtime server.
     #[cfg(unix)]
+    /// A completed connection task keeps its whole future allocation — for a
+    /// snapshot that is several kilobytes — until it is joined. A resident
+    /// daemon serves one request per connection, so a `JoinSet` that is only
+    /// drained at shutdown grows without bound: the 24-hour soak added about
+    /// 3.4 GiB that way. Reap completed tasks on a bounded tick.
+    fn connection_reaper() -> tokio::time::Interval {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    }
+
+    pub(crate) fn reap_finished_connections(tasks: &mut tokio::task::JoinSet<()>) {
+        while tasks.try_join_next().is_some() {}
+    }
+
     pub struct LocalSocketServer {
         path: PathBuf,
         socket_device: u64,
@@ -1154,9 +1169,11 @@ mod transport {
         pub async fn serve(self, shutdown: CancellationToken) -> Result<(), TransportError> {
             let child_shutdown = shutdown.child_token();
             let mut tasks = tokio::task::JoinSet::new();
+            let mut reap = connection_reaper();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
+                    _ = reap.tick() => reap_finished_connections(&mut tasks),
                     accepted = self.listener.accept() => {
                         let (stream, _) = accepted?;
                         let runtime = self.runtime.clone();
@@ -1176,6 +1193,9 @@ mod transport {
                                 tracing::debug!(%error, "local socket connection ended");
                             }
                         });
+                        // One request per connection: a burst must not wait for
+                        // the tick before its completed tasks are reclaimed.
+                        crate::transport::reap_finished_connections(&mut tasks);
                     }
                 }
             }
@@ -2303,9 +2323,11 @@ mod transport {
         pub async fn serve(self, shutdown: CancellationToken) -> Result<(), TransportError> {
             let child_shutdown = shutdown.child_token();
             let mut tasks = tokio::task::JoinSet::new();
+            let mut reap = connection_reaper();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
+                    _ = reap.tick() => reap_finished_connections(&mut tasks),
                     accepted = self.listener.accept() => {
                         let (stream, _peer) = accepted?;
                         // Loopback only: never serve a non-loopback peer even if
@@ -2331,6 +2353,7 @@ mod transport {
                                 tracing::debug!(%error, "tcp daemon connection ended");
                             }
                         });
+                        crate::transport::reap_finished_connections(&mut tasks);
                     }
                 }
             }
@@ -2540,6 +2563,18 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_completed_connection_task_is_reaped_instead_of_held_forever() {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            tasks.spawn(async {});
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(tasks.len(), 8, "completed but unjoined tasks are retained");
+        crate::transport::reap_finished_connections(&mut tasks);
+        assert_eq!(tasks.len(), 0, "every completed task is released");
+    }
 
     #[test]
     fn legacy_peers_receive_no_unknown_timing_variant_even_inside_history() {
