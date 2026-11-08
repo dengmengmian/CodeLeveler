@@ -146,6 +146,11 @@ async fn m6_server_exit_mid_call_is_not_a_confirmed_success() {
         .await
         .unwrap();
     assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("未知"),
+        "a transport close after send is Unknown: {}",
+        out.content
+    );
     assert_eq!(std::fs::read_to_string(&f.counter).unwrap(), "x");
 }
 
