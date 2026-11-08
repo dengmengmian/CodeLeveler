@@ -4194,12 +4194,15 @@ impl AgentHarness for Drive<'_> {
                             let recorded =
                                 epoch_modified_paths(&self.progress, &self.modified_files);
                             let artifact = |path: &str| artifact_state(workspace, path, &recorded);
+                            let literal =
+                                |path: &str, text: &str| literal_state(workspace, path, text);
                             match goal_scope::decide(&goal_scope::ScopeFacts {
                                 requirements: &requirements,
                                 accounting: accounting.as_deref(),
                                 runs: &self.verification_runs,
                                 mutation_ops: self.ledger.total_mutation_ops,
                                 artifact: &artifact,
+                                literal: &literal,
                             }) {
                                 goal_scope::ScopeDecision::Accept { warnings } => {
                                     self.completion_warnings.extend(warnings);
@@ -7310,6 +7313,88 @@ fn lexical_clean(path: &std::path::Path) -> std::path::PathBuf {
     cleaned
 }
 
+/// Largest file the content check reads. A user-named literal belongs to a
+/// source or README-sized file; a file this large is not silently scanned —
+/// the result is Unknown, which is an explicit unverified boundary.
+const MAX_CONTENT_CHECK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Whether a literal the user asked to appear is present as a line of the
+/// named file.
+///
+/// This reads the CURRENT workspace, so a later edit that removes the line is
+/// observed at completion time. A path the runtime cannot read (no workspace,
+/// outside it, unreadable, or too large) is Unknown, never a pass.
+fn literal_state(
+    workspace: Option<&leveler_execution::Workspace>,
+    path: &str,
+    literal: &str,
+) -> goal_scope::LiteralState {
+    use goal_scope::LiteralState;
+    let path = path.trim().trim_start_matches("./");
+    let literal = literal.trim();
+    if path.is_empty()
+        || literal.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('~')
+        || path.starts_with('\\')
+        || path.split(['/', '\\']).any(|part| part == "..")
+    {
+        return LiteralState::Unknown;
+    }
+    let Some(workspace) = workspace else {
+        return LiteralState::Unknown;
+    };
+    let Ok(resolved) = workspace.resolve_for_read(path) else {
+        return LiteralState::Unknown;
+    };
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A bare file name is shorthand for a file in its real directory
+            // (`aggregate.go` for `internal/report/aggregate.go`). If it is
+            // not at the root, the runtime cannot tell which recorded file
+            // the user meant, so the state is unknown rather than absent.
+            return if path.contains(['/', '\\']) {
+                LiteralState::Absent
+            } else {
+                LiteralState::Unknown
+            };
+        }
+        Err(_) => return LiteralState::Unknown,
+    };
+    if !metadata.is_file() || metadata.len() > MAX_CONTENT_CHECK_BYTES {
+        return LiteralState::Unknown;
+    }
+    let Ok(bytes) = std::fs::read(&resolved) else {
+        return LiteralState::Unknown;
+    };
+    let needle = literal.as_bytes();
+    if bytes
+        .split(|byte| *byte == b'\n')
+        .any(|line| trim_ascii_whitespace(line) == needle)
+    {
+        LiteralState::Present
+    } else {
+        LiteralState::Absent
+    }
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = bytes {
+        if !first.is_ascii_whitespace() {
+            break;
+        }
+        bytes = rest;
+    }
+    while let [rest @ .., last] = bytes {
+        if !last.is_ascii_whitespace() {
+            break;
+        }
+        bytes = rest;
+    }
+    bytes
+}
+
 fn artifact_state(
     workspace: Option<&leveler_execution::Workspace>,
     path: &str,
@@ -7352,7 +7437,73 @@ fn artifact_state(
 
 #[cfg(test)]
 mod artifact_scope_tests {
-    use super::{artifact_state, goal_scope};
+    use super::{artifact_state, goal_scope, literal_state};
+
+    #[test]
+    fn a_content_literal_is_present_only_when_a_line_holds_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# calc\n\nVerify with `python3 -m unittest`.\r\nVerified.\r\n",
+        )
+        .expect("file");
+        let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
+
+        assert_eq!(
+            literal_state(Some(&workspace), "README.md", "Verified."),
+            goal_scope::LiteralState::Present
+        );
+        assert_eq!(
+            literal_state(Some(&workspace), "README.md", "Verified"),
+            goal_scope::LiteralState::Absent,
+            "a line is matched whole, so a different line is not evidence"
+        );
+    }
+
+    /// The check reads the CURRENT file. An edit that removes the line after a
+    /// successful append must be observed, not remembered as verified.
+    #[test]
+    fn a_later_rewrite_that_removes_the_line_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let readme = dir.path().join("README.md");
+        std::fs::write(&readme, "Verified.\n").expect("file");
+        let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
+        assert_eq!(
+            literal_state(Some(&workspace), "README.md", "Verified."),
+            goal_scope::LiteralState::Present
+        );
+
+        std::fs::write(&readme, "# calc\n").expect("rewrite");
+        assert_eq!(
+            literal_state(Some(&workspace), "README.md", "Verified."),
+            goal_scope::LiteralState::Absent
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_ambiguous_content_target_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
+
+        assert_eq!(
+            literal_state(Some(&workspace), "docs/README.md", "Verified."),
+            goal_scope::LiteralState::Absent,
+            "a missing path the user spelled out is a fact"
+        );
+        assert_eq!(
+            literal_state(Some(&workspace), "README.md", "Verified."),
+            goal_scope::LiteralState::Unknown,
+            "a bare name may be shorthand for a nested recorded file"
+        );
+        assert_eq!(
+            literal_state(Some(&workspace), "../outside.md", "Verified."),
+            goal_scope::LiteralState::Unknown
+        );
+        assert_eq!(
+            literal_state(None, "README.md", "Verified."),
+            goal_scope::LiteralState::Unknown
+        );
+    }
 
     /// A bare file name in the user's prose is shorthand for the file in its
     /// real directory (`aggregate.go` for `internal/report/aggregate.go`).

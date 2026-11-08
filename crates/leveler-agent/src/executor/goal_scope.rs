@@ -30,6 +30,12 @@ pub(crate) enum RequirementKind {
     Command,
     /// An explicitly enumerated deliverable with no mechanical check.
     Named,
+    /// A literal the user asked to appear in a named file ("append a line
+    /// `Verified.` to README.md").
+    ///
+    /// Unlike [`Self::Named`], the runtime can check this: the target path is
+    /// named by the user in the same clause, and the file's content is a fact.
+    Content,
     /// The user explicitly required the test suite to pass.
     Tests,
     /// The user forbade something (`禁止实现支付功能`, `不要新增第三方登录`).
@@ -59,6 +65,7 @@ impl RequirementKind {
             Self::Artifact { removed: true } => "absent-artifact",
             Self::Command => "command",
             Self::Named => "deliverable",
+            Self::Content => "content",
             Self::Tests => "tests",
             Self::Forbidden => "forbidden",
         }
@@ -82,6 +89,9 @@ pub(crate) struct Requirement {
     pub text: String,
     pub kind: RequirementKind,
     pub source: RequirementSource,
+    /// For [`RequirementKind::Content`], the file the user named in the same
+    /// clause as the literal. Every other kind has no target.
+    pub target: Option<String>,
 }
 
 /// The model's per-requirement account in `update_goal(complete)`.
@@ -110,6 +120,17 @@ pub(crate) enum ArtifactState {
     Unknown,
 }
 
+/// What the runtime could observe about a content literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralState {
+    /// A line of the target file holds the literal.
+    Present,
+    /// The target exists and no line holds the literal.
+    Absent,
+    /// The file could not be read (no workspace, outside it, or unreadable).
+    Unknown,
+}
+
 /// Everything [`decide`] needs. Pure data so the gate is unit-testable.
 pub(crate) struct ScopeFacts<'a> {
     pub requirements: &'a [Requirement],
@@ -117,6 +138,9 @@ pub(crate) struct ScopeFacts<'a> {
     pub runs: &'a [VerificationRun],
     pub mutation_ops: u64,
     pub artifact: &'a dyn Fn(&str) -> ArtifactState,
+    /// Reads the workspace for a [`RequirementKind::Content`] requirement:
+    /// `(target path, literal) -> state`.
+    pub literal: &'a dyn Fn(&str, &str) -> LiteralState,
 }
 
 /// The scope gate's answer for one `update_goal(complete)`.
@@ -357,7 +381,8 @@ const WAIVER_GUARDS: &[&str] = &[
 /// the user's authority and is applied here. No model-authored text reaches
 /// this function — both inputs come from persisted user turns.
 pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement> {
-    let mut collected: Vec<(String, RequirementKind, RequirementSource)> = Vec::new();
+    let mut collected: Vec<(String, RequirementKind, RequirementSource, Option<String>)> =
+        Vec::new();
     collect_segments(objective, &RequirementSource::Objective, &mut collected);
 
     let mut tests_demanded = test_demanded(objective);
@@ -396,7 +421,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
                 if mentions_tests(clause) {
                     tests_demanded = false;
                 }
-                collected.retain(|(text, kind, _)| {
+                collected.retain(|(text, kind, _, _)| {
                     !matches!(kind, RequirementKind::Tests) && !mentioned(text, clause)
                 });
             }
@@ -432,6 +457,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
             "tests".to_string(),
             RequirementKind::Tests,
             RequirementSource::Objective,
+            None,
         ));
     } else {
         // A demand the runtime cannot enumerate must not be silently dropped,
@@ -445,13 +471,14 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
                     subject,
                     RequirementKind::Named,
                     RequirementSource::Objective,
+                    None,
                 ));
             }
         }
     }
 
     let mut requirements: Vec<Requirement> = Vec::new();
-    for (text, kind, source) in collected {
+    for (text, kind, source, target) in collected {
         let text = clean_token(&text);
         if text.is_empty() {
             continue;
@@ -481,6 +508,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
             text,
             kind,
             source,
+            target,
         });
     }
     requirements
@@ -810,6 +838,39 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
                     },
                 }
             }
+            RequirementKind::Content => {
+                let Some(account) = find_account(accounting, requirement) else {
+                    refusals.push(unaccounted(requirement));
+                    continue;
+                };
+                let target = requirement.target.as_deref().unwrap_or("");
+                match account.status {
+                    AccountStatus::NotDone => refusals.push(format!(
+                        "`{}` is accounted not_done ({})",
+                        requirement.text, account.evidence
+                    )),
+                    // The model's own boundary is not erased by evidence the
+                    // runtime happens to have: `unverifiable` is a statement
+                    // about what the model did not verify.
+                    AccountStatus::Unverifiable => warnings.push(format!(
+                        "requirement `{}` is explicitly unverifiable ({}); the completion \
+                         carries an unverified boundary",
+                        requirement.text, account.evidence
+                    )),
+                    AccountStatus::Done => match (facts.literal)(target, &requirement.text) {
+                        LiteralState::Present => {}
+                        LiteralState::Absent => refusals.push(format!(
+                            "`{}` is accounted done, but it does not appear as a line of `{}`",
+                            requirement.text, target
+                        )),
+                        LiteralState::Unknown => warnings.push(format!(
+                            "requirement `{}` is accounted done, but the runtime could not read \
+                             `{}` to check it; it is unverified",
+                            requirement.text, target
+                        )),
+                    },
+                }
+            }
             RequirementKind::Named => {
                 // Symmetric with the commit gate: a phrase the user listed as
                 // several deliverables can be accounted by one entry naming
@@ -1132,7 +1193,7 @@ fn mentions_tests(text: &str) -> bool {
 fn collect_segments(
     text: &str,
     source: &RequirementSource,
-    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+    out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
     for segment in split_segments(text) {
         let segment = segment.trim();
@@ -1156,7 +1217,7 @@ fn collect_segments(
 fn collect_constraint_clauses(
     text: &str,
     source: &RequirementSource,
-    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+    out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
     for sentence in text.split(['\n', '。', '；', ';']) {
         let sentence = sentence.trim();
@@ -1176,7 +1237,7 @@ fn collect_constraint_clauses(
             let Some(text) = clean_item(part) else {
                 continue;
             };
-            out.push((text, RequirementKind::Forbidden, source.clone()));
+            out.push((text, RequirementKind::Forbidden, source.clone(), None));
         }
     }
 }
@@ -1264,7 +1325,7 @@ fn split_segments(text: &str) -> Vec<String> {
 fn collect_segment(
     segment: &str,
     source: &RequirementSource,
-    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+    out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
     let segment = strip_fenced_blocks(segment);
     collect_backticks(&segment, source, out);
@@ -1312,7 +1373,7 @@ fn strip_fenced_blocks(text: &str) -> String {
 fn collect_backticks(
     segment: &str,
     source: &RequirementSource,
-    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+    out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
     let parts: Vec<&str> = segment.split('`').collect();
     for span in parts.iter().skip(1).step_by(2) {
@@ -1337,9 +1398,27 @@ fn collect_backticks(
             if permission_only(segment, &token) {
                 continue;
             }
-            out.push((token.clone(), path_kind(segment, &token), source.clone()));
+            out.push((
+                token.clone(),
+                path_kind(segment, &token),
+                source.clone(),
+                None,
+            ));
         }
         if added_path || is_test_phrase(span) || permission_only(segment, span) {
+            continue;
+        }
+        // The user asked for this literal to appear in a file they named in
+        // the same clause ("append a line `Verified.` to README.md"). That is
+        // content, and the target file lets the runtime check it; it is not a
+        // semantic deliverable that can only rest on the model's account.
+        if let Some(target) = content_target(segment, span) {
+            out.push((
+                span.to_string(),
+                RequirementKind::Content,
+                source.clone(),
+                Some(target),
+            ));
             continue;
         }
         // A backticked command the user asked to run is mechanical evidence,
@@ -1349,11 +1428,21 @@ fn collect_backticks(
             continue;
         }
         if command_text(span) {
-            out.push((span.to_string(), RequirementKind::Command, source.clone()));
+            out.push((
+                span.to_string(),
+                RequirementKind::Command,
+                source.clone(),
+                None,
+            ));
             continue;
         }
         if named_span(span) {
-            out.push((span.to_string(), RequirementKind::Named, source.clone()));
+            out.push((
+                span.to_string(),
+                RequirementKind::Named,
+                source.clone(),
+                None,
+            ));
         }
     }
 }
@@ -1375,10 +1464,92 @@ fn named_span(span: &str) -> bool {
     !word.contains(['=', '<', '>', '+', '(', ')'])
 }
 
+/// The file a write-content instruction targets, when the user asked for a
+/// literal to appear in it ("append a line `Verified.` to README.md").
+///
+/// The binding is deliberately narrow: one write verb, one literal, one path,
+/// all in the same comma clause. Two possible targets leave the requirement
+/// Named instead of guessing which file the user meant.
+fn content_target(segment: &str, span: &str) -> Option<String> {
+    let clause = clause_around(segment, span);
+    if !content_write_verb(clause) || !content_literal(span, clause) {
+        return None;
+    }
+    let mut targets: Vec<String> = Vec::new();
+    for raw in clause.split(|c: char| TOKEN_BREAKS.contains(&c)) {
+        let token = clean_token(raw);
+        if token == span || !path_like(&token) || looks_like_url(&token) {
+            continue;
+        }
+        if !targets
+            .iter()
+            .any(|existing| normalize(existing) == normalize(&token))
+        {
+            targets.push(token);
+        }
+    }
+    (targets.len() == 1).then(|| targets.remove(0))
+}
+
+/// A verb that writes material into a file.
+fn content_write_verb(text: &str) -> bool {
+    const CJK: &[&str] = &[
+        "追加", "添加", "增加", "写入", "插入", "附加", "填入", "加入",
+    ];
+    if CJK.iter().any(|verb| text.contains(verb)) {
+        return true;
+    }
+    text.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "append" | "add" | "insert" | "write" | "put" | "prepend"
+        )
+    })
+}
+
+/// Whether the span reads like material written into the file rather than the
+/// name of a symbol, flag, or option.
+///
+/// A flag always stays out. Otherwise a line/content noun in the clause is the
+/// strong cue; without one, the literal must carry prose punctuation or
+/// whitespace, so identifiers and bare option names keep their Named
+/// classification (and its honest boundary) instead of being checked against a
+/// file they were never meant to appear in.
+fn content_literal(span: &str, clause: &str) -> bool {
+    if span.starts_with('-') {
+        return false;
+    }
+    if content_noun(clause) {
+        return true;
+    }
+    span.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '.' | '。' | ':' | '：' | '!' | '！' | '?' | '？' | ',' | '，' | ';' | '；'
+            )
+    })
+}
+
+fn content_noun(text: &str) -> bool {
+    if ["一行", "一句", "一段", "内容", "文本"]
+        .iter()
+        .any(|noun| text.contains(noun))
+    {
+        return true;
+    }
+    text.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "line" | "lines" | "text" | "content" | "string"
+        )
+    })
+}
+
 fn collect_paths(
     segment: &str,
     source: &RequirementSource,
-    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+    out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
     for raw in segment.split(|c: char| TOKEN_BREAKS.contains(&c)) {
         let token = clean_token(raw);
@@ -1403,14 +1574,14 @@ fn collect_paths(
         if matches!(kind, RequirementKind::Artifact { .. }) && permission_only(segment, &token) {
             continue;
         }
-        out.push((token, kind, source.clone()));
+        out.push((token, kind, source.clone(), None));
     }
 }
 
 fn collect_enumerations(
     segment: &str,
     source: &RequirementSource,
-    out: &mut Vec<(String, RequirementKind, RequirementSource)>,
+    out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
     let mut items: Vec<String> = Vec::new();
     if let Some(item) = bullet_item(segment) {
@@ -1487,7 +1658,7 @@ fn collect_enumerations(
         } else {
             RequirementKind::Named
         };
-        out.push((text, kind, source.clone()));
+        out.push((text, kind, source.clone(), None));
     }
 }
 
@@ -1546,6 +1717,7 @@ fn kind_key(kind: RequirementKind) -> u8 {
         RequirementKind::Named => 3,
         RequirementKind::Tests => 4,
         RequirementKind::Forbidden => 5,
+        RequirementKind::Content => 6,
     }
 }
 
@@ -2489,6 +2661,17 @@ mod tests {
             text: text.to_string(),
             kind,
             source: RequirementSource::Objective,
+            target: None,
+        }
+    }
+
+    fn content(text: &str, target: &str) -> Requirement {
+        Requirement {
+            id: "R1".to_string(),
+            text: text.to_string(),
+            kind: RequirementKind::Content,
+            source: RequirementSource::Objective,
+            target: Some(target.to_string()),
         }
     }
 
@@ -2764,6 +2947,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         };
         assert!(
             matches!(decide(&facts), ScopeDecision::Accept { .. }),
@@ -3053,6 +3237,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match decision {
             ScopeDecision::Accept { warnings } => assert!(
@@ -3068,6 +3253,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(missing, ScopeDecision::Refuse(_)),
@@ -3202,6 +3388,236 @@ mod tests {
                 .iter()
                 .any(|requirement| requirement.kind == RequirementKind::Tests),
             "{requirements:?}"
+        );
+    }
+
+    /// The classification half of the same session: the literal the user
+    /// asked to append is content bound to the file named in its clause, not
+    /// an unverifiable named deliverable.
+    #[test]
+    fn a_line_the_user_asked_to_append_is_content_bound_to_the_named_file() {
+        let objective = "第 4 步（后续回复）：按拒绝提示继续：在 README.md 末尾追加一行 \
+                         `Verified.`，重新运行 python3 -m unittest，然后调用 update_goal 完成。";
+        let requirements = extract(objective, &[]);
+        let literal = requirements
+            .iter()
+            .find(|requirement| requirement.text == "Verified.")
+            .expect("the literal is named by the user");
+        assert_eq!(literal.kind, RequirementKind::Content, "{requirements:?}");
+        assert_eq!(
+            literal.target.as_deref(),
+            Some("README.md"),
+            "{requirements:?}"
+        );
+    }
+
+    /// Session `9a1230c9` (DeepSeek, 2026-11-08): the user asked to append the
+    /// literal line `Verified.` to README.md. The runtime extracted the literal
+    /// as a deliverable but had no way to check it, so an edit the user could
+    /// SEE in the transcript (`+Verified.`) still produced the warning "reported
+    /// done but has no mechanical check". A content literal the user bound to a
+    /// named file is mechanically checkable; the warning is false.
+    #[test]
+    fn a_line_the_user_asked_to_append_is_verified_by_the_named_files_content() {
+        let objective = "第 4 步（后续回复）：按拒绝提示继续：在 README.md 末尾追加一行 \
+                         `Verified.`，重新运行 python3 -m unittest，然后调用 update_goal 完成。";
+        let requirements = extract(objective, &[]);
+        let literal = requirements
+            .iter()
+            .find(|requirement| requirement.text == "Verified.")
+            .expect("the literal is named by the user");
+        let accounting = vec![account(
+            "第 4 步：在 README.md 末尾追加 Verified. 并重新运行测试",
+            AccountStatus::Done,
+            "apply_patch 在 README.md 末尾追加 Verified.",
+        )];
+        let decision = decide(&ScopeFacts {
+            requirements: std::slice::from_ref(literal),
+            accounting: Some(&accounting),
+            runs: &[],
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Present,
+        });
+        match decision {
+            ScopeDecision::Accept { warnings } => assert!(
+                warnings.is_empty(),
+                "a literal present in the named file is mechanically verified: {warnings:?}"
+            ),
+            other => panic!("expected acceptance, got {other:?}"),
+        }
+    }
+
+    /// A `done` claim about a content literal the target file does not hold is
+    /// contradicted by the runtime's own reading, so it cannot settle.
+    #[test]
+    fn a_content_line_missing_from_the_named_file_refuses_the_claim() {
+        let requirements = vec![content("Verified.", "README.md")];
+        let accounting = vec![account(
+            "README.md 末尾追加 Verified.",
+            AccountStatus::Done,
+            "apply_patch 追加",
+        )];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounting),
+            runs: &[],
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Absent,
+        });
+        assert!(
+            matches!(
+                &decision,
+                ScopeDecision::Refuse(message)
+                    if message.contains("Verified.") && message.contains("README.md")
+            ),
+            "the missing line is a refusal, not an unverified warning: {decision:?}"
+        );
+    }
+
+    /// A passing test command proves the suite, not a line of documentation.
+    /// The two requirements stay separate.
+    #[test]
+    fn passing_tests_do_not_verify_an_unrelated_content_line() {
+        let requirements = vec![content("Verified.", "README.md")];
+        let accounting = vec![account(
+            "README.md 末尾追加 Verified.",
+            AccountStatus::Done,
+            "apply_patch 追加",
+        )];
+        let runs = vec![
+            run("python3 -m unittest", true, 1, 1),
+            run("python3 -m unittest", true, 5, 2),
+        ];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounting),
+            runs: &runs,
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Absent,
+        });
+        assert!(
+            matches!(&decision, ScopeDecision::Refuse(message) if message.contains("Verified.")),
+            "a test run is not evidence for a documentation literal: {decision:?}"
+        );
+    }
+
+    /// When the target cannot be read, the completion may still proceed — but
+    /// only as an explicitly unverified boundary, and the reason is the read,
+    /// not an absent mechanical check.
+    #[test]
+    fn an_unreadable_content_target_is_an_unverified_boundary() {
+        let requirements = vec![content("Verified.", "README.md")];
+        let accounting = vec![account(
+            "README.md 末尾追加 Verified.",
+            AccountStatus::Done,
+            "apply_patch 追加",
+        )];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounting),
+            runs: &[],
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Unknown,
+        });
+        match decision {
+            ScopeDecision::Accept { warnings } => assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("could not read")
+                        && warning.contains("README.md")
+                        && warning.contains("Verified.")),
+                "the warning names the actual gap: {warnings:?}"
+            ),
+            other => panic!("expected an accepted boundary, got {other:?}"),
+        }
+    }
+
+    /// The model's own `unverifiable` statement is preserved even when the
+    /// literal happens to be present: the account states a boundary the
+    /// runtime does not get to erase.
+    #[test]
+    fn an_explicitly_unverifiable_content_line_keeps_the_boundary() {
+        let requirements = vec![content("Verified.", "README.md")];
+        let accounting = vec![account(
+            "README.md 末尾追加 Verified.",
+            AccountStatus::Unverifiable,
+            "the line is present but its placement was not checked",
+        )];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounting),
+            runs: &[],
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Present,
+        });
+        match decision {
+            ScopeDecision::Accept { warnings } => assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("unverifiable")),
+                "{warnings:?}"
+            ),
+            other => panic!("expected an accepted boundary, got {other:?}"),
+        }
+    }
+
+    /// One verified requirement does not vouch for its neighbours.
+    #[test]
+    fn verified_content_does_not_silence_an_unverified_neighbour() {
+        let requirements = vec![
+            content("Verified.", "README.md"),
+            req("认证模块", RequirementKind::Named),
+        ];
+        let accounting = vec![
+            account(
+                "README.md 末尾追加 Verified.",
+                AccountStatus::Done,
+                "apply_patch 追加",
+            ),
+            account("认证模块", AccountStatus::Done, "implemented"),
+        ];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounting),
+            runs: &[],
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Present,
+        });
+        match decision {
+            ScopeDecision::Accept { warnings } => {
+                assert!(
+                    !warnings.iter().any(|warning| warning.contains("Verified.")),
+                    "the verified literal stays silent: {warnings:?}"
+                );
+                assert!(
+                    warnings.iter().any(|warning| warning.contains("认证模块")),
+                    "the unverified neighbour keeps its warning: {warnings:?}"
+                );
+            }
+            other => panic!("expected acceptance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unaccounted_content_line_refuses_the_claim() {
+        let requirements = vec![content("Verified.", "README.md")];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&[]),
+            runs: &[],
+            mutation_ops: 2,
+            artifact: &|_| ArtifactState::Present,
+            literal: &|_, _| LiteralState::Present,
+        });
+        assert!(
+            matches!(&decision, ScopeDecision::Refuse(message) if message.contains("Verified.")),
+            "{decision:?}"
         );
     }
 
@@ -3728,6 +4144,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match decision {
             ScopeDecision::Refuse(message) => {
@@ -3760,6 +4177,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(decision, ScopeDecision::Accept { .. }),
@@ -3784,6 +4202,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(matches!(
             &decision,
@@ -3806,6 +4225,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &absent,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(&decision, ScopeDecision::Refuse(message) if message.contains("does not exist")),
@@ -3826,6 +4246,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert_eq!(decision, ScopeDecision::Accept { warnings: vec![] });
     }
@@ -3840,6 +4261,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(&decision, ScopeDecision::Refuse(message) if message.contains("still exists")),
@@ -3860,6 +4282,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match decision {
             ScopeDecision::Accept { warnings } => {
@@ -3891,6 +4314,7 @@ mod tests {
             runs: &[],
             mutation_ops: 1,
             artifact: &absent,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(&decision, ScopeDecision::Refuse(message) if message.contains("does not exist")),
@@ -3912,6 +4336,7 @@ mod tests {
             runs: &[],
             mutation_ops: 3,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match decision {
             ScopeDecision::Accept { warnings } => assert!(
@@ -3936,6 +4361,7 @@ mod tests {
             runs: &[],
             mutation_ops: 3,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match decision {
             ScopeDecision::Accept { warnings } => assert!(
@@ -3975,6 +4401,7 @@ mod tests {
             runs: &runs,
             mutation_ops: 0,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(decision, ScopeDecision::Accept { .. }),
@@ -3989,6 +4416,7 @@ mod tests {
             runs: &[run("make up", true, 3, 0), run("make status", true, 4, 0)],
             mutation_ops: 0,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match only_started {
             ScopeDecision::Refuse(message) => {
@@ -4009,6 +4437,7 @@ mod tests {
             runs: &[run("cargo check", true, 2, 5)],
             mutation_ops: 5,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(&refuse, ScopeDecision::Refuse(message) if message.contains("test")),
@@ -4021,6 +4450,7 @@ mod tests {
             runs: &[run("cargo test", true, 2, 4)],
             mutation_ops: 5,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(&stale, ScopeDecision::Refuse(message) if message.contains("before the most recent")),
@@ -4033,6 +4463,7 @@ mod tests {
             runs: &[run("cargo test", true, 6, 5)],
             mutation_ops: 5,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert_eq!(accept, ScopeDecision::Accept { warnings: vec![] });
     }
@@ -4047,6 +4478,7 @@ mod tests {
             runs: &[],
             mutation_ops: 2,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(&refuse, ScopeDecision::Refuse(message) if message.contains("./verify.sh")),
@@ -4059,6 +4491,7 @@ mod tests {
             runs: &[run("sh ./verify.sh", true, 9, 2)],
             mutation_ops: 2,
             artifact: &present,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert_eq!(accept, ScopeDecision::Accept { warnings: vec![] });
     }
@@ -4073,6 +4506,7 @@ mod tests {
                 runs: &[],
                 mutation_ops: 0,
                 artifact: &present,
+                literal: &|_, _| LiteralState::Unknown,
             }),
             ScopeDecision::Accept { warnings: vec![] }
         );
@@ -4127,6 +4561,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(accept, ScopeDecision::Accept { .. }),
@@ -4154,6 +4589,7 @@ mod tests {
                 runs: &[],
                 mutation_ops: 0,
                 artifact: &|_| ArtifactState::Unknown,
+                literal: &|_, _| LiteralState::Unknown,
             });
             assert_eq!(
                 matches!(decision, ScopeDecision::Accept { .. }),
@@ -4190,6 +4626,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(decision, ScopeDecision::Accept { .. }),
@@ -4615,6 +5052,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(accept, ScopeDecision::Accept { .. }),
@@ -4631,6 +5069,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         match refuse {
             ScopeDecision::Refuse(message) => assert!(
@@ -4649,6 +5088,7 @@ mod tests {
             runs: &[],
             mutation_ops: 0,
             artifact: &|_| ArtifactState::Unknown,
+            literal: &|_, _| LiteralState::Unknown,
         });
         assert!(
             matches!(missing, ScopeDecision::Refuse(_)),

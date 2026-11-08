@@ -729,9 +729,12 @@ pub(crate) fn is_verification_command(label: &str) -> bool {
                 words.iter().skip(1).any(|word| VERB_TARGETS.contains(word))
             }
             "pytest" | "phpunit" => true,
-            "python" | "python3" | "py" => words
-                .windows(2)
-                .any(|pair| pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")),
+            "python" | "python3" | "py" => {
+                let module = words.windows(2).any(|pair| {
+                    pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")
+                });
+                module || first_positional(&words).is_some_and(python_test_script)
+            }
             "node" => words.iter().skip(1).any(|word| *word == "--test"),
             // A shell entry point named for verification: `sh verify.sh`,
             // `bash ./scripts/check.sh`, `./accept.sh`.
@@ -829,10 +832,12 @@ pub(crate) fn is_runner_named_test_command(label: &str) -> bool {
     names_a_test_suite(label, false)
 }
 
+/// Words that name a test suite rather than just a build or a check.
+const TEST_SUITE_WORDS: &[&str] = &[
+    "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
+];
+
 fn names_a_test_suite(label: &str, suite_targets: bool) -> bool {
-    const TEST_TARGETS: &[&str] = &[
-        "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
-    ];
     for segment in label.split([';', '&', '|', '\n']) {
         let words: Vec<&str> = segment
             .split_whitespace()
@@ -856,21 +861,26 @@ fn names_a_test_suite(label: &str, suite_targets: bool) -> bool {
             }
             "make" | "just" | "bazel" | "mvn" | "gradle" | "dotnet" | "swift" | "flutter"
             | "dart" | "mix" => words.iter().skip(1).any(|word| {
-                TEST_TARGETS.contains(word) || (suite_targets && target_names_a_suite(word))
+                TEST_SUITE_WORDS.contains(word) || (suite_targets && target_names_a_suite(word))
             }),
             "pytest" | "phpunit" | "ctest" => true,
-            "python" | "python3" | "py" => words
-                .windows(2)
-                .any(|pair| pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")),
+            "python" | "python3" | "py" => {
+                let module = words.windows(2).any(|pair| {
+                    pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")
+                });
+                module || first_positional(&words).is_some_and(python_test_script)
+            }
             "node" => words.iter().skip(1).any(|word| *word == "--test"),
             "sh" | "bash" | "zsh" | "pwsh" | "powershell" | "cmd" => {
                 words.iter().skip(1).any(|word| {
                     let name = word.rsplit('/').next().unwrap_or(word);
-                    TEST_TARGETS.iter().any(|target| name.contains(target))
+                    TEST_SUITE_WORDS.iter().any(|target| name.contains(target))
                 })
             }
             _ => {
-                TEST_TARGETS.iter().any(|target| basename.contains(target))
+                TEST_SUITE_WORDS
+                    .iter()
+                    .any(|target| basename.contains(target))
                     && (basename.ends_with(".sh")
                         || basename.ends_with(".py")
                         || basename.ends_with(".ps1")
@@ -883,6 +893,29 @@ fn names_a_test_suite(label: &str, suite_targets: bool) -> bool {
         }
     }
     false
+}
+
+/// The first non-option word after the interpreter: the script it runs.
+fn first_positional<'a>(words: &'a [&'a str]) -> Option<&'a str> {
+    words
+        .iter()
+        .skip(1)
+        .find(|word| !word.starts_with('-'))
+        .copied()
+}
+
+/// A Python file whose own name says it is a test suite.
+///
+/// `python3 test_app.py` is the file analogue of `sh run-tests.sh`. The
+/// extension check keeps `python3 -m pip install pytest` and inline `-c` code
+/// out: they name a suite without running one.
+fn python_test_script(word: &str) -> bool {
+    let name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_ascii_lowercase();
+    name.ends_with(".py") && TEST_SUITE_WORDS.iter().any(|target| name.contains(target))
 }
 
 /// Whether a command's output says the test runner executed no tests.
@@ -1702,6 +1735,11 @@ mod tests {
             "pnpm run tests",
             "pytest -q",
             "python3 -m unittest",
+            // A user-named test script is the same evidence as a test-named
+            // shell script (`sh run-tests.sh`): the interpreter runs a file
+            // whose own name says it is the suite.
+            "python3 test_app.py",
+            "python3 -u tests/run_tests.py",
             "make test",
             // A repository names its own suite; the target name is what the
             // runtime has to read it by (`make regression` is DevOrder's full
@@ -1730,6 +1768,10 @@ mod tests {
             "sh verify.sh",
             "sh ./scripts/check.sh",
             "grep -rn test src",
+            // An ordinary script, an install, and inline code are not a suite.
+            "python3 app.py",
+            "python3 -m pip install pytest",
+            "python3 -c \"print('test')\"",
             // A build target that is not the suite: starting the services,
             // reporting status, building, and a target whose name only
             // contains a stem by accident.
@@ -1785,6 +1827,7 @@ mod tests {
             "./acceptance.sh",
             "pytest -q",
             "python3 -m unittest",
+            "python3 test_app.py",
             "python -m pytest -q",
         ] {
             assert!(is_verification_command(command), "{command}");
