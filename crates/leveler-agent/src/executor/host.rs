@@ -1386,7 +1386,7 @@ impl Executor {
         // can be scrubbed if it reappears in durable text from another path.
         let outcome = {
             let (content, is_error, metadata) = outcome;
-            let (sanitized, found) = leveler_core::sanitize_model_visible(&content);
+            let (mut sanitized, found) = leveler_core::sanitize_model_visible(&content);
             if !found.is_empty() {
                 if let Some(session) = admitted.ctx.session_scope.as_deref() {
                     leveler_core::register_session_secrets(session, &found);
@@ -1398,6 +1398,12 @@ impl Executor {
                     keys = ?found.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
                     "redacted secret values from tool output before the model saw them"
                 );
+                // File-content tools are the ones a patch is built from.
+                // Tell the model that the placeholder is not file bytes, so a
+                // later apply_patch is not anchored on text that never existed.
+                if matches!(call.name.as_str(), "read_file" | "grep") {
+                    sanitized.push_str(&redaction_notice(found.len()));
+                }
             }
             (sanitized, is_error, metadata)
         };
@@ -1427,6 +1433,18 @@ impl Executor {
         }
         outcome
     }
+}
+
+/// Tell the model that file-content redaction happened and what the
+/// placeholder means. It is not file bytes; copying it into a patch anchors
+/// on text that never existed.
+fn redaction_notice(count: usize) -> String {
+    format!(
+        "\n\n[security: {count} secret value(s) above were replaced with `[REDACTED]`. \
+         That placeholder is not the file's literal content — do not copy it into a patch. \
+         To edit around a hidden value, delete or replace the whole affected line, or anchor \
+         the hunk on a nearby line that has no secret.]"
+    )
 }
 
 #[cfg(test)]

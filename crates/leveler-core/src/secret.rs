@@ -162,7 +162,16 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
         cursor = skip_spaces(bytes, cursor);
         // Separator: `=` or `:` … or plain whitespace for CLI flags
         // (`--password hunter2`), which only counts when the key was a flag.
-        let flag_style = line[..key_start].ends_with("--") || line[..key_start].ends_with('-');
+        // A flag is `--password value` or `-password value`. A hyphen *inside*
+        // a word (`non-secret description`) is not a flag: it would turn the
+        // word after it into a credential value.
+        let before_key = &line[..key_start];
+        let flag_style = before_key.ends_with("--")
+            || (before_key.ends_with('-')
+                && !before_key[..before_key.len() - 1]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric()));
         let sep = bytes.get(cursor).copied();
         let has_sep = matches!(sep, Some(b'=') | Some(b':'));
         if has_sep {
@@ -317,7 +326,7 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
         }
         _ => {
             let end = line[from..]
-                .find(|c: char| c.is_whitespace() || c == ',' || c == '}' || c == ';' || c == '`')
+                .find(|c: char| c.is_whitespace() || matches!(c, ',' | '}' | ')' | ';' | '`'))
                 .map(|rel| from + rel)
                 .unwrap_or(line.len());
             (end > from).then_some((from, end, false))
@@ -350,12 +359,32 @@ fn is_credential_value(value: &str, quoted: bool, code_line: bool) -> bool {
     if is_code_expression(trimmed) {
         return false;
     }
-    // On a line that reads as source code, only a quoted literal is credible
-    // as a credential — a bare word there is almost always an expression.
-    if code_line && !quoted {
+    // On a line that reads as source code, a bare value is an identifier or a
+    // language expression, not the credential literal. Quoted literals stay
+    // eligible: `Password: "hunter2"` is a value the source really contains.
+    //
+    // Only a *bare identifier* is demoted, not every bare token: the storage
+    // scrubber runs on prose too, and `password: p@ss,with{braces}` is prose
+    // whose value happens to contain code punctuation. It must still be
+    // redacted.
+    if code_line && !quoted && is_bare_identifier(trimmed) {
         return false;
     }
     true
+}
+
+/// A single language-level identifier (`redisPassword`, `_token`, `apiKey`).
+///
+/// This is a shape, not a verdict: the verdict comes from the line context
+/// ([`looks_like_code`]) plus the value position. The shape is only used to
+/// keep code identifiers out of a code line's secret positions.
+fn is_bare_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Identifier paths (`config.password`), calls (`get_token()`), types
@@ -390,8 +419,16 @@ fn is_code_expression(value: &str) -> bool {
 }
 
 /// Heuristic: does this line read as source code declaring or using a field?
-/// Used only to demote BARE values; quoted literals are still redacted.
+/// Used only to demote BARE identifiers; quoted literals are still redacted.
+///
+/// A struct-literal field is one line of a larger expression, so the line
+/// alone often has no brace: `\tPassword: redisPassword,` is code because it is
+/// indented, has a field separator, and ends with the field comma. A comment
+/// is deliberately not code — a credential in a comment is still a credential.
 fn looks_like_code(line: &str) -> bool {
+    if is_comment_line(line) {
+        return false;
+    }
     const MARKERS: &[&str] = &[
         "let ",
         "const ",
@@ -412,11 +449,34 @@ fn looks_like_code(line: &str) -> bool {
         "->",
         "=>",
         "::",
-        "//",
-        "/*",
+        ":=",
+        "{",
+        "}",
+        "(",
+        ")",
         "#[",
     ];
-    MARKERS.iter().any(|m| line.contains(m))
+    if MARKERS.iter().any(|m| line.contains(m)) {
+        return true;
+    }
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    let indented = trimmed.len() != trimmed.trim_start().len();
+    indented
+        && trimmed.trim_end().ends_with(',')
+        && (trimmed.contains(':') || trimmed.contains('='))
+}
+
+/// A line whose credential-shaped text is prose/comment, not code structure.
+fn is_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("-- ")
+        || trimmed.starts_with("--\t")
+        || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+        || (trimmed.starts_with(';')
+            && trimmed[1..].chars().next().is_some_and(char::is_whitespace))
 }
 
 // ── Layer B: session-scoped registry of concrete secret values ─────────────
@@ -621,6 +681,87 @@ mod tests {
         ];
         for input in cases {
             assert_eq!(sanitize(input), input, "code was rewritten: {input:?}");
+        }
+    }
+
+    /// REGRESSION P1-2. A language-level identifier is not a credential just
+    /// because it sits on the right of `Password:`. The real session
+    /// `9db65d21` persisted `[REDACTED] := os.Getenv(...)` and
+    /// `Password: [REDACTED]` because the line-level code heuristic missed a
+    /// struct-literal field and the value was registered as a secret.
+    #[test]
+    fn ordinary_code_identifiers_are_not_secrets() {
+        let cases = [
+            "redisPassword := os.Getenv(\"TEST_REDIS_PASSWORD\")\n",
+            "accessToken := os.Getenv(\"ACCESS_TOKEN\")\n",
+            "clientSecret := os.Getenv(\"CLIENT_SECRET\")\n",
+            "apiKey := config.APIKey\n",
+            "client := Config{\n\tAddr:     redisAddr,\n\tPassword: redisPassword,\n}\n",
+            "client := Config{ Password: redisPassword, Token: accessToken }\n",
+            "let client = Config { password: redis_password, token: access_token };\n",
+            "config = Config(password=redis_password, token=access_token)\n",
+            "const client = { password: redisPassword, token: accessToken };\n",
+        ];
+        for input in cases {
+            let (out, found) = sanitize_model_visible(input);
+            assert_eq!(out, input, "code was rewritten: {input:?}");
+            assert!(
+                found.is_empty(),
+                "identifier registered as secret: {found:?}"
+            );
+        }
+    }
+
+    /// REGRESSION P1-2. A code identifier that was never redacted must not be
+    /// registered, and a clean registry must leave a later transcript
+    /// byte-identical.
+    #[test]
+    fn ordinary_identifiers_do_not_enter_the_session_registry() {
+        let session = "sess-code-identifiers";
+        clear_session_secrets(session);
+        let (_, found) = sanitize_model_visible("client := Config{ Password: redisPassword }\n");
+        assert!(found.is_empty(), "identifier detected: {found:?}");
+        register_session_secrets(session, &found);
+        assert_eq!(registered_secret_count(session), 0);
+
+        let text = "client := Config{ Password: redisPassword }\n";
+        assert_eq!(
+            scrub_registered_secrets(session, text),
+            text,
+            "a clean registry must not rewrite code"
+        );
+        clear_session_secrets(session);
+    }
+
+    /// Comment lines carry no code structure: a credential-shaped value in a
+    /// comment must still be redacted, not treated as a field expression.
+    #[test]
+    fn credentials_in_comments_are_still_redacted() {
+        for input in [
+            "// password: hunter2-abc\n",
+            "# password: hunter2-abc\n",
+            "/* password: hunter2-abc */\n",
+            "-- password: hunter2-abc\n",
+        ] {
+            let (out, found) = sanitize_model_visible(input);
+            assert!(!out.contains("hunter2-abc"), "comment leaked: {out:?}");
+            assert_eq!(found.len(), 1, "comment value not registered: {out:?}");
+        }
+    }
+
+    /// Dogfood A regression: a hyphen inside a word is not a CLI flag. The
+    /// prose `non-secret description` was redacted to `non-secret
+    /// [REDACTED]` because the detector read `-secret` as a flag.
+    #[test]
+    fn hyphenated_prose_is_not_a_credential_flag() {
+        for input in [
+            "// Describe returns a non-secret description of the configuration.\n",
+            "// This is a non-secret value.\n",
+            "the non-secret description is public\n",
+        ] {
+            let (out, found) = sanitize_model_visible(input);
+            assert_eq!(out, input, "prose rewritten: {out:?}");
+            assert!(found.is_empty(), "prose registered: {found:?}");
         }
     }
 
