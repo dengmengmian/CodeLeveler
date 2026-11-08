@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_agent::{AutoClarify, SteeringSource, StepLimits};
 use leveler_core::{RequestId, SessionId, ToolCallId};
-use leveler_engine::{EngineBoot, ExecutionKind, TaskEngine};
+use leveler_engine::{EngineBoot, EngineEvent, ExecutionKind, TaskEngine};
 use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
@@ -435,6 +435,69 @@ async fn pre_upgrade_spend_counts_against_the_resumed_goal_budget() {
     assert_eq!(goals.len(), 1);
     assert_eq!(goals[0].id, goal.id);
     assert_eq!(goals[0].objective, OBJECTIVE);
+}
+
+/// A command the Chat ran before `/goal` belongs to the upgraded goal. Resume
+/// must not hand that goal a fresh command budget.
+#[tokio::test]
+async fn a_command_before_the_upgrade_counts_against_the_resumed_goal() {
+    let fx = fixture(
+        vec![None, Some(OBJECTIVE)],
+        vec![
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({"program": "true", "args": []}),
+            ),
+            Scripted::goal("blocked"),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({"program": "printf", "args": ["AFTER_UPGRADE"]}),
+            ),
+        ],
+        true,
+    )
+    .await;
+    let limits = StepLimits {
+        max_commands: Some(1),
+        ..Default::default()
+    };
+    let first = chat(&fx, limits).await;
+    assert_eq!(
+        first.stop_reason,
+        leveler_agent::StopReason::Blocked,
+        "the upgrade ends on the blocked declaration: {first:?}"
+    );
+
+    let mut resume_spec = spec(&fx, None);
+    resume_spec.runtime.limits.max_commands = Some(1);
+    let mut events = Vec::new();
+    let resumed = fx
+        .coding
+        .resume_with_instruction(
+            &fx.session,
+            &resume_spec,
+            Message::user_input("继续"),
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resume");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolCallFinished { is_error: true, preview, .. }
+                if preview.contains("1-command budget is exhausted")
+        )),
+        "the pre-upgrade command must already fill the goal budget: {events:?} {resumed:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolCallFinished { is_error: false, preview, .. }
+                if preview.contains("AFTER_UPGRADE")
+        )),
+        "resume must not run a second command"
+    );
 }
 
 #[tokio::test]

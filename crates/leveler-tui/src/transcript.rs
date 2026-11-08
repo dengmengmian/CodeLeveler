@@ -16,9 +16,13 @@ const HARNESS_REVIEWER_ROLE: &str = "reviewer";
 
 /// What one assistant message IS in the turn, decided by event order alone.
 ///
-/// The classifier never reads the prose: a message followed by a tool call was
-/// demonstrably not the answer, and a message the turn ended on was. Nothing
-/// here is a guess about wording, length, or Markdown shape.
+/// The turn-end classifier never reads the prose: a message followed by a
+/// tool call was demonstrably not the answer, and a message the turn ended
+/// on was. Nothing there is a guess about wording, length, or Markdown shape.
+/// [`TranscriptState::commit_named_answer`] is the other mechanical fact: the
+/// runtime published one delivery, and the block whose text is that delivery
+/// is the answer. The comparison is exact trimmed equality with the published
+/// record, not a reading of the prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistantKind {
     /// Streaming, or complete but the turn has not yet shown which it is.
@@ -980,6 +984,71 @@ impl TranscriptState {
             }
         }
         false
+    }
+
+    /// Name the answer the runtime already committed.
+    ///
+    /// `text` is the delivery record, not a description of it. The first
+    /// assistant block in the current turn whose trimmed text equals that
+    /// record becomes [`AssistantKind::Final`]. Every other assistant block in
+    /// the turn becomes [`AssistantKind::Progress`], including ones the
+    /// turn-end classifier already marked Final: a progress note written after
+    /// the answer must not stay the answer. The scan is the current turn: it
+    /// starts after the previous turn-end marker or user prompt. A marker that
+    /// already closed this turn is the scan's end, so a late delivery fact
+    /// still names that turn.
+    ///
+    /// A record that matches nothing changes nothing. The caller does not
+    /// invent a message, and the ordinary turn-end rule still applies.
+    pub fn commit_named_answer(&mut self, text: &str) {
+        let wanted = text.trim();
+        if wanted.is_empty() {
+            return;
+        }
+        // A delivery fact can arrive after the turn-end marker. That marker
+        // closes the turn the fact belongs to, so it is the scan's end, not
+        // its start. The previous marker (or the user prompt) is the start.
+        let mut end = self.items.len();
+        while end > 0 {
+            match &self.items[end - 1] {
+                TranscriptItem::TurnEnd(_)
+                | TranscriptItem::Recap(_)
+                | TranscriptItem::GoalRecap(_) => end -= 1,
+                _ => break,
+            }
+        }
+        let start = self.items[..end]
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::TurnEnd(_) | TranscriptItem::User(_)))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let Some(answer_at) = self.items[start..end].iter().position(|item| {
+            matches!(
+                item,
+                TranscriptItem::Assistant(block) if block.text.trim() == wanted
+            )
+        }) else {
+            return;
+        };
+        let answer_at = start + answer_at;
+        let mut changed = false;
+        for (index, item) in self.items.iter_mut().enumerate().take(end).skip(start) {
+            let TranscriptItem::Assistant(block) = item else {
+                continue;
+            };
+            let kind = if index == answer_at {
+                AssistantKind::Final
+            } else {
+                AssistantKind::Progress
+            };
+            if block.kind != kind {
+                block.kind = kind;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
     }
 
     /// Decide every still-undecided assistant block, from event order alone.
@@ -3484,6 +3553,79 @@ mod tests {
             kinds(&t),
             vec![AssistantKind::Progress, AssistantKind::Final],
             "only the answer the turn ended on is final"
+        );
+    }
+
+    /// The runtime committed an earlier answer, then the model sent a progress
+    /// note and the turn ended on that note. Event order would present the
+    /// note as the answer. The delivery record names the earlier text, so the
+    /// note stays narration and the named block stays the answer.
+    #[test]
+    fn a_committed_delivery_keeps_the_earlier_answer_after_the_turn_ends() {
+        let mut t = TranscriptState::new();
+        let answer =
+            "清理前 12 行，清理后 0 行。备份在 /tmp/db.bak。服务已恢复。运营账号尚未验收。";
+        say(&mut t, "m0", "先核对现场。");
+        say(&mut t, "m1", answer);
+        say(&mut t, "m2", "我去掉附加说明后重新提交");
+        t.commit_named_answer(answer);
+        t.push_turn_end(TurnEndStatus::Completed, 1, 9, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![
+                AssistantKind::Progress,
+                AssistantKind::Final,
+                AssistantKind::Progress
+            ]
+        );
+    }
+
+    /// The turn-end classifier may already have run (history replay, a late
+    /// delivery fact). The record still wins over the note the turn ended on.
+    #[test]
+    fn a_committed_delivery_overrides_the_note_the_turn_ended_on() {
+        let mut t = TranscriptState::new();
+        let answer = "清理前 12 行，清理后 0 行。";
+        say(&mut t, "m1", answer);
+        say(&mut t, "m2", "我去掉附加说明后重新提交");
+        t.push_turn_end(TurnEndStatus::Completed, 1, 9, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Progress, AssistantKind::Final]
+        );
+        let padded = format!("\n{answer}\n");
+        t.commit_named_answer(&padded);
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Final, AssistantKind::Progress]
+        );
+    }
+
+    /// A delivery the transcript does not contain is not an answer to invent.
+    #[test]
+    fn a_delivery_that_matches_nothing_leaves_the_turn_alone() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "只有这句进度。");
+        t.commit_named_answer("一份没有出现过的报告");
+        assert_eq!(kinds(&t), vec![AssistantKind::Pending]);
+        t.commit_named_answer("   ");
+        assert_eq!(kinds(&t), vec![AssistantKind::Pending]);
+        t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
+        assert_eq!(kinds(&t), vec![AssistantKind::Final]);
+    }
+
+    /// The record names a block in this turn. A previous turn that happens to
+    /// hold the same words keeps the classification it already settled.
+    #[test]
+    fn a_committed_delivery_stays_inside_the_current_turn() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "上一轮的完整报告");
+        t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
+        say(&mut t, "m2", "这一轮还在核对。");
+        t.commit_named_answer("上一轮的完整报告");
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Final, AssistantKind::Pending]
         );
     }
 

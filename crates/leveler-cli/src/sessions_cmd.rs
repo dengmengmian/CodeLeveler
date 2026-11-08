@@ -337,6 +337,7 @@ mod usage_tests {
         ModelRequestRecord {
             budget_scope: None,
             error_detail: None,
+            turn_id: None,
             estimated_tokens: None,
             id: "r".into(),
             provider_request_id: None,

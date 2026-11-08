@@ -118,6 +118,7 @@ pub(crate) async fn record_auxiliary_call(
         finish_reason,
         error_kind,
         error_detail,
+        turn_id: None,
         latency_ms: Some(latency_ms),
         attempt_ms: None,
         connect_ms: None,
@@ -1139,6 +1140,7 @@ mod tests {
         db.insert(&ModelRequestRecord {
             budget_scope: None,
             error_detail: None,
+            turn_id: None,
             estimated_tokens: None,
             id: "req-1".into(),
             provider_request_id: None,
@@ -1875,6 +1877,7 @@ mod accounting_tests {
         ModelRequestRecord {
             budget_scope: None,
             error_detail: None,
+            turn_id: None,
             estimated_tokens: None,
             id: id.into(),
             provider_request_id: None,

@@ -193,6 +193,7 @@ mod tests {
         db.insert(&ModelRequestRecord {
             budget_scope: None,
             error_detail: None,
+            turn_id: None,
             estimated_tokens: None,
             id: leveler_core::new_uuid_string(),
             provider_request_id: None,

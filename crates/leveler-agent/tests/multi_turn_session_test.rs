@@ -907,33 +907,31 @@ async fn multi_turn_deictic_followup_after_compact_then_resume() {
     );
 }
 
-/// End-to-end task-epoch budget: chat1 spends a shell command → ProgressUpdated
-/// is persisted → chat2 (next Engine request) seeds that spend and trips
-/// max_commands=1 before another shell call runs.
+/// An ordinary answered Chat leaves an active progress row in older sessions.
+/// A new request must honor its own command cap rather than inherit that spend.
 #[tokio::test]
-async fn engine_chat_command_spend_forces_budget_on_next_request() {
+async fn answered_chat_does_not_spend_the_next_tasks_command_budget() {
     let h = harness(vec![
-        // Chat 1: one shell command, then answer (non-terminal progress keeps epoch).
         tool_call(
             "c1",
             "run_command",
             serde_json::json!({"program": "true", "args": []}),
         ),
         text("first turn spent one command"),
-        // Chat 2: try another command — must be refused under max_commands=1.
         tool_call(
             "c2",
             "run_command",
-            serde_json::json!({"program": "true", "args": []}),
+            serde_json::json!({"program": "printf", "args": ["SECOND_TASK_RAN"]}),
         ),
-        text("should not freely run a second epoch command"),
+        text("second turn spent its own command"),
     ])
     .await;
     let s = spec_with_command_budget(&h, "budget epoch", 1);
     let session = h.engine.create_task(&s).await.unwrap();
 
     let mut events1 = Vec::new();
-    h.engine
+    let first = h
+        .engine
         .chat(
             &session,
             &s,
@@ -945,23 +943,43 @@ async fn engine_chat_command_spend_forces_budget_on_next_request() {
         )
         .await
         .expect("chat1");
-
-    let progress_cmds = events1.iter().rev().find_map(|e| match e {
-        EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_commands),
-        _ => None,
-    });
+    assert_eq!(first.stop_reason, leveler_agent::StopReason::Answered);
+    let previous_progress = events1
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(previous_progress.cumulative_commands, 1);
     assert!(
-        progress_cmds.unwrap_or(0) >= 1,
-        "chat1 must persist command spend on ProgressUpdated; events={events1:?}"
+        previous_progress.is_terminal_for_inheritance(),
+        "a finished chat closes its ledger: {previous_progress:?}"
+    );
+    let stored = leveler_storage::EventRepository::new(&h.db)
+        .load_last_by_type(&session, "progress_updated", None)
+        .await
+        .unwrap()
+        .expect("the closed ledger is durable");
+    let EngineEvent::ProgressUpdated { ledger: reloaded } =
+        EngineEvent::from_payload(&stored.payload).unwrap()
+    else {
+        panic!("latest progress_updated did not decode");
+    };
+    assert!(
+        reloaded.is_terminal_for_inheritance(),
+        "reloading the finished chat must not restore an active ledger: {reloaded:?}"
     );
 
     let mut events2 = Vec::new();
-    h.engine
+    let second = h
+        .engine
         .chat(
             &session,
             &s,
             vec![ContentPart::Text {
-                text: "run another command".into(),
+                text: "print a marker for a separate task".into(),
             }],
             &mut |e| events2.push(e),
             CancellationToken::new(),
@@ -969,39 +987,361 @@ async fn engine_chat_command_spend_forces_budget_on_next_request() {
         .await
         .expect("chat2");
 
-    let refused = events2.iter().any(|e| match e {
-        EngineEvent::ToolCallFinished {
-            is_error: true,
-            preview,
-            ..
-        } => {
-            preview.contains("command budget")
-                || preview.contains("budget is exhausted")
-                || preview.contains("command")
-        }
-        EngineEvent::TurnFinished { stop_reason, .. } => {
-            stop_reason.contains("Budget") || stop_reason.contains("budget")
-        }
-        EngineEvent::AssistantMessage { text, .. } => {
-            text.contains("command") && text.contains("budget")
-        }
-        _ => false,
-    });
-    let final_cmds = events2.iter().rev().find_map(|e| match e {
-        EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_commands),
+    assert!(
+        events2.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolCallFinished { is_error: false, preview, .. }
+                if preview.contains("SECOND_TASK_RAN")
+        )),
+        "the second task must be allowed to run its own command: {events2:?}"
+    );
+    assert_eq!(second.stop_reason, leveler_agent::StopReason::Answered);
+    let progress = events2
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(progress.cumulative_commands, 1);
+    assert_eq!(progress.cumulative_model_steps, second.model_steps);
+}
+
+#[tokio::test]
+async fn answered_status_chat_does_not_reset_a_running_goals_command_budget() {
+    let h = harness(vec![
+        tool_call(
+            "goal-command",
+            "run_command",
+            serde_json::json!({"program": "true", "args": []}),
+        ),
+        text("the goal has work left"),
+        tool_call(
+            "extra-command",
+            "run_command",
+            serde_json::json!({"program": "true", "args": []}),
+        ),
+    ])
+    .await;
+    let mut s = spec_with_command_budget(&h, "run commands for one goal", 1);
+    s.runtime.continuation = ContinuationPolicy::bounded(1);
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let first = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("first goal window");
+    assert_ne!(first.outcome, TaskOutcome::Completed);
+
+    let status = h
+        .engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "what is the current status?".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("status chat");
+    assert_eq!(status.stop_reason, leveler_agent::StopReason::Answered);
+
+    let mut events = Vec::new();
+    let resumed = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |e| events.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second window for the same goal");
+    assert_eq!(resumed.outcome, TaskOutcome::BudgetLimited);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
+            if call_id.as_str() == "extra-command" && preview.contains("1-command budget is exhausted")
+    )));
+    let inherited = events.iter().rev().find_map(|event| match event {
+        EngineEvent::ProgressUpdated { ledger } => Some(ledger),
         _ => None,
     });
     assert!(
-        refused,
-        "next Engine request must enforce seeded max_commands=1; final_cmds={final_cmds:?} \
-         events2={events2:?}"
+        inherited.is_some_and(|ledger| ledger.cumulative_commands >= 1),
+        "the same goal's next window keeps the command already spent: {inherited:?}"
     );
-    if let Some(n) = final_cmds {
-        assert!(
-            n <= 1,
-            "epoch command total must not exceed max_commands=1 after chat2; n={n}"
-        );
+}
+
+/// A finished chat does not spend the next goal's command budget.
+#[tokio::test]
+async fn answered_chat_does_not_spend_the_next_goals_command_budget() {
+    let h = harness(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "true", "args": []}),
+        ),
+        text("first chat is done"),
+        tool_call(
+            "c2",
+            "run_command",
+            serde_json::json!({"program": "printf", "args": ["GOAL_RAN"]}),
+        ),
+        // Goal mode does not end on prose. Settle the window in this round so
+        // the run is not a script underrun.
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "the new goal spent its own command"}),
+        ),
+    ])
+    .await;
+    let s = spec_with_command_budget(&h, "separate goal", 1);
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "run one command".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat");
+
+    let mut events = Vec::new();
+    let goal = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |e| events.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("new goal");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ToolCallFinished { is_error: false, preview, .. } if preview.contains("GOAL_RAN")
+    )));
+    assert_ne!(goal.outcome, TaskOutcome::BudgetLimited);
+    let progress = events.iter().rev().find_map(|event| match event {
+        EngineEvent::ProgressUpdated { ledger } => Some(ledger),
+        _ => None,
+    });
+    assert!(
+        progress.is_some_and(|ledger| ledger.cumulative_commands == 1),
+        "the goal counts only its own command: {progress:?}"
+    );
+}
+
+/// An unfinished goal still owes its command spend after an explicit resume.
+#[tokio::test]
+async fn an_unfinished_goal_resume_keeps_its_command_budget() {
+    let h = harness(vec![
+        tool_call(
+            "goal-command",
+            "run_command",
+            serde_json::json!({"program": "true", "args": []}),
+        ),
+        tool_call(
+            "extra-command",
+            "run_command",
+            serde_json::json!({"program": "true", "args": []}),
+        ),
+    ])
+    .await;
+    let mut s = spec_with_command_budget(&h, "resume the same goal", 1);
+    s.runtime.continuation = ContinuationPolicy::bounded(1);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let first = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("first window");
+    assert_ne!(first.outcome, TaskOutcome::Completed);
+    // The window stopped on its round edge. Pause it the way a resumed task
+    // is stored, without clearing the execution the resume path reads.
+    SessionRepository::new(&h.db)
+        .set_execution(
+            &session,
+            "assisted",
+            false,
+            ExecutionKind::Direct.as_str(),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    SessionRepository::new(&h.db)
+        .set_outcome(&session, TaskOutcome::Interrupted, leveler_core::now())
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    let resumed = h
+        .engine
+        .resume(
+            &session,
+            &s,
+            &mut |e| events.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resume");
+    assert_eq!(resumed.outcome, TaskOutcome::BudgetLimited);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
+            if call_id.as_str() == "extra-command" && preview.contains("1-command budget is exhausted")
+    )));
+}
+
+/// A later active snapshot cannot reopen a completed task's budget, including
+/// a duration cap smaller than that stale snapshot.
+#[tokio::test]
+async fn a_completed_task_ignores_a_later_active_ledger() {
+    let h = harness(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            serde_json::json!({"program": "true", "args": []}),
+        ),
+        text("first task closed"),
+        tool_call(
+            "c2",
+            "run_command",
+            serde_json::json!({"program": "printf", "args": ["FRESH_TASK"]}),
+        ),
+        text("second task ran"),
+    ])
+    .await;
+    let s = spec_with_command_budget(&h, "duration isolation", 1);
+    let session = h.engine.create_task(&s).await.unwrap();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "run one command".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat1");
+
+    let stale = leveler_lifecycle::ProgressLedger {
+        phase: leveler_lifecycle::TurnPhase::Active,
+        cumulative_commands: 43,
+        cumulative_model_steps: 65,
+        cumulative_duration_ms: 775_114,
+        budget_scope: Some("stale-finished-task".into()),
+        ..Default::default()
+    };
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
+    leveler_engine::EventLog::new(stores.events.as_ref(), session.clone())
+        .append(
+            None,
+            EngineEvent::ProgressUpdated { ledger: stale },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    let mut limited = spec_with_command_budget(&h, "duration isolation", 1);
+    limited.runtime.limits.max_duration = Some(std::time::Duration::from_secs(1));
+    let mut events = Vec::new();
+    let second = h
+        .engine
+        .chat(
+            &session,
+            &limited,
+            vec![ContentPart::Text {
+                text: "print a marker for a separate task".into(),
+            }],
+            &mut |e| events.push(e),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat2");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ToolCallFinished { is_error: false, preview, .. } if preview.contains("FRESH_TASK")
+    )));
+    let progress = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(progress.cumulative_commands, 1);
+    assert_eq!(progress.cumulative_model_steps, second.model_steps);
+    assert!(
+        progress.cumulative_duration_ms < 775_114,
+        "the stale duration must not enter the new task: {}",
+        progress.cumulative_duration_ms
+    );
+}
+
+/// Main-model requests record the turn that made them. Two chats stay distinct.
+#[tokio::test]
+async fn main_model_requests_record_the_turn_that_made_them() {
+    let h = harness(vec![text("one"), text("two")]).await;
+    let s = spec(&h, "turn attribution");
+    let session = h.engine.create_task(&s).await.unwrap();
+    for prompt in ["first question", "second question"] {
+        h.engine
+            .chat(
+                &session,
+                &s,
+                vec![ContentPart::Text {
+                    text: prompt.into(),
+                }],
+                &mut |_| {},
+                CancellationToken::new(),
+            )
+            .await
+            .expect(prompt);
     }
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    let turn_ids: Vec<&str> = turns.iter().map(|turn| turn.id.as_str()).collect();
+    assert!(turn_ids.len() >= 2, "each chat opens a turn: {turn_ids:?}");
+    let rows = leveler_storage::ModelRequestRepository::new(&h.db)
+        .load_for_session(&session)
+        .await
+        .unwrap();
+    let main: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_id.is_none() && row.kind == leveler_storage::ModelCallKind::Round)
+        .collect();
+    assert!(
+        main.len() >= 2,
+        "each chat records a main request: {rows:?}"
+    );
+    assert!(
+        main.iter().all(|row| row
+            .turn_id
+            .as_deref()
+            .is_some_and(|id| turn_ids.contains(&id))),
+        "every main request names a real turn: {main:?}"
+    );
+    let distinct: std::collections::BTreeSet<&str> = main
+        .iter()
+        .filter_map(|row| row.turn_id.as_deref())
+        .collect();
+    assert!(
+        distinct.len() >= 2,
+        "consecutive chats do not share one turn id: {distinct:?}"
+    );
 }
 
 /// An interactive chat turn must anchor its own baseline before editing.

@@ -12,17 +12,16 @@ use serde::{Deserialize, Serialize};
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 1,
-    // 1.16: retire durable-memory commands, events and DTOs.
+    // 1.17: name the delivery the runtime committed (additive event).
     //
-    // Memory removal is a per-message change, not an envelope change: a peer
-    // that still sends a retired command gets a decode error for THAT command,
-    // and an event variant it does not know is skipped. The envelope major is
+    // Minor bumps are additive per-message changes, not envelope changes: a
+    // peer that does not know an event variant skips it. The envelope major is
     // what the runtime handover uses to recognise a peer at all, so it stays 1:
     // a major bump here would make every older runtime undiscoverable, and the
     // lifecycle contract (an idle previous generation may be atomically
     // retired, a busy one is deferred) could never be applied across the
     // upgrade it exists for.
-    minor: 16,
+    minor: 17,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
@@ -142,7 +141,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":16},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
+            r#"{"protocol":{"major":1,"minor":17},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

@@ -265,6 +265,15 @@ pub(crate) struct Drive<'a> {
     /// count and does not tick the denial streak. A round that executes a
     /// tool resets it. A new drive starts it over.
     goal_gate_recovery_rounds: u32,
+    /// The last answer the model explicitly offered on a completion attempt
+    /// that did not settle (verification or scope refused it). A later round
+    /// that only repairs evidence leaves it alone; `revise_answer` replaces it.
+    /// Nothing infers a candidate from undeclared prose.
+    answer_candidate: Option<String>,
+    /// This drive was seeded from an open task epoch that already spent
+    /// budget. An answered Chat inside that epoch must not close the ledger.
+    /// A Chat that started from an empty ledger is its own task and closes.
+    preserve_running_epoch: bool,
     /// The last goal-gate refusal text and how many times in a row it has been
     /// returned unchanged. Set to the gate's own message when the bound is
     /// reached, so the round can stop after its results are durable.
@@ -892,6 +901,11 @@ impl Executor {
         // the kernel reads it when it builds the accounting snapshot.
         let compaction_record: Arc<std::sync::Mutex<Option<CompactionRecord>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let preserve_running_epoch = !progress.is_terminal_for_inheritance()
+            && (progress.cumulative_commands > 0
+                || progress.cumulative_model_steps > 0
+                || progress.cumulative_duration_ms > 0
+                || progress.cumulative_modified_files > 0);
         let mut harness = Drive {
             executor: self,
             observer,
@@ -934,6 +948,8 @@ impl Executor {
             verification_runs: self.seeded_verification_runs.clone(),
             pending_commands: Vec::new(),
             goal_gate_recovery_rounds: 0,
+            answer_candidate: None,
+            preserve_running_epoch,
             repeated_gate_refusal: None,
             requirements_refusal: None,
             commit_refusal: None,
@@ -1685,6 +1701,51 @@ impl<'a> Drive<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Remember the answer a refused completion attempt explicitly offered.
+    ///
+    /// A refused completion does not settle the goal, so its text is only a
+    /// candidate. Only an explicit declaration (`deliver_answer` or
+    /// `revise_answer`) creates one: prose written next to a refused call is
+    /// not promoted by the runtime's guess. A first declaration fills the
+    /// slot; later declarations keep it unless the model explicitly asked to
+    /// replace the answer (`revise_answer`), so a repair round that repeats
+    /// `deliver_answer` cannot silently overwrite the answer it is repairing.
+    ///
+    /// The declared text is this round's prose, or — for a bookkeeping-only
+    /// round with no prose — the last prose the model wrote, which is exactly
+    /// what `deliver_answer` names. A round that ran a work tool never reaches
+    /// back: the text before that work is not an answer to what the work found.
+    fn note_refused_completion(
+        &mut self,
+        prose: &str,
+        declares: bool,
+        revises: bool,
+        round_has_work: bool,
+    ) {
+        if !declares && !revises {
+            return;
+        }
+        let text = prose.trim();
+        let text = if text.is_empty() {
+            if round_has_work {
+                None
+            } else {
+                self.terminal_answer
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|saved| !saved.is_empty())
+            }
+        } else {
+            Some(text)
+        };
+        let Some(text) = text else {
+            return;
+        };
+        if revises || self.answer_candidate.is_none() {
+            self.answer_candidate = Some(text.to_string());
+        }
     }
 
     /// Record a delivery repair and give the model another request.
@@ -3185,8 +3246,14 @@ impl AgentHarness for Drive<'_> {
                         )),
                     )
                 } else {
-                    if self.progress.human_boundary_seen() {
+                    // An independent Chat that answered is finished. Leaving
+                    // its ledger active made the next task inherit this
+                    // spend. A Chat seeded from an open epoch (a status
+                    // question while a goal is running) keeps that epoch.
+                    if self.progress.human_boundary_seen() || !self.preserve_running_epoch {
                         self.progress.enter_closed();
+                    }
+                    if self.progress.human_boundary_seen() {
                         (self.observer)(AgentEvent::ProgressUpdated {
                             ledger: self.progress.clone(),
                         });
@@ -3262,6 +3329,11 @@ impl AgentHarness for Drive<'_> {
         // mechanical proof that prose in this turn is a delivery rather than
         // narration: both shapes are text next to a tool call.
         let mut goal_delivery_declared = false;
+        // Whether that declaration is a replacement of an answer the model
+        // already offered (`update_goal(revise_answer = true)`). Without it, a
+        // later declaration never displaces the earlier candidate: a repair
+        // round that repeats `deliver_answer` is still only a repair.
+        let mut goal_answer_revised = false;
         // Images loaded via view_image this round, injected as a user message
         // after the tool results so a vision model sees them next request.
         let mut pending_images: Vec<ContentPart> = Vec::new();
@@ -3305,6 +3377,13 @@ impl AgentHarness for Drive<'_> {
         // Ids/names survive the consuming loop below so calls the cancel
         // cut short can still be refused in place (transcript pairing).
         let call_snapshot: Vec<ToolCall> = calls.clone();
+        // Whether this response ran anything beyond the goal's own
+        // bookkeeping. Prose a work tool follows is progress, not the answer,
+        // and it is also what separates "the answer I just wrote" from "text
+        // written before the work this round performed".
+        let round_has_work = call_snapshot
+            .iter()
+            .any(|call| !is_goal_bookkeeping(&call.name));
 
         let advertised: std::collections::HashSet<String> =
             self.tools.iter().map(|tool| tool.name.clone()).collect();
@@ -3899,6 +3978,21 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
+                // What the model declared about its visible text, read on every
+                // resolution attempt. `deliver_answer` offers this round's text
+                // as the answer; `revise_answer` says it replaces an answer
+                // already offered. Only the second may replace a candidate.
+                let revises_answer = call
+                    .arguments
+                    .get("revise_answer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let declares_answer = revises_answer
+                    || call
+                        .arguments
+                        .get("deliver_answer")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 // The user's pause is not the model's obstruction. A model
                 // that reaches the authorized boundary truthfully reports
                 // "waiting for the user", and `blocked` is the only terminal
@@ -3951,9 +4045,19 @@ impl AgentHarness for Drive<'_> {
                 // actually passed after the change or an explicit
                 // `not_applicable` reason. No semantic judgement is made here.
                 if reason == StopReason::Completed {
+                    // What the model declared about its visible text. Read on
+                    // every completion attempt, accepted or refused: a refused
+                    // attempt's declaration is the answer candidate, and a
+                    // revision must be able to replace an earlier candidate.
                     let claim = match super::goal_verification::parse_claim(&call.arguments) {
                         Ok(claim) => claim,
                         Err(message) => {
+                            self.note_refused_completion(
+                                &round_prose,
+                                declares_answer,
+                                revises_answer,
+                                round_has_work,
+                            );
                             denied_calls_this_round += 1;
                             (self.observer)(AgentEvent::GoalIntercepted {
                                 kind: "invalid_verification".to_string(),
@@ -3995,6 +4099,12 @@ impl AgentHarness for Drive<'_> {
                             self.repeated_gate_refusal = None;
                         }
                         super::goal_verification::VerificationDecision::Refuse(message) => {
+                            self.note_refused_completion(
+                                &round_prose,
+                                declares_answer,
+                                revises_answer,
+                                round_has_work,
+                            );
                             verification_refusals_this_round += 1;
                             note_gate_refusal(&mut self.repeated_gate_refusal, &message);
                             (self.observer)(AgentEvent::GoalIntercepted {
@@ -4045,6 +4155,12 @@ impl AgentHarness for Drive<'_> {
                             ) {
                                 Ok(accounting) => accounting,
                                 Err(message) => {
+                                    self.note_refused_completion(
+                                        &round_prose,
+                                        declares_answer,
+                                        revises_answer,
+                                        round_has_work,
+                                    );
                                     denied_calls_this_round += 1;
                                     (self.observer)(AgentEvent::GoalIntercepted {
                                         kind: "invalid_requirements".to_string(),
@@ -4091,6 +4207,12 @@ impl AgentHarness for Drive<'_> {
                                     self.requirements_refusal = None;
                                 }
                                 goal_scope::ScopeDecision::Refuse(message) => {
+                                    self.note_refused_completion(
+                                        &round_prose,
+                                        declares_answer,
+                                        revises_answer,
+                                        round_has_work,
+                                    );
                                     denied_calls_this_round += 1;
                                     // A DIFFERENT verdict after an earlier one is
                                     // the model answering the feedback. The first
@@ -4182,11 +4304,8 @@ impl AgentHarness for Drive<'_> {
                     .trim()
                     .to_string();
                 goal_resolution = Some((reason, summary));
-                goal_delivery_declared = call
-                    .arguments
-                    .get("deliver_answer")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                goal_delivery_declared = declares_answer;
+                goal_answer_revised = revises_answer;
                 results[index] = Some(ContentPart::ToolResult {
                     result: ToolResultContent {
                         call_id: call.id,
@@ -5181,6 +5300,7 @@ impl AgentHarness for Drive<'_> {
                             ok: !is_error,
                             model_step: model_steps,
                             mutation_ops: self.ledger.total_mutation_ops,
+                            call_id: Some(call.id.as_str().to_string()),
                         });
                     if self.verification_runs.len() > 64 {
                         self.verification_runs.remove(0);
@@ -5196,6 +5316,7 @@ impl AgentHarness for Drive<'_> {
                         .push(super::goal_verification::PendingCommand {
                             label,
                             task_id: command_facts.started_task.clone(),
+                            call_id: Some(call.id.as_str().to_string()),
                         });
                     if self.pending_commands.len() > MAX_PENDING_COMMANDS {
                         self.pending_commands.remove(0);
@@ -5222,6 +5343,12 @@ impl AgentHarness for Drive<'_> {
             {
                 // The task produced its result: it is no longer a pending
                 // start, whatever label the process reports.
+                let started_call = self
+                    .pending_commands
+                    .iter()
+                    .rev()
+                    .find(|pending| pending.task_id.as_deref() == Some(result.task_id.as_str()))
+                    .and_then(|pending| pending.call_id.clone());
                 self.pending_commands
                     .retain(|pending| pending.task_id.as_deref() != Some(result.task_id.as_str()));
                 let duplicate = self
@@ -5235,6 +5362,7 @@ impl AgentHarness for Drive<'_> {
                             ok: result.ok,
                             model_step: model_steps,
                             mutation_ops: self.ledger.total_mutation_ops,
+                            call_id: started_call,
                         });
                     if self.verification_runs.len() > 64 {
                         self.verification_runs.remove(0);
@@ -6024,9 +6152,7 @@ impl AgentHarness for Drive<'_> {
         // Prose a work tool followed is progress, not the answer. Bookkeeping
         // (`update_goal`, `update_plan`) does not erase an answer the round
         // already wrote.
-        let work_executed = call_snapshot
-            .iter()
-            .any(|call| !is_goal_bookkeeping(&call.name));
+        let work_executed = round_has_work;
         if work_executed {
             self.terminal_answer = None;
         } else if round_spoke {
@@ -6054,13 +6180,32 @@ impl AgentHarness for Drive<'_> {
                 };
                 return self.finish_settled_goal(rt, messages, model_steps).await;
             }
-            // Settling without saying which text is the answer settles the
-            // goal, not the delivery. Prose the model happened to publish in a
-            // bookkeeping round (a transition, the state of the last check)
-            // has the same protocol shape as a finished answer, so it is not
-            // promoted on the runtime's guess: the post-settlement request
-            // below is the compatibility path, and it asks for the answer.
-            if !goal_delivery_declared {
+            // Delivery is an explicit commit. A refusal did not settle the
+            // goal, so the answer offered with it is only a candidate; the
+            // accepting round may deliver that candidate, must not let its own
+            // repair prose take the candidate's place, and may replace it only
+            // when the model explicitly says the answer changed.
+            if goal_answer_revised {
+                // The replacing text is this round's declared prose (or the
+                // last prose before a bookkeeping-only round). No text means
+                // there is nothing to revise with: ask for the answer.
+                if self
+                    .terminal_answer
+                    .as_ref()
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    self.answer_candidate = self.terminal_answer.clone();
+                    return self.finish_settled_goal(rt, messages, model_steps).await;
+                }
+                self.terminal_answer = None;
+            } else if let Some(candidate) = self
+                .answer_candidate
+                .clone()
+                .filter(|text| !text.trim().is_empty())
+            {
+                self.terminal_answer = Some(candidate);
+                return self.finish_settled_goal(rt, messages, model_steps).await;
+            } else if !goal_delivery_declared {
                 self.terminal_answer = None;
             } else if self.terminal_answer.is_some() {
                 // The declared text is the answer, already written: deliver it
@@ -6727,6 +6872,12 @@ impl AgentHarness for Drive<'_> {
             // `on_quiet` owns every quiet exit and returns its own outcome, so
             // the kernel's neutral model-end never decides anything here.
             KernelStop::ModelEnd => {
+                if !self.executor.goal_mode()
+                    && !self.preserve_running_epoch
+                    && !self.progress.is_terminal_for_inheritance()
+                {
+                    self.progress.enter_closed();
+                }
                 (self.observer)(AgentEvent::Finished(self.last_text.clone()));
                 self.enter_finalization();
                 self.flush_epoch(rt);

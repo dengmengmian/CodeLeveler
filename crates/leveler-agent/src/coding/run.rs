@@ -1438,8 +1438,34 @@ impl CodingRuntime {
     /// The engine loads the same durable rows again when it actually seeds; the
     /// decision is the harness's, because forming it requires reading Coding
     /// semantics — which is exactly what F9.1 moved out of the engine.
-    async fn prior_epoch_open(&self, session_id: &SessionId) -> Result<bool, EngineError> {
+    async fn prior_epoch_open(
+        &self,
+        session_id: &SessionId,
+        continuing_goal: bool,
+    ) -> Result<bool, EngineError> {
         let events = self.engine.stores.events.as_ref();
+        // An answered Chat can leave its last progress phase active. The
+        // durable task terminal closes that epoch for new work, including
+        // sessions written before this check. An older terminal must not
+        // close a newer window that crashed before it could publish its own.
+        if !continuing_goal
+            && let Some(terminal) = events
+                .load_last_by_type(session_id, "task_finished", None)
+                .await?
+            && matches!(
+                EngineEvent::from_payload(&terminal.payload)?,
+                EngineEvent::TaskFinished {
+                    outcome: TaskOutcome::Completed,
+                    ..
+                }
+            )
+            && events
+                .load_last_by_type(session_id, "turn_started", None)
+                .await?
+                .is_none_or(|start| start.sequence < terminal.sequence)
+        {
+            return Ok(false);
+        }
         let progress = crate::coding::turn::last_persisted_progress(events, session_id).await?;
         let plan = crate::coding::turn::last_persisted_plan(events, session_id).await?;
         Ok(prior_epoch_open(plan.as_ref(), progress.as_ref()))
@@ -2014,6 +2040,7 @@ impl CodingRuntime {
                     &runner,
                     spec,
                     &goal,
+                    continued_running,
                     content,
                     declaration,
                     observer,
@@ -2134,10 +2161,11 @@ impl CodingRuntime {
         // a Chat turn. Recording it here is what keeps a supplement from being
         // lost when the user did not type `继续` (the resume path records the
         // same text for a continuation).
-        if let Some(goal_id) = self.single_running_goal(&token.task_id).await?
+        let running_goal = self.single_running_goal(&token.task_id).await?;
+        if let Some(goal_id) = running_goal.as_ref()
             && let Some(text) = objective_hint.as_deref()
         {
-            self.record_goal_instruction(&token, &goal_id, text, InstructionBar::ChatMessage)
+            self.record_goal_instruction(&token, goal_id, text, InstructionBar::ChatMessage)
                 .await?;
         }
         let runner = TurnRunner {
@@ -2149,7 +2177,9 @@ impl CodingRuntime {
             clarifier: self.clarifier.clone(),
             lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
-        let prior_epoch_open = self.prior_epoch_open(session_id).await?;
+        let prior_epoch_open = self
+            .prior_epoch_open(session_id, running_goal.is_some())
+            .await?;
         let initiating_message =
             Message::from_parts(Role::User, content.clone(), Some(origin.clone()));
         let terminal_cancellation = cancellation.clone();
@@ -2824,8 +2854,8 @@ impl CodingRuntime {
             );
             // Replay the already durable delivery to this continuation's
             // observer. This is presentation recovery, not a second append:
-            // headless clients need the accepted answer even when no model
-            // turn runs, and interactive clients ignore the delivery fact.
+            // headless clients emit the accepted answer, and interactive
+            // clients use the fact to name the answer already on screen.
             observer(EngineEvent::DeliveryCommitted {
                 text: delivery.text.clone(),
                 stop: delivery.stop,
@@ -3346,12 +3376,14 @@ impl CodingRuntime {
     }
 
     /// The direct strategy: one goal turn.
+    #[allow(clippy::too_many_arguments)]
     async fn run_direct(
         &self,
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         goal_id: &leveler_core::GoalId,
+        continuing_goal: bool,
         content: Vec<ContentPart>,
         declaration: Option<String>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
@@ -3364,7 +3396,7 @@ impl CodingRuntime {
             goal_id,
             Message::from_parts(Role::User, content, Some(TranscriptOrigin::UserInput)),
             self.factory.independent_review,
-            false,
+            continuing_goal,
             declaration,
             observer,
             cancellation,
@@ -3386,7 +3418,7 @@ impl CodingRuntime {
         goal_id: &leveler_core::GoalId,
         task: Message,
         review_policy: IndependentReviewPolicy,
-        continues_task_budget: bool,
+        continuing_goal: bool,
         goal_declaration: Option<String>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
@@ -3428,8 +3460,9 @@ impl CodingRuntime {
         if objective_text.trim() != content_objective_text(&task.content).trim() {
             prior.insert(0, leveler_context::objective_pin_message(&objective_text));
         }
-        let prior_epoch_open =
-            continues_task_budget || self.prior_epoch_open(&runner.session_id).await?;
+        let prior_epoch_open = self
+            .prior_epoch_open(&runner.session_id, continuing_goal)
+            .await?;
         // A goal that already ran windows keeps their mechanical verification
         // facts. A brand-new goal has none, and the loader returns empty.
         let verification_runs = crate::coding::turn::load_goal_verification_runs(

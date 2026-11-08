@@ -297,6 +297,7 @@ mod tests {
                 created_at: Utc::now(),
                 reasoning_effort: None,
                 error_detail: None,
+                turn_id: None,
             },
         }
     }

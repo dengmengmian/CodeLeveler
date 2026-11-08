@@ -212,6 +212,30 @@ fn assistant_says_and_calls(
     }
 }
 
+/// A response that publishes several tool calls and no prose.
+fn assistant_calls(calls: &[(&str, &str, serde_json::Value)]) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: calls
+                .iter()
+                .map(|(id, name, arguments)| ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new(*id),
+                        name: (*name).to_string(),
+                        arguments: arguments.clone(),
+                    },
+                })
+                .collect(),
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
 fn goal_complete(id: &str, deliver: Option<bool>) -> ModelResponse {
     let mut args = serde_json::json!({
         "status": "complete",
@@ -641,6 +665,187 @@ async fn a_refused_verification_claim_is_not_delivered() {
     );
 }
 
+fn deliveries_of(run: &Run) -> Vec<&str> {
+    run.events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::DeliveryCommitted { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn command_calls(run: &Run) -> usize {
+    run.events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCall { name, .. } if name == "run_command"
+            )
+        })
+        .count()
+}
+
+/// A full command plus a trailing result note is that execution. The note
+/// must not force another run of the same check.
+#[tokio::test]
+async fn a_trailing_result_note_accepts_without_another_command() {
+    let answer = "Git was available. The version check passed.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            answer,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "git --version → available"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_text("this later progress must not be requested"),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert!(
+        !run.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "verification_refused"
+        )),
+        "a result note is not a different command: {:?}",
+        run.events
+    );
+    assert_eq!(command_calls(&run), 1);
+    assert_eq!(deliveries_of(&run), vec![answer]);
+    assert_eq!(run.final_text(), answer);
+    assert_eq!(
+        run.outcome.model_steps, 2,
+        "acceptance does not add a round"
+    );
+}
+
+/// The answer written with the refused citation stays the delivery when a
+/// later round only corrects the citation.
+#[tokio::test]
+async fn a_citation_repair_keeps_the_answer_from_the_refused_attempt() {
+    let answer = "Git was available. The version check passed. Backup kept. Service is up.";
+    let repair = "我去掉附加说明后重新提交";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            answer,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "git status"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            repair,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "call_id:probe"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_text("this later progress must not replace the answer"),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "verification_refused"
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        command_calls(&run),
+        1,
+        "the cited execution is not repeated"
+    );
+    assert_eq!(deliveries_of(&run), vec![answer]);
+    assert_eq!(run.finished_texts(), vec![answer.to_string()]);
+    assert_ne!(run.final_text(), repair);
+    assert_eq!(
+        run.outcome.model_steps, 3,
+        "the repair settles; it does not ask again"
+    );
+}
+
+/// A second bad citation does not replace the answer captured on the first.
+#[tokio::test]
+async fn repeated_citation_refusals_keep_the_first_answer() {
+    let answer = "Git was available. The version check passed. Backup kept. Service is up.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            answer,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "git status"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            "still the wrong command",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "git status --short"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g3",
+            "我去掉附加说明后重新提交",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "call_id:probe"},
+                "deliver_answer": true,
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(command_calls(&run), 1);
+    assert_eq!(deliveries_of(&run), vec![answer]);
+    assert_eq!(run.outcome.model_steps, 4);
+}
+
 /// A textless blocked resolution must not reach back for an earlier refused
 /// claim. The report the model owed is its own text; the summary is the
 /// honest fallback.
@@ -822,4 +1027,350 @@ async fn an_exhausted_request_budget_leaves_a_visible_missing_delivery() {
         "the missing delivery stays observable: {:?}",
         run.outcome.completion_warnings
     );
+}
+
+/// The model may correct its own conclusion. A refusal is not a settlement:
+/// the answer offered with it is only a candidate, and an explicit revision
+/// (`revise_answer`) replaces it. The delivered text is the revision, not the
+/// first answer that happened to be written.
+#[tokio::test]
+async fn an_explicit_revision_replaces_the_refused_answer() {
+    let first = "Git was available. The repository is clean. Service is up.";
+    let revised = "Git was available. The repository has two modified files. Service is up.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            first,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "git status"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            revised,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version verified.",
+                "verification": {"status": "passed", "detail": "call_id:probe"},
+                "deliver_answer": true,
+                "revise_answer": true,
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(deliveries_of(&run), vec![revised]);
+    assert_eq!(run.final_text(), revised);
+    assert_ne!(run.final_text(), first);
+    assert_eq!(
+        run.outcome.model_steps, 3,
+        "the revision settles in the same request"
+    );
+}
+
+/// A later revision offered with a still-bad citation is the new candidate.
+/// When the following round repairs the citation without a declaration, the
+/// last explicit revision is delivered — never the first answer.
+#[tokio::test]
+async fn a_revision_chain_delivers_the_last_explicit_revision() {
+    let first = "The migration removed 12 rows.";
+    let second = "The migration removed 10 rows; two were re-inserted.";
+    let third = "The migration removed 10 rows; two remained by design.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            first,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Migration checked.",
+                "verification": {"status": "passed", "detail": "git status"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            second,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Migration checked.",
+                "verification": {"status": "passed", "detail": "git status --short"},
+                "deliver_answer": true,
+                "revise_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g3",
+            third,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Migration checked.",
+                "verification": {"status": "passed", "detail": "call_id:probe"},
+                "deliver_answer": true,
+                "revise_answer": true,
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(deliveries_of(&run), vec![third]);
+    assert_eq!(run.final_text(), third);
+    assert_eq!(run.outcome.model_steps, 4);
+}
+
+/// Prose next to a refused completion that did not declare itself the answer
+/// is progress, not a candidate. The runtime asks for the answer instead of
+/// promoting the progress note.
+#[tokio::test]
+async fn an_undeclared_refusal_does_not_make_its_prose_the_answer() {
+    let progress = "Let me check the recorded output before I claim completion.";
+    let answer = "Git was available; the version check exited 0.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            progress,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version checked.",
+                "verification": {"status": "passed", "detail": "git status"},
+            }),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            "citation corrected",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version checked.",
+                "verification": {"status": "passed", "detail": "call_id:probe"},
+            }),
+        ),
+        assistant_text(answer),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(deliveries_of(&run), vec![answer]);
+    assert_eq!(run.final_text(), answer);
+    assert_ne!(run.final_text(), progress);
+    assert_eq!(
+        run.outcome.model_steps, 4,
+        "one delivery request was needed"
+    );
+}
+
+/// Work and progress between the refused answer and the accepted settlement
+/// do not touch the offered answer. With no declaration on the accepting
+/// round, the answer already offered is the delivery.
+#[tokio::test]
+async fn progress_between_the_refused_answer_and_settlement_keeps_the_answer() {
+    let answer = "Git was available; the version check exited 0.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            answer,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version checked.",
+                "verification": {"status": "passed", "detail": "git status"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "p1",
+            "Checking the workspace once more.",
+            "list_files",
+            serde_json::json!({"path": "."}),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            "Resubmitting the corrected citation.",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Git version checked.",
+                "verification": {"status": "passed", "detail": "call_id:probe"},
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(deliveries_of(&run), vec![answer]);
+    assert_eq!(run.final_text(), answer);
+}
+
+/// A refusal that follows real work in the same round must not reach back for
+/// the prose written before that work. The declaration promises "the answer I
+/// wrote", and after a work round with no visible text there is no such answer
+/// — the model's next stated answer is the one the goal settles on.
+#[tokio::test]
+async fn a_refusal_after_work_does_not_resurrect_the_pre_work_answer() {
+    let stale = "The repository contains 3 tracked files.";
+    let revised = "The repository contains 2 tracked files.";
+    let run = run_goal(vec![
+        assistant_says_and_calls(
+            "p1",
+            stale,
+            "update_plan",
+            serde_json::json!({"plan": [{"step": "count the tracked files", "status": "completed"}]}),
+        ),
+        assistant_calls(&[
+            ("w1", "list_files", serde_json::json!({"path": "."})),
+            (
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "Counted the tracked files.",
+                    "deliver_answer": true,
+                    "verification": {"status": "passed", "detail": "git status"},
+                }),
+            ),
+        ]),
+        assistant_says_and_calls(
+            "g2",
+            revised,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Counted the tracked files.",
+                "deliver_answer": true,
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(deliveries_of(&run), vec![revised]);
+    assert_eq!(run.final_text(), revised);
+}
+
+/// A revision is still only a candidate until the goal settles. When the
+/// revised completion is refused too and the model blocks, neither the
+/// revision nor the superseded answer may be presented as delivered.
+#[tokio::test]
+async fn a_refused_revision_is_not_delivered_when_the_goal_blocks() {
+    let first = "The migration removed 12 rows.";
+    let revised = "The migration removed 10 rows.";
+    let blocked = "Blocked: the migration ledger cannot be read without credentials.";
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "probe",
+            "run_command",
+            serde_json::json!({"program": "git", "args": ["--version"]}),
+        ),
+        assistant_says_and_calls(
+            "g1",
+            first,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Migration checked.",
+                "verification": {"status": "passed", "detail": "git status"},
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g2",
+            revised,
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Migration checked.",
+                "verification": {"status": "passed", "detail": "git status --short"},
+                "deliver_answer": true,
+                "revise_answer": true,
+            }),
+        ),
+        assistant_says_and_calls(
+            "g3",
+            blocked,
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "summary": "Migration ledger unavailable.",
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Blocked);
+    assert_eq!(run.final_text(), blocked);
+    assert_eq!(deliveries_of(&run), vec![blocked]);
+    assert!(!run.finished_texts().iter().any(|text| text == first));
+    assert!(!run.finished_texts().iter().any(|text| text == revised));
+}
+
+/// Two accepted settlements in one response are still one commit. Settlement
+/// is idempotent: a duplicate call cannot publish a second delivery.
+#[tokio::test]
+async fn a_duplicate_settlement_in_one_response_commits_once() {
+    let answer = "Git was available; the version check exited 0.";
+    let settle = || ToolCall {
+        id: ToolCallId::new("g"),
+        name: "update_goal".to_string(),
+        arguments: serde_json::json!({
+            "status": "complete",
+            "summary": "Git version checked.",
+            "deliver_answer": true,
+        }),
+    };
+    let mut first = settle();
+    let mut second = settle();
+    first.id = ToolCallId::new("g1");
+    second.id = ToolCallId::new("g2");
+    let response = ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Text {
+                    text: answer.to_string(),
+                },
+                ContentPart::ToolCall { call: first },
+                ContentPart::ToolCall { call: second },
+            ],
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    };
+    let run = run_goal(vec![response]).await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(deliveries_of(&run), vec![answer]);
+    assert_eq!(run.outcome.model_steps, 1);
 }
