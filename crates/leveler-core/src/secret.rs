@@ -38,6 +38,11 @@ const MIN_SECRET_LEN: usize = 6;
 /// grow the registry without limit.
 const MAX_REGISTERED_PER_SESSION: usize = 256;
 
+/// A PEM block or a very long free-form value is still redacted where it was
+/// found; remembering the whole block for later prose matching is not useful
+/// and would keep multi-kilobyte secrets in memory.
+const MAX_REGISTERED_VALUE_LEN: usize = 4096;
+
 /// One detected secret: where it sat and what the value was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedSecret {
@@ -52,23 +57,131 @@ pub struct DetectedSecret {
 /// with secret VALUES replaced and the list of values that were found.
 ///
 /// Keys, structure, code, and prose are preserved. Safe to run on arbitrary
-/// tool output — source files, shell output, JSON, YAML, `.env`, logs.
+/// tool output — source files, shell output, JSON, YAML, .env, logs. Private
+/// key blocks and sensitive block scalars are handled before the line pass so
+/// a multi-line credential is one classified value, not its first line.
 pub fn sanitize_model_visible(text: &str) -> (String, Vec<DetectedSecret>) {
     if text.is_empty() {
         return (String::new(), Vec::new());
     }
-    let mut found = Vec::new();
+    let (text, mut found) = redact_private_key_blocks(text);
     let mut out = String::with_capacity(text.len());
+    let mut block_indent: Option<usize> = None;
     for line in text.split_inclusive('\n') {
-        out.push_str(&sanitize_line(line, &mut found));
+        if let Some(indent) = block_indent {
+            let (source_start, content) = source_line(line);
+            let trimmed = content.trim_start_matches([' ', '\t']);
+            let leading = content.len() - trimmed.len();
+            if trimmed.is_empty() {
+                out.push_str(line);
+                continue;
+            }
+            if leading >= indent {
+                let newline = if line.ends_with('\n') { "\n" } else { "" };
+                let value = trimmed.trim_end_matches(['\n', '\r']).trim();
+                if !value.is_empty() && value != SECRET_PLACEHOLDER {
+                    found.push(DetectedSecret {
+                        value: value.to_string(),
+                        key: "block scalar".to_string(),
+                    });
+                }
+                out.push_str(&line[..source_start]);
+                out.push_str(&content[..leading]);
+                out.push_str(SECRET_PLACEHOLDER);
+                out.push_str(newline);
+                continue;
+            }
+            block_indent = None;
+        }
+        let sanitized = sanitize_line(line, &mut found);
+        if let Some(indent) = block_scalar_indent(line) {
+            block_indent = Some(indent);
+        }
+        out.push_str(&sanitized);
     }
     (out, found)
+}
+
+/// Replace complete PEM private-key blocks. A block that starts and never ends
+/// is redacted through the end of the text: fail closed rather than expose the
+/// first line and leave the body readable.
+fn redact_private_key_blocks(text: &str) -> (String, Vec<DetectedSecret>) {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if is_private_key_marker(lines[i], true) {
+            let mut end = i;
+            while end < lines.len() && !is_private_key_marker(lines[end], false) {
+                end += 1;
+            }
+            let last = end.min(lines.len().saturating_sub(1));
+            let values = lines[i..=last].concat();
+            found.push(DetectedSecret {
+                value: values.trim_end().to_string(),
+                key: "PEM private key".to_string(),
+            });
+            out.push_str(SECRET_PLACEHOLDER);
+            if lines[last].ends_with('\n') {
+                out.push('\n');
+            }
+            i = last + 1;
+            continue;
+        }
+        out.push_str(lines[i]);
+        i += 1;
+    }
+    (out, found)
+}
+
+fn is_private_key_marker(line: &str, begin: bool) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let marker = if begin { "-----begin " } else { "-----end " };
+    lower.contains(marker) && lower.contains("private key-----")
+}
+
+/// Read_file renders each line as a right-aligned number, a tab, then the
+/// source text. Block-scalar indentation must be measured against the source
+/// text, not the renderer's number prefix.
+fn source_line(line: &str) -> (usize, &str) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while matches!(bytes.get(i), Some(b' ')) {
+        i += 1;
+    }
+    let digits = i;
+    while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+        i += 1;
+    }
+    if i > digits && matches!(bytes.get(i), Some(b'\t') | Some(b' ')) {
+        return (i + 1, &line[i + 1..]);
+    }
+    (0, line)
+}
+
+/// A YAML/Ansible-style block scalar under a sensitive key:
+///   password: |
+///     value-on-the-next-lines
+/// Returns the minimum indentation that belongs to the block. The header line
+/// itself is left intact; its indented body is replaced by the placeholder.
+fn block_scalar_indent(line: &str) -> Option<usize> {
+    let (_, content) = source_line(line);
+    let (_, key_end) = next_sensitive_key(content, 0)?;
+    let after = content[key_end..].trim_start();
+    let value = after.strip_prefix(':')?.trim();
+    if matches!(value, "|" | ">" | "|-" | ">-" | "|+" | ">+") {
+        let indent = content.len() - content.trim_start_matches([' ', '\t']).len();
+        Some(indent + 1)
+    } else {
+        None
+    }
 }
 
 fn sanitize_line(line: &str, found: &mut Vec<DetectedSecret>) -> String {
     let step = redact_url_userinfo(line, found);
     let step = redact_sensitive_assignments(&step, found);
-    // Self-identifying key shapes (`sk-…`, `ghp_…`, `AKIA…`) need no key
+    // Self-identifying key shapes (sk-…, ghp_…, AKIA…) need no key
     // position at all — they ARE the credential. Carried over from the
     // pre-F6 scrubber so durable coverage never regresses.
     redact_prefixed_key_shapes(&step, found)
@@ -190,6 +303,7 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
         }
         cursor = skip_spaces(bytes, cursor);
         // `Authorization: Bearer <token>` — the scheme word is not the secret.
+        let mut credential_scheme = false;
         for scheme in ["bearer ", "basic ", "token "] {
             // `is_char_boundary` guards the slice: the value may begin with a
             // multi-byte character (Chinese prose around a credential is a
@@ -201,6 +315,7 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
             {
                 cursor += scheme.len();
                 cursor = skip_spaces(bytes, cursor);
+                credential_scheme = true;
                 break;
             }
         }
@@ -211,7 +326,7 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
         };
         let value = &line[value_start..value_end];
         out.push_str(&line[idx..value_start]);
-        if is_credential_value(value, quoted, code_line) {
+        if is_credential_value(value, quoted, code_line, credential_scheme) {
             out.push_str(SECRET_PLACEHOLDER);
             found.push(DetectedSecret {
                 value: value.to_string(),
@@ -259,9 +374,17 @@ fn next_sensitive_key(line: &str, from: usize) -> Option<(usize, usize)> {
         "passphrase",
         "password",
         "passwd",
+        "pass",
+        "db_pass",
+        "db_password",
+        "database_password",
+        "mysql_root_password",
+        "postgres_password",
         "secret",
+        "secrets",
         "token",
         "credential",
+        "credentials",
         "pwd",
     ];
     let lower = line.to_ascii_lowercase();
@@ -326,7 +449,9 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
         }
         _ => {
             let end = line[from..]
-                .find(|c: char| c.is_whitespace() || matches!(c, ',' | '}' | ')' | ';' | '`'))
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, ',' | '}' | ')' | ';' | '\'' | '"' | '`')
+                })
                 .map(|rel| from + rel)
                 .unwrap_or(line.len());
             (end > from).then_some((from, end, false))
@@ -335,7 +460,12 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
 }
 
 /// Does this value look like a credential rather than code or a placeholder?
-fn is_credential_value(value: &str, quoted: bool, code_line: bool) -> bool {
+fn is_credential_value(
+    value: &str,
+    quoted: bool,
+    code_line: bool,
+    credential_scheme: bool,
+) -> bool {
     let trimmed = value.trim();
     if trimmed.len() < MIN_SECRET_LEN {
         return false;
@@ -345,32 +475,153 @@ fn is_credential_value(value: &str, quoted: bool, code_line: bool) -> bool {
         "<secret>",
         "<redacted>",
         "changeme",
+        "demo-password",
+        "test-password",
+        "example-password",
+        "sample-password",
+        "dummy-password",
         "password",
         "secret",
         "string",
         "boolean",
         "number",
         "undefined",
+        "required",
+        "invalid",
+        "optional",
+        "enabled",
+        "disabled",
+        "true",
+        "false",
+        "none",
+        "null",
+        "bearer",
+        "basic",
+        "completed",
+        "pending",
+        "running",
+        "failed",
+        "success",
+        "valid",
     ];
     let lower = trimmed.to_ascii_lowercase();
     if NON_SECRETS.contains(&lower.as_str()) {
         return false;
     }
-    if is_code_expression(trimmed) {
+    if is_non_secret_prose(trimmed) {
+        return false;
+    }
+    // A scheme word is explicit credential context: a dotted opaque token
+    // (Bearer abc.def.ghi) is a token, not a code expression.
+    if !credential_scheme && is_code_expression(trimmed) {
         return false;
     }
     // On a line that reads as source code, a bare value is an identifier or a
     // language expression, not the credential literal. Quoted literals stay
-    // eligible: `Password: "hunter2"` is a value the source really contains.
+    // eligible: Password: "hunter2" is a value the source really contains.
     //
     // Only a *bare identifier* is demoted, not every bare token: the storage
-    // scrubber runs on prose too, and `password: p@ss,with{braces}` is prose
+    // scrubber runs on prose too, and password: p@ss,with{braces} is prose
     // whose value happens to contain code punctuation. It must still be
     // redacted.
     if code_line && !quoted && is_bare_identifier(trimmed) {
         return false;
     }
     true
+}
+
+/// A value used for structured JSON/YAML key decisions. It does not know the
+/// source line, so it is deliberately the strict subset of the text rules.
+pub(crate) fn is_secret_like_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.len() < MIN_SECRET_LEN {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "[redacted]"
+            | "<secret>"
+            | "<redacted>"
+            | "changeme"
+            | "demo-password"
+            | "test-password"
+            | "example-password"
+            | "sample-password"
+            | "dummy-password"
+            | "password"
+            | "secret"
+            | "string"
+            | "boolean"
+            | "number"
+            | "undefined"
+            | "required"
+            | "invalid"
+            | "optional"
+            | "enabled"
+            | "disabled"
+            | "true"
+            | "false"
+            | "none"
+            | "null"
+            | "bearer"
+            | "basic"
+            | "completed"
+            | "pending"
+            | "running"
+            | "failed"
+            | "success"
+            | "valid"
+    ) {
+        return false;
+    }
+    if is_non_secret_prose(trimmed) {
+        return false;
+    }
+    if is_code_expression(trimmed) {
+        return false;
+    }
+    true
+}
+
+/// A short UI/status phrase under a sensitive key is not a credential. The
+/// hint list catches common labels (Enter your password, The token has
+/// expired) without treating every space as prose: a passphrase whose first
+/// word is not a UI verb still gets redacted.
+fn is_non_secret_prose(value: &str) -> bool {
+    if !value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let first = value
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        first.as_str(),
+        "enter"
+            | "your"
+            | "the"
+            | "please"
+            | "new"
+            | "confirm"
+            | "current"
+            | "forgot"
+            | "reset"
+            | "paste"
+            | "provide"
+            | "specify"
+            | "a"
+            | "an"
+            | "this"
+            | "that"
+            | "not"
+            | "no"
+            | "if"
+            | "when"
+            | "use"
+            | "set"
+    )
 }
 
 /// A single language-level identifier (`redisPassword`, `_token`, `apiKey`).
@@ -503,7 +754,10 @@ pub fn register_session_secrets(session: &str, secrets: &[DetectedSecret]) {
     let entry = map.entry(session.to_string()).or_default();
     for secret in secrets {
         let value = secret.value.trim();
-        if value.len() < MIN_SECRET_LEN || entry.len() >= MAX_REGISTERED_PER_SESSION {
+        if value.len() < MIN_SECRET_LEN
+            || value.len() > MAX_REGISTERED_VALUE_LEN
+            || entry.len() >= MAX_REGISTERED_PER_SESSION
+        {
             continue;
         }
         if !entry.iter().any(|v| v == value) {
@@ -999,5 +1253,79 @@ mod tests {
         let text = "nothing sensitive here";
         assert_eq!(scrub_registered_secrets("sess-empty", text), text);
         assert_eq!(scrub_registered_secrets("", text), text);
+    }
+
+    /// F-03: the shapes the audit found outside the old key list.
+    #[test]
+    fn pem_common_pass_and_multiline_shapes_are_redacted() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdef\n-----END RSA PRIVATE KEY-----";
+        let out = sanitize(pem);
+        assert_eq!(out, SECRET_PLACEHOLDER, "PEM must be one hidden value");
+        assert!(!out.contains("MIIEowIBAAKCAQEA1234567890abcdef"));
+
+        for input in [
+            "DB_PASS=hunter2-abc",
+            "PASS=hunter2-abc",
+            "database_password=hunter2-abc",
+            "mysql_root_password=hunter2-abc",
+            "{\"secrets\": \"hunter2-abc\"}",
+            "{\"credentials\": \"hunter2-abc\"}",
+        ] {
+            let out = sanitize(input);
+            assert!(!out.contains("hunter2-abc"), "missed {input:?} -> {out:?}");
+        }
+
+        let yaml = "password: |\n  hunter2-abc\n  more-secret\nnext: keep";
+        let out = sanitize(yaml);
+        assert!(!out.contains("hunter2-abc"), "{out}");
+        assert!(!out.contains("more-secret"), "{out}");
+        assert!(out.contains("next: keep"), "{out}");
+    }
+
+    /// F-06: ordinary status/prose values under a sensitive word are not
+    /// credentials, and a dotted opaque token under a scheme is.
+
+    #[test]
+    fn equality_is_not_a_password_assignment() {
+        let line = "\treturn password == \"demo-password\"";
+        assert_eq!(sanitize(line), line);
+        let assignment = "\tpassword = \"demo-password\"";
+        assert_eq!(sanitize(assignment), assignment);
+    }
+
+    #[test]
+    fn read_file_line_numbers_do_not_defeat_block_scalar_redaction() {
+        let input = "     1\tdb_password: |\n     2\t  hunter2-abc\n     3\t  more-secret\n     4\tsafe: yes\n";
+        let out = sanitize(input);
+        assert!(!out.contains("hunter2-abc"), "{out}");
+        assert!(!out.contains("more-secret"), "{out}");
+        assert!(out.contains("safe: yes"), "{out}");
+    }
+
+    #[test]
+    fn shell_header_keeps_its_quote_boundary() {
+        let out = sanitize("curl -H 'X-Api-Key: hunter2-abc' https://x");
+        assert!(!out.contains("hunter2-abc"), "{out}");
+        assert!(
+            out.contains("' https://x"),
+            "closing quote must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn status_prose_and_dotted_bearer_are_classified() {
+        assert_eq!(
+            sanitize("authorization: required"),
+            "authorization: required"
+        );
+        assert_eq!(sanitize("token: invalid"), "token: invalid");
+        assert_eq!(
+            sanitize("{\"password\": \"Enter your password\"}"),
+            "{\"password\": \"Enter your password\"}"
+        );
+        let dotted = "Authorization: Bearer abcdef0123456789.abcdef0123456789";
+        let out = sanitize(dotted);
+        assert!(!out.contains("abcdef0123456789"), "{out}");
+        assert!(out.contains("Bearer"), "{out}");
     }
 }

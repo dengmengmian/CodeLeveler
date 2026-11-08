@@ -241,64 +241,131 @@ fn scrub_registered_in_json(value: &mut serde_json::Value, session: &str) {
     }
 }
 
-fn redact_json_string_values(value: &mut serde_json::Value) {
+fn redact_json_string_values(value: &mut serde_json::Value) -> Vec<crate::secret::DetectedSecret> {
+    let mut found = Vec::new();
+    sanitize_json_value_inner(value, false, false, &mut found);
+    found
+}
+
+/// Sanitize every string value of a structured value while preserving its
+/// keys, types and shape. This is the single structured-data entry point used
+/// by durable redaction and by tool-metadata/projection boundaries.
+pub fn sanitize_json_value(value: &mut serde_json::Value) -> Vec<crate::secret::DetectedSecret> {
+    redact_json_string_values(value)
+}
+
+fn sanitize_json_value_inner(
+    value: &mut serde_json::Value,
+    sensitive_parent: bool,
+    secret_container: bool,
+    found: &mut Vec<crate::secret::DetectedSecret>,
+) {
     match value {
         serde_json::Value::String(s) => {
-            // Value-position aware, so a stored record keeps ordinary code and
-            // prose intact — the old keyword scrubber rewrote an assistant's
-            // correct answer about `pub password: String` into `[REDACTED]`.
-            let (redacted, _) = crate::secret::sanitize_model_visible(s);
+            if s.is_empty() || s == "[REDACTED]" {
+                return;
+            }
+            if secret_container || (sensitive_parent && is_json_credential_value(s)) {
+                found.push(crate::secret::DetectedSecret {
+                    value: s.clone(),
+                    key: "structured".to_string(),
+                });
+                *s = "[REDACTED]".to_string();
+                return;
+            }
+            let (redacted, mut nested) = crate::secret::sanitize_model_visible(s);
             if redacted != *s {
                 *s = redacted;
             }
+            found.append(&mut nested);
         }
         serde_json::Value::Array(items) => {
-            items.iter_mut().for_each(redact_json_string_values);
+            for item in items {
+                sanitize_json_value_inner(item, sensitive_parent, secret_container, found);
+            }
         }
         serde_json::Value::Object(map) => {
             for (key, entry) in map.iter_mut() {
-                // The serialized-text scrubber used to see `"password":"…"` as
-                // one text span and redact by KEY name; after moving to
-                // value-level scrubbing that signal lives here: a sensitive key
-                // redacts its whole string value.
-                match entry {
-                    serde_json::Value::String(s) if is_sensitive_key(key) && !s.is_empty() => {
-                        *s = "[REDACTED]".to_string();
-                    }
-                    _ => redact_json_string_values(entry),
-                }
+                let sensitive = sensitive_parent || is_sensitive_key(key);
+                let container = secret_container || is_secret_container(key);
+                sanitize_json_value_inner(entry, sensitive, container, found);
             }
         }
         _ => {}
     }
 }
 
-/// Key names whose string values are credentials by contract. Mirrors (and
-/// slightly widens, toward over-redaction) the serialized-text coverage of
-/// [`redact_kv_assignments`] + the Authorization-header scrubber.
+/// A value under a sensitive key is a credential only when its shape says so.
+/// This is deliberately stricter than the text path: JSON schema words,
+/// status labels and UI copy must survive.
+fn is_json_credential_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("bearer ") || lower.starts_with("basic ") || lower.starts_with("token ") {
+        return true;
+    }
+    crate::secret::is_secret_like_value(trimmed)
+}
+
+fn is_secret_container(key: &str) -> bool {
+    matches!(normalize_json_key(key).as_str(), "secrets" | "credentials")
+}
+
+/// Exact/suffix credential keys. Substring matching was the F-06 bug:
+/// secret_name, authorization_url, password_policy and secretary are
+/// descriptive fields, not credentials.
 fn is_sensitive_key(key: &str) -> bool {
-    const KEY_MARKERS: &[&str] = &[
-        "api_key",
-        "api-key",
-        "apikey",
-        "access_token",
-        "access-token",
-        "secret",
+    let key = normalize_json_key(key);
+    const EXACT: &[&str] = &[
         "password",
         "passwd",
+        "pwd",
+        "pass",
         "passphrase",
-        "auth_token",
-        "auth-token",
-        "refresh_token",
-        "refresh-token",
-        "private_key",
-        "private-key",
-        "signing_key",
-        "signing-key",
+        "secret",
+        "secrets",
+        "token",
+        "credentials",
+        "credential",
         "authorization",
+        "apikey",
+        "api_key",
+        "accesskey",
+        "access_key",
+        "privatekey",
+        "private_key",
+        "signingkey",
+        "signing_key",
+        "clientsecret",
+        "client_secret",
+        "refreshtoken",
+        "refresh_token",
+        "accesstoken",
+        "access_token",
+        "authtoken",
+        "auth_token",
+        "idtoken",
+        "id_token",
     ];
-    let lower = key.to_ascii_lowercase();
-    KEY_MARKERS.iter().any(|marker| lower.contains(marker))
+    EXACT.contains(&key.as_str())
+        || key.ends_with("_password")
+        || key.ends_with("_passwd")
+        || key.ends_with("_pwd")
+        || key.ends_with("_pass")
+        || key.ends_with("_secret")
+        || key.ends_with("_token")
+        || key.ends_with("_api_key")
+        || key.ends_with("_private_key")
+        || key.ends_with("_signing_key")
+        || key.ends_with("_credentials")
+        || key.ends_with("_authorization")
+}
+
+fn normalize_json_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase().replace('-', "_")
 }
 
 /// `Authorization: Bearer <token>`, JSON `"Authorization":"Bearer …"`, etc.
@@ -946,6 +1013,23 @@ mod tests {
         assert_eq!(truncate_tail_bytes("abc", 0, "[cut]"), "[cut]");
     }
 
+    /// F-16: tool metadata (applied_diff, plan, image-bearing fields) goes
+    /// through the same structured boundary as content.
+    #[test]
+    fn structured_metadata_does_not_bypass_the_sanitizer() {
+        let mut metadata = serde_json::json!({
+            "applied_diff": "+API_TOKEN=hunter2-abc\n",
+            "plan": {"note": "authorization: required"},
+            "safe": "visible"
+        });
+        let found = sanitize_json_value(&mut metadata);
+        let text = metadata.to_string();
+        assert!(!text.contains("hunter2-abc"), "{text}");
+        assert_eq!(metadata["safe"], "visible");
+        assert_eq!(metadata["plan"]["note"], "authorization: required");
+        assert!(!found.is_empty());
+    }
+
     #[test]
     fn copy_projection_keeps_layout_controls_and_real_glyphs() {
         let raw = "\u{1b}[31m│ name │ value │\u{1b}[0m\r\ttabbed\n▏ SELECT 1;";
@@ -956,5 +1040,54 @@ mod tests {
             clean.contains('\t'),
             "a tab is source layout, not a terminal control to erase"
         );
+    }
+
+    /// F-06: exact/named credential keys only; descriptive fields survive.
+    #[test]
+    fn json_descriptive_fields_are_not_credentials() {
+        let payload = r#"{"secret_name":"my-app-secret","authorization_url":"https://example.com/oauth/authorize","password_policy":"strong","secretary":"Alice","safe":"visible"}"#;
+        let out = redact_secrets_json(payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["secret_name"], "my-app-secret");
+        assert_eq!(
+            value["authorization_url"],
+            "https://example.com/oauth/authorize"
+        );
+        assert_eq!(value["password_policy"], "strong");
+        assert_eq!(value["secretary"], "Alice");
+        assert_eq!(value["safe"], "visible");
+    }
+
+    /// Real credential fields still hide; status containers stay identifiable.
+    #[test]
+    fn json_real_credentials_are_hidden_and_containers_are_safe() {
+        let payload = r#"{"password":"hunter2-abc","token":"completed","api_key":"required","secrets":{"db":"hunter2-abc"},"credentials":["x","y"]}"#;
+        let out = redact_secrets_json(payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["password"], "[REDACTED]");
+        assert_eq!(value["token"], "completed");
+        assert_eq!(value["api_key"], "required");
+        assert_eq!(value["secrets"]["db"], "[REDACTED]");
+        assert_eq!(value["credentials"][0], "[REDACTED]");
+    }
+
+    /// A PEM string remains valid JSON and is hidden as one value.
+
+    #[test]
+    fn multiline_json_credential_is_redacted() {
+        let payload = "{\n  \"password\":\n    \"hunter2-abc\"\n}";
+        let out = redact_secrets_json(payload).unwrap();
+        assert!(!out.contains("hunter2-abc"), "{out}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["password"], "[REDACTED]");
+    }
+
+    #[test]
+    fn json_private_key_string_is_hidden() {
+        let payload =
+            r#"{"private_key":"-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"}"#;
+        let out = redact_secrets_json(payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["private_key"], "[REDACTED]");
     }
 }
