@@ -1445,6 +1445,19 @@ impl CodingRuntime {
         else {
             return Ok(messages);
         };
+        // Eval-only: record the projection that is returned into the model
+        // context. Unset in production; this is the same text, not a copy made
+        // by a different path.
+        if let Ok(path) = std::env::var("LEVELER_EVAL_FACTS_TRACE") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(file, "{}", facts.text_content());
+            }
+        }
         messages.retain(|message| !message.text_content().contains(COMPACTION_FACTS_MARKER));
         let at = messages
             .iter()

@@ -3256,6 +3256,53 @@ fn reasoning_retention_override(
     }))
 }
 
+/// EVAL ONLY: `LEVELER_EVAL_CONTEXT_SOFT_PERCENT` lowers the soft compaction
+/// threshold for an isolated dogfood session. Unset leaves production at the
+/// model's declared default; a value outside 1..=99 is refused.
+const CONTEXT_SOFT_PERCENT_ENV: &str = "LEVELER_EVAL_CONTEXT_SOFT_PERCENT";
+
+fn context_soft_percent_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let percent: u8 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{CONTEXT_SOFT_PERCENT_ENV}: expected 1..=99, got {raw:?}"))?;
+    if !(1..=99).contains(&percent) {
+        anyhow::bail!("{CONTEXT_SOFT_PERCENT_ENV}: expected 1..=99, got {percent}");
+    }
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        context_soft_percent: Some(percent),
+        ..Default::default()
+    }))
+}
+
+/// EVAL ONLY: `LEVELER_EVAL_CONTEXT_TRACE=1` persists the model context after
+/// every round using the existing measurement seam. Unset leaves production
+/// byte-identical; it only makes the request context auditable for dogfood.
+const CONTEXT_TRACE_ENV: &str = "LEVELER_EVAL_CONTEXT_TRACE";
+
+fn context_trace_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let enabled = match raw.as_str() {
+        "1" | "true" | "on" => true,
+        "0" | "false" | "off" => false,
+        other => {
+            anyhow::bail!("{CONTEXT_TRACE_ENV}: expected 1/true/on/0/false/off, got {other:?}")
+        }
+    };
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        context_trace: Some(enabled),
+        ..Default::default()
+    }))
+}
+
 /// Read every eval-only override seam and fold them into ONE override set for
 /// `with_execution_overrides` (which replaces, so the seams must be merged
 /// here rather than applied one after another). `None` when no seam is set.
@@ -3274,6 +3321,14 @@ fn eval_env_overrides() -> anyhow::Result<Option<leveler_agent::coding::Executio
     }
     if let Some(o) = reasoning_retention_override(std::env::var(REASONING_RETENTION_ENV).ok())? {
         merged.reasoning_retention = o.reasoning_retention;
+        any = true;
+    }
+    if let Some(o) = context_soft_percent_override(std::env::var(CONTEXT_SOFT_PERCENT_ENV).ok())? {
+        merged.context_soft_percent = o.context_soft_percent;
+        any = true;
+    }
+    if let Some(o) = context_trace_override(std::env::var(CONTEXT_TRACE_ENV).ok())? {
+        merged.context_trace = o.context_trace;
         any = true;
     }
     Ok(any.then_some(merged))

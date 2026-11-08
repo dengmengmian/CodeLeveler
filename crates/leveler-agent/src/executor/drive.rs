@@ -2460,6 +2460,110 @@ impl Drive<'_> {
     }
 }
 
+/// A bounded facts projection for a fold that happens **inside** a live
+/// turn. `assembled_prior` covers the turn boundary; a long turn can fold
+/// several times after it, and those folds must not leave the model with
+/// only the summary. Built from the same in-memory owners the turn already
+/// writes (goal scope, plan, progress, verification).
+async fn retained_facts_after_fold(
+    binder: Option<std::sync::Arc<dyn leveler_engine::GoalBinder>>,
+    objective: String,
+    plan_state: leveler_lifecycle::PlanState,
+    progress: leveler_lifecycle::ProgressLedger,
+    verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+) -> Option<leveler_model::Message> {
+    const MARKER: &str = "## Retained execution facts";
+    const MAX: usize = 3_500;
+    let scope = match binder {
+        Some(binder) => binder.scope().await.ok().flatten(),
+        None => None,
+    };
+    let objective = scope
+        .as_ref()
+        .map(|scope| scope.objective.clone())
+        .unwrap_or(objective);
+    let requirements = scope
+        .as_ref()
+        .map(|scope| goal_scope::extract(&scope.objective, &scope.amendments))
+        .unwrap_or_default();
+    let mut text = format!("{MARKER} (deterministic, not the model summary)\n");
+    if !objective.trim().is_empty() {
+        text.push_str(&format!(
+            "Task objective: {}\n",
+            objective.chars().take(400).collect::<String>()
+        ));
+    }
+    if !requirements.is_empty() {
+        text.push_str("Effective acceptance (the Gate uses exactly this set):\n");
+        for requirement in requirements.iter().take(8) {
+            text.push_str(&format!(
+                "- {} [{}] {}\n",
+                requirement.id,
+                requirement.kind.label(),
+                requirement.text.chars().take(200).collect::<String>()
+            ));
+        }
+        if requirements.len() > 8 {
+            text.push_str(&format!(
+                "…and {} more effective requirements the Gate still enforces.\n",
+                requirements.len() - 8
+            ));
+        }
+    }
+    let open = plan_state.open_steps();
+    if !open.is_empty() {
+        text.push_str("Open plan steps (the runtime still expects these):\n");
+        for step in open.iter().take(10) {
+            text.push_str(&format!(
+                "- [{}] {}\n",
+                step.status.as_str(),
+                step.step.chars().take(180).collect::<String>()
+            ));
+        }
+    }
+    text.push_str(&format!(
+        "Execution so far: phase={:?}, commands={}, modified_files={}\n",
+        progress.phase, progress.cumulative_commands, progress.cumulative_modified_files
+    ));
+    if !verification_runs.is_empty() {
+        text.push_str("Verification evidence (recorded mutation count matters):\n");
+        for run in verification_runs.iter().rev().take(5) {
+            text.push_str(&format!(
+                "- `{}` {} (step {}, mutations {})\n",
+                run.label.chars().take(160).collect::<String>(),
+                if run.ok { "passed" } else { "failed" },
+                run.model_step,
+                run.mutation_ops
+            ));
+        }
+    }
+    if text.len() > MAX {
+        let cut = text
+            .char_indices()
+            .take_while(|(index, _)| *index <= MAX)
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        text.truncate(cut);
+        text.push_str("\n…[facts truncated to the context budget]\n");
+    }
+    let (text, _) = leveler_core::sanitize_model_visible(&text);
+    if let Ok(path) = std::env::var("LEVELER_EVAL_FACTS_TRACE") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{text}");
+        }
+    }
+    Some(leveler_model::Message::text(
+        leveler_model::Role::System,
+        text,
+    ))
+}
+
 #[async_trait]
 impl AgentHarness for Drive<'_> {
     type Stop = AgentOutcome;
@@ -6821,7 +6925,35 @@ impl AgentHarness for Drive<'_> {
                 )));
             }
             // The candidate cleared the gate (or no gate applied): commit it.
-            if let Some(folded) = candidate {
+            if let Some(mut folded) = candidate {
+                // A fold inside the turn has no assembled_prior pass. Insert
+                // the same deterministic facts block here, replacing any
+                // earlier one, so the next round cannot see only the summary.
+                let facts = retained_facts_after_fold(
+                    self.executor.goal_binder().cloned(),
+                    self.objective.text().to_string(),
+                    self.plan_state.clone(),
+                    self.progress.clone(),
+                    self.verification_runs.clone(),
+                )
+                .await;
+                if let Some(facts) = facts {
+                    folded.retain(|message| {
+                        !message
+                            .text_content()
+                            .contains("## Retained execution facts")
+                    });
+                    let at = folded
+                        .iter()
+                        .position(|message| {
+                            message
+                                .text_content()
+                                .contains(leveler_model::COMPACTION_BREADCRUMB_MARKER)
+                        })
+                        .map(|index| index + 1)
+                        .unwrap_or(0);
+                    folded.insert(at, facts);
+                }
                 *messages = folded;
                 self.context_diverged = true;
                 // The fold cycle restarts from the folded size.
