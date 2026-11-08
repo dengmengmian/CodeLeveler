@@ -12,7 +12,7 @@
 - Background work is supervised. Every background task has a durable identity and result; a runtime crash keeps the original task id and its process start identity, and a recovered task is observed rather than spawned again.
 - MCP outcomes distinguish success, failure, timeout, cancellation and transport loss. An unknown outcome is reported as unknown and is never retried blindly.
 - Steering and compaction keep order and identity: a mid-turn instruction survives compaction and resume, a status question adds no goal scope, and `run --resume` sends its instruction through the production amendment path.
-- The resident runtime bounds idle session event streams, so long-running scheduled automation no longer grows memory without bound.
+- Long-running daemons reclaim request and session state: a completed connection task is joined instead of retained (about 7 KiB per request), and idle session event streams are bounded. A resident runtime serving scheduled automation no longer grows memory without bound.
 - The release page records the 24-hour soak status and any conditional-release reason, so an unfinished soak is never shown as passed.
 
 ## [1.0.24] - 2026-11-07
