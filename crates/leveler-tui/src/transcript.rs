@@ -164,6 +164,14 @@ pub struct ToolCallBlock {
     /// knows where the change landed. `None` for every non-edit call, and for
     /// an edit whose location could not be established.
     pub applied_diff: Option<String>,
+    /// A successful `update_goal(complete)` that follows a REFUSED closeout in
+    /// the same turn.
+    ///
+    /// A plain accepted closeout is Silent bookkeeping, but when the turn has
+    /// already shown a refusal, hiding the acceptance leaves the refusal as the
+    /// last goal state the user read. Set from event order at completion, so a
+    /// replayed history reaches the same conclusion.
+    pub supersedes_refusal: bool,
 }
 
 /// A burst of tool calls belonging to one execution round.
@@ -1377,6 +1385,7 @@ impl TranscriptState {
             started_elapsed_secs,
             applied_diff: None,
             batch: None,
+            supersedes_refusal: false,
         };
         if let Some(TranscriptItem::ToolGroup(group)) = self.items.last()
             && group.open
@@ -1460,6 +1469,7 @@ impl TranscriptState {
     ) {
         use leveler_client_protocol::UiCommandStop;
         self.bump();
+        let refused_before = self.has_refused_closeout_before(id);
         if let Some(block) = self.tool_call_mut(id) {
             block.status = match (stop, ok) {
                 (Some(UiCommandStop::Confirmed), _) => ToolStatus::Cancelled,
@@ -1471,7 +1481,37 @@ impl TranscriptState {
             block.duration_ms = Some(duration_ms);
             block.applied_diff = applied_diff;
             block.exit_code = exit_code;
+            block.supersedes_refusal = refused_before
+                && block.name == "update_goal"
+                && block.status == ToolStatus::Ok
+                && !crate::tool_taxonomy::update_goal_is_blocked(&block.arguments);
         }
+    }
+
+    /// Whether the current turn already showed a refused `update_goal` before
+    /// `id` completed. The scan stops at the call itself, so a later refusal
+    /// cannot claim to be the one an earlier acceptance resolved.
+    fn has_refused_closeout_before(&self, id: &ToolCallId) -> bool {
+        let start = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::TurnEnd(_) | TranscriptItem::User(_)))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        for item in &self.items[start..] {
+            let TranscriptItem::ToolGroup(group) = item else {
+                continue;
+            };
+            for call in &group.calls {
+                if &call.id == id {
+                    return false;
+                }
+                if call.name == "update_goal" && call.status == ToolStatus::Failed {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Record how a detached process ended on the shell call that started it.
@@ -3668,6 +3708,7 @@ mod tests {
                 batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
+                supersedes_refusal: false,
             }],
             open: false,
             display: if expanded {

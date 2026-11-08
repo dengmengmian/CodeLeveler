@@ -1665,6 +1665,7 @@ mod m1_tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: applied.map(str::to_string),
+            supersedes_refusal: false,
         }
     }
 
@@ -1899,6 +1900,7 @@ mod m1_tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         tool_lines(&block, &theme, 80, true, t, &mut out);
         let text: String = out
@@ -2285,6 +2287,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2328,6 +2331,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         }
     }
 
@@ -2349,6 +2353,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         }
     }
 
@@ -2530,6 +2535,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2581,6 +2587,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2627,6 +2634,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2682,6 +2690,7 @@ mod tests {
                 batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
+                supersedes_refusal: false,
             };
             let mut out = Vec::new();
             tool_lines(
@@ -2753,6 +2762,7 @@ mod tests {
                 batch: None,
                 started_elapsed_secs: 0,
                 applied_diff: None,
+                supersedes_refusal: false,
             };
             let mut out = Vec::new();
             tool_lines(
@@ -2894,6 +2904,7 @@ mod tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: None,
+            supersedes_refusal: false,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -3117,6 +3128,7 @@ mod diff_render_tests {
             batch: None,
             started_elapsed_secs: 0,
             applied_diff: applied.map(str::to_string),
+            supersedes_refusal: false,
         }
     }
 
