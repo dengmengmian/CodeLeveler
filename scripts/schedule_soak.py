@@ -1891,12 +1891,21 @@ def sample_processes(paths: RunPaths, lanes: Dict[str, Dict[str, Any]], recorder
     rows = matching_processes(paths.live_root)  # type: ignore[arg-type]
     runtime_count = 0
     dispatcher_count = 0
+    process_rss: List[Dict[str, Any]] = []
     for row in rows:
         command = row["command"]
         if " schedule " in command and " serve" in command:
             dispatcher_count += 1
+            kind = "dispatcher"
         elif re.search(r"\bserve\b", command):
             runtime_count += 1
+            kind = "runtime"
+        else:
+            kind = "other"
+        # Per-process RSS makes a growth failure attributable to the resident
+        # dispatcher or to a specific runtime instead of only to the sum. The
+        # sum alone cannot say which process leaked.
+        process_rss.append({"pid": row["pid"], "rss_kb": row["rss_kb"], "kind": kind})
     rss_kb = sum(row["rss_kb"] for row in rows)
     cpu = sum(row["cpu"] for row in rows)
     db_bytes = 0
@@ -1919,6 +1928,7 @@ def sample_processes(paths: RunPaths, lanes: Dict[str, Dict[str, Any]], recorder
         "runtime_processes": runtime_count,
         "dispatcher_processes": dispatcher_count,
         "rss_kb": rss_kb,
+        "process_rss": process_rss,
         "cpu_pct": round(cpu, 3),
         "db_bytes": db_bytes,
         "live_root_bytes": root_bytes,
@@ -2983,7 +2993,13 @@ class Supervisor:
         if not target:
             raise SoakError("the OS tick definition is missing")
         shown = lane_json(lane, ["schedule", "show", target["id"]])
-        runs = lane_json(lane, ["schedule", "runs", "--definition", target["id"]])
+        # `schedule runs` defaults to twenty rows. The check compares the CLI's
+        # view with the store's full history, so it must ask for all of it;
+        # a default page is a display choice, not a disagreement.
+        runs = lane_json(
+            lane,
+            ["schedule", "runs", "--definition", target["id"], "--limit", "100000"],
+        )
         snapshot = read_schedule(Path(lane["home"]))
         db_runs = len([run for run in snapshot["runs"] if run.get("definition_id") == target["id"]])
         payload = {
