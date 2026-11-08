@@ -1026,6 +1026,12 @@ class DefSpec:
     model: Optional[str] = None
     permission: str = "assisted"
     marker: Optional[str] = None
+    # A definition may run in its own workspace. The overlap lane uses this
+    # for `allow-concurrent`: three long-running definitions sharing one
+    # workspace exceed the runtime's four-turn admission capacity, and that
+    # capacity failure is not a policy result. A separate workspace gives the
+    # policy its own runtime without changing what the run does.
+    workspace: Optional[str] = None
 
     def plan_row(self) -> Dict[str, Any]:
         return {
@@ -1043,7 +1049,21 @@ class DefSpec:
             "model": self.model,
             "permission": self.permission,
             "marker": self.marker,
+            "workspace": self.workspace,
         }
+
+
+def spec_workspace(lane: Dict[str, Any], spec: DefSpec) -> Path:
+    """The workspace one definition runs in.
+
+    The lane's own repo is the default. A spec with `workspace` gets a sibling
+    repo named `<lane-repo>-<suffix>`, so it owns a separate runtime and cannot
+    be starved by the lane's other long-running definitions.
+    """
+    if not spec.workspace:
+        return Path(lane["repo"])
+    repo = Path(lane["repo"])
+    return repo.parent / (repo.name + "-" + spec.workspace)
 
 
 def lane_paths(paths: RunPaths, name: str) -> Dict[str, Path]:
@@ -1149,13 +1169,16 @@ def ensure_definition(lane: Dict[str, Any], spec: DefSpec, recorder: Recorder) -
         recorder.event("definition_reused", lane=lane["name"], key=spec.key, definition=row["id"])
         return str(row["id"])
 
+    workspace = spec_workspace(lane, spec)
+    if spec.workspace:
+        make_fixture_repo(workspace)
     args: List[str] = [
         "schedule",
         "add",
         "--name",
         spec.name,
         "--workspace",
-        str(lane["repo"]),
+        str(workspace),
         "--overlap",
         spec.overlap,
         "--misfire",
@@ -1263,6 +1286,10 @@ def lane_specs(mode: str, model: Optional[str]) -> Dict[str, List[DefSpec]]:
                 grace=180,
                 timeout=180,
                 marker="effects/allow.log",
+                # Its own runtime: with skip (1) and queue (2) sharing the
+                # lane runtime, a second allow run would be the fifth turn on
+                # a four-turn runtime and fail for capacity, not policy.
+                workspace="allow",
             ),
         ]
         agent_specs = [
@@ -1424,6 +1451,10 @@ def lane_specs(mode: str, model: Optional[str]) -> Dict[str, List[DefSpec]]:
             grace=180,
             timeout=180,
             marker="effects/allow.log",
+            # Its own runtime: its 70 s runs overlap, and sharing the lane
+            # runtime with skip (1) and queue (2) would make the second allow
+            # run the fifth turn on a four-turn runtime.
+            workspace="allow",
         ),
     ]
     agent_specs = [
@@ -1780,12 +1811,11 @@ def registration_status(lane: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def marker_counts(lane: Dict[str, Any], specs: Sequence[DefSpec]) -> Dict[str, Any]:
-    repo = Path(lane["repo"])
     result: Dict[str, Any] = {}
     for spec in specs:
         if not spec.marker:
             continue
-        path = repo / spec.marker
+        path = spec_workspace(lane, spec) / spec.marker
         if not path.is_file():
             result[spec.key] = {"path": spec.marker, "exists": False, "lines": 0, "bytes": 0}
             continue
@@ -1953,6 +1983,7 @@ def defspec_from_row(row: Dict[str, Any]) -> DefSpec:
         model=row.get("model"),
         permission=row.get("permission", "assisted"),
         marker=row.get("marker"),
+        workspace=row.get("workspace"),
     )
 
 

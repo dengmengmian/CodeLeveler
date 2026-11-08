@@ -414,6 +414,23 @@ class ResourceTests(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
 
+class WorkspaceIsolationTests(unittest.TestCase):
+    def test_a_definition_can_own_a_separate_workspace(self):
+        lane = {"repo": "/tmp/soak/repos/overlap"}
+        allow = soak.DefSpec(
+            "allow",
+            "soak-overlap-allow",
+            "shell",
+            ["--every", "60"],
+            marker="effects/allow.log",
+            workspace="allow",
+        )
+        plain = soak.DefSpec("queue", "soak-overlap-queue", "shell", ["--every", "60"])
+        self.assertEqual(str(soak.spec_workspace(lane, allow)), "/tmp/soak/repos/overlap-allow")
+        self.assertEqual(str(soak.spec_workspace(lane, plain)), "/tmp/soak/repos/overlap")
+        self.assertEqual(allow.plan_row()["workspace"], "allow")
+
+
 class VerdictTests(unittest.TestCase):
     def _checks(self, names):
         return {name: {"passed": True} for name in names}
