@@ -2146,6 +2146,14 @@ fn restore_history(
             RuntimeEvent::ToolTimingUpdated { id, timing } => {
                 scratch.transcript.set_tool_timing(&id, Some(timing), None);
             }
+            // A durable review is projected directly: the live handler's
+            // `away_summary_pending` gate exists to match an asynchronous
+            // answer to the request that asked for it, and a replay has no
+            // request in flight. It carries the same turn identity the live
+            // row did, so it lands after that turn's terminal exactly once.
+            RuntimeEvent::AwaySummary { text } => {
+                scratch.transcript.push_away_summary(text);
+            }
             event => apply_runtime(&mut scratch, event),
         }
     }

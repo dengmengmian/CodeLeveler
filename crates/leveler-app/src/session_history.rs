@@ -12,7 +12,10 @@ use leveler_client_protocol::{MessageId, RuntimeEvent, UiHistoryEntry, UiMessage
 use leveler_core::{SessionId, Timestamp, TurnId};
 use leveler_engine::EngineEvent;
 use leveler_model::{ContentPart, Message, TranscriptOrigin};
-use leveler_storage::{Database, EventRepository, MessageRepository, TurnRecord, TurnRepository};
+use leveler_storage::{
+    Database, EventRepository, MessageRepository, SessionRecapRepository, TurnRecord,
+    TurnRepository,
+};
 use tokio::sync::broadcast;
 
 use crate::AppError;
@@ -32,6 +35,8 @@ enum Fact {
     Notice(String),
     /// A host-marked incomplete raw response; identity is its transcript row.
     PartialAssistant(MessageId, String),
+    /// The durable review of the turn this fact sits in (`※ 回顾`).
+    Recap(String),
 }
 
 /// The latest [`HISTORY_TURNS_MAX`] turns of a session, and how many older
@@ -136,6 +141,31 @@ pub async fn load_session_history(
         }
     }
     facts.extend(messages);
+    // A settled turn's review is a replayable fact. It is NOT a transcript
+    // row: it never enters a model request, and the message store (the next
+    // request's context) must not carry it. Place it by its own record time so
+    // it reads after the turn terminal it belongs to. A recap older than the
+    // bounded history window is left out with the turn it belongs to.
+    for recap in SessionRecapRepository::new(db)
+        .load_for_session(session_id)
+        .await
+        .map_err(AppError::from)?
+    {
+        let at = parse_time(&recap.created_at);
+        if let (Some(cutoff), Some(at)) = (since.and_then(parse_time), at)
+            && at < cutoff
+        {
+            continue;
+        }
+        let position = facts
+            .iter()
+            .position(|(existing, _)| match (existing, at) {
+                (Some(existing), Some(at)) => *existing > at,
+                _ => false,
+            })
+            .unwrap_or(facts.len());
+        facts.insert(position, (at, Fact::Recap(recap.text)));
+    }
 
     // A turn is everything from one TurnStarted to the next.
     //
@@ -211,6 +241,7 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
                     images: 0,
                 },
             }],
+            Fact::Recap(text) => vec![RuntimeEvent::AwaySummary { text }],
             Fact::PartialAssistant(id, text) => vec![
                 RuntimeEvent::AssistantMessageStarted {
                     message_id: id.clone(),

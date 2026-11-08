@@ -20,9 +20,13 @@ pub fn request(state: &mut AppState) -> Option<Effect> {
     if state.away_summary_pending || state.is_busy() {
         return None;
     }
+    // A turn that already has a durable review — the structured goal recap
+    // the turn terminal pushed, or a recap replayed from history — must not
+    // ask a second time: a reconnect would otherwise drop the row by
+    // rebuilding the transcript and then regenerate it with a new model call.
     if matches!(
         state.transcript.items().last(),
-        Some(TranscriptItem::Recap(_))
+        Some(TranscriptItem::Recap(_)) | Some(TranscriptItem::AwaySummary(_))
     ) {
         return None;
     }

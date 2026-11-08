@@ -399,6 +399,17 @@ def termios_tiocswinsz() -> int:
 # ---------------------------------------------------------------------------
 
 
+def is_assist_request(body: str) -> bool:
+    """A UI assist call: no tools, and not a streaming chat completion."""
+    try:
+        request = json.loads(body)
+    except Exception:
+        return False
+    if request.get("tools"):
+        return False
+    return request.get("stream") is not True
+
+
 class MockProvider:
     """Serves scripted SSE frames per request, in order.
 
@@ -411,6 +422,12 @@ class MockProvider:
         self.turns: list[list[str]] = []
         self.requests: list[str] = []
         self.calls = 0
+        # Opt-in: tool-less non-streaming requests are the UI assist lane
+        # (prompt suggestion / away summary). They expect a ChatCompletion
+        # JSON body, not SSE. Left None, the old SSE behaviour is unchanged
+        # for every existing scenario.
+        self.assist_text: str | None = None
+        self.assist_requests: list[str] = []
         self.lock = threading.Lock()
         provider = self
 
@@ -423,11 +440,47 @@ class MockProvider:
             def do_POST(self):
                 length = int(self.headers.get("content-length") or 0)
                 body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+                assist = provider.assist_text is not None and is_assist_request(body)
                 with provider.lock:
-                    index = min(provider.calls, len(provider.turns) - 1)
-                    provider.calls += 1
                     provider.requests.append(body)
-                frames = provider.turns[index] if provider.turns else []
+                    if assist:
+                        provider.assist_requests.append(body)
+                        assist_text = provider.assist_text
+                    else:
+                        index = min(provider.calls, len(provider.turns) - 1)
+                        provider.calls += 1
+                        frames = provider.turns[index] if provider.turns else []
+                        assist_text = None
+                if assist:
+                    data = json.dumps(
+                        {
+                            "id": "assist",
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": assist_text,
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 5,
+                                "total_tokens": 15,
+                            },
+                        }
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(data)))
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except Exception:
+                        pass
+                    return
                 payload = "".join(
                     "data: %s\n\n" % frame for frame in frames
                 ) + "data: [DONE]\n\n"

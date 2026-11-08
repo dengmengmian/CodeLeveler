@@ -150,6 +150,23 @@ impl<'a> TurnRepository<'a> {
         Ok(rows)
     }
 
+    /// The newest turn of a session that already reached a terminal.
+    ///
+    /// A review describes a settled turn; the running one is not eligible.
+    pub async fn latest_settled(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<TurnRecord>, StorageError> {
+        Ok(sqlx::query_as::<_, TurnRecord>(
+            "SELECT id, session_id, ordinal, kind, payload, status, created_at, finished_at, owner_boot_id \
+             FROM turns WHERE session_id = ?1 AND status <> 'running' \
+             ORDER BY ordinal DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(self.db.pool())
+        .await?)
+    }
+
     /// Accepted inputs only for the turns a bounded history will replay.
     pub async fn list_by_ids(
         &self,

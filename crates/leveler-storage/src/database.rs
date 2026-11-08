@@ -572,7 +572,16 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-            assert_eq!(version, 51, "starting with migration {applied}");
+            // The store must reach whatever this build's newest migration is;
+            // hardcoding the number turns every added migration into a false
+            // failure of the preservation property this test is about.
+            let latest = super::MIGRATOR
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .max()
+                .unwrap();
+            assert_eq!(version, latest, "starting with migration {applied}");
             let session = leveler_core::SessionId::new("legacy");
             if applied != 0 {
                 let stored = SessionRepository::new(&db)

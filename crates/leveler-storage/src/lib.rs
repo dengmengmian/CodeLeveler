@@ -23,6 +23,7 @@ mod ownership_store;
 mod resource_grant_store;
 mod session_facts;
 mod session_input_repo;
+mod session_recap_repo;
 mod session_repo;
 mod session_store;
 mod task_creation_store;
@@ -56,6 +57,7 @@ pub use ownership_store::{
 };
 pub use session_facts::SessionFacts;
 pub use session_input_repo::{SessionInputRecord, SessionInputRepository, SessionInputState};
+pub use session_recap_repo::{SessionRecapRecord, SessionRecapRepository};
 pub use session_repo::{
     SessionEdit, SessionEditResult, SessionRecord, SessionRepository, SessionSettingsSnapshot,
 };

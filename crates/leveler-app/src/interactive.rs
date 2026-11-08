@@ -41,7 +41,7 @@ use leveler_model::{
 };
 use leveler_storage::{
     ForeignSessionOriginRepository, MessageRepository, SessionInputRepository, SessionInputState,
-    SessionRepository,
+    SessionRecapRepository, SessionRepository, TurnRepository,
 };
 
 use leveler_client_protocol::{
@@ -284,6 +284,15 @@ fn spawn_auxiliary_assist(
     }
     let (generation, cancellation) = assists.begin(&session_id, kind);
     tokio::spawn(async move {
+        // A review belongs to the turn it describes. Read the settled turn
+        // BEFORE the model call so a turn that starts later cannot be credited
+        // with this text; the `active.is_running` guard below already refuses
+        // to publish after such a turn started.
+        let recap_turn = if matches!(kind, AssistKind::AwaySummary) {
+            settled_turn_id(&app, &session_id).await
+        } else {
+            None
+        };
         let Some(generated) =
             prompt_assist::generate(&app, &session_id, model, kind, cancellation).await
         else {
@@ -303,12 +312,64 @@ fn spawn_auxiliary_assist(
             AssistKind::PromptSuggestion => RuntimeEvent::PromptSuggestion {
                 text: generated.text,
             },
-            AssistKind::AwaySummary => RuntimeEvent::AwaySummary {
-                text: generated.text,
-            },
+            AssistKind::AwaySummary => {
+                // Durable BEFORE the client sees it: a reconnect must replay
+                // this exact review instead of regenerating one, and a crash
+                // after delivery must not lose it. A storage failure leaves
+                // the review visible for this session but not replayable; it
+                // is reported rather than silently turning into an empty row.
+                if let Some(turn_id) = recap_turn {
+                    record_session_recap(&app, &session_id, &turn_id, &generated.text).await;
+                }
+                RuntimeEvent::AwaySummary {
+                    text: generated.text,
+                }
+            }
         };
         let _ = events.send(event);
     });
+}
+
+/// The newest settled turn of a session, or `None` when the turn table has
+/// nothing to attach a review to.
+async fn settled_turn_id(app: &Arc<Application>, session_id: &SessionId) -> Option<String> {
+    let db = app.open_database().await.ok()?;
+    TurnRepository::new(&db)
+        .latest_settled(session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|turn| turn.id)
+}
+
+/// Persist the review a client is about to see. Idempotent by turn identity.
+async fn record_session_recap(
+    app: &Arc<Application>,
+    session_id: &SessionId,
+    turn_id: &str,
+    text: &str,
+) {
+    let db = match app.open_database().await {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(
+                session = session_id.as_str(),
+                error = %error,
+                "the review could not be persisted for replay"
+            );
+            return;
+        }
+    };
+    if let Err(error) = SessionRecapRepository::new(&db)
+        .record(session_id, turn_id, text, leveler_core::now())
+        .await
+    {
+        tracing::warn!(
+            session = session_id.as_str(),
+            error = %error,
+            "the review could not be persisted for replay"
+        );
+    }
 }
 
 /// The instruction used to summarize a conversation for compaction (spec §53).
