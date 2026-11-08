@@ -112,3 +112,5 @@ pub use resource_identity::{
     resolve_git_grant_with_environment, resolve_project_identity,
     resolve_project_identity_with_environment,
 };
+
+pub mod process_identity;
