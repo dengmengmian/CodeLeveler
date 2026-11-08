@@ -376,6 +376,43 @@ class ResourceTests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_a_sample_names_the_rss_of_each_kind_of_process(self):
+        import shutil
+        from unittest import mock
+
+        root = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvs-res-test-"))
+        try:
+            evidence = root / "evidence"
+            evidence.mkdir()
+            paths = soak.RunPaths.for_evidence(evidence, root)
+            recorder = soak.Recorder(paths)
+            rows = [
+                {
+                    "pid": 11,
+                    "ppid": 1,
+                    "rss_kb": 100,
+                    "cpu": 1.0,
+                    "command": str(root) + "/bin/leveler schedule serve --poll-secs 5",
+                },
+                {
+                    "pid": 22,
+                    "ppid": 11,
+                    "rss_kb": 200,
+                    "cpu": 2.0,
+                    "command": str(root) + "/bin/leveler serve --ready-json",
+                },
+            ]
+            with mock.patch.object(soak, "matching_processes", return_value=rows):
+                sample = soak.sample_processes(paths, {}, recorder)
+            by_pid = {row["pid"]: row for row in sample["process_rss"]}
+            self.assertEqual(by_pid[11]["kind"], "dispatcher")
+            self.assertEqual(by_pid[22]["kind"], "runtime")
+            self.assertEqual(by_pid[11]["rss_kb"], 100)
+            self.assertEqual(by_pid[22]["rss_kb"], 200)
+            self.assertEqual(sample["rss_kb"], 300)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
 
 class VerdictTests(unittest.TestCase):
     def _checks(self, names):
