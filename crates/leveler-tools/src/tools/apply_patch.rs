@@ -587,7 +587,7 @@ impl Tool for ApplyPatchTool {
                     if context
                         .execution
                         .file_state
-                        .is_stale(&path, existing.as_bytes())
+                        .is_stale(&resolved, existing.as_bytes())
                     {
                         return Ok(ToolOutput::error(format!(
                             "{path} changed since you read it — another process, command, or \
@@ -790,14 +790,16 @@ impl Tool for ApplyPatchTool {
 
         // Re-fingerprint what we just wrote, so the agent's own edit does not look
         // like an outside change to its next patch. A path we can no longer read
-        // was deleted here; forget it so a recreated file starts clean.
+        // was deleted here; forget its canonical entry so a recreated file starts
+        // clean. If the path cannot be resolved now, keep the previous
+        // observation: a later write is then checked conservatively instead of
+        // being treated as untracked.
         for rel in &modified {
-            match context.execution_workspace()?.resolve_for_read(rel) {
-                Ok(resolved) => match tokio::fs::read(&resolved).await {
-                    Ok(bytes) => context.execution.file_state.record(rel, &bytes),
-                    Err(_) => context.execution.file_state.forget(rel),
-                },
-                Err(_) => context.execution.file_state.forget(rel),
+            if let Ok(resolved) = context.execution_workspace()?.resolve_for_read(rel) {
+                match tokio::fs::read(&resolved).await {
+                    Ok(bytes) => context.execution.file_state.record(&resolved, &bytes),
+                    Err(_) => context.execution.file_state.forget(&resolved),
+                }
             }
         }
 
@@ -2079,6 +2081,53 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "TOKEN=[REDACTED]\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod alias_identity_tests {
+    use super::*;
+
+    /// F-18: the stale-write key is the resolved resource identity, not the
+    /// model's spelling. `a.txt` read and `./a.txt` patch target the same
+    /// object; an outside edit must still be refused.
+    #[tokio::test]
+    async fn dot_slash_alias_cannot_bypass_the_stale_write_check() {
+        let (context, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("a.txt", "one\n")],
+        );
+        crate::tools::read_file::ReadFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt"}),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // An outside writer changes the file after the read.
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: ./a.txt\n@@\n-two\n+patched\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("changed since you read it"),
+            "the alias must resolve to the same observed resource: {}",
+            out.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "two\n",
+            "the outside edit must survive"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

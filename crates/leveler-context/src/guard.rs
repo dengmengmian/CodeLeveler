@@ -7,6 +7,7 @@
 //! harness does not make it (`docs/ARCHITECTURE.md` §1.1).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Incremental fingerprint for streamed file reads.
@@ -46,7 +47,11 @@ impl ContentFingerprint {
 /// a deliberate collision.
 #[derive(Default)]
 pub struct FileStateTracker {
-    seen: Mutex<HashMap<String, u64>>,
+    /// Keyed by the RESOLVED resource identity (canonical absolute path), not
+    /// by the model's spelling. `a.rs`, `./a.rs` and a symlink to the same
+    /// object must be one entry, or a stale-write check can be bypassed by
+    /// changing how the path is written.
+    seen: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl FileStateTracker {
@@ -60,27 +65,27 @@ impl FileStateTracker {
 
     /// Record the contents of `path` as the agent now knows them. Call after a
     /// read, and after a write, so the agent's own edits do not look stale.
-    pub fn record(&self, path: &str, content: &[u8]) {
+    pub fn record(&self, path: &Path, content: &[u8]) {
         self.record_fingerprint(path, Self::fingerprint(content));
     }
 
     /// Record a fingerprint produced while streaming the file.
-    pub fn record_fingerprint(&self, path: &str, fingerprint: u64) {
+    pub fn record_fingerprint(&self, path: &Path, fingerprint: u64) {
         self.seen
             .lock()
             .unwrap()
-            .insert(path.to_string(), fingerprint);
+            .insert(path.to_path_buf(), fingerprint);
     }
 
     /// Drop any fingerprint for `path`. Call when the file is deleted, so a file
     /// later recreated at the same path is not judged against the dead one.
-    pub fn forget(&self, path: &str) {
+    pub fn forget(&self, path: &Path) {
         self.seen.lock().unwrap().remove(path);
     }
 
     /// Whether `path` changed since it was last recorded. An untracked path is
     /// never stale — the agent never claimed to know its contents.
-    pub fn is_stale(&self, path: &str, current: &[u8]) -> bool {
+    pub fn is_stale(&self, path: &Path, current: &[u8]) -> bool {
         match self.seen.lock().unwrap().get(path) {
             Some(&known) => known != Self::fingerprint(current),
             None => false,
@@ -95,23 +100,23 @@ mod tests {
     #[test]
     fn untracked_file_is_never_stale() {
         let t = FileStateTracker::default();
-        assert!(!t.is_stale("never/read.rs", b"anything"));
+        assert!(!t.is_stale(Path::new("never/read.rs"), b"anything"));
     }
 
     #[test]
     fn recorded_file_is_stale_only_when_content_differs() {
         let t = FileStateTracker::default();
-        t.record("a.rs", b"one");
-        assert!(!t.is_stale("a.rs", b"one"));
-        assert!(t.is_stale("a.rs", b"two"));
+        t.record(Path::new("a.rs"), b"one");
+        assert!(!t.is_stale(Path::new("a.rs"), b"one"));
+        assert!(t.is_stale(Path::new("a.rs"), b"two"));
     }
 
     #[test]
     fn re_recording_clears_staleness() {
         let t = FileStateTracker::default();
-        t.record("a.rs", b"one");
-        t.record("a.rs", b"two");
-        assert!(!t.is_stale("a.rs", b"two"));
+        t.record(Path::new("a.rs"), b"one");
+        t.record(Path::new("a.rs"), b"two");
+        assert!(!t.is_stale(Path::new("a.rs"), b"two"));
     }
 
     #[test]
@@ -119,15 +124,15 @@ mod tests {
         let bytes = b"streamed content\n";
         let fingerprint = FileStateTracker::fingerprint(bytes);
         let tracker = FileStateTracker::default();
-        tracker.record_fingerprint("a.rs", fingerprint);
-        assert!(!tracker.is_stale("a.rs", bytes));
+        tracker.record_fingerprint(Path::new("a.rs"), fingerprint);
+        assert!(!tracker.is_stale(Path::new("a.rs"), bytes));
     }
 
     #[test]
     fn forgetting_makes_a_path_untracked_again() {
         let t = FileStateTracker::default();
-        t.record("a.rs", b"one");
-        t.forget("a.rs");
-        assert!(!t.is_stale("a.rs", b"totally different"));
+        t.record(Path::new("a.rs"), b"one");
+        t.forget(Path::new("a.rs"));
+        assert!(!t.is_stale(Path::new("a.rs"), b"totally different"));
     }
 }

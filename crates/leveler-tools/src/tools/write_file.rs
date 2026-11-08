@@ -106,7 +106,7 @@ impl Tool for WriteFileTool {
                 if context
                     .execution
                     .file_state
-                    .is_stale(&input.path, existing.as_bytes())
+                    .is_stale(&resolved, existing.as_bytes())
                 {
                     return Ok(ToolOutput::error(format!(
                         "{} changed since you read it — re-read it and decide again \
@@ -150,7 +150,7 @@ impl Tool for WriteFileTool {
         context
             .execution
             .file_state
-            .record(&input.path, input.content.as_bytes());
+            .record(&resolved, input.content.as_bytes());
 
         let hunks = super::applied_diff::whole_file_hunks(
             existing.as_deref().unwrap_or(""),
@@ -453,6 +453,44 @@ mod tests {
         let out = run(ctx, serde_json::json!({"path": "a.txt", "content": ""})).await;
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod alias_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dot_slash_alias_cannot_bypass_the_stale_write_check() {
+        let (ctx, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("a.txt", "one\n")],
+        );
+        crate::tools::read_file::ReadFileTool
+            .execute(
+                serde_json::json!({"path": "a.txt"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let out = WriteFileTool
+            .execute(
+                serde_json::json!({"path": "./a.txt", "content": "replace\n"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("changed since you read it"),
+            "the alias must resolve to the same observed resource: {}",
+            out.content
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -151,7 +151,7 @@ impl Tool for ReadFileTool {
         context
             .execution
             .file_state
-            .record_fingerprint(&input.path, read.observation.fingerprint);
+            .record_fingerprint(&path, read.observation.fingerprint);
 
         let total_lines = read.observation.total_lines;
         let mut out = String::new();
