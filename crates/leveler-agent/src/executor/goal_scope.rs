@@ -766,6 +766,18 @@ pub(crate) fn parse_accounting(
 }
 
 /// Decide whether the completion accounts for every explicit requirement.
+/// A bounded page over the effective set. The caller must keep the returned
+/// slice tied to the same requirement vector; nothing is re-extracted per page.
+pub(crate) fn page(
+    requirements: &[Requirement],
+    offset: usize,
+    limit: usize,
+) -> (&[Requirement], usize) {
+    let start = offset.min(requirements.len());
+    let end = start.saturating_add(limit.max(1)).min(requirements.len());
+    (&requirements[start..end], start)
+}
+
 pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
     if facts.requirements.is_empty() {
         return ScopeDecision::Accept {
@@ -5309,5 +5321,41 @@ mod effective_acceptance_tests {
                 .any(|requirement| requirement.kind == RequirementKind::Tests),
             "{requirements:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod goal_scope_page_tests {
+    use super::*;
+
+    fn req(index: usize) -> Requirement {
+        Requirement {
+            id: format!("R{index}"),
+            text: format!("deliverable-{index}"),
+            kind: RequirementKind::Named,
+            source: RequirementSource::Objective,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn paging_covers_twelve_without_gaps_or_duplicates() {
+        let requirements: Vec<Requirement> = (0..12).map(req).collect();
+        let (first, start) = page(&requirements, 0, 8);
+        assert_eq!(start, 0);
+        assert_eq!(first.len(), 8);
+        let (second, start) = page(&requirements, 8, 8);
+        assert_eq!(start, 8);
+        assert_eq!(second.len(), 4);
+        let ids: Vec<&str> = first.iter().chain(second).map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, (0..12).map(|i| format!("R{i}")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_offset_past_the_end_is_an_empty_page_not_an_error() {
+        let requirements: Vec<Requirement> = (0..3).map(req).collect();
+        let (empty, start) = page(&requirements, 99, 8);
+        assert!(empty.is_empty());
+        assert_eq!(start, 3);
     }
 }

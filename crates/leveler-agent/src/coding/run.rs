@@ -274,7 +274,7 @@ fn render_compaction_facts(input: &CompactionFactsInput<'_>) -> Option<String> {
         }
         if input.effective.len() > 8 {
             out.push_str(&format!(
-                "…and {} more effective requirements the Gate still enforces.\n",
+                "…and {} more effective requirements the Gate still enforces; call get_goal_scope to read them.\n",
                 input.effective.len() - 8
             ));
         }
