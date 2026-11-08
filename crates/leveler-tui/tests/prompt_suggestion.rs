@@ -212,6 +212,91 @@ fn restored_history_requests_one_prediction_even_when_entries_are_empty() {
     }
 }
 
+/// R5/R6: a review replayed from durable history is projected once, after its
+/// turn terminal, and the reducer must NOT ask the runtime to regenerate a
+/// review the turn already has. A reconnect used to drop the transient row and
+/// re-request it — the visible "review disappears and comes back" flicker.
+#[test]
+fn a_replayed_review_is_projected_once_and_not_requested_again() {
+    let mut s = reopened_with_history();
+    let answer = MessageId::new("replayed-answer");
+    let event = RuntimeEvent::SessionHistoryLoaded {
+        query_id: s.history_query.clone(),
+        session_id: s.session_id.clone(),
+        omitted_turns: 0,
+        entries: vec![
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 0,
+                turn_start: true,
+                event: RuntimeEvent::UserMessageAdded {
+                    message: leveler_client_protocol::UiMessage {
+                        id: MessageId::new("replayed-user"),
+                        role: leveler_client_protocol::UiRole::User,
+                        text: "梳理配置".into(),
+                        ordinal: None,
+                        kind: None,
+                        images: 0,
+                    },
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 100,
+                turn_start: false,
+                event: RuntimeEvent::AssistantMessageStarted {
+                    message_id: answer.clone(),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 200,
+                turn_start: false,
+                event: RuntimeEvent::AssistantTextDelta {
+                    message_id: answer.clone(),
+                    delta: "配置已梳理完毕。".into(),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 300,
+                turn_start: false,
+                event: RuntimeEvent::AssistantMessageCompleted { message_id: answer },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 400,
+                turn_start: false,
+                event: RuntimeEvent::TurnAnswered,
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 500,
+                turn_start: false,
+                event: RuntimeEvent::AwaySummary {
+                    text: "配置已梳理完毕，下一步核对交付顺序。".into(),
+                },
+            },
+        ],
+    };
+    let effects = reduce(&mut s, Action::Runtime(event));
+    assert_eq!(
+        recap_requests(&effects),
+        0,
+        "a turn that already has a review must not ask for another: {effects:?}"
+    );
+    let recaps: Vec<&str> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::AwaySummary(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recaps, vec!["配置已梳理完毕，下一步核对交付顺序。"]);
+    let shown = frame(&mut s, 100, 32);
+    assert_eq!(shown.matches("※ 回顾:").count(), 1, "{shown}");
+    assert!(
+        shown.contains("配置已梳理完毕，下一步核对交付顺序。"),
+        "{shown}"
+    );
+}
+
 #[test]
 fn restored_history_does_not_request_a_prediction_after_input_or_while_busy() {
     for guard in [
