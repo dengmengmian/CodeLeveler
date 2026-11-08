@@ -2589,11 +2589,7 @@ fn apply_session_with(
             // A compacted-history summary is stored as a User message so the model
             // keeps it as context, but it isn't something the user typed — render
             // it as a distinct assistant/summary block, not a user turn.
-            UiRole::User
-                if message
-                    .text
-                    .starts_with(leveler_client_protocol::COMPACTION_SUMMARY_PREFIX) =>
-            {
+            UiRole::User if leveler_client_protocol::is_compaction_summary_text(&message.text) => {
                 state.transcript.begin_assistant(message.id.clone());
                 state
                     .transcript

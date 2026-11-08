@@ -62,10 +62,11 @@ export function conversationMatches(messages,query){
 }
 /** Stamped by the runtime on the user-role message that replaces compacted history. */
 export const COMPACTION_SUMMARY_PREFIX = '对话摘要（已压缩历史）';
+export const COMPACTION_BREADCRUMB_PREFIX = '[Earlier context was compacted';
 /** @param {string} text */
-export function isCompactionSummaryText(text){return typeof text==='string'&&text.startsWith(COMPACTION_SUMMARY_PREFIX);}
+export function isCompactionSummaryText(text){if(typeof text!=='string')return false;const value=text.trimStart();return value.startsWith(COMPACTION_SUMMARY_PREFIX)||value.startsWith(COMPACTION_BREADCRUMB_PREFIX);}
 /** @param {string} text */
-export function compactionBody(text){return isCompactionSummaryText(text)?text.slice(COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/,'').trimStart():text;}
+export function compactionBody(text){if(!isCompactionSummaryText(text))return text;const value=text.trimStart();if(value.startsWith(COMPACTION_BREADCRUMB_PREFIX)){const at=value.indexOf(COMPACTION_SUMMARY_PREFIX);return at>=0?value.slice(at+COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/,'').trimStart():value;}return value.slice(COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/,'').trimStart();}
 
 /** @param {{role:string,kind?:string,text?:string}} message */
 export function messageKind(message){if(message.kind==='runtime_notice')return 'notice';if(message.kind==='compaction_summary'||(message.role==='user'&&isCompactionSummaryText(message.text??'')))return 'summary';return ['user','assistant'].includes(message.role)?message.role:'other';}
