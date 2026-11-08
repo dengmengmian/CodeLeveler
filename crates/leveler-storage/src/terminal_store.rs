@@ -470,6 +470,28 @@ impl MemoryTerminalStore {
             )));
         }
         self.check_injected_failure()?;
+        // Turn-identity idempotency, mirroring the SQLite store: the same
+        // terminal returns the committed row, a different terminal is a typed
+        // conflict, and neither appends a second row (TERM-01..03).
+        if let Some(prior) = self
+            .events
+            .recovery_events()
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.session_id == session_id.as_str()
+                    && event.turn_id.as_deref() == Some(turn_id.as_str())
+                    && event.event_type == event_type
+            })
+        {
+            if !crate::terminal_repo::turn_terminal_payload_matches(&prior.payload, payload) {
+                return Err(StorageError::InvalidData(format!(
+                    "conflicting terminal for turn {}",
+                    turn_id.as_str()
+                )));
+            }
+            return Ok(prior);
+        }
         let record = self.events.append_record_for_terminal_validated(
             session_id,
             Some(turn_id),
@@ -739,6 +761,51 @@ mod tests {
         assert!(
             turns.list_running(Some(&session)).await.unwrap().is_empty(),
             "finish_turn must terminate the running turn"
+        );
+
+        // TERM-01/02: the same turn terminal retried is the same fact. The
+        // committed row is returned and no second event is appended.
+        let repeated = terminal
+            .finish_turn(
+                &session,
+                &turn_id,
+                "turn_finished",
+                r#"{"ok":true}"#,
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated.id, event.id,
+            "a repeated identical terminal returns the committed row"
+        );
+        assert_eq!(
+            events.load(&session).await.unwrap().len(),
+            1,
+            "a repeated identical terminal must not append a second row"
+        );
+
+        // TERM-03: a different terminal for the same turn is a typed conflict,
+        // not a second terminal and not a silent overwrite.
+        assert!(
+            terminal
+                .finish_turn(
+                    &session,
+                    &turn_id,
+                    "turn_finished",
+                    r#"{"outcome":"failed"}"#,
+                    TurnOutcome::Failed,
+                    leveler_core::now(),
+                )
+                .await
+                .is_err(),
+            "a conflicting turn terminal must be refused"
+        );
+        assert_eq!(
+            events.load(&session).await.unwrap().len(),
+            1,
+            "a conflicting terminal must leave the log unchanged"
         );
 
         terminal

@@ -6,6 +6,31 @@ use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
 use crate::event_repo::EVENT_SCHEMA_VERSION;
 use crate::{Database, EventRecord, GoalTerminalUpdate, StorageError, TaskTerminalCommit};
 
+/// Whether a persisted `turn_finished` payload is the same terminal fact as
+/// the one a caller is retrying. The turn identity is the lookup key; the
+/// semantic fields decide equality, so a retry written by another process
+/// (and therefore serialized independently) is still idempotent. A different
+/// outcome/stop is a typed conflict, never a second terminal row.
+///
+/// Field defaults match the event decoder: a legacy row without `outcome` is
+/// `Completed`, without `rounds` is zero, and without `modified_files` is
+/// empty.
+pub(crate) fn turn_terminal_payload_matches(existing: &str, incoming: &str) -> bool {
+    let Ok(existing) = serde_json::from_str::<serde_json::Value>(existing) else {
+        return false;
+    };
+    let Ok(incoming) = serde_json::from_str::<serde_json::Value>(incoming) else {
+        return false;
+    };
+    let field = |value: &serde_json::Value, key: &str| value.get(key).cloned().unwrap_or_default();
+    existing.get("turn_id") == incoming.get("turn_id")
+        && field(&existing, "outcome") == field(&incoming, "outcome")
+        && field(&existing, "stop_reason") == field(&incoming, "stop_reason")
+        && field(&existing, "stop") == field(&incoming, "stop")
+        && field(&existing, "rounds") == field(&incoming, "rounds")
+        && field(&existing, "modified_files") == field(&incoming, "modified_files")
+}
+
 /// Writes that must land together: appending the terminal event, marking the
 /// aggregate finished, and applying any supplied goal projection. Each method
 /// uses one transaction, so a crash cannot expose a partial terminal fact.
@@ -88,6 +113,31 @@ impl<'a> TerminalRepository<'a> {
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         let mut tx = self.db.pool().begin().await?;
+        // A retried turn terminal is idempotent by turn identity. The same
+        // fact returns the committed row; a different fact is a typed
+        // conflict. This is the turn counterpart of the task terminal's
+        // ownership-epoch key (TERM-01..03).
+        let prior = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, \
+             created_at, schema_version FROM events WHERE session_id = ?1 AND turn_id = ?2 \
+             AND type = ?3 ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .bind(turn_id.as_str())
+        .bind(event_type)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(prior) = prior {
+            if !turn_terminal_payload_matches(&prior.payload, payload) {
+                tx.rollback().await?;
+                return Err(StorageError::InvalidData(format!(
+                    "conflicting terminal for turn {}",
+                    turn_id.as_str()
+                )));
+            }
+            tx.commit().await?;
+            return Ok(prior);
+        }
         let event = append_event(
             &mut tx,
             session_id,
@@ -463,6 +513,35 @@ impl TerminalRepository<'_> {
         if !owner_current_in_tx(&mut tx, token, session_id).await? {
             let _ = tx.rollback().await;
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        // Turn-identity idempotency, inside the same fenced transaction: a
+        // retry of the same terminal returns the committed row; a different
+        // terminal is a typed conflict (TERM-01..03). The row update and the
+        // event append still commit together.
+        let prior = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, \
+             created_at, schema_version FROM events WHERE session_id = ?1 AND turn_id = ?2 \
+             AND type = ?3 ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .bind(turn_id.as_str())
+        .bind(event_type)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StorageError::from)
+        .map_err(crate::OwnershipError::Storage)?;
+        if let Some(prior) = prior {
+            if !turn_terminal_payload_matches(&prior.payload, payload) {
+                let _ = tx.rollback().await;
+                return Err(crate::OwnershipError::Storage(StorageError::InvalidData(
+                    format!("conflicting terminal for turn {}", turn_id.as_str()),
+                )));
+            }
+            tx.commit()
+                .await
+                .map_err(StorageError::from)
+                .map_err(crate::OwnershipError::Storage)?;
+            return Ok(prior);
         }
         let event = append_event(
             &mut tx,
