@@ -90,6 +90,17 @@ impl RuntimeEventSender {
                 .map_or(0, broadcast::Sender::receiver_count)
     }
 
+    /// Receivers of this session's own stream. The compatibility broadcast is
+    /// excluded: it carries one copy for every session, so counting it here
+    /// would make an idle session look watched forever.
+    pub(crate) fn session_receiver_count(&self) -> usize {
+        let publication = self.0.lock().unwrap();
+        publication
+            .sender
+            .as_ref()
+            .map_or(0, broadcast::Sender::receiver_count)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
         let publication = self.0.lock().unwrap();
         match &publication.sender {
