@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use leveler_core::{BootId, OwnerEpoch, RuntimeId, SessionId, TaskId, Timestamp, TurnId};
 use leveler_storage::{
     Database, EventRepository, MessageRepository, MessageStore, OwnershipStore,
-    SessionInputRepository, SessionRecord, SessionRepository, TaskStore, TurnRepository,
+    SessionInputRepository, SessionRecord, SessionRepository, TaskStore, TerminalStore,
+    TurnRepository,
 };
 
 fn now() -> Timestamp {
@@ -172,6 +173,7 @@ async fn c1_sigkill_before_the_cut_leaves_the_original_transcript() {
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("state.json")).unwrap())
             .unwrap();
+    eprintln!("RESUME_DBG read state={state}");
     let session = SessionId::new(state["session"].as_str().unwrap());
     let messages = MessageRepository::new(&db).load(&session).await.unwrap();
     assert_eq!(
@@ -212,6 +214,7 @@ async fn c3_sigkill_after_the_cut_does_not_reproject_consumed_inputs() {
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("state.json")).unwrap())
             .unwrap();
+    eprintln!("RESUME_DBG read state={state}");
     let session = SessionId::new(state["session"].as_str().unwrap());
     let messages = MessageRepository::new(&db).load(&session).await.unwrap();
     assert_eq!(messages.len(), 1, "summary-only epoch: {messages:?}");
@@ -292,6 +295,166 @@ async fn c3_sigkill_after_the_cut_does_not_reproject_consumed_inputs() {
             .len(),
         1,
         "no duplicate initiating message"
+    );
+    drop(dir);
+}
+
+/// C5 resume child. Opens the durable epoch, runs the reaper projection and
+/// settles the interrupted turn, then (when armed) dies inside the resume
+/// recovery window. The parent runs this twice.
+#[tokio::test]
+async fn resume_child() {
+    let Ok(path) = std::env::var("EPOCH_RESUME_DB") else {
+        return;
+    };
+    let db = Database::connect(Path::new(&path)).await.unwrap();
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(std::env::var("EPOCH_RESUME_STATE").unwrap()).unwrap(),
+    )
+    .unwrap();
+    eprintln!("RESUME_DBG read state={state}");
+    let session = SessionId::new(state["session"].as_str().unwrap());
+    let task = TaskId::new(state["task"].as_str().unwrap());
+    let token = OwnershipStore::acquire(
+        &db,
+        &task,
+        &RuntimeId::new("rt-resume"),
+        &BootId::new("boot-resume"),
+        OwnerEpoch::new(state["epoch"].as_u64().unwrap()),
+    )
+    .await
+    .unwrap();
+    // The next resume must fence on the epoch this recovery acquired, not the
+    // pre-crash one. Persist it before any recovery write.
+    let mut state = state;
+    state["epoch"] = serde_json::json!(token.owner_epoch.get());
+    std::fs::write(
+        std::env::var("EPOCH_RESUME_STATE").unwrap(),
+        state.to_string(),
+    )
+    .unwrap();
+    let turn_id = TurnId::new(state["turns"][1].as_str().unwrap());
+    let inserted = db
+        .ensure_initiating_message_owned(
+            &token,
+            &session,
+            &turn_id,
+            &user_payload("second task"),
+            now(),
+        )
+        .await
+        .unwrap();
+    assert!(!inserted);
+    db.finish_turn_owned(
+        &token,
+        &session,
+        &turn_id,
+        "turn_finished",
+        r#"{"outcome":"interrupted"}"#,
+        leveler_lifecycle::TurnOutcome::Interrupted,
+        now(),
+    )
+    .await
+    .unwrap();
+    leveler_core::test_crash::point("after_resume_recovery");
+}
+
+fn spawn_resume(dir: &Path, point: Option<&str>) -> std::process::Child {
+    let exe = std::env::current_exe().unwrap();
+    let mut command = Command::new(exe);
+    command
+        .arg("resume_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("EPOCH_RESUME_DB", dir.join("session.db"))
+        .env("EPOCH_RESUME_STATE", dir.join("state.json"));
+    if let Some(point) = point {
+        command
+            .env("LEVELER_TEST_CRASH_POINT", point)
+            .env("LEVELER_TEST_CRASH_MARKER", dir.join("resume.marker"));
+    }
+    command.spawn().unwrap()
+}
+
+#[tokio::test]
+async fn c5_sigkill_during_resume_then_a_second_resume_is_idempotent() {
+    use std::os::unix::process::ExitStatusExt;
+    let (dir, path, status) = run_child("after_context_epoch_cut");
+    assert_eq!(status.signal(), Some(9));
+
+    let mut first = spawn_resume(dir.path(), Some("after_resume_recovery"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !dir.path().join("resume.marker").exists() {
+        assert!(Instant::now() < deadline, "resume failpoint not reached");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let first_pid = first.id();
+    let first_status = first.wait().unwrap();
+    eprintln!("C5_RESUME pid={first_pid} status={first_status:?}");
+    assert_eq!(first_status.signal(), Some(9), "resume must die by SIGKILL");
+
+    let db = Database::connect(&path).await.unwrap();
+    let session = SessionId::new(
+        serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(dir.path().join("state.json")).unwrap(),
+        )
+        .unwrap()["session"]
+            .as_str()
+            .unwrap(),
+    );
+    let events = EventRepository::new(&db).load(&session).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "turn_finished")
+            .count(),
+        1,
+        "the first resume settled the turn once"
+    );
+
+    let second_status = spawn_resume(dir.path(), None).wait().unwrap();
+    assert!(second_status.success(), "second resume must succeed");
+    let events = EventRepository::new(&db).load(&session).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "turn_finished")
+            .count(),
+        1,
+        "a repeated resume must not duplicate the terminal: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "delivery_committed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "compacted")
+            .count(),
+        1
+    );
+    let journal = SessionInputRepository::new(&db)
+        .all(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|i| i.state.as_str() == "consumed")
+            .count(),
+        2
+    );
+    assert_eq!(
+        MessageRepository::new(&db)
+            .load(&session)
+            .await
+            .unwrap()
+            .len(),
+        1
     );
     drop(dir);
 }
