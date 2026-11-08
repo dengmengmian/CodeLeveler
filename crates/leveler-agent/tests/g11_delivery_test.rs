@@ -288,21 +288,19 @@ async fn run_goal_for_with(
     script: Vec<ModelResponse>,
     configure: impl FnOnce(Executor) -> Executor,
 ) -> Run {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-g11-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    // A unique directory per run. PID + nanos collides when two tests start
+    // in the same clock tick; one test's cleanup then deletes the other's
+    // workspace and the command cwd resolves outside it.
+    let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(MockRuntime::new(script));
     let executor = configure(
         Executor::new(
             runtime,
             Arc::new(default_registry()),
-            ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+            ToolContext::new(
+                Workspace::new(dir.path()).unwrap(),
+                PermissionProfile::Assisted,
+            ),
             ModelRef::new("mock", "m"),
             20,
         )
@@ -318,7 +316,6 @@ async fn run_goal_for_with(
         )
         .await
         .expect("the scripted goal run must complete");
-    std::fs::remove_dir_all(&dir).ok();
     Run { outcome, events }
 }
 
@@ -507,15 +504,7 @@ async fn a_declared_answer_that_stays_textless_ends_with_an_honest_missing_deliv
 /// fact.
 #[tokio::test]
 async fn the_delivery_request_states_that_the_answer_is_still_owed() {
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-g11-notice-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_says_and_calls(
             "g1",
@@ -528,7 +517,10 @@ async fn the_delivery_request_states_that_the_answer_is_still_owed() {
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
         ModelRef::new("mock", "m"),
         20,
     )
@@ -555,7 +547,6 @@ async fn the_delivery_request_states_that_the_answer_is_still_owed() {
             && seen.contains("this round is the delivery"),
         "the model must be told the answer is still owed; saw:\n{seen}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A model that keeps calling `update_goal` after an undeclared settlement gets
@@ -940,20 +931,15 @@ async fn a_provider_failure_on_the_delivery_round_is_not_a_completed_delivery() 
         ],
         ModelError::new(leveler_model::ModelErrorKind::Transport, "connection reset"),
     ));
-    let dir = std::env::temp_dir().join(format!(
-        "leveler-g11-provider-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let mut events = Vec::new();
     let result = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
         ModelRef::new("mock", "m"),
         20,
     )
@@ -986,7 +972,6 @@ async fn a_provider_failure_on_the_delivery_round_is_not_a_completed_delivery() 
             assert!(!finished.contains(&TRANSITION.to_string()), "{error:?}");
         }
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// If the hard budget stops the run before the delivery request can be sent,
