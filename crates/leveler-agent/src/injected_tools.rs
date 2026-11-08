@@ -170,7 +170,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 },
                 "deliver_answer": {
                     "type": "boolean",
-                    "description": "Set true when the visible text you wrote in this SAME response is your complete final answer to the user, ready to be delivered verbatim. It may be the text of this response, or the last text you wrote before a bookkeeping-only round (`update_plan`) with no work tool in between. When true, the runtime delivers that text as written and asks for nothing more. Omit it when the text only announces a next step or reports progress; the runtime will then ask for the answer. Only the model can know which of the two its text is."
+                    "description": "Set true when the visible text you wrote in this SAME response is your complete final answer to the user, ready to be delivered verbatim. It may be the text of this response, or the last text you wrote before a bookkeeping-only round (`update_plan`) with no work tool in between. Omit it when the text only announces a next step or reports progress. Once you have offered an answer, setting this again does not replace it. A citation repair does not replace an answer already written: cite `call_id:<id>` or the exact command, and leave the answer text as it stands."
+                },
+                "revise_answer": {
+                    "type": "boolean",
+                    "description": "Set true only when the visible text of this response REPLACES the answer you already offered because new evidence changed your conclusion. It implies `deliver_answer`. Omit it when you are only repairing verification citations or reporting progress for an answer that is still correct; the answer already written remains the delivery."
                 },
                 "next_step": {
                     "type": "string",
@@ -186,7 +190,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                         },
                         "detail": {
                             "type": "string",
-                            "description": "For passed: commands you ran, one per line (e.g. \"go test ./...\"). For not_applicable: why no executable check exists."
+                            "description": "For passed: cite each check on its own line. Prefer `call_id:<id>` of the tool call that ran it. A full command line also matches. A trailing result note (`→ ...` or a parenthetical) is not part of the command. Do not abbreviate a command, and do not rerun a check only to make the citation match. For not_applicable: why no executable check exists."
                         }
                     },
                     "required": ["status", "detail"]

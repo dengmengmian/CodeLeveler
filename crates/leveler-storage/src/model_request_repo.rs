@@ -178,6 +178,10 @@ pub struct ModelRequestRecord {
     /// body failure carried one (see `leveler_model::TransportObservation`).
     /// Diagnostic only; never an input to delivery, retry or settlement.
     pub error_detail: Option<String>,
+    /// The turn that admitted this call. `None` when the call has no turn
+    /// (an auxiliary request) and on rows written before turns were recorded.
+    /// A missing turn is not filled in from timestamps.
+    pub turn_id: Option<String>,
 }
 
 /// One `model_requests` row as the loader reads it.
@@ -213,6 +217,7 @@ struct ModelRequestRow {
     projected_input_tokens: Option<i64>,
     projected_reasoning_tokens: Option<i64>,
     error_detail: Option<String>,
+    turn_id: Option<String>,
 }
 
 /// One `model_requests` row plus the session that owns it, as the window
@@ -258,6 +263,7 @@ fn record_from_row(
         projected_input_tokens,
         projected_reasoning_tokens,
         error_detail,
+        turn_id,
     } = row;
     Ok(ModelRequestRecord {
         budget_scope,
@@ -289,6 +295,7 @@ fn record_from_row(
         projected_input_tokens: projected_input_tokens.map(|value| value.max(0) as u64),
         projected_reasoning_tokens: projected_reasoning_tokens.map(|value| value.max(0) as u64),
         error_detail,
+        turn_id,
     })
 }
 
@@ -317,8 +324,8 @@ impl<'a> ModelRequestRepository<'a> {
               error_kind, latency_ms, retry_count, created_at, kind, \
               provider_request_id, cached_input_tokens, cost_usd_micros, agent_id, \
               reasoning_effort, reasoning_tokens, attempt_ms, connect_ms, ttft_ms, \
-              max_event_gap_ms, projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, error_detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+              max_event_gap_ms, projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, error_detail, turn_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         )
         .bind(&record.id)
         .bind(record.session_id.as_str())
@@ -375,6 +382,7 @@ impl<'a> ModelRequestRepository<'a> {
         .bind(&record.budget_scope)
         .bind(record.estimated_tokens.map(|value| value.min(i64::MAX as u64) as i64))
         .bind(&record.error_detail)
+        .bind(&record.turn_id)
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -455,7 +463,7 @@ impl<'a> ModelRequestRepository<'a> {
                     cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort, \
                     reasoning_tokens, attempt_ms, connect_ms, ttft_ms, max_event_gap_ms, \
                     projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, \
-                    error_detail \
+                    error_detail, turn_id \
              FROM model_requests \
              WHERE (?1 IS NULL OR session_id = ?1) \
                AND (?2 IS NULL OR created_at >= ?2) \
@@ -651,6 +659,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             error_kind: None,
             error_detail: None,
+            turn_id: None,
             latency_ms: Some(10),
             attempt_ms: Some(9),
             connect_ms: Some(4),
@@ -1042,6 +1051,7 @@ mod tests {
             finish_reason: Some("length".to_string()),
             error_kind: None,
             error_detail: None,
+            turn_id: None,
             latency_ms: Some(42),
             attempt_ms: Some(40),
             connect_ms: Some(5),
@@ -1106,6 +1116,7 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 error_kind: None,
                 error_detail: None,
+                turn_id: None,
                 latency_ms: Some(1),
                 attempt_ms: None,
                 connect_ms: None,
@@ -1164,6 +1175,7 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 error_kind: None,
                 error_detail: None,
+                turn_id: None,
                 latency_ms: Some(1),
                 attempt_ms: None,
                 connect_ms: None,
@@ -1229,6 +1241,7 @@ mod tests {
                 finish_reason: Some("stop".to_string()),
                 error_kind: None,
                 error_detail: None,
+                turn_id: None,
                 latency_ms: None,
                 attempt_ms: None,
                 connect_ms: None,
@@ -1310,5 +1323,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded[0].kind, ModelCallKind::Round);
+        assert_eq!(loaded[0].turn_id, None, "a legacy row has no turn");
+    }
+
+    /// A call made inside a turn keeps that turn. A row inserted the way the
+    /// old writer did — without the column — stays unset, so history still loads.
+    #[tokio::test]
+    async fn a_turn_id_round_trips_and_a_legacy_row_stays_unset() {
+        let (db, session) = seeded().await;
+        let turn = crate::TurnRepository::new(&db)
+            .start(&session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        let repo = ModelRequestRepository::new(&db);
+        let mut owned = record("owned", &session);
+        owned.turn_id = Some(turn.id.clone());
+        repo.insert(&owned).await.unwrap();
+        sqlx::query(
+            "INSERT INTO model_requests \
+             (id, session_id, provider, model, input_tokens, output_tokens, created_at) \
+             VALUES ('legacy-turn', ?1, 'p', 'm', 1, 1, ?2)",
+        )
+        .bind(session.as_str())
+        .bind(leveler_core::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        let owned_row = loaded.iter().find(|row| row.id == "owned").unwrap();
+        assert_eq!(owned_row.turn_id.as_deref(), Some(turn.id.as_str()));
+        let legacy = loaded.iter().find(|row| row.id == "legacy-turn").unwrap();
+        assert_eq!(legacy.turn_id, None);
     }
 }

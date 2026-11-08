@@ -541,6 +541,7 @@ pub(crate) async fn load_goal_verification_runs(
                         ok: !is_error,
                         model_step,
                         mutation_ops,
+                        call_id: Some(call_id),
                     });
                 }
             }
@@ -577,6 +578,7 @@ fn background_result_run(
         ok: !is_error,
         model_step: *model_step,
         mutation_ops,
+        call_id: Some(call_id.to_string()),
     })
 }
 

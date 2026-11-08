@@ -349,6 +349,14 @@ pub enum RuntimeEvent {
     ReasoningCompleted { elapsed_ms: u64 },
     /// The assistant message is complete.
     AssistantMessageCompleted { message_id: MessageId },
+    /// The runtime named the text it accepted as this turn's delivery.
+    ///
+    /// The text is already on screen as an assistant message. This event does
+    /// not append another copy. It tells the client which existing block is
+    /// the answer, so a later progress note cannot take that place when the
+    /// turn ends. `text` is the runtime's published delivery, compared by
+    /// exact trimmed equality — not a guess about length or wording.
+    DeliveryCommitted { text: String },
     /// The assistant has produced its final response, while the runtime is
     /// still settling the task before its one authoritative terminal event.
     TurnFinalizing { stage: FinalizationStage },
@@ -1306,6 +1314,16 @@ mod tests {
                 message_id: MessageId::new("m1"),
             },
             "assistant_message_completed",
+        );
+    }
+
+    #[test]
+    fn delivery_committed_roundtrips_the_named_answer() {
+        roundtrip(
+            RuntimeEvent::DeliveryCommitted {
+                text: "清理前 12 行，清理后 0 行。".into(),
+            },
+            "delivery_committed",
         );
     }
 

@@ -2479,6 +2479,7 @@ mod tests {
             ok,
             model_step: step,
             mutation_ops,
+            call_id: None,
         }
     }
 

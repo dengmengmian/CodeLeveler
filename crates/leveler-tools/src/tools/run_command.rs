@@ -116,12 +116,15 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a program with an argument array and no shell, for example \
-         {\"program\": \"cargo\", \"args\": [\"test\"]}. There is no `cmd` \
-         field; a shell command line is `shell_command`. Returns `exit: N`, \
-         stdout, and stderr. `exit: 0` \
-         means the program succeeded. A pipe is not available in this argv \
-         form. Temporary files are writable in the workspace, in `$TMPDIR`, \
+        "Run a program with an argument array and no shell. For `ls .`, pass \
+         {\"program\": \"ls\", \"args\": [\".\"]}. Each argument is an operand or flag \
+         for the program. To list workspace entries directly, use list_files with {\"path\": \".\"}. \
+         There is no `cmd` field. Use `shell_command` for shell syntax such as pipes. \
+         Returns `exit: N`, stdout, \
+         and stderr. `exit: 0` means the program succeeded. Distinguish executable lookup or launch \
+         failures (check the executable in the same cwd and PATH) from a client that ran but \
+         could not reach its service (check the endpoint or service named in stderr). \
+         Temporary files are writable in the workspace, in `$TMPDIR`, \
          and under the system `/tmp`; other host paths are not writable. \
          `background` true \
          starts a long-running process and returns a task id for \
@@ -664,6 +667,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn description_distinguishes_command_failures() {
+        let tool = RunCommandTool::new(crate::tools::test_commands());
+        let description = tool.description();
+
+        assert!(description.contains("executable lookup or launch"));
+        assert!(description.contains("could not reach its service"));
+    }
+
     /// SH-E2 RC-1: the model must read the command's own exit code instead of
     /// piping verification through grep/tail, which discards it (and, before
     /// TERM=dumb, re-introduced ANSI that broke the grep). The temp-file
@@ -938,12 +950,10 @@ mod tests {
     #[test]
     fn description_shows_the_call_shape() {
         let tool = RunCommandTool::new(crate::tools::test_commands());
-        assert!(
-            tool.description()
-                .contains(r#"{"program": "cargo", "args": ["test"]}"#),
-            "{}",
-            tool.description()
-        );
+        let description = tool.description();
+        assert!(description.contains(r#"{"program": "ls", "args": ["."]}"#));
+        assert!(description.contains(r#"list_files with {"path": "."}"#));
+        assert!(description.contains("There is no `cmd` field"));
     }
 
     /// A loopback server that answers one HTTP request and reports whether

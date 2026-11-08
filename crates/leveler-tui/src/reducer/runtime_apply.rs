@@ -356,6 +356,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::AssistantMessageCompleted { message_id } => {
             state.transcript.finish_assistant(&message_id);
         }
+        RuntimeEvent::DeliveryCommitted { text } => {
+            // Settlement can follow the real answer with a short progress
+            // note. Name the runtime's delivery before the turn-end classifier
+            // treats that note as the answer. No new transcript row: the text
+            // is already an assistant message.
+            state.transcript.commit_named_answer(&text);
+        }
         RuntimeEvent::TurnFinalizing { stage } => {
             mark_turn_busy(state);
             state.finalization_stage = Some(stage);

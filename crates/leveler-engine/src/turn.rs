@@ -443,6 +443,9 @@ impl TranscriptSink for TurnSink {
         if row.budget_scope.is_none() {
             row.budget_scope = Some(self.budget_scope.clone());
         }
+        // The sink's turn is the call's turn. Auxiliary writers that do not
+        // go through a turn sink leave the column unset.
+        row.turn_id = Some(self.turn_id.as_str().to_string());
         self.model_requests
             .insert(&row)
             .await
@@ -486,6 +489,7 @@ pub fn storage_model_request(
         finish_reason,
         error_kind: record.error_kind.clone(),
         error_detail: record.error_detail.clone(),
+        turn_id: None,
         latency_ms: Some(record.latency_ms),
         attempt_ms: record.attempt_ms,
         connect_ms: record.connect_ms,

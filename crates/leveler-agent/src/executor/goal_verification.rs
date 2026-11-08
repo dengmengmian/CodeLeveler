@@ -30,6 +30,10 @@ pub struct VerificationRun {
     /// `EvidenceLedger::total_mutation_ops` when it ran, so "after the last
     /// file change" is a comparison, not a timestamp guess.
     pub mutation_ops: u64,
+    /// The tool call that produced this run. A citation of `call_id:<id>`
+    /// names this execution, not whatever later run shares the command text.
+    /// `None` for a record rebuilt before call ids were stored.
+    pub call_id: Option<String>,
 }
 
 /// What the model said about verification in `update_goal`.
@@ -64,6 +68,8 @@ pub(crate) struct PendingCommand {
     pub label: String,
     /// The background task id, when the start reported one.
     pub task_id: Option<String>,
+    /// The tool call that started it, so the result can be cited by that id.
+    pub call_id: Option<String>,
 }
 
 /// Decide whether `update_goal(complete)` may resolve the goal.
@@ -79,9 +85,9 @@ pub(crate) fn decide(
     // declaration, including `not_applicable`.
     if let Some(failed) = last_unrecovered_failure(runs) {
         return VerificationDecision::Refuse(format!(
-            "the last verification command `{}` failed (step {}). Fix the failure and run it \
-             again, or call update_goal(status=\"blocked\") with the exact obstruction. A failed \
-             verification cannot be closed as complete.",
+            "the last verification command `{}` failed (step {}). The command failed. Fix the \
+             failure and run it again, or call update_goal(status=\"blocked\") with the exact \
+             obstruction. A failed verification cannot be closed as complete.",
             failed.label, failed.model_step
         ));
     }
@@ -93,13 +99,17 @@ pub(crate) fn decide(
                 if cited.is_empty() {
                     continue;
                 }
-                let Some(last) = runs.iter().rev().find(|run| cites(&run.label, cited)) else {
-                    return VerificationDecision::Refuse(unmatched_citation(
-                        cited,
-                        runs,
-                        pending,
-                        mutation_ops,
-                    ));
+                let last = match cited_run(cited, runs) {
+                    CitedRun::Refuse(message) => return VerificationDecision::Refuse(message),
+                    CitedRun::Unmatched => {
+                        return VerificationDecision::Refuse(unmatched_citation(
+                            cited,
+                            runs,
+                            pending,
+                            mutation_ops,
+                        ));
+                    }
+                    CitedRun::Found(run) => run,
                 };
                 if !last.ok {
                     // A later successful compound line can contain this exact
@@ -118,7 +128,8 @@ pub(crate) fn decide(
                         ));
                     }
                     return VerificationDecision::Refuse(format!(
-                        "`{cited}` was cited as verification but its last run failed (step {}).",
+                        "`{cited}` was cited as verification but the command failed: its last run \
+                         failed (step {}).",
                         last.model_step
                     ));
                 }
@@ -128,8 +139,9 @@ pub(crate) fn decide(
                 // demanding it run again would reverse the user's sequence.
                 if is_verification_command(&last.label) && last.mutation_ops < mutation_ops {
                     return VerificationDecision::Refuse(format!(
-                        "`{cited}` passed before the most recent file change. Re-run it against \
-                         the current workspace before marking the goal complete."
+                        "`{cited}` verification expired: it passed before the most recent file \
+                         change. Re-run it against the current workspace before marking the goal \
+                         complete."
                     ));
                 }
             }
@@ -144,7 +156,7 @@ pub(crate) fn decide(
             };
             VerificationDecision::Accept {
                 warning: Some(format!(
-                    "goal completed without executable verification ({why})"
+                    "goal completed without executable verification ({why}); insufficient evidence"
                 )),
             }
         }
@@ -166,8 +178,9 @@ pub(crate) fn decide(
                 && let Some(stale) = stale_pass
             {
                 return VerificationDecision::Refuse(format!(
-                    "`{}` passed before the most recent file change (step {}). Re-run it against \
-                     the current workspace, or declare why the change needs no executable check.",
+                    "`{}` verification expired: it passed before the most recent file change \
+                     (step {}). Re-run it against the current workspace, or declare why the \
+                     change needs no executable check.",
                     stale.label, stale.model_step
                 ));
             }
@@ -175,7 +188,7 @@ pub(crate) fn decide(
                 VerificationDecision::Accept {
                     warning: Some(
                         "goal completed without executable verification (no verification \
-                         command ran after the last file change)"
+                         command ran after the last file change); insufficient evidence"
                             .to_string(),
                     ),
                 }
@@ -220,50 +233,60 @@ fn unmatched_citation(
     let partial = closest_recorded_command(cited, runs);
     let why = match &partial {
         Some(partial) if partial.glued => format!(
-            "`{cited}` was cited as verification but it is only part of a recorded command, \
-             not a command that ran on its own. It lines up with `{label}` (step {step}) and \
-             that command continues (`{next}`). A subcommand of a compound shell command is \
-             not its own execution record.",
+            "`{cited}` verification object does not match an execution record: it is only \
+             part of a recorded command, not a command that ran on its own. It lines up with \
+             `{label}` (step {step}) and that command continues (`{next}`). A subcommand of a \
+             compound shell command is not its own execution record.",
             label = partial.run.label,
             step = partial.run.model_step,
             next = partial.next_token.as_deref().unwrap_or("")
         ),
-        Some(partial) if partial.matched >= 3 => format!(
-            "`{cited}` was cited as verification but it does not match an execution record. \
-             The closest recorded command is `{label}` (step {step}); the citation diverges \
-             before the end of that command.",
+        Some(partial) if partial.full_record_prefix => format!(
+            "`{cited}` command does not match `{label}` (step {step}): the citation contains \
+             extra text after the full recorded command, and that text is not a result note \
+             (`→`, `->`, `=>`, or a parenthetical).",
             label = partial.run.label,
             step = partial.run.model_step
         ),
-        _ => format!("`{cited}` was cited as verification but never ran in this task."),
+        Some(partial) if partial.matched >= 3 => format!(
+            "`{cited}` command does not match an execution record. The closest recorded \
+             command is `{label}` (step {step}); the citation diverges before the end of that \
+             command.",
+            label = partial.run.label,
+            step = partial.run.model_step
+        ),
+        _ => format!(
+            "`{cited}` citation does not exist: it was cited as verification but never ran in \
+             this task."
+        ),
     };
     let citable = citable_commands(
         runs,
         mutation_ops,
         partial.as_ref().map(|partial| partial.run),
     );
-    let recorded = if citable.is_empty() {
-        "No recorded command can be cited as a passing check.".to_string()
+    if citable.is_empty() {
+        format!(
+            "{why} No eligible passing check matched this citation or can be suggested from \
+             the recorded build/test checks. Cite a relevant execution record in full, or run \
+             the check as its own command if the task has no suitable result."
+        )
     } else {
-        format!("Recorded commands that can be cited in full: {citable}.")
-    };
-    let unmet = if runs.iter().any(|run| {
-        run.ok && is_verification_command(&run.label) && run.mutation_ops >= mutation_ops
-    }) {
-        "The cited evidence is not accepted."
-    } else {
-        "No verification command has passed since the last file change."
-    };
-    format!(
-        "{why} {recorded} {unmet} Cite one recorded command in full, exactly as shown, or run \
-         the check again as its own command and cite that command."
-    )
+        format!(
+            "{why} Recorded commands that can be cited in full: {citable}. Reuse a relevant \
+             command without rerunning it by citing `call_id:<id>` when one is shown, or by \
+             copying the command exactly as shown. A trailing result note (`→ ...` or a \
+             parenthetical) is not part of the command. If these records do not prove the \
+             claim, run the required check as its own command."
+        )
+    }
 }
 
 struct RecordedPartial<'a> {
     run: &'a VerificationRun,
     matched: usize,
     glued: bool,
+    full_record_prefix: bool,
     next_token: Option<String>,
 }
 
@@ -307,14 +330,20 @@ fn closest_recorded_command<'a>(
             } else {
                 label_tokens.get(start + matched).cloned()
             };
-            let better = best
-                .as_ref()
-                .is_none_or(|current| matched > current.matched);
+            let full_record_prefix =
+                start == 0 && matched == label_tokens.len() && matched < cited_tokens.len();
+            let better = best.as_ref().is_none_or(|current| {
+                matched > current.matched
+                    || (matched == current.matched
+                        && full_record_prefix
+                        && !current.full_record_prefix)
+            });
             if matched > 0 && better {
                 best = Some(RecordedPartial {
                     run,
                     matched,
                     glued,
+                    full_record_prefix,
                     next_token,
                 });
             }
@@ -348,7 +377,7 @@ fn later_compound_pass<'a>(
 
 /// Passing commands the model may copy. The closest record is included even
 /// when it is not classified as verification, because that is the command
-/// the citation almost named. Failed runs are omitted.
+/// the citation almost named. Suggest only records the gate could accept.
 fn citable_commands(
     runs: &[VerificationRun],
     mutation_ops: u64,
@@ -356,10 +385,21 @@ fn citable_commands(
 ) -> String {
     let mut listed: Vec<String> = Vec::new();
     let push = |listed: &mut Vec<String>, run: &VerificationRun| {
-        if !run.ok {
+        if !run.ok
+            || run.label.contains('\n')
+            || (is_verification_command(&run.label) && run.mutation_ops < mutation_ops)
+            || !runs
+                .iter()
+                .rev()
+                .find(|latest| cites(&latest.label, &run.label))
+                .is_some_and(|latest| std::ptr::eq(latest, run))
+        {
             return;
         }
-        let line = format!("`{}` (step {})", run.label, run.model_step);
+        let line = match run.call_id.as_deref() {
+            Some(id) => format!("`call_id:{id}` = `{}` (step {})", run.label, run.model_step),
+            None => format!("`{}` (step {})", run.label, run.model_step),
+        };
         if !listed.contains(&line) {
             listed.push(line);
         }
@@ -440,10 +480,72 @@ fn is_observation(line: &str) -> bool {
     line.starts_with('(') && line.ends_with(')')
 }
 
-/// The command a tool call actually asked to run, in one display string.
+enum CitedRun<'a> {
+    Found(&'a VerificationRun),
+    /// The citation itself is not a usable reference.
+    Refuse(String),
+    /// Text that is not a `call_id:` and does not name a recorded run.
+    Unmatched,
+}
+
+/// Resolve one citation to the execution it names.
 ///
-/// Only the two command tools have one. Every other tool is not executable
-/// verification, so a call returns `None`.
+/// `call_id:<id>` selects that tool call. Otherwise the existing command text
+/// matches, including a full command with a trailing result note. A bare id,
+/// an abbreviation, or a different command stays unmatched.
+fn cited_run<'a>(cited: &str, runs: &'a [VerificationRun]) -> CitedRun<'a> {
+    if let Some(rest) = cited.strip_prefix("call_id:") {
+        let id = rest.trim();
+        if id.is_empty() || id.chars().any(char::is_whitespace) {
+            return CitedRun::Refuse(
+                "citation format is invalid: `call_id:` must name one tool-call id and nothing \
+                 else. Cite `call_id:<id>` of the tool call that ran the check, or cite the \
+                 exact command."
+                    .to_string(),
+            );
+        }
+        return match runs
+            .iter()
+            .rev()
+            .find(|run| run.call_id.as_deref() == Some(id))
+        {
+            Some(run) => CitedRun::Found(run),
+            None => CitedRun::Refuse(format!(
+                "citation does not exist: no execution record in this task has call_id `{id}`."
+            )),
+        };
+    }
+    if let Some(run) = runs.iter().rev().find(|run| cites(&run.label, cited)) {
+        return CitedRun::Found(run);
+    }
+    if let Some(run) = runs
+        .iter()
+        .rev()
+        .find(|run| cites_recorded_command_with_result_note(&run.label, cited))
+    {
+        return CitedRun::Found(run);
+    }
+    CitedRun::Unmatched
+}
+
+fn result_note_marker(token: &str) -> bool {
+    matches!(token, "→" | "->" | "=>" | "⇒")
+}
+
+/// A full recorded command plus a trailing result note.
+///
+/// The note starts at an unquoted `→`, `->`, `=>`, or `⇒`. An arrow inside a
+/// quoted argument stays part of that argument, so it cannot open a note.
+fn cites_recorded_command_with_result_note(label: &str, cited: &str) -> bool {
+    let cited_tokens = command_tokens(strip_trailing_note(cited));
+    let label_tokens = command_tokens(label);
+    if label_tokens.is_empty() || cited_tokens.len() <= label_tokens.len() {
+        return false;
+    }
+    cited_tokens[..label_tokens.len()] == label_tokens[..]
+        && result_note_marker(&cited_tokens[label_tokens.len()])
+}
+
 /// Whether a citation names a command the runtime actually ran.
 ///
 /// The model writes the citation as prose: it may quote one argument for
@@ -529,6 +631,10 @@ fn strip_trailing_note(command: &str) -> &str {
     command[..open].trim_end()
 }
 
+/// The command a tool call actually asked to run, in one display string.
+///
+/// Only the two command tools have one. Every other tool is not executable
+/// verification, so a call returns `None`.
 pub(crate) fn command_label(name: &str, arguments: &serde_json::Value) -> Option<String> {
     match name {
         "run_command" => {
@@ -869,6 +975,20 @@ mod tests {
             ok,
             model_step: step,
             mutation_ops,
+            call_id: None,
+        }
+    }
+
+    fn run_id(
+        label: &str,
+        ok: bool,
+        step: u32,
+        mutation_ops: u64,
+        call_id: &str,
+    ) -> VerificationRun {
+        VerificationRun {
+            call_id: Some(call_id.to_string()),
+            ..run(label, ok, step, mutation_ops)
         }
     }
 
@@ -1033,6 +1153,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_full_record_with_a_trailing_result_note_is_that_execution() {
+        let command = "ssh -o BatchMode=yes fixture 'psql -tAc SELECT'";
+        let runs = [run_id(command, true, 4, 2, "probe")];
+        for cited in [
+            format!("{command} → 0|0|15|1"),
+            format!("{command} -> 0|0|15|1"),
+            format!("{command} (0|0|15|1)"),
+            "call_id:probe".to_string(),
+        ] {
+            assert_eq!(
+                decide(
+                    &VerificationClaim::Passed(vec![cited.clone()]),
+                    &runs,
+                    &[],
+                    2,
+                    true,
+                ),
+                VerificationDecision::Accept { warning: None },
+                "{cited}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_abbreviated_command_is_still_refused() {
+        let command = "ssh -o BatchMode=yes fixture 'psql -tAc SELECT'";
+        let runs = [run(command, true, 4, 2)];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["ssh fixture 'psql'".into()]),
+            &runs,
+            &[],
+            2,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("an abbreviation is not the recorded command");
+        };
+        assert!(
+            message.contains("never ran") || message.contains("command does not match"),
+            "{message}"
+        );
+        assert!(message.contains("without rerunning"), "{message}");
+    }
+
+    #[test]
+    fn extra_text_that_is_not_a_result_note_does_not_match() {
+        let command = "git status";
+        let runs = [run(command, true, 4, 0)];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["git status --short".into()]),
+            &runs,
+            &[],
+            0,
+            false,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a different command must not match");
+        };
+        assert!(message.contains("command does not match"), "{message}");
+    }
+
+    #[test]
+    fn a_call_id_names_one_execution_of_a_repeated_command() {
+        let runs = [
+            run_id("cargo test --lib", false, 2, 1, "old"),
+            run_id("cargo test --lib", true, 5, 3, "new"),
+        ];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec!["call_id:new".into()]),
+                &runs,
+                &[],
+                3,
+                true,
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
+        let failed = decide(
+            &VerificationClaim::Passed(vec!["call_id:old".into()]),
+            &runs,
+            &[],
+            3,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = failed else {
+            panic!("the failed instance is not redeemed by a later one");
+        };
+        assert!(message.contains("command failed"), "{message}");
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec!["cargo test --lib".into()]),
+                &runs,
+                &[],
+                3,
+                true,
+            ),
+            VerificationDecision::Accept { warning: None },
+            "text citation still names the latest matching run"
+        );
+    }
+
+    #[test]
+    fn a_call_id_from_another_task_does_not_exist_here() {
+        let runs = [run_id("cargo test --lib", true, 2, 1, "ours")];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["call_id:theirs".into()]),
+            &runs,
+            &[],
+            1,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("another task's call id is not this task's evidence");
+        };
+        assert!(message.contains("citation does not exist"), "{message}");
+        assert!(!message.contains("never ran"), "{message}");
+    }
+
+    #[test]
+    fn a_malformed_call_id_is_a_format_error() {
+        let runs = [run_id("cargo test --lib", true, 2, 1, "ours")];
+        for cited in ["call_id:", "call_id:ours extra"] {
+            let decision = decide(
+                &VerificationClaim::Passed(vec![cited.into()]),
+                &runs,
+                &[],
+                1,
+                false,
+            );
+            let VerificationDecision::Refuse(message) = decision else {
+                panic!("{cited} must be a format error");
+            };
+            assert!(message.contains("citation format is invalid"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_stale_call_id_is_expired_even_though_the_run_exists() {
+        let runs = [run_id("cargo test --lib", true, 2, 1, "probe")];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["call_id:probe".into()]),
+            &runs,
+            &[],
+            4,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a pass from before the file change is expired");
+        };
+        assert!(message.contains("verification expired"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_command_citation_names_the_failure() {
+        let runs = [run("cargo test --lib", false, 2, 1)];
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["cargo test --lib".into()]),
+            &runs,
+            &[],
+            1,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a failed command is not a pass");
+        };
+        assert!(message.contains("command failed"), "{message}");
+    }
+
+    #[test]
+    fn an_arrow_argument_stays_part_of_the_executed_command() {
+        let command = "printf %s 'alpha → beta'";
+        let runs = [run(command, true, 4, 0)];
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec![command.into()]),
+                &runs,
+                &[],
+                0,
+                false,
+            ),
+            VerificationDecision::Accept { warning: None }
+        );
+        assert!(matches!(
+            decide(
+                &VerificationClaim::Passed(vec!["printf %s 'alpha → gamma'".into()]),
+                &runs,
+                &[],
+                0,
+                false,
+            ),
+            VerificationDecision::Refuse(_)
+        ));
+    }
+
     /// The T6 shape: the model cites one segment of a compound shell command.
     /// The runtime recorded the whole script, and the separator is glued to
     /// the last argument, so the segment is not an execution record. The
@@ -1047,6 +1362,7 @@ mod tests {
         let pending = vec![PendingCommand {
             label: "make up CONFIG=probe.yaml".to_string(),
             task_id: Some("bg-1".to_string()),
+            call_id: None,
         }];
         let decision = decide(
             &VerificationClaim::Passed(vec!["make up CONFIG=probe.yaml".into()]),

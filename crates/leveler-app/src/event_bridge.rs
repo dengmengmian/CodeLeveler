@@ -1386,15 +1386,17 @@ impl EventBridge {
                     slot.insert(Instant::now());
                 }
             }
+            EngineEvent::DeliveryCommitted { text, .. } => {
+                // The assistant message already carries the words. This event
+                // names which of those messages the runtime accepted, so a
+                // later progress note is not presented as the answer. It does
+                // not append a second copy of the text.
+                let _ = self.events.send(RuntimeEvent::DeliveryCommitted { text });
+            }
             EngineEvent::SessionMetadataChanged { .. }
             | EngineEvent::TaskCancelRequested { .. }
             | EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnFinished { .. }
-            // The delivery decision is the runtime's record of which visible
-            // text is the answer. Its text already reached the client as the
-            // assistant message; projecting it again would duplicate the
-            // answer on screen.
-            | EngineEvent::DeliveryCommitted { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
@@ -1425,6 +1427,26 @@ mod bridge_tests {
     /// EngineEvent` conversion keeps them meaningful unchanged.
     fn forward_agent(bridge: &mut EventBridge, event: leveler_agent::AgentEvent) {
         bridge.forward(event.into());
+    }
+
+    /// The delivery record names an answer the client already has. Projecting
+    /// it must not open a second assistant message.
+    #[test]
+    fn a_delivery_commitment_names_the_answer_without_a_second_message() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::DeliveryCommitted {
+            text: "完整报告".into(),
+            stop: leveler_lifecycle::StopReason::Completed,
+            model_steps: 2,
+            modified_files: Vec::new(),
+        });
+        assert_eq!(
+            drain(&mut rx),
+            vec![RuntimeEvent::DeliveryCommitted {
+                text: "完整报告".into()
+            }]
+        );
     }
 
     fn drain(rx: &mut broadcast::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
