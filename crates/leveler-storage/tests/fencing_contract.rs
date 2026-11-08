@@ -704,3 +704,64 @@ async fn a_consumed_input_is_not_reprojected_after_an_epoch_cut() {
         "the reaper must not resurrect compacted history"
     );
 }
+
+/// R3-0: a headless continuation has no `session_inputs` row; after an epoch
+/// cut removes its transcript row the reaper repairs it exactly once. The
+/// restoration is the current turn's request, not duplicated history, and a
+/// second reaper is a no-op.
+#[tokio::test]
+async fn a_headless_continuation_is_repaired_once_after_an_epoch_cut() {
+    let db = Database::connect_in_memory().await.unwrap();
+    let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+    let session = SessionId::new(record.id.clone());
+    SessionStore::create(&db, &record).await.unwrap();
+    let task = leveler_storage::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+        .await
+        .unwrap();
+    let token = OwnershipStore::acquire(
+        &db,
+        &task,
+        &RuntimeId::new("rt-a"),
+        &leveler_core::BootId::new("test-boot"),
+        OwnerEpoch::UNOWNED,
+    )
+    .await
+    .unwrap();
+    let turn = TurnStore::start(&db, &session, "user", None, leveler_core::now())
+        .await
+        .unwrap();
+    let turn_id = leveler_core::TurnId::new(turn.id);
+    let user = r#"{"role":"user","content":[{"type":"text","text":"headless instruction"}]}"#;
+    db.append_in_turn_owned(
+        &token,
+        &session,
+        &turn_id,
+        &[user.to_string()],
+        leveler_core::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(MessageStore::count(&db, &session).await.unwrap(), 1);
+
+    // `/compact` removed the projection; there is no input journal row.
+    db.cut_context_epoch(
+        &session,
+        &[r#"{"role":"user","content":[{"type":"text","text":"summary"}]}"#.to_string()],
+        &[],
+        leveler_core::now(),
+    )
+    .await
+    .unwrap();
+    let inserted = db
+        .ensure_initiating_message_owned(&token, &session, &turn_id, user, leveler_core::now())
+        .await
+        .unwrap();
+    assert!(inserted, "the current turn's request is restored once");
+    assert_eq!(MessageStore::count(&db, &session).await.unwrap(), 2);
+    let again = db
+        .ensure_initiating_message_owned(&token, &session, &turn_id, user, leveler_core::now())
+        .await
+        .unwrap();
+    assert!(!again);
+    assert_eq!(MessageStore::count(&db, &session).await.unwrap(), 2);
+}

@@ -25,6 +25,19 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 mod mcp_http;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Test-only override for a live-server timeout test. Debug builds only; a
+/// release build ignores the variable and keeps the production timeout.
+fn request_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("LEVELER_TEST_MCP_TIMEOUT_MS")
+        && let Ok(ms) = raw.parse::<u64>()
+        && ms > 0
+    {
+        return Duration::from_millis(ms);
+    }
+    REQUEST_TIMEOUT
+}
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Configuration for one MCP server.
@@ -268,7 +281,7 @@ impl McpClient {
             self.pending.lock().await.remove(&id);
             return Err(e);
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(request_timeout(), rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err("MCP 响应通道关闭".to_string()),
             Err(_) => {
