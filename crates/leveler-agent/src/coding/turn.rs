@@ -597,17 +597,21 @@ pub(crate) async fn reconcile_model_spend(
     scope: &str,
 ) -> Result<ProgressLedger, EngineError> {
     if progress.budget_scope.as_deref() != Some(scope) {
-        // Model spend belongs to ONE scope's request facts. A different scope
-        // (a new chat turn is the common case) must not inherit another
-        // scope's model totals, so those are cleared and rebuilt below. The
-        // task-epoch counters that share this ledger — commands run, modified
-        // files, model steps, delegated children — describe the task, not the
-        // budget owner, and a fresh turn must not reset the limits the user
-        // set on it.
+        // A different scope is a different task epoch. Model totals belong to
+        // one scope's request facts and are rebuilt below; the task-epoch
+        // counters must start at zero too. Otherwise a new task after
+        // Interrupted/BudgetLimited/Blocked inherits the previous task's
+        // duration, commands, model steps and modified-file count, and can
+        // exhaust a budget it never spent (F-11/F-12).
         progress.cumulative_model_tokens = 0;
         progress.cumulative_estimated_model_tokens = 0;
         progress.cumulative_cost_usd_micros = 0;
         progress.has_unpriced_model_attempt = false;
+        progress.cumulative_model_steps = 0;
+        progress.cumulative_commands = 0;
+        progress.cumulative_duration_ms = 0;
+        progress.cumulative_modified_files = 0;
+        progress.cumulative_modified_paths.clear();
     }
     progress.budget_scope = Some(scope.to_string());
     let records = store.load_for_budget_scope(session_id, scope).await?;
@@ -824,6 +828,31 @@ pub(crate) async fn persisted_budget_progress(
         }
     }
     Ok(None)
+}
+
+/// Whether this session persisted model spend WITHOUT a budget scope. Such a
+/// row cannot be attributed to a scope, so a capped resume must fail closed
+/// instead of rebuilding the cap from zero. Scanning every row matters: the
+/// old guard looked only at the last progress row, so a scoped row after
+/// legacy spend hid the legacy spend entirely.
+pub(crate) async fn has_unscoped_model_spend(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<bool, EngineError> {
+    for row in events.load(session_id).await? {
+        if row.event_type != "progress_updated" {
+            continue;
+        }
+        if let EngineEvent::ProgressUpdated { ledger } = EngineEvent::from_payload(&row.payload)?
+            && ledger.budget_scope.is_none()
+            && (ledger.cumulative_model_tokens > 0
+                || ledger.cumulative_estimated_model_tokens > 0
+                || ledger.cumulative_cost_usd_micros > 0)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) async fn last_persisted_progress(
@@ -1223,6 +1252,86 @@ mod goal_verification_replay_tests {
         );
     }
 
+    /// F-07: the production order is EvidenceLedgerUpdated then
+    /// ToolCallFinished, so replay samples the post-call count. A run before
+    /// the update keeps the earlier count; a run after it sees the new one.
+    #[tokio::test]
+    async fn a_run_after_a_ledger_update_samples_the_new_mutation_count() {
+        let (stores, session, goal) = goal_with_one_call(false, Some(0), "ok").await;
+        let turn_id = leveler_core::TurnId::new(
+            stores.turns.list_for_session(&session).await.unwrap()[0]
+                .id
+                .clone(),
+        );
+        let ledger = leveler_lifecycle::EvidenceLedger {
+            total_mutation_ops: 4,
+            ..Default::default()
+        };
+        let updated = EngineEvent::EvidenceLedgerUpdated { ledger };
+        stores
+            .events
+            .append(
+                &session,
+                Some(&turn_id),
+                "evidence_ledger_updated",
+                &serde_json::to_string(&updated).unwrap(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        // A second command after the update is sampled at 4.
+        let started = EngineEvent::ToolCallStarted {
+            call_id: "call-2".into(),
+            name: "shell_command".into(),
+            arguments: serde_json::json!({"cmd": "cargo build"}).to_string(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(4),
+        };
+        stores
+            .events
+            .append(
+                &session,
+                Some(&turn_id),
+                "tool_call_started",
+                &serde_json::to_string(&started).unwrap(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let finished = EngineEvent::ToolCallFinished {
+            call_id: "call-2".into(),
+            name: "shell_command".into(),
+            is_error: false,
+            preview: "ok".into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: Some(0),
+            stop: None,
+        };
+        stores
+            .events
+            .append(
+                &session,
+                Some(&turn_id),
+                "tool_call_finished",
+                &serde_json::to_string(&finished).unwrap(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let runs = load_goal_verification_runs(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0].mutation_ops, 0);
+        assert_eq!(
+            runs[1].mutation_ops, 4,
+            "a finished command after the ledger update sees the new count"
+        );
+    }
+
     /// The control: a command that really failed is still a failed run, so
     /// the fix above cannot silently drop real evidence.
     #[tokio::test]
@@ -1234,5 +1343,139 @@ mod goal_verification_replay_tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].label, "cargo test");
         assert!(!runs[0].ok);
+    }
+}
+
+#[cfg(test)]
+mod budget_legacy_tests {
+    use super::*;
+    use leveler_storage::{Database, EngineStores, SessionRecord, SessionRepository};
+
+    /// A scoped row after legacy spend must not hide the legacy spend: the
+    /// scan looks at every progress row, not just the last one.
+    #[tokio::test]
+    async fn legacy_unscoped_spend_is_detected_behind_a_later_scoped_row() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
+        let legacy = leveler_lifecycle::ProgressLedger {
+            budget_scope: None,
+            cumulative_model_tokens: 10,
+            ..Default::default()
+        };
+        let scoped = leveler_lifecycle::ProgressLedger {
+            budget_scope: Some("goal-scope".to_string()),
+            ..Default::default()
+        };
+        for ledger in [legacy, scoped] {
+            let event = EngineEvent::ProgressUpdated { ledger };
+            stores
+                .events
+                .append(
+                    &session,
+                    None,
+                    "progress_updated",
+                    &serde_json::to_string(&event).unwrap(),
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            has_unscoped_model_spend(stores.events.as_ref(), &session)
+                .await
+                .unwrap(),
+            "the legacy row must stay visible behind the later scoped row"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_purely_scoped_history_is_not_legacy() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
+        let scoped = leveler_lifecycle::ProgressLedger {
+            budget_scope: Some("goal-scope".to_string()),
+            cumulative_model_tokens: 10,
+            ..Default::default()
+        };
+        let event = EngineEvent::ProgressUpdated { ledger: scoped };
+        stores
+            .events
+            .append(
+                &session,
+                None,
+                "progress_updated",
+                &serde_json::to_string(&event).unwrap(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !has_unscoped_model_spend(stores.events.as_ref(), &session)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod cross_scope_budget_tests {
+    use super::*;
+    use leveler_storage::Database;
+
+    /// A new scope starts with a clean task epoch: no inherited duration,
+    /// commands, model steps or modified files. This is what keeps an
+    /// independent task after Interrupted/BudgetLimited from exhausting a
+    /// budget it never spent.
+    #[tokio::test]
+    async fn a_new_scope_resets_task_epoch_counters() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let progress = leveler_lifecycle::ProgressLedger {
+            budget_scope: Some("old-task".to_string()),
+            cumulative_model_tokens: 100,
+            cumulative_estimated_model_tokens: 20,
+            cumulative_cost_usd_micros: 5,
+            cumulative_model_steps: 7,
+            cumulative_commands: 4,
+            cumulative_duration_ms: 9_000,
+            cumulative_modified_files: 3,
+            cumulative_modified_paths: vec!["a.rs".into(), "b.rs".into()],
+            ..Default::default()
+        };
+        let reconciled =
+            reconcile_model_spend(progress, &db, &SessionId::new("session"), "new-task")
+                .await
+                .unwrap();
+        assert_eq!(reconciled.budget_scope.as_deref(), Some("new-task"));
+        assert_eq!(reconciled.cumulative_model_tokens, 0);
+        assert_eq!(reconciled.cumulative_model_steps, 0);
+        assert_eq!(reconciled.cumulative_commands, 0);
+        assert_eq!(reconciled.cumulative_duration_ms, 0);
+        assert_eq!(reconciled.cumulative_modified_files, 0);
+        assert!(reconciled.cumulative_modified_paths.is_empty());
+    }
+
+    /// The same scope (a Goal continuation) keeps its spend.
+    #[tokio::test]
+    async fn the_same_scope_keeps_its_counters() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let progress = leveler_lifecycle::ProgressLedger {
+            budget_scope: Some("goal".to_string()),
+            cumulative_commands: 4,
+            cumulative_duration_ms: 9_000,
+            cumulative_modified_files: 2,
+            ..Default::default()
+        };
+        let reconciled = reconcile_model_spend(progress, &db, &SessionId::new("session"), "goal")
+            .await
+            .unwrap();
+        assert_eq!(reconciled.cumulative_commands, 4);
+        assert_eq!(reconciled.cumulative_duration_ms, 9_000);
+        assert_eq!(reconciled.cumulative_modified_files, 2);
     }
 }

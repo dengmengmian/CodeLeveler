@@ -11199,3 +11199,73 @@ async fn a_round_row_records_the_projection_s_reasoning_channel() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// F-17: a mixed batch must preserve the model's call order. The first read
+/// observes the pre-edit bytes, the write runs between them, and the second
+/// read observes the edit. Independent reads still batch concurrently.
+#[tokio::test]
+async fn mixed_read_write_read_observes_the_edit_between_the_reads() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-rwr-{}-{}",
+        std::process::id(),
+        leveler_core::new_uuid_string()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "before\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_calls(vec![
+            ("r1", "read_file", serde_json::json!({"path": "a.txt"})),
+            (
+                "w1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-before\n+after\n*** End Patch"
+                }),
+            ),
+            ("r2", "read_file", serde_json::json!({"path": "a.txt"})),
+        ]),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    executor
+        .run(
+            "inspect, edit, then inspect again",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("mixed batch completes");
+    let preview = |id: &str| {
+        events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult {
+                    id: got, preview, ..
+                } if got == id => Some(preview.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing result {id}: {events:?}"))
+    };
+    let first = preview("r1");
+    let second = preview("r2");
+    assert!(
+        first.contains("before") && !first.contains("after"),
+        "the first read must observe the pre-edit bytes: {first}"
+    );
+    assert!(
+        second.contains("after"),
+        "the second read must observe the edit: {second}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

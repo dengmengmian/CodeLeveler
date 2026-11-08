@@ -1908,6 +1908,32 @@ impl<'a> Drive<'a> {
     }
 }
 
+/// Whether a mid-turn user message belongs in the goal's durable scope.
+///
+/// A Goal window records constraints and prohibitions (`is_goal_instruction`);
+/// a Chat window only records a change to the DELIVERABLE set
+/// (`is_chat_goal_instruction`). Either way a status question is neither and is
+/// delivered to the model without polluting the acceptance contract.
+fn steer_joins_goal_scope(
+    goal_mode: bool,
+    objective: &str,
+    amendments: &[String],
+    text: &str,
+) -> bool {
+    if goal_mode {
+        crate::executor::goal_scope::is_goal_instruction(objective, amendments, text)
+    } else {
+        crate::executor::goal_scope::is_chat_goal_instruction(objective, amendments, text)
+    }
+}
+
+/// One deferred parallel-safe call, carrying the admitted proof so the host
+/// pipeline cannot be bypassed by the batch runner.
+struct ParallelJob {
+    index: usize,
+    admitted: crate::executor::host::AdmittedCall,
+}
+
 impl Drive<'_> {
     /// Drop the "you can enable this" hint once nothing it mentions is still
     /// unexposed. A hint that outlives its fact is worse than none.
@@ -2308,6 +2334,122 @@ fn anchor_user_texts(anchor: &leveler_lifecycle::ObjectiveAnchor) -> Vec<&str> {
     texts
 }
 
+impl Drive<'_> {
+    /// Execute the deferred parallel-safe calls, then fold their results into
+    /// the original call slots. Grouping is by CONSECUTIVE parallel-safe calls:
+    /// the caller flushes this batch before the next serial call, so a
+    /// `read -> write -> read` round observes the write between the reads while
+    /// adjacent independent reads still overlap.
+    async fn run_parallel_tools(
+        &mut self,
+        jobs: &mut Vec<ParallelJob>,
+        results: &mut [Option<ContentPart>],
+        pending_images: &mut Vec<ContentPart>,
+        observed_terminal_tasks: &mut Vec<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), AgentError> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        {
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let cancellation_ref = cancellation;
+            let executor = self.executor;
+            // Leveling knob: bound how many of the batch actually overlap
+            // (policy `max_parallel_tools`; 0 = the whole batch at once).
+            let permits = match self.executor.policy.max_parallel_tools {
+                0 => jobs.len(),
+                n => n,
+            };
+            let sem = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+            let mut futs = FuturesUnordered::new();
+            for job in jobs.iter() {
+                let sem = sem.clone();
+                futs.push(async move {
+                    let _permit = sem
+                        .acquire()
+                        .await
+                        .expect("tool-batch semaphore is never closed");
+                    let out = executor
+                        .dispatch_raw(&job.admitted, cancellation_ref, None)
+                        .await;
+                    (job.index, out)
+                });
+            }
+            let mut raw: std::collections::HashMap<usize, (String, bool, serde_json::Value)> =
+                std::collections::HashMap::new();
+            while let Some((idx, out)) = futs.next().await {
+                raw.insert(idx, out);
+            }
+            drop(futs);
+
+            for job in jobs.iter() {
+                let (content, is_error, metadata) = raw
+                    .remove(&job.index)
+                    .expect("every parallel job produced a result");
+                let mut job_files = Vec::new();
+                collect_modified(&metadata, &mut job_files);
+                for f in &job_files {
+                    if !self.modified_files.iter().any(|e| e == f) {
+                        self.modified_files.push(f.clone());
+                    }
+                }
+                if !is_error && !job_files.is_empty() {
+                    let touched = workspace_mutations(
+                        executor.tool_context.execution.workspace.as_deref(),
+                        job_files,
+                    );
+                    if !touched.is_empty() {
+                        note_tool_side_effects(
+                            &mut self.ledger,
+                            job.admitted.call.id.as_str(),
+                            job.admitted.call.name.as_str(),
+                            touched,
+                            &self.plan_state,
+                            &mut *self.observer,
+                        );
+                    }
+                }
+                if let Some(part) = extract_image(&metadata) {
+                    pending_images.push(part);
+                }
+                let facts = super::dispatch::extract_command_facts(&metadata);
+                if let Some(task_id) = facts.terminal_task_id.as_ref() {
+                    observed_terminal_tasks.push(task_id.clone());
+                }
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: facts.exit_code,
+                    stop: facts.stop,
+                    execution_status: facts.execution_status,
+                    id: job.admitted.call.id.as_str().to_string(),
+                    name: job.admitted.call.name.clone(),
+                    is_error,
+                    preview: preview(&content),
+                    applied_diff: (!is_error)
+                        .then(|| extract_applied_diff(&metadata))
+                        .flatten(),
+                });
+                if !is_error && let Some(steps) = extract_plan(&metadata) {
+                    (self.observer)(AgentEvent::PlanUpdated { steps });
+                }
+                for path in &self.modified_files {
+                    push_unique_path(&mut self.scoped_paths, path);
+                }
+                results[job.index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: job.admitted.call.id.clone(),
+                        // Already size-capped centrally by `ToolRegistry::execute`.
+                        content,
+                        is_error,
+                    },
+                });
+            }
+        }
+        jobs.clear();
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl AgentHarness for Drive<'_> {
     type Stop = AgentOutcome;
@@ -2570,10 +2712,23 @@ impl AgentHarness for Drive<'_> {
                     }
                 }
                 // A user message during an active goal is user authority over
-                // the scope (it may narrow or add a requirement). Keep it with
-                // the goal so a later window cannot forget it.
+                // the scope (it may narrow or add a requirement), but not every
+                // message is a scope change. A status question, a consultation,
+                // or an acknowledgment must reach the model without becoming a
+                // durable requirement the completion gate later enforces.
                 if let Some(binder) = self.executor.goal_binder() {
-                    binder.append_amendment(text).await?;
+                    let joins = match binder.scope().await? {
+                        Some(scope) => steer_joins_goal_scope(
+                            self.executor.goal_mode(),
+                            &scope.objective,
+                            &scope.amendments,
+                            text,
+                        ),
+                        None => false,
+                    };
+                    if joins {
+                        binder.append_amendment(text).await?;
+                    }
                 }
                 messages.push(message);
             }
@@ -3362,13 +3517,9 @@ impl AgentHarness for Drive<'_> {
         // Images loaded via view_image this round, injected as a user message
         // after the tool results so a vision model sees them next request.
         let mut pending_images: Vec<ContentPart> = Vec::new();
-        // Read-only, side-effect-free tools deferred to run concurrently
-        // after this in-order pass. Everything else runs here, serially.
-        // Each job carries the AdmittedCall proving the host pipeline ran.
-        struct ParallelJob {
-            index: usize,
-            admitted: crate::executor::host::AdmittedCall,
-        }
+        // Read-only, side-effect-free calls deferred into a consecutive
+        // group; the group is flushed before the next serial call so call
+        // order is preserved without serializing independent reads.
         let mut parallel_jobs: Vec<ParallelJob> = Vec::new();
         // spawn_agent calls deferred to run concurrently after this pass.
         let mut spawn_jobs: Vec<(usize, ToolCall)> = Vec::new();
@@ -4859,6 +5010,20 @@ impl AgentHarness for Drive<'_> {
                 .get(&call.name)
                 .map(|t| t.supports_parallel())
                 .unwrap_or(false);
+            // Call-order contract (F-17): a deferred read group belongs BEFORE
+            // this serial call. Flush it now so `read -> write -> read` sees
+            // the write between the reads. Adjacent reads still share a
+            // concurrent batch.
+            if !parallel && !parallel_jobs.is_empty() {
+                self.run_parallel_tools(
+                    &mut parallel_jobs,
+                    &mut results,
+                    &mut pending_images,
+                    &mut observed_terminal_tasks,
+                    &cancellation,
+                )
+                .await?;
+            }
             (self.observer)(AgentEvent::ToolCall {
                 id: call.id.as_str().to_string(),
                 name: call.name.clone(),
@@ -5258,26 +5423,9 @@ impl AgentHarness for Drive<'_> {
                 });
             }
 
-            (self.observer)(AgentEvent::ToolResult {
-                exit_code: command_facts.exit_code,
-                stop: command_facts.stop,
-                execution_status: command_facts.execution_status,
-                id: call.id.as_str().to_string(),
-                name: call.name.clone(),
-                is_error,
-                preview: preview(&content),
-                // An edit's real landing site, straight from the tool that
-                // made it. A failed call never carries one.
-                applied_diff: (!is_error).then_some(applied_diff).flatten(),
-            });
-
             // Any tool that newly modified files records a mutation (not
             // only apply_patch/replace by name). Paths are this call only.
             if !is_error && call_mutated {
-                // Record what THIS call touched. `newly_modified` is the
-                // first-touch delta and is empty on a re-edit; `call_files`
-                // is the call's own report. Together they name every path
-                // this change reached, so scope and impact see re-edits.
                 let mut touched = newly_modified;
                 for path in &call_files {
                     if !touched.iter().any(|p| p == path) {
@@ -5299,13 +5447,25 @@ impl AgentHarness for Drive<'_> {
                     );
                 }
             }
-            for path in &self.modified_files {
-                push_unique_path(&mut self.scoped_paths, path);
-            }
-
-            // Mechanical verification fact. Recorded after the call's own
-            // mutation note, so "passed after the last change" compares the
-            // right sequence number.
+            (self.observer)(AgentEvent::ToolResult {
+                exit_code: command_facts.exit_code,
+                stop: command_facts.stop,
+                execution_status: command_facts.execution_status,
+                id: call.id.as_str().to_string(),
+                name: call.name.clone(),
+                is_error,
+                preview: preview(&content),
+                // An edit's real landing site, straight from the tool that
+                // made it. A failed call never carries one.
+                applied_diff: (!is_error).then_some(applied_diff).flatten(),
+            });
+            // Mechanical verification fact, sampled AFTER this call's own
+            // mutation note. The note is emitted before this result, so the
+            // replay path sees the same EvidenceLedgerUpdated before
+            // ToolCallFinished and reaches the same mutation count (F-07).
+            // A command that mutates the tree is therefore credited with its
+            // own mutation, which is the completion contract the gate tests
+            // pin; it is never judged against a pre-command count.
             //
             // A command that only STARTED (a background task, or a foreground
             // run handed to the background) reported no execution status: its
@@ -5394,6 +5554,14 @@ impl AgentHarness for Drive<'_> {
                 }
             }
 
+            for path in &self.modified_files {
+                push_unique_path(&mut self.scoped_paths, path);
+            }
+
+            for path in &self.modified_files {
+                push_unique_path(&mut self.scoped_paths, path);
+            }
+
             results[index] = Some(ContentPart::ToolResult {
                 result: ToolResultContent {
                     call_id: call.id,
@@ -5407,102 +5575,16 @@ impl AgentHarness for Drive<'_> {
             }
         }
 
-        // Run the deferred read-only tools concurrently, then fold their
-        // results back into their original call slots so the transcript
-        // stays in call order regardless of completion order.
-        if !parallel_jobs.is_empty() && !cancelled_mid_batch {
-            use futures::stream::{FuturesUnordered, StreamExt};
-            let cancellation_ref = &cancellation;
-            let executor = self.executor;
-            // Leveling knob: bound how many of the batch actually overlap
-            // (policy `max_parallel_tools`; 0 = the whole batch at once).
-            let permits = match self.executor.policy.max_parallel_tools {
-                0 => parallel_jobs.len(),
-                n => n,
-            };
-            let sem = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
-            let mut futs = FuturesUnordered::new();
-            for job in &parallel_jobs {
-                let sem = sem.clone();
-                futs.push(async move {
-                    let _permit = sem
-                        .acquire()
-                        .await
-                        .expect("tool-batch semaphore is never closed");
-                    let out = executor
-                        .dispatch_raw(&job.admitted, cancellation_ref, None)
-                        .await;
-                    (job.index, out)
-                });
-            }
-            let mut raw: std::collections::HashMap<usize, (String, bool, serde_json::Value)> =
-                std::collections::HashMap::new();
-            while let Some((idx, out)) = futs.next().await {
-                raw.insert(idx, out);
-            }
-            drop(futs);
-
-            for job in &parallel_jobs {
-                let (content, is_error, metadata) = raw
-                    .remove(&job.index)
-                    .expect("every parallel job produced a result");
-                let mut job_files = Vec::new();
-                collect_modified(&metadata, &mut job_files);
-                for f in &job_files {
-                    if !self.modified_files.iter().any(|e| e == f) {
-                        self.modified_files.push(f.clone());
-                    }
-                }
-                if !is_error && !job_files.is_empty() {
-                    let touched = workspace_mutations(
-                        executor.tool_context.execution.workspace.as_deref(),
-                        job_files,
-                    );
-                    if !touched.is_empty() {
-                        note_tool_side_effects(
-                            &mut self.ledger,
-                            job.admitted.call.id.as_str(),
-                            job.admitted.call.name.as_str(),
-                            touched,
-                            &self.plan_state,
-                            &mut *self.observer,
-                        );
-                    }
-                }
-                if let Some(part) = extract_image(&metadata) {
-                    pending_images.push(part);
-                }
-                let facts = super::dispatch::extract_command_facts(&metadata);
-                if let Some(task_id) = facts.terminal_task_id.as_ref() {
-                    observed_terminal_tasks.push(task_id.clone());
-                }
-                (self.observer)(AgentEvent::ToolResult {
-                    exit_code: facts.exit_code,
-                    stop: facts.stop,
-                    execution_status: facts.execution_status,
-                    id: job.admitted.call.id.as_str().to_string(),
-                    name: job.admitted.call.name.clone(),
-                    is_error,
-                    preview: preview(&content),
-                    applied_diff: (!is_error)
-                        .then(|| extract_applied_diff(&metadata))
-                        .flatten(),
-                });
-                if !is_error && let Some(steps) = extract_plan(&metadata) {
-                    (self.observer)(AgentEvent::PlanUpdated { steps });
-                }
-                for path in &self.modified_files {
-                    push_unique_path(&mut self.scoped_paths, path);
-                }
-                results[job.index] = Some(ContentPart::ToolResult {
-                    result: ToolResultContent {
-                        call_id: job.admitted.call.id.clone(),
-                        // Already size-capped centrally by `ToolRegistry::execute`.
-                        content,
-                        is_error,
-                    },
-                });
-            }
+        // Trailing parallel-safe calls (a batch that ended with reads).
+        if !cancelled_mid_batch {
+            self.run_parallel_tools(
+                &mut parallel_jobs,
+                &mut results,
+                &mut pending_images,
+                &mut observed_terminal_tasks,
+                &cancellation,
+            )
+            .await?;
         }
 
         // Concurrent sub-agent batch (CC-style star delegation): several
@@ -8041,5 +8123,53 @@ mod workspace_mutation_tests {
             &format!("{root_text}/../outside.txt")
         ));
         assert!(!path_is_within(&root, "/tmp/captured-evidence.txt"));
+    }
+}
+
+#[cfg(test)]
+mod steer_scope_tests {
+    use super::steer_joins_goal_scope;
+
+    #[test]
+    fn a_status_question_does_not_change_the_goal_scope() {
+        assert!(!steer_joins_goal_scope(
+            true,
+            "fix the parser",
+            &[],
+            "为什么刚才没有权限？"
+        ));
+        assert!(!steer_joins_goal_scope(
+            false,
+            "fix the parser",
+            &[],
+            "进度如何？"
+        ));
+    }
+
+    #[test]
+    fn a_goal_window_records_a_real_constraint_or_prohibition() {
+        assert!(steer_joins_goal_scope(
+            true,
+            "fix the parser",
+            &[],
+            "不要修改 src/payments.rs，改用环境变量。"
+        ));
+    }
+
+    #[test]
+    fn a_chat_message_only_records_a_deliverable_change() {
+        // A one-off constraint reaches the model but is not a forever scope.
+        assert!(!steer_joins_goal_scope(
+            false,
+            "fix the parser",
+            &[],
+            "这次只回答，不要改任何文件。"
+        ));
+        assert!(steer_joins_goal_scope(
+            false,
+            "fix the parser",
+            &[],
+            "另外新增 src/export_csv.rs，实现导出 CSV。"
+        ));
     }
 }

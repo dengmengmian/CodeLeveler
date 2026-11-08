@@ -3208,9 +3208,12 @@ impl CodingRuntime {
         }
             let scope = lineage.goal_id.as_ref().map(|id| id.as_str()).unwrap_or(lineage.root_turn_id.as_str());
             let scoped = crate::coding::turn::persisted_budget_progress(self.engine.stores.events.as_ref(), session_id, scope).await?;
-            let latest = crate::coding::turn::last_persisted_progress(self.engine.stores.events.as_ref(), session_id).await?.unwrap_or_default();
-            if scoped.is_none() && latest.budget_scope.is_none()
-                && (latest.cumulative_model_tokens > 0 || latest.cumulative_cost_usd_micros > 0)
+            // F-12: every legacy unscoped spend row matters, not only the last
+            // progress row. A scoped row appended after legacy spend used to
+            // hide it and let a capped resume rebuild the cap from zero.
+            let legacy_unscoped =
+                crate::coding::turn::has_unscoped_model_spend(self.engine.stores.events.as_ref(), session_id).await?;
+            if scoped.is_none() && legacy_unscoped
                 && (spec.runtime.limits.max_model_tokens.is_some() || spec.runtime.limits.max_cost_usd_micros.is_some()) {
                 return Err(EngineError::Config("cannot reconstruct capped legacy task budget: request scope attribution is unavailable".into()));
             }
