@@ -346,7 +346,7 @@ async fn assert_fencing_contract(
     assert_eq!(unchanged_goal.state, GoalState::Running);
 
     // Scenario I (terminal): the current owner commits normally.
-    ports
+    let turn_event = ports
         .terminal
         .finish_turn_owned(
             current,
@@ -359,6 +359,40 @@ async fn assert_fencing_contract(
         )
         .await
         .unwrap();
+    // TERM-01/02: retrying the same fenced turn terminal returns the committed
+    // row and appends nothing, even though the retry is a separate call.
+    let repeated = ports
+        .terminal
+        .finish_turn_owned(
+            current,
+            session,
+            &turn_id,
+            "turn_finished",
+            "{}",
+            TurnOutcome::Completed,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.id, turn_event.id);
+    // TERM-03: a different terminal for the same turn is refused, and the
+    // original row survives.
+    assert!(
+        ports
+            .terminal
+            .finish_turn_owned(
+                current,
+                session,
+                &turn_id,
+                "turn_finished",
+                r#"{"outcome":"failed"}"#,
+                TurnOutcome::Failed,
+                now(),
+            )
+            .await
+            .is_err(),
+        "a conflicting fenced turn terminal must be refused"
+    );
     ports
         .terminal
         .finish_task_owned(
