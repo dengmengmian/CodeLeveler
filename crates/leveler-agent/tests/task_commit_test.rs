@@ -34,6 +34,9 @@ const USER_REQUEST: &str = "接入全部运营后台能力到 MCP，读写都要
 enum Scripted {
     Tool(&'static str, serde_json::Value),
     Text(&'static str),
+    /// Wait on the background task id the runtime just returned to the model.
+    /// The harness learns the id from the real tool result, never predicts it.
+    WaitLatestBackground,
 }
 
 impl Scripted {
@@ -149,7 +152,7 @@ impl ModelRuntime for Runtime {
                 usage: usage(),
             }));
         }
-        self.requests.lock().unwrap().push(request);
+        self.requests.lock().unwrap().push(request.clone());
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let next = self
             .script
@@ -173,6 +176,39 @@ impl ModelRuntime for Runtime {
                 FinishReason::ToolCalls,
             ),
             Scripted::Text(text) => (Message::text(Role::Assistant, text), FinishReason::Stop),
+            Scripted::WaitLatestBackground => {
+                let task_id = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .flat_map(|message| message.content.iter().rev())
+                    .find_map(|part| match part {
+                        ContentPart::ToolResult { result } => {
+                            result.content.split("task_id: ").nth(1).map(|rest| {
+                                rest.split_whitespace()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_string()
+                            })
+                        }
+                        _ => None,
+                    })
+                    .expect("a background start result must name its task");
+                (
+                    Message::from_parts(
+                        Role::Assistant,
+                        vec![ContentPart::ToolCall {
+                            call: ToolCall {
+                                id: leveler_core::ToolCallId::new(format!("call-{call}")),
+                                name: "wait_task".to_string(),
+                                arguments: serde_json::json!({ "task_id": task_id }),
+                            },
+                        }],
+                        None,
+                    ),
+                    FinishReason::ToolCalls,
+                )
+            }
         };
         if call == self.cancel_after.load(Ordering::SeqCst) {
             self.cancel.cancel();
@@ -202,6 +238,8 @@ struct Fixture {
     db: Database,
     session: SessionId,
     dir: tempfile::TempDir,
+    _home: tempfile::TempDir,
+    mode: PermissionProfile,
     cancel: CancellationToken,
     task_cancel: Arc<AtomicBool>,
 }
@@ -217,6 +255,14 @@ fn with_delivery(mut script: Vec<Scripted>) -> Vec<Scripted> {
 }
 
 async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
+    fixture_with_mode(script, read_only, PermissionProfile::Assisted).await
+}
+
+async fn fixture_with_mode(
+    script: Vec<Scripted>,
+    read_only: bool,
+    mode: PermissionProfile,
+) -> Fixture {
     let script = with_delivery(script);
     let dir = tempfile::tempdir().unwrap();
     write_test_runner(dir.path());
@@ -239,13 +285,28 @@ async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
         cancel_after: AtomicU32::new(0),
         cancel: cancel.clone(),
     });
+    // Keep the sandbox scratch in a private home OUTSIDE the workspace: the
+    // real home is not writable under the agent sandbox, and a test must not
+    // write there. A home inside the workspace is refused by the product.
+    let home = tempfile::tempdir().unwrap();
+    let leveler_home = home.path().join("leveler-home");
+    let scratch = home.path().join("tmp");
+    std::fs::create_dir_all(&leveler_home).unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        std::env::vars_os().collect();
+    environment.retain(|(key, _)| key != "LEVELER_HOME");
+    environment.push((
+        std::ffi::OsString::from("LEVELER_HOME"),
+        leveler_home.into_os_string(),
+    ));
     let context = ToolContext::with_environment(
         Workspace::new(dir.path()).unwrap(),
-        PermissionProfile::Assisted,
+        mode,
         Arc::new(leveler_core::EnvSnapshot::new(
-            std::env::vars_os(),
+            environment,
             dir.path().into(),
-            std::env::temp_dir(),
+            scratch,
         )),
     )
     .with_read_only(read_only);
@@ -290,6 +351,8 @@ async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
         db,
         session,
         dir,
+        _home: home,
+        mode,
         cancel,
         task_cancel,
     }
@@ -305,7 +368,7 @@ fn spec(fx: &Fixture) -> TaskSpec {
         },
         coding: leveler_agent::coding::CodingTaskSpec {
             repository: Some(fx.dir.path().into()),
-            mode: PermissionProfile::Assisted,
+            mode: fx.mode,
             sandbox: false,
         },
     }
@@ -2733,4 +2796,82 @@ async fn an_explicit_new_relation_opens_an_independent_goal() {
         new.acceptance, old.acceptance,
         "the new task must not inherit the old acceptance"
     );
+}
+
+/// B12: a background process that modifies the workspace after a verification
+/// pass must expire that pass. The modification is learned from the durable
+/// settlement the production `wait_task` returns, so the model cannot carry a
+/// stale pass into completion.
+#[tokio::test]
+async fn b12_a_background_write_expires_the_verification_it_followed() {
+    let fx = fixture_with_mode(
+        vec![
+            Scripted::commit(),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "sleep 0.1; printf 'background' > background-write.txt"],
+                    "background": true
+                }),
+            ),
+            Scripted::WaitLatestBackground,
+            Scripted::complete(),
+            Scripted::run_tests(),
+            Scripted::complete(),
+            Scripted::Text("后台写入了工作区，已重新验证后完成。"),
+        ],
+        false,
+        PermissionProfile::FullAccess,
+    )
+    .await;
+
+    leveler_test_support::git::init_repo(fx.dir.path());
+    std::fs::write(fx.dir.path().join("seed.txt"), "seed\n").unwrap();
+    leveler_test_support::git::run(fx.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(fx.dir.path(), &["commit", "-qm", "seed"]);
+
+    let mut refusals = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: USER_REQUEST.into(),
+            }],
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "verification_refused"
+                {
+                    refusals.push(detail.to_string());
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        fx.dir.path().join("background-write.txt").is_file(),
+        "the real background process must have written the workspace"
+    );
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the stale pass must be refused exactly once: {refusals:?}; report={report:?}"
+    );
+    assert!(
+        refusals[0].contains("verification expired")
+            || refusals[0].contains("before the most recent file change"),
+        "the refusal must name freshness: {}",
+        refusals[0]
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the re-run must permit completion: {report:?}"
+    );
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }

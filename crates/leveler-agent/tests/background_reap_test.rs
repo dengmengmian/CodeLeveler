@@ -225,6 +225,10 @@ struct Harness {
     #[allow(dead_code)]
     db: Database,
     dir: tempfile::TempDir,
+    /// The runtime home this harness resolves. A background spawn creates its
+    /// private sandbox scratch here, and the owner refuses a home inside the
+    /// writable workspace, so it must be a sibling of `dir`, not a child.
+    _home: tempfile::TempDir,
     registry: Arc<BackgroundTaskRegistry>,
     runtime: Arc<MockRuntime>,
 }
@@ -236,8 +240,20 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     let workspace = Workspace::new(dir.path()).unwrap();
     // Tests never initialize the global env snapshot, so the registry default
     // (empty env → no resolvable LevelerHome) would fail sandbox scratch prep.
+    // The home must be this test's own temp directory, outside the workspace:
+    // a background spawn creates its private sandbox scratch under LevelerHome,
+    // and inheriting the developer's `$HOME` makes the test depend on whether
+    // that directory is writable at all (a sandboxed runner denies it).
+    let home = tempfile::tempdir().unwrap();
+    let mut environment_vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        std::env::vars_os().collect();
+    environment_vars.retain(|(key, _)| key != "LEVELER_HOME");
+    environment_vars.push((
+        std::ffi::OsString::from("LEVELER_HOME"),
+        home.path().as_os_str().to_os_string(),
+    ));
     let environment = Arc::new(leveler_core::EnvSnapshot::new(
-        std::env::vars_os(),
+        environment_vars,
         std::env::current_dir().unwrap_or_default(),
         std::env::temp_dir(),
     ));
@@ -295,6 +311,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         engine,
         db,
         dir,
+        _home: home,
         registry,
         runtime,
     }
