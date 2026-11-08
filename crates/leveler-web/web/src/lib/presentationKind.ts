@@ -7,19 +7,33 @@
 /** Stamped by the runtime on the message that replaces compacted history. */
 export const COMPACTION_SUMMARY_PREFIX = '对话摘要（已压缩历史）';
 
+/** Starts the engine's breadcrumb when a fold replaces the elided history. */
+export const COMPACTION_BREADCRUMB_PREFIX = '[Earlier context was compacted';
+
 // - Runtime notice: the runtime's own message kind (`runtime_notice`) on a
 //   user-role message it wrote into the model's context (a child settled, a
 //   delegation was lost or resumed). Never inferred from the text here.
 export type PresentationKind = 'normal' | 'btw' | 'compaction_summary' | 'runtime_notice';
 
 export function isCompactionSummaryText(text: string): boolean {
-  return text.startsWith(COMPACTION_SUMMARY_PREFIX);
+  const value = text.trimStart();
+  return (
+    value.startsWith(COMPACTION_SUMMARY_PREFIX) ||
+    value.startsWith(COMPACTION_BREADCRUMB_PREFIX)
+  );
 }
 
 /** Markdown body after the runtime prefix. */
 export function compactionBodyMarkdown(text: string): string {
   if (!isCompactionSummaryText(text)) return text;
-  return text.slice(COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/, '').trimStart();
+  const value = text.trimStart();
+  if (value.startsWith(COMPACTION_BREADCRUMB_PREFIX)) {
+    const at = value.indexOf(COMPACTION_SUMMARY_PREFIX);
+    return at >= 0
+      ? value.slice(at + COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/, '').trimStart()
+      : value;
+  }
+  return value.slice(COMPACTION_SUMMARY_PREFIX.length).replace(/^：\s*/, '').trimStart();
 }
 
 export function isTurnUser(m: {

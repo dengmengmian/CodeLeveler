@@ -14,6 +14,14 @@ describe('compaction presentation', () => {
     expect(isCompactionSummaryText('看看这个项目')).toBe(false);
   });
 
+  it('recognizes the engine breadcrumb that wraps a generated summary', () => {
+    const text = `[Earlier context was compacted to fit the window: 2 steps elided.]\n\n${COMPACTION_SUMMARY_PREFIX}：\n## 简报`;
+    expect(isCompactionSummaryText(text)).toBe(true);
+    expect(compactionBodyMarkdown(text)).toBe('## 简报');
+    expect(isTurnUser({ role: 'user', text })).toBe(true);
+    expect(presentationKindOf({ role: 'user', text })).toBe('compaction_summary');
+  });
+
   it('strips the prefix so Markdown is the body', () => {
     expect(compactionBodyMarkdown(`${COMPACTION_SUMMARY_PREFIX}：\n## 会话简报\n- a`)).toBe(
       '## 会话简报\n- a',

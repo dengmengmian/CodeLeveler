@@ -356,12 +356,22 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
     ) {
         return None;
     }
+    // A compaction summary is user-role context the runtime wrote. The durable
+    // origin is authoritative; the text check below still covers legacy rows
+    // and summaries that were re-wrapped by a later fold (the engine
+    // breadcrumb may precede the `/compact` prefix).
+    if matches!(
+        message.origin.as_ref(),
+        Some(leveler_model::TranscriptOrigin::CompactionSummary { .. })
+    ) {
+        return None;
+    }
     let (text, images) = user_input(&message);
     let first = text.lines().next().unwrap_or("").trim_end();
     // A message that was only a picture has no text; replaying it as nothing
     // is how a reopened session lost the turn.
     if (text.trim().is_empty() && images == 0)
-        || text.starts_with(leveler_client_protocol::COMPACTION_SUMMARY_PREFIX)
+        || leveler_client_protocol::is_compaction_summary_text(&text)
         || leveler_agent::RUNTIME_NOTICE_HEADERS.contains(&first)
     {
         return None;

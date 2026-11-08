@@ -142,5 +142,41 @@ pub use leveler_model::{ModelRef, ThinkingLevel};
 /// render it as a distinct "history summary" block rather than a user message.
 pub const COMPACTION_SUMMARY_PREFIX: &str = "对话摘要（已压缩历史）";
 
+/// Prefix of the engine's compaction breadcrumb. A context fold replaces the
+/// elided history with a message that begins with this marker; the `/compact`
+/// summary (`COMPACTION_SUMMARY_PREFIX`) may follow it.
+pub const COMPACTION_BREADCRUMB_PREFIX: &str = "[Earlier context was compacted";
+
+/// Whether a message is a compaction summary rather than something the user
+/// typed. Both shapes count: the `/compact` summary and the engine breadcrumb
+/// (which may wrap a generated summary). Clients use one predicate so a fold
+/// never reappears as a conversation row.
+pub fn is_compaction_summary_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with(COMPACTION_SUMMARY_PREFIX) || text.starts_with(COMPACTION_BREADCRUMB_PREFIX)
+}
+
 /// Authoritative wire-tag policy for snapshot versioned replacements.
 pub use command::SNAPSHOT_VERSIONED_COMMANDS;
+
+#[cfg(test)]
+mod compaction_summary_tests {
+    use super::{
+        COMPACTION_BREADCRUMB_PREFIX, COMPACTION_SUMMARY_PREFIX, is_compaction_summary_text,
+    };
+
+    #[test]
+    fn both_compaction_shapes_are_recognised() {
+        assert!(is_compaction_summary_text(&format!(
+            "{COMPACTION_SUMMARY_PREFIX}：\nfolded"
+        )));
+        assert!(is_compaction_summary_text(&format!(
+            "{COMPACTION_BREADCRUMB_PREFIX} to fit the window: 2 steps elided.]\n\n\
+             {COMPACTION_SUMMARY_PREFIX}：\nfolded"
+        )));
+        assert!(!is_compaction_summary_text("please fix the parser"));
+        assert!(!is_compaction_summary_text(&format!(
+            "note: {COMPACTION_SUMMARY_PREFIX} appears in this sentence"
+        )));
+    }
+}
