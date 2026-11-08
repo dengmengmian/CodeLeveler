@@ -61,6 +61,7 @@ fn runtime_child() {
     std::fs::write(&state, format!("{pid}\n{start}\n")).unwrap();
     std::thread::sleep(Duration::from_secs(60));
     let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
@@ -84,6 +85,7 @@ fn a_runtime_sigkill_leaves_a_verifiable_background_identity() {
     let pid: u32 = lines.next().unwrap().parse().unwrap();
     let start = lines.next().unwrap().to_string();
     let runtime_pid = runtime.id();
+    eprintln!("R3_IDENTITY runtime_pid={runtime_pid} background_pid={pid} start={start:?}");
     let status = Command::new("kill")
         .args(["-9", &runtime_pid.to_string()])
         .status()
