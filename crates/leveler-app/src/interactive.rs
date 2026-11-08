@@ -545,7 +545,27 @@ struct SessionStreams {
 struct SessionStream {
     events: crate::event_bridge::RuntimeEventSender,
     cancellation: CancellationToken,
+    /// When this stream was last handed to a producer. A stream is derived
+    /// state — the durable event log is the authority — so an idle one can be
+    /// dropped and recreated on the next publish.
+    last_used: std::time::Instant,
 }
+
+/// How many idle session streams one runtime keeps. A stream reserves a full
+/// 2048-slot ring of `RuntimeEvent` (936 bytes, measured), about 1.9 MiB, plus
+/// one background-registry bridge task. A schedule that creates a fresh
+/// session per run would otherwise grow that set for the life of a resident
+/// runtime. Thirty-two streams bound the rings near 61 MiB — eight times the
+/// runtime's four-turn admission capacity — while staying far below the
+/// 24-hour soak's 512 MiB growth budget.
+///
+/// This is a resource bound, not a visibility bound: a reconnecting client
+/// replays durable history and the next publish recreates the stream.
+const SESSION_STREAM_CACHE_CAPACITY: usize = 32;
+
+/// A stream younger than this is never evicted, so a client that has just
+/// attached has time to subscribe before its ring is reclaimed.
+const SESSION_STREAM_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Drop for SessionStreams {
     fn drop(&mut self) {
@@ -1770,9 +1790,44 @@ impl InProcessRuntimeClient {
         self.goal_steering.lock().unwrap().remove(session_id);
     }
 
+    /// Drop session streams nobody is watching once the cache is over its
+    /// cap, oldest first.
+    ///
+    /// A stream is only evicted when it has no subscriber of its own (the
+    /// compatibility broadcast does not count — it carries one copy globally,
+    /// not one per session), no main turn is running for it, and it has been
+    /// idle for the grace period. Eviction closes the stream and cancels its
+    /// background bridge task; the next publish for that session recreates
+    /// both. The durable event log, not the ring, is what a later client
+    /// replays.
+    fn evict_idle_session_streams(&self, now: std::time::Instant) {
+        let mut streams = self.session_events.streams.lock().unwrap();
+        if streams.len() <= SESSION_STREAM_CACHE_CAPACITY {
+            return;
+        }
+        let mut idle: Vec<(std::time::Instant, SessionId)> = streams
+            .iter()
+            .filter(|(session_id, stream)| {
+                stream.events.session_receiver_count() == 0
+                    && !self.active.is_running(session_id)
+                    && now.saturating_duration_since(stream.last_used) >= SESSION_STREAM_IDLE_GRACE
+            })
+            .map(|(session_id, stream)| (stream.last_used, session_id.clone()))
+            .collect();
+        idle.sort_by_key(|(last_used, _)| *last_used);
+        let excess = streams.len() - SESSION_STREAM_CACHE_CAPACITY;
+        for (_, session_id) in idle.into_iter().take(excess) {
+            if let Some(stream) = streams.remove(&session_id) {
+                stream.cancellation.cancel();
+                stream.events.close();
+            }
+        }
+    }
+
     fn events_for(&self, session_id: &SessionId) -> crate::event_bridge::RuntimeEventSender {
         let mut streams = self.session_events.streams.lock().unwrap();
-        if let Some(stream) = streams.get(session_id) {
+        if let Some(stream) = streams.get_mut(session_id) {
+            stream.last_used = std::time::Instant::now();
             return stream.events.clone();
         }
         let (sender, _) = broadcast::channel(2048);
@@ -1789,9 +1844,11 @@ impl InProcessRuntimeClient {
             SessionStream {
                 events: events.clone(),
                 cancellation: cancellation.clone(),
+                last_used: std::time::Instant::now(),
             },
         );
         drop(streams);
+        self.evict_idle_session_streams(std::time::Instant::now());
         let background_registry = self.app.background_tasks().clone();
         let mut background_events = background_registry.subscribe();
         let background_session_id = session_id.clone();
@@ -10871,6 +10928,106 @@ mod session_stream_tests {
                 .unwrap();
         }
         assert!(runtime.live_views.view(&id).active_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_unwatched_session_streams_stay_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        let mut watched = None;
+        for index in 0..(SESSION_STREAM_CACHE_CAPACITY + 10) {
+            let id = SessionId::new(format!("bounded-{index}"));
+            let sender = runtime.events_for(&id);
+            if index == 0 {
+                watched = Some((id.clone(), sender.subscribe()));
+            }
+        }
+        assert_eq!(
+            runtime.session_events.streams.lock().unwrap().len(),
+            SESSION_STREAM_CACHE_CAPACITY + 10,
+            "a fresh stream is never evicted inside the grace period"
+        );
+        let now = std::time::Instant::now()
+            + SESSION_STREAM_IDLE_GRACE
+            + std::time::Duration::from_secs(1);
+        runtime.evict_idle_session_streams(now);
+        let streams = runtime.session_events.streams.lock().unwrap();
+        assert_eq!(streams.len(), SESSION_STREAM_CACHE_CAPACITY);
+        let (watched_id, mut receiver) = watched.unwrap();
+        assert!(
+            streams.contains_key(&watched_id),
+            "a subscribed stream is not evicted"
+        );
+        assert!(
+            !streams.contains_key(&SessionId::new("bounded-1")),
+            "the oldest unwatched stream is reclaimed first"
+        );
+        drop(streams);
+        let sender = runtime.events_for(&watched_id);
+        sender
+            .send(RuntimeEvent::Notification {
+                level: NotificationLevel::Info,
+                message: "still live".into(),
+            })
+            .unwrap();
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_active_turn_keeps_its_session_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        for index in 0..(SESSION_STREAM_CACHE_CAPACITY + 4) {
+            runtime.events_for(&SessionId::new(format!("busy-{index}")));
+        }
+        let busy = SessionId::new("busy-0");
+        let lease = runtime.active.admit(&busy).unwrap();
+        let now = std::time::Instant::now()
+            + SESSION_STREAM_IDLE_GRACE
+            + std::time::Duration::from_secs(1);
+        runtime.evict_idle_session_streams(now);
+        assert!(
+            runtime
+                .session_events
+                .streams
+                .lock()
+                .unwrap()
+                .contains_key(&busy),
+            "a running turn keeps its events"
+        );
+        runtime.active.finish(&lease);
+    }
+
+    #[tokio::test]
+    async fn an_evicted_session_stream_is_recreated_on_the_next_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = runtime(tmp.path());
+        for index in 0..(SESSION_STREAM_CACHE_CAPACITY + 2) {
+            runtime.events_for(&SessionId::new(format!("recreate-{index}")));
+        }
+        let now = std::time::Instant::now()
+            + SESSION_STREAM_IDLE_GRACE
+            + std::time::Duration::from_secs(1);
+        runtime.evict_idle_session_streams(now);
+        let id = SessionId::new("recreate-0");
+        assert!(
+            !runtime
+                .session_events
+                .streams
+                .lock()
+                .unwrap()
+                .contains_key(&id)
+        );
+        let sender = runtime.events_for(&id);
+        assert!(
+            runtime
+                .session_events
+                .streams
+                .lock()
+                .unwrap()
+                .contains_key(&id)
+        );
+        assert!(sender.subscribe().try_recv().is_err());
     }
 
     #[tokio::test]
