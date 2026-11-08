@@ -3,6 +3,24 @@
 use super::parse::UpdateChunk;
 use super::seek::seek_sequence;
 
+/// The runtime's placeholder for a value hidden from the model.
+const REDACTED: &str = leveler_core::secret::SECRET_PLACEHOLDER;
+
+/// What the model needs to know when a hunk carries the placeholder.
+const REDACTION_NOTE: &str = "Tool output replaces secret values with `[REDACTED]`, \
+which is a placeholder for a hidden value — not the file's literal text.";
+
+/// A resolved hunk: the splice plus the lines to show in the applied diff.
+///
+/// `display_old` is deliberately separate from the file's real lines: a masked
+/// match must not put the hidden credential into user-visible metadata.
+struct ResolvedOp {
+    start: usize,
+    len: usize,
+    replacement: Vec<String>,
+    display_old: Vec<String>,
+}
+
 /// Apply a sequence of update chunks to `original`, returning the new content.
 /// Chunks must apply in file order; on any hunk that cannot be located this
 /// returns an error and makes no partial change (the caller commits nothing).
@@ -34,8 +52,8 @@ pub fn apply_update_located(
     };
     let mut file = split_lines(&normalized);
 
-    // Resolve every hunk to a (start, len, replacement) op before mutating.
-    let mut ops: Vec<(usize, usize, Vec<String>)> = Vec::new();
+    // Resolve every hunk to an op before mutating.
+    let mut ops: Vec<ResolvedOp> = Vec::new();
     let mut search_from = 0;
 
     for chunk in chunks {
@@ -68,6 +86,13 @@ pub fn apply_update_located(
         }
 
         let mut replacement = chunk.new_lines.clone();
+        let carries_redaction = chunk.old_lines.iter().any(|line| line.contains(REDACTED));
+        // A placeholder is not a value: writing it back would replace the real
+        // credential with the literal text `[REDACTED]`.
+        if carries_redaction && replacement.iter().any(|line| line.contains(REDACTED)) {
+            return Err(redaction_write_refused());
+        }
+
         let (match_start, matched_len) = if chunk.old_lines.is_empty() {
             // A context-less pure addition means "append at end";
             // only a `@@` label pins it to a specific spot.
@@ -77,6 +102,21 @@ pub fn apply_update_located(
                 file.len()
             };
             (at, 0)
+        } else if carries_redaction {
+            // Exact first: a file may literally contain the placeholder.
+            if let Some(i) = seek_sequence(&file, &chunk.old_lines, start, chunk.is_eof) {
+                (i, chunk.old_lines.len())
+            } else {
+                match seek_redacted(&file, &chunk.old_lines, start, chunk.is_eof) {
+                    RedactedSeek::Found(i) => (i, chunk.old_lines.len()),
+                    RedactedSeek::Ambiguous { count } => {
+                        return Err(redacted_ambiguous(count));
+                    }
+                    RedactedSeek::None => {
+                        return Err(redacted_not_found(&chunk.old_lines));
+                    }
+                }
+            }
         } else {
             match seek_sequence(&file, &chunk.old_lines, start, chunk.is_eof) {
                 Some(i) => (i, chunk.old_lines.len()),
@@ -93,7 +133,19 @@ pub fn apply_update_located(
             }
         };
 
-        ops.push((match_start, matched_len, replacement));
+        // A masked match must not surface the hidden value in the applied diff.
+        let display_old = if carries_redaction {
+            chunk.old_lines.clone()
+        } else {
+            let end = (match_start + matched_len).min(file.len());
+            file[match_start.min(file.len())..end].to_vec()
+        };
+        ops.push(ResolvedOp {
+            start: match_start,
+            len: matched_len,
+            replacement,
+            display_old,
+        });
         // A pure-append hunk occupies no span in the file, so it must not
         // advance the cursor — otherwise the next hunk would search past EOF.
         if !chunk.old_lines.is_empty() {
@@ -104,29 +156,26 @@ pub fn apply_update_located(
     // Apply bottom-up so earlier indices stay valid. Sort by start first so a
     // hunk authored out of file order (e.g. an EOF append listed before an
     // edit) still splices at a valid, non-shifting index.
-    ops.sort_by_key(|&(start, _, _)| start);
+    ops.sort_by_key(|op| op.start);
     // Record each landing site against the file as it is now, and against the
     // file as it will be once earlier hunks have shifted it.
     let mut located = Vec::with_capacity(ops.len());
     let mut delta: i64 = 0;
-    for (start, len, replacement) in &ops {
-        let end = (start + len).min(file.len());
-        let start = (*start).min(file.len());
-        let old_lines = file[start..end].to_vec();
-        let old_start = start + 1;
+    for op in &ops {
+        let old_start = op.start.min(file.len()) + 1;
         let new_start = (old_start as i64 + delta).max(1) as usize;
-        delta += replacement.len() as i64 - old_lines.len() as i64;
+        delta += op.replacement.len() as i64 - op.display_old.len() as i64;
         located.push(crate::tools::applied_diff::AppliedHunk {
             old_start,
-            old_lines,
+            old_lines: op.display_old.clone(),
             new_start,
-            new_lines: replacement.clone(),
+            new_lines: op.replacement.clone(),
         });
     }
-    for (start, len, replacement) in ops.into_iter().rev() {
-        let end = (start + len).min(file.len());
-        let start = start.min(file.len());
-        file.splice(start..end, replacement);
+    for op in ops.into_iter().rev() {
+        let end = (op.start + op.len).min(file.len());
+        let start = op.start.min(file.len());
+        file.splice(start..end, op.replacement);
     }
 
     // Normalize to a trailing newline on any non-empty result, regardless of
@@ -169,6 +218,112 @@ fn retry_without_trailing_blank(
     Err(hunk_not_found(file, chunk, start))
 }
 
+/// What a redaction-aware search found.
+enum RedactedSeek {
+    Found(usize),
+    Ambiguous { count: usize },
+    None,
+}
+
+/// Locate a hunk whose `old_lines` contain the runtime placeholder.
+///
+/// This is not fuzzy matching. Every non-placeholder line must be byte-equal;
+/// on a placeholder line the text before and after the placeholder must match
+/// and the hidden span must be non-empty. The result must be unique: two
+/// candidate sites are an ambiguity the runtime refuses to guess through.
+fn seek_redacted(file: &[String], pattern: &[String], start: usize, eof: bool) -> RedactedSeek {
+    if pattern.is_empty() {
+        return RedactedSeek::Found(start.min(file.len()));
+    }
+    if pattern.len() > file.len() {
+        return RedactedSeek::None;
+    }
+    let search_start = if eof {
+        file.len().saturating_sub(pattern.len()).max(start)
+    } else {
+        start
+    };
+    let mut found: Option<usize> = None;
+    let mut count = 0usize;
+    let mut i = search_start;
+    while i + pattern.len() <= file.len() {
+        if pattern
+            .iter()
+            .zip(&file[i..i + pattern.len()])
+            .all(|(want, have)| masked_line_matches(want, have))
+        {
+            count += 1;
+            if found.is_none() {
+                found = Some(i);
+            } else {
+                return RedactedSeek::Ambiguous { count };
+            }
+        }
+        i += 1;
+    }
+    match found {
+        Some(i) => RedactedSeek::Found(i),
+        None => RedactedSeek::None,
+    }
+}
+
+/// Whether `file_line` is the line `pattern` describes, allowing exactly the
+/// placeholder to stand for one hidden, non-empty span.
+fn masked_line_matches(pattern: &str, file_line: &str) -> bool {
+    let Some((prefix, suffix)) = placeholder_parts(pattern) else {
+        return pattern == file_line;
+    };
+    file_line.len() > prefix.len() + suffix.len()
+        && file_line.starts_with(prefix)
+        && file_line.ends_with(suffix)
+}
+
+/// The text around the single placeholder in `line`.
+///
+/// More than one placeholder is not supported by this matcher: two hidden
+/// spans could slide against each other, so the result is not a unique match.
+fn placeholder_parts(line: &str) -> Option<(&str, &str)> {
+    let at = line.find(REDACTED)?;
+    let suffix = &line[at + REDACTED.len()..];
+    if suffix.contains(REDACTED) {
+        return None;
+    }
+    Some((&line[..at], suffix))
+}
+
+fn redaction_write_refused() -> String {
+    format!(
+        "refusing to apply this hunk: it would write `{REDACTED}` into the file, replacing a \
+         real secret with a placeholder. {REDACTION_NOTE} Delete the whole affected line, replace \
+         it with a real value or environment reference, or leave that line out of the hunk and \
+         anchor on a nearby line without a secret."
+    )
+}
+
+fn redacted_ambiguous(count: usize) -> String {
+    format!(
+        "the hunk's redacted line is ambiguous: it matches {count} candidate sites in the file; \
+         refusing to guess. {REDACTION_NOTE} Add an `@@` anchor or enough non-secret context to \
+         make the target unique."
+    )
+}
+
+fn redacted_not_found(lines: &[String]) -> String {
+    let hidden: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(REDACTED))
+        .map(|(index, _)| format!("hunk line {}", index + 1))
+        .collect();
+    format!(
+        "could not locate this hunk: {} contains `{REDACTED}`. {REDACTION_NOTE} The line as \
+         written cannot match the file byte-for-byte, and a hunk that keeps a redacted line as \
+         context would write the placeholder back. Anchor on a nearby line that has no secret, or \
+         delete/replace the whole affected line.",
+        hidden.join(", ")
+    )
+}
+
 /// Build the error for a hunk whose `old_lines` match nowhere. Showing the file
 /// at `start` is near-useless: without a `@@` label `start` is line 1, so the
 /// model gets the top of the file while its hunk targets line 300. The failure
@@ -177,6 +332,12 @@ fn retry_without_trailing_blank(
 /// the file there — the model can then copy the real text back verbatim.
 fn hunk_not_found(file: &[String], chunk: &UpdateChunk, start: usize) -> String {
     let wanted = chunk.old_lines.join("\n");
+    // A hunk carrying the runtime placeholder is a different failure: the
+    // model copied text that was never on disk. Name it instead of printing a
+    // file line and a hunk line that both sanitize to the same placeholder.
+    if wanted.contains(REDACTED) {
+        return redacted_not_found(&chunk.old_lines);
+    }
     let head = format!(
         "could not find expected lines (searched from line {}):\n{wanted}\n",
         start + 1,
@@ -586,11 +747,125 @@ mod tests {
         );
     }
 
+    /// REGRESSION P1-1. The model only ever sees `[REDACTED]`, so a hunk that
+    /// deletes or replaces the whole secret-bearing line must still locate the
+    /// real line by its unambiguous prefix/suffix — without the secret value.
+    #[test]
+    fn redacted_hunk_deletes_or_replaces_the_whole_secret_line() {
+        let original = "before\nDEVORDER_SEED_PASSWORD='synthetic-secret'\nafter\n";
+        let out = apply_update(
+            original,
+            &[chunk(&["DEVORDER_SEED_PASSWORD='[REDACTED]'"], &[])],
+        )
+        .unwrap();
+        assert_eq!(out, "before\nafter\n");
+        assert!(!out.contains("synthetic-secret"));
+
+        let out = apply_update(
+            original,
+            &[chunk(
+                &["DEVORDER_SEED_PASSWORD='[REDACTED]'"],
+                &["DEVORDER_SEED_PASSWORD=\"${SEED_PASSWORD}\""],
+            )],
+        )
+        .unwrap();
+        assert!(out.contains("${SEED_PASSWORD}"), "{out}");
+        assert!(!out.contains("synthetic-secret"), "{out}");
+    }
+
+    /// A patch may not write the placeholder back: that would replace the real
+    /// credential with the literal text `[REDACTED]`.
+    #[test]
+    fn redacted_hunk_refuses_to_write_the_placeholder() {
+        let original = "PASSWORD='synthetic-secret'\n";
+        let err = apply_update(
+            original,
+            &[chunk(
+                &["PASSWORD='[REDACTED]'"],
+                &["PASSWORD='[REDACTED]'"],
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot write") || err.contains("placeholder"),
+            "{err}"
+        );
+    }
+
+    /// The masked match must be unique. Two identical assignments are not a
+    /// licence to pick one.
+    #[test]
+    fn redacted_hunk_rejects_ambiguous_matches() {
+        let original = "PASSWORD='one'\nPASSWORD='two'\n";
+        let err = apply_update(original, &[chunk(&["PASSWORD='[REDACTED]'"], &[])]).unwrap_err();
+        assert!(
+            err.contains("ambiguous") || err.contains("more than one"),
+            "{err}"
+        );
+    }
+
+    /// A miss must name the redaction, not print two identical-looking lines.
+    #[test]
+    fn redacted_hunk_miss_explains_the_placeholder() {
+        let original = "OTHER='x'\n";
+        let err = apply_update(original, &[chunk(&["PASSWORD='[REDACTED]'"], &[])]).unwrap_err();
+        assert!(err.contains("[REDACTED]"), "{err}");
+        assert!(
+            err.contains("placeholder") || err.contains("not the file's literal"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("file: `PASSWORD='[REDACTED]'`"),
+            "must not print a self-contradictory identical diff: {err}"
+        );
+    }
+
+    /// If the file really contains the placeholder bytes, exact matching still
+    /// wins; this is not a wildcard.
+    #[test]
+    fn literal_placeholder_in_the_file_is_not_a_wildcard() {
+        let original = "PASSWORD='[REDACTED]'\n";
+        let out = apply_update(original, &[chunk(&["PASSWORD='[REDACTED]'"], &[])]).unwrap();
+        assert_eq!(out, "");
+    }
+
+    /// The applied diff is user-visible metadata. A masked match must not put
+    /// the real secret into it.
+    #[test]
+    fn applied_diff_for_a_redacted_match_stays_masked() {
+        let original = "PASSWORD='synthetic-secret'\n";
+        let (_out, hunks) =
+            apply_update_located(original, &[chunk(&["PASSWORD='[REDACTED]'"], &[])]).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_lines[0], "PASSWORD='[REDACTED]'");
+        for line in &hunks[0].old_lines {
+            assert!(!line.contains("synthetic-secret"), "{line}");
+        }
+    }
+
+    /// A hunk that keeps the redacted line as context would splat the
+    /// placeholder into the file if it were allowed to apply.
+    #[test]
+    fn redacted_context_that_would_be_rewritten_is_refused() {
+        let original = "PASSWORD='synthetic-secret'\nKEEP=1\n";
+        let err = apply_update(
+            original,
+            &[chunk(
+                &["PASSWORD='[REDACTED]'", "KEEP=1"],
+                &["PASSWORD='[REDACTED]'", "KEEP=2"],
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot write") || err.contains("placeholder"),
+            "{err}"
+        );
+    }
+
     /// The dogfood case: the model copied a line out of tool output, which
     /// replaces a credential with a placeholder, so the hunk anchors on text
-    /// that was never in the file. "Read the file" is the wrong advice there —
-    /// the model did read it. Naming the redaction is what lets it patch around
-    /// the secret instead of silently dropping the edit.
+    /// that was never in the file. Naming the redaction is what lets the model
+    /// patch around the secret instead of silently dropping the edit.
     #[test]
     fn a_hunk_that_copied_a_redacted_value_says_so() {
         let content = "database:\n  dsn: host=127.0.0.1 user=develop password=hunter2 \
@@ -601,7 +876,7 @@ mod tests {
         );
         let err = apply_update(content, &[c]).unwrap_err();
         assert!(
-            err.contains("password=[REDACTED]") && err.contains("Tool output replaces secret"),
+            err.contains("[REDACTED]") && err.contains("Tool output replaces secret"),
             "a failed hunk that carries a redacted value must name that cause; got:\n{err}"
         );
     }

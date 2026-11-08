@@ -819,6 +819,32 @@ mod tests {
         assert!(redact_secrets_json(r#"{"truncated":"#).is_err());
     }
 
+    /// REGRESSION P1-2. Durable transcripts are replayed on resume, so a
+    /// field expression in source code must survive the storage-side scrub
+    /// exactly like it survives the model-visible one.
+    #[test]
+    fn session_json_redaction_preserves_code_identifiers() {
+        let session = "sess-json-code";
+        crate::secret::clear_session_secrets(session);
+        let payload = "{\"text\":\"redisPassword := os.Getenv(\\\"TEST_REDIS_PASSWORD\\\")\\nclient := \\n\\tPassword: redisPassword,\\n\"}";
+        let out = redact_secrets_json_for_session(payload, Some(session)).unwrap();
+        assert!(out.contains("redisPassword"), "{out}");
+        assert!(!out.contains("[REDACTED]"), "{out}");
+        crate::secret::clear_session_secrets(session);
+    }
+
+    /// The same storage path must still remove a real credential value.
+    #[test]
+    fn session_json_redaction_still_removes_real_secrets() {
+        let session = "sess-json-secret";
+        crate::secret::clear_session_secrets(session);
+        let payload = r#"{"text":"password: hunter2-secret-abc"}"#;
+        let out = redact_secrets_json_for_session(payload, Some(session)).unwrap();
+        assert!(!out.contains("hunter2-secret-abc"), "{out}");
+        assert!(out.contains("[REDACTED]"), "{out}");
+        crate::secret::clear_session_secrets(session);
+    }
+
     /// Structural fingerprint: object keys + container shapes, ignoring string
     /// leaf contents (which redaction may rewrite).
     fn shape_of(value: &serde_json::Value) -> String {
