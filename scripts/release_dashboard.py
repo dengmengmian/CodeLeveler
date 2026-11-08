@@ -443,6 +443,7 @@ def summary_cards(record):
     post = record.get("post_release") or {}
     fresh = post.get("fresh_install") or {}
     upgrade = post.get("upgrade") or {}
+    soak = post.get("soak") or {}
     build = stages.get("1", {}).get("status", NOT_VERIFIED)
     tests = stages.get("2", {}).get("status", NOT_VERIFIED)
     cross = dig(record, "remote", "assets", default=[]) or []
@@ -491,6 +492,11 @@ def summary_cards(record):
             text(fresh.get("status")),
             "upgrade: %s" % text(upgrade.get("status")),
         ),
+        (
+            "24-hour Soak",
+            text(soak.get("status"), NOT_VERIFIED).upper() if soak else NOT_VERIFIED,
+            text(soak.get("short_note"), "run %s" % text(soak.get("run_id"))) if soak else "not recorded",
+        ),
     ]
 
 
@@ -505,7 +511,11 @@ def status_class(value):
     word = str(value).upper()
     if word.startswith("PASS") or word in ("RELEASED", "VERIFIED", "IMPROVED", "UNCHANGED"):
         return "ok"
-    if word.startswith("WARN") or word in ("PARTIAL", "NOT_COMPARABLE", "UNPROVEN", "SKIPPED"):
+    if (
+        word.startswith("WARN")
+        or word.startswith("IN PROGRESS")
+        or word in ("PARTIAL", "NOT_COMPARABLE", "UNPROVEN", "SKIPPED")
+    ):
         return "warn"
     if word.startswith("FAIL") or word in ("BLOCKED", "REGRESSED"):
         return "bad"
@@ -768,6 +778,44 @@ def render_version(record):
                 ],
             )
         )
+
+    # 24-hour soak. The status is a certification fact, not a release gate:
+    # a conditional release may be published while the run is still going.
+    soak = post.get("soak") or {}
+    if soak:
+        parts.append("<h2>24-hour Soak</h2>")
+        parts.append('<div class="panel">')
+        parts.append(
+            "<p><b>%s</b></p>"
+            % esc(text(soak.get("headline"), "24-hour Soak: %s" % text(soak.get("status"))))
+        )
+        if soak.get("note"):
+            parts.append('<p class="note">%s</p>' % esc(text(soak.get("note"))))
+        soak_rows = [
+            ("Run", "<code>%s</code>" % esc(text(soak.get("run_id")))),
+            ("Code SHA", "<code>%s</code>" % esc(text(soak.get("code_sha")))),
+            ("Started (UTC)", esc(text(soak.get("started_at")))),
+            ("Elapsed", esc(text(soak.get("elapsed")))),
+            ("Target", esc(text(soak.get("target")))),
+            ("Verdict", ("badge", text(soak.get("verdict"), NOT_VERIFIED))),
+        ]
+        parts.append(table(["Field", "Value"], soak_rows))
+        parts.append("</div>")
+
+    conditional = post.get("conditional_release") or {}
+    if conditional:
+        parts.append("<h2>Conditional release</h2>")
+        parts.append('<div class="panel">')
+        if conditional.get("status"):
+            parts.append("<p>%s</p>" % badge(conditional.get("status")))
+        for label, key in (
+            ("Why", "reason"),
+            ("Risk", "risk"),
+            ("Rollback", "rollback"),
+        ):
+            if conditional.get(key):
+                parts.append("<h3>%s</h3><p>%s</p>" % (esc(label), esc(text(conditional.get(key)))))
+        parts.append("</div>")
 
     # Performance
     parts.append("<h2>Performance</h2>")
