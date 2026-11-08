@@ -151,7 +151,10 @@ fn run_child(point: &str) -> (tempfile::TempDir, PathBuf, std::process::ExitStat
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let pid = child.id();
+    let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
     let status = child.wait().unwrap();
+    eprintln!("EPOCH_CUT_CRASH pid={pid} point={point} marker={marker_text:?} status={status:?}");
     (dir, db_path, status)
 }
 
