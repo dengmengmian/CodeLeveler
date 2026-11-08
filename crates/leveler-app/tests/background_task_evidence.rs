@@ -629,6 +629,8 @@ impl Fixture {
                 lifetime: leveler_execution::BackgroundTaskLifetime::Goal,
                 expired_exit_waits: 0,
                 output_bytes: 12,
+                start_identity: None,
+                signal: None,
             },
             lifetime: leveler_execution::BackgroundTaskLifetime::Goal,
             writer_scope: self.session.as_str().to_owned(),
@@ -641,6 +643,7 @@ impl Fixture {
             log_end: 12,
             log_prefix_len: 0,
             loss: None,
+            result: None,
         };
         std::fs::write(
             state_dir.join("tasks.json"),

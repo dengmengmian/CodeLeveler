@@ -72,7 +72,9 @@ pub use command::{
     shell_invocation,
 };
 pub use credential::{CredentialMaterial, fill_http_credential};
-pub use execution_host::{HostRecovery, ProcessPresence, RecoveredTask, TaskLoss};
+pub use execution_host::{
+    CompletionRecord, HostRecovery, ProcessPresence, RecoveredTask, TaskLoss,
+};
 pub use git_effects::{
     CallGitEffects, GitCommandEffects, GitEffects, call_git_effects, git_command_effects,
 };

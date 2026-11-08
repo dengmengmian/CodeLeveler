@@ -48,6 +48,16 @@ pub struct BackgroundSettlement {
     pub snapshot: Option<SnapshotId>,
 }
 
+/// Another owner is already committing this task's settlement.
+///
+/// The durable record is intact and the reservation is retained; a read path
+/// must not turn a concurrent-but-correct reconcile into a failed observation.
+/// The next read retries, and the reconciler that owns the lock finishes the
+/// one-time commit. This is the read side of the journal's "retryable" contract.
+fn reconciliation_in_progress(error: &str) -> bool {
+    error.contains("semantic reconciliation busy")
+}
+
 const MAX_CONCURRENT: usize = 4;
 const MAX_LOG_BYTES: usize = 256 * 1024;
 /// Completed task records kept for later `get`/`wait` calls. Pruning happens
@@ -196,6 +206,21 @@ pub struct BackgroundTaskSnapshot {
     /// fact a caller cannot infer from an empty log delta alone.
     #[serde(default)]
     pub output_bytes: u64,
+    /// Platform start token captured from the OS at spawn.
+    ///
+    /// A PID is reused; this token is what lets a later runtime tell the same
+    /// process from an unrelated one. It is absent when the platform exposes no
+    /// start token (Windows today) or when the process had already exited when
+    /// it was read. `None` is never a licence to treat the PID as identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_identity: Option<String>,
+    /// The signal that terminated the process, when the OS reported one.
+    ///
+    /// A signal-terminated child has no exit code, so this is the only honest
+    /// termination fact. `None` with a terminal status means the process exited
+    /// normally or the platform did not report a signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 fn default_lifetime() -> BackgroundTaskLifetime {
@@ -424,6 +449,14 @@ struct TaskInner {
     cwd: PathBuf,
     status: BackgroundTaskStatus,
     exit_code: Option<i32>,
+    /// The signal reported by the OS for the direct child, when it did not exit
+    /// normally. Retained beside the exit code so a signal death is never
+    /// reported as a code-less success.
+    signal: Option<i32>,
+    /// Platform start token read while the child was freshly spawned. It is the
+    /// only durable identity a later runtime may compare against; the pid alone
+    /// is never identity.
+    start_identity: Option<String>,
     /// The process-group leader's OS pid, recorded at spawn and kept after the
     /// identity is dropped so a finished task's detail can still name it.
     pid: Option<u32>,
@@ -484,6 +517,10 @@ pub struct BackgroundTaskRegistry {
     /// Dropped when the last registry handle is dropped (session end).
     kill_on_drop: Arc<KillOnDrop>,
     execution_host: Option<crate::execution_host::ExecutionHostConfig>,
+    /// Set once when the independent supervisor cannot be reached. Goal-lifetime
+    /// work may still run, but it must run locally: a supervisor that is not
+    /// there cannot be the owner of a durable result.
+    supervisor_unavailable: Arc<std::sync::atomic::AtomicBool>,
     retain_process_facts: bool,
     hosted_monitors: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
@@ -624,6 +661,7 @@ impl BackgroundTaskRegistry {
             spawn_registration_hook: Arc::new(std::sync::Mutex::new(None)),
             kill_on_drop: Arc::new(KillOnDrop::default()),
             execution_host: None,
+            supervisor_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retain_process_facts: false,
             hosted_monitors: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             runner: CommandRunner::with_environment(environment),
@@ -718,7 +756,18 @@ impl BackgroundTaskRegistry {
             } else {
                 journal.reconcile(&task.snapshot.id).await
             };
-            settled?;
+            match settled {
+                Ok(_) => {}
+                Err(error) if reconciliation_in_progress(&error) => {
+                    tracing::debug!(
+                        task = %task.snapshot.id,
+                        %error,
+                        "another owner is committing this settlement during boot"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             client
                 .acknowledge(
                     &task.snapshot.id,
@@ -872,16 +921,27 @@ impl BackgroundTaskRegistry {
             if let Some(client) = probe.client {
                 for mut task in client.list().await? {
                     if task.settlement_proven() {
-                        self.journal()?.reconcile(&task.snapshot.id).await?;
-                        client
-                            .acknowledge(
-                                &task.snapshot.id,
-                                task.snapshot
-                                    .owner_scope
-                                    .as_deref()
-                                    .ok_or("missing hosted owner")?,
-                            )
-                            .await?;
+                        match self.journal()?.reconcile(&task.snapshot.id).await {
+                            Ok(_) => {
+                                client
+                                    .acknowledge(
+                                        &task.snapshot.id,
+                                        task.snapshot
+                                            .owner_scope
+                                            .as_deref()
+                                            .ok_or("missing hosted owner")?,
+                                    )
+                                    .await?;
+                            }
+                            Err(error) if reconciliation_in_progress(&error) => {
+                                tracing::debug!(
+                                    task = %task.snapshot.id,
+                                    %error,
+                                    "another owner is committing this settlement; reading the fact without acknowledging it"
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     if task.snapshot.ready.is_none() {
                         task.snapshot.ready = self.readiness_of(&task.snapshot.id).await;
@@ -947,8 +1007,10 @@ impl BackgroundTaskRegistry {
                 .await?
                 .into_iter()
                 .filter(|t| {
-                    t.lifetime == BackgroundTaskLifetime::Session
-                        && t.snapshot.owner_scope.as_deref() == Some(owner)
+                    matches!(
+                        t.lifetime,
+                        BackgroundTaskLifetime::Session | BackgroundTaskLifetime::Goal
+                    ) && t.snapshot.owner_scope.as_deref() == Some(owner)
                         && t.snapshot.status.is_active()
                 })
                 .map(|t| t.snapshot.id)
@@ -996,7 +1058,14 @@ impl BackgroundTaskRegistry {
             .prepare_with_scope(id, owner, owner, None, request.write_scope.clone())
             .await?;
         let task = match client
-            .spawn(id, request, owner, owner, BackgroundTaskLifetime::Session)
+            .spawn(
+                id,
+                request,
+                owner,
+                owner,
+                BackgroundTaskLifetime::Session,
+                BackgroundTaskOrigin::default(),
+            )
             .await
         {
             Ok(task) => task,
@@ -1163,11 +1232,14 @@ impl BackgroundTaskRegistry {
                 writer,
                 baseline,
                 request.write_scope.clone(),
-                origin,
+                origin.clone(),
             )
             .await?;
         // Transport failure is ambiguous: retain the prepared write reservation.
-        let task = match client.spawn(&id, request, owner, writer, lifetime).await {
+        let task = match client
+            .spawn(&id, request, owner, writer, lifetime, origin)
+            .await
+        {
             Ok(task) => task,
             Err(crate::execution_host::SpawnError::Rejected(error)) => {
                 self.journal()?.abandon_prepared(&id)?;
@@ -1374,6 +1446,53 @@ impl BackgroundTaskRegistry {
                 )
                 .await;
         }
+        // Goal-lifetime work is the DEFAULT `run_command`/`shell` background
+        // path, so it is the one a crash actually loses. It is supervised too
+        // whenever an independent supervisor is configured and the task has a
+        // session owner to attribute a recovered result to.
+        //
+        // The supervisor is a separate OS process; when it cannot be started
+        // (no workspace, a build without the helper, a broken state dir) the
+        // task still runs locally. That is the pre-existing behaviour, not a
+        // silent conversion of a durable task into an unverified one: the
+        // failure is reported once, and a local task's id is never `host-`.
+        if lifetime == BackgroundTaskLifetime::Goal
+            && owner_scope.is_some()
+            && let Some(config) = self.execution_host.clone()
+            && !self.supervisor_unavailable.load(Ordering::Acquire)
+        {
+            match crate::execution_host::ExecutionHostClient::ensure(config).await {
+                // A legacy supervisor predates Goal ownership. It must not be
+                // handed a lifetime it cannot represent; the task keeps the
+                // pre-existing local behaviour instead of being refused.
+                Ok(client) if client.peer_major() < crate::execution_host::PROTOCOL_MAJOR => {
+                    self.supervisor_unavailable.store(true, Ordering::Release);
+                    tracing::warn!(
+                        peer_major = client.peer_major(),
+                        "background supervisor is too old for durable goal tasks; running locally"
+                    );
+                }
+                Ok(_) => {
+                    return self
+                        .spawn_hosted(
+                            request,
+                            mutation_baseline,
+                            owner_scope,
+                            writer_scope,
+                            lifetime,
+                            origin,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    self.supervisor_unavailable.store(true, Ordering::Release);
+                    tracing::warn!(
+                        %error,
+                        "background supervisor unavailable; this task runs without durable recovery"
+                    );
+                }
+            }
+        }
         let (id, mut reservation) = {
             let mut st = self.inner.lock().await;
             if !self.retain_process_facts {
@@ -1416,6 +1535,9 @@ impl BackgroundTaskRegistry {
         let pty = reservation.process_mut().take_pty();
         let identity = reservation.process_mut().identity();
         let pid = process_identity_pid(&identity);
+        // Read the start token while the child is definitely ours and alive.
+        // This is the durable half of the identity; the pid is only its slot.
+        let start_identity = crate::process_identity::process_start_identity(pid);
         let stdout = reservation.process_mut().take_stdout();
         let stderr = reservation.process_mut().take_stderr();
         let sandbox_scratch = reservation.process_mut().take_sandbox_scratch();
@@ -1447,6 +1569,8 @@ impl BackgroundTaskRegistry {
                 cwd: request.cwd.clone(),
                 status: BackgroundTaskStatus::Running,
                 exit_code: None,
+                signal: None,
+                start_identity,
                 pid: Some(pid),
                 log: String::new(),
                 log_end: 0,
@@ -1523,7 +1647,7 @@ impl BackgroundTaskRegistry {
             // share its process group are still this task's workload, and
             // dropping the identity here is what used to make them
             // unstoppable (and the task immortal).
-            let (code, identity) = {
+            let (code, signal, identity) = {
                 let mut st = reg.lock().await;
                 let Some(task) = st.tasks.get_mut(&tid) else {
                     return;
@@ -1533,11 +1657,12 @@ impl BackgroundTaskRegistry {
                 };
                 let identity = task.identity;
                 drop(st);
-                let code = match child.wait().await {
-                    Ok(s) => s.code(),
-                    Err(_) => None,
-                };
-                (code, identity)
+                let status = child.wait().await.ok();
+                (
+                    status.and_then(|s| s.code()),
+                    exit_signal(status.as_ref()),
+                    identity,
+                )
             };
             let failed_launcher = {
                 let mut st = reg.lock().await;
@@ -1546,6 +1671,7 @@ impl BackgroundTaskRegistry {
                 };
                 task.process_done = true;
                 task.exit_code = code;
+                task.signal = signal;
                 task.status == BackgroundTaskStatus::Running && code.is_some_and(|c| c != 0)
             };
             // The process group, not its launcher, owns the write lifetime.
@@ -1649,6 +1775,7 @@ impl BackgroundTaskRegistry {
             let sandbox_scratch = handoff.process.take_sandbox_scratch();
             let identity = handoff.process.identity();
             let pid = process_identity_pid(&identity);
+            let start_identity = crate::process_identity::process_start_identity(pid);
             let process = handoff.process;
             let stdout_task = handoff.stdout_task;
             let stderr_task = handoff.stderr_task;
@@ -1677,6 +1804,8 @@ impl BackgroundTaskRegistry {
                     cwd: spec.cwd.clone(),
                     status: BackgroundTaskStatus::Running,
                     exit_code: None,
+                    signal: None,
+                    start_identity,
                     pid: Some(pid),
                     log_end: log.len() as u64,
                     log,
@@ -1780,20 +1909,29 @@ impl BackgroundTaskRegistry {
             };
             let mut cancelled = false;
             let mut timed_out = false;
-            let code = match first {
-                AdoptedFirst::Exited(status) => status.ok().and_then(|s| s.code()),
+            let (code, signal) = match first {
+                AdoptedFirst::Exited(status) => (
+                    status.as_ref().ok().and_then(|s| s.code()),
+                    exit_signal(status.as_ref().ok()),
+                ),
                 AdoptedFirst::Cancelled => {
                     cancelled = true;
                     drain.cancel();
                     process.terminate_tree().await;
-                    let _ = process.wait_deadline().await;
-                    None
+                    let status = process.wait_deadline().await.ok();
+                    (
+                        status.as_ref().and_then(|s| s.code()),
+                        exit_signal(status.as_ref()),
+                    )
                 }
                 AdoptedFirst::TimedOut => {
                     timed_out = true;
                     process.terminate_tree().await;
-                    let status = process.wait_deadline().await;
-                    status.ok().and_then(|s| s.code())
+                    let status = process.wait_deadline().await.ok();
+                    (
+                        status.as_ref().and_then(|s| s.code()),
+                        exit_signal(status.as_ref()),
+                    )
                 }
             };
             // The process group, not the launcher, owns the workload.
@@ -1851,6 +1989,7 @@ impl BackgroundTaskRegistry {
                 if let Some(task) = st.tasks.get_mut(&tid) {
                     task.process_done = true;
                     task.exit_code = code;
+                    task.signal = signal;
                     task.group_reaped = true;
                     task.identity = None;
                     task.settlement = settlement;
@@ -2062,12 +2201,23 @@ impl BackgroundTaskRegistry {
                 client.get_owned(id, owner).await?
             };
             if task.status.is_terminal() {
-                self.journal()?.reconcile(id).await?;
-                if unrestricted {
-                    client.acknowledge_unrestricted(id).await?;
-                } else {
-                    client.acknowledge(id, owner).await?;
-                };
+                match self.journal()?.reconcile(id).await {
+                    Ok(_) => {
+                        if unrestricted {
+                            client.acknowledge_unrestricted(id).await?;
+                        } else {
+                            client.acknowledge(id, owner).await?;
+                        };
+                    }
+                    Err(error) if reconciliation_in_progress(&error) => {
+                        tracing::debug!(
+                            task = %id,
+                            %error,
+                            "settlement is being committed by another observer; reading the fact"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             let ready = self.inner.lock().await.readiness.get(id).cloned();
             let mut task = task;
@@ -2558,11 +2708,23 @@ impl BackgroundTaskRegistry {
                 result = async { match owner { Some(owner) => client.observe_owned(id, owner, cursor, max_bytes, timeout).await, None => client.observe_unrestricted(id, cursor, max_bytes, timeout).await } } => result?,
             };
             if result.snapshot.status.is_terminal() {
-                result.settlement = Some(self.journal()?.reconcile(id).await?);
-                match owner {
-                    Some(owner) => client.acknowledge(id, owner).await?,
-                    None => client.acknowledge_unrestricted(id).await?,
-                };
+                match self.journal()?.reconcile(id).await {
+                    Ok(settlement) => {
+                        result.settlement = Some(settlement);
+                        match owner {
+                            Some(owner) => client.acknowledge(id, owner).await?,
+                            None => client.acknowledge_unrestricted(id).await?,
+                        };
+                    }
+                    Err(error) if reconciliation_in_progress(&error) => {
+                        tracing::debug!(
+                            task = %id,
+                            %error,
+                            "settlement is being committed by another observer; returning the exit fact"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if result.snapshot.ready.is_none() {
                 result.snapshot.ready = self.inner.lock().await.readiness.get(id).cloned();
@@ -2672,7 +2834,7 @@ impl BackgroundTaskRegistry {
     }
 
     pub async fn kill_all(&self) -> usize {
-        let ids: Vec<String> = {
+        let mut ids: Vec<String> = {
             let st = self.inner.lock().await;
             st.tasks
                 .values()
@@ -2680,6 +2842,24 @@ impl BackgroundTaskRegistry {
                 .map(|t| t.id.clone())
                 .collect()
         };
+        // Goal-lifetime work is owned by this runtime generation even when the
+        // host supervises its process: a graceful runtime shutdown ends it.
+        // Session/Runtime/Persistent services are deliberately left alive.
+        if let Some(config) = &self.execution_host
+            && let Ok(client) =
+                crate::execution_host::ExecutionHostClient::connect(config.clone()).await
+            && let Ok(tasks) = client.list().await
+        {
+            ids.extend(
+                tasks
+                    .into_iter()
+                    .filter(|task| {
+                        task.lifetime == BackgroundTaskLifetime::Goal
+                            && task.snapshot.status.is_active()
+                    })
+                    .map(|task| task.snapshot.id),
+            );
+        }
         let mut n = 0;
         for id in ids {
             if self.kill(&id).await.is_ok() {
@@ -2723,17 +2903,43 @@ impl BackgroundTaskRegistry {
     /// the registry owns process lifecycle truth, while terminal records are
     /// retained only for later `get`/`wait` calls.
     pub async fn active_snapshots_for_scope(&self, scope: &str) -> Vec<BackgroundTaskSnapshot> {
-        let st = self.inner.lock().await;
-        let mut snapshots: Vec<_> = st
-            .tasks
-            .values()
-            .filter(|task| task.owner_scope.as_deref() == Some(scope) && task.status.is_active())
-            .map(|task| {
-                let mut snap = snapshot(task);
-                st.attach_readiness(&mut snap);
-                snap
-            })
-            .collect();
+        let mut snapshots = {
+            let st = self.inner.lock().await;
+            st.tasks
+                .values()
+                .filter(|task| {
+                    task.owner_scope.as_deref() == Some(scope) && task.status.is_active()
+                })
+                .map(|task| {
+                    let mut snap = snapshot(task);
+                    st.attach_readiness(&mut snap);
+                    snap
+                })
+                .collect::<Vec<_>>()
+        };
+        // A resumed turn must see the same task that survived the crash. Its
+        // process fact lives in the independent host, not in this registry.
+        // Read-only: use `list` rather than the reconciling snapshot path so a
+        // turn projection never acknowledges or settles anything.
+        if let Some(config) = &self.execution_host
+            && let Ok(client) =
+                crate::execution_host::ExecutionHostClient::connect(config.clone()).await
+        {
+            match client.list().await {
+                Ok(tasks) => snapshots.extend(
+                    tasks
+                        .into_iter()
+                        .filter(|task| {
+                            task.snapshot.owner_scope.as_deref() == Some(scope)
+                                && task.snapshot.status.is_active()
+                        })
+                        .map(|task| task.snapshot),
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read active supervised tasks for a turn")
+                }
+            }
+        }
         snapshots.sort_by(|a, b| a.id.cmp(&b.id));
         snapshots
     }
@@ -2747,7 +2953,7 @@ impl BackgroundTaskRegistry {
         scope: &str,
         goal_id: Option<&GoalId>,
     ) -> BackgroundCleanupTicket {
-        let ids = {
+        let mut ids = {
             let st = self.inner.lock().await;
             st.tasks
                 .values()
@@ -2758,8 +2964,28 @@ impl BackgroundTaskRegistry {
                         && !task.status.is_terminal()
                 })
                 .map(|task| task.id.clone())
-                .collect()
+                .collect::<Vec<_>>()
         };
+        // Goal-lifetime work is supervised by the independent host too. Its
+        // records are not in this registry, so the ticket must come from the
+        // host; otherwise completing the goal would leave its process behind.
+        if let Some(config) = &self.execution_host
+            && let Ok(client) =
+                crate::execution_host::ExecutionHostClient::connect(config.clone()).await
+            && let Ok(tasks) = client.list().await
+        {
+            ids.extend(
+                tasks
+                    .into_iter()
+                    .filter(|task| {
+                        task.lifetime == BackgroundTaskLifetime::Goal
+                            && task.snapshot.owner_scope.as_deref() == Some(scope)
+                            && task.snapshot.goal_id.as_ref() == goal_id
+                            && task.snapshot.status.is_active()
+                    })
+                    .map(|task| task.snapshot.id),
+            );
+        }
         BackgroundCleanupTicket {
             registry: self.clone(),
             ids,
@@ -2814,11 +3040,20 @@ impl BackgroundTaskRegistry {
                 None => client.kill_unrestricted(id).await?,
             };
             if task.status.is_terminal() {
-                self.journal()?.reconcile(id).await?;
-                match owner {
-                    Some(owner) => client.acknowledge(id, owner).await?,
-                    None => client.acknowledge_unrestricted(id).await?,
-                };
+                match self.journal()?.reconcile(id).await {
+                    Ok(_) => match owner {
+                        Some(owner) => client.acknowledge(id, owner).await?,
+                        None => client.acknowledge_unrestricted(id).await?,
+                    },
+                    Err(error) if reconciliation_in_progress(&error) => {
+                        tracing::debug!(
+                            task = %id,
+                            %error,
+                            "settlement is being committed by another observer; returning the stop fact"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             return Ok(task);
         }
@@ -3252,6 +3487,25 @@ fn snapshot_with_log(task: &TaskInner, log: String) -> BackgroundTaskSnapshot {
         lifetime: task.lifetime,
         expired_exit_waits: task.expired_exit_waits,
         output_bytes: task.log_end,
+        start_identity: task.start_identity.clone(),
+        signal: task.signal,
+    }
+}
+
+/// The signal the OS reported for a waited child, when it reported one.
+///
+/// A signal death has no exit code. Recording the signal separately is what
+/// keeps it from being projected as a code-less success.
+fn exit_signal(status: Option<&std::process::ExitStatus>) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(std::process::ExitStatus::signal)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
     }
 }
 
@@ -4048,6 +4302,8 @@ mod tests {
                     cwd: PathBuf::new(),
                     status: BackgroundTaskStatus::Exited,
                     exit_code: Some(0),
+                    signal: None,
+                    start_identity: None,
                     pid: None,
                     log: String::new(),
                     log_end: 0,
@@ -4092,6 +4348,8 @@ mod tests {
                     cwd: PathBuf::new(),
                     status,
                     exit_code: None,
+                    signal: None,
+                    start_identity: None,
                     pid: None,
                     log: String::new(),
                     log_end: 0,
@@ -4151,6 +4409,8 @@ mod tests {
             cwd: PathBuf::new(),
             status: BackgroundTaskStatus::Running,
             exit_code: Some(0),
+            signal: None,
+            start_identity: None,
             pid: None,
             log: String::new(),
             log_end: 0,
@@ -4197,6 +4457,8 @@ mod tests {
             cwd: PathBuf::new(),
             status: BackgroundTaskStatus::Running,
             exit_code: Some(0),
+            signal: None,
+            start_identity: None,
             pid: None,
             log: String::new(),
             log_end: 0,
@@ -4361,6 +4623,54 @@ mod tests {
             reg.take_settlement(&id).await.is_none(),
             "a settlement is reported exactly once"
         );
+    }
+
+    /// A task's durable snapshot must carry the OS start token and the signal
+    /// that ended it, not just a reusable pid and a missing exit code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_task_records_start_identity_and_the_signal_that_ended_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = host_registry();
+        let id = reg
+            .spawn(
+                ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), "sleep 5".into()],
+                    dir.path().to_path_buf(),
+                ),
+                None,
+            )
+            .await
+            .expect("spawn");
+        let running = reg.get(&id).await.expect("running snapshot");
+        let pid = running.pid.expect("pid");
+        let start = running
+            .start_identity
+            .clone()
+            .expect("the platform start token is captured at spawn");
+        assert_eq!(
+            crate::process_identity::verify_process_identity(pid, &start),
+            crate::process_identity::ProcessIdentity::Matches
+        );
+        reg.kill(&id).await.expect("kill");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = reg.get(&id).await.expect("snapshot");
+            if snapshot.status.is_terminal() {
+                if snapshot.status == BackgroundTaskStatus::Killed {
+                    assert_eq!(
+                        snapshot.signal,
+                        Some(nix::sys::signal::Signal::SIGKILL as i32),
+                        "a signalled child must not be reported as a code-less success"
+                    );
+                }
+                break;
+            }
+            assert!(Instant::now() < deadline, "task never became terminal");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Terminal state implies completed accounting even without wait_task.
