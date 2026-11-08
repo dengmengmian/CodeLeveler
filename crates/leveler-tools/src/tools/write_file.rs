@@ -23,6 +23,11 @@ struct Input {
     path: String,
     /// The file's complete new contents.
     content: String,
+    /// Set only when the user explicitly asked for the literal text
+    /// [REDACTED]. Defaults to false: that token is normally the runtime's
+    /// placeholder for a hidden secret and must not be written to disk.
+    #[serde(default)]
+    allow_redacted_literal: bool,
 }
 
 pub struct WriteFileTool;
@@ -38,7 +43,10 @@ impl Tool for WriteFileTool {
          `content` becomes the whole file — anything already there is replaced. \
          Use this to create a new file or to deliberately rewrite one end to \
          end; use `apply_patch` to change part of an existing file. Overwriting \
-         a file that changed since you read it is refused."
+         a file that changed since you read it is refused. [REDACTED] in your \
+         content is refused because it is the runtime's hidden-secret \
+         placeholder; set allow_redacted_literal only when the user explicitly \
+         asked for that literal text."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -106,9 +114,24 @@ impl Tool for WriteFileTool {
                         input.path
                     )));
                 }
-                WorkspaceEditor::replace(&context, &resolved, existing, &input.content).await?
+                WorkspaceEditor::replace(
+                    &context,
+                    &resolved,
+                    existing,
+                    &input.content,
+                    input.allow_redacted_literal,
+                )
+                .await?
             }
-            None => WorkspaceEditor::create(&context, &resolved, &input.content).await?,
+            None => {
+                WorkspaceEditor::create(
+                    &context,
+                    &resolved,
+                    &input.content,
+                    input.allow_redacted_literal,
+                )
+                .await?
+            }
         };
 
         match commit {
@@ -287,6 +310,98 @@ mod tests {
         // Best-effort teardown: on Windows the still-open workspace root
         // owns the directory, exactly as its siblings in this module do.
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// F-02: the model-visible placeholder cannot be materialized by a whole
+    /// file rewrite; an explicit literal request can.
+    #[tokio::test]
+    async fn placeholder_content_is_refused_unless_explicitly_literal() {
+        let (ctx, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("config.txt", "API_TOKEN=hunter2\n")],
+        );
+        let refused = run(
+            ctx.clone(),
+            serde_json::json!({"path":"config.txt","content":"API_TOKEN=[REDACTED]\n"}),
+        )
+        .await;
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(refused.content.contains("placeholder") || refused.content.contains("REDACTED"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.txt")).unwrap(),
+            "API_TOKEN=hunter2\n"
+        );
+
+        let allowed = run(
+            ctx,
+            serde_json::json!({
+                "path":"config.txt",
+                "content":"LITERAL=[REDACTED]\n",
+                "allow_redacted_literal":true
+            }),
+        )
+        .await;
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.txt")).unwrap(),
+            "LITERAL=[REDACTED]\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// INV-03: the default refusal and the literal escape are two different
+    /// claims. The refusal protects the ordinary read → rewrite loop; the
+    /// escape is a model-controlled integrity opt-in, not a security
+    /// boundary. Pinning both keeps the report honest about what the harness
+    /// can and cannot prove.
+    #[tokio::test]
+    async fn placeholder_copied_from_tool_output_is_refused_unless_the_model_claims_literal() {
+        let (ctx, dir) = super::super::test_ctx(
+            leveler_execution::PermissionProfile::Assisted,
+            &[("config.env", "API_TOKEN=hunter2-seed\n")],
+        );
+
+        // E: a tool result was sanitized to `[REDACTED]`; the model copies it
+        // back. The default guard refuses and the on-disk value survives.
+        let copied = run(
+            ctx.clone(),
+            serde_json::json!({"path":"config.env","content":"API_TOKEN=[REDACTED]\n"}),
+        )
+        .await;
+        assert!(copied.is_error, "{}", copied.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.env")).unwrap(),
+            "API_TOKEN=hunter2-seed\n"
+        );
+
+        // A/C: a new file that merely contains the literal string is refused
+        // by the same rule, so the guard does not depend on the target path.
+        let created = run(
+            ctx.clone(),
+            serde_json::json!({"path":"notes.txt","content":"fixture uses [REDACTED]\n"}),
+        )
+        .await;
+        assert!(created.is_error, "{}", created.content);
+        assert!(!dir.join("notes.txt").exists());
+
+        // D: when the model sets the escape there is no harness-verifiable
+        // user request at this layer; the write is allowed. This is the
+        // documented limit, and the call stays visible in the transcript.
+        let escaped = run(
+            ctx,
+            serde_json::json!({
+                "path":"config.env",
+                "content":"API_TOKEN=[REDACTED]\n",
+                "allow_redacted_literal":true
+            }),
+        )
+        .await;
+        assert!(!escaped.is_error, "{}", escaped.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.env")).unwrap(),
+            "API_TOKEN=[REDACTED]\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     async fn run(ctx: ToolContext, args: serde_json::Value) -> ToolOutput {

@@ -101,7 +101,13 @@ impl WorkspaceEditor {
         resolved: &std::path::Path,
         expected: &str,
         replacement: &str,
+        allow_redacted_literal: bool,
     ) -> Result<Commit, ToolError> {
+        if let Err(message) =
+            crate::workspace::ensure_materializable(replacement, allow_redacted_literal)
+        {
+            return Ok(Commit::Rejected(message));
+        }
         let workspace =
             editing_workspace(context, resolved, leveler_core::Capability::FilesystemWrite)?;
         let lock_path =
@@ -259,8 +265,10 @@ impl WorkspaceEditor {
         context: &ToolContext,
         resolved: &std::path::Path,
         content: &str,
+        allow_redacted_literal: bool,
     ) -> Result<Commit, ToolError> {
-        Self::create_with_permissions(context, resolved, content, None).await
+        Self::create_with_permissions(context, resolved, content, None, allow_redacted_literal)
+            .await
     }
 
     /// [`Self::create`] restoring the permissions a rollback captured.
@@ -269,7 +277,13 @@ impl WorkspaceEditor {
         resolved: &std::path::Path,
         content: &str,
         permissions: Option<std::fs::Permissions>,
+        allow_redacted_literal: bool,
     ) -> Result<Commit, ToolError> {
+        if let Err(message) =
+            crate::workspace::ensure_materializable(content, allow_redacted_literal)
+        {
+            return Ok(Commit::Rejected(message));
+        }
         #[cfg(not(unix))]
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent)

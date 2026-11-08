@@ -10,6 +10,34 @@ pub(crate) mod reader;
 pub(crate) mod search;
 
 pub(crate) use editor::{Commit, WorkspaceEditor};
+
+/// Reject materializing the runtime's secret placeholder into a file. The
+/// model sees `[REDACTED]` where a real value was hidden; copying that text
+/// back would permanently replace the credential with the placeholder.
+///
+/// `allow_redacted_literal` is a model-controlled integrity opt-in, not a
+/// security boundary. It exists so a user who explicitly asked for the
+/// literal text is not blocked, but the harness cannot verify that intent:
+/// repository or tool text can persuade the model to set it, and the write is
+/// then allowed. The guarantee is therefore narrow and worth stating exactly —
+/// the default refusal prevents the ordinary read → rewrite data loss, while
+/// the escape remains an explicit, transcript-visible decision. It is not a
+/// control that stops a determined or induced model from writing the literal.
+pub(crate) fn ensure_materializable(
+    content: &str,
+    allow_redacted_literal: bool,
+) -> Result<(), String> {
+    if allow_redacted_literal || !content.contains(leveler_core::SECRET_PLACEHOLDER) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to write {} into a file: it is the runtime's placeholder for a hidden \
+         secret value, not the file's literal bytes. Read the file again and keep the real \
+         value, or — only when the user explicitly asked for that literal text — set \
+         allow_redacted_literal: true.",
+        leveler_core::SECRET_PLACEHOLDER
+    ))
+}
 pub(crate) use reader::{Clip, ReadError, ReadWindow, WorkspaceReader};
 pub(crate) use search::{DirEntry, GrepQuery, SearchError, WorkspaceSearch};
 

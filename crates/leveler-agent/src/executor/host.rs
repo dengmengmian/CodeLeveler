@@ -1385,8 +1385,11 @@ impl Executor {
         // Values found are remembered for this session so the same plaintext
         // can be scrubbed if it reappears in durable text from another path.
         let outcome = {
-            let (content, is_error, metadata) = outcome;
-            let (mut sanitized, found) = leveler_core::sanitize_model_visible(&content);
+            let (content, is_error, mut metadata) = outcome;
+            let (mut sanitized, mut found) = sanitize_tool_output(&content, &mut metadata);
+            // Metadata is a second model/UI-visible exit: applied_diff, plan
+            // and image-bearing payloads must not bypass the same boundary.
+            found.extend(leveler_core::sanitize_json_value(&mut metadata));
             if !found.is_empty() {
                 if let Some(session) = admitted.ctx.session_scope.as_deref() {
                     leveler_core::register_session_secrets(session, &found);
@@ -1396,7 +1399,7 @@ impl Executor {
                     tool = %call.name,
                     redacted = found.len(),
                     keys = ?found.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
-                    "redacted secret values from tool output before the model saw them"
+                    "redacted secret values from tool output/metadata before the model saw them"
                 );
                 // File-content tools are the ones a patch is built from.
                 // Tell the model that the placeholder is not file bytes, so a
@@ -1435,6 +1438,31 @@ impl Executor {
     }
 }
 
+/// Tool output often arrives as a JSON document. Parse it first so a
+/// multi-line key/value pair is one structured value; fall back to the text
+/// pass for logs and JSONL. Formatting is preserved when nothing was found.
+fn sanitize_tool_output(
+    content: &str,
+    metadata: &mut serde_json::Value,
+) -> (String, Vec<leveler_core::DetectedSecret>) {
+    let (sanitized, mut found) = sanitize_tool_content(content);
+    found.extend(leveler_core::sanitize_json_value(metadata));
+    (sanitized, found)
+}
+
+fn sanitize_tool_content(content: &str) -> (String, Vec<leveler_core::DetectedSecret>) {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) {
+        let found = leveler_core::sanitize_json_value(&mut value);
+        if found.is_empty() {
+            return (content.to_string(), found);
+        }
+        if let Ok(serialized) = serde_json::to_string(&value) {
+            return (serialized, found);
+        }
+    }
+    leveler_core::sanitize_model_visible(content)
+}
+
 /// Tell the model that file-content redaction happened and what the
 /// placeholder means. It is not file bytes; copying it into a patch anchors
 /// on text that never existed.
@@ -1449,6 +1477,29 @@ fn redaction_notice(count: usize) -> String {
 
 #[cfg(test)]
 mod authorize_tests {
+
+    #[test]
+    fn structured_tool_metadata_does_not_bypass_sanitization() {
+        let mut metadata = serde_json::json!({
+            "applied_diff": "+API_TOKEN=hunter2-abc\n",
+            "safe": "visible"
+        });
+        let (_, found) = super::sanitize_tool_output("changed", &mut metadata);
+        let text = metadata.to_string();
+        assert!(!text.contains("hunter2-abc"), "{text}");
+        assert_eq!(metadata["safe"], "visible");
+        assert!(!found.is_empty());
+    }
+
+    #[test]
+    fn structured_tool_content_sanitizes_multiline_json() {
+        let content = "{\n  \"password\":\n    \"hunter2-abc\"\n}";
+        let (out, found) = super::sanitize_tool_content(content);
+        assert!(!out.contains("hunter2-abc"), "{out}");
+        assert!(!found.is_empty());
+        assert!(out.contains("[REDACTED]"));
+    }
+
     use super::*;
     use std::sync::Arc;
 
