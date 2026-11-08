@@ -49,6 +49,9 @@ impl Database {
         // IMMEDIATE: take the write lock at BEGIN so the read-then-write
         // event sequencing below cannot hit the non-waitable upgrade deadlock.
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        // C1: the transaction is open but nothing is durable yet. A SIGKILL
+        // here must leave the pre-compact transcript intact (SQLite rollback).
+        leveler_core::test_crash::point("before_context_epoch_cut");
 
         // 1. Replace the transcript (same shape as MessageRepository::replace_all).
         sqlx::query("DELETE FROM session_messages WHERE session_id = ?1")
@@ -105,6 +108,9 @@ impl Database {
             .await?;
 
         tx.commit().await?;
+        // C3: the new epoch (transcript + epoch events) is durable; the reaper
+        // has not run. A SIGKILL here is the window the journal guard covers.
+        leveler_core::test_crash::point("after_context_epoch_cut");
         Ok(())
     }
 }
