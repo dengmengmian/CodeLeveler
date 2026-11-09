@@ -189,11 +189,27 @@ fn sse(frames: Vec<serde_json::Value>) -> MockResponse {
 }
 
 fn spawn_response(call_id: &str, script: &str) -> MockResponse {
-    let arguments = serde_json::json!({
+    spawn_response_with_lifetime(call_id, script, None)
+}
+
+/// As [`spawn_response`], with an explicit `background_lifetime`.
+///
+/// The default is `goal`, which belongs to the runtime generation that
+/// admitted it. A test that requires the process to survive runtime
+/// replacement must say `runtime`; it must not rely on the default.
+fn spawn_response_with_lifetime(
+    call_id: &str,
+    script: &str,
+    lifetime: Option<&str>,
+) -> MockResponse {
+    let mut arguments = serde_json::json!({
         "program": "sh",
         "args": ["-c", script],
         "background": true
     });
+    if let Some(lifetime) = lifetime {
+        arguments["background_lifetime"] = serde_json::Value::String(lifetime.into());
+    }
     sse(vec![
         serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": call_id, "function": {"name": "run_command", "arguments": arguments.to_string()}}]}}]}),
         serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
@@ -693,8 +709,14 @@ fn h2_host_crash_after_spawn_before_started_never_replays_the_side_effect() {
             );
 
             std::fs::write(env.repo.join("h2-release"), b"go").unwrap();
+            // The shell creates the file before it writes the line, so waiting
+            // for existence alone can observe an empty file.
             wait_until(
-                || Ok(env.repo.join("h2-side.log").exists()),
+                || {
+                    let text =
+                        std::fs::read_to_string(env.repo.join("h2-side.log")).unwrap_or_default();
+                    Ok(count_occurrences(&text, &nonce) == 1)
+                },
                 "the workload's single side effect",
             )
             .await
@@ -1105,7 +1127,17 @@ fn b14_two_runtime_sigkills_observe_the_same_running_instance() {
                  echo COMPLETED\n\
                  exit 0"
             );
-            mock.push(spawn_response("b14-spawn", &script)).await;
+            // This test is about ONE execution instance surviving two runtime
+            // replacements. Only a `runtime` service promises that; a `goal`
+            // task belongs to the generation that admitted it and is expected
+            // to be reported Lost when that generation dies. Relying on the
+            // default here would assert the very silence B15 removes.
+            mock.push(spawn_response_with_lifetime(
+                "b14-spawn",
+                &script,
+                Some("runtime"),
+            ))
+            .await;
             mock.push(MockResponse::NeverResponds).await;
             submit(&client_a, &session, "Start the long background command.").await;
 
@@ -1206,6 +1238,223 @@ fn b14_two_runtime_sigkills_observe_the_same_running_instance() {
             eprintln!(
                 "B14 PASS task={task_id} host_pid={host} background_pid={pid} \
                  start_identity={start_identity} runtime_sigkills=2 spawn_count=1 side_effect_count=1"
+            );
+            let _ = runtime_c.kill();
+            let _ = runtime_c.wait();
+            stop_isolated_host(&host_state);
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B15 — a goal task dies with the runtime generation that admitted it.
+//
+// The host keeps draining the process, so its output and exit are not lost.
+// What ends with the runtime is OWNERSHIP: the replacement must not adopt the
+// task as its own live work, and the task must never read as permanently
+// Running. The host records the lost owner durably, the projection reports
+// Lost, and a repeated restart adds no second fact or side effect.
+// ---------------------------------------------------------------------------
+#[test]
+fn b15_goal_task_loses_its_owner_and_is_never_reported_running() {
+    leveler_test_support::bounded_test(
+        "b15_goal_task_loses_its_owner_and_is_never_reported_running",
+        Duration::from_secs(240),
+        || async {
+            let nonce = format!("b15-{}", std::process::id());
+            let mock = MockServer::start(vec![]).await;
+            let env = Environment::new(&mock.base_url());
+            let (mut runtime_a, ready_a) = env.serve("b15-a");
+            ready(&ready_a, &mut runtime_a).await;
+            let client_a = LocalSocketRuntimeClient::connect(&env.socket())
+                .await
+                .unwrap();
+            let session = create_goal_session(&client_a, "b15 goal owner loss").await;
+            let script = format!(
+                "echo GOALSTART={nonce} >> b15-goal.log\n\
+                 while :; do echo HEARTBEAT={nonce} >> b15-heartbeat.log; echo HEARTBEAT; sleep 0.05; done"
+            );
+            mock.push(spawn_response_with_lifetime(
+                "b15-goal",
+                &script,
+                Some("goal"),
+            ))
+            .await;
+            mock.push(MockResponse::NeverResponds).await;
+            submit(&client_a, &session, "Start the goal background command.").await;
+
+            let (task_id, pid) = wait_hosted_task(&client_a, &session).await;
+            let pid = pid.expect("pid");
+            let host_state = env.host_state();
+            let host = host_pid(&host_state);
+            let started = wait_archived(
+                &host_state,
+                &task_id,
+                |task| task["snapshot"]["status"] == "Running",
+                "the started fact",
+            )
+            .await;
+            assert!(
+                started["owner_boot"]
+                    .as_str()
+                    .is_some_and(|boot| !boot.is_empty()),
+                "the host must durably attribute the task to the boot that admitted it: {started}"
+            );
+            assert_eq!(started["snapshot"]["origin_call_id"], "b15-goal");
+            assert_eq!(started["snapshot"]["exit_code"], serde_json::Value::Null);
+            let heartbeat_path = env.repo.join("b15-heartbeat.log");
+            let heartbeats_before = std::fs::read_to_string(&heartbeat_path)
+                .unwrap_or_default()
+                .lines()
+                .count();
+
+            // The owner generation really dies. The host and the workload do
+            // not: the host still owns the process group and drains its output.
+            runtime_a.kill().unwrap();
+            assert_eq!(runtime_a.wait().unwrap().signal(), Some(9));
+            assert!(
+                alive(host) && alive(pid),
+                "crash recovery must not kill the workload"
+            );
+
+            let (mut runtime_b, ready_b) = env.serve("b15-b");
+            ready(&ready_b, &mut runtime_b).await;
+            let recovered = wait_archived(
+                &host_state,
+                &task_id,
+                |task| task["owner_loss"].is_object(),
+                "the durable owner-loss fact",
+            )
+            .await;
+            assert_eq!(
+                recovered["snapshot"]["status"], "Running",
+                "the host still owns a live process; owner loss is not a fake terminal"
+            );
+            assert_eq!(
+                recovered["owner_loss"]["owner_boot"], started["owner_boot"],
+                "only the boot that admitted the task can be recorded lost"
+            );
+            let owner_loss_at = recovered["owner_loss"]["observed_at_ms"]
+                .as_u64()
+                .expect("owner-loss timestamp");
+            assert!(owner_loss_at >= recovered["started_at_ms"].as_u64().unwrap());
+
+            // The process is provably alive after the owner died.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let heartbeats_after = std::fs::read_to_string(&heartbeat_path)
+                .unwrap()
+                .lines()
+                .count();
+            assert!(
+                heartbeats_after > heartbeats_before,
+                "the workload kept running: {heartbeats_before} -> {heartbeats_after}"
+            );
+
+            // The replacement runtime must not present the dead generation's
+            // task as its own live work, and its log is still readable.
+            let client_b = LocalSocketRuntimeClient::connect(&env.socket())
+                .await
+                .unwrap();
+            let snapshot = client_b
+                .snapshot(&leveler_client_protocol::SessionId::new(&session))
+                .await
+                .unwrap();
+            assert!(
+                snapshot
+                    .active_background_tasks
+                    .iter()
+                    .all(|task| task.task_id != task_id),
+                "a dead owner's task is not live work of the replacement: {snapshot:?}"
+            );
+            let record = snapshot
+                .background_tasks
+                .iter()
+                .find(|record| record.task_id == task_id)
+                .unwrap_or_else(|| panic!("lost task missing from projection: {snapshot:?}"));
+            assert_eq!(
+                record.state,
+                leveler_client_protocol::UiBackgroundTaskState::Lost,
+                "{record:?}"
+            );
+            assert_eq!(record.call_id.as_deref(), Some("b15-goal"));
+            assert_eq!(record.exit_code, None, "no terminal was invented");
+            assert!(
+                env.background(&["logs", &task_id]).contains("HEARTBEAT"),
+                "the host-retained output is still readable"
+            );
+            assert!(
+                finished_events(&env.db(), &session).await.is_empty(),
+                "a lost task has no fabricated terminal fact"
+            );
+
+            let inventory: Vec<serde_json::Value> =
+                serde_json::from_str(&env.background(&["list", "--json"])).unwrap();
+            let listed = inventory
+                .iter()
+                .find(|task| task["task_id"] == task_id.as_str())
+                .unwrap_or_else(|| panic!("task missing from inventory: {inventory:?}"));
+            assert_eq!(listed["status"], "lost", "{listed}");
+            assert_eq!(
+                listed["owner"], "runtime",
+                "goal work belongs to the runtime generation"
+            );
+            let listed_elapsed = listed["elapsed_ms"].as_u64().unwrap();
+
+            // A different replacement boot converges to the SAME durable fact:
+            // one record, one occurrence, one unchanged observation time.
+            runtime_b.kill().unwrap();
+            assert_eq!(runtime_b.wait().unwrap().signal(), Some(9));
+            let (mut runtime_c, ready_c) = env.serve("b15-c");
+            ready(&ready_c, &mut runtime_c).await;
+            let repeated = wait_archived(
+                &host_state,
+                &task_id,
+                |task| task["owner_loss"].is_object(),
+                "the repeated owner-loss read",
+            )
+            .await;
+            assert_eq!(
+                repeated["owner_loss"]["observed_at_ms"], owner_loss_at,
+                "a repeated recovery must not restamp the loss"
+            );
+            assert_eq!(
+                host_tasks(&host_state)
+                    .iter()
+                    .filter(|task| task["snapshot"]["id"] == task_id.as_str())
+                    .count(),
+                1,
+                "recovery is idempotent"
+            );
+            assert_eq!(
+                count_occurrences(
+                    &std::fs::read_to_string(env.repo.join("b15-goal.log")).unwrap(),
+                    &nonce
+                ),
+                1,
+                "recovery never replayed the command"
+            );
+            let inventory: Vec<serde_json::Value> =
+                serde_json::from_str(&env.background(&["list", "--json"])).unwrap();
+            let repeated_entry = inventory
+                .iter()
+                .find(|task| task["task_id"] == task_id.as_str())
+                .unwrap();
+            assert_eq!(repeated_entry["status"], "lost");
+            assert_eq!(
+                repeated_entry["elapsed_ms"], listed_elapsed,
+                "a lost task's clock is frozen, not a running timer"
+            );
+            assert!(
+                alive(pid),
+                "the live workload was never signalled by recovery"
+            );
+
+            // Explicit user authority can still stop it: recovery itself must
+            // not kill, but the session owner keeps that command.
+            let _ = env.background(&["stop", &task_id]);
+            stop_workload(pid).await;
+            eprintln!(
+                "B15 PASS task={task_id} host_pid={host} pid={pid} owner_loss_at={owner_loss_at}"
             );
             let _ = runtime_c.kill();
             let _ = runtime_c.wait();

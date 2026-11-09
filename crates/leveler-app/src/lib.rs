@@ -1118,9 +1118,19 @@ impl Application {
 
     /// Recover hosted process settlements at an explicit runtime startup
     /// boundary. Merely reading the session database never performs this work.
+    ///
+    /// The same boundary binds this runtime's boot identity to the background
+    /// registry. A hosted goal task is attributed to the boot that admitted it,
+    /// and a replacement boot can then prove the previous generation gone
+    /// instead of silently adopting its live process as its own.
     pub async fn reconcile_execution_services(
         &self,
     ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+        let boot = self.boot_id()?;
+        let probe: std::sync::Arc<dyn leveler_core::BootLivenessProbe> = std::sync::Arc::new(
+            runtime_boot::StateDirBootLiveness::new(&self.layout.state_dir),
+        );
+        self.background_tasks.bind_runtime_boot(boot, probe);
         self.background_tasks
             .reconcile_hosted()
             .await

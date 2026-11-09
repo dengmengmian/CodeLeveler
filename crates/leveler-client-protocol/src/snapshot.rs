@@ -748,6 +748,13 @@ pub struct UiBackgroundTaskRecord {
     pub output: String,
     #[serde(default)]
     pub output_truncated: bool,
+    /// How long the task's execution was observed, when a fact establishes it.
+    ///
+    /// A lost task's duration ends at the proven loss, not at the moment a
+    /// client happens to read the record: work whose owner is gone must not
+    /// appear to keep growing. Absent when no observed start or end exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// One live background task that is keeping a runtime from becoming idle.

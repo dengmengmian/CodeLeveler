@@ -142,19 +142,44 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
                 .collect::<Vec<_>>();
             inventory.extend(hosted.iter().map(|task| {
                 let snapshot = &task.snapshot;
+                // The runtime generation owns goal work even though the
+                // Execution Host carries the process. Naming the host as the
+                // owner hid exactly which generation a lost task belonged to.
+                let owner = match task.lifetime {
+                    leveler_execution::BackgroundTaskLifetime::Goal => "runtime",
+                    _ => "execution-host",
+                };
+                // An owner-lost task still has a running process, but the
+                // generation that admitted it can never receive the result.
+                // "running" would claim an owner that cannot act on it.
+                let owner_lost = task.is_live() && task.owner_loss.is_some();
                 InventoryEntry {
                     task_id: snapshot.id.clone(),
                     program: snapshot.program.clone(),
                     args: snapshot.args.clone(),
-                    status: match snapshot.status {
-                        BackgroundTaskStatus::Running => "running",
-                        BackgroundTaskStatus::Killing => "killing",
-                        BackgroundTaskStatus::Exited => "exited",
-                        BackgroundTaskStatus::Killed => "killed",
-                        BackgroundTaskStatus::Unknown => "unknown",
+                    status: if owner_lost {
+                        "lost"
+                    } else {
+                        match snapshot.status {
+                            BackgroundTaskStatus::Running => "running",
+                            BackgroundTaskStatus::Killing => "killing",
+                            BackgroundTaskStatus::Exited => "exited",
+                            BackgroundTaskStatus::Killed => "killed",
+                            BackgroundTaskStatus::Unknown => "unknown",
+                        }
                     },
-                    owner: "execution-host",
-                    elapsed_ms: snapshot.duration_ms,
+                    owner,
+                    // A LIVE task whose owner is gone stops its clock at the
+                    // proven loss. Once the host proves an exit, its own
+                    // measured lifetime is the real duration.
+                    elapsed_ms: if owner_lost {
+                        task.owner_loss
+                            .as_ref()
+                            .map(|loss| loss.observed_at_ms.saturating_sub(task.started_at_ms))
+                            .unwrap_or(snapshot.duration_ms)
+                    } else {
+                        snapshot.duration_ms
+                    },
                     session_id: snapshot
                         .owner_scope
                         .clone()

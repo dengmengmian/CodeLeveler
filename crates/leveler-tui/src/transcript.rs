@@ -1562,10 +1562,6 @@ impl TranscriptState {
         exit_code: Option<i32>,
         duration_ms: u64,
     ) -> bool {
-        if task_id.is_empty() || task_id.contains(['\n', '\r']) {
-            return false;
-        }
-        let task_line = format!("task_id: {task_id}");
         let status = if stopped {
             "stopped"
         } else if ok {
@@ -1573,34 +1569,57 @@ impl TranscriptState {
         } else {
             "failed"
         };
-        let mut changed = false;
-        let mut matched = false;
-        for item in &mut self.items {
-            let TranscriptItem::ToolGroup(group) = item else {
-                continue;
+        self.note_background_settled(task_id, status, exit_code, Some(duration_ms))
+    }
+
+    /// Stamp a settled outcome onto the command row that started a detached
+    /// process. `status` is the wire word the row reads (`exited`, `failed`,
+    /// `stopped`, `unknown`); `duration_ms` is `None` when the fact carries no
+    /// measured lifetime, leaving any replayed duration in place.
+    pub fn note_background_settled(
+        &mut self,
+        task_id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+    ) -> bool {
+        self.update_background_starter(task_id, |call| {
+            let Some(preview) = call.preview.as_deref() else {
+                return false;
             };
-            for call in &mut group.calls {
-                if call.status != ToolStatus::Ok || !runs_detached(call) {
-                    continue;
-                }
-                let Some(preview) = call.preview.as_mut() else {
-                    continue;
-                };
-                if !preview.lines().any(|line| line.trim() == task_line) {
-                    continue;
-                }
-                matched = true;
-                let stamped = rewrite_detached_preview(preview, status, exit_code, duration_ms);
-                if stamped != *preview {
-                    *preview = stamped;
-                    changed = true;
-                }
+            let stamped = rewrite_detached_preview(preview, status, exit_code, duration_ms);
+            if stamped == preview {
+                return false;
             }
-        }
-        if changed {
-            self.bump();
-        }
-        matched
+            call.preview = Some(stamped);
+            true
+        })
+    }
+
+    /// Mark a detached process whose state cannot be proven: its owner is gone
+    /// and no terminal fact exists. Only that absence is claimed — never that
+    /// the process ended or failed. A real terminal stamp already on the row
+    /// wins, so a late loss marker cannot overwrite a known outcome.
+    pub fn note_background_unknown(&mut self, task_id: &str) -> bool {
+        self.update_background_starter(task_id, |call| {
+            let Some(preview) = call.preview.as_deref() else {
+                return false;
+            };
+            let settled = preview.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("status:")
+                    .is_some_and(|status| !matches!(status.trim(), "" | "running" | "unknown"))
+            });
+            if settled {
+                return false;
+            }
+            let stamped = rewrite_detached_preview(preview, "unknown", None, None);
+            if stamped == preview {
+                return false;
+            }
+            call.preview = Some(stamped);
+            true
+        })
     }
 
     /// Record readiness that the runtime OBSERVED for a still-running task on
@@ -2585,7 +2604,7 @@ fn rewrite_detached_preview(
     preview: &str,
     status: &str,
     exit_code: Option<i32>,
-    duration_ms: u64,
+    duration_ms: Option<u64>,
 ) -> String {
     let mut saw_status = false;
     let mut saw_duration = false;
@@ -2597,7 +2616,12 @@ fn rewrite_detached_preview(
             lines.push(format!("status: {status}"));
             saw_status = true;
         } else if trimmed.starts_with("duration_ms:") {
-            lines.push(format!("duration_ms: {duration_ms}"));
+            match duration_ms {
+                Some(ms) => lines.push(format!("duration_ms: {ms}")),
+                // No measured lifetime in this fact: keep whatever an earlier
+                // replay already stamped rather than inventing or dropping it.
+                None => lines.push(line.to_string()),
+            }
             saw_duration = true;
         } else if trimmed.starts_with("exit_code:") {
             if let Some(code) = exit_code {
@@ -2611,8 +2635,8 @@ fn rewrite_detached_preview(
     if !saw_status {
         lines.push(format!("status: {status}"));
     }
-    if !saw_duration {
-        lines.push(format!("duration_ms: {duration_ms}"));
+    if !saw_duration && let Some(ms) = duration_ms {
+        lines.push(format!("duration_ms: {ms}"));
     }
     if !saw_exit && let Some(code) = exit_code {
         lines.push(format!("exit_code: {code}"));

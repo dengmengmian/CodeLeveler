@@ -21,7 +21,7 @@ use tokio::{
 };
 
 pub const PROTOCOL_MAJOR: u32 = 2;
-pub const PROTOCOL_MINOR: u32 = 1;
+pub const PROTOCOL_MINOR: u32 = 2;
 /// Older majors this build can still talk to.
 ///
 /// The Execution Host is a persistent owner: a runtime upgrade must not strand
@@ -38,6 +38,15 @@ pub const REQUIRED_CAPABILITIES: &[&str] = &[
     "process.stop",
     "logs.read",
 ];
+/// Optional capability: a client may durably record that the runtime
+/// generation which admitted a goal task is gone.
+///
+/// The host never signals or forgets the process: it keeps owning, draining
+/// and reporting it. The record only states that no result can be delivered to
+/// the generation that asked for the work. Clients must check this capability
+/// before sending [`Request::OwnerLost`]; a host that predates it has no way to
+/// represent the fact and keeps its previous behaviour.
+pub const OWNER_LOSS_CAPABILITY: &str = "process.owner-loss";
 const FRAME_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -62,6 +71,21 @@ pub struct HostedTask {
     pub finished_at_ms: Option<u64>,
     pub log_end: u64,
     pub log_prefix_len: usize,
+    /// The runtime boot that admitted this task, when the spawn recorded it.
+    ///
+    /// A goal task belongs to the runtime generation that asked for it. This
+    /// attribution is what lets a REPLACEMENT generation prove that the owner
+    /// is gone instead of silently adopting the task as its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_boot: Option<String>,
+    /// Proven loss of the runtime generation that admitted a goal task.
+    ///
+    /// This is not a terminal state: the host still owns and drains the
+    /// process. It records that the result can no longer be delivered to the
+    /// generation that admitted the work, so a replacement must not present
+    /// the task as its own Running work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_loss: Option<OwnerLoss>,
     /// Set only by recovery, after the owning host was proven gone. Its
     /// presence means the exit fact is missing: the status is `Unknown` and
     /// [`TaskLoss::process`] says whether a workload may still exist.
@@ -205,6 +229,20 @@ pub struct TaskLoss {
     pub process: ProcessPresence,
 }
 
+/// A goal task whose admitting runtime generation is proven gone.
+///
+/// Unlike [`TaskLoss`], this says nothing about the process: the host observed
+/// no host loss and still owns the workload. It is the ownership fact a
+/// replacement generation needs before it may stop treating the task as live
+/// work — and the moment its duration stops advancing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerLoss {
+    /// When the replacement generation proved the admitting boot gone.
+    pub observed_at_ms: u64,
+    /// The boot that admitted the task, exactly as recorded at spawn.
+    pub owner_boot: String,
+}
+
 /// What one recovery pass converged for a repository's durable host state.
 #[derive(Clone, Debug)]
 pub struct HostRecovery {
@@ -279,6 +317,20 @@ enum Request {
         /// received the spawn reply can still attribute the task.
         #[serde(default)]
         origin: crate::BackgroundTaskOrigin,
+        /// The runtime boot that admitted the task. Absent from clients that
+        /// predate owner-loss recovery; only a goal task uses it.
+        #[serde(default)]
+        owner_boot: Option<String>,
+    },
+    /// Record that a goal task's admitting runtime generation is gone.
+    ///
+    /// The sender has proven the boot dead (the boot lease is the authority);
+    /// the host only verifies that the claim names the boot this task was
+    /// admitted by. It never signals, forgets or reclassifies the process.
+    OwnerLost {
+        id: String,
+        owner: String,
+        owner_boot: String,
     },
     Get {
         id: String,
@@ -820,6 +872,10 @@ pub struct ExecutionHostClient {
     /// `unrestricted` control plane, so that path stays refused rather than
     /// silently degrading to an owner-scoped permission check.
     peer_major: u32,
+    /// Optional capabilities the host declared in its handshake. Required
+    /// capabilities are checked at connect; these gate additive requests such
+    /// as owner-loss recovery.
+    peer_capabilities: Vec<String>,
 }
 impl ExecutionHostClient {
     /// Read a live host, or recover the residue of one that is gone.
@@ -894,8 +950,9 @@ impl ExecutionHostClient {
 
     async fn connect_classified(config: ExecutionHostConfig) -> Result<Self, ConnectFailure> {
         let r = ready(&config).map_err(ConnectFailure::Metadata)?;
-        let c = Self {
+        let mut c = Self {
             peer_major: r.major,
+            peer_capabilities: Vec::new(),
             config,
             ready: r,
         };
@@ -917,6 +974,7 @@ impl ExecutionHostClient {
                         "Execution Host major changed since readiness".into(),
                     ));
                 }
+                c.peer_capabilities = capabilities;
                 Ok(c)
             }
             _ => Err(ConnectFailure::Metadata(
@@ -928,6 +986,13 @@ impl ExecutionHostClient {
     /// The major the connected host speaks.
     pub fn peer_major(&self) -> u32 {
         self.peer_major
+    }
+
+    /// Whether the connected host declared an optional capability.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.peer_capabilities
+            .iter()
+            .any(|declared| declared == capability)
     }
 
     fn require_unrestricted_control(&self) -> Result<(), String> {
@@ -1146,6 +1211,7 @@ impl ExecutionHostClient {
         writer: &str,
         lifetime: BackgroundTaskLifetime,
         origin: crate::BackgroundTaskOrigin,
+        owner_boot: Option<&str>,
     ) -> Result<BackgroundTaskSnapshot, SpawnError> {
         // A legacy host predates the `Runtime` owner tag and only admits
         // `Session`/`Persistent`. `Persistent` is its exact name for the same
@@ -1165,6 +1231,7 @@ impl ExecutionHostClient {
                 writer: writer.into(),
                 lifetime,
                 origin,
+                owner_boot: owner_boot.map(str::to_string),
             })
             .await
             .map_err(SpawnError::OutcomeUnknown)?
@@ -1175,6 +1242,31 @@ impl ExecutionHostClient {
             _ => Err(SpawnError::OutcomeUnknown(
                 "invalid Execution Host spawn reply".into(),
             )),
+        }
+    }
+
+    /// Record that a goal task's admitting runtime generation is gone.
+    ///
+    /// The boot liveness proof belongs to the caller. This request only names
+    /// the fact; the host verifies the task identity and persists it without
+    /// touching the process. Idempotent: an already-marked task is
+    /// acknowledged and its original observation time is kept.
+    pub async fn owner_lost(&self, id: &str, owner: &str, owner_boot: &str) -> Result<(), String> {
+        if !self.supports(OWNER_LOSS_CAPABILITY) {
+            return Err(format!(
+                "Execution Host does not declare {OWNER_LOSS_CAPABILITY}; owner loss cannot be recorded"
+            ));
+        }
+        match self
+            .call(Request::OwnerLost {
+                id: id.into(),
+                owner: owner.into(),
+                owner_boot: owner_boot.into(),
+            })
+            .await?
+        {
+            Reply::Acknowledged => Ok(()),
+            _ => Err("invalid Execution Host owner-loss reply".into()),
         }
     }
 
@@ -1329,6 +1421,8 @@ struct Entry {
     fingerprint: String,
     lifetime: BackgroundTaskLifetime,
     started_at_ms: u64,
+    owner_boot: Option<String>,
+    owner_loss: Option<OwnerLoss>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct SpawnIntent {
@@ -1441,6 +1535,8 @@ impl Host {
                         finished_at_ms,
                         log_end,
                         log_prefix_len,
+                        owner_boot: e.owner_boot.clone(),
+                        owner_loss: e.owner_loss.clone(),
                         // This host observed the entry; the exit fact is its own.
                         loss: None,
                         result,
@@ -1537,6 +1633,7 @@ impl Host {
                 writer,
                 lifetime,
                 origin,
+                owner_boot,
             } => {
                 if !id.starts_with("host-")
                     || id.len() != 37
@@ -1559,6 +1656,7 @@ impl Host {
                         || e.writer != writer
                         || e.fingerprint != fingerprint
                         || e.lifetime != lifetime
+                        || e.owner_boot != owner_boot
                     {
                         return Err("hosted spawn identity belongs to another owner".into());
                     }
@@ -1667,6 +1765,8 @@ impl Host {
                         fingerprint,
                         lifetime,
                         started_at_ms,
+                        owner_boot,
+                        owner_loss: None,
                     },
                 );
                 drop(entries);
@@ -1685,6 +1785,45 @@ impl Host {
                     .find(|t| t.snapshot.id == id)
                     .ok_or("missing spawn fact")?;
                 Ok(Reply::Task(t.snapshot))
+            }
+            Request::OwnerLost {
+                id,
+                owner,
+                owner_boot,
+            } => {
+                if owner_boot.is_empty() {
+                    return Err("owner loss must name the admitting boot".into());
+                }
+                let mut entries = self.entries.lock().await;
+                let entry = entries
+                    .get_mut(&id)
+                    .ok_or_else(|| format!("unknown hosted task `{id}`"))?;
+                if entry.owner != owner {
+                    return Err("hosted task belongs to another session".into());
+                }
+                // Only goal work belongs to a runtime generation. Session,
+                // runtime and persistent services outlive their creator by
+                // contract and must keep their attribution.
+                if entry.lifetime != BackgroundTaskLifetime::Goal {
+                    return Err("only a goal-lifetime task can lose its runtime owner".into());
+                }
+                if entry.owner_boot.as_deref() != Some(owner_boot.as_str()) {
+                    return Err("owner boot does not match the spawn record".into());
+                }
+                // The first observation is the fact. A repeated recovery — from
+                // this boot or a later one — keeps it, so elapsed time and the
+                // durable record do not drift.
+                if entry.owner_loss.is_none() {
+                    entry.owner_loss = Some(OwnerLoss {
+                        observed_at_ms: wall_ms(),
+                        owner_boot,
+                    });
+                }
+                drop(entries);
+                // Always rewrite the archive: a first call that failed to
+                // persist must not be reported as acknowledged by a retry.
+                self.persist().await?;
+                Ok(Reply::Acknowledged)
             }
             Request::Get {
                 id,
@@ -1855,6 +1994,7 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
         capabilities: REQUIRED_CAPABILITIES
             .iter()
             .copied()
+            .chain([OWNER_LOSS_CAPABILITY])
             .chain(if cfg!(unix) {
                 vec![
                     "terminal.pty",
@@ -2350,6 +2490,139 @@ mod tests {
         assert!(!constant_time_equal("abc", "abd"));
         assert!(!constant_time_equal("abc", "ab"));
     }
+
+    /// Owner loss is recorded, never enacted: the host still owns the process,
+    /// and only the generation that admitted the work can declare that it has
+    /// gone. A second declaration keeps the first observation, so repeated
+    /// reconciliation cannot rewrite when the loss happened.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_loss_is_attributed_idempotent_and_never_signals_the_process() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let config = ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        let server = tokio::spawn(serve(config.clone()));
+        let client = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(c) = ExecutionHostClient::connect(config.clone()).await {
+                    break c;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client.supports(OWNER_LOSS_CAPABILITY));
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "while :; do printf tick; sleep 0.05; done".into(),
+            ],
+            repo,
+        );
+        let started = client
+            .spawn(
+                &id,
+                request.clone(),
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Goal,
+                crate::BackgroundTaskOrigin::default(),
+                Some("boot-a"),
+            )
+            .await
+            .unwrap();
+        let pid = started.pid.expect("hosted goal task has a pid");
+        let listed = || async {
+            client
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|task| task.snapshot.id == id)
+                .expect("hosted task is listed")
+        };
+        assert_eq!(listed().await.owner_boot.as_deref(), Some("boot-a"));
+        assert!(listed().await.owner_loss.is_none());
+
+        // Only the admitting owner, naming the admitting generation, may
+        // declare loss; a wrong or empty boot is not evidence of anything.
+        assert!(
+            client
+                .owner_lost(&id, "another-session", "boot-a")
+                .await
+                .is_err()
+        );
+        assert!(client.owner_lost(&id, "session", "boot-b").await.is_err());
+        assert!(client.owner_lost(&id, "session", "").await.is_err());
+        assert!(
+            client
+                .owner_lost("host-unknown", "session", "boot-a")
+                .await
+                .is_err()
+        );
+        assert!(listed().await.owner_loss.is_none());
+
+        client.owner_lost(&id, "session", "boot-a").await.unwrap();
+        let first = listed().await;
+        let loss = first.owner_loss.clone().expect("loss is recorded");
+        assert_eq!(loss.owner_boot, "boot-a");
+        assert!(loss.observed_at_ms >= first.started_at_ms);
+        assert!(process_alive(pid), "owner loss must not signal the process");
+        let marked = client.get_owned(&id, "session").await.unwrap();
+        assert_eq!(marked.status, BackgroundTaskStatus::Running);
+
+        // Reconciliation may re-declare the same loss many times. The first
+        // observation is the fact; later calls must not move it.
+        client.owner_lost(&id, "session", "boot-a").await.unwrap();
+        assert_eq!(
+            listed().await.owner_loss.unwrap().observed_at_ms,
+            loss.observed_at_ms
+        );
+        drop(client);
+        let archive = HostRecords::read(&config.state_dir).unwrap();
+        let archived = archive.task(&id).expect("archive keeps the record");
+        assert_eq!(
+            archived.owner_loss.as_ref().unwrap().observed_at_ms,
+            loss.observed_at_ms,
+            "the marker survives the client that wrote it"
+        );
+        assert!(process_alive(pid));
+
+        let client = ExecutionHostClient::connect(config.clone()).await.unwrap();
+        let persistent = format!("host-{}", fresh_id().unwrap());
+        client
+            .spawn(
+                &persistent,
+                request,
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Persistent,
+                crate::BackgroundTaskOrigin::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            client
+                .owner_lost(&persistent, "session", "boot-a")
+                .await
+                .is_err(),
+            "only goal work belongs to a runtime generation"
+        );
+        client.kill_owned(&id, "session").await.unwrap();
+        wait_until_dead(pid).await;
+        client.kill_owned(&persistent, "session").await.unwrap();
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_process_survives_clients_and_preserves_offline_exit_and_logs() {
@@ -2386,6 +2659,7 @@ mod tests {
                 "parent",
                 BackgroundTaskLifetime::Persistent,
                 crate::BackgroundTaskOrigin::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2430,6 +2704,7 @@ mod tests {
                 "parent",
                 BackgroundTaskLifetime::Persistent,
                 crate::BackgroundTaskOrigin::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2450,6 +2725,7 @@ mod tests {
                 "parent",
                 BackgroundTaskLifetime::Persistent,
                 crate::BackgroundTaskOrigin::default(),
+                None,
             )
             .await
             .unwrap();
@@ -2535,7 +2811,8 @@ mod tests {
                     "session",
                     "parent",
                     BackgroundTaskLifetime::Persistent,
-                    crate::BackgroundTaskOrigin::default()
+                    crate::BackgroundTaskOrigin::default(),
+                    None,
                 )
                 .await
                 .is_err()
@@ -2652,6 +2929,7 @@ mod tests {
                     "parent",
                     BackgroundTaskLifetime::Persistent,
                     crate::BackgroundTaskOrigin::default(),
+                    None,
                 )
                 .await
                 .unwrap();

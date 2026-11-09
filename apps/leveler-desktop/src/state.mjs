@@ -383,6 +383,50 @@ export function workspaceDraftText({isHome,text,homeDraft}){return isHome?text:h
 
 export function attachmentSubmissionError(attachments){return attachments.some(ref=>ref.kind!=='image')?'普通文件已上传，当前暂不能发送给模型。移除附件后可发送文字。':'';}
 
+/**
+ * Reconcile the rows a client already showed against the runtime's durable
+ * background records. `active` is the live registry; a prior row the registry
+ * no longer holds settles from its record and is never silently kept as
+ * running. A row with no record at all cannot prove any outcome, so it becomes
+ * unknown rather than either running or completed.
+ */
+export function reconcileBackgroundJobs({active=[],prior=[],records=[],settled=[]}={}){
+  const activeJobs=[...active];
+  const activeIds=new Set(activeJobs.map(job=>job.task_id));
+  const settledJobs=[...settled];
+  const settledIds=new Set(settledJobs.map(job=>job.task_id));
+  const byId=new Map((records??[]).map(record=>[record.task_id,record]));
+  for(const job of prior??[]){
+    if(activeIds.has(job.task_id)||settledIds.has(job.task_id))continue;
+    const record=byId.get(job.task_id);
+    // The durable record still says the live registry holds this task: its
+    // absence from the blocker list is not proof of termination.
+    if(record?.state==='running'){activeJobs.push(job);continue;}
+    settledJobs.push({...job,...settledBackgroundRow(job,record)});
+    settledIds.add(job.task_id);
+  }
+  return {backgroundTasks:activeJobs,settledBackgroundTasks:settledJobs.slice(-20)};
+}
+
+function settledBackgroundRow(job,record){
+  const state=record?.state;
+  const stopped=state==='cancelled';
+  const status=stopped?'completed':['completed','failed','lost','conflict'].includes(state)?state:'unknown';
+  const duration=record?.duration_ms??job.duration_ms;
+  return {
+    program:record?.program??job.program,
+    args:record?.args??job.args,
+    status,
+    // A measured lifetime ends at the proven loss, not when this client read
+    // the snapshot; rows without one keep the client's observed span.
+    finished_at:Number.isFinite(duration)&&Number.isFinite(job.started_at)?job.started_at+duration:Date.now(),
+    output:record?.output||job.output||'',
+    exit_code:record?.exit_code??job.exit_code,
+    duration_ms:duration,
+    stopped,
+  };
+}
+
 export function permissionCommand(sessionId,mode){if(!sessionId||!['full_access','assisted','request_approval'].includes(mode))throw new Error('无效的权限模式');return {type:'set_permission_profile',session_id:sessionId,mode};}
 export function permissionConfirmed(current,sessionId,mode){return current?.session.id===sessionId&&current.session.mode===mode;}
 
