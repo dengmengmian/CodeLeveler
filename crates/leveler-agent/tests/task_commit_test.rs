@@ -2432,6 +2432,69 @@ async fn a_paused_goal_with_a_review_warning_keeps_the_pause_terminal() {
     );
 }
 
+/// A plain Chat answer can also receive a required-review warning. That is a
+/// warning about the work, not a registration failure: nothing was declared,
+/// so the executor must not emit the refusal fact the clients read.
+#[tokio::test]
+async fn a_plain_chat_review_warning_is_not_a_registration_failure() {
+    let mut fx = fixture(
+        vec![
+            write_named("answer.txt"),
+            Scripted::Text("已创建 answer.txt。"),
+            Scripted::Tool(
+                "report_finding",
+                serde_json::json!({
+                    "kind": "correctness",
+                    "summary": "answer.txt is empty",
+                    "file": "answer.txt",
+                    "blocking": true
+                }),
+            ),
+            Scripted::Text("reviewed answer.txt: one finding reported"),
+            Scripted::Text("reviewed answer.txt: one finding reported"),
+        ],
+        false,
+    )
+    .await;
+    fx.coding.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    let mut events = Vec::new();
+    let objective = "创建 answer.txt 并交付";
+
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, objective),
+            vec![ContentPart::Text {
+                text: objective.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Answered);
+    assert!(
+        !report.completion_warnings.is_empty(),
+        "the review finding must stay on the report: {report:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, .. }
+                if kind == "acceptance_narrowed"
+        )),
+        "a plain Chat answer attempted no declaration: {events:?}"
+    );
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "a plain Chat registers no goal"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
 #[tokio::test]
 async fn a_status_question_after_a_pause_does_not_release_it() {
     let mut script = pause_stage_one_script();

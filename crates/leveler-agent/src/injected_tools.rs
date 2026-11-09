@@ -269,7 +269,17 @@ pub(crate) fn completion_receipt(resolution: &str, warnings: &[String]) -> Strin
 /// the running turn binds itself to a durable goal. No sub-agent is created —
 /// `spawn_agent` is the only tool that delegates. It is not inferred from the
 /// user's words.
-pub(crate) const COMMIT_TASK_TOOL: &str = "commit_task";
+pub const COMMIT_TASK_TOOL: &str = "commit_task";
+
+/// The structured `GoalIntercepted` kind the executor emits when it refuses a
+/// `commit_task` declaration because the acceptance array does not cover the
+/// user's explicitly named deliverables.
+///
+/// This is the durable registration fact: the refused declaration is what
+/// leaves the work unregistered. Clients must not infer that state from the
+/// terminal's warning list — a plain Chat answer can carry an unrelated
+/// review warning without ever attempting a declaration.
+pub const COMMIT_REFUSED_KIND: &str = "acceptance_narrowed";
 
 /// Commit the current Chat turn to the Goal lifecycle.
 ///

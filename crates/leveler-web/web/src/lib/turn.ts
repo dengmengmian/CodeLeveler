@@ -96,11 +96,14 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
     case 'answered_unregistered':
       // 回答结束，但声明被拒：没有登记执行任务。不是完成，也不是失败；
       // 文案对齐 TUI turn_end_answered_unregistered / turn_unregistered_detail。
+      // 固定句只说明登记事实；终态同时带回的警告（如 Review 发现）原文保留。
       return {
         glyph: '⚠',
         label: '回答结束 · 任务未登记',
         tone: 'warn',
-        detail: '本轮只回答了问题，未登记执行任务；不构成验收完成。',
+        detail: token
+          ? `本轮只回答了问题，未登记执行任务；不构成验收完成。 ${localizeDetail(token)}`
+          : '本轮只回答了问题，未登记执行任务；不构成验收完成。',
       };
     case 'answered':
       return { glyph: '✓', label: '已回答', tone: 'success', detail: null };

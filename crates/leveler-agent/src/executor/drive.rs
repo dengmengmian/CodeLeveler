@@ -34,7 +34,7 @@ use super::{
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::executor::goal_scope;
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, COMMIT_TASK_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope,
+    CLAIM_WRITE_SCOPE_TOOL, COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope,
     PermissionRequestOutcome, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL,
     TurnPermissionGrants, UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants,
     claim_write_scope_tool_definition, commit_task_tool_definition, escalation_action,
@@ -4097,7 +4097,7 @@ impl AgentHarness for Drive<'_> {
                                     ));
                                 }
                                 (self.observer)(AgentEvent::GoalIntercepted {
-                                    kind: "acceptance_narrowed".to_string(),
+                                    kind: COMMIT_REFUSED_KIND.to_string(),
                                     detail: detail.clone(),
                                 });
                                 (false, detail)

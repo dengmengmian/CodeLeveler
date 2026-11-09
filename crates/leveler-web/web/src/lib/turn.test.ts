@@ -22,21 +22,27 @@ describe('turn truth', () => {
   });
 
   it('does not present an unregistered answer as a completed task', () => {
+    const warning = 'required independent review reported 1 finding(s)';
     const end = turnEndFromEvent({
       type: 'turn_completed_with_warnings',
-      reason: 'no execution task was registered',
+      reason: warning,
       unregistered_task: true,
     });
     expect(end?.outcome).toBe('answered_unregistered');
     const shown = presentTurnEnd(end!);
     expect(shown.label).toBe('回答结束 · 任务未登记');
     expect(shown.tone).toBe('warn');
-    expect(shown.detail).toBe('本轮只回答了问题，未登记执行任务；不构成验收完成。');
+    expect(shown.detail).toContain('本轮只回答了问题，未登记执行任务；不构成验收完成。');
+    // The registration fact does not replace the terminal's warnings.
+    expect(shown.detail).toContain(warning);
     // A legacy warning event carries no unregistered fact; it keeps its
     // historical completed-with-warnings reading.
-    expect(
-      turnEndFromEvent({ type: 'turn_completed_with_warnings', reason: 'review unavailable' })?.outcome,
-    ).toBe('completed_with_warnings');
+    const plain = turnEndFromEvent({
+      type: 'turn_completed_with_warnings',
+      reason: 'review unavailable',
+    });
+    expect(plain?.outcome).toBe('completed_with_warnings');
+    expect(presentTurnEnd(plain!).detail).toBe('review unavailable');
   });
 
   it('presents completion and incompletion directly', () => {
