@@ -3983,6 +3983,16 @@ async fn say(fx: &Fixture, text: &str) -> leveler_agent::coding::TaskReport {
 #[tokio::test]
 async fn a_supplement_to_a_paused_goal_is_recorded_without_releasing_the_pause() {
     let mut script = pause_stage_one_script();
+    // The model reads the supplement as an amendment to the same goal; the
+    // runtime records the user's words from that declaration, not from the
+    // text itself.
+    script.push(Scripted::Tool(
+        "declare_intent",
+        serde_json::json!({
+            "source_quote": supplement_request(),
+            "operations": [{"kind": "amend_current_task"}]
+        }),
+    ));
     script.push(Scripted::Text("补充要求已记下；阶段 2 仍等你确认。"));
     let fx = fixture(script, false).await;
     write_verifier(fx.dir.path());
@@ -4052,8 +4062,8 @@ async fn a_status_question_in_a_paused_goal_is_not_scope() {
     assert_eq!(goals.len(), 1, "{goals:?}");
     assert_eq!(
         goals[0].amendments,
-        vec![question.to_string()],
-        "the user's message is recorded verbatim: {goals:?}"
+        Vec::<String>::new(),
+        "a question the model did not declare as an amendment stays out of scope: {goals:?}"
     );
     let requirements = leveler_storage::EngineStores::from_database(&fx.db)
         .goals
@@ -4083,8 +4093,8 @@ async fn an_independent_request_with_no_deliverable_is_not_scope() {
     assert_eq!(goals.len(), 1, "{goals:?}");
     assert_eq!(
         goals[0].amendments,
-        vec![request.to_string()],
-        "the user's message is recorded verbatim: {goals:?}"
+        Vec::<String>::new(),
+        "without a declaration the message is not an amendment to this goal: {goals:?}"
     );
     let requirements = leveler_storage::EngineStores::from_database(&fx.db)
         .goals

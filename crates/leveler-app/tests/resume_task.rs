@@ -1420,8 +1420,8 @@ async fn a_failed_verification_survives_into_the_retry() {
                 ),
                 finish_frame("tool_calls"),
             ]),
-            // Retry: first tries to close without evidence — the remembered
-            // failure must refuse it.
+            // Retry: first cites the check that failed in the earlier window —
+            // the remembered execution must refuse it.
             sse(vec![
                 tool_call_frame(
                     "g-premature",
@@ -1429,7 +1429,7 @@ async fn a_failed_verification_survives_into_the_retry() {
                     serde_json::json!({
                         "status": "complete",
                         "summary": "treat it as done",
-                        "verification": {"status": "not_applicable", "detail": "looks fine"}
+                        "verification": {"status": "passed", "detail": cited}
                     }),
                 ),
                 finish_frame("tool_calls"),
@@ -1756,12 +1756,23 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
         "the acceptance plan is reused, not re-declared"
     );
     assert!(goals[0].user_paused_at.is_none());
+    // The authorization is durable with its goal as the model's structured
+    // declaration: which turn carried the words, the quoted source, and the
+    // operation it was read as. `goals.amendments` is not this record; it is
+    // the short window of instructions the model declared as scope changes.
+    let intents = stores.goals.intent_log(&goal_id).await.unwrap();
     assert!(
-        goals[0]
-            .amendments
-            .iter()
-            .any(|amendment| amendment.contains("继续阶段 2")),
-        "the authorization is durable with its goal: {goals:?}"
+        intents.iter().any(|record| {
+            record.source_quote.contains("继续阶段 2")
+                && record.operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        leveler_lifecycle::UserIntentOperation::ContinueTask
+                    )
+                })
+                && !record.pause_in_force
+        }),
+        "the authorization is durable with its goal: {intents:?}"
     );
     let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
     assert_eq!(turns.len(), 2);

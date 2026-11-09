@@ -1121,50 +1121,6 @@ impl CodingRuntime {
         Ok(running.next().is_none().then_some(first.id))
     }
 
-    /// Record one user-authored message in the goal's durable instruction
-    /// sequence.
-    ///
-    /// This is a verbatim user record, not a scope decision: whether the words
-    /// add, amend or waive a requirement is declared by the model through
-    /// `declare_scope`, anchored to a quote. Recording every message here
-    /// keeps the user's own instructions available across resume and
-    /// compaction without letting a keyword menu decide what became scope.
-    ///
-    /// This writes the user's instruction only. It never executes the new
-    /// requirement, never binds the window to the goal and never touches
-    /// `user_paused_at`, so a supplement added while the user withheld
-    /// authorization stays owed instead of being run or forgotten — and a
-    /// pause is released only by the user's own continuation.
-    async fn record_goal_instruction(
-        &self,
-        token: &leveler_core::OwnershipToken,
-        goal_id: &leveler_core::GoalId,
-        text: &str,
-    ) -> Result<(), EngineError> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(());
-        }
-        let Some(record) = self.engine.stores.goals.get(goal_id).await? else {
-            return Ok(());
-        };
-        // A settled or cancelled goal owes nothing: the store refuses such an
-        // amendment, and the user's words must not be attached to a finished
-        // goal's scope either.
-        if record.state != leveler_storage::GoalState::Running {
-            return Ok(());
-        }
-        if record.amendments.iter().any(|value| value.trim() == text) {
-            return Ok(());
-        }
-        self.engine
-            .stores
-            .goals
-            .append_amendment(token, goal_id, text)
-            .await?;
-        Ok(())
-    }
-
     /// Re-attribute every Chat window that was bound to this goal.
     ///
     /// The binder moves the rows at bind time. A crash between binding the
@@ -2263,14 +2219,6 @@ impl CodingRuntime {
                 return result;
             }
         };
-        // A message that continues a running goal is recorded verbatim as a
-        // user instruction. Requirement changes are not inferred from it:
-        // the model declares them with `declare_scope` and a verbatim quote,
-        // so a status question is recorded but can never become a deliverable.
-        if continued_running {
-            self.record_goal_instruction(&token, &goal, spec.runtime.goal.trim())
-                .await?;
-        }
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
             session_id.clone(),
@@ -2460,15 +2408,10 @@ impl CodingRuntime {
             .next()
             .map(str::to_string);
         // A Chat turn can add work to the one goal this task still owes. The
-        // user's own words are recorded verbatim; binding and requirement
-        // changes remain explicit model declarations, so this turn stays a
-        // Chat turn.
+        // user's own words become scope only when the model declares an
+        // amendment through `declare_intent`; binding and requirement changes
+        // remain explicit model declarations, so this turn stays a Chat turn.
         let running_goal = self.single_running_goal(&token.task_id).await?;
-        if let Some(goal_id) = running_goal.as_ref()
-            && let Some(text) = objective_hint.as_deref()
-        {
-            self.record_goal_instruction(&token, goal_id, text).await?;
-        }
         let runner = TurnRunner {
             stores: &self.engine.stores,
             token: token.clone(),

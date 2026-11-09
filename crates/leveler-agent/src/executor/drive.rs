@@ -2206,6 +2206,19 @@ impl Drive<'_> {
             .record_intent(&declaration, &projection)
             .await
             .map_err(intent_fatal)?;
+        // The model's reading is what makes the newest user message an
+        // amendment. This short window feeds the goal prompt; the ordered,
+        // quoted authority remains the `goal_intents` log written above.
+        if declaration
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, UserIntentOperation::AmendCurrentTask))
+        {
+            binder
+                .append_amendment(self.latest_user_input.trim())
+                .await
+                .map_err(intent_fatal)?;
+        }
 
         if projection.cancel {
             self.cancelled_goal = Some(target.to_string());
@@ -3178,16 +3191,10 @@ impl AgentHarness for Drive<'_> {
                         self.sink.append(std::slice::from_ref(&message)).await?;
                     }
                 }
-                // A user message during a running goal is recorded verbatim
-                // as a user instruction. It does not change the requirement
-                // set by itself: that authority belongs to the model's
-                // `declare_scope` declaration and its verbatim quote, so no
-                // keyword reading decides whether the words became scope.
-                if let Some(binder) = self.executor.goal_binder() {
-                    if binder.bound().is_some() {
-                        binder.append_amendment(text).await?;
-                    }
-                }
+                // A user message during a running goal becomes scope only
+                // through the model's structured declaration: `declare_intent`
+                // records the reading, and `declare_scope` records the
+                // requirement change. Nothing here classifies the words.
                 messages.push(message);
             }
         }
