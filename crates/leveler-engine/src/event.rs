@@ -110,6 +110,73 @@ impl TurnKind {
     }
 }
 
+/// Read the terminal verification report, tolerating the field's history.
+///
+/// Before 2026-09-23 the same field carried the removed host-owned verdict as
+/// a bare string (`"not_run"`, `"verified"`, …). That value is not a report and
+/// carries no authority now, so it decodes as "no report" and the row still
+/// replays. A structured object is parsed strictly: only the legacy string
+/// shape is tolerated, so a corrupt report still fails the whole replay.
+fn deserialize_verification<'de, D>(
+    deserializer: D,
+) -> Result<Option<leveler_lifecycle::VerificationReport>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, MapAccess, Visitor};
+    use std::fmt;
+
+    struct VerificationField;
+
+    impl<'de> Visitor<'de> for VerificationField {
+        type Value = Option<leveler_lifecycle::VerificationReport>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a verification report or a legacy verification status")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, _status: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            leveler_lifecycle::VerificationReport::deserialize(
+                de::value::MapAccessDeserializer::new(map),
+            )
+            .map(Some)
+        }
+    }
+
+    deserializer.deserialize_any(VerificationField)
+}
+
 /// Every event the engine can emit. Kernel events first, then strategy
 /// events. Transient events (deltas, usage) are forwarded to observers but
 /// never persisted — see [`EngineEvent::is_transient`].
@@ -208,7 +275,11 @@ pub enum EngineEvent {
         /// aggregate verdict plus one record per assessed requirement. Absent
         /// when the task declared no verification obligation, and absent on
         /// every row written before the record existed.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_verification"
+        )]
         verification: Option<leveler_lifecycle::VerificationReport>,
     },
 
