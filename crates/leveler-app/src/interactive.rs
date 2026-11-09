@@ -4535,26 +4535,11 @@ impl InProcessRuntimeClient {
         // Every route below runs a model. A session that exists only for
         // deterministic host commands says so here, before it stages a turn.
         let model = require_model(&config, &session_id)?;
-        // A paused goal is waiting for the user's authorization, and the user
-        // just gave it. A Chat session keeps its axis after a committed task,
-        // so this continuation would otherwise be a fresh conversation and the
-        // owed goal would never be re-entered. The authorization reader is the
-        // same one the closeout honors: `继续阶段 2` is the user's own
-        // instruction, and the goal is re-entered by identity (same acceptance,
-        // same plan evidence).
-        if !promoted
-            && attachments.is_empty()
-            && !collaboration_routes_submit_to_goal(&config.collaboration)
-            && leveler_lifecycle::authorizes_continuation(&content)
-            && let Some(goal) = self.paused_running_goal(&session_id).await?
-        {
-            tracing::info!(
-                session = %session_id.as_str(),
-                goal = %goal,
-                "user continuation authorization resumes the paused goal"
-            );
-            return self.resume_session_task(session_id, content).await;
-        }
+        // Continuation, pause and amendment are read by the MODEL from the
+        // user's message and declared through the structured intent tool; the
+        // runtime validates that declaration against the durable goal. This
+        // path never classifies the text, so any language and phrasing reaches
+        // the same machinery.
         // The TUI asks the user about this first, but the reducer is one
         // client. Every other one — web, headless, a model changed between
         // staging and sending — arrives here, and here the answer is the same:
@@ -4589,24 +4574,18 @@ impl InProcessRuntimeClient {
         await_turn_acceptance(accepted).await
     }
 
-    /// Route a continuation intent (`继续`, `继续，但是先不要跑测试`, …).
+    /// Route an explicit resume command into the session's logical task.
     ///
-    /// The runtime owns the mapping: continuation intent AND a resumable task
-    /// must both hold before this becomes a resume. Otherwise the message is an
-    /// ordinary submit, so a `继续` in a fresh session, or one that is really a
-    /// new request, reaches the model exactly as before.
+    /// The command itself is the client's express request to resume; the
+    /// runtime decides whether a task is really resumable. The user's words are
+    /// not classified here — a continuation said in an ordinary message is
+    /// read by the model and declared through the structured intent tool.
     async fn handle_resume_task(
         &self,
         session_id: SessionId,
         content: String,
         origin: Option<&CommandId>,
     ) -> Result<(), ClientError> {
-        // No continuation intent: the client mislabelled an ordinary message.
-        let Some(continuation) = leveler_client_protocol::parse_continuation(&content) else {
-            return self
-                .handle_submit_message(session_id, content, Vec::new(), origin, None)
-                .await;
-        };
         // Continuation intent is not enough: the runtime must also own a
         // resumable task. An explicitly cancelled task must never be silently
         // reopened, so it is told apart from the ordinary "nothing to resume".
@@ -4630,16 +4609,12 @@ impl InProcessRuntimeClient {
         }
         // The instruction is the user's own words. The original objective stays
         // the task's first user message and the resume path seeds the prior
-        // plan/ledger; `continuation.amendment` travels inside that text, so an
-        // amendment is an addition and never a replacement.
-        if let Some(amendment) = &continuation.amendment {
-            tracing::info!(
-                session = %session_id.as_str(),
-                phrase = %continuation.phrase,
-                amendment = %amendment,
-                "continuation intent resumes the session's logical task"
-            );
-        }
+        // plan/ledger, so what the user adds here is an addition and never a
+        // replacement.
+        tracing::info!(
+            session = %session_id.as_str(),
+            "explicit resume command re-enters the session's logical task"
+        );
         self.resume_session_task(session_id, content).await
     }
 
@@ -4682,46 +4657,11 @@ impl InProcessRuntimeClient {
         await_turn_acceptance(accepted).await
     }
 
-    /// The one running goal that is waiting for the user's continuation
-    /// authorization.
+    /// What an explicit resume command means for this session.
     ///
-    /// Ambiguity is not guessed: two paused goals in one task mean the message
-    /// cannot be routed by this fact alone.
-    async fn paused_running_goal(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<leveler_core::GoalId>, ClientError> {
-        let db = self
-            .app
-            .open_database()
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        let stores = leveler_storage::EngineStores::from_database(&db);
-        let Some(task) = stores
-            .tasks
-            .task_for_session(session_id)
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?
-        else {
-            return Ok(None);
-        };
-        let paused: Vec<leveler_core::GoalId> = stores
-            .goals
-            .for_task(&task)
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?
-            .into_iter()
-            .filter(|goal| {
-                goal.state == leveler_storage::GoalState::Running && goal.user_paused_at.is_some()
-            })
-            .map(|goal| goal.id)
-            .collect();
-        Ok((paused.len() == 1).then(|| paused[0].clone()))
-    }
-
-    /// What a continuation intent (`继续`) means for this session.
-    ///
-    /// The persisted terminal is the authority: an `interrupted` turn (user
+    /// The user chose the resume action in a client; the user's words are not
+    /// classified here. The persisted terminal is the authority: an
+    /// `interrupted` turn (user
     /// Esc, force-cancel) or a `failed` turn whose typed failure is a
     /// recoverable provider/network fault is resumable. A task the user
     /// explicitly cancelled is reported as such (a continuation must not
@@ -6067,15 +6007,12 @@ impl InProcessRuntimeClient {
                 content,
                 attachments,
             } => {
-                if attachments.is_empty()
-                    && leveler_client_protocol::parse_continuation(&content).is_some()
-                {
-                    self.handle_resume_task(session_id, content, Some(origin))
-                        .await
-                } else {
-                    self.handle_submit_message(session_id, content, attachments, Some(origin), None)
-                        .await
-                }
+                // An ordinary message stays an ordinary message. Whether it
+                // continues an existing goal is the model's reading, declared
+                // through the structured intent tool, not a client-side phrase
+                // match.
+                self.handle_submit_message(session_id, content, attachments, Some(origin), None)
+                    .await
             }
             ClientCommand::ResumeTask {
                 session_id,
@@ -6270,17 +6207,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
                 attachments,
             } => {
-                // Continuation is an App intent, shared by every client. Keep
-                // attachments on the content path rather than discarding them
-                // when invoking the existing attachment-free Resume command.
-                if attachments.is_empty()
-                    && leveler_client_protocol::parse_continuation(&content).is_some()
-                {
-                    self.handle_resume_task(session_id, content, None).await
-                } else {
-                    self.handle_submit_message(session_id, content, attachments, None, None)
-                        .await
-                }
+                // Same rule as `send_with_origin`: no client-side continuation
+                // classification. Attachments stay on the content path.
+                self.handle_submit_message(session_id, content, attachments, None, None)
+                    .await
             }
             ClientCommand::ResumeTask {
                 session_id,

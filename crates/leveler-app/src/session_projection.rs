@@ -234,6 +234,7 @@ mod tests {
             acceptance: Vec::new(),
             amendments: Vec::new(),
             user_paused_at: paused.then(leveler_core::now),
+            pause_boundary: None,
         }
     }
 

@@ -6073,36 +6073,36 @@ fn plain_message_with_goal_collab_marks_goal_mode() {
 }
 
 #[test]
-fn a_continuation_phrase_is_sent_as_a_resume_intent() {
+fn a_continuation_phrase_is_a_plain_message() {
     let mut s = opened();
     typed(&mut s, "继续");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Submit { command: ClientCommand::ResumeTask { content, .. }, .. }]
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }]
                 if content == "继续"
         ),
-        "`继续` must express resume intent, not a plain message: {effects:?}"
+        "the client does not classify `继续`; the runtime's structured intent does: {effects:?}"
     );
     assert!(
         !s.goal_mode_active,
-        "a resume is not a fresh goal turn; the runtime decides the profile"
+        "an ordinary message is not mirrored as a fresh goal turn"
     );
 }
 
 #[test]
-fn a_continuation_amendment_travels_with_the_resume_intent() {
+fn a_continuation_amendment_travels_verbatim_in_the_plain_message() {
     let mut s = opened();
     typed(&mut s, "继续，但是先不要跑测试");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::Submit { command: ClientCommand::ResumeTask { content, .. }, .. }]
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }]
                 if content == "继续，但是先不要跑测试"
         ),
-        "the runtime parses the amendment off the original text: {effects:?}"
+        "the user's words reach the runtime unchanged: {effects:?}"
     );
 }
 

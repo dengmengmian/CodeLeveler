@@ -212,12 +212,11 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     let attachments = std::mem::take(&mut state.pending_attachments);
     let shown = state.message_with_images(attachments.len(), &content);
     state.transcript.push_user_if_new(shown);
-    // Stage the turn's goal identity before it flips to Busy. A continuation
-    // phrase re-enters the goal already shown (and the runtime's own resume
-    // path); any other input opens a new one. A paused goal accepts the
-    // authorization forms the runtime itself honors ("确认，继续阶段 2，可以
-    // 吗？"), so the badge leaves the moment the user releases it.
-    let continuation = attachments.is_empty() && resumes_goal(state, &content);
+    // Stage the turn's goal identity before it flips to Busy. In Goal mode
+    // every turn belongs to the goal on screen; in Chat the runtime's own
+    // structured intent decides whether this message re-enters a goal, and the
+    // client projects that fact instead of guessing it from the text.
+    let continuation = attachments.is_empty() && resumes_goal(state);
     state.staged_goal = Some(crate::active_goal::StagedGoal {
         title: crate::active_goal::short_title(&content),
         objective: Some(content.clone()),
@@ -235,38 +234,26 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     submit_turn_input(state, command)
 }
 
-/// Whether this submitted text re-enters the goal already on screen.
+/// Whether this submitted text belongs to the goal already on screen.
 ///
-/// In Goal mode every turn is the goal's; in Chat, only an explicit
-/// continuation is — either the client's own phrase parser or, for a paused
-/// goal, the authorization forms the runtime honors when it routes the same
-/// text to its resume path.
-fn resumes_goal(state: &AppState, content: &str) -> bool {
+/// Only the session's collaboration axis answers that on the client: in Goal
+/// mode every turn is the goal's. In Chat, whether an ordinary message
+/// continues a goal is the model's reading, declared through the runtime's
+/// structured intent tool; the client never classifies the user's words.
+fn resumes_goal(state: &AppState) -> bool {
     state.collaboration.eq_ignore_ascii_case("goal")
-        || leveler_client_protocol::parse_continuation(content).is_some()
-        || (crate::active_goal::paused_owed(state)
-            && leveler_lifecycle::authorizes_continuation(content))
 }
 
 /// The command a user's turn input becomes.
 ///
-/// A continuation phrase (`继续`, `继续，但是先不要跑测试`, `go on`, …) is sent as
-/// [`ClientCommand::ResumeTask`] so the runtime can re-enter the session's
-/// logical task through its resume path. The runtime remains the authority on
-/// whether a resumable task exists: when none does, it treats the same text as
-/// an ordinary message. Attachments stay ordinary messages — a continuation is
-/// text.
+/// An ordinary message stays [`ClientCommand::SubmitMessage`]. The runtime —
+/// not the client — decides whether the model's structured declaration makes it
+/// a continuation, so any language and phrasing takes the same path.
 fn turn_input_command(
     state: &AppState,
     content: String,
     attachments: Vec<leveler_client_protocol::AttachmentRef>,
 ) -> ClientCommand {
-    if attachments.is_empty() && leveler_client_protocol::parse_continuation(&content).is_some() {
-        return ClientCommand::ResumeTask {
-            session_id: state.session_id.clone(),
-            content,
-        };
-    }
     ClientCommand::SubmitMessage {
         session_id: state.session_id.clone(),
         content,
@@ -303,7 +290,7 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
     } else {
         // The runtime announces an admitted turn's message itself
         // (`UserMessageAdded`); only the optimistic Busy is ours to set.
-        let continuation = resumes_goal(state, &content);
+        let continuation = resumes_goal(state);
         state.staged_goal = Some(crate::active_goal::StagedGoal {
             title: crate::active_goal::short_title(&content),
             objective: Some(content.clone()),

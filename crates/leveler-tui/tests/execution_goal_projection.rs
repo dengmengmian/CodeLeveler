@@ -47,6 +47,15 @@ fn paused_goal(objective: &str) -> UiExecutionTask {
     }
 }
 
+fn running_goal(objective: &str) -> UiExecutionTask {
+    UiExecutionTask {
+        goal_id: "g-1".into(),
+        objective: objective.into(),
+        running: true,
+        user_paused: false,
+    }
+}
+
 fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
     UiSessionSnapshot {
         history: None,
@@ -182,10 +191,12 @@ fn an_ordinary_question_does_not_drop_a_paused_chat_goal() {
     );
 }
 
-/// The user's own continuation is what releases the pause, and it re-enters
-/// the same goal rather than opening a new one.
+/// No user text — however clearly it reads — releases a pause on the client.
+/// The message goes out as an ordinary submission; the runtime's projection of
+/// the goal (after the model declares the continuation) is what clears the
+/// badge.
 #[test]
-fn an_authorized_continuation_resumes_the_same_goal() {
+fn an_authorized_continuation_releases_the_pause_on_the_runtimes_projection() {
     let mut state = state();
     reduce(
         &mut state,
@@ -203,30 +214,47 @@ fn an_authorized_continuation_resumes_the_same_goal() {
         matches!(
             &effects[..],
             [Effect::Submit {
-                command: ClientCommand::ResumeTask { .. },
+                command: ClientCommand::SubmitMessage { .. },
                 ..
             }]
         ),
-        "an explicit continuation re-enters the goal: {effects:?}"
+        "the client submits the message; it does not classify it: {effects:?}"
+    );
+    let phase = state.active_goal.as_ref().map(|goal| goal.phase());
+    assert_eq!(
+        phase,
+        Some(GoalPhase::Paused),
+        "the pause is durable truth; the client cannot read the user's words as its release"
+    );
+    assert!(
+        header(&state).contains("已暂停"),
+        "the paused badge stays until the runtime publishes the change: {}",
+        header(&state)
+    );
+
+    // The runtime projected the declaration: the same goal is running now.
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionUpdated {
+            session: snapshot("running", Some(running_goal("实现数据导出，阶段 1 后暂停"))),
+        }),
     );
     let phase = state.active_goal.as_ref().map(|goal| goal.phase());
     assert!(
-        matches!(phase, Some(GoalPhase::Resuming | GoalPhase::Running)),
+        matches!(phase, Some(GoalPhase::Running | GoalPhase::Resuming)),
         "the same goal resumes: {phase:?}"
     );
     assert!(
         !header(&state).contains("已暂停"),
-        "the pause badge is gone once the user authorized continuing: {}",
+        "the pause badge is gone once the runtime projects the release: {}",
         header(&state)
     );
 }
 
-/// The polite form is an authorization too. The runtime is what routes it (the
-/// client sends the message and the runtime's continuation reader resumes the
-/// paused goal), so the display must already treat it as the same goal
-/// resuming instead of showing a pause the user just released.
+/// The polite form takes the same path: one ordinary submission, no client-side
+/// reading, and the runtime's projection is what changes the display.
 #[test]
-fn a_polite_continuation_question_resumes_the_displayed_goal() {
+fn a_polite_continuation_is_routed_by_the_runtime_not_the_display() {
     let mut state = state();
     reduce(
         &mut state,
@@ -250,13 +278,26 @@ fn a_polite_continuation_question_resumes_the_displayed_goal() {
         "the runtime owns the routing decision: {effects:?}"
     );
     let phase = state.active_goal.as_ref().map(|goal| goal.phase());
+    assert_eq!(
+        phase,
+        Some(GoalPhase::Paused),
+        "a question form is not an authorization the display may infer"
+    );
+
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionUpdated {
+            session: snapshot("running", Some(running_goal("实现数据导出，阶段 1 后暂停"))),
+        }),
+    );
+    let phase = state.active_goal.as_ref().map(|goal| goal.phase());
     assert!(
-        matches!(phase, Some(GoalPhase::Resuming | GoalPhase::Running)),
+        matches!(phase, Some(GoalPhase::Running | GoalPhase::Resuming)),
         "the same goal resumes: {phase:?}"
     );
     assert!(
         !header(&state).contains("已暂停"),
-        "the pause badge is gone once the user authorized continuing: {}",
+        "the pause badge is gone once the runtime projects the release: {}",
         header(&state)
     );
 }

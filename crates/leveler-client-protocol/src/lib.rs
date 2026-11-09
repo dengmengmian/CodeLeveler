@@ -41,7 +41,6 @@ mod approval;
 mod client;
 mod command;
 mod command_envelope;
-mod continuation;
 mod contribution;
 mod event;
 mod failure;
@@ -78,7 +77,6 @@ pub use approval::{
 pub use client::{ClientError, InteractiveRuntimeClient};
 pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
-pub use continuation::{Continuation, parse_continuation};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
 pub use failure::{
     FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,

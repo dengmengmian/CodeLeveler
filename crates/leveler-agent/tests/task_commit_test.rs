@@ -2200,9 +2200,40 @@ fn stage_plan(status1: &'static str, status2: &'static str) -> Scripted {
         "update_plan",
         serde_json::json!({
             "plan": [
-                {"step": "阶段 1：创建 stage-1.txt 并验收", "status": status1},
-                {"step": "阶段 2：创建 stage-2.txt 并验收", "status": status2}
+                {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt 并验收", "status": status1},
+                {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt 并验收", "status": status2}
             ]
+        }),
+    )
+}
+
+/// The model's structured reading of the user's boundary: stop once the stage
+/// the user named is completed. The quote is verbatim from the objective; the
+/// boundary references the plan's stable step id, not its wording.
+fn declare_pause_after_stage_one() -> Scripted {
+    Scripted::Tool(
+        "declare_intent",
+        serde_json::json!({
+            "source_quote": "阶段 1 完成后停下，等待我确认再执行阶段 2",
+            "operations": [{
+                "kind": "set_pause_boundary",
+                "boundary": {
+                    "kind": "after_step",
+                    "step": {"step_id": "stage-1", "label": "阶段 1：创建 stage-1.txt 并验收"}
+                }
+            }]
+        }),
+    )
+}
+
+/// The model's reading of a user message that authorizes the withheld work.
+/// `quote` must occur verbatim in that message.
+fn declare_continue(quote: &'static str) -> Scripted {
+    Scripted::Tool(
+        "declare_intent",
+        serde_json::json!({
+            "source_quote": quote,
+            "operations": [{"kind": "continue_task"}]
         }),
     )
 }
@@ -2225,6 +2256,7 @@ fn pause_stage_one_script() -> Vec<Scripted> {
             staged_pause_objective(),
         ),
         stage_plan("in_progress", "pending"),
+        declare_pause_after_stage_one(),
         write_named("stage-1.txt"),
         Scripted::Tool("run_command", verifier_call()),
         stage_plan("completed", "pending"),
@@ -2265,8 +2297,8 @@ async fn a_goal_bound_pause_keeps_the_goal_open_and_unpressured() {
     );
     assert_eq!(
         fx.runtime.calls.load(Ordering::SeqCst),
-        6,
-        "the reached boundary buys NO extra model round"
+        7,
+        "the reached boundary buys NO extra model round: the seven calls are the script's own"
     );
     assert!(
         !events.iter().any(|event| matches!(
@@ -2555,9 +2587,190 @@ async fn a_status_question_after_a_pause_does_not_release_it() {
 }
 
 #[tokio::test]
+async fn a_declaration_that_quotes_an_older_message_is_refused() {
+    // The user's continuation is "确认，继续阶段 2". The model tries to
+    // authorize it by quoting the ORIGINAL objective — a real span of an older
+    // message. Provenance is per newest input: an older authorization cannot
+    // stand in for the message being read now.
+    let mut script = pause_stage_one_script();
+    script.extend([
+        Scripted::Tool(
+            "declare_intent",
+            serde_json::json!({
+                "source_quote": "阶段 1 完成后停下，等待我确认再执行阶段 2",
+                "operations": [{"kind": "continue_task"}]
+            }),
+        ),
+        Scripted::Text("没有得到新的继续授权，阶段 2 仍未执行。"),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+    let paused = goal_records(&fx).await;
+    let goal_id = paused[0].id.clone();
+    let requests_before = fx.runtime.requests.lock().unwrap().len();
+
+    let report = say(&fx, "确认，继续阶段 2，把剩余任务完成并验收。").await;
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Answered,
+        "the turn answers; it does not drive the goal: {report:?}"
+    );
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let refusal = requests[requests_before..]
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("does not occur in the user's newest message"))
+            .expect("the model sees the provenance refusal");
+        assert!(
+            refusal.contains("do not invent an instruction"),
+            "{refusal}"
+        );
+    }
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].id, goal_id);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "the older quote did not release the pause: {goals:?}"
+    );
+    assert!(
+        !fx.dir.path().join("stage-2.txt").exists(),
+        "no authority was created by the quote"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+#[tokio::test]
+async fn a_declaration_with_two_running_goals_must_name_one() {
+    // Two durable running goals. The model's declaration names neither, so the
+    // runtime refuses instead of guessing — the ids are the fix, not a phrase.
+    let first_pause = Scripted::Tool(
+        "declare_intent",
+        serde_json::json!({
+            "source_quote": "接入全部运营后台能力到 MCP",
+            "operations": [{"kind": "pause_task", "boundary": {"kind": "now"}}]
+        }),
+    );
+    let second_commit = Scripted::Tool(
+        "commit_task",
+        serde_json::json!({
+            "objective": "把清单剩下的部分做完",
+            "acceptance": ["stage-2.txt 存在"],
+            "task_relation": "new"
+        }),
+    );
+    let second_pause = Scripted::Tool(
+        "declare_intent",
+        serde_json::json!({
+            "source_quote": "把清单剩下的部分做完",
+            "operations": [{"kind": "pause_task", "boundary": {"kind": "now"}}]
+        }),
+    );
+    let fx = fixture(
+        vec![
+            Scripted::commit(),
+            first_pause,
+            Scripted::Text("已按你的要求暂停。"),
+            second_commit,
+            second_pause,
+            Scripted::Text("第二个任务也先停在这里。"),
+            Scripted::Tool(
+                "declare_intent",
+                serde_json::json!({
+                    "source_quote": "继续",
+                    "operations": [{"kind": "continue_task"}]
+                }),
+            ),
+            Scripted::Text("需要你说明要继续哪一个任务。"),
+        ],
+        false,
+    )
+    .await;
+    // Turn 1: the first goal, paused by declaration.
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: USER_REQUEST.into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Turn 2: an explicit independent task, paused too.
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec(&fx),
+            vec![ContentPart::Text {
+                text: "把清单剩下的部分做完".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let owed = goal_records(&fx).await;
+    assert_eq!(owed.len(), 2, "two independent running goals: {owed:?}");
+    assert!(
+        owed.iter()
+            .all(|goal| goal.state == leveler_storage::GoalState::Running)
+    );
+    let ids: Vec<String> = owed.iter().map(|goal| goal.id.to_string()).collect();
+
+    let _ = say(&fx, "继续").await;
+
+    let requests = fx.runtime.requests.lock().unwrap();
+    let refusal = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result.content.clone()),
+            _ => None,
+        })
+        .find(|content| content.contains("running goals") && content.contains("will not guess"))
+        .expect("the ambiguity refusal names the choice");
+    for id in &ids {
+        assert!(
+            refusal.contains(id),
+            "the refusal lists goal {id}: {refusal}"
+        );
+    }
+    drop(requests);
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        2,
+        "no goal was created or settled by the refusal"
+    );
+    assert_eq!(
+        goals
+            .iter()
+            .map(|goal| goal.id.to_string())
+            .collect::<Vec<_>>(),
+        ids,
+        "the same two goals"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+#[tokio::test]
 async fn an_explicit_continuation_resumes_the_paused_goal_and_verifies_it() {
     let mut script = pause_stage_one_script();
     script.extend([
+        declare_continue("继续阶段 2"),
         write_named("stage-2.txt"),
         Scripted::Tool("run_command", verifier_call()),
         stage_plan("completed", "completed"),
@@ -2638,6 +2851,72 @@ async fn an_explicit_continuation_resumes_the_paused_goal_and_verifies_it() {
             .iter()
             .any(|amendment| amendment.contains("继续阶段 2")),
         "the continuation is durable with its goal: {goals:?}"
+    );
+    assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// The same authorization in another language, with no shared keyword: the
+/// model reads it and quotes the user's own span. Nothing in the runtime has a
+/// vocabulary to match it against.
+#[tokio::test]
+async fn a_continuation_in_another_language_releases_the_same_pause() {
+    let mut script = pause_stage_one_script();
+    script.extend([
+        declare_continue("continue with stage 2"),
+        write_named("stage-2.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        stage_plan("completed", "completed"),
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "both stages delivered and verified",
+                "verification": {"status": "passed", "detail": verifier_label()},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done",
+                     "evidence": "created stage-1.txt"},
+                    {"requirement": "stage-2.txt", "status": "done",
+                     "evidence": "created stage-2.txt"},
+                    {"requirement": verifier_path(), "status": "done",
+                     "evidence": "ran the verifier"}
+                ]
+            }),
+        ),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    let staged = staged_pause_objective();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged),
+            vec![ContentPart::Text {
+                text: staged.into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        goal_records(&fx).await[0].user_paused_at.is_some(),
+        "the pause is the precondition"
+    );
+
+    let report = say(
+        &fx,
+        "Okay — continue with stage 2 and finish the remaining work.",
+    )
+    .await;
+
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Completed);
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert!(
+        goals[0].user_paused_at.is_none(),
+        "the English authorization released the pause: {goals:?}"
     );
     assert!(fx.dir.path().join("stage-2.txt").exists());
     std::fs::remove_dir_all(fx.dir.path()).ok();
@@ -2837,13 +3116,23 @@ async fn a_paused_goal_route_answers_a_query_then_continues_on_authorization() {
     let fx = fixture(
         vec![
             stage_plan("in_progress", "pending"),
+            declare_pause_after_stage_one(),
             write_named("stage-1.txt"),
             Scripted::Tool("run_command", verifier_call()),
             stage_plan("completed", "pending"),
             Scripted::Text("阶段 1 已完成并验收。按你的要求，阶段 2 等待你的确认。"),
-            // The query turn: an ordinary answer, not authorization.
+            // The query turn: the model reads it as a question, not
+            // authorization, and the runtime drives no withheld stage.
+            Scripted::Tool(
+                "declare_intent",
+                serde_json::json!({
+                    "source_quote": "刚才阶段 1 修改了哪些文件？测试通过了吗？",
+                    "operations": [{"kind": "answer_only"}]
+                }),
+            ),
             Scripted::Text("阶段 1 修改了 stage-1.txt；验收命令 sh ./verify.sh 退出码 0。"),
             // The authorization turn: the model continues for real.
+            declare_continue("继续阶段 2"),
             write_named("stage-2.txt"),
             Scripted::Tool("run_command", verifier_call()),
             stage_plan("completed", "completed"),
@@ -2916,8 +3205,8 @@ async fn a_paused_goal_route_answers_a_query_then_continues_on_authorization() {
     );
     assert_eq!(
         fx.runtime.calls.load(Ordering::SeqCst),
-        calls_after_pause + 1,
-        "a query buys exactly its own answer, no goal continuation"
+        calls_after_pause + 2,
+        "a query buys its declared reading and its own answer, no goal continuation"
     );
     assert!(
         !query_events.iter().any(|event| matches!(
@@ -2984,21 +3273,34 @@ async fn a_blocked_claim_at_the_user_boundary_is_a_pause_not_a_block() {
             Scripted::Tool(
                 "update_plan",
                 serde_json::json!({"plan": [
-                    {"step": "阶段 1：创建 stage-1.txt", "status": "in_progress"},
-                    {"step": "阶段 1：运行 sh ./verify.sh 确认", "status": "pending"},
+                    {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt", "status": "in_progress"},
+                    {"id": "stage-1-verify", "step": "阶段 1：运行 sh ./verify.sh 确认", "status": "pending"},
                     {"step": "阶段 1 完成后停下，等待用户确认后再继续", "status": "pending"},
-                    {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                    {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt", "status": "pending"}
                 ]}),
+            ),
+            Scripted::Tool(
+                "declare_intent",
+                serde_json::json!({
+                    "source_quote": "阶段 1 完成后停下，等待我确认再执行阶段 2",
+                    "operations": [{
+                        "kind": "set_pause_boundary",
+                        "boundary": {
+                            "kind": "after_step",
+                            "step": {"step_id": "stage-1-verify", "label": "阶段 1：运行 sh ./verify.sh 确认"}
+                        }
+                    }]
+                }),
             ),
             write_named("stage-1.txt"),
             Scripted::Tool("run_command", verifier_call()),
             Scripted::Tool(
                 "update_plan",
                 serde_json::json!({"plan": [
-                    {"step": "阶段 1：创建 stage-1.txt", "status": "completed"},
-                    {"step": "阶段 1：运行 sh ./verify.sh 确认", "status": "completed"},
+                    {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt", "status": "completed"},
+                    {"id": "stage-1-verify", "step": "阶段 1：运行 sh ./verify.sh 确认", "status": "completed"},
                     {"step": "阶段 1 完成后停下，等待用户确认后再继续", "status": "in_progress"},
-                    {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                    {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt", "status": "pending"}
                 ]}),
             ),
             Scripted::Tool(
@@ -3230,6 +3532,9 @@ async fn a_dynamic_requirement_needs_its_own_mechanical_evidence() {
     let mut script = pause_stage_one_script();
     script.push(Scripted::Text("补充要求已记下；阶段 2 仍等你确认。"));
     script.extend([
+        // The user's continuation releases the pause and continues the same
+        // goal; only a validated declaration can do that.
+        declare_continue("继续阶段 2"),
         // Stage 2 only: the supplement is still owed, and the model claims it
         // anyway. The runtime must refuse, not warn.
         write_named("stage-2.txt"),
@@ -3316,6 +3621,7 @@ async fn a_dynamic_requirement_needs_its_own_mechanical_evidence() {
 async fn an_authorized_window_is_not_cut_short_as_paused() {
     let mut script = pause_stage_one_script();
     script.extend([
+        declare_continue("继续阶段 2"),
         write_named("stage-2.txt"),
         Scripted::Tool("run_command", verifier_call()),
         stage_plan("completed", "completed"),

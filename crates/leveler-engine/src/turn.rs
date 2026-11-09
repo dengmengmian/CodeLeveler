@@ -672,26 +672,7 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
                 .await
                 .map_err(binder_ownership_error)?;
         }
-        // The running turn's lineage is what a resume or blocked-retry reads
-        // to return to THIS goal. Bind it BEFORE consuming the declaration: a
-        // crash between the two then leaves the declaration recoverable, and
-        // the next turn reuses the running goal.
-        self.stores
-            .turns
-            .bind_goal(&self.token, &self.turn_id, &goal)
-            .await
-            .map_err(binder_ownership_error)?;
-        // The window's spend moves with the work. Calls this turn made before
-        // the declaration were recorded under the turn's own budget scope;
-        // the goal now owns the turn, so its cap must own them too. This is a
-        // move (no duplicate row), and recovery repeats it idempotently.
-        if self.turn_budget_scope != goal.as_str() {
-            self.stores
-                .model_requests
-                .reassign_budget_scope(&self.session_id, &self.turn_budget_scope, goal.as_str())
-                .await
-                .map_err(binder_store_error)?;
-        }
+        self.attach(&goal).await?;
         if pending.is_some() {
             self.stores
                 .sessions
@@ -699,10 +680,6 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
                 .await
                 .map_err(binder_store_error)?;
         }
-        *self
-            .bound
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(goal.clone());
         Ok(goal)
     }
 
@@ -729,11 +706,100 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             )));
         };
         Ok(Some(crate::ports::GoalScope {
+            goal_id: record.id,
             objective: record.objective,
             acceptance: record.acceptance,
             amendments: record.amendments,
             user_paused_at: record.user_paused_at,
+            pause_boundary: record.pause_boundary,
         }))
+    }
+
+    async fn adopt(&self, goal: &GoalId) -> Result<(), PortError> {
+        if let Some(bound) = self
+            .bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return if &bound == goal {
+                Ok(())
+            } else {
+                Err(PortError::Persistence(format!(
+                    "this turn already serves goal {bound}; it cannot also adopt {goal}. \
+                     Finish or resolve the current goal before acting on another one."
+                )))
+            };
+        }
+        let Some(record) = self
+            .stores
+            .goals
+            .get(goal)
+            .await
+            .map_err(binder_store_error)?
+        else {
+            return Err(PortError::Persistence(format!(
+                "goal {goal} does not exist; an intent declaration cannot create one. \
+                 Call commit_task to start a task."
+            )));
+        };
+        if record.task_id != self.token.task_id {
+            return Err(PortError::StaleOwnership(format!(
+                "goal {goal} belongs to another task"
+            )));
+        }
+        if record.state != leveler_storage::GoalState::Running {
+            return Err(PortError::Persistence(format!(
+                "goal {goal} is settled; a settled goal accepts no continuation. \
+                 Call commit_task if the user asked for new work."
+            )));
+        }
+        self.attach(goal).await
+    }
+
+    async fn running_goals(&self) -> Result<Vec<crate::ports::GoalScope>, PortError> {
+        let records = self
+            .stores
+            .goals
+            .for_task(&self.token.task_id)
+            .await
+            .map_err(binder_store_error)?;
+        Ok(records
+            .into_iter()
+            .filter(|record| record.state == leveler_storage::GoalState::Running)
+            .map(|record| crate::ports::GoalScope {
+                goal_id: record.id,
+                objective: record.objective,
+                acceptance: record.acceptance,
+                amendments: record.amendments,
+                user_paused_at: record.user_paused_at,
+                pause_boundary: record.pause_boundary,
+            })
+            .collect())
+    }
+
+    async fn record_intent(
+        &self,
+        declaration: &leveler_lifecycle::UserIntentDeclaration,
+        projection: &leveler_lifecycle::IntentProjection,
+    ) -> Result<(), PortError> {
+        let Some(goal_id) = self.bound() else {
+            return Err(PortError::Persistence(
+                "no goal is bound to this turn; an intent declaration needs a target".to_string(),
+            ));
+        };
+        self.stores
+            .goals
+            .record_intent(
+                &self.token,
+                &goal_id,
+                &self.turn_id,
+                declaration,
+                projection,
+                leveler_core::now(),
+            )
+            .await
+            .map_err(binder_ownership_error)
     }
 
     async fn append_amendment(&self, amendment: &str) -> Result<(), PortError> {
@@ -754,6 +820,34 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             .clear_pending_goal(&self.session_id, declaration)
             .await
             .map_err(binder_store_error)?;
+        Ok(())
+    }
+}
+
+impl TurnGoalBinder {
+    /// Make `goal` the durable goal of this running turn.
+    ///
+    /// The turn's lineage is what a resume or blocked-retry reads to return to
+    /// THIS goal, so it is written before the in-memory binding. Budget rows
+    /// already spent by this window move to the goal: the goal owns the work
+    /// now, and a cap that did not own its spend would be a second ledger.
+    async fn attach(&self, goal: &GoalId) -> Result<(), PortError> {
+        self.stores
+            .turns
+            .bind_goal(&self.token, &self.turn_id, goal)
+            .await
+            .map_err(binder_ownership_error)?;
+        if self.turn_budget_scope != goal.as_str() {
+            self.stores
+                .model_requests
+                .reassign_budget_scope(&self.session_id, &self.turn_budget_scope, goal.as_str())
+                .await
+                .map_err(binder_store_error)?;
+        }
+        *self
+            .bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(goal.clone());
         Ok(())
     }
 }

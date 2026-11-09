@@ -52,6 +52,7 @@ mod plan;
 mod progress;
 pub mod runtime;
 mod user_boundary;
+mod user_intent;
 pub mod workflow;
 
 pub use axes::CollaborationMode;
@@ -67,6 +68,11 @@ pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 pub use user_boundary::{
     AuthorizationSignal, UserPauseBoundary, authorizes_continuation, effective_user_pause,
     extract_user_pause, latest_authorization_signal, pause_in_force, user_pause_reached,
+};
+pub use user_intent::{
+    INTENT_OPERATIONS_MAX, INTENT_SOURCE_QUOTE_MAX_CHARS, IntentError, IntentProjection,
+    PauseBoundary, StageRef, UserIntentDeclaration, UserIntentOperation, project_intent,
+    quote_is_in_input,
 };
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
