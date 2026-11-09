@@ -32,15 +32,15 @@ use super::{
     Executor, ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
-use crate::executor::goal_scope;
+use crate::executor::scope_gate;
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL, DECLARE_INTENT_TOOL,
-    GET_GOAL_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
-    REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
-    advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
-    commit_task_tool_definition, declare_intent_tool_definition, escalation_action,
-    escalation_missing_axis_message, get_goal_scope_tool_definition, is_escalatable_tool,
-    is_user_input_tool, parse_escalation, parse_permission_request,
+    DECLARE_SCOPE_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope, PermissionRequestOutcome,
+    REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
+    UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
+    commit_task_tool_definition, declare_intent_tool_definition, declare_scope_tool_definition,
+    escalation_action, escalation_missing_axis_message, get_goal_scope_tool_definition,
+    is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
     permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
@@ -88,20 +88,6 @@ struct BackgroundChild {
 /// A dropped future cannot prove its background processes are gone. Scope
 /// release belongs to the explicit asynchronous settlement path.
 #[derive(Default)]
-/// One refused `commit_task` declaration, kept only to answer a repetition.
-///
-/// Identity is the pair the model sent (objective text plus acceptance list);
-/// a changed declaration is a different attempt and resets the counter. The
-/// uncovered count is stored because the closeout quotes it back when the model
-/// goes quiet after the refusal — the user's request never became a goal, and
-/// the turn must not end as if the refusal had settled it.
-struct CommitRefusal {
-    objective: String,
-    acceptance: Vec<String>,
-    repeats: u32,
-    uncovered: usize,
-}
-
 struct BackgroundChildren {
     children: Vec<BackgroundChild>,
 }
@@ -284,22 +270,23 @@ pub(crate) struct Drive<'a> {
     /// returned unchanged. Set to the gate's own message when the bound is
     /// reached, so the round can stop after its results are durable.
     repeated_gate_refusal: Option<(String, u32)>,
-    /// The last acceptance-scope refusal text this drive returned.
+    /// The last acceptance-scope refusal text this drive returned and how many
+    /// times in a row it was returned unchanged.
     ///
     /// Kept apart from [`Self::repeated_gate_refusal`] on purpose: that slot is
     /// shared with the verification gate, which clears it on a pass, so reading
     /// it here made every requirements refusal look new.
-    requirements_refusal: Option<String>,
-    /// The last `commit_task` scope refusal. A deterministic refusal changes
-    /// nothing when retried with the same objective and acceptance, so the
-    /// model is told it is repeating itself instead of being left to guess.
-    commit_refusal: Option<CommitRefusal>,
-    /// How many of the user's deliverables the LAST refused declaration left
-    /// uncovered, remembered past the closeout that answers it. A Chat turn
-    /// that ends after such a refusal did not deliver a verified task: the
-    /// report says so instead of letting an `Answered` turn be read as a
-    /// completed user request.
-    registration_refused: Option<usize>,
+    requirements_refusal: Option<(String, u32)>,
+    /// Whether the LAST commit_task declaration was refused, remembered past
+    /// the closeout that answers it. A Chat turn that ends after such a refusal
+    /// did not deliver a verified task: the report says so instead of letting
+    /// an `Answered` turn be read as a completed user request.
+    registration_refused: bool,
+    /// Whether the continuation for [`Self::registration_refused`] was already
+    /// stated. The refusal is delivered once; a later quiet round after real
+    /// work must not repeat the same pressure, while the terminal warning still
+    /// reports the original fact.
+    registration_nudged: bool,
     /// Facts the terminal must carry even though the Goal resolved: accepted
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
@@ -684,14 +671,20 @@ impl Executor {
         // The scope the Gate will enforce is readable BEFORE registration too:
         // a refusal is only actionable if the model can read the whole set it
         // must cover, and the commit-time refusal list is not the only entry
-        // point. Both readings come from one extraction (see the handler).
-        if self.goal_mode()
-            || self
-                .goal_binder()
-                .is_some_and(|binder| binder.bound().is_some())
-            || chat_can_declare_task
-        {
+        // point. Both readings come from the recorded declaration (see the
+        // handler), never from re-reading the user's prose.
+        let bound = self
+            .goal_binder()
+            .is_some_and(|binder| binder.bound().is_some());
+        if self.goal_mode() || bound || chat_can_declare_task {
             tools.push(get_goal_scope_tool_definition());
+        }
+        // Changing a bound goal's requirement set is a declared operation
+        // anchored to the newest user message. A Chat turn that has not bound a
+        // goal has no scope to change yet: its declaration belongs to
+        // commit_task.
+        if self.depth == 0 && !self.tool_context.policy.read_only && (self.goal_mode() || bound) {
+            tools.push(declare_scope_tool_definition());
         }
         tools
     }
@@ -1014,8 +1007,8 @@ impl Executor {
             preserve_running_epoch,
             repeated_gate_refusal: None,
             requirements_refusal: None,
-            commit_refusal: None,
-            registration_refused: None,
+            registration_refused: false,
+            registration_nudged: false,
             completion_warnings: Vec::new(),
             settled_goal: None,
             settled_rounds: 0,
@@ -1966,25 +1959,6 @@ impl<'a> Drive<'a> {
     }
 }
 
-/// Whether a mid-turn user message belongs in the goal's durable scope.
-///
-/// A Goal window records constraints and prohibitions (`is_goal_instruction`);
-/// a Chat window only records a change to the DELIVERABLE set
-/// (`is_chat_goal_instruction`). Either way a status question is neither and is
-/// delivered to the model without polluting the acceptance contract.
-fn steer_joins_goal_scope(
-    goal_mode: bool,
-    objective: &str,
-    amendments: &[String],
-    text: &str,
-) -> bool {
-    if goal_mode {
-        crate::executor::goal_scope::is_goal_instruction(objective, amendments, text)
-    } else {
-        crate::executor::goal_scope::is_chat_goal_instruction(objective, amendments, text)
-    }
-}
-
 /// One deferred parallel-safe call, carrying the admitted proof so the host
 /// pipeline cannot be bypassed by the batch runner.
 struct ParallelJob {
@@ -2263,6 +2237,52 @@ impl Drive<'_> {
             );
         }
         Ok(receipt)
+    }
+
+    /// Apply one `declare_scope` call.
+    ///
+    /// Mechanical checks only: every operation quotes the newest user input,
+    /// the target is the goal bound to this turn, and the sequence is legal
+    /// over the recorded requirement history. The model supplies the reading;
+    /// the runtime supplies identity, order and durability.
+    async fn apply_scope_change(&mut self, call: &ToolCall) -> Result<String, IntentCall> {
+        use leveler_lifecycle::{ScopeDeclaration, quote_is_in_input};
+
+        let Some(binder) = self.executor.goal_binder().cloned() else {
+            return Err(IntentCall::Refused(
+                "declare_scope is unavailable here: this execution has no durable goal store."
+                    .to_string(),
+            ));
+        };
+        if binder.bound().is_none() {
+            return Err(IntentCall::Refused(
+                "declare_scope needs a goal bound to this turn. When the work should be carried \
+                 to completion, call commit_task and declare the requirements there."
+                    .to_string(),
+            ));
+        }
+        let declaration: ScopeDeclaration = serde_json::from_value(call.arguments.clone())
+            .map_err(|error| {
+                IntentCall::Refused(format!(
+                    "declare_scope is not a valid declaration: {error}. Each operation needs \
+                     `op`, `source_quote`, and the fields its op requires."
+                ))
+            })?;
+        for operation in &declaration.operations {
+            let quote = operation.source_quote().trim();
+            if !quote_is_in_input(quote, &self.latest_user_input) {
+                return Err(IntentCall::Refused(format!(
+                    "the scope operation quotes text that is not in the newest user message. \
+                     Newest user message: \"{}\"",
+                    leveler_core::truncate_head_bytes(&self.latest_user_input, 400, "…")
+                )));
+            }
+        }
+        match binder.record_scope(&declaration).await {
+            Ok(projection) => Ok(scope_receipt_text(&projection)),
+            Err(leveler_engine::PortError::Invalid(message)) => Err(IntentCall::Refused(message)),
+            Err(error) => Err(intent_fatal(error)),
+        }
     }
 
     /// Drop the "you can enable this" hint once nothing it mentions is still
@@ -2789,7 +2809,7 @@ async fn retained_facts_after_fold(
 ) -> Option<leveler_model::Message> {
     const MARKER: &str = "## Retained execution facts";
     const MAX: usize = 3_500;
-    let scope = match binder {
+    let scope = match binder.as_ref() {
         Some(binder) => binder.scope().await.ok().flatten(),
         None => None,
     };
@@ -2797,10 +2817,10 @@ async fn retained_facts_after_fold(
         .as_ref()
         .map(|scope| scope.objective.clone())
         .unwrap_or(objective);
-    let requirements = scope
-        .as_ref()
-        .map(|scope| goal_scope::extract(&scope.objective, &scope.amendments))
-        .unwrap_or_default();
+    let requirements = match binder.as_ref() {
+        Some(binder) => binder.requirements().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
     let mut text = format!("{MARKER} (deterministic, not the model summary)\n");
     if !objective.trim().is_empty() {
         text.push_str(&format!(
@@ -2808,9 +2828,11 @@ async fn retained_facts_after_fold(
             objective.chars().take(400).collect::<String>()
         ));
     }
-    if !requirements.is_empty() {
-        text.push_str("Effective acceptance (the Gate uses exactly this set):\n");
-        for requirement in requirements.iter().take(8) {
+    let owed: Vec<&leveler_lifecycle::RequirementItem> =
+        requirements.iter().filter(|item| item.is_owed()).collect();
+    if !owed.is_empty() {
+        text.push_str("Recorded user requirements (the Gate uses exactly this set):\n");
+        for requirement in owed.iter().take(8) {
             text.push_str(&format!(
                 "- {} [{}] {}\n",
                 requirement.id,
@@ -2818,10 +2840,10 @@ async fn retained_facts_after_fold(
                 requirement.text.chars().take(200).collect::<String>()
             ));
         }
-        if requirements.len() > 8 {
+        if owed.len() > 8 {
             text.push_str(&format!(
-                "…and {} more effective requirements the Gate still enforces; call get_goal_scope to read them.\n",
-                requirements.len() - 8
+                "…and {} more recorded requirements the Gate still enforces; call get_goal_scope to read them.\n",
+                owed.len() - 8
             ));
         }
     }
@@ -3096,7 +3118,7 @@ impl AgentHarness for Drive<'_> {
                     binder.append_amendment(&declaration).await?;
                     binder.discard_declaration(&declaration).await?;
                 } else {
-                    binder.bind(&declaration, &[], None).await?;
+                    binder.bind(&declaration, &[], &[], None).await?;
                 }
             }
             let tools = self.executor.request_tool_definitions();
@@ -3149,22 +3171,13 @@ impl AgentHarness for Drive<'_> {
                         self.sink.append(std::slice::from_ref(&message)).await?;
                     }
                 }
-                // A user message during an active goal is user authority over
-                // the scope (it may narrow or add a requirement), but not every
-                // message is a scope change. A status question, a consultation,
-                // or an acknowledgment must reach the model without becoming a
-                // durable requirement the completion gate later enforces.
+                // A user message during a running goal is recorded verbatim
+                // as a user instruction. It does not change the requirement
+                // set by itself: that authority belongs to the model's
+                // `declare_scope` declaration and its verbatim quote, so no
+                // keyword reading decides whether the words became scope.
                 if let Some(binder) = self.executor.goal_binder() {
-                    let joins = match binder.scope().await? {
-                        Some(scope) => steer_joins_goal_scope(
-                            self.executor.goal_mode(),
-                            &scope.objective,
-                            &scope.amendments,
-                            text,
-                        ),
-                        None => false,
-                    };
-                    if joins {
+                    if binder.bound().is_some() {
                         binder.append_amendment(text).await?;
                     }
                 }
@@ -3585,16 +3598,6 @@ impl AgentHarness for Drive<'_> {
             } else {
                 Vec::new()
             };
-            let refused_registration_gaps = if self.executor.goal_mode() {
-                // A goal turn is bound to the goal lifecycle; the refused
-                // declaration is already answered by the goal closeout.
-                0
-            } else {
-                self.commit_refusal
-                    .as_ref()
-                    .map(|refusal| refusal.uncovered)
-                    .unwrap_or(0)
-            };
             // The durable pause state and the declared boundary, both
             // structured. `answer_only` is this window's own reading: the
             // model declared the user asked a question, so the goal is not
@@ -3615,7 +3618,7 @@ impl AgentHarness for Drive<'_> {
                     .progress
                     .should_hard_stop_no_progress(self.progress_caps),
                 open_plan_steps: open_plan_steps.len(),
-                refused_registration_gaps,
+                registration_refused: self.registration_refused && !self.registration_nudged,
                 user_pause_reached,
                 goal_user_paused,
             });
@@ -3675,7 +3678,7 @@ impl AgentHarness for Drive<'_> {
                     kind: AdvisoryKind::CloseoutNudge(CloseoutReason::PlanUnresolved),
                 });
                 let nudge = Message::user(
-                    plan_unresolved_nudge(&open_plan_steps, refused_registration_gaps),
+                    plan_unresolved_nudge(&open_plan_steps),
                     TranscriptOrigin::ProtocolRepair {
                         repair: ProtocolRepairKind::PlanUnresolved,
                     },
@@ -3699,23 +3702,17 @@ impl AgentHarness for Drive<'_> {
                 // harness refused the declaration for missing acceptance
                 // coverage. That refusal settled the CONTRACT, not the user's
                 // request: the turn may not end as though the work were done.
+                self.registration_nudged = true;
                 self.progress.note_no_progress_round(model_steps);
                 self.emit_progress();
                 (self.observer)(AgentEvent::AdvisoryStarted {
                     kind: AdvisoryKind::CloseoutNudge(CloseoutReason::TaskUnregistered),
                 });
-                let uncovered = self
-                    .commit_refusal
-                    .as_ref()
-                    .map(|refusal| refusal.uncovered)
-                    .unwrap_or(0);
                 // State it ONCE. The harness has said the only thing it knows;
                 // repeating it on the next quiet round is pressure, not
                 // information, and the model's next declaration is a fresh
-                // attempt that needs its own comparison.
-                self.commit_refusal = None;
                 let nudge = Message::user(
-                    task_unregistered_nudge(uncovered),
+                    task_unregistered_nudge(),
                     TranscriptOrigin::ProtocolRepair {
                         repair: ProtocolRepairKind::TaskRegistrationRefused,
                     },
@@ -3745,7 +3742,7 @@ impl AgentHarness for Drive<'_> {
                         },
                     ),
                     CloseoutReason::PlanUnresolved => Message::user(
-                        plan_unresolved_nudge(&open_plan_steps, refused_registration_gaps),
+                        plan_unresolved_nudge(&open_plan_steps),
                         TranscriptOrigin::ProtocolRepair {
                             repair: ProtocolRepairKind::PlanUnresolved,
                         },
@@ -3754,12 +3751,7 @@ impl AgentHarness for Drive<'_> {
                     // repair, so this arm is unreachable through `decide`.
                     // The text is the same fact the continuation states.
                     CloseoutReason::TaskUnregistered => Message::user(
-                        task_unregistered_nudge(
-                            self.commit_refusal
-                                .as_ref()
-                                .map(|refusal| refusal.uncovered)
-                                .unwrap_or(0),
-                        ),
+                        task_unregistered_nudge(),
                         TranscriptOrigin::ProtocolRepair {
                             repair: ProtocolRepairKind::TaskRegistrationRefused,
                         },
@@ -3893,15 +3885,15 @@ impl AgentHarness for Drive<'_> {
             // terminal must carry the fact so the answer is not read as
             // acceptance of the user's request.
             if !self.executor.goal_mode()
-                && self.registration_refused.is_some()
+                && self.registration_refused
                 && matches!(outcome.stop_reason, StopReason::Answered)
             {
-                outcome.completion_warnings.push(format!(
+                outcome.completion_warnings.push(
                     "no execution task was registered: a commit_task declaration was refused \
-                     because {} of the user's explicitly named deliverables had no acceptance \
-                     check. This turn ended with an answer, not with a verified delivery.",
-                    self.registration_refused.unwrap_or(0)
-                ));
+                     (its tool result names the reason). This turn ended with an answer, not \
+                     with a verified delivery."
+                        .to_string(),
+                );
             }
             return Ok(Flow::Stop(outcome));
         }
@@ -4269,6 +4261,11 @@ impl AgentHarness for Drive<'_> {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(20)
                     .clamp(1, 50) as usize;
+                let include_history = call
+                    .arguments
+                    .get("history")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 (self.observer)(AgentEvent::ToolCall {
                     id: call.id.as_str().to_string(),
                     name: GET_GOAL_SCOPE_TOOL.to_string(),
@@ -4276,35 +4273,41 @@ impl AgentHarness for Drive<'_> {
                     parallel: true,
                     model_step: Some(model_steps),
                 });
-                let durable = match self.executor.goal_binder() {
-                    Some(binder) => binder.scope().await?,
-                    None => None,
-                };
-                let (content, is_error) = match durable {
-                    Some(scope) => {
-                        let requirements = goal_scope::extract(&scope.objective, &scope.amendments);
-                        let text = scope_page_text(&requirements, offset, limit, false);
-                        let (text, _) = leveler_core::sanitize_model_visible(&text);
-                        (text, false)
-                    }
-                    // Before registration the only authoritative scope is this
-                    // turn's own user text — the same input `commit_task`
-                    // projects. Reading it is how the model can see every
-                    // deliverable the acceptance list must cover before it
-                    // writes that list, instead of discovering the gaps one
-                    // refusal at a time.
-                    None if !self.executor.goal_mode()
-                        && !self.objective.text().trim().is_empty() =>
-                    {
-                        let requirements =
-                            goal_scope::extract(self.objective.text(), &self.objective.amendments);
-                        let text = scope_page_text(&requirements, offset, limit, true);
-                        let (text, _) = leveler_core::sanitize_model_visible(&text);
-                        (text, false)
-                    }
+                let binder = self.executor.goal_binder().cloned();
+                let (content, is_error) = match binder {
+                    Some(binder) => match binder.scope().await? {
+                        Some(scope) => {
+                            let items = binder.requirements().await?;
+                            let history = if include_history {
+                                binder.requirement_history().await?
+                            } else {
+                                Vec::new()
+                            };
+                            let text = structured_scope_text(
+                                &scope.objective,
+                                &scope.acceptance,
+                                &items,
+                                &history,
+                                scope.user_paused_at.is_some(),
+                                offset,
+                                limit,
+                            );
+                            let (text, _) = leveler_core::sanitize_model_visible(&text);
+                            (text, false)
+                        }
+                        None => (
+                            "No committed goal exists for this turn. The runtime does not \
+                             extract requirements from prose: when the work should be carried \
+                             to completion, call commit_task and declare each requirement with \
+                             its `kind`, `text` and a verbatim `source_quote` from the user's \
+                             message."
+                                .to_string(),
+                            false,
+                        ),
+                    },
                     None => (
-                        "No committed goal exists for this turn, and there is no user text to \
-                         preview."
+                        "This execution has no durable goal store, so there is no goal scope to \
+                         read."
                             .to_string(),
                         true,
                     ),
@@ -4315,6 +4318,42 @@ impl AgentHarness for Drive<'_> {
                     execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: GET_GOAL_SCOPE_TOOL.to_string(),
+                    is_error,
+                    preview: preview(&content),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content,
+                        is_error,
+                    },
+                });
+                continue;
+            }
+            // A bound goal's requirement set changes only through this
+            // structured declaration. The model supplies the reading and a
+            // verbatim quote; the runtime validates identity, transition
+            // legality and order over the durable history.
+            if call.name == DECLARE_SCOPE_TOOL {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: DECLARE_SCOPE_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
+                let (content, is_error) = match self.apply_scope_change(&call).await {
+                    Ok(receipt) => (receipt, false),
+                    Err(IntentCall::Refused(message)) => (message, true),
+                    Err(IntentCall::Fatal(error)) => return Err(error),
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: DECLARE_SCOPE_TOOL.to_string(),
                     is_error,
                     preview: preview(&content),
                     applied_diff: None,
@@ -4347,200 +4386,164 @@ impl AgentHarness for Drive<'_> {
                     match parse_commit_declaration(&call.arguments, self.objective.text()) {
                         Ok(declaration) => {
                             // The durable objective is the user's own request, not the
-                            // model's restatement. A model cannot narrow the task by
-                            // declaring a smaller objective; its `acceptance` checks
-                            // are the part it owns — but they must still cover every
-                            // deliverable the user explicitly enumerated.
+                            // model's restatement. Its structured requirements are
+                            // declarations anchored to quoted user spans: the runtime
+                            // checks that each quote exists and that identity and order
+                            // are legal, never what the words mean.
                             let goal_objective = declaration.objective;
                             let acceptance = declaration.acceptance;
                             let relation = declaration.relation;
-                            let requirements =
-                                goal_scope::extract(&goal_objective, &self.objective.amendments);
-                            let uncovered = goal_scope::uncovered(&requirements, &acceptance);
-                            if !uncovered.is_empty() {
-                                let repeats = match &self.commit_refusal {
-                                    Some(previous)
-                                        if previous.objective == goal_objective
-                                            && previous.acceptance == acceptance =>
+                            let seeds = declaration.requirements;
+                            match self.executor.goal_binder().cloned() {
+                                Some(binder) => {
+                                    match binder
+                                        .bind(&goal_objective, &acceptance, &seeds, relation)
+                                        .await
                                     {
-                                        previous.repeats.saturating_add(1)
-                                    }
-                                    _ => 1,
-                                };
-                                self.registration_refused = Some(uncovered.len());
-                                self.commit_refusal = Some(CommitRefusal {
-                                    objective: goal_objective.clone(),
-                                    acceptance: acceptance.clone(),
-                                    repeats,
-                                    uncovered: uncovered.len(),
-                                });
-                                // Structured refusal: the model needs to know WHAT is
-                                // uncovered and HOW to fix it. The list is complete,
-                                // not a sample: a missing item the model never sees is
-                                // a condition it cannot satisfy.
-                                let deliverables = requirements
-                                    .iter()
-                                    .filter(|requirement| requirement.kind.is_deliverable())
-                                    .count();
-                                let mut detail = format!(
-                                    "commit_task refused [acceptance_missing_deliverables]: {} of {} \
-                                     explicit user deliverables have no covering `acceptance` check.\n",
-                                    uncovered.len(),
-                                    deliverables
-                                );
-                                for text in &uncovered {
-                                    match requirements
-                                        .iter()
-                                        .find(|requirement| requirement.text == *text)
-                                    {
-                                        Some(requirement) => detail.push_str(&format!(
-                                            "- {} [{}] {}\n",
-                                            requirement.id,
-                                            requirement.kind.label(),
-                                            requirement.text
-                                        )),
-                                        None => detail.push_str(&format!("- {text}\n")),
-                                    }
-                                }
-                                detail.push_str(
-                                    "Fix: add one concrete `acceptance` check per item above, quoting \
-                                     the deliverable's own words. One check may name several related \
-                                     deliverables. Do not drop or reword the user's deliverables to make \
-                                     them match the checks you already have — the refusal conditions are \
-                                     the user's text, not the plan. Prohibitions (`forbidden`) never need \
-                                     an acceptance check.",
-                                );
-                                if acceptance.len() == COMMIT_ACCEPTANCE_MAX_ITEMS {
-                                    detail.push_str(&format!(
-                                        "\nThe acceptance array is already at its \
-                                         {COMMIT_ACCEPTANCE_MAX_ITEMS}-item limit: merge related \
-                                         deliverables into one check instead of dropping any."
-                                    ));
-                                }
-                                detail.push_str(
-                                    "\nContinuing without a committed task leaves this work \
-                                     unregistered: the turn's answer does not prove completion and \
-                                     cannot be reported as verified. `update_plan` records intended \
-                                     steps only; it does not register the task or replace the \
-                                     acceptance contract.",
-                                );
-                                if repeats > 1 {
-                                    detail.push_str(&format!(
-                                        "\nThis is refusal #{repeats} for the identical objective and \
-                                         acceptance: the conditions have not changed, so repeating the \
-                                         same call cannot succeed. Either add the missing checks or \
-                                         continue the work without committing, but do not present an \
-                                         unregistered answer as a verified delivery."
-                                    ));
-                                }
-                                (self.observer)(AgentEvent::GoalIntercepted {
-                                    kind: COMMIT_REFUSED_KIND.to_string(),
-                                    detail: detail.clone(),
-                                });
-                                (false, detail)
-                            } else {
-                                match self.executor.goal_binder().cloned() {
-                                    Some(binder) => {
-                                        match binder.bind(&goal_objective, &acceptance, relation).await {
-                                            Ok(goal) => {
-                                                self.commit_refusal = None;
-                                                self.registration_refused = None;
-                                                // The committed window carries the goal
-                                                // contract from the next request on.
-                                                self.tools = self.executor.request_tool_definitions();
-                                                // Report the DURABLE scope, not the
-                                                // model's restatement. When this turn
-                                                // joined a goal the task already owed,
-                                                // that goal's objective and acceptance
-                                                // are what the completion gate reads,
-                                                // and the model must not believe it
-                                                // declared a second task.
-                                                let bound = binder.scope().await.ok().flatten();
-                                                let (bound_objective, bound_acceptance) = bound
+                                        Ok(bound) => {
+                                            self.registration_refused = false;
+                                            self.registration_nudged = false;
+                                            // The committed window carries the goal
+                                            // contract from the next request on.
+                                            self.tools = self.executor.request_tool_definitions();
+                                            // Report the DURABLE scope, not the model's
+                                            // restatement. When this turn joined a goal the
+                                            // task already owed, that goal's objective,
+                                            // acceptance and recorded requirement history
+                                            // are what the completion gate reads.
+                                            let bound_scope = binder.scope().await.ok().flatten();
+                                            let (bound_objective, bound_acceptance) =
+                                                bound_scope
                                                     .map(|scope| (scope.objective, scope.acceptance))
                                                     .unwrap_or_else(|| {
                                                         (goal_objective.clone(), acceptance.clone())
                                                     });
-                                                let joined = bound_objective != goal_objective;
-                                                let checks = bound_acceptance
-                                                    .iter()
-                                                    .map(|check| format!("- {check}"))
-                                                    .collect::<Vec<_>>()
-                                                    .join("\n");
-                                                let requirements = goal_scope::extract(
-                                                    &bound_objective,
-                                                    &self.objective.amendments,
-                                                );
-                                                let header = if joined {
-                                                    format!(
-                                                        "Execution task joined: goal {goal}. This session \
-                                                         already owed this task, so the runtime did not \
-                                                         open a second one.\nObjective: {bound_objective}\n"
-                                                    )
-                                                } else {
-                                                    format!(
-                                                        "Execution task committed as goal {goal}.\n\
-                                                         Objective: {bound_objective}\n"
-                                                    )
-                                                };
-                                                let deliverables: Vec<String> = requirements
-                                                    .iter()
-                                                    .filter(|requirement| requirement.kind.is_deliverable())
-                                                    .map(|requirement| format!("- {}", requirement.text))
-                                                    .collect();
-                                                let constraints: Vec<String> = requirements
-                                                    .iter()
-                                                    .filter(|requirement| {
-                                                        !requirement.kind.is_deliverable()
-                                                    })
-                                                    .map(|requirement| format!("- {}", requirement.text))
-                                                    .collect();
-                                                let mut scope = String::new();
-                                                if !deliverables.is_empty() {
-                                                    scope.push_str(&format!(
-                                                        "User requirements (explicit deliverables):\n{}\n",
-                                                        deliverables.join("\n")
-                                                    ));
-                                                }
-                                                if !constraints.is_empty() {
-                                                    scope.push_str(&format!(
-                                                        "User constraints (prohibitions: honour them, do \
-                                                         not report them as delivered work):\n{}\n",
-                                                        constraints.join("\n")
-                                                    ));
-                                                }
-                                                (
-                                                    true,
-                                                    format!(
-                                                        "{header}{scope}Acceptance:\n{checks}\n\
-                                                         This turn stays running until the task is \
-                                                         resolved. A stage summary does not end it. \
-                                                         Continue the work, then call \
-                                                         update_goal(status=\"complete\", \
-                                                         verification=..., requirements=[...]) with one \
-                                                         entry per explicit user requirement, or \
-                                                         update_goal(status=\"blocked\", ...) if the \
-                                                         stated objective cannot be met. Do not narrow \
-                                                         the objective."
-                                                    ),
+                                            let joined = !bound.opened
+                                                || bound_objective != goal_objective;
+                                            let checks = bound_acceptance
+                                                .iter()
+                                                .map(|check| format!("- {check}"))
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            let items = binder.requirements().await.unwrap_or_default();
+                                            let header = if joined {
+                                                format!(
+                                                    "Execution task joined: goal {}. This session \
+                                                     already owed this task, so the runtime did not \
+                                                     open a second one.\nObjective: {bound_objective}\n",
+                                                    bound.goal
                                                 )
+                                            } else {
+                                                format!(
+                                                    "Execution task committed as goal {}.\n\
+                                                     Objective: {bound_objective}\n",
+                                                    bound.goal
+                                                )
+                                            };
+                                            let mut scope = String::new();
+                                            let deliverables: Vec<String> = items
+                                                .iter()
+                                                .filter(|item| item.is_owed())
+                                                .map(|item| {
+                                                    format!(
+                                                        "- {} [{}] {}",
+                                                        item.id,
+                                                        item.kind.label(),
+                                                        item.text
+                                                    )
+                                                })
+                                                .collect();
+                                            let constraints: Vec<String> = items
+                                                .iter()
+                                                .filter(|item| {
+                                                    item.state
+                                                        == leveler_lifecycle::RequirementState::Active
+                                                        && !item.kind.is_deliverable()
+                                                })
+                                                .map(|item| {
+                                                    format!(
+                                                        "- {} [{}] {}",
+                                                        item.id,
+                                                        item.kind.label(),
+                                                        item.text
+                                                    )
+                                                })
+                                                .collect();
+                                            if !deliverables.is_empty() {
+                                                scope.push_str(&format!(
+                                                    "User requirements (declared deliverables, by \
+                                                     stable id):\n{}\n",
+                                                    deliverables.join("\n")
+                                                ));
                                             }
-                                            Err(error) => (
-                                                false,
-                                                format!("commit_task could not record the task: {error}"),
-                                            ),
+                                            if !constraints.is_empty() {
+                                                scope.push_str(&format!(
+                                                    "User constraints (honour them; they are not \
+                                                     delivered work):\n{}\n",
+                                                    constraints.join("\n")
+                                                ));
+                                            }
+                                            if items.is_empty() {
+                                                scope.push_str(
+                                                    "No structured requirements were declared. \
+                                                     This goal's completion rests on the acceptance \
+                                                     plan below; a user requirement that is stated \
+                                                     later must be declared with declare_scope and \
+                                                     a verbatim user quote.\n",
+                                                );
+                                            }
+                                            if !bound.opened && !seeds.is_empty() {
+                                                scope.push_str(
+                                                    "The requirements in this commit call were not \
+                                                     applied: this goal already had a recorded \
+                                                     requirement set. Use declare_scope with a \
+                                                     verbatim user quote to add, amend, replace or \
+                                                     waive one.\n",
+                                                );
+                                            }
+                                            (
+                                                true,
+                                                format!(
+                                                    "{header}{scope}Acceptance:\n{checks}\n\
+                                                     This turn stays running until the task is \
+                                                     resolved. A stage summary does not end it. \
+                                                     Continue the work, then call \
+                                                     update_goal(status=\"complete\", \
+                                                     verification=..., requirements=[...]) with one \
+                                                     entry per active deliverable id above, or \
+                                                     update_goal(status=\"blocked\", ...) if the \
+                                                     stated objective cannot be met. Do not narrow \
+                                                     the objective."
+                                                ),
+                                            )
                                         }
+                                        Err(error) => (
+                                            false,
+                                            format!("commit_task could not record the task: {error}"),
+                                        ),
                                     }
-                                    None => (
-                                        false,
-                                        "commit_task is unavailable here: this execution has no durable \
-                                         task store."
-                                            .to_string(),
-                                    ),
                                 }
+                                None => (
+                                    false,
+                                    "commit_task is unavailable here: this execution has no durable \
+                                     task store."
+                                        .to_string(),
+                                ),
                             }
                         }
-                        Err(message) => (false, message),
+
+                        Err(message) => {
+                            self.registration_refused = true;
+                            self.registration_nudged = false;
+                            // The refused declaration is the durable registration
+                            // fact the terminal reads. It is emitted as the
+                            // refusal happens, not inferred from warnings later.
+                            (self.observer)(AgentEvent::GoalIntercepted {
+                                kind: COMMIT_REFUSED_KIND.to_string(),
+                                detail: message.clone(),
+                            });
+                            (false, message)
+                        }
                     }
                 };
                 (self.observer)(AgentEvent::ToolResult {
@@ -4827,130 +4830,116 @@ impl AgentHarness for Drive<'_> {
                             continue;
                         }
                     }
-                    // Acceptance scope. The user's explicitly enumerated
-                    // deliverables are the authority; the durable goal row
-                    // (objective plus user-authored amendments) is read HERE,
-                    // so neither a resumed transcript nor a compaction fold
-                    // can shrink the scope. Every requirement must be
-                    // accounted for, and the claims the runtime can check
-                    // mechanically are checked against the execution record.
-                    let scope = match self.executor.goal_binder() {
-                        Some(binder) => binder.scope().await?,
-                        None => None,
+                    // Structured requirement accounting. The recorded set —
+                    // not a re-reading of the objective's prose — is the
+                    // authority, and it is read here from durable history, so
+                    // neither a resumed transcript nor a compaction fold can
+                    // shrink it. Every active deliverable is accounted by its
+                    // stable id, and the claims the runtime can check
+                    // mechanically are checked against the workspace and the
+                    // command record.
+                    let requirements = match self.executor.goal_binder() {
+                        Some(binder) => binder.requirements().await?,
+                        None => Vec::new(),
                     };
-                    if let Some(scope) = scope {
-                        let requirements = goal_scope::extract(&scope.objective, &scope.amendments);
-                        if !requirements.is_empty() {
-                            // The accounting cap follows the requirement set: a long
-                            // but legitimate task must be able to account for every
-                            // requirement it has. The floor keeps a short goal from
-                            // accepting an unbounded array.
-                            let accounting = match goal_scope::parse_accounting(
-                                &call.arguments,
-                                requirements.len(),
-                            ) {
-                                Ok(accounting) => accounting,
-                                Err(message) => {
-                                    self.note_refused_completion(
-                                        &round_prose,
-                                        declares_answer,
-                                        revises_answer,
-                                        round_has_work,
-                                    );
-                                    denied_calls_this_round += 1;
-                                    (self.observer)(AgentEvent::GoalIntercepted {
-                                        kind: "invalid_requirements".to_string(),
-                                        detail: message.clone(),
-                                    });
-                                    (self.observer)(AgentEvent::ToolResult {
-                                        exit_code: None,
-                                        stop: None,
-                                        execution_status: None,
-                                        id: call.id.as_str().to_string(),
-                                        name: UPDATE_GOAL_TOOL.to_string(),
+                    let owed = requirements.iter().filter(|item| item.is_owed()).count();
+                    if owed > 0 {
+                        // The accounting cap follows the requirement set: a long
+                        // but legitimate task must be able to account for every
+                        // requirement it has. The floor keeps a short goal from
+                        // accepting an unbounded array.
+                        let accounting = match scope_gate::parse_accounting(&call.arguments, owed) {
+                            Ok(accounting) => accounting,
+                            Err(message) => {
+                                self.note_refused_completion(
+                                    &round_prose,
+                                    declares_answer,
+                                    revises_answer,
+                                    round_has_work,
+                                );
+                                denied_calls_this_round += 1;
+                                (self.observer)(AgentEvent::GoalIntercepted {
+                                    kind: "invalid_requirements".to_string(),
+                                    detail: message.clone(),
+                                });
+                                (self.observer)(AgentEvent::ToolResult {
+                                    exit_code: None,
+                                    stop: None,
+                                    execution_status: None,
+                                    id: call.id.as_str().to_string(),
+                                    name: UPDATE_GOAL_TOOL.to_string(),
+                                    is_error: true,
+                                    preview: goal_refusal_preview("invalid_requirements", &message),
+                                    applied_diff: None,
+                                });
+                                results[index] = Some(ContentPart::ToolResult {
+                                    result: ToolResultContent {
+                                        call_id: call.id,
+                                        content: message,
                                         is_error: true,
-                                        preview: goal_refusal_preview(
-                                            "invalid_requirements",
-                                            &message,
-                                        ),
-                                        applied_diff: None,
-                                    });
-                                    results[index] = Some(ContentPart::ToolResult {
-                                        result: ToolResultContent {
-                                            call_id: call.id,
-                                            content: message,
-                                            is_error: true,
-                                        },
-                                    });
-                                    continue;
-                                }
-                            };
-                            let workspace =
-                                self.executor.tool_context.execution.workspace.as_deref();
-                            let recorded =
-                                epoch_modified_paths(&self.progress, &self.modified_files);
-                            let artifact = |path: &str| artifact_state(workspace, path, &recorded);
-                            let literal =
-                                |path: &str, text: &str| literal_state(workspace, path, text);
-                            match goal_scope::decide(&goal_scope::ScopeFacts {
-                                requirements: &requirements,
-                                accounting: accounting.as_deref(),
-                                runs: &self.verification_runs,
-                                mutation_ops: self.ledger.total_mutation_ops,
-                                artifact: &artifact,
-                                literal: &literal,
-                            }) {
-                                goal_scope::ScopeDecision::Accept { warnings } => {
-                                    self.completion_warnings.extend(warnings);
-                                    self.repeated_gate_refusal = None;
-                                    self.requirements_refusal = None;
-                                }
-                                goal_scope::ScopeDecision::Refuse(message) => {
-                                    self.note_refused_completion(
-                                        &round_prose,
-                                        declares_answer,
-                                        revises_answer,
-                                        round_has_work,
-                                    );
-                                    denied_calls_this_round += 1;
-                                    // A DIFFERENT verdict after an earlier one is
-                                    // the model answering the feedback. The first
-                                    // refusal of a drive has nothing to answer yet,
-                                    // so it stays an ordinary refused round.
-                                    let advanced = self
-                                        .requirements_refusal
-                                        .as_deref()
-                                        .is_some_and(|previous| previous != message);
-                                    self.requirements_refusal = Some(message.clone());
-                                    note_gate_refusal(&mut self.repeated_gate_refusal, &message);
-                                    gate_verdict_advanced_this_round =
-                                        gate_verdict_advanced_this_round || advanced;
-                                    (self.observer)(AgentEvent::GoalIntercepted {
-                                        kind: "requirements_refused".to_string(),
-                                        detail: message.clone(),
-                                    });
-                                    (self.observer)(AgentEvent::ToolResult {
-                                        exit_code: None,
-                                        stop: None,
-                                        execution_status: None,
-                                        id: call.id.as_str().to_string(),
-                                        name: UPDATE_GOAL_TOOL.to_string(),
+                                    },
+                                });
+                                continue;
+                            }
+                        };
+                        let workspace = self.executor.tool_context.execution.workspace.as_deref();
+                        let recorded = epoch_modified_paths(&self.progress, &self.modified_files);
+                        let artifact = |path: &str| artifact_state(workspace, path, &recorded);
+                        let literal = |path: &str, text: &str| literal_state(workspace, path, text);
+                        match scope_gate::decide(&scope_gate::ScopeFacts {
+                            requirements: &requirements,
+                            accounting: accounting.as_deref(),
+                            runs: &self.verification_runs,
+                            mutation_ops: self.ledger.total_mutation_ops,
+                            artifact: &artifact,
+                            literal: &literal,
+                        }) {
+                            scope_gate::ScopeDecision::Accept { warnings } => {
+                                self.completion_warnings.extend(warnings);
+                                self.repeated_gate_refusal = None;
+                                self.requirements_refusal = None;
+                            }
+                            scope_gate::ScopeDecision::Refuse(message) => {
+                                self.note_refused_completion(
+                                    &round_prose,
+                                    declares_answer,
+                                    revises_answer,
+                                    round_has_work,
+                                );
+                                denied_calls_this_round += 1;
+                                // A DIFFERENT verdict after an earlier one is
+                                // the model answering the feedback. The first
+                                // refusal of a drive has nothing to answer yet,
+                                // so it stays an ordinary refused round.
+                                let advanced = self
+                                    .requirements_refusal
+                                    .as_ref()
+                                    .is_some_and(|(previous, _)| previous != &message);
+                                note_gate_refusal(&mut self.requirements_refusal, &message);
+                                gate_verdict_advanced_this_round =
+                                    gate_verdict_advanced_this_round || advanced;
+                                (self.observer)(AgentEvent::GoalIntercepted {
+                                    kind: "requirements_refused".to_string(),
+                                    detail: message.clone(),
+                                });
+                                (self.observer)(AgentEvent::ToolResult {
+                                    exit_code: None,
+                                    stop: None,
+                                    execution_status: None,
+                                    id: call.id.as_str().to_string(),
+                                    name: UPDATE_GOAL_TOOL.to_string(),
+                                    is_error: true,
+                                    preview: goal_refusal_preview("requirements_refused", &message),
+                                    applied_diff: None,
+                                });
+                                results[index] = Some(ContentPart::ToolResult {
+                                    result: ToolResultContent {
+                                        call_id: call.id,
+                                        content: message,
                                         is_error: true,
-                                        preview: goal_refusal_preview(
-                                            "requirements_refused",
-                                            &message,
-                                        ),
-                                        applied_diff: None,
-                                    });
-                                    results[index] = Some(ContentPart::ToolResult {
-                                        result: ToolResultContent {
-                                            call_id: call.id,
-                                            content: message,
-                                            is_error: true,
-                                        },
-                                    });
-                                    continue;
-                                }
+                                    },
+                                });
+                                continue;
                             }
                         }
                     }
@@ -6778,7 +6767,9 @@ impl AgentHarness for Drive<'_> {
         // between identical refusals, so no no-progress streak ever tripped.
         if all_refused {
             // Already classified by the bounded recovery above.
-        } else if let Some(detail) = stuck_gate_detail(&self.repeated_gate_refusal) {
+        } else if let Some(detail) = stuck_gate_detail(&self.repeated_gate_refusal)
+            .or_else(|| stuck_gate_detail(&self.requirements_refusal))
+        {
             return Ok(Flow::Stop(
                 self.stop_now(rt, messages, StopReason::Incomplete, &detail, &detail)
                     .await?,
@@ -7900,12 +7891,17 @@ struct CommitDeclaration {
     /// otherwise the model's validated `objective` argument.
     objective: String,
     acceptance: Vec<String>,
+    /// The model's structured requirement declarations. Each is anchored to a
+    /// verbatim span of the user's message, so the runtime can check the source
+    /// exists without interpreting it.
+    requirements: Vec<leveler_lifecycle::RequirementSeed>,
     relation: Option<leveler_engine::TaskRelation>,
 }
 
 const COMMIT_OBJECTIVE_MAX_CHARS: usize = 4000;
 const COMMIT_ACCEPTANCE_MAX_ITEMS: usize = 20;
 const COMMIT_ACCEPTANCE_MAX_CHARS: usize = 500;
+const COMMIT_REQUIREMENTS_MAX_ITEMS: usize = 40;
 
 /// The JSON shape an error message shows the model: type and a small preview.
 fn json_shape(value: &serde_json::Value) -> String {
@@ -7937,49 +7933,167 @@ fn json_preview(value: &serde_json::Value) -> String {
 /// duplicate validation that can only add a failure mode. When there is no
 /// user text, the model's objective is required. `acceptance` is always the
 /// model's own contract and is validated element by element.
-/// One page of the user-scope projection shown to the model.
-///
-/// Committed goals and pre-registration previews use the same extraction and
-/// the same page bounds: a preview that read a different set would teach the
-/// model a contract the commit gate does not enforce.
-fn scope_page_text(
-    requirements: &[goal_scope::Requirement],
-    offset: usize,
-    limit: usize,
-    preview: bool,
-) -> String {
-    let (slice, start) = goal_scope::page(requirements, offset, limit);
-    let end = start + slice.len();
-    let label = if preview {
-        "Goal scope preview (this task is not registered yet)"
-    } else {
-        "Effective acceptance"
-    };
+/// The receipt for one accepted `declare_scope` call: what was recorded and
+/// what the set now is. The model reads identity and state, not a re-reading
+/// of the user's words.
+fn scope_receipt_text(projection: &leveler_lifecycle::ScopeProjection) -> String {
+    const MAX_LISTED: usize = 40;
+    let owed = projection
+        .items
+        .iter()
+        .filter(|item| item.is_owed())
+        .count();
     let mut text = format!(
-        "{label}: {} requirement(s), showing {}..{} of {}.\n",
-        requirements.len(),
-        start,
-        end,
-        requirements.len()
+        "Recorded {} requirement operation(s). The goal now carries {} requirement(s), {} still owed.\n",
+        projection.events.len(),
+        projection.items.len(),
+        owed
     );
-    if preview {
-        text.push_str(
-            "This is the exact set commit_task requires `acceptance` to cover. Reading it does \
-             not register the task.\n",
-        );
-    }
-    for requirement in slice {
+    text.push_str("Operations applied:\n");
+    for event in &projection.events {
+        let payload = event
+            .text
+            .as_deref()
+            .or(event.supersedes.as_deref())
+            .unwrap_or("");
         text.push_str(&format!(
-            "- {} [{}] {}\n",
-            requirement.id,
-            requirement.kind.label(),
-            requirement.text
+            "- {} {} [{}] {}\n",
+            event.operation.as_str(),
+            event.requirement_id,
+            event.kind.map(|kind| kind.label()).unwrap_or("-"),
+            payload
         ));
     }
-    if end < requirements.len() {
+    text.push_str("Current requirement set:\n");
+    for item in projection.items.iter().take(MAX_LISTED) {
+        let mut line = format!(
+            "- {} [{}] {}: {}",
+            item.id,
+            item.kind.label(),
+            item.state.as_str(),
+            item.text
+        );
+        if let Some(target) = &item.target {
+            line.push_str(&format!(" (target: {target})"));
+        }
+        if let Some(replaced_by) = &item.superseded_by {
+            line.push_str(&format!(" [replaced by {replaced_by}]"));
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    if projection.items.len() > MAX_LISTED {
+        text.push_str(&format!(
+            "{} more requirement(s) exist; call get_goal_scope to read them.\n",
+            projection.items.len() - MAX_LISTED
+        ));
+    }
+    text.push_str(
+        "When the work is done, call update_goal(status=\"complete\", \
+         requirements=[{id, status, evidence}]) with one entry per active deliverable id.",
+    );
+    text
+}
+
+/// The recorded scope shown to the model: identity, kind, state, source span
+/// and the model's acceptance plan. The runtime never re-derives this set from
+/// the objective's prose, so reading it cannot invent or drop a requirement.
+fn structured_scope_text(
+    objective: &str,
+    acceptance: &[String],
+    items: &[leveler_lifecycle::RequirementItem],
+    history: &[leveler_engine::ports::RequirementEvent],
+    paused: bool,
+    offset: usize,
+    limit: usize,
+) -> String {
+    let start = offset.min(items.len());
+    let end = (start + limit).min(items.len());
+    let slice = &items[start..end];
+    let owed = items.iter().filter(|item| item.is_owed()).count();
+    let mut text = format!(
+        "Goal scope: {} requirement(s), {} still owed, showing {}..{} of {}.\n",
+        items.len(),
+        owed,
+        start,
+        end,
+        items.len()
+    );
+    if paused {
+        text.push_str(
+            "State: paused by the user. Work the goal owes stays owed; only the user's own \
+             continuation releases the pause.\n",
+        );
+    }
+    text.push_str(&format!("Objective (verbatim user text): {objective}\n"));
+    if items.is_empty() {
+        text.push_str(
+            "No structured requirements are recorded for this goal. Completion rests on the \
+             acceptance plan below; a user requirement stated later must be declared with \
+             declare_scope and a verbatim user quote.\n",
+        );
+    }
+    for item in slice {
+        let mut line = format!(
+            "- {} [{}] {}: {}",
+            item.id,
+            item.kind.label(),
+            item.state.as_str(),
+            item.text
+        );
+        if let Some(target) = &item.target {
+            line.push_str(&format!(" (target: {target})"));
+        }
+        if let Some(check) = &item.check {
+            line.push_str(&format!(" [check: {check}]"));
+        }
+        if let Some(replaced_by) = &item.superseded_by {
+            line.push_str(&format!(" [replaced by {replaced_by}]"));
+        }
+        line.push_str(&format!("\n  source: \"{}\"\n", item.source_quote));
+        text.push_str(&line);
+    }
+    if end < items.len() {
         text.push_str(&format!(
             "More requirements exist: call get_goal_scope with offset={end}.\n"
         ));
+    }
+    if !acceptance.is_empty() {
+        text.push_str("Acceptance (the model's candidate checks, not the user's scope):\n");
+        for check in acceptance {
+            text.push_str(&format!("- {check}\n"));
+        }
+    }
+    if !history.is_empty() {
+        text.push_str("Requirement history (oldest first, with the turn that authorized it):\n");
+        for record in history.iter().take(limit) {
+            let event = &record.event;
+            let payload = event
+                .text
+                .as_deref()
+                .or(event.supersedes.as_deref())
+                .unwrap_or("-");
+            text.push_str(&format!(
+                "- #{} turn {} {} {} [{}] {}\n  quote: \"{}\"\n",
+                record.seq,
+                if record.turn_id.is_empty() {
+                    "<pre-scope>"
+                } else {
+                    &record.turn_id
+                },
+                event.operation.as_str(),
+                event.requirement_id,
+                event.kind.map(|kind| kind.label()).unwrap_or("-"),
+                payload,
+                event.source_quote
+            ));
+        }
+        if history.len() > limit {
+            text.push_str(&format!(
+                "{} more history event(s) exist.\n",
+                history.len() - limit
+            ));
+        }
     }
     text
 }
@@ -8106,11 +8220,148 @@ fn parse_commit_declaration(
         }
     };
 
+    let requirements = parse_commit_requirements(arguments.get("requirements"))?;
+    if !requirements.is_empty() {
+        if user_objective.is_empty() {
+            return Err(
+                "`requirements` needs a user message to quote, but this turn carries no user \
+                 message text. Fix: commit without requirements, or declare them in a turn that \
+                 carries the user's own words."
+                    .to_string(),
+            );
+        }
+        for (index, seed) in requirements.iter().enumerate() {
+            if !leveler_lifecycle::quote_is_in_input(&seed.source_quote, user_objective) {
+                return Err(format!(
+                    "`requirements[{index}].source_quote` does not occur in the user's message. \
+                     The quote proves the requirement comes from the user; it must be copied \
+                     verbatim. Fix: quote the exact user words that state this requirement, or \
+                     remove the requirement."
+                ));
+            }
+            if let Some(check) = &seed.check
+                && !acceptance.iter().any(|item| item == check)
+            {
+                return Err(format!(
+                    "`requirements[{index}].check` (`{check}`) is not one of the `acceptance` \
+                     entries. Fix: set `check` to one acceptance string exactly, or omit it when \
+                     no acceptance check covers this requirement."
+                ));
+            }
+        }
+        leveler_lifecycle::initial_scope(&requirements).map_err(|error| {
+            format!(
+                "`requirements` is invalid: {error}. Fix the named field and retry; do not drop a \
+                 requirement the user stated."
+            )
+        })?;
+    }
+
     Ok(CommitDeclaration {
         objective,
         acceptance,
+        requirements,
         relation,
     })
+}
+
+/// Parse the model's structured requirement declarations.
+///
+/// The shape is checked here with field-level errors so the model can fix a
+/// call instead of guessing which element was wrong. Source relevance is the
+/// caller's check: this function only knows the JSON.
+fn parse_commit_requirements(
+    value: Option<&serde_json::Value>,
+) -> Result<Vec<leveler_lifecycle::RequirementSeed>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "`requirements` must be an array, got {} (`{}`). Fix: pass the user's explicit \
+             requirements as objects with `kind`, `text` and `source_quote`.",
+            json_shape(value),
+            json_preview(value)
+        ));
+    };
+    if items.len() > COMMIT_REQUIREMENTS_MAX_ITEMS {
+        return Err(format!(
+            "`requirements` has {} items; the limit is {COMMIT_REQUIREMENTS_MAX_ITEMS}. Fix: one \
+             entry per distinct user requirement, grouping only requirements the user themselves \
+             stated together.",
+            items.len()
+        ));
+    }
+    let mut seeds = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            return Err(format!(
+                "`requirements[{index}]` must be an object, got {} (`{}`). Fix: pass `kind`, \
+                 `text` and `source_quote`.",
+                json_shape(item),
+                json_preview(item)
+            ));
+        };
+        let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+            return Err(format!(
+                "`requirements[{index}].kind` is required and must be a string. Fix: use \
+                 `artifact`, `artifact_absent`, `command`, `named`, `content`, `tests`, \
+                 `forbidden`, `baseline`, `preparation` or `constraint`."
+            ));
+        };
+        let Some(kind) = leveler_lifecycle::RequirementKind::parse(kind) else {
+            return Err(format!(
+                "`requirements[{index}].kind` is `{kind}`, which is not a requirement kind. Fix: \
+                 use `artifact`, `artifact_absent`, `command`, `named`, `content`, `tests`, \
+                 `forbidden`, `baseline`, `preparation` or `constraint`."
+            ));
+        };
+        let Some(text) = object.get("text").and_then(serde_json::Value::as_str) else {
+            return Err(format!(
+                "`requirements[{index}].text` is required and must be a string. Fix: state the \
+                 requirement in the user's terms."
+            ));
+        };
+        let Some(source_quote) = object
+            .get("source_quote")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(format!(
+                "`requirements[{index}].source_quote` is required and must be a string. Fix: copy \
+                 the exact user words that state this requirement."
+            ));
+        };
+        let target = match object.get("target") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "`requirements[{index}].target` must be a string, got {} (`{}`).",
+                    json_shape(other),
+                    json_preview(other)
+                ));
+            }
+        };
+        let check = match object.get("check") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "`requirements[{index}].check` must be a string, got {} (`{}`).",
+                    json_shape(other),
+                    json_preview(other)
+                ));
+            }
+        };
+        seeds.push(leveler_lifecycle::RequirementSeed {
+            kind,
+            text: text.to_string(),
+            target,
+            source_quote: source_quote.to_string(),
+            check,
+        });
+    }
+    Ok(seeds)
 }
 
 /// The preview for a refused `update_goal`: the refusing gate, then the
@@ -8363,8 +8614,8 @@ fn literal_state(
     workspace: Option<&leveler_execution::Workspace>,
     path: &str,
     literal: &str,
-) -> goal_scope::LiteralState {
-    use goal_scope::LiteralState;
+) -> scope_gate::LiteralState {
+    use scope_gate::LiteralState;
     let path = path.trim().trim_start_matches("./");
     let literal = literal.trim();
     if path.is_empty()
@@ -8434,8 +8685,8 @@ fn artifact_state(
     workspace: Option<&leveler_execution::Workspace>,
     path: &str,
     recorded_paths: &[String],
-) -> goal_scope::ArtifactState {
-    use goal_scope::ArtifactState;
+) -> scope_gate::ArtifactState {
+    use scope_gate::ArtifactState;
     let path = path.trim().trim_start_matches("./");
     if path.is_empty()
         || path.starts_with('/')
@@ -8472,7 +8723,7 @@ fn artifact_state(
 
 #[cfg(test)]
 mod artifact_scope_tests {
-    use super::{artifact_state, goal_scope, literal_state};
+    use super::{artifact_state, literal_state, scope_gate};
 
     #[test]
     fn a_content_literal_is_present_only_when_a_line_holds_it() {
@@ -8486,11 +8737,11 @@ mod artifact_scope_tests {
 
         assert_eq!(
             literal_state(Some(&workspace), "README.md", "Verified."),
-            goal_scope::LiteralState::Present
+            scope_gate::LiteralState::Present
         );
         assert_eq!(
             literal_state(Some(&workspace), "README.md", "Verified"),
-            goal_scope::LiteralState::Absent,
+            scope_gate::LiteralState::Absent,
             "a line is matched whole, so a different line is not evidence"
         );
     }
@@ -8505,13 +8756,13 @@ mod artifact_scope_tests {
         let workspace = leveler_execution::Workspace::new(dir.path()).expect("workspace");
         assert_eq!(
             literal_state(Some(&workspace), "README.md", "Verified."),
-            goal_scope::LiteralState::Present
+            scope_gate::LiteralState::Present
         );
 
         std::fs::write(&readme, "# calc\n").expect("rewrite");
         assert_eq!(
             literal_state(Some(&workspace), "README.md", "Verified."),
-            goal_scope::LiteralState::Absent
+            scope_gate::LiteralState::Absent
         );
     }
 
@@ -8522,21 +8773,21 @@ mod artifact_scope_tests {
 
         assert_eq!(
             literal_state(Some(&workspace), "docs/README.md", "Verified."),
-            goal_scope::LiteralState::Absent,
+            scope_gate::LiteralState::Absent,
             "a missing path the user spelled out is a fact"
         );
         assert_eq!(
             literal_state(Some(&workspace), "README.md", "Verified."),
-            goal_scope::LiteralState::Unknown,
+            scope_gate::LiteralState::Unknown,
             "a bare name may be shorthand for a nested recorded file"
         );
         assert_eq!(
             literal_state(Some(&workspace), "../outside.md", "Verified."),
-            goal_scope::LiteralState::Unknown
+            scope_gate::LiteralState::Unknown
         );
         assert_eq!(
             literal_state(None, "README.md", "Verified."),
-            goal_scope::LiteralState::Unknown
+            scope_gate::LiteralState::Unknown
         );
     }
 
@@ -8555,7 +8806,7 @@ mod artifact_scope_tests {
 
         assert_eq!(
             artifact_state(Some(&workspace), "aggregate.go", &recorded),
-            goal_scope::ArtifactState::Present
+            scope_gate::ArtifactState::Present
         );
     }
 
@@ -8566,7 +8817,7 @@ mod artifact_scope_tests {
 
         assert_eq!(
             artifact_state(Some(&workspace), "done.txt", &[]),
-            goal_scope::ArtifactState::Absent
+            scope_gate::ArtifactState::Absent
         );
     }
 
@@ -8578,7 +8829,7 @@ mod artifact_scope_tests {
 
         assert_eq!(
             artifact_state(Some(&workspace), "done.txt", &[]),
-            goal_scope::ArtifactState::Present
+            scope_gate::ArtifactState::Present
         );
     }
 }
@@ -9055,53 +9306,5 @@ mod workspace_mutation_tests {
             &format!("{root_text}/../outside.txt")
         ));
         assert!(!path_is_within(&root, "/tmp/captured-evidence.txt"));
-    }
-}
-
-#[cfg(test)]
-mod steer_scope_tests {
-    use super::steer_joins_goal_scope;
-
-    #[test]
-    fn a_status_question_does_not_change_the_goal_scope() {
-        assert!(!steer_joins_goal_scope(
-            true,
-            "fix the parser",
-            &[],
-            "为什么刚才没有权限？"
-        ));
-        assert!(!steer_joins_goal_scope(
-            false,
-            "fix the parser",
-            &[],
-            "进度如何？"
-        ));
-    }
-
-    #[test]
-    fn a_goal_window_records_a_real_constraint_or_prohibition() {
-        assert!(steer_joins_goal_scope(
-            true,
-            "fix the parser",
-            &[],
-            "不要修改 src/payments.rs，改用环境变量。"
-        ));
-    }
-
-    #[test]
-    fn a_chat_message_only_records_a_deliverable_change() {
-        // A one-off constraint reaches the model but is not a forever scope.
-        assert!(!steer_joins_goal_scope(
-            false,
-            "fix the parser",
-            &[],
-            "这次只回答，不要改任何文件。"
-        ));
-        assert!(steer_joins_goal_scope(
-            false,
-            "fix the parser",
-            &[],
-            "另外新增 src/export_csv.rs，实现导出 CSV。"
-        ));
     }
 }

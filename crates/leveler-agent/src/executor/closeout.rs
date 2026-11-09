@@ -215,16 +215,15 @@ pub struct CloseoutInput {
     /// it says the model left its own record open, nothing about whether those
     /// steps are still needed.
     pub open_plan_steps: usize,
-    /// How many of the user's explicitly named deliverables the model's
-    /// refused `commit_task` declaration left without an acceptance check.
-    /// `0` when no declaration was refused this turn. A refused declaration is
-    /// the model's own statement that this request is work to finish, so a
-    /// quiet round after it is the same class of contradiction as an open plan.
-    pub refused_registration_gaps: usize,
-    /// The user explicitly bounded this turn and the model's own latest plan
-    /// has reached that boundary (see [`leveler_lifecycle::user_pause_reached`]).
+    /// Whether the model's `commit_task` declaration was refused this turn.
+    /// A refused declaration is the model's own statement that this request is
+    /// work to finish, so a quiet round after it is the same class of
+    /// contradiction as an open plan.
+    pub registration_refused: bool,
+    /// The model's own latest plan has reached the [`leveler_lifecycle::PauseBoundary`]
+    /// the user authorized through a validated intent declaration.
     ///
-    /// This is an authorization fact read from the user's own words and the
+    /// This is an authorization fact read from the durable boundary and the
     /// model's plan, never a model claim. When true, the harness must not buy
     /// another round to pressure past the pause: the turn ends normally with
     /// the remaining steps still recorded as open.
@@ -260,7 +259,7 @@ pub fn decide(input: &CloseoutInput) -> CloseoutAction {
         Some(CloseoutReason::GoalUnresolved)
     } else if input.open_plan_steps > 0 {
         Some(CloseoutReason::PlanUnresolved)
-    } else if input.refused_registration_gaps > 0 {
+    } else if input.registration_refused {
         Some(CloseoutReason::TaskUnregistered)
     } else {
         None
@@ -353,7 +352,7 @@ mod tests {
             human_boundary_seen: false,
             continuations_exhausted: false,
             open_plan_steps: 0,
-            refused_registration_gaps: 0,
+            registration_refused: false,
             user_pause_reached: false,
             goal_user_paused: false,
         }
@@ -424,7 +423,7 @@ mod tests {
     #[test]
     fn a_refused_registration_buys_one_more_round_in_chat() {
         let mut i = input();
-        i.refused_registration_gaps = 2;
+        i.registration_refused = true;
         assert_eq!(decide(&i), CloseoutAction::ContinueTask);
 
         i.can_continue = false;
@@ -448,7 +447,7 @@ mod tests {
     fn an_open_plan_outranks_a_refused_registration() {
         let mut i = input();
         i.open_plan_steps = 1;
-        i.refused_registration_gaps = 2;
+        i.registration_refused = true;
         assert_eq!(decide(&i), CloseoutAction::ContinuePlan);
     }
 
@@ -463,7 +462,7 @@ mod tests {
         assert_eq!(decide(&i), CloseoutAction::Finish);
 
         let mut i = input();
-        i.refused_registration_gaps = 2;
+        i.registration_refused = true;
         i.user_pause_reached = true;
         assert_eq!(decide(&i), CloseoutAction::Finish);
     }

@@ -528,6 +528,26 @@ fn cited_run<'a>(cited: &str, runs: &'a [VerificationRun]) -> CitedRun<'a> {
     CitedRun::Unmatched
 }
 
+/// Resolve one evidence line to the execution it names.
+///
+/// Structured requirement accounts cite a run the same way `verification`
+/// does, so both readings share one identity rule: a `call_id:<id>`, or the
+/// command the runtime actually recorded.
+pub(crate) fn cited_run_in<'a>(
+    line: &str,
+    runs: &'a [VerificationRun],
+) -> Option<&'a VerificationRun> {
+    match cited_run(line, runs) {
+        CitedRun::Found(run) => Some(run),
+        CitedRun::Refuse(_) | CitedRun::Unmatched => None,
+    }
+}
+
+/// Whether a recorded command is the command a requirement names.
+pub(crate) fn run_matches_command(label: &str, command: &str) -> bool {
+    cites(label, command)
+}
+
 fn result_note_marker(token: &str) -> bool {
     matches!(token, "→" | "->" | "=>" | "⇒")
 }
@@ -761,140 +781,6 @@ pub(crate) fn is_verification_command(label: &str) -> bool {
     false
 }
 
-/// Suite names a repository gives its own test target.
-///
-/// A repository names its suite in its own words (`make regression`,
-/// `just e2e`); the runner vocabulary alone cannot see it, and a goal that
-/// demanded the tests then becomes unsatisfiable while the tests really ran.
-/// These stems are the words that still name a test suite. Build, check, lint
-/// and verify are deliberately absent: they are verification, not the suite
-/// the user asked to pass.
-const TEST_SUITE_STEMS: &[&str] = &[
-    "test",
-    "spec",
-    "e2e",
-    "regression",
-    "acceptance",
-    "integration",
-];
-
-/// Whether a build tool's target names a test suite.
-///
-/// Matched per word, so a target containing a stem by accident (`make
-/// inspect`) is not a suite. `run-tests` and `test-all` are.
-fn target_names_a_suite(target: &str) -> bool {
-    target
-        .to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|part| {
-            !part.is_empty()
-                && TEST_SUITE_STEMS
-                    .iter()
-                    .any(|stem| part == *stem || part.starts_with(stem))
-        })
-}
-
-/// What the runtime recognises as a test run, in words the model can act on.
-///
-/// A refusal that only says "no test command ran" leaves a model whose suite
-/// has an unrecognised name with nowhere to go; the vocabulary is mechanical,
-/// so it is stated instead of guessed.
-pub(crate) fn test_command_guidance() -> String {
-    format!(
-        "the runtime recognises a test run by its runner (`go test`, `cargo test`, `cargo \
-         nextest run`, `pytest`, `npm test`, `ctest`, …) or by a build-tool target named for a \
-         suite ({})",
-        TEST_SUITE_STEMS.join(", ")
-    )
-}
-
-/// Whether a command actually runs a test suite.
-///
-/// Narrower than [`is_verification_command`]: a build, a type-check or a lint
-/// is verification, but it is not the test suite the user asked to pass.
-/// Deliberately mechanical and conservative; an unrecognised runner simply
-/// does not satisfy a test requirement, and a build target counts only when
-/// its own name names a suite (see [`TEST_SUITE_STEMS`]).
-pub(crate) fn is_test_command(label: &str) -> bool {
-    names_a_test_suite(label, true)
-}
-
-/// Whether a command is the standard test runner, without a repository's own
-/// suite name.
-///
-/// This is the question requirement *extraction* asks: a span that already
-/// reads as "run the tests" is covered by the Tests requirement, so it must
-/// not also become a named command. A project's own target is different — when
-/// the user writes `` `make regression` `` without demanding "the tests", it is
-/// a command they asked to run, and skipping it would drop the requirement
-/// instead of covering it.
-pub(crate) fn is_runner_named_test_command(label: &str) -> bool {
-    names_a_test_suite(label, false)
-}
-
-/// Words that name a test suite rather than just a build or a check.
-const TEST_SUITE_WORDS: &[&str] = &[
-    "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
-];
-
-fn names_a_test_suite(label: &str, suite_targets: bool) -> bool {
-    for segment in label.split([';', '&', '|', '\n']) {
-        let words: Vec<&str> = segment
-            .split_whitespace()
-            .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
-            .filter(|word| !word.is_empty())
-            .collect();
-        let Some(first) = words.first().copied() else {
-            continue;
-        };
-        let second = words.get(1).copied().unwrap_or("");
-        let basename = first.rsplit('/').next().unwrap_or(first);
-        let matches = match basename {
-            "go" => second == "test",
-            "cargo" => second == "test" || (second == "nextest" && words.get(2) == Some(&"run")),
-            "npm" | "pnpm" | "yarn" | "bun" | "deno" => {
-                second == "test"
-                    || (second == "run"
-                        && words
-                            .get(2)
-                            .is_some_and(|word| matches!(*word, "test" | "tests")))
-            }
-            "make" | "just" | "bazel" | "mvn" | "gradle" | "dotnet" | "swift" | "flutter"
-            | "dart" | "mix" => words.iter().skip(1).any(|word| {
-                TEST_SUITE_WORDS.contains(word) || (suite_targets && target_names_a_suite(word))
-            }),
-            "pytest" | "phpunit" | "ctest" => true,
-            "python" | "python3" | "py" => {
-                let module = words.windows(2).any(|pair| {
-                    pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")
-                });
-                module || first_positional(&words).is_some_and(python_test_script)
-            }
-            "node" => words.iter().skip(1).any(|word| *word == "--test"),
-            "sh" | "bash" | "zsh" | "pwsh" | "powershell" | "cmd" => {
-                words.iter().skip(1).any(|word| {
-                    let name = word.rsplit('/').next().unwrap_or(word);
-                    TEST_SUITE_WORDS.iter().any(|target| name.contains(target))
-                })
-            }
-            _ => {
-                TEST_SUITE_WORDS
-                    .iter()
-                    .any(|target| basename.contains(target))
-                    && (basename.ends_with(".sh")
-                        || basename.ends_with(".py")
-                        || basename.ends_with(".ps1")
-                        || basename.ends_with(".bat")
-                        || basename.ends_with(".cmd"))
-            }
-        };
-        if matches {
-            return true;
-        }
-    }
-    false
-}
-
 /// The first non-option word after the interpreter: the script it runs.
 fn first_positional<'a>(words: &'a [&'a str]) -> Option<&'a str> {
     words
@@ -917,6 +803,10 @@ fn python_test_script(word: &str) -> bool {
         .to_ascii_lowercase();
     name.ends_with(".py") && TEST_SUITE_WORDS.iter().any(|target| name.contains(target))
 }
+
+const TEST_SUITE_WORDS: &[&str] = &[
+    "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
+];
 
 /// Whether a command's output says the test runner executed no tests.
 ///
@@ -1722,95 +1612,6 @@ mod tests {
             command_label("run_command", &serde_json::json!({"program": "  "})),
             None
         );
-    }
-
-    #[test]
-    fn test_classification_is_narrower_than_verification() {
-        for command in [
-            "cargo test",
-            "cargo test --workspace",
-            "cargo nextest run --workspace",
-            "go test ./...",
-            "npm test",
-            "pnpm run tests",
-            "pytest -q",
-            "python3 -m unittest",
-            // A user-named test script is the same evidence as a test-named
-            // shell script (`sh run-tests.sh`): the interpreter runs a file
-            // whose own name says it is the suite.
-            "python3 test_app.py",
-            "python3 -u tests/run_tests.py",
-            "make test",
-            // A repository names its own suite; the target name is what the
-            // runtime has to read it by (`make regression` is DevOrder's full
-            // end-to-end suite).
-            "make regression",
-            "just e2e",
-            "just regression",
-            "make acceptance",
-            "make e2e",
-            "make integration",
-            "make test-all",
-            "make run-tests",
-            "make acceptance-suite",
-            "sh run-tests.sh",
-            "cmd /c run-tests.cmd",
-            "./acceptance-test.sh",
-        ] {
-            assert!(is_test_command(command), "{command}");
-        }
-        for command in [
-            "cargo check",
-            "cargo build",
-            "cargo clippy --all-targets",
-            "go build ./...",
-            "npm run build",
-            "sh verify.sh",
-            "sh ./scripts/check.sh",
-            "grep -rn test src",
-            // An ordinary script, an install, and inline code are not a suite.
-            "python3 app.py",
-            "python3 -m pip install pytest",
-            "python3 -c \"print('test')\"",
-            // A build target that is not the suite: starting the services,
-            // reporting status, building, and a target whose name only
-            // contains a stem by accident.
-            "make up",
-            "make status",
-            "make build",
-            "make lint",
-            "make inspect",
-            "make prepare",
-        ] {
-            assert!(!is_test_command(command), "not a test suite: {command}");
-        }
-    }
-
-    /// A shell wrapper is still the command inside it when that command names
-    /// the standard runner (`bash -lc 'npm test'`). A repository's own suite
-    /// name inside a wrapper is NOT read: the runtime's label is the wrapper,
-    /// and it does not parse prose to guess what the script ran. The
-    /// requirement stays unproven instead, which is the honest answer — the
-    /// wrapper's body is not an execution record the gate can match.
-    #[test]
-    fn a_wrapped_runner_is_read_but_a_wrapped_suite_name_is_not_guessed() {
-        for wrapped in [
-            "bash -lc \"npm test\"",
-            "sh -c 'go test ./...'",
-            "bash -lc '/usr/bin/pytest -q'",
-            "pwsh -c 'cargo test --workspace'",
-        ] {
-            assert!(is_test_command(wrapped), "{wrapped}");
-        }
-        for not_evidence in [
-            "bash -lc \"make regression\"",
-            "sh -c 'just e2e'",
-            "sh ./scripts/lint.sh",
-            "bash ./scripts/check.sh",
-            "make lint",
-        ] {
-            assert!(!is_test_command(not_evidence), "{not_evidence}");
-        }
     }
 
     #[test]

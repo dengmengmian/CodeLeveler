@@ -43,7 +43,10 @@ pub use foreign_session_repo::{ForeignSessionOriginRecord, ForeignSessionOriginR
 pub use goal_checkpoint_store::{
     GoalCheckpointRecord, GoalCheckpointStore, MemoryGoalCheckpointStore, NewGoalCheckpoint,
 };
-pub use goal_store::{GoalIntentRecord, GoalRecord, GoalState, GoalStore, MemoryGoalStore};
+pub use goal_store::{
+    GoalIntentRecord, GoalRecord, GoalRequirementRecord, GoalState, GoalStore, MemoryGoalStore,
+    ScopeWriteError,
+};
 pub use message_repo::{MessageRepository, TimedMessage};
 pub use message_store::{
     MemoryMessageStore, MemoryModelRequestStore, MessageStore, ModelRequestStore,

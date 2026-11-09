@@ -1007,7 +1007,10 @@ async fn progressive_initial_surface_inventory() {
     // for the part of the effective acceptance set the prompt does not inline.
     // It replaces a silent truncation with a tool call, so the one added
     // definition buys back the scope the model would otherwise miss.
-    assert_eq!(initial.tools.len(), 19, "pinned initial surface grew");
+    // 20 (was 19): a Goal turn also offers `declare_scope`, the only writer of
+    // the structured requirement set the completion gate enforces. Without it
+    // the model can read the set but never record what the user asked for.
+    assert_eq!(initial.tools.len(), 20, "pinned initial surface grew");
     // 7000 (was 6800): the Goal completion contract now carries the
     // mechanical `verification` evidence field the runtime checks. That is
     // ~100 tokens on a surface already pinned; the alternative — a completion
@@ -1021,8 +1024,12 @@ async fn progressive_initial_surface_inventory() {
     // alternative is a model that cannot see the full effective scope at all;
     // keeping the budget at the old number would trade a real capability for
     // 140 tokens.
+    // 8600 (was 7500): `declare_scope` — the only writer of the structured
+    // requirement set the gate enforces — plus the op/field contract it must
+    // describe. The definition is ~700 tokens; the alternative is a scope the
+    // model can read but never declare, which is no scope at all.
     assert!(
-        schema_tokens <= 7500,
+        schema_tokens <= 8600,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());
