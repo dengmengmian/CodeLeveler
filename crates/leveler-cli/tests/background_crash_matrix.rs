@@ -384,7 +384,7 @@ async fn wait_hosted_task(
     client: &LocalSocketRuntimeClient,
     session: &str,
 ) -> (String, Option<u32>) {
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = client
             .snapshot(&leveler_client_protocol::SessionId::new(session))

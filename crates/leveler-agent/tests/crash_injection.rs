@@ -437,7 +437,16 @@ fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
     status.signal() == Some(9)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
+    // The crash point falls back to `abort()` where there is no `kill`; that
+    // terminates with STATUS_STACK_BUFFER_OVERRUN. It is an unclean death with
+    // no destructor, no flush and no recovery path, which is what the cut
+    // needs — the signal name is a Unix spelling of the same fact.
+    status.code() == Some(0xC000_0409u32 as i32)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
     let _ = status;
     false
