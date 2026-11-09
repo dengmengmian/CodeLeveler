@@ -287,13 +287,12 @@ pub(crate) const GET_GOAL_SCOPE_TOOL: &str = "get_goal_scope";
 pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: GET_GOAL_SCOPE_TOOL.to_string(),
-        description: "Read the effective acceptance set for this turn, page by page. Before a \
-            commit there is no goal row: the result is the candidate set `commit_task` will \
-            enforce, derived from the user's request. After the commit it is the goal's durable \
-            scope. The completion Gate uses exactly this set. Call it when the retained-facts \
-            block says more requirements exist than it expanded, before declaring completion \
-            when the task has many explicit deliverables, and before a `commit_task` whose \
-            request enumerates many deliverables. Read-only; it never changes the goal."
+        description: "Read the user scope the acceptance Gate enforces, page by page. Before \
+            commit_task this previews the exact set the acceptance list must cover; after \
+            registration it reads the committed goal's effective acceptance. Call it when the \
+            retained-facts block says more requirements exist than it expanded, or before \
+            writing an acceptance list for a task with many explicit deliverables. Read-only; \
+            it never registers or changes a goal."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -315,7 +314,7 @@ pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     }
 }
 
-pub(crate) fn commit_task_tool_definition(acceptance_limit: usize) -> ToolDefinition {
+pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Declare that the user's request is execution work this turn must carry \
             to completion, and commit the turn to the task lifecycle. Call it before the \
@@ -330,12 +329,17 @@ pub(crate) fn commit_task_tool_definition(acceptance_limit: usize) -> ToolDefini
             or verification check, a discussion, a single small fix, or when the user asked you \
             not to modify anything. If you are unsure whether this is execution work, do not \
             call it. `objective` is the user's stated end state, not a narrower version of it \
-            and never an enlargement of it. `acceptance` lists the concrete checks that will \
-            prove it. When the request enumerates many deliverables, call `get_goal_scope` \
-            first: it pages the exact set a commit is judged against. After the commit, the \
-            runtime keeps this turn running: a stage summary \
-            or a quiet end does NOT finish the task. Continue the work and resolve it with \
-            update_goal(complete|blocked). The session itself stays a Chat session.",
+            and never an enlargement of it; when the user's message itself is non-empty the \
+            runtime records that message as the durable objective, so `objective` is unused. \
+            `acceptance` lists the concrete checks that will prove it. Before a \
+            many-deliverable commit, call `get_goal_scope`: it pages the exact set the commit \
+            is judged against. After the commit, the \
+            runtime keeps this turn running: a stage summary or a quiet end does NOT finish the \
+            task. Continue the work and resolve it with update_goal(complete|blocked). Do not \
+            substitute update_plan for the acceptance contract: a plan records intended steps, \
+            not proof that the user's deliverables exist. This is not a Git commit: it records \
+            an execution task in CodeLeveler and does not stage, commit or alter repository \
+            files. The session itself stays a Chat session.",
     );
     ToolDefinition {
         name: COMMIT_TASK_TOOL.to_string(),
@@ -351,8 +355,8 @@ pub(crate) fn commit_task_tool_definition(acceptance_limit: usize) -> ToolDefini
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
-                    "maxItems": acceptance_limit,
-                    "description": "Concrete checks that will prove the objective. Every deliverable the user enumerated needs its own check; a commit that drops one is refused."
+                    "maxItems": 20,
+                    "description": "Concrete checks that will prove the objective. Cover every deliverable the user enumerated; one check may name several related deliverables. A commit that leaves an explicit deliverable uncovered is refused."
                 },
                 "task_relation": {
                     "type": "string",
@@ -1224,7 +1228,7 @@ mod tests {
     /// Keep it small and make the number visible to the performance record.
     #[test]
     fn commit_task_surface_stays_small() {
-        let tool = commit_task_tool_definition(20);
+        let tool = commit_task_tool_definition();
         let tokens = leveler_model::estimate_text(&tool.description)
             + leveler_model::estimate_text(&tool.input_schema.to_string());
         let guidance = leveler_model::estimate_text(TASK_COMMIT_GUIDANCE);
@@ -1233,20 +1237,19 @@ mod tests {
         assert!(guidance < 300, "task guidance grew to {guidance} tokens");
     }
 
-    /// Capacity is a property of the request, not a constant: the commit gate
-    /// extracts one requirement per deliverable, so the declaration must be
-    /// able to carry at least that many checks.
+    /// The acceptance list stays a bounded payload; scale is handled by
+    /// grouping related deliverables under one check, never by letting the
+    /// declaration grow with a possibly inflated extraction set.
     #[test]
-    fn commit_task_capacity_follows_the_requirement_set() {
-        let floor = commit_task_tool_definition(20);
-        let wide = commit_task_tool_definition(132);
-        assert_eq!(
-            floor.input_schema["properties"]["acceptance"]["maxItems"],
-            20
-        );
-        assert_eq!(
-            wide.input_schema["properties"]["acceptance"]["maxItems"],
-            132
+    fn commit_task_acceptance_capacity_stays_bounded_and_grouping_is_required() {
+        let tool = commit_task_tool_definition();
+        let acceptance = &tool.input_schema["properties"]["acceptance"];
+        assert_eq!(acceptance["maxItems"], 20);
+        assert!(
+            acceptance["description"].as_str().is_some_and(
+                |text| text.contains("one check may name several related deliverables")
+            ),
+            "the schema must state the grouping contract: {acceptance}"
         );
     }
 
@@ -1269,7 +1272,7 @@ mod tests {
     /// length, tool count, keyword list) may appear as the trigger.
     #[test]
     fn the_task_upgrade_needs_evidence_and_never_counts_words() {
-        let def = commit_task_tool_definition(20);
+        let def = commit_task_tool_definition();
         let rule = format!("{} {}", def.description, TASK_COMMIT_GUIDANCE);
         for required in [
             "perform work",

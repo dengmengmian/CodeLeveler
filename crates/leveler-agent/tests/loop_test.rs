@@ -506,7 +506,7 @@ async fn update_plan_tool_call_emits_a_plan_updated_event() {
     let plan = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("a successful update_plan call must emit PlanUpdated");
@@ -592,12 +592,34 @@ async fn consecutive_plan_declarations_advance_the_authoritative_state() {
     let plans: Vec<Vec<String>> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::PlanUpdated { steps } => {
+            AgentEvent::PlanUpdated { steps, .. } => {
                 Some(steps.iter().map(|s| s.status.clone()).collect())
             }
             _ => None,
         })
         .collect();
+    // The operation is decided against the runtime's own mirror: the first
+    // accepted declaration created the plan; every later one replaced it.
+    // The carrying call is named so the UI can label that exact row.
+    let operations: Vec<(bool, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanUpdated {
+                created, call_id, ..
+            } => Some((*created, call_id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        operations,
+        vec![
+            (true, Some("c1".to_string())),
+            (false, Some("c2".to_string())),
+            (false, Some("c3".to_string())),
+            (false, Some("c4".to_string())),
+        ],
+        "only the declaration that finds an empty mirror creates the plan"
+    );
     assert_eq!(
         plans,
         vec![
@@ -614,7 +636,7 @@ async fn consecutive_plan_declarations_advance_the_authoritative_state() {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("a plan declaration is projected");
@@ -681,7 +703,7 @@ async fn renamed_plan_steps_replace_the_declared_list_before_blocked_closeout() 
     let plans: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps),
             _ => None,
         })
         .collect();
@@ -787,7 +809,7 @@ async fn a_later_step_may_be_completed_while_an_earlier_one_is_still_open() {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("the declaration is recorded");
@@ -2756,7 +2778,7 @@ async fn the_reminder_never_changes_a_single_plan_status() {
         .run(
             "rewrite every file",
             &mut |e| {
-                if let AgentEvent::PlanUpdated { steps } = e {
+                if let AgentEvent::PlanUpdated { steps, .. } = e {
                     plans.push(steps);
                 }
             },
@@ -2817,7 +2839,7 @@ async fn a_resumed_turn_reactivates_the_persisted_plan_and_invents_no_other() {
         .run(
             "continue",
             &mut |e| {
-                if let AgentEvent::PlanUpdated { steps } = e {
+                if let AgentEvent::PlanUpdated { steps, .. } = e {
                     plans.push(steps);
                 }
             },
@@ -5041,7 +5063,7 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
         .iter()
         .rev()
         .find_map(|e| match e {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("the plan the model wrote must still be reported");
@@ -5160,7 +5182,7 @@ async fn chat_continues_when_its_own_plan_is_still_open() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("the plan the model declared is preserved");
@@ -5213,7 +5235,7 @@ async fn chat_ends_when_the_model_adjusts_its_plan_instead_of_doing_the_step() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .unwrap();
@@ -5226,7 +5248,7 @@ async fn chat_ends_when_the_model_adjusts_its_plan_instead_of_doing_the_step() {
     let declarations: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps),
             _ => None,
         })
         .collect();
@@ -5322,7 +5344,7 @@ async fn a_user_stage_pause_ends_the_turn_without_a_plan_nudge() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("the plan is preserved");
@@ -5479,7 +5501,7 @@ async fn a_model_claimed_confirmation_does_not_stop_an_authorized_task() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps.clone()),
             _ => None,
         })
         .expect("the plan is preserved");
@@ -5905,7 +5927,7 @@ async fn goal_completion_does_not_require_plan_reconciliation() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            AgentEvent::PlanUpdated { steps } => Some(steps),
+            AgentEvent::PlanUpdated { steps, .. } => Some(steps),
             _ => None,
         })
         .unwrap();

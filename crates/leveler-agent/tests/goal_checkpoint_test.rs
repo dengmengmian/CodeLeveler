@@ -491,7 +491,11 @@ async fn a_pre_compact_checkpoint_is_never_consumed_after_the_cut() {
             messages: vec![Message::text(Role::User, "compaction summary")],
             through_ordinal: Some(1),
         },
-        leveler_engine::EngineEvent::PlanUpdated { steps: vec![] },
+        leveler_engine::EngineEvent::PlanUpdated {
+            steps: vec![],
+            created: false,
+            call_id: None,
+        },
     ]
     .into_iter()
     .map(|e| e.to_row().unwrap())

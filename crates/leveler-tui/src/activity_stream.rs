@@ -2043,10 +2043,9 @@ fn unit_lines(
     // it that does not matter. The answer always gets its row.
     let fold_result = !expanded && call.status == ToolStatus::Ok && !is_user_decision_call(call);
     if fold_result {
-        let n = content_line_count(call);
-        if n > 0 {
-            let (pre, post) = split_placeholder(t.tool_output_lines);
-            let at_least = if preview_truncated(call) { "+" } else { "" };
+        if let Some((template, n, truncated)) = result_size_stat(call, t) {
+            let (pre, post) = split_placeholder(template);
+            let at_least = if truncated { "+" } else { "" };
             head.push(Span::styled(
                 format!(" · {pre}{n}{at_least}{post}"),
                 Style::default().fg(theme.ink(Ink::Meta)),
@@ -3541,10 +3540,9 @@ fn result_lines_for(
     if call.status == ToolStatus::Running {
         return Vec::new();
     }
-    let n = content_line_count(call);
-    if n == 0 {
+    let Some((template, n, truncated)) = result_size_stat(call, t) else {
         return Vec::new();
-    }
+    };
     // An interaction's result is the user's own words. Print them, not a line
     // count: "· 1 行" over a decision the user was asked to make tells them
     // how long their answer was and not what it said. A multi-question answer
@@ -3588,7 +3586,7 @@ fn result_lines_for(
         }
         return out;
     }
-    let (pre, post) = split_placeholder(t.tool_output_lines);
+    let (pre, post) = split_placeholder(template);
     // Collapsed, a success is worth one fact: how much came back. The first
     // content line is `package main` or a title comment often enough that
     // spending a whole row on it, for every read, forever, is not worth it —
@@ -3605,7 +3603,7 @@ fn result_lines_for(
     if let Some(first) = first {
         let count_w = UnicodeWidthStr::width(pre)
             + n.to_string().len()
-            + usize::from(preview_truncated(call))
+            + usize::from(truncated)
             + UnicodeWidthStr::width(post);
         let avail = width.saturating_sub(4 + count_w + 3 + 2).max(8);
         spans.push(Span::styled(
@@ -3622,7 +3620,7 @@ fn result_lines_for(
         Style::default().fg(theme.ink(Ink::Meta)),
     ));
     spans.push(Span::styled(
-        if preview_truncated(call) {
+        if truncated {
             format!("{n}+")
         } else {
             n.to_string()
@@ -3985,6 +3983,22 @@ fn content_line_count(call: &ToolCallBlock) -> usize {
     }
 }
 
+/// The size fact a finished success shows: the runtime's stored step count for
+/// a plan declaration, otherwise the lines of output that came back.
+///
+/// A plan's result body also lists its steps, so counting lines would fold a
+/// short explanation plus a prefix marker into the number. The step count is
+/// what the declaration actually recorded, and the runtime supplies it.
+fn result_size_stat(call: &ToolCallBlock, t: &UiText) -> Option<(&'static str, usize, bool)> {
+    if call.name == "update_plan"
+        && let Some(steps) = call.plan_steps
+    {
+        return Some((t.plan_steps, steps, false));
+    }
+    let n = content_line_count(call);
+    (n > 0).then(|| (t.tool_output_lines, n, preview_truncated(call)))
+}
+
 fn preview_line_count(call: &ToolCallBlock) -> usize {
     call.preview
         .as_deref()
@@ -4261,6 +4275,8 @@ pub(crate) fn child_activity_lines(
             stop: StopRequest::None,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         })
         .collect::<Vec<_>>();
     // Only the newest call can still be in flight. A call the child moved past
@@ -4472,6 +4488,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 
@@ -8393,6 +8411,8 @@ mod compact_command_tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 
@@ -8787,6 +8807,42 @@ mod compact_command_tests {
         // A batch child renders through the unit path instead; its count comes
         // from the same lines the expanded body shows.
         assert_eq!(content_line_count(&c), 1);
+    }
+
+    /// A plan's result body is the explanation plus one marker per step, so
+    /// counting its text lines reports neither the plan's size nor its work.
+    /// The runtime states the stored step count; the row shows that instead.
+    #[test]
+    fn a_plan_row_counts_stored_steps_not_result_lines() {
+        let mut c = cmd(
+            r#"{"plan":[{"step":"a"},{"step":"b"},{"step":"c"}]}"#,
+            ToolStatus::Ok,
+        );
+        c.name = "update_plan".into();
+        c.preview = Some("先把三件事列出来\n\n[ ] a\n[ ] b\n[ ] c\n".into());
+        c.duration_ms = Some(5);
+        c.plan_created = Some(true);
+        c.plan_steps = Some(3);
+        let rows = rows(c);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("创建计划"), "{rows:?}");
+        assert!(rows[0].contains("3 \u{6b65}"), "{rows:?}");
+        assert!(
+            !rows[0].contains("\u{884c}"),
+            "steps, not text lines: {rows:?}"
+        );
+    }
+
+    /// A session recorded before the fact has no step count; it keeps the
+    /// historical line count rather than inventing a number.
+    #[test]
+    fn a_legacy_plan_row_keeps_its_line_count() {
+        let mut c = cmd("{}", ToolStatus::Ok);
+        c.name = "update_plan".into();
+        c.preview = Some("[ ] a\n[ ] b\n".into());
+        c.plan_steps = None;
+        let rows = rows(c);
+        assert!(rows[0].contains("2 \u{884c}"), "{rows:?}");
     }
 
     #[test]

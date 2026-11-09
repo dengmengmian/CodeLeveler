@@ -186,7 +186,7 @@ where
                     }
                     RuntimeEvent::AssistantTextDelta { delta, .. } => facts.text.push_str(&delta),
                     RuntimeEvent::TurnCompleted => facts.terminal = Some("completed".into()),
-                    RuntimeEvent::TurnCompletedWithWarnings { reason } => {
+                    RuntimeEvent::TurnCompletedWithWarnings { reason, .. } => {
                         facts.terminal = Some(format!("completed_with_warnings: {reason}"))
                     }
                     RuntimeEvent::TurnAnswered => facts.terminal = Some("answered".into()),

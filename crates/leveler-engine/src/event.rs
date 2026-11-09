@@ -477,6 +477,17 @@ pub enum EngineEvent {
     /// not a delta; step text derives from the task/model output.
     PlanUpdated {
         steps: Vec<leveler_lifecycle::PlanStep>,
+        /// True when the declaration created the plan.
+        ///
+        /// Old events omit it. Their only available semantics is the previous
+        /// presentation (an update), so they decode as `false` rather than
+        /// inventing a creation fact the runtime never recorded.
+        #[serde(default)]
+        created: bool,
+        /// The tool call that carried the declaration; absent on a resume
+        /// seed and on every legacy event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     /// Read-only tombstone for retired durable-memory events in old sessions.
     /// Historical payloads do not participate in execution or presentation.

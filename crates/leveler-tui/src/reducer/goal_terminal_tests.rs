@@ -73,6 +73,82 @@ fn a_failed_turn_keeps_the_goal_failed() {
     );
 }
 
+/// A refused `commit_task` turn ends with an answer and a warning, not with a
+/// registered task. It must not settle a goal the user paused: the paused
+/// stage is still owed, and the warning belongs to this answer, not to the
+/// goal's lifecycle.
+#[test]
+fn an_unregistered_answer_does_not_complete_a_paused_goal() {
+    let mut state = state();
+    state.goal_mode_active = false;
+    state
+        .active_goal
+        .as_mut()
+        .expect("the paused goal stays visible")
+        .pause(Instant::now());
+
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TurnCompletedWithWarnings {
+            reason: "no execution task was registered: a commit_task declaration was refused"
+                .into(),
+            unregistered_task: true,
+        }),
+    );
+
+    let goal = state.active_goal.as_ref().expect("the goal stays visible");
+    assert_eq!(goal.phase(), GoalPhase::Paused);
+    assert!(
+        state.execution_task_active,
+        "the paused goal still owes the withheld stage"
+    );
+}
+
+/// A real Goal that passed its acceptance gate still completes even when the
+/// terminal carries an unrelated review/verification warning. Only the
+/// `unregistered_task` fact belongs to the refused-declaration path.
+#[test]
+fn a_completed_goal_with_a_review_warning_stays_completed() {
+    let mut state = state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TurnCompletedWithWarnings {
+            reason: "required independent review found two non-blocking findings".into(),
+            unregistered_task: false,
+        }),
+    );
+
+    let goal = state.active_goal.as_ref().expect("the goal stays visible");
+    assert_eq!(goal.phase(), GoalPhase::Completed);
+    assert!(
+        !state.execution_task_active,
+        "an accepted goal does not keep an owed-task badge"
+    );
+}
+
+/// An unregistered answer in a Chat turn says nothing about a running Goal it
+/// did not execute. Preserve the goal and the owed-task badge.
+#[test]
+fn an_unregistered_answer_leaves_a_running_goal_running() {
+    let mut state = state();
+    state.goal_mode_active = false;
+
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TurnCompletedWithWarnings {
+            reason: "no execution task was registered".into(),
+            unregistered_task: true,
+        }),
+    );
+
+    let goal = state.active_goal.as_ref().expect("the goal stays visible");
+    assert_eq!(goal.phase(), GoalPhase::Running);
+    assert!(
+        state.execution_task_active,
+        "the running goal still owes its work"
+    );
+}
+
 /// A user pause is not a completion. The turn answered inside the authorized
 /// range, so the terminal marker is an answer — but the goal still owes the
 /// withheld stage, so the header must say paused and the task must stay

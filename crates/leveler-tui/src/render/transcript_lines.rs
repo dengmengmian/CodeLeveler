@@ -771,6 +771,13 @@ pub(crate) fn turn_end_marker(
         // arrived — so it leads the receipt while still not claiming that the
         // task is done.
         TurnEndStatus::Answered => (format!("✓ {}", t.turn_end_answered), theme.status.success),
+        // The task was never registered. The turn did answer, so this is not a
+        // failure, but it is not a completion either: use the warning colour
+        // and name the missing registration in the label itself.
+        TurnEndStatus::AnsweredUnregistered => (
+            format!("⚠ {}", t.turn_end_answered_unregistered),
+            theme.status.warning,
+        ),
         TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Truncated => (
             format!("⚠ {}", t.final_completed_warnings),
             theme.status.warning,
@@ -836,6 +843,7 @@ fn turn_receipt_stats(block: &TurnEndBlock, t: &crate::i18n::UiText) -> String {
         TurnEndStatus::Completed
             | TurnEndStatus::CompletedWithWarnings
             | TurnEndStatus::Answered
+            | TurnEndStatus::AnsweredUnregistered
             | TurnEndStatus::NoFinalAnswer
     ) && let Some(summary) = &block.summary
         && !summary.is_empty()
@@ -860,7 +868,12 @@ fn turn_end_lines(
     let mut stats = turn_receipt_stats(block, t);
     let star = "* ";
     let mut detail_below = false;
-    if let Some(detail) = &block.detail {
+    let detail = if block.status == TurnEndStatus::AnsweredUnregistered {
+        Some(t.turn_unregistered_detail)
+    } else {
+        block.detail.as_deref()
+    };
+    if let Some(detail) = detail {
         let d = localized_turn_detail(detail, t);
         if !d.is_empty() {
             let prefix = UnicodeWidthStr::width(star)
@@ -905,7 +918,7 @@ fn turn_end_lines(
         }
         out.push(Line::from(spans));
     }
-    if detail_below && let Some(detail) = &block.detail {
+    if detail_below && let Some(detail) = detail {
         for line in wrap(
             localized_turn_detail(detail, t),
             width.saturating_sub(4).max(8),
@@ -3003,6 +3016,8 @@ mod tests {
                 started_elapsed_secs: 0,
                 applied_diff: None,
                 supersedes_refusal: false,
+                plan_created: None,
+                plan_steps: None,
             }],
             open: false,
             display: crate::fold::DisplayMode::Collapsed,

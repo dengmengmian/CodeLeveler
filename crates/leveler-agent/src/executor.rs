@@ -203,7 +203,16 @@ pub enum AgentEvent {
     Compacted { from: usize, to: usize },
     /// The model updated its structured plan via the `update_plan` tool. The
     /// full step list replaces any previous plan (not a delta).
-    PlanUpdated { steps: Vec<PlanStep> },
+    PlanUpdated {
+        steps: Vec<PlanStep>,
+        /// True when this declaration created the plan: the executor's plan
+        /// mirror was empty before the declaration. A later declaration is an
+        /// update, even when it rewrites every step.
+        created: bool,
+        /// The tool call that carried the declaration. A resume seed re-emits
+        /// the persisted plan without a call, so it carries `None`.
+        call_id: Option<String>,
+    },
     /// Exact message list the next model request will see. Emitted at a round
     /// boundary so crash recovery does not reconstruct a different context.
     ContextSnapshot {

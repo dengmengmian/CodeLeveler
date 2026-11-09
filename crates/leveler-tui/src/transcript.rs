@@ -172,6 +172,15 @@ pub struct ToolCallBlock {
     /// last goal state the user read. Set from event order at completion, so a
     /// replayed history reaches the same conclusion.
     pub supersedes_refusal: bool,
+    /// For `update_plan`: whether this call created the plan (`Some(true)`) or
+    /// replaced an existing one (`Some(false)`). `None` for every other call
+    /// and for blocks whose runtime event carried no operation fact (legacy
+    /// sessions recorded before the fact existed).
+    pub plan_created: Option<bool>,
+    /// For `update_plan`: how many steps the runtime recorded for this
+    /// declaration. `None` for every other call and for legacy events; the
+    /// row then falls back to its historical line count.
+    pub plan_steps: Option<usize>,
 }
 
 /// A burst of tool calls belonging to one execution round.
@@ -215,6 +224,10 @@ pub enum TurnEndStatus {
     Completed,
     CompletedWithWarnings,
     Answered,
+    /// The turn answered, but its `commit_task` declaration was refused, so
+    /// no durable task was registered. This is not a Goal terminal: a paused
+    /// or running Goal remains exactly as it was.
+    AnsweredUnregistered,
     Truncated,
     Incomplete,
     /// The loop reached a clean end without committing an answer.
@@ -1386,6 +1399,8 @@ impl TranscriptState {
             applied_diff: None,
             batch: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         if let Some(TranscriptItem::ToolGroup(group)) = self.items.last()
             && group.open
@@ -1421,6 +1436,20 @@ impl TranscriptState {
         self.bump();
         if let Some(call) = self.tool_call_mut(id) {
             call.started_elapsed_secs = started_elapsed_secs;
+        }
+    }
+
+    /// Record the plan declaration this call carried: whether it created the
+    /// plan or replaced an existing one, and how many steps the runtime stored.
+    ///
+    /// The facts come from the runtime's own plan mirror; the client never
+    /// infers them from transcript order. A block whose runtime event predates
+    /// the facts keeps `None` and renders the historical label.
+    pub fn set_plan_fact(&mut self, id: &ToolCallId, created: bool, steps: usize) {
+        self.bump();
+        if let Some(call) = self.tool_call_mut(id) {
+            call.plan_created = Some(created);
+            call.plan_steps = Some(steps);
         }
     }
 
@@ -3709,6 +3738,8 @@ mod tests {
                 started_elapsed_secs: 0,
                 applied_diff: None,
                 supersedes_refusal: false,
+                plan_created: None,
+                plan_steps: None,
             }],
             open: false,
             display: if expanded {

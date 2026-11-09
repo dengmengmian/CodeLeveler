@@ -863,6 +863,14 @@ pub(crate) fn call_state_label(
             ToolStatus::Failed => t.delegation_failed.to_string(),
             _ => t.delegation_created.to_string(),
         },
+        // The runtime decides the operation against its own plan mirror: the
+        // first declaration creates the plan, every later one replaces it.
+        // The client never infers this from transcript order.
+        "update_plan" => match block.plan_created {
+            Some(true) => t.plan_created.to_string(),
+            Some(false) => t.plan_updated.to_string(),
+            None => tool_call_label(&block.name, &block.arguments, locale),
+        },
         _ => tool_call_label(&block.name, &block.arguments, locale),
     }
 }
@@ -1666,6 +1674,8 @@ mod m1_tests {
             started_elapsed_secs: 0,
             applied_diff: applied.map(str::to_string),
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 
@@ -1901,6 +1911,8 @@ mod m1_tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         tool_lines(&block, &theme, 80, true, t, &mut out);
         let text: String = out
@@ -2288,6 +2300,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2332,6 +2346,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 
@@ -2354,6 +2370,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 
@@ -2536,6 +2554,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2588,6 +2608,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2635,6 +2657,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -2691,6 +2715,8 @@ mod tests {
                 started_elapsed_secs: 0,
                 applied_diff: None,
                 supersedes_refusal: false,
+                plan_created: None,
+                plan_steps: None,
             };
             let mut out = Vec::new();
             tool_lines(
@@ -2763,6 +2789,8 @@ mod tests {
                 started_elapsed_secs: 0,
                 applied_diff: None,
                 supersedes_refusal: false,
+                plan_created: None,
+                plan_steps: None,
             };
             let mut out = Vec::new();
             tool_lines(
@@ -2905,6 +2933,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         };
         let mut out = Vec::new();
         tool_lines(
@@ -3129,6 +3159,8 @@ mod diff_render_tests {
             started_elapsed_secs: 0,
             applied_diff: applied.map(str::to_string),
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 
@@ -3559,5 +3591,79 @@ index 1111111..2222222 100644
         let text = plain(&out);
         assert!(text.iter().any(|r| r.contains("context not found")));
         assert!(!text.iter().any(|r| r.contains("│")));
+    }
+
+    /// The runtime records whether a declaration created the plan or replaced
+    /// one; the row states that operation instead of calling every
+    /// declaration an update. A legacy row that carries no fact keeps the
+    /// label its runtime actually showed.
+    #[test]
+    fn a_plan_row_names_the_operation_the_runtime_recorded() {
+        let mut block = plan_block(Some(true), Some(3));
+        let zh = crate::i18n::Locale::Zh.text();
+        assert_eq!(
+            call_state_label(&block, crate::i18n::Locale::Zh, zh),
+            "创建计划"
+        );
+        block.plan_created = Some(false);
+        assert_eq!(
+            call_state_label(&block, crate::i18n::Locale::Zh, zh),
+            "更新计划"
+        );
+        block.plan_created = None;
+        assert_eq!(
+            call_state_label(&block, crate::i18n::Locale::Zh, zh),
+            "更新计划",
+            "a pre-fact session keeps its historical label"
+        );
+        assert_eq!(
+            call_state_label(
+                &block,
+                crate::i18n::Locale::En,
+                crate::i18n::Locale::En.text()
+            ),
+            "Plan",
+            "the English fallback is neutral, not a made-up update"
+        );
+    }
+
+    #[test]
+    fn a_created_plan_row_renders_its_operation() {
+        let block = plan_block(Some(true), Some(3));
+        let mut out = Vec::new();
+        tool_lines(
+            &block,
+            &Theme::no_color(),
+            80,
+            false,
+            crate::i18n::Locale::Zh.text(),
+            &mut out,
+        );
+        let text = plain(&out);
+        assert!(text[0].contains("创建计划"), "{text:?}");
+    }
+
+    fn plan_block(created: Option<bool>, steps: Option<usize>) -> ToolCallBlock {
+        ToolCallBlock {
+            timing: None,
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: Default::default(),
+            id: leveler_client_protocol::ToolCallId::new("p1"),
+            name: "update_plan".to_string(),
+            arguments: r#"{"explanation":"安排三步"}"#.to_string(),
+            status: ToolStatus::Ok,
+            preview: Some("[ ] a\n[ ] b\n[ ] c\n".to_string()),
+            duration_ms: Some(5),
+            parallel: false,
+            batch: None,
+            started_elapsed_secs: 0,
+            applied_diff: None,
+            supersedes_refusal: false,
+            plan_created: created,
+            plan_steps: steps,
+        }
     }
 }

@@ -6,8 +6,8 @@ use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
     AnswerEffect, ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId,
     NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall,
-    UiApprovalRequest, UiCheckpoint, UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole,
-    UiSessionSnapshot, UiThinkingAccess, UiThinkingState,
+    UiApprovalRequest, UiCheckpoint, UiCompletionReport, UiMessage, UiPlan, UiPlanState,
+    UiPlanStep, UiRole, UiSessionSnapshot, UiThinkingAccess, UiThinkingState,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::btw::{BtwToolState, BtwTurnState, SurfaceFocus};
@@ -4760,6 +4760,8 @@ fn plan_events_update_state() {
                 }],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         }),
     );
     assert_eq!(s.plan.as_ref().unwrap().steps[0].description, "定位代码");
@@ -4818,6 +4820,8 @@ fn successive_plan_events_advance_the_mirrored_plan() {
             &mut s,
             Action::Runtime(RuntimeEvent::PlanUpdated {
                 plan: plan(statuses),
+                created: false,
+                call_id: None,
             }),
         );
     }
@@ -9861,6 +9865,8 @@ fn a_plan_transition_is_on_screen_in_the_next_frame() {
                 ],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         })
     };
     reduce(&mut s, plan(P::Running, P::Pending, P::Pending));
@@ -9911,6 +9917,8 @@ fn a_settling_sub_agent_never_advances_the_plan_by_itself() {
                 ],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         }),
     );
     reduce(
@@ -9962,6 +9970,8 @@ fn the_parent_advancing_after_a_child_settles_projects_normally() {
                 ],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         })
     };
     reduce(&mut s, plan(P::Running, P::Pending));
@@ -10015,6 +10025,8 @@ fn stale_open_plan(s: &mut AppState) {
                     .collect(),
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         }),
     );
 }
@@ -10055,6 +10067,8 @@ fn a_completed_plan_disappears_when_the_turn_ends() {
                 ],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         }),
     );
     answer(&mut s, "m-final", "完成。");
@@ -11431,6 +11445,34 @@ fn an_idle_snapshot_never_restores_a_failed_plan_as_active() {
     );
 }
 
+/// A runtime killed mid-turn never writes a task terminal, so its last plan
+/// is projected as `Active` from the log. An idle snapshot must not adopt it:
+/// nothing is running, and reviving the checklist would show work that no
+/// process is advancing. The log's `Active` means "no terminal recorded", not
+/// "a runtime is working on it now".
+#[test]
+fn an_idle_snapshot_does_not_revive_a_crashed_turns_plan() {
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.status = "idle".into();
+    snap.plan = Some(plan_of(&[
+        ("finish the migration", PlanStepStatus::Pending),
+        ("run the suites", PlanStepStatus::Pending),
+    ]));
+    assert_eq!(snap.plan.as_ref().unwrap().state, UiPlanState::Active);
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+
+    assert!(
+        s.plan.is_none(),
+        "a crashed turn's plan is history, not live work: {:?}",
+        s.plan
+    );
+}
+
 #[test]
 fn history_replay_does_not_overwrite_the_plan_the_snapshot_restored() {
     let mut s = state();
@@ -11466,6 +11508,8 @@ fn history_replay_does_not_overwrite_the_plan_the_snapshot_restored() {
                         ("a stale step from an older turn", PlanStepStatus::Pending),
                         ("another stale step", PlanStepStatus::Pending),
                     ]),
+                    created: false,
+                    call_id: None,
                 },
             }],
         }),

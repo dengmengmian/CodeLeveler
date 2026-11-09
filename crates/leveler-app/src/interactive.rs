@@ -8886,7 +8886,7 @@ async fn projected_plan(
     let steps = match leveler_engine::EngineEvent::from_payload(&row.payload)
         .map_err(|e| ClientError::Runtime(e.to_string()))?
     {
-        leveler_engine::EngineEvent::PlanUpdated { steps } => steps,
+        leveler_engine::EngineEvent::PlanUpdated { steps, .. } => steps,
         _ => {
             return Err(ClientError::Runtime(
                 "plan_updated row carried a different event".into(),
@@ -9410,7 +9410,11 @@ fn epoch_event_rows(
         leveler_engine::EngineEvent::ProgressUpdated {
             ledger: leveler_lifecycle::ProgressLedger::new_context_epoch(),
         },
-        leveler_engine::EngineEvent::PlanUpdated { steps: vec![] },
+        leveler_engine::EngineEvent::PlanUpdated {
+            steps: vec![],
+            created: false,
+            call_id: None,
+        },
         leveler_engine::EngineEvent::EvidenceLedgerUpdated {
             ledger: leveler_lifecycle::EvidenceLedger::default(),
         },

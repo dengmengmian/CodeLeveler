@@ -148,7 +148,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
                 }
             }
         }
-        RuntimeEvent::PlanUpdated { plan } => view.plan = Some(plan.clone()),
+        RuntimeEvent::PlanUpdated { plan, .. } => view.plan = Some(plan.clone()),
         RuntimeEvent::ContextUsage { accounting } => {
             view.context_usage = Some(accounting.clone());
         }
@@ -420,6 +420,7 @@ mod tests {
             RuntimeEvent::TurnCompleted,
             RuntimeEvent::TurnCompletedWithWarnings {
                 reason: "warning".to_string(),
+                unregistered_task: false,
             },
             RuntimeEvent::TurnAnswered,
             RuntimeEvent::TurnTruncated {
@@ -439,7 +440,14 @@ mod tests {
         for terminal in terminal_events {
             let session_id = SessionId::new("s1");
             let views = LiveViews::default();
-            views.apply(&session_id, &RuntimeEvent::PlanUpdated { plan: plan() });
+            views.apply(
+                &session_id,
+                &RuntimeEvent::PlanUpdated {
+                    plan: plan(),
+                    created: false,
+                    call_id: None,
+                },
+            );
             assert!(views.view(&session_id).plan.is_some());
 
             views.apply(&session_id, &terminal);
@@ -477,6 +485,8 @@ mod task_cancel_cleanup_tests {
                     steps: Vec::new(),
                     state: Default::default(),
                 },
+                created: false,
+                call_id: None,
             },
         );
         views.apply(
@@ -519,6 +529,8 @@ mod task_cancel_cleanup_tests {
                     steps: Vec::new(),
                     state: Default::default(),
                 },
+                created: false,
+                call_id: None,
             },
         );
         views.apply(&session_id, &RuntimeEvent::ContextUsage { accounting });

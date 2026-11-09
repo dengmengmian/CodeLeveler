@@ -390,7 +390,7 @@ async fn collect_turn(
                     turn.outcome = "completed".into();
                     return turn;
                 }
-                RuntimeEvent::TurnCompletedWithWarnings { reason } => {
+                RuntimeEvent::TurnCompletedWithWarnings { reason, .. } => {
                     turn.outcome = format!("completed_with_warnings: {reason}");
                     return turn;
                 }
@@ -2063,7 +2063,7 @@ async fn watch_kill_task(
                     watch.outcome = "completed".into();
                     return watch;
                 }
-                RuntimeEvent::TurnCompletedWithWarnings { reason } => {
+                RuntimeEvent::TurnCompletedWithWarnings { reason, .. } => {
                     watch.outcome = format!("completed_with_warnings: {reason}");
                     return watch;
                 }

@@ -92,6 +92,7 @@ fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
         TurnEndStatus::NoFinalAnswer
         | TurnEndStatus::Truncated
         | TurnEndStatus::Incomplete
+        | TurnEndStatus::AnsweredUnregistered
         | TurnEndStatus::Failed
         | TurnEndStatus::Cancelled => TerminalTaskStatus::Failed,
     }

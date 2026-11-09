@@ -2276,6 +2276,18 @@
             "type"
           ],
           "properties": {
+            "call_id": {
+              "description": "The tool call that carried the declaration; absent on a resume seed and on legacy events. Clients use it to label the matching row.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "created": {
+              "description": "True when the declaration created the plan, false when it replaced an existing one. Legacy events omit it and decode as an update, which is the only presentation their runtime ever had.",
+              "default": false,
+              "type": "boolean"
+            },
             "plan": {
               "$ref": "#/definitions/UiPlan"
             },
@@ -2866,7 +2878,7 @@
           }
         },
         {
-          "description": "The work completed and project verification retains its own result, but a separate required completion contract produced warnings.",
+          "description": "The work completed and project verification retains its own result, but a separate required completion contract produced warnings.\n\n`unregistered_task` is a structured terminal fact, not a reading of `reason`: the turn was an answer whose `commit_task` declaration was refused, so no durable task was registered. It must never settle a Goal. Omitted on legacy events, where the old semantics apply.",
           "type": "object",
           "required": [
             "reason",
@@ -2881,6 +2893,10 @@
               "enum": [
                 "turn_completed_with_warnings"
               ]
+            },
+            "unregistered_task": {
+              "default": false,
+              "type": "boolean"
             }
           }
         },

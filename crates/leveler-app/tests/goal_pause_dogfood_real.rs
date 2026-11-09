@@ -92,7 +92,7 @@ async fn run_turn(
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(left, events.recv()).await {
             Ok(Ok(RuntimeEvent::ToolCallStarted { name, .. })) => facts.tools.push(name),
-            Ok(Ok(RuntimeEvent::PlanUpdated { plan })) => facts.plans.push(
+            Ok(Ok(RuntimeEvent::PlanUpdated { plan, .. })) => facts.plans.push(
                 plan.steps
                     .iter()
                     .map(|step| {
@@ -120,7 +120,7 @@ async fn run_turn(
                 facts.terminal = true;
                 facts.outcome = Some("completed".into());
             }
-            Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })) => {
+            Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { reason, .. })) => {
                 facts.terminal = true;
                 facts.outcome = Some(format!("completed_with_warnings: {reason}"));
             }

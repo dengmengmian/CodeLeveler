@@ -857,6 +857,8 @@ fn a_plan_transition_repaints_on_the_same_frame() {
                 ],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         })
     };
     // Plan updates arrive while a turn runs.
@@ -901,6 +903,8 @@ fn renders_plan_chrome_and_diff_screen() {
                 }],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         }),
     );
     reduce(

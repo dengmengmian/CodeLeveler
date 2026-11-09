@@ -269,6 +269,8 @@ fn tui_session_commands_ui_and_logic() {
                 ],
                 state: Default::default(),
             },
+            created: false,
+            call_id: None,
         }),
     );
     assert!(

@@ -506,11 +506,22 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let chunk = leveler_core::sanitize_terminal_output(&chunk);
             state.transcript.append_tool_output(&id, &chunk);
         }
-        RuntimeEvent::PlanUpdated { plan } => {
+        RuntimeEvent::PlanUpdated {
+            plan,
+            created,
+            call_id,
+        } => {
             // This is the runtime's latest declaration for the active turn.
             // Rendering may hide the indicator (a settled plan outside a
             // running turn), but the reducer keeps the exact value until the
             // terminal transition archives it.
+            if let Some(call_id) = call_id {
+                state.transcript.set_plan_fact(
+                    &leveler_client_protocol::ToolCallId::new(call_id),
+                    created,
+                    plan.steps.len(),
+                );
+            }
             if !crate::workbench::plan_indicator_should_show(&plan, state.is_busy())
                 && state.workbench_focus == crate::state::WorkbenchFocus::Plan
             {
@@ -692,8 +703,16 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::TurnCompleted => {
             finish_turn(state, TurnEndStatus::Completed, None);
         }
-        RuntimeEvent::TurnCompletedWithWarnings { reason } => {
-            finish_turn(state, TurnEndStatus::CompletedWithWarnings, Some(reason));
+        RuntimeEvent::TurnCompletedWithWarnings {
+            reason,
+            unregistered_task,
+        } => {
+            let status = if unregistered_task {
+                TurnEndStatus::AnsweredUnregistered
+            } else {
+                TurnEndStatus::CompletedWithWarnings
+            };
+            finish_turn(state, status, Some(reason));
         }
         RuntimeEvent::TurnAnswered => {
             finish_turn(state, TurnEndStatus::Answered, None);
@@ -1601,6 +1620,11 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     state.status = RuntimeStatus::Idle;
     state.finalization_stage = None;
     state.resumable_task = false;
+    // An unregistered answer is not a Goal terminal. Keep the pause
+    // resumable so the user can still continue the work the goal owes.
+    if matches!(status, TurnEndStatus::AnsweredUnregistered) && paused_owed {
+        state.resumable_task = true;
+    }
     clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
@@ -1610,8 +1634,13 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // outcomes that render as done are rewritten — an Incomplete or Failed turn
     // already says something went wrong.
     let answered = state.transcript.settle_final_answer();
+    let unregistered = matches!(status, TurnEndStatus::AnsweredUnregistered);
     let status = match status {
-        TurnEndStatus::Completed | TurnEndStatus::Answered if !answered => {
+        TurnEndStatus::Completed
+        | TurnEndStatus::Answered
+        | TurnEndStatus::AnsweredUnregistered
+            if !answered =>
+        {
             TurnEndStatus::NoFinalAnswer
         }
         other => other,
@@ -1630,7 +1659,11 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // have to act on (red) never hides on a timer.
     if let Some(goal) = state.active_goal.as_mut() {
         let now = std::time::Instant::now();
-        if goal_completed {
+        if unregistered {
+            // The refusal belongs to this answer, not to the Goal. Leave the
+            // goal's phase untouched: a paused goal stays paused, a running
+            // goal stays running, and an already-completed goal stays green.
+        } else if goal_completed {
             goal.complete(now);
         } else if paused_owed {
             // The user's pause is still the last word about this goal, whatever
@@ -1643,6 +1676,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
                     goal.pause(now)
                 }
                 TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
+                TurnEndStatus::AnsweredUnregistered => {}
                 TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings => {
                     goal.complete(now)
                 }

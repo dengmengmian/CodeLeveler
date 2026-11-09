@@ -448,7 +448,18 @@ pub enum RuntimeEvent {
         chunk: String,
     },
     /// The execution plan was created or a step's status changed (spec §20).
-    PlanUpdated { plan: UiPlan },
+    PlanUpdated {
+        plan: UiPlan,
+        /// True when the declaration created the plan, false when it replaced
+        /// an existing one. Legacy events omit it and decode as an update,
+        /// which is the only presentation their runtime ever had.
+        #[serde(default)]
+        created: bool,
+        /// The tool call that carried the declaration; absent on a resume seed
+        /// and on legacy events. Clients use it to label the matching row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+    },
     /// The working-tree diff changed or was explicitly requested (spec §21).
     DiffUpdated {
         /// Present only for a `RequestDiff` response. `None` is an
@@ -606,7 +617,16 @@ pub enum RuntimeEvent {
     TurnCompleted,
     /// The work completed and project verification retains its own result,
     /// but a separate required completion contract produced warnings.
-    TurnCompletedWithWarnings { reason: String },
+    ///
+    /// `unregistered_task` is a structured terminal fact, not a reading of
+    /// `reason`: the turn was an answer whose `commit_task` declaration was
+    /// refused, so no durable task was registered. It must never settle a
+    /// Goal. Omitted on legacy events, where the old semantics apply.
+    TurnCompletedWithWarnings {
+        reason: String,
+        #[serde(default)]
+        unregistered_task: bool,
+    },
     /// The assistant naturally finished its answer, without claiming that an
     /// external task was independently verified as complete.
     TurnAnswered,
@@ -1408,9 +1428,36 @@ mod tests {
                     }],
                     state: Default::default(),
                 },
+                created: true,
+                call_id: Some("call_1".to_string()),
             },
             "plan_updated",
         );
+    }
+
+    /// A legacy plan event carries neither the creation/update operation nor
+    /// the originating tool call. A reader must decode both as unknown, never
+    /// infer that an old payload proves either fact.
+    #[test]
+    fn a_legacy_plan_updated_decodes_without_an_operation_or_call() {
+        let json = serde_json::json!({
+            "type": "plan_updated",
+            "plan": {
+                "steps": [{ "index": 0, "description": "step", "status": "running" }],
+            },
+        });
+        match serde_json::from_value::<RuntimeEvent>(json).unwrap() {
+            RuntimeEvent::PlanUpdated {
+                created,
+                call_id,
+                plan,
+            } => {
+                assert!(!created);
+                assert_eq!(call_id, None);
+                assert_eq!(plan.steps.len(), 1);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
@@ -1625,6 +1672,33 @@ mod tests {
     #[test]
     fn turn_completed_roundtrips() {
         roundtrip(RuntimeEvent::TurnCompleted, "turn_completed");
+    }
+
+    #[test]
+    fn turn_completed_with_warnings_roundtrips() {
+        roundtrip(
+            RuntimeEvent::TurnCompletedWithWarnings {
+                reason: "completion review required".to_string(),
+                unregistered_task: true,
+            },
+            "turn_completed_with_warnings",
+        );
+    }
+
+    /// A warning recorded before the `unregistered_task` fact existed cannot
+    /// prove that a task was unregistered; it decodes with the legacy meaning.
+    #[test]
+    fn a_legacy_warning_event_does_not_claim_an_unregistered_task() {
+        let json = serde_json::json!({
+            "type": "turn_completed_with_warnings",
+            "reason": "completion review required",
+        });
+        match serde_json::from_value::<RuntimeEvent>(json).unwrap() {
+            RuntimeEvent::TurnCompletedWithWarnings {
+                unregistered_task, ..
+            } => assert!(!unregistered_task),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
