@@ -393,7 +393,7 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             },
                             "text": {
                                 "type": "string",
-                                "description": "The requirement in the user's terms. Required for add and replace; optional for amend."
+                                "description": "For `content`, the exact line the target must contain — not a description of it. Otherwise the requirement in the user's terms. Required for add and replace; optional for amend."
                             },
                             "target": {
                                 "type": "string",
@@ -594,7 +594,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                             },
                             "text": {
                                 "type": "string",
-                                "description": "The requirement in the user's terms."
+                                "description": "For `content`, the exact line the target must contain — not a description of it. Otherwise the requirement in the user's terms."
                             },
                             "target": {
                                 "type": "string",

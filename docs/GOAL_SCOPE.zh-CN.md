@@ -39,7 +39,8 @@ quote 只证明来源存在，不证明模型的解释正确；原始用户消�
 `forbidden`、`baseline`、`preparation`、`constraint`。交付类是 Gate 会追究的
 种类；`forbidden`、`baseline`、`preparation`、`constraint` 是模型必须遵守、
 但不能被「完成」的上下文。`artifact`、`artifact_absent`、`content`、`command`
-必须提供 `target`。
+必须提供 `target`。`content` 的 `text` 是 Gate 与 `target` 逐行比对的字面内容
+本身；若写成对该行的描述，Gate 会拒绝并要求模型 amend `text`，而不是继续改文件。
 
 ## 声明方式
 
