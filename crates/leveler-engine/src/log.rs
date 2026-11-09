@@ -1876,4 +1876,96 @@ mod tests {
             "diagnostics must not echo payload bytes: {msg}"
         );
     }
+
+    /// A task terminal written before the structured verification report
+    /// existed still replays. The field is additive: an old row means "no
+    /// report", not "unreplayable", and a resumed session must not lose its
+    /// history over it.
+    #[tokio::test]
+    async fn a_task_terminal_written_before_the_verification_report_still_replays() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let log = EventLog::new(&store, session.clone());
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: None,
+            sequence: 1,
+            event_type: "task_finished".to_string(),
+            payload: r#"{"type":"task_finished","payload":{"outcome":"completed","reason":null,"failure":null,"stop":null,"warnings":[]}}"#.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
+
+        let replayed = log.replay().await.expect("a legacy terminal must replay");
+        assert!(matches!(
+            &replayed[0],
+            EngineEvent::TaskFinished {
+                outcome: crate::TaskOutcome::Completed,
+                verification: None,
+                ..
+            }
+        ));
+    }
+
+    /// Before 2026-09-23 the terminal carried the host-owned verification
+    /// verdict as a bare string under the same field name. That verdict is not
+    /// a report and no longer carries authority, so it reads as "no report" —
+    /// but the row must still replay. Reusing the name must not make a
+    /// previously readable session unreadable.
+    #[tokio::test]
+    async fn a_task_terminal_with_the_legacy_verification_string_still_replays() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let log = EventLog::new(&store, session.clone());
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: None,
+            sequence: 1,
+            event_type: "task_finished".to_string(),
+            payload: r#"{"payload":{"outcome":"completed","reason":null,"stop":"answered","verification":"not_run"},"type":"task_finished"}"#.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
+
+        let replayed = log.replay().await.expect("a legacy terminal must replay");
+        assert!(matches!(
+            &replayed[0],
+            EngineEvent::TaskFinished {
+                outcome: crate::TaskOutcome::Completed,
+                verification: None,
+                ..
+            }
+        ));
+    }
+
+    /// A malformed structured report is still a corrupt row. The legacy
+    /// string tolerance above must not turn every decode error into "no
+    /// report".
+    #[tokio::test]
+    async fn a_malformed_verification_report_still_fails_closed() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let log = EventLog::new(&store, session.clone());
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: None,
+            sequence: 1,
+            event_type: "task_finished".to_string(),
+            payload: r#"{"payload":{"outcome":"completed","reason":null,"stop":null,"verification":{"status":"bogus","records":[]}},"type":"task_finished"}"#.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
+
+        let error = log
+            .replay()
+            .await
+            .expect_err("a malformed report must fail closed");
+        assert!(
+            error.to_string().contains("task_finished"),
+            "the error must name the row type: {error}"
+        );
+    }
 }

@@ -160,6 +160,13 @@ carries the evidence fields only when a recorded execution backed it; otherwise
 could not check. `workspace_version` is the mutation counter the verdict was
 taken against, so a stale verdict is visible without replaying the transcript.
 
+Replay is additive. Terminals written before 2026-09-23 carry the removed
+host-owned verdict as a bare string under the same field
+(`"verification": "not_run"`); that value is not a report and decodes as no
+report, so the old session still replays. A structured object is parsed
+strictly: a malformed report still fails the whole replay instead of silently
+becoming "no report".
+
 The four user-visible outcomes are projections of two facts, not a separate
 computed verdict:
 

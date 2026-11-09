@@ -1192,6 +1192,164 @@ async fn an_unverified_completion_is_accepted_and_records_the_boundary() {
     assert!(record.command.is_none());
 }
 
+/// The requirement contract is language-independent. The model reads the
+/// user's message and declares the same structure; the runtime only checks the
+/// quote, the identity and the execution record. Chinese, English, Japanese,
+/// German, Spanish and mixed input take one path because no word list exists.
+#[tokio::test]
+async fn the_same_requirement_contract_holds_in_any_language() {
+    struct Case {
+        label: &'static str,
+        objective: &'static str,
+        quote: &'static str,
+        requirement: &'static str,
+    }
+    let cases = [
+        Case {
+            label: "zh",
+            objective: "完成文章发布，完成后运行 sh run-tests.sh 并确保通过",
+            quote: "完成后运行 sh run-tests.sh 并确保通过",
+            requirement: "sh run-tests.sh 通过",
+        },
+        Case {
+            label: "en",
+            objective: "Implement the publisher and run sh run-tests.sh before calling it done.",
+            quote: "run sh run-tests.sh before calling it done",
+            requirement: "sh run-tests.sh passes",
+        },
+        Case {
+            label: "ja",
+            objective: "公開機能を実装し、完了前に sh run-tests.sh を実行して成功させてください。",
+            quote: "完了前に sh run-tests.sh を実行して成功させてください",
+            requirement: "sh run-tests.sh が成功する",
+        },
+        Case {
+            label: "de",
+            objective: "Implementiere den Publisher und führe vor dem Abschluss sh run-tests.sh aus.",
+            quote: "führe vor dem Abschluss sh run-tests.sh aus",
+            requirement: "sh run-tests.sh ist erfolgreich",
+        },
+        Case {
+            label: "es",
+            objective: "Implementa el publicador y ejecuta sh run-tests.sh antes de terminar.",
+            quote: "ejecuta sh run-tests.sh antes de terminar",
+            requirement: "sh run-tests.sh pasa",
+        },
+        Case {
+            label: "mixed",
+            objective: "实现发布功能 then run sh run-tests.sh 确保通过",
+            quote: "run sh run-tests.sh 确保通过",
+            requirement: "sh run-tests.sh 通过",
+        },
+    ];
+
+    for case in cases {
+        let fx = fixture(
+            vec![
+                Scripted::Tool(
+                    "commit_task",
+                    serde_json::json!({
+                        "objective": case.objective,
+                        "acceptance": [case.requirement],
+                        "requirements": [{
+                            "kind": "tests",
+                            "text": case.requirement,
+                            "source_quote": case.quote
+                        }]
+                    }),
+                ),
+                Scripted::run_tests(),
+                Scripted::Tool(
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "done",
+                        "verification": {"status": "passed", "detail": test_runner_label()},
+                        "requirements": [
+                            {"id": "R1", "status": "done", "evidence": "call_id:call-2"}
+                        ]
+                    }),
+                ),
+            ],
+            false,
+        )
+        .await;
+
+        let report = chat_with_request(&fx, case.objective, CancellationToken::new()).await;
+        assert_eq!(
+            report.outcome,
+            leveler_lifecycle::TaskOutcome::Completed,
+            "{}: {report:?}",
+            case.label
+        );
+        let verification = report
+            .verification
+            .unwrap_or_else(|| panic!("{}: no verification report", case.label));
+        assert_eq!(
+            verification.status,
+            leveler_lifecycle::VerificationStatus::Verified,
+            "{}: {verification:?}",
+            case.label
+        );
+        assert_eq!(verification.records.len(), 1, "{}", case.label);
+        assert_eq!(
+            verification.records[0].command.as_deref(),
+            Some(test_runner_label()),
+            "{}",
+            case.label
+        );
+    }
+}
+
+/// No language's word for "tests" is evidence. A summary that claims the
+/// suite passed produces no run record, so the completion stays unverified.
+#[tokio::test]
+async fn a_success_claim_in_any_language_is_not_verification() {
+    let summaries = [
+        "测试全部通过",
+        "All tests pass",
+        "テストはすべて成功しました",
+        "Alle Tests sind grün",
+        "Todas las pruebas pasan",
+        "tests 全部 pass",
+    ];
+    for summary in summaries {
+        let fx = fixture(
+            vec![
+                Scripted::Tool(
+                    "commit_task",
+                    serde_json::json!({
+                        "objective": STAGED_REQUEST,
+                        "acceptance": ["文章发布可访问"]
+                    }),
+                ),
+                write_stage(),
+                Scripted::Tool(
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": summary
+                    }),
+                ),
+            ],
+            false,
+        )
+        .await;
+
+        let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+        assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+        let verification = report
+            .verification
+            .unwrap_or_else(|| panic!("{summary}: no verification report"));
+        assert_eq!(
+            verification.status,
+            leveler_lifecycle::VerificationStatus::Unverified,
+            "{summary}: a prose claim created evidence"
+        );
+        assert!(verification.records.is_empty(), "{summary}");
+    }
+}
+
 #[tokio::test]
 async fn a_long_p2_request_registers_its_declared_requirements() {
     const P2: &str = include_str!("../../../testdata/regression/p2_scope_classification.zh-CN.md");
