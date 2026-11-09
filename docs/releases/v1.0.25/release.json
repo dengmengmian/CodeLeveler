@@ -16942,11 +16942,13 @@
     },
     "known_issues": [
       "Downgrading a schema-52 store to v1.0.24 is refused by design; rollback is a forward patch or a pre-upgrade backup.",
-      "Feature coverage ends at CONDITIONAL PASS: 2 features unverified (session replay corpus without a corpus; TUI slash fork), 51 declared gaps, performance collected but not compared against a hard threshold (perf hard-fail disabled in this phase)."
+      "Feature coverage ends at CONDITIONAL PASS: 2 features unverified (session replay corpus without a corpus; TUI slash fork), 51 declared gaps, performance collected but not compared against a hard threshold (perf hard-fail disabled in this phase).",
+      "The Linux x86_64 archive is built on Ubuntu 24.04 and requires glibc >= 2.39 (v1.0.24 has the same floor). It runs on Ubuntu 24.04+, Fedora 40+ and Debian 13+, but not on Ubuntu 22.04 or Debian 12. The CI matrix still tests the source on ubuntu-22.04; the archive's glibc floor is a build-image choice in release.yml, not a code regression in this release."
     ],
     "not_verified": [
       "24-hour soak: IN PROGRESS — final verdict pending 2026-11-10T03:21:08Z.",
-      "Physical flicker of the wait spinner is not verified by the PTY contract (reported as NOT VERIFIED there)."
+      "Physical flicker of the wait spinner is not verified by the PTY contract (reported as NOT VERIFIED there).",
+      "Windows x86_64 artifact was checksum-verified and built by the release workflow but was not executed here (no Windows host); macOS x86_64 was executed under Rosetta 2 and reports 1.0.25 (3a3fa8fb7702)."
     ]
   },
   "dashboard": {
