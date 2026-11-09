@@ -1139,6 +1139,114 @@ async fn an_accepted_completion_carries_the_structured_verification_records() {
     assert!(record.model_step > 0);
 }
 
+/// `content` compares the requirement's `text` to a line of the target file.
+/// A model that records the requirement as prose cannot satisfy it by
+/// rewriting the file; the refusal must name the declaration fix, and an
+/// `amend` to the literal must then complete on the same evidence.
+#[tokio::test]
+async fn a_content_requirement_refusal_names_the_declaration_fix() {
+    const REQUEST: &str = "创建 stage-1.txt，内容为一行 stage 1，完成后确认。";
+    fn complete() -> Scripted {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "stage-1.txt 已创建",
+                "verification": {
+                    "status": "not_applicable",
+                    "detail": "the content requirement is checked against the workspace"
+                },
+                "requirements": [
+                    {"id": "R1", "status": "done", "evidence": "created stage-1.txt"}
+                ]
+            }),
+        )
+    }
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 内容为一行 stage 1"],
+                    "requirements": [{
+                        "kind": "content",
+                        "text": "stage-1.txt 的内容为一行 stage 1",
+                        "target": "stage-1.txt",
+                        "source_quote": "内容为一行 stage 1"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            complete(),
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [{
+                        "op": "amend",
+                        "requirement_id": "R1",
+                        "text": "stage 1",
+                        "source_quote": "内容为一行 stage 1"
+                    }]
+                }),
+            ),
+            complete(),
+        ],
+        false,
+    )
+    .await;
+
+    let mut events: Vec<leveler_engine::EngineEvent> = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "requirements_refused"
+                    && detail.contains("R1")
+                    && detail.contains("declare_scope")
+        )),
+        "the refusal names the declaration fix, not only the missing fact: {events:?}"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "the amended declaration completes on the evidence that was already there: {report:?}"
+    );
+    let verification = report.verification.expect("a verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified
+    );
+    let goals = goal_records(&fx).await;
+    let items = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        items[0].text, "stage 1",
+        "the declaration now holds the literal the gate compares"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
 /// A completion the runtime cannot mechanically check still completes: it is
 /// accepted as unverified and the terminal says exactly which requirement
 /// rests on the model's account. An unverified boundary is not a gate that

@@ -42,7 +42,10 @@ Kinds: `artifact`, `artifact_absent`, `command`, `named`, `content`, `tests`,
 `forbidden`, `baseline`, `preparation`, `constraint`. Deliverables are the kinds
 the gate holds the model to; `forbidden`, `baseline`, `preparation` and
 `constraint` are context the model must honour but cannot be "completed".
-`artifact`, `artifact_absent`, `content` and `command` require `target`.
+`artifact`, `artifact_absent`, `content` and `command` require `target`. For
+`content`, `text` is the exact literal line the gate compares against `target`;
+a description of the line is refused, and the model must amend `text` to the
+literal rather than rewrite the file.
 
 ## Declaration
 

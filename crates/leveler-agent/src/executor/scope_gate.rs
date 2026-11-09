@@ -423,7 +423,9 @@ fn check_mechanical<'a>(
                 LiteralState::Present => Mechanical::Satisfied(None),
                 LiteralState::Absent => Mechanical::Failed(format!(
                     "`{}` [content] `{}` is accounted done, but it does not appear as a line \
-                     of `{target}`",
+                     of `{target}`. `content` compares the requirement's `text` to a file \
+                     line; if the record holds a description instead of the literal, amend \
+                     `text` with declare_scope.",
                     item.id,
                     clip(&item.text, 120)
                 )),
