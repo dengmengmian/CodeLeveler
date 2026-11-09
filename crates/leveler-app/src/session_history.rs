@@ -709,6 +709,7 @@ mod tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -797,6 +798,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -884,6 +886,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -934,6 +937,7 @@ mod tests {
                      check. This turn ended with an answer, not with a verified delivery."
                         .into(),
                 ],
+                verification: None,
             },
         )
         .await;
@@ -979,6 +983,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: vec!["required independent review reported 1 finding(s)".into()],
+                verification: None,
             },
         )
         .await;
@@ -1023,6 +1028,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: vec!["required independent review reported 1 finding(s)".into()],
+                verification: None,
             },
         )
         .await;
@@ -1063,6 +1069,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Completed),
                 warnings: vec!["required independent review did not complete".into()],
+                verification: None,
             },
         )
         .await;
@@ -1145,6 +1152,7 @@ mod tests {
                 failure: None,
                 stop: None,
                 warnings: vec![],
+                verification: None,
             },
         )
         .await;
@@ -1236,6 +1244,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -1352,6 +1361,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -1545,6 +1555,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -1648,6 +1659,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;
@@ -1939,6 +1951,7 @@ mod tests {
                 failure: None,
                 stop: Some(StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         )
         .await;

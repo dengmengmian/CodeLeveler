@@ -73,6 +73,7 @@ async fn persist_task_outcome(app: &Application, session_id: &SessionId, outcome
         stop,
         failure: None,
         warnings: Vec::new(),
+        verification: None,
     };
     let (event_type, payload) = event.to_row().unwrap();
     EventRepository::new(&db)

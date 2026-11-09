@@ -18,7 +18,9 @@ use leveler_engine::{
     TurnRunner,
 };
 use leveler_execution::{Approver, Clarifier, PermissionProfile};
-use leveler_lifecycle::{AgentState, PlanState, ProgressLedger, SessionStatus, StopReason};
+use leveler_lifecycle::{
+    AgentState, PlanState, ProgressLedger, SessionStatus, StopReason, VerificationReport,
+};
 use leveler_model::{
     ContentPart, Message, Role, RuntimeNoticeKind, ToolCall, ToolResultContent, TranscriptOrigin,
 };
@@ -462,6 +464,9 @@ pub struct TaskReport {
     pub review: Option<Vec<String>>,
     /// Completion-contract warnings orthogonal to project verification.
     pub completion_warnings: Vec<String>,
+    /// How far the runtime could verify an accepted completion. `None` when
+    /// the task declared no verification obligation.
+    pub verification: Option<VerificationReport>,
 }
 
 impl TaskReport {
@@ -487,6 +492,7 @@ impl TaskReport {
             windows: 1,
             review: None,
             completion_warnings: Vec::new(),
+            verification: None,
         }
     }
 
@@ -511,6 +517,7 @@ fn report_from_agent_outcome(
     .with_stop_detail(outcome.stop_detail);
     report.execution_duration_ms = execution_duration_ms;
     report.completion_warnings = outcome.completion_warnings;
+    report.verification = outcome.verification;
     report
 }
 
@@ -1911,6 +1918,7 @@ impl CodingRuntime {
                     state,
                     goal: goal_update,
                     warnings: report.completion_warnings.clone(),
+                    verification: report.verification.clone(),
                 }
             }
             Err(EngineError::Cancelled) if explicit_task_cancel => leveler_engine::TaskTerminal {
@@ -1922,6 +1930,7 @@ impl CodingRuntime {
                 state: AgentState::Cancelled,
                 goal: goal_update,
                 warnings: Vec::new(),
+                verification: None,
             },
             Err(EngineError::Cancelled) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Interrupted,
@@ -1932,6 +1941,7 @@ impl CodingRuntime {
                 state: AgentState::Execute,
                 goal: goal_update,
                 warnings: Vec::new(),
+                verification: None,
             },
             Err(error) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
@@ -1947,6 +1957,7 @@ impl CodingRuntime {
                 state: AgentState::Failed,
                 goal: goal_update,
                 warnings: Vec::new(),
+                verification: None,
             },
         };
         // A continuing goal's milestone is part of the authoritative window

@@ -355,6 +355,7 @@ fn completed() -> leveler_engine::TaskTerminal {
         state: leveler_lifecycle::AgentState::Complete,
         goal: None,
         warnings: Vec::new(),
+        verification: None,
     }
 }
 

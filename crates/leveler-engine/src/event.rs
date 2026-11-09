@@ -204,6 +204,12 @@ pub enum EngineEvent {
         /// Completion-contract warnings.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
+        /// How far the runtime could verify an accepted completion: the
+        /// aggregate verdict plus one record per assessed requirement. Absent
+        /// when the task declared no verification obligation, and absent on
+        /// every row written before the record existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<leveler_lifecycle::VerificationReport>,
     },
 
     // ── kernel: model / tools (1:1 from AgentEvent) ──────────────────────
@@ -1391,6 +1397,7 @@ mod contract_tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             }
             .data_class(),
             DataClass::Projectable
@@ -1445,6 +1452,7 @@ mod contract_tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             EngineEvent::ApprovalRequested {
                 grant: None,
@@ -1525,6 +1533,7 @@ mod contract_tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             }
             .is_transient()
         );

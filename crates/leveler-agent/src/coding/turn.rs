@@ -500,6 +500,7 @@ pub(crate) async fn load_goal_verification_runs(
             call_id,
             goal_id: owner_goal,
             is_error,
+            exit_code,
             status,
             ..
         } = &event
@@ -507,7 +508,8 @@ pub(crate) async fn load_goal_verification_runs(
             if owner_goal.as_ref().is_none_or(|owner| owner == goal_id)
                 && status
                     .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited)
-                && let Some(run) = background_result_run(&started, call_id, *is_error, mutation_ops)
+                && let Some(run) =
+                    background_result_run(&started, call_id, *is_error, *exit_code, mutation_ops)
             {
                 runs.push(run);
             }
@@ -563,6 +565,7 @@ pub(crate) async fn load_goal_verification_runs(
                     runs.push(crate::executor::goal_verification::VerificationRun {
                         label,
                         ok: !is_error,
+                        exit_code,
                         model_step,
                         mutation_ops,
                         call_id: Some(call_id),
@@ -593,6 +596,7 @@ fn background_result_run(
     started: &std::collections::HashMap<String, (String, serde_json::Value, u32)>,
     call_id: &str,
     is_error: bool,
+    exit_code: Option<i32>,
     mutation_ops: u64,
 ) -> Option<crate::executor::goal_verification::VerificationRun> {
     let (name, arguments, model_step) = started.get(call_id)?;
@@ -600,6 +604,7 @@ fn background_result_run(
     Some(crate::executor::goal_verification::VerificationRun {
         label,
         ok: !is_error,
+        exit_code,
         model_step: *model_step,
         mutation_ops,
         call_id: Some(call_id.to_string()),
@@ -1142,7 +1147,7 @@ mod background_result_run_tests {
             serde_json::json!({"program":"cargo","args":["test"]}),
             7,
         )]);
-        let run = background_result_run(&calls, "call-1", false, 3).expect("run");
+        let run = background_result_run(&calls, "call-1", false, Some(0), 3).expect("run");
         assert_eq!(run.label, "cargo test");
         assert!(run.ok);
         assert_eq!(run.model_step, 7);
@@ -1159,7 +1164,7 @@ mod background_result_run_tests {
             serde_json::json!({"cmd":"make e2e"}),
             2,
         )]);
-        let run = background_result_run(&calls, "call-1", true, 0).expect("run");
+        let run = background_result_run(&calls, "call-1", true, Some(1), 0).expect("run");
         assert_eq!(run.label, "make e2e");
         assert!(!run.ok);
     }
@@ -1173,7 +1178,7 @@ mod background_result_run_tests {
             serde_json::json!({"program":"cargo","args":["test"]}),
             1,
         )]);
-        assert!(background_result_run(&calls, "call-other", false, 0).is_none());
+        assert!(background_result_run(&calls, "call-other", false, None, 0).is_none());
     }
 
     /// A non-command call has no command label, so a result attributed to it
@@ -1181,7 +1186,7 @@ mod background_result_run_tests {
     #[test]
     fn a_non_command_call_has_no_run() {
         let calls = started(&[("call-1", "read_file", serde_json::json!({"path":"a"}), 1)]);
-        assert!(background_result_run(&calls, "call-1", false, 0).is_none());
+        assert!(background_result_run(&calls, "call-1", false, None, 0).is_none());
     }
 }
 

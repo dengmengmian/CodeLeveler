@@ -290,6 +290,7 @@ impl Application {
                 state: AgentState::Complete,
                 goal: None,
                 warnings: warnings.clone(),
+                verification: None,
             },
             Ok(summary) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
@@ -303,6 +304,7 @@ impl Application {
                 state: AgentState::Failed,
                 goal: None,
                 warnings: warnings.clone(),
+                verification: None,
             },
             Err(AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
                 leveler_engine::TaskTerminal {
@@ -314,6 +316,7 @@ impl Application {
                     state: AgentState::Execute,
                     goal: None,
                     warnings: warnings.clone(),
+                    verification: None,
                 }
             }
             Err(error) => leveler_engine::TaskTerminal {
@@ -328,6 +331,7 @@ impl Application {
                 state: AgentState::Failed,
                 goal: None,
                 warnings: warnings.clone(),
+                verification: None,
             },
         };
         // Terminal event + every lifecycle column in ONE transaction — the

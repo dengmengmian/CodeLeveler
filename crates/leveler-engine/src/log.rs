@@ -750,6 +750,7 @@ mod tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             &mut |_| {},
         )
@@ -765,6 +766,7 @@ mod tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             }],
             "transient delta is skipped; the canonical event replays"
         );
@@ -1651,6 +1653,7 @@ mod tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             },
         ];
         for e in &events {
@@ -1672,6 +1675,7 @@ mod tests {
             failure: None,
             stop: None,
             warnings: Vec::new(),
+            verification: None,
         };
         let (event_type, payload) = event.to_row().unwrap();
         store.seed(leveler_storage::EventRecord {
@@ -1707,6 +1711,7 @@ mod tests {
                 failure: None,
                 stop: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             &mut |_| {},
         )

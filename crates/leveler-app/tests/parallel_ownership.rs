@@ -119,6 +119,7 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
                 state: AgentState::Failed,
                 goal: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             &mut |_| {},
         )
@@ -215,6 +216,7 @@ async fn parallel_parent_finishes_through_the_engine() {
                 state: AgentState::Complete,
                 goal: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             &mut |_| {},
         )

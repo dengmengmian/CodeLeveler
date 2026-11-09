@@ -12,6 +12,9 @@
 - 完成 Gate 按模型声明的集合追责：每个 active 交付项按稳定 id 记账；artifact 与 absent-artifact 对照工作区，content 对照目标文件的一行，command 与 tests 对照最后一次变更之后的真实执行记录。恢复或折叠上下文都无法缩小集合；没有机械检查却被报告为 done 的需求会作为明确的未验证边界呈现，而不是被当作证据静默接受。
 - 需求变更按有序事件持久化（迁移 0055），记录授权回合与原文引用；当前集合是这段历史的折叠结果。`get_goal_scope` 投射集合与变更历史，Goal mode 在契约中写明声明义务。
 - `docs/GOAL_SCOPE.zh-CN.md` 记录需求归属、声明、校验、历史与完成 Gate 的边界。
+- 声明与证据分离。`update_goal(verification)` 仍是模型的声明；Gate 用运行时自己的执行记录解析引用（call id、精确命令行，或命令行加尾部备注）。失败的运行、早于最后一次变更的运行、以及被同一命令更晚一次运行推翻的引用，都会按真实原因拒绝。命令不再按名称或输出分类，因此记录证明通过时，陌生 runner 与熟悉 runner 完全等价。
+- 被接受的完成会在任务终态持久化结构化 `VerificationReport`：聚合的 Verified/Unverified 结论，加上每个应交付项一条记录，包含 id、种类、状态、执行的 call id、命令、退出码、工作区版本与模型步。Verified、CompletedUnverified、Incomplete、Blocked 是任务结果、该报告与停止原因的投射；未验证的完成带警告照常交付，不会停下来等待用户确认。
+- 残余的 runner 名称与输出标记词表（`is_verification_command`、`names_a_test_suite`、`reports_no_tests`）已删除：运行时不再读取命令名称或嗅探测试输出决定其结果含义。
 
 ## [1.0.25] - 2026-11-09
 

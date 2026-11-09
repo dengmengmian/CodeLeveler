@@ -110,6 +110,52 @@ Gate 在每次完成声明时读取持久集合，因此被折叠的 transcript 
 无法缩小范围。模型完全不声明时 Gate 没有可执行集合；所以 Goal mode 在契约里
 写明声明义务，`get_goal_scope` 始终展示 Gate 将读取的精确集合。
 
+## 验证报告
+
+完成状态由两层组成，它们是不同性质的事实：
+
+| 层 | 来源 | 证明什么 |
+| --- | --- | --- |
+| `update_goal(verification)` | 模型声明 | 模型声称自己运行了哪些执行 |
+| `VerificationRun` | Runtime 执行记录（`ToolCallStarted` + `ToolCallFinished`、后台完成） | 命令、call id、退出状态、工作区版本与所在模型步 |
+
+Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命令行，或命令行加
+尾部备注；失败的运行、早于最后一次变更的运行、以及被同一命令更晚一次运行推翻
+的引用，都会按真实原因拒绝。命令「是不是测试 runner」永远不会由名称或输出
+决定。
+
+被接受的完成会在任务终态持久化一份 `VerificationReport`
+（`TaskFinished.verification`，`TaskReport` 上也是同一份）：
+
+```json
+{
+  "status": "unverified",
+  "records": [
+    {"requirement_id": "R1", "kind": "tests", "state": "verified",
+     "detail": "verified against the execution record: `sh run-tests.sh` exited 0 at workspace version 4",
+     "call_id": "call-12", "command": "sh run-tests.sh", "exit_code": 0,
+     "workspace_version": 4, "model_step": 7}
+  ]
+}
+```
+
+`records` 按需求顺序、每个应交付项一条。只有真实执行记录支撑时才会出现证据
+字段；否则 `call_id`/`command`/`exit_code` 缺省，`detail` 说明 Runtime 无法
+检查什么。`workspace_version` 是判定针对的变更计数器，因此无需重放 transcript
+就能看出结论是否过期。
+
+四种用户可见结果是对这两个事实的投射，而不是另算一套状态：
+
+| 结果 | 表示 |
+| --- | --- |
+| Verified | `TaskOutcome::Completed` + `VerificationStatus::Verified` |
+| CompletedUnverified | `TaskOutcome::Completed` + `VerificationStatus::Unverified` |
+| Incomplete | 被接受轮次上的非交付 `StopReason`（预算、中断） |
+| Blocked | `TaskOutcome::Blocked` |
+
+未验证的完成照常接受并交付，不会停下来等待用户确认：警告与报告告诉用户
+Runtime 证明了什么、没能证明什么，由用户决定后续处理。
+
 ## 不属于本契约
 
 - 没有关键词、否定词、章节标题、测试 runner 或状态词表。

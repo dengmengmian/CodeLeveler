@@ -228,6 +228,7 @@ fn w5_w6_authoritative_cancel_freezes_wire_without_a_false_final() {
             stop: None,
             failure: None,
             warnings: vec![],
+            verification: None,
         },
         EngineEvent::ReasoningCompleted { elapsed_ms: 999 },
         EngineEvent::AssistantMessage {

@@ -26,6 +26,7 @@ use leveler_execution::{
 };
 use leveler_lifecycle::{
     EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, StopReason,
+    VerificationReport,
 };
 use leveler_model::{
     ContentPart, ControlContext, Message, ModelError, ModelPricing, ModelRef, ModelRuntime,
@@ -680,6 +681,11 @@ pub struct AgentOutcome {
     /// closed without executable verification, for example. The engine copies
     /// these onto `TaskFinished.warnings`; they are never a success claim.
     pub completion_warnings: Vec<String>,
+    /// How far the runtime could verify an accepted completion: the aggregate
+    /// verdict plus one record per assessed requirement. `None` when the task
+    /// declared no verification obligation (a conversational turn, a blocked
+    /// goal, or a read-only goal with nothing to check).
+    pub verification: Option<VerificationReport>,
     /// The goal this turn bound when it was NOT a Goal turn at start (a Chat
     /// turn upgraded by `/goal`). `None` for a turn that started in Goal mode:
     /// its identity came from the caller, not from a mid-turn declaration.
@@ -711,6 +717,7 @@ impl AgentOutcome {
             progress: progress.clone(),
             objective: objective.clone(),
             completion_warnings: Vec::new(),
+            verification: None,
             bound_goal: None,
         }
     }
@@ -737,6 +744,7 @@ impl AgentOutcome {
             progress: progress.clone(),
             objective: objective.clone(),
             completion_warnings: Vec::new(),
+            verification: None,
             bound_goal: None,
         }
     }

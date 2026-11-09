@@ -16,7 +16,11 @@
 //!
 //! Everything here is a fact about commands and exit codes. No LLM call, no
 //! keyword reading of the user's goal, no opinion about whether the change is
-//! good.
+//! good. A command's *name* is never classified: the model's structured
+//! declaration says which executions it cites, and the requirement set says
+//! which requirements need executable evidence.
+
+use leveler_lifecycle::VerificationStatus;
 
 /// One command execution the runtime observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,10 +29,13 @@ pub struct VerificationRun {
     pub label: String,
     /// The tool did not report an error (for a command, exit 0).
     pub ok: bool,
+    /// The exit status the tool reported, when it reported one. A killed or
+    /// timed-out command may have none; `ok` stays the verdict.
+    pub exit_code: Option<i32>,
     /// Model step that ran it; ordering only.
     pub model_step: u32,
-    /// `EvidenceLedger::total_mutation_ops` when it ran, so "after the last
-    /// file change" is a comparison, not a timestamp guess.
+    /// Workspace version: `EvidenceLedger::total_mutation_ops` when it ran, so
+    /// "after the last file change" is a comparison, not a timestamp guess.
     pub mutation_ops: u64,
     /// The tool call that produced this run. A citation of `call_id:<id>`
     /// names this execution, not whatever later run shares the command text.
@@ -50,8 +57,15 @@ pub(crate) enum VerificationClaim {
 /// The gate's answer for one `update_goal(complete)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerificationDecision {
-    /// Resolve the goal. `warning` is persisted on the terminal.
-    Accept { warning: Option<String> },
+    /// Resolve the goal. `status` is the verdict this declaration contributes:
+    /// `None` means the declaration named no verification obligation (a
+    /// read-only goal has nothing to assess); `Some(Unverified)` means the
+    /// completion is accepted with a boundary that rests on the model's
+    /// account. `warnings` are persisted on the terminal.
+    Accept {
+        status: Option<VerificationStatus>,
+        warnings: Vec<String>,
+    },
     /// Refuse this resolution and tell the model exactly which fact failed.
     Refuse(String),
 }
@@ -73,6 +87,13 @@ pub(crate) struct PendingCommand {
 }
 
 /// Decide whether `update_goal(complete)` may resolve the goal.
+///
+/// Only the model's own structured declaration is read here: the commands it
+/// names as evidence. A named command must resolve to a recorded execution,
+/// that execution must have passed, the latest run of the same command must
+/// not have failed since, and it must be current for the workspace version.
+/// No command name is classified: what a command means belongs to the model,
+/// and a requirement's own evidence is checked by the scope gate.
 pub(crate) fn decide(
     claim: &VerificationClaim,
     runs: &[VerificationRun],
@@ -80,18 +101,6 @@ pub(crate) fn decide(
     mutation_ops: u64,
     modified: bool,
 ) -> VerificationDecision {
-    // A verification-class command that failed and has not been followed by a
-    // successful one is hard evidence against completion. It outranks every
-    // declaration, including `not_applicable`.
-    if let Some(failed) = last_unrecovered_failure(runs) {
-        return VerificationDecision::Refuse(format!(
-            "the last verification command `{}` failed (step {}). The command failed. Fix the \
-             failure and run it again, or call update_goal(status=\"blocked\") with the exact \
-             obstruction. A failed verification cannot be closed as complete.",
-            failed.label, failed.model_step
-        ));
-    }
-
     match claim {
         VerificationClaim::Passed(commands) if !commands.is_empty() => {
             for command in commands {
@@ -99,7 +108,7 @@ pub(crate) fn decide(
                 if cited.is_empty() {
                     continue;
                 }
-                let last = match cited_run(cited, runs) {
+                let run = match cited_run(cited, runs) {
                     CitedRun::Refuse(message) => return VerificationDecision::Refuse(message),
                     CitedRun::Unmatched => {
                         return VerificationDecision::Refuse(unmatched_citation(
@@ -111,33 +120,45 @@ pub(crate) fn decide(
                     }
                     CitedRun::Found(run) => run,
                 };
-                if !last.ok {
+                if !run.ok {
                     // A later successful compound line can contain this exact
                     // command as one segment (`cmd; next`). That is not this
                     // command's own record, but the earlier failure is no longer
                     // the current state. Reporting "last run failed (step N)"
                     // points the model at a stale step and invites a rerun that
                     // cannot fix it. Name the real record instead.
-                    if let Some(later) = later_compound_pass(runs, last.model_step, cited) {
+                    if let Some(later) = later_compound_pass(runs, run.model_step, cited) {
                         return VerificationDecision::Refuse(format!(
                             "`{cited}` last ran on its own at step {} and failed. It also appears \
                              inside the later command `{}` (step {}), which passed as a compound \
                              line; a subcommand is not its own execution record. Cite that command \
                              in full, or run `{cited}` on its own again.",
-                            last.model_step, later.label, later.model_step
+                            run.model_step, later.label, later.model_step
                         ));
                     }
                     return VerificationDecision::Refuse(format!(
                         "`{cited}` was cited as verification but the command failed: its last run \
                          failed (step {}).",
-                        last.model_step
+                        run.model_step
                     ));
                 }
-                // Freshness is a property of verification: a test or build
-                // must judge the current tree. A command the user ordered as
-                // an action can legitimately precede the change it produces;
-                // demanding it run again would reverse the user's sequence.
-                if is_verification_command(&last.label) && last.mutation_ops < mutation_ops {
+                // A `call_id` names one execution. If the same command ran
+                // again later and failed, the earlier pass is no longer the
+                // command's current state; citing its id would hide the
+                // failure. This is mechanical — no name is classified.
+                if let Some(later) = later_failed_execution(runs, run) {
+                    return VerificationDecision::Refuse(format!(
+                        "`{cited}` cites a run from step {}, but the same command ran again at \
+                         step {} and failed. Cite the later run once it passes, or fix the \
+                         failure; an older passing record is not current evidence.",
+                        run.model_step, later.model_step
+                    ));
+                }
+                // A pass must judge the current tree. This applies to any cited
+                // command: the runtime does not know which commands are
+                // "verification", so it treats the model's own citation as the
+                // claim it is.
+                if run.mutation_ops < mutation_ops {
                     return VerificationDecision::Refuse(format!(
                         "`{cited}` verification expired: it passed before the most recent file \
                          change. Re-run it against the current workspace before marking the goal \
@@ -145,7 +166,10 @@ pub(crate) fn decide(
                     ));
                 }
             }
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         }
         VerificationClaim::NotApplicable(reason) => {
             let reason = reason.trim();
@@ -155,50 +179,53 @@ pub(crate) fn decide(
                 reason
             };
             VerificationDecision::Accept {
-                warning: Some(format!(
+                status: Some(VerificationStatus::Unverified),
+                warnings: vec![format!(
                     "goal completed without executable verification ({why}); insufficient evidence"
-                )),
+                )],
             }
         }
         // An empty `passed.commands` list is not evidence. Treat it like an
         // omission. The runtime does not force a command to exist (a Goal may
-        // have no executable check), but it refuses to let a stale pass stand
-        // in for a fresh one, and it records the absence on the terminal
-        // instead of reporting a silently verified success.
+        // have no executable check), and it does not wait for the user: the
+        // completion is accepted with an explicit unverified boundary when the
+        // workspace changed, and carries no verdict when there was nothing to
+        // verify.
         VerificationClaim::Passed(_) | VerificationClaim::Missing => {
-            let fresh_pass = runs.iter().rev().any(|run| {
-                is_verification_command(&run.label) && run.ok && run.mutation_ops >= mutation_ops
-            });
-            let stale_pass = runs
-                .iter()
-                .rev()
-                .find(|run| is_verification_command(&run.label) && run.ok);
-            if modified
-                && !fresh_pass
-                && let Some(stale) = stale_pass
-            {
-                return VerificationDecision::Refuse(format!(
-                    "`{}` verification expired: it passed before the most recent file change \
-                     (step {}). Re-run it against the current workspace, or declare why the \
-                     change needs no executable check.",
-                    stale.label, stale.model_step
-                ));
-            }
-            if modified && !fresh_pass {
+            if modified {
                 VerificationDecision::Accept {
-                    warning: Some(
-                        "goal completed without executable verification (no verification \
-                         command ran after the last file change); insufficient evidence"
+                    status: Some(VerificationStatus::Unverified),
+                    warnings: vec![
+                        "goal completed without executable verification (no check was declared \
+                         after the last file change); insufficient evidence"
                             .to_string(),
-                    ),
+                    ],
                 }
             } else {
                 // A read-only goal has nothing to verify; its answer is the
                 // deliverable.
-                VerificationDecision::Accept { warning: None }
+                VerificationDecision::Accept {
+                    status: None,
+                    warnings: Vec::new(),
+                }
             }
         }
     }
+}
+
+/// The latest later execution of the same recorded command that failed.
+///
+/// Only an exact command label counts: a compound line that merely contains
+/// the command is a different execution and cannot supersede it.
+fn later_failed_execution<'a>(
+    runs: &'a [VerificationRun],
+    cited: &VerificationRun,
+) -> Option<&'a VerificationRun> {
+    let position = runs.iter().position(|run| std::ptr::eq(run, cited))?;
+    runs[position + 1..]
+        .iter()
+        .rev()
+        .find(|run| run.label == cited.label && !run.ok)
 }
 
 /// Why a citation is not an execution record, and what the model can do.
@@ -376,8 +403,8 @@ fn later_compound_pass<'a>(
 }
 
 /// Passing commands the model may copy. The closest record is included even
-/// when it is not classified as verification, because that is the command
-/// the citation almost named. Suggest only records the gate could accept.
+/// when it is not fresh, because that is the command the citation almost
+/// named. Suggest only records the gate could accept.
 fn citable_commands(
     runs: &[VerificationRun],
     mutation_ops: u64,
@@ -387,7 +414,7 @@ fn citable_commands(
     let push = |listed: &mut Vec<String>, run: &VerificationRun| {
         if !run.ok
             || run.label.contains('\n')
-            || (is_verification_command(&run.label) && run.mutation_ops < mutation_ops)
+            || run.mutation_ops < mutation_ops
             || !runs
                 .iter()
                 .rev()
@@ -407,32 +434,17 @@ fn citable_commands(
     if let Some(run) = closest {
         push(&mut listed, run);
     }
-    for run in runs.iter().rev().filter(|run| {
-        run.ok && is_verification_command(&run.label) && run.mutation_ops >= mutation_ops
-    }) {
+    for run in runs
+        .iter()
+        .rev()
+        .filter(|run| run.ok && run.mutation_ops >= mutation_ops)
+    {
         push(&mut listed, run);
         if listed.len() >= 3 {
             break;
         }
     }
     listed.join("; ")
-}
-
-/// The most recent verification-class failure with no later verification
-/// success. `runs` is chronological.
-fn last_unrecovered_failure(runs: &[VerificationRun]) -> Option<&VerificationRun> {
-    let mut failure: Option<&VerificationRun> = None;
-    for run in runs
-        .iter()
-        .filter(|run| is_verification_command(&run.label))
-    {
-        if run.ok {
-            failure = None;
-        } else {
-            failure = Some(run);
-        }
-    }
-    failure
 }
 
 /// Parse the optional `verification` object from `update_goal` arguments.
@@ -573,7 +585,7 @@ fn cites_recorded_command_with_result_note(label: &str, cited: &str) -> bool {
 /// The execution record stores the command as the tool received it. Compare
 /// token sequences after removing only that presentation, never words:
 /// `grep 'a b' file` and `grep a b file` are different commands.
-fn cites(label: &str, cited: &str) -> bool {
+pub(crate) fn cites(label: &str, cited: &str) -> bool {
     let cited = command_tokens(strip_trailing_note(cited));
     if cited.is_empty() {
         return false;
@@ -701,166 +713,6 @@ pub(crate) fn background_command_label(program: &str, args: &[String]) -> Option
     command_label("run_command", &arguments)
 }
 
-/// Whether a command is a test/build/check-class command.
-///
-/// Deliberately narrow and mechanical: it only decides which FAILURES are hard
-/// evidence. A command that is not recognised here is still usable as cited
-/// verification (`README` inspection, a custom CI script the model names).
-pub(crate) fn is_verification_command(label: &str) -> bool {
-    const VERB_TARGETS: &[&str] = &[
-        "test",
-        "tests",
-        "build",
-        "check",
-        "clippy",
-        "vet",
-        "lint",
-        "typecheck",
-        "type-check",
-        "verify",
-        "acceptance",
-        "e2e",
-        "ci",
-    ];
-    // `;`, `&&`, `||` and pipes run several programs; a verification in any
-    // segment counts, because a failure in that segment fails the command.
-    for segment in label.split([';', '&', '|', '\n']) {
-        let words: Vec<&str> = segment
-            .split_whitespace()
-            .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
-            .filter(|word| !word.is_empty())
-            .collect();
-        let Some(first) = words.first().copied() else {
-            continue;
-        };
-        let second = words.get(1).copied().unwrap_or("");
-        let basename = first.rsplit('/').next().unwrap_or(first);
-        let matches = match basename {
-            "go" => matches!(second, "test" | "build" | "vet"),
-            "cargo" => matches!(second, "test" | "build" | "check" | "clippy"),
-            "npm" | "pnpm" | "yarn" | "bun" | "deno" => {
-                second == "test"
-                    || (second == "run" && words.get(2).is_some_and(|w| VERB_TARGETS.contains(w)))
-            }
-            "make" | "just" | "bazel" => {
-                words.iter().skip(1).any(|word| VERB_TARGETS.contains(word))
-            }
-            "mvn" | "gradle" | "dotnet" | "swift" | "flutter" | "dart" | "mix" | "ctest" => {
-                words.iter().skip(1).any(|word| VERB_TARGETS.contains(word))
-            }
-            "pytest" | "phpunit" => true,
-            "python" | "python3" | "py" => {
-                let module = words.windows(2).any(|pair| {
-                    pair[0] == "-m" && matches!(pair[1], "unittest" | "pytest" | "nose2")
-                });
-                module || first_positional(&words).is_some_and(python_test_script)
-            }
-            "node" => words.iter().skip(1).any(|word| *word == "--test"),
-            // A shell entry point named for verification: `sh verify.sh`,
-            // `bash ./scripts/check.sh`, `./accept.sh`.
-            "sh" | "bash" | "zsh" | "pwsh" | "powershell" | "cmd" => {
-                words.iter().skip(1).any(|word| {
-                    let name = word.rsplit('/').next().unwrap_or(word);
-                    VERB_TARGETS.iter().any(|target| name.contains(target))
-                })
-            }
-            _ => {
-                // `./verify.sh`, `./acceptance.sh`, `scripts/test.sh` run
-                // directly.
-                VERB_TARGETS.iter().any(|target| basename.contains(target))
-                    && (basename.ends_with(".sh")
-                        || basename.ends_with(".py")
-                        || basename.ends_with(".ps1")
-                        || basename.ends_with(".bat"))
-            }
-        };
-        if matches {
-            return true;
-        }
-    }
-    false
-}
-
-/// The first non-option word after the interpreter: the script it runs.
-fn first_positional<'a>(words: &'a [&'a str]) -> Option<&'a str> {
-    words
-        .iter()
-        .skip(1)
-        .find(|word| !word.starts_with('-'))
-        .copied()
-}
-
-/// A Python file whose own name says it is a test suite.
-///
-/// `python3 test_app.py` is the file analogue of `sh run-tests.sh`. The
-/// extension check keeps `python3 -m pip install pytest` and inline `-c` code
-/// out: they name a suite without running one.
-fn python_test_script(word: &str) -> bool {
-    let name = word
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(word)
-        .to_ascii_lowercase();
-    name.ends_with(".py") && TEST_SUITE_WORDS.iter().any(|target| name.contains(target))
-}
-
-const TEST_SUITE_WORDS: &[&str] = &[
-    "test", "tests", "pytest", "unittest", "jest", "vitest", "mocha", "rspec", "ctest",
-];
-
-/// Whether a command's output says the test runner executed no tests.
-///
-/// A suite that only skipped, or a runner that found no tests, cannot prove
-/// that the objective's tests pass. This is a mechanical fact about the
-/// output, not a judgment about the project; the markers are deliberately
-/// narrow so a mixed suite that really passed is never mistaken for an empty
-/// one.
-pub(crate) fn reports_no_tests(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    // Whole-invocation markers. Per-package messages such as Go's
-    // `[no test files]` are deliberately NOT used: another package in the
-    // same command may have run real tests.
-    if lower.contains("ran 0 tests") || lower.contains("no tests ran") {
-        return true;
-    }
-    // unittest: `Ran 3 tests ... OK (skipped=3)` means every discovered test
-    // was skipped; `Ran 5 tests ... skipped=1` executed four real tests.
-    if let Some(ran) = number_after(&lower, "ran ")
-        && let Some(skipped) = number_after(&lower, "skipped=")
-    {
-        return ran > 0 && ran <= skipped;
-    }
-    // cargo: one `test result:` summary per test binary. Only the sum of
-    // passed tests decides emptiness, so a crate with no tests cannot turn a
-    // workspace run that passed elsewhere into a false failure.
-    if lower.contains("test result:") {
-        let mut any_passed = false;
-        for (index, _) in lower.match_indices("test result:") {
-            let rest = &lower[index + "test result:".len()..];
-            if number_after(rest, "ok. ").is_some_and(|passed| passed > 0) {
-                any_passed = true;
-                break;
-            }
-        }
-        return !any_passed;
-    }
-    // pytest: `3 skipped in 0.01s` with nothing passed, failed or errored.
-    if lower.contains(" skipped in ")
-        && !lower.contains(" passed")
-        && !lower.contains(" failed")
-        && !lower.contains(" error")
-    {
-        return true;
-    }
-    false
-}
-
-fn number_after(text: &str, needle: &str) -> Option<usize> {
-    let rest = &text[text.find(needle)? + needle.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
 #[cfg(test)]
 mod background_label_tests {
     use super::*;
@@ -896,6 +748,7 @@ mod tests {
         VerificationRun {
             label: label.to_string(),
             ok,
+            exit_code: Some(if ok { 0 } else { 1 }),
             model_step: step,
             mutation_ops,
             call_id: None,
@@ -912,37 +765,6 @@ mod tests {
         VerificationRun {
             call_id: Some(call_id.to_string()),
             ..run(label, ok, step, mutation_ops)
-        }
-    }
-
-    #[test]
-    fn empty_and_all_skipped_test_runs_are_not_evidence() {
-        for output in [
-            "Ran 0 tests in 0.000s",
-            "test result: ok. 0 passed; 0 failed; 3 ignored",
-            "Ran 1 test in 0.000s\n\nOK (skipped=1)",
-            "3 skipped in 0.01s",
-            "no tests ran in 0.01s",
-        ] {
-            assert!(
-                reports_no_tests(output),
-                "must be treated as empty: {output:?}"
-            );
-        }
-        for output in [
-            "Ran 5 tests in 0.12s\n\nOK (skipped=1)",
-            "test result: ok. 5 passed; 0 failed; 1 ignored",
-            // A workspace run may include an empty test binary. The real
-            // passes elsewhere must keep the command as evidence.
-            "test result: ok. 0 passed; 0 failed; 0 ignored\n\n\
-             test result: ok. 12 passed; 0 failed; 0 ignored",
-            "3 passed, 1 skipped in 0.2s",
-            "5 tests completed",
-        ] {
-            assert!(
-                !reports_no_tests(output),
-                "a real mixed run must stay evidence: {output:?}"
-            );
         }
     }
 
@@ -1021,7 +843,10 @@ mod tests {
                 2,
                 true
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
     }
 
@@ -1094,7 +919,10 @@ mod tests {
                     2,
                     true,
                 ),
-                VerificationDecision::Accept { warning: None },
+                VerificationDecision::Accept {
+                    status: Some(VerificationStatus::Verified),
+                    warnings: Vec::new(),
+                },
                 "{cited}"
             );
         }
@@ -1152,7 +980,10 @@ mod tests {
                 3,
                 true,
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
         let failed = decide(
             &VerificationClaim::Passed(vec!["call_id:old".into()]),
@@ -1173,7 +1004,10 @@ mod tests {
                 3,
                 true,
             ),
-            VerificationDecision::Accept { warning: None },
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            },
             "text citation still names the latest matching run"
         );
     }
@@ -1210,6 +1044,31 @@ mod tests {
                 panic!("{cited} must be a format error");
             };
             assert!(message.contains("citation format is invalid"), "{message}");
+        }
+    }
+
+    /// A passing call id stays a record of THAT execution, but an older pass
+    /// is not the command's current state: a later run of the same command
+    /// failed, and citing the older id would hide it. This is a mechanical
+    /// comparison of two recorded executions, not a reading of either name.
+    #[test]
+    fn an_older_pass_is_not_current_when_the_same_command_later_failed() {
+        let runs = [
+            run_id("make check", true, 3, 4, "pass"),
+            run_id("make check", false, 9, 4, "fail"),
+        ];
+        match decide(
+            &VerificationClaim::Passed(vec!["call_id:pass".into()]),
+            &runs,
+            &[],
+            4,
+            true,
+        ) {
+            VerificationDecision::Refuse(message) => {
+                assert!(message.contains("ran again"), "{message}");
+                assert!(message.contains("step 9"), "{message}");
+            }
+            other => panic!("a later failure makes the older pass stale: {other:?}"),
         }
     }
 
@@ -1257,7 +1116,10 @@ mod tests {
                 0,
                 false,
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
         assert!(matches!(
             decide(
@@ -1353,7 +1215,10 @@ mod tests {
                 2,
                 true
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
     }
 
@@ -1375,7 +1240,10 @@ mod tests {
                 2,
                 true
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
     }
 
@@ -1394,7 +1262,10 @@ mod tests {
         .expect("valid claim");
         assert_eq!(
             decide(&claim, &runs, &[], 2, true),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
     }
 
@@ -1411,7 +1282,10 @@ mod tests {
                 2,
                 true
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
     }
 
@@ -1435,7 +1309,10 @@ mod tests {
                 0,
                 false
             ),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
         );
     }
 
@@ -1471,79 +1348,98 @@ mod tests {
         ));
     }
 
-    /// The T9 shape: a task orders a side-effect-free command BEFORE the file
-    /// it creates ("run sleep 60, only then create done.txt"). A cited
-    /// command that is not verification-class must have run and passed, but
-    /// it cannot be made "stale" by the later change it was ordered to
-    /// precede; demanding a re-run reverses the user's own sequence.
+    /// A command's name does not decide whether it is verification: the
+    /// model's own citation does. Freshness therefore applies to every cited
+    /// run, and the runtime never needs a vocabulary of command names.
     #[test]
-    fn a_cited_non_verification_command_need_not_follow_the_last_change() {
+    fn a_cited_command_that_predates_the_last_change_is_refused_whatever_its_name() {
         let runs = vec![
             run("sleep 60", true, 3, 0),
             run("od -c done.txt", true, 5, 1),
         ];
-        assert_eq!(
-            decide(
-                &VerificationClaim::Passed(vec!["sleep 60".into()]),
-                &runs,
-                &[],
-                1,
-                true
-            ),
-            VerificationDecision::Accept { warning: None }
-        );
+        match decide(
+            &VerificationClaim::Passed(vec!["sleep 60".into()]),
+            &runs,
+            &[],
+            1,
+            true,
+        ) {
+            VerificationDecision::Refuse(message) => {
+                assert!(message.contains("before the most recent"), "{message}")
+            }
+            other => panic!("a cited run from before the change is stale: {other:?}"),
+        }
     }
 
+    /// A failed command is a fact, not by itself a verdict on the goal. The
+    /// runtime does not classify the command's name, so without a declaration
+    /// tying it to the objective it accepts the completion as unverified and
+    /// says so rather than hard-blocking on prose it cannot read.
     #[test]
-    fn a_failed_verification_blocks_completion_even_without_a_claim() {
+    fn a_failed_command_without_a_claim_completes_unverified_not_verified() {
         let runs = vec![run("cargo test", false, 5, 2)];
-        assert!(matches!(
-            decide(&VerificationClaim::Missing, &runs, &[], 2, true),
-            VerificationDecision::Refuse(message) if message.contains("failed")
-        ));
-        assert!(matches!(
-            decide(
-                &VerificationClaim::NotApplicable("config only".into()),
-                &runs, &[],
-                2,
-                true
+        match decide(&VerificationClaim::Missing, &runs, &[], 2, true) {
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                warnings,
+            } => assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("without executable verification")),
+                "{warnings:?}"
             ),
-            VerificationDecision::Refuse(message) if message.contains("failed")
-        ));
+            other => panic!("expected an unverified acceptance, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_later_success_recovers_a_failed_verification() {
+    fn an_undeclared_success_still_completes_only_as_unverified() {
         let runs = vec![
             run("cargo test", false, 5, 2),
             run("cargo test", true, 7, 2),
         ];
-        assert_eq!(
-            decide(&VerificationClaim::Missing, &runs, &[], 2, true),
-            VerificationDecision::Accept { warning: None }
-        );
+        match decide(&VerificationClaim::Missing, &runs, &[], 2, true) {
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                ..
+            } => {}
+            other => panic!("no machine-readable declaration means unverified: {other:?}"),
+        }
     }
 
     #[test]
-    fn changed_files_without_evidence_complete_with_a_warning_and_read_only_goals_do_not() {
-        assert!(matches!(
-            decide(&VerificationClaim::Missing, &[], &[], 0, true),
-            VerificationDecision::Accept { warning: Some(warning) }
-                if warning.contains("without executable verification")
-        ));
+    fn changed_files_without_a_declaration_are_unverified_and_read_only_goals_have_no_verdict() {
+        match decide(&VerificationClaim::Missing, &[], &[], 0, true) {
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                warnings,
+            } => assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("without executable verification")),
+                "{warnings:?}"
+            ),
+            other => panic!("changed files without evidence are unverified: {other:?}"),
+        }
         assert_eq!(
             decide(&VerificationClaim::Missing, &[], &[], 0, false),
-            VerificationDecision::Accept { warning: None }
+            VerificationDecision::Accept {
+                status: None,
+                warnings: Vec::new(),
+            }
         );
     }
 
     #[test]
-    fn a_pass_that_predates_the_last_change_cannot_stand_in_for_a_fresh_one() {
+    fn an_undeclared_pass_that_predates_the_change_completes_unverified() {
         let runs = vec![run("go test ./...", true, 4, 1)];
-        assert!(matches!(
-            decide(&VerificationClaim::Missing, &runs, &[], 3, true),
-            VerificationDecision::Refuse(message) if message.contains("before the most recent")
-        ));
+        match decide(&VerificationClaim::Missing, &runs, &[], 3, true) {
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                ..
+            } => {}
+            other => panic!("nothing was declared, so the boundary is unverified: {other:?}"),
+        }
     }
 
     #[test]
@@ -1556,9 +1452,15 @@ mod tests {
             true,
         ) {
             VerificationDecision::Accept {
-                warning: Some(warning),
+                status: Some(VerificationStatus::Unverified),
+                warnings,
             } => {
-                assert!(warning.contains("documentation only"), "{warning}")
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("documentation only")),
+                    "{warnings:?}"
+                )
             }
             other => panic!("expected an accepted warning, got {other:?}"),
         }
@@ -1612,36 +1514,5 @@ mod tests {
             command_label("run_command", &serde_json::json!({"program": "  "})),
             None
         );
-    }
-
-    #[test]
-    fn verification_classification_is_narrow_enough_not_to_read_prose_as_a_test() {
-        for command in [
-            "go test ./...",
-            "go build ./...",
-            "cargo clippy --all-targets",
-            "npm run build",
-            "pnpm test",
-            "make ci",
-            "sh verify.sh",
-            "bash ./scripts/check.sh",
-            "./acceptance.sh",
-            "pytest -q",
-            "python3 -m unittest",
-            "python3 test_app.py",
-            "python -m pytest -q",
-        ] {
-            assert!(is_verification_command(command), "{command}");
-        }
-        for command in [
-            "grep -rn validate src",
-            "cat testdata/verify.md",
-            "go version",
-            "git status",
-            "ls scripts",
-            "python3 script.py",
-        ] {
-            assert!(!is_verification_command(command), "{command}");
-        }
     }
 }

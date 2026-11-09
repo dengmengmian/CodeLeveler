@@ -987,10 +987,11 @@ async fn resume_after_provider_timeout_observes_and_stops_the_original_service()
 }
 
 /// A background test run has not produced a result. Its START is not evidence
-/// of a pass: the completion gate must keep the goal open when the only test
-/// command in the record is a suite that is still running — even when the model
-/// cites that command. `execution_status` is the mechanical line between
-/// "started" and "ran to its own answer".
+/// of a pass: a completion that cites the started command is refused for the
+/// real missing fact — no result yet — and the refusal names the task to wait
+/// on. The model's honest `blocked` declaration is still the terminal.
+/// `execution_status` is the mechanical line between "started" and "ran to its
+/// own answer", and no command name is classified either way.
 #[tokio::test]
 async fn a_background_test_start_is_not_evidence_of_a_pass() {
     let (script_name, script) = if cfg!(windows) {
@@ -1004,14 +1005,6 @@ async fn a_background_test_start_is_not_evidence_of_a_pass() {
         ("sh", vec![script_name])
     };
     let suite_label = format!("{suite_program} {}", suite_args.join(" "));
-    // A command that really completed, so the citation itself is valid and any
-    // refusal can only be about the tests.
-    let (quick_program, quick_args) = if cfg!(windows) {
-        ("cmd", vec!["/c", "exit 0"])
-    } else {
-        ("sh", vec!["-c", "exit 0"])
-    };
-    let quick_label = format!("{quick_program} {}", quick_args.join(" "));
     let h = harness(vec![
         tool_call(
             "w1",
@@ -1029,26 +1022,12 @@ async fn a_background_test_start_is_not_evidence_of_a_pass() {
             }),
         ),
         tool_call(
-            "q1",
-            "run_command",
-            serde_json::json!({
-                "program": quick_program,
-                "args": quick_args,
-                "reason": "a completed command the completion may cite"
-            }),
-        ),
-        tool_call(
             "g1",
             "update_goal",
             serde_json::json!({
                 "status": "complete",
                 "summary": "the suite is running",
-                "verification": {"status": "passed", "detail": quick_label},
-                "requirements": [{
-                    "requirement": "tests",
-                    "status": "done",
-                    "evidence": format!("{suite_label} started")
-                }]
+                "verification": {"status": "passed", "detail": suite_label}
             }),
         ),
         tool_call(
@@ -1086,9 +1065,11 @@ async fn a_background_test_start_is_not_evidence_of_a_pass() {
     );
     assert!(
         refusals.iter().any(|(kind, detail)| {
-            kind == "requirements_refused" && detail.contains("no test command ran")
+            kind == "verification_refused"
+                && detail.contains("only STARTED")
+                && detail.contains("wait_task")
         }),
-        "the gate must say no test command RAN, not accept the start: {refusals:?}"
+        "the gate must say the command only STARTED, not accept the start: {refusals:?}"
     );
 }
 

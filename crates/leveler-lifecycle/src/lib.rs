@@ -53,6 +53,7 @@ mod progress;
 mod requirement;
 pub mod runtime;
 mod user_intent;
+mod verification;
 pub mod workflow;
 
 pub use axes::CollaborationMode;
@@ -78,10 +79,11 @@ pub use user_intent::{
     PauseBoundary, StageRef, UserIntentDeclaration, UserIntentOperation, project_intent,
     quote_is_in_input,
 };
+pub use verification::{VerificationRecord, VerificationRecordState, VerificationReport};
 // Original top-level paths stay valid: the module split is semantic first,
 // physical second — no consumer changes required.
 pub use runtime::{
     ChildAgentSnapshot, ChildLimit, ChildSpawnSpec, ChildStop, SessionStatus, StopReason,
-    TaskOutcome, TurnOutcome, UnknownVariant,
+    TaskOutcome, TurnOutcome, UnknownVariant, VerificationStatus,
 };
 pub use workflow::AgentState;
