@@ -10,11 +10,11 @@ class Leveler < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.24/leveler-v1.0.24-aarch64-apple-darwin.tar.gz"
-      sha256 "18586100d098c2ef4c9014de15ae6845037f01636cb0df0e664b5d2de042bc8e"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.25/leveler-v1.0.25-aarch64-apple-darwin.tar.gz"
+      sha256 "5c86765391acb58a13840ee0658425ebc17e4ff7c46026152ffaf78fe08990ca"
     else
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.24/leveler-v1.0.24-x86_64-apple-darwin.tar.gz"
-      sha256 "8e0f9308e6a0c8f1268f55ba8d5f4061e5250b5677cca5f9baf83b6eea60d9dd"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.25/leveler-v1.0.25-x86_64-apple-darwin.tar.gz"
+      sha256 "ee4eba0f65c7d0c36e751a0569fb581f662556b0ec8c40a40d9c5ab24c655ef3"
     end
   end
 
@@ -24,12 +24,12 @@ class Leveler < Formula
       # platform branch and rejects the tap when one has no URL, so this branch
       # names the artifact it would use; `fetch` then fails there with a plain
       # 404 instead of taking the whole tap down.
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.24/leveler-v1.0.24-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.25/leveler-v1.0.25-aarch64-unknown-linux-gnu.tar.gz"
       sha256 :no_check
     end
     on_intel do
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.24/leveler-v1.0.24-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0f83cb4d48bef20f2f3ee2294f7443460f9a7478f57e24ccd759619c54cad1bd"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.25/leveler-v1.0.25-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "3c2dabef311e2b03eb40b0ead2523a1568f41b1b5aa9f85f9a04828010970062"
     end
   end
 
