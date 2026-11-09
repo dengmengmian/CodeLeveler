@@ -495,10 +495,14 @@ async fn a_chat_delegation_commits_the_task_and_continues_past_a_stage_summary()
     );
 }
 
-/// A repository names its own suite. DevOrder's is `make regression`: the
-/// runtime recorded it, it passed, and the goal still refused to close because
-/// the runner's name was not in the test vocabulary (session `1c3bf9aa`). The
-/// suite the user demanded has to be the suite the runtime recognises.
+/// A repository names its own suite. DevOrder's is `bin/make regression`: the
+/// runtime recorded it and it passed, but the old runner vocabulary could not
+/// see the name and refused to close the goal (session `1c3bf9aa`).
+///
+/// The structured contract has no runner vocabulary: the model declares the
+/// `tests` requirement and cites the recorded run by the command it actually
+/// ran. Any repository name works, because the citation is identity, not a
+/// recognised word.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_suite_named_in_the_repositorys_own_words_resolves_the_goal() {
@@ -506,7 +510,19 @@ async fn a_suite_named_in_the_repositorys_own_words_resolves_the_goal() {
 
     let fx = fixture(
         vec![
-            Scripted::commit(),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    "acceptance": ["go test ./... 通过", "MCP 读写工具与页面能力一致"],
+                    "task_relation": "continue",
+                    "requirements": [{
+                        "kind": "tests",
+                        "text": "完整测试通过",
+                        "source_quote": "完成后通过测试"
+                    }]
+                }),
+            ),
             Scripted::Tool(
                 "run_command",
                 serde_json::json!({
@@ -522,8 +538,7 @@ async fn a_suite_named_in_the_repositorys_own_words_resolves_the_goal() {
                     "summary": "本地全套已启动，13 组真实回归全过",
                     "verification": {"status": "passed", "detail": "bin/make regression"},
                     "requirements": [
-                        {"requirement": "tests", "status": "done",
-                         "evidence": "bin/make regression 退出码 0：13 组用例、191 条断言通过"}
+                        {"id": "R1", "status": "done", "evidence": "bin/make regression"}
                     ]
                 }),
             ),
@@ -650,12 +665,18 @@ async fn chat_with_request(
 async fn a_refused_declaration_buys_a_continuation_and_does_not_create_a_goal() {
     let fx = fixture(
         vec![
-            // Covers one deliverable out of three: the refusal is deterministic.
+            // The quote does not occur in the user's message: the declaration
+            // is invalid, deterministically.
             Scripted::Tool(
                 "commit_task",
                 serde_json::json!({
                     "objective": STAGED_REQUEST,
-                    "acceptance": ["文章发布可访问"]
+                    "acceptance": ["文章发布可访问"],
+                    "requirements": [{
+                        "kind": "named",
+                        "text": "文章发布",
+                        "source_quote": "这是一句用户没有说过的话"
+                    }]
                 }),
             ),
             Scripted::Text("我先完成了文章发布这一部分。"),
@@ -684,11 +705,10 @@ async fn a_refused_declaration_buys_a_continuation_and_does_not_create_a_goal() 
                 ContentPart::ToolResult { result } => Some(result.content.clone()),
                 _ => None,
             })
-            .find(|content| content.contains("commit_task refused"))
+            .find(|content| content.contains("source_quote"))
             .expect("the model sees the refusal");
-        assert!(refusal.contains("[deliverable]"), "{refusal}");
         assert!(
-            refusal.contains("评论回复") && refusal.contains("内容权限校验"),
+            refusal.contains("does not occur in the user's message"),
             "{refusal}"
         );
         assert!(refusal.contains("Fix:"), "{refusal}");
@@ -722,10 +742,10 @@ async fn a_refused_declaration_buys_a_continuation_and_does_not_create_a_goal() 
     );
 }
 
-/// Before the declaration is committed there is no goal row, but the commit
-/// gate already derives an effective requirement set from the user's request.
-/// The audited session was refused three times while only an eight-item sample
-/// of that set was visible, and the model finally guessed the cause wrong.
+/// Before the declaration is committed there is no goal row and no requirement
+/// set: the runtime does not derive one from the user's prose. The pre-commit
+/// reader must say that honestly and name the structured declaration path,
+/// instead of presenting an extracted candidate as authority.
 #[tokio::test]
 async fn the_scope_tool_is_readable_before_commit() {
     let fx = fixture(
@@ -743,7 +763,7 @@ async fn the_scope_tool_is_readable_before_commit() {
     let tools = tool_names(&requests[0]);
     assert!(
         tools.contains(&"get_goal_scope"),
-        "the commit gate's reader must be on the pre-commit surface: {tools:?}"
+        "the scope reader must be on the pre-commit surface: {tools:?}"
     );
     let result = requests[1]
         .messages
@@ -757,17 +777,25 @@ async fn the_scope_tool_is_readable_before_commit() {
         .expect("the scope result reaches the model");
     assert!(!result.is_error, "{}", result.content);
     assert!(
-        result.content.contains("[deliverable]"),
-        "the candidate scope is typed like the committed one: {}",
+        result
+            .content
+            .contains("No committed goal exists for this turn"),
+        "{}",
         result.content
     );
-    for deliverable in ["文章发布", "评论回复", "内容权限校验"] {
-        assert!(
-            result.content.contains(deliverable),
-            "the candidate scope names `{deliverable}`: {}",
-            result.content
-        );
-    }
+    assert!(
+        result
+            .content
+            .contains("does not extract requirements from prose")
+            && result.content.contains("commit_task")
+            && result.content.contains("source_quote"),
+        "the reader names the declaration path instead of inventing scope: {}",
+        result.content
+    );
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "reading the scope before a declaration must not register anything"
+    );
 }
 
 /// The commit gate extracts one requirement per deliverable, so a request that
@@ -856,27 +884,44 @@ async fn a_request_with_more_than_twenty_deliverables_can_be_committed() {
     assert_eq!(goals[0].objective, request);
 }
 
-/// The other honest recovery: the model fixes the contract and re-declares.
+/// The other honest recovery: the model fixes the refused declaration and
+/// re-declares the same scope. The first call quotes words the user never
+/// said, so the runtime refuses it deterministically; the corrected call
+/// declares every deliverable with a verbatim quote and is accepted.
 #[tokio::test]
 async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
+    let acceptance = serde_json::json!([
+        "文章发布可访问",
+        "评论回复可提交且可见",
+        "内容权限校验覆盖作者与管理员",
+        format!("{} 通过", test_runner_label())
+    ]);
     let fx = fixture(
         vec![
             Scripted::Tool(
                 "commit_task",
                 serde_json::json!({
                     "objective": STAGED_REQUEST,
-                    "acceptance": ["文章发布可访问"]
+                    "acceptance": acceptance.clone(),
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"},
+                        {"kind": "named", "text": "评论回复", "source_quote": "评论回复"},
+                        {"kind": "named", "text": "内容权限校验",
+                         "source_quote": "用户没有这样说过"}
+                    ]
                 }),
             ),
             Scripted::Tool(
                 "commit_task",
                 serde_json::json!({
                     "objective": STAGED_REQUEST,
-                    "acceptance": [
-                        "文章发布可访问",
-                        "评论回复可提交且可见",
-                        "内容权限校验覆盖作者与管理员",
-                        "sh run-tests.sh 通过"
+                    "acceptance": acceptance,
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"},
+                        {"kind": "named", "text": "评论回复", "source_quote": "评论回复"},
+                        {"kind": "named", "text": "内容权限校验",
+                         "source_quote": "内容权限校验"},
+                        {"kind": "tests", "text": "测试通过", "source_quote": "完成后通过测试"}
                     ]
                 }),
             ),
@@ -888,10 +933,10 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
                     "summary": "三项社区业务完成",
                     "verification": {"status": "passed", "detail": test_runner_label()},
                     "requirements": [
-                        {"requirement": "文章发布", "status": "done", "evidence": "发布链路可访问"},
-                        {"requirement": "评论回复", "status": "done", "evidence": "回复可见"},
-                        {"requirement": "内容权限校验", "status": "done", "evidence": "作者/管理员/只读"},
-                        {"requirement": "tests", "status": "done", "evidence": test_runner_label()}
+                        {"id": "R1", "status": "done", "evidence": "发布链路可访问"},
+                        {"id": "R2", "status": "done", "evidence": "回复可见"},
+                        {"id": "R3", "status": "done", "evidence": "作者/管理员/只读"},
+                        {"id": "R4", "status": "done", "evidence": test_runner_label()}
                     ]
                 }),
             ),
@@ -901,6 +946,25 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
     .await;
 
     let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let refusal = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id.as_str() == "call-1")
+            .expect("the first declaration's result reaches the model");
+        assert!(
+            refusal.is_error && refusal.content.contains("source_quote"),
+            "the first declaration is refused for its quote: {}",
+            refusal.content
+        );
+    }
 
     let goals = goal_records(&fx).await;
     assert_eq!(
@@ -914,21 +978,26 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
         "the corrected contract completes: {:?}",
         goals[0].state
     );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        requirements.len(),
+        4,
+        "the accepted call's four requirements are the recorded set: {requirements:?}"
+    );
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }
 
-/// The scope the acceptance gate enforces is readable BEFORE registration,
-/// from the same extraction the commit uses. The model reads it and writes a
-/// covering list on its first declaration instead of learning the gaps one
-/// refusal at a time.
+/// The committed requirement set is readable by stable id. What the model
+/// declared at commit is what the completion gate reads; a read cannot invent
+/// or drop a requirement because it never re-parses the objective.
 #[tokio::test]
-async fn the_goal_scope_is_previewable_before_registration() {
+async fn the_goal_scope_reads_the_declared_requirements_by_id() {
     let fx = fixture(
         vec![
-            Scripted::Tool(
-                "get_goal_scope",
-                serde_json::json!({"offset": 0, "limit": 20}),
-            ),
             Scripted::Tool(
                 "commit_task",
                 serde_json::json!({
@@ -938,8 +1007,17 @@ async fn the_goal_scope_is_previewable_before_registration() {
                         "评论回复可提交且可见",
                         "内容权限校验覆盖作者与管理员",
                         "sh run-tests.sh 通过"
+                    ],
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"},
+                        {"kind": "named", "text": "评论回复", "source_quote": "评论回复"},
+                        {"kind": "named", "text": "内容权限校验", "source_quote": "内容权限校验"}
                     ]
                 }),
+            ),
+            Scripted::Tool(
+                "get_goal_scope",
+                serde_json::json!({"offset": 0, "limit": 20, "history": true}),
             ),
             Scripted::run_tests(),
             Scripted::Tool(
@@ -949,10 +1027,9 @@ async fn the_goal_scope_is_previewable_before_registration() {
                     "summary": "三项社区业务完成",
                     "verification": {"status": "passed", "detail": test_runner_label()},
                     "requirements": [
-                        {"requirement": "文章发布", "status": "done", "evidence": "发布链路可访问"},
-                        {"requirement": "评论回复", "status": "done", "evidence": "回复可见"},
-                        {"requirement": "内容权限校验", "status": "done", "evidence": "作者/管理员/只读"},
-                        {"requirement": "tests", "status": "done", "evidence": test_runner_label()}
+                        {"id": "R1", "status": "done", "evidence": "发布链路可访问"},
+                        {"id": "R2", "status": "done", "evidence": "回复可见"},
+                        {"id": "R3", "status": "done", "evidence": "作者/管理员/只读"}
                     ]
                 }),
             ),
@@ -967,96 +1044,88 @@ async fn the_goal_scope_is_previewable_before_registration() {
         let requests = fx.runtime.requests.lock().unwrap();
         assert!(
             tool_names(&requests[0]).contains(&"get_goal_scope"),
-            "the preview is advertised before any declaration: {:?}",
+            "the scope reader is advertised on the Chat surface: {:?}",
             tool_names(&requests[0])
         );
-        let preview = requests[1]
-            .messages
+        let scope = requests
             .iter()
+            .flat_map(|request| request.messages.iter())
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
                 ContentPart::ToolResult { result } => Some(result.content.clone()),
                 _ => None,
             })
-            .find(|content| content.contains("Goal scope preview"))
-            .expect("the model reads the pre-registration scope");
-        assert!(preview.contains("not registered yet"), "{preview}");
-        for deliverable in ["文章发布", "评论回复", "内容权限校验"] {
+            .find(|content| content.contains("Goal scope:"))
+            .expect("the model reads the committed scope");
+        for (id, text) in [
+            ("R1", "文章发布"),
+            ("R2", "评论回复"),
+            ("R3", "内容权限校验"),
+        ] {
             assert!(
-                preview.contains(deliverable),
-                "the preview names every deliverable ({deliverable}): {preview}"
+                scope.contains(&format!("- {id} [deliverable] active: {text}")),
+                "the scope names {id} as declared: {scope}"
             );
         }
-        assert!(
-            preview.contains("[tests]"),
-            "the classification reaches the model: {preview}"
-        );
     }
 
     let goals = goal_records(&fx).await;
-    assert_eq!(goals.len(), 1, "the preview does not register anything");
+    assert_eq!(goals.len(), 1, "the declaration registers one goal");
     assert_eq!(goals[0].objective, STAGED_REQUEST);
     assert!(
         goals[0].state == leveler_storage::GoalState::Settled,
-        "the covering declaration registers and completes: {:?}",
+        "the declared set can be accounted and completed: {:?}",
         goals[0].state
     );
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }
 
 #[tokio::test]
-async fn a_long_p2_request_registers_from_the_classified_scope() {
+async fn a_long_p2_request_registers_its_declared_requirements() {
     const P2: &str = include_str!("../../../testdata/regression/p2_scope_classification.zh-CN.md");
-    const DELIVERABLES: &[&str] = &[
-        "订阅计划管理",
-        "按量计费采集",
-        "账单周期生成",
-        "账单明细查询接口",
-        "发票开具流程",
-        "发票红冲流程",
-        "付款记录登记",
-        "付款核销与账单匹配",
-        "逾期账单提醒",
-        "退款申请与审批",
-        "退款执行与账单回滚",
-        "客户信用额度管理",
-        "多币种结算与汇率快照",
-        "税率配置与按地区计税",
-        "收入确认表",
-        "应收账龄表",
-        "现金流日报",
-        "渠道账与系统账自动比对",
-        "对账差异处理工作台",
-        "财务审计日志",
-        "财务数据导出",
-        "计费规则版本管理与灰度发布",
-        "账单冲正接口",
-        "财务指标看板",
-    ];
     // More than 20 real deliverables fit the unchanged 20-item acceptance cap
     // by grouping; the cap is a payload bound, not a scope bound.
-    let mut acceptance: Vec<String> = DELIVERABLES
-        .chunks(8)
-        .map(|group| format!("{} 均已交付并可用", group.join("、")))
+    let acceptance: Vec<String> = (1..=24)
+        .map(|index| format!("本轮交付物 {index} 已交付并可用"))
+        .collect::<Vec<_>>()
+        .chunks(3)
+        .map(|group| group.join("、"))
         .collect();
+    let mut acceptance = acceptance;
     acceptance.push("迁移脚本 migrations/0007_billing.sql 已创建".to_string());
     acceptance.push("cargo test -p billing 通过".to_string());
 
     let fx = fixture(
         vec![
             Scripted::Tool(
-                "get_goal_scope",
-                serde_json::json!({"offset": 0, "limit": 20}),
-            ),
-            Scripted::Tool(
-                "get_goal_scope",
-                serde_json::json!({"offset": 20, "limit": 20}),
-            ),
-            Scripted::Tool(
                 "commit_task",
-                serde_json::json!({"objective": P2, "acceptance": acceptance}),
+                serde_json::json!({
+                    "objective": P2,
+                    "acceptance": acceptance,
+                    "requirements": [
+                        {"kind": "baseline",
+                         "text": "P0/P1 的租户、发票与基线能力已上线",
+                         "source_quote": "以下能力已经上线，本阶段只在其上扩展，不重做"},
+                        {"kind": "preparation",
+                         "text": "阅读计费与发票代码",
+                         "source_quote": "阅读 `crates/billing/src/tenant.rs` 与 `crates/finance/src/invoice.rs`"},
+                        {"kind": "constraint",
+                         "text": "所有新增代码必须有中文注释",
+                         "source_quote": "所有新增代码必须有中文注释"},
+                        {"kind": "named",
+                         "text": "订阅计划管理",
+                         "source_quote": "实现订阅计划管理"},
+                        {"kind": "artifact",
+                         "text": "迁移脚本 migrations/0007_billing.sql",
+                         "target": "migrations/0007_billing.sql",
+                         "source_quote": "交付必须包含迁移脚本 `migrations/0007_billing.sql`"},
+                        {"kind": "tests",
+                         "text": "cargo test -p billing 通过",
+                         "source_quote": "完成后运行 `cargo test -p billing` 并确保通过"}
+                    ]
+                }),
             ),
-            Scripted::Text("已按分类后的范围注册任务。"),
+            Scripted::Text("已按声明的要求注册任务。"),
         ],
         false,
     )
@@ -1075,31 +1144,31 @@ async fn a_long_p2_request_registers_from_the_classified_scope() {
                 _ => None,
             })
             .collect();
-        let preview = tool_results
+        let receipt = tool_results
             .iter()
-            .filter(|content| content.contains("Goal scope preview"))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
+            .find(|content| content.contains("Execution task committed"))
+            .expect("the declaration is recorded");
         for expected in [
             "[baseline]",
             "[preparation]",
             "[constraint]",
             "[deliverable]",
+            "[artifact]",
+            "[tests]",
             "订阅计划管理",
-            "crates/billing/src/tenant.rs",
+            "migrations/0007_billing.sql",
             "所有新增代码必须有中文注释",
         ] {
             assert!(
-                preview.contains(expected),
-                "the preview lacks `{expected}`: {preview}"
+                receipt.contains(expected),
+                "the receipt lacks `{expected}`: {receipt}"
             );
         }
         assert!(
             !tool_results
                 .iter()
-                .any(|content| content.contains("commit_task refused")),
-            "the classified scope must be registrable: {tool_results:#?}"
+                .any(|content| content.contains("could not record the task")),
+            "a valid structured declaration must register: {tool_results:#?}"
         );
     }
 
@@ -1132,6 +1201,11 @@ async fn shrinking_the_plan_does_not_narrow_the_goals_scope() {
                         "订阅计费可用",
                         "发票管理可用",
                         "财务对账可用"
+                    ],
+                    "requirements": [
+                        {"kind": "named", "text": "订阅计费", "source_quote": "实现订阅计费"},
+                        {"kind": "named", "text": "发票管理", "source_quote": "实现发票管理"},
+                        {"kind": "named", "text": "财务对账", "source_quote": "实现财务对账"}
                     ]
                 }),
             ),
@@ -1159,8 +1233,8 @@ async fn shrinking_the_plan_does_not_narrow_the_goals_scope() {
                     "summary": "退款与关账完成",
                     "verification": {"status": "passed", "detail": test_runner_label()},
                     "requirements": [
-                        {"requirement": "退款流程", "status": "done", "evidence": "已完成"},
-                        {"requirement": "日终关账", "status": "done", "evidence": "已完成"}
+                        {"id": "退款流程", "status": "done", "evidence": "已完成"},
+                        {"id": "日终关账", "status": "done", "evidence": "已完成"}
                     ]
                 }),
             ),
@@ -1227,13 +1301,14 @@ async fn shrinking_the_plan_does_not_narrow_the_goals_scope() {
                 ContentPart::ToolResult { result } => Some(result.content.clone()),
                 _ => None,
             })
-            .find(|content| content.contains("Effective acceptance"))
+            .find(|content| content.contains("Goal scope:"))
             .expect("the scope is readable after the plan change")
     };
-    for deliverable in ["订阅计费", "发票管理", "财务对账"] {
+    for (id, deliverable) in [("R1", "订阅计费"), ("R2", "发票管理"), ("R3", "财务对账")]
+    {
         assert!(
-            scope.contains(deliverable),
-            "the goal still owes `{deliverable}`: {scope}"
+            scope.contains(&format!("- {id} [deliverable] active: {deliverable}")),
+            "the goal still owes `{deliverable}` by id: {scope}"
         );
     }
 
@@ -1609,19 +1684,34 @@ fn write_stage() -> Scripted {
 async fn a_completion_cannot_omit_a_user_named_deliverable() {
     let fx = fixture(
         vec![
-            commit_with(
-                vec![
-                    "stage-1.txt 存在",
-                    "stage-2.txt 存在",
-                    "stage-3.txt 存在",
-                    verifier_acceptance(),
-                ],
-                staged_objective(),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": staged_objective(),
+                    "acceptance": [
+                        "stage-1.txt 存在",
+                        "stage-2.txt 存在",
+                        "stage-3.txt 存在",
+                        verifier_acceptance(),
+                    ],
+                    "task_relation": "continue",
+                    "requirements": [
+                        {"kind": "artifact", "text": "stage-1.txt 存在",
+                         "target": "stage-1.txt", "source_quote": "创建 stage-1.txt"},
+                        {"kind": "artifact", "text": "stage-2.txt 存在",
+                         "target": "stage-2.txt", "source_quote": "stage-2.txt"},
+                        {"kind": "artifact", "text": "stage-3.txt 存在",
+                         "target": "stage-3.txt", "source_quote": "stage-3.txt"},
+                        {"kind": "command", "text": "verify.sh 通过",
+                         "target": verifier_label(),
+                         "source_quote": format!("运行 {}", verifier_label())}
+                    ]
+                }),
             ),
             write_stage(),
-            // The model tries to re-declare a narrower plan mid-task. A bound
-            // goal has no acceptance update path; the stored plan stays the
-            // full one.
+            // The model tries to re-declare a narrower plan mid-task. The stored
+            // goal keeps the requirements it was committed against; a second
+            // commit cannot seed a new scope into the same goal.
             commit_with(vec!["stage-1.txt 存在"], staged_objective()),
             Scripted::Tool("run_command", verifier_call()),
             Scripted::Tool(
@@ -1631,14 +1721,10 @@ async fn a_completion_cannot_omit_a_user_named_deliverable() {
                     "summary": "all three stages are complete",
                     "verification": {"status": "passed", "detail": verifier_label()},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done",
-                         "evidence": "created stage-1.txt"},
-                        {"requirement": "stage-2.txt", "status": "done",
-                         "evidence": "created stage-2.txt"},
-                        {"requirement": "stage-3.txt", "status": "done",
-                         "evidence": "created stage-3.txt"},
-                        {"requirement": verifier_path(), "status": "done",
-                         "evidence": "ran the verifier"}
+                        {"id": "R1", "status": "done", "evidence": "created stage-1.txt"},
+                        {"id": "R2", "status": "done", "evidence": "created stage-2.txt"},
+                        {"id": "R3", "status": "done", "evidence": "created stage-3.txt"},
+                        {"id": "R4", "status": "done", "evidence": "ran the verifier"}
                     ]
                 }),
             ),
@@ -1703,8 +1789,48 @@ async fn a_completion_cannot_omit_a_user_named_deliverable() {
 async fn a_narrow_acceptance_cannot_commit_the_users_full_request() {
     let fx = fixture(
         vec![
-            commit_with(vec!["stage-1.txt 存在"], staged_objective()),
-            Scripted::Text("I cannot narrow the user's scope."),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": staged_objective(),
+                    "acceptance": ["stage-1.txt 存在"],
+                    "task_relation": "continue",
+                    "requirements": [
+                        {"kind": "artifact", "text": "stage-1.txt 存在",
+                         "target": "stage-1.txt", "source_quote": "创建 stage-1.txt"},
+                        {"kind": "artifact", "text": "stage-2.txt 存在",
+                         "target": "stage-2.txt", "source_quote": "stage-2.txt"},
+                        {"kind": "artifact", "text": "stage-3.txt 存在",
+                         "target": "stage-3.txt", "source_quote": "stage-3.txt"},
+                        {"kind": "command", "text": "verify.sh 通过",
+                         "target": verifier_label(),
+                         "source_quote": format!("运行 {}", verifier_label())}
+                    ]
+                }),
+            ),
+            write_stage(),
+            Scripted::Tool("run_command", verifier_call()),
+            // A one-line acceptance plan says what the model intends to check;
+            // it cannot retire the requirements the commit itself declared.
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "stage-1 is done",
+                    "verification": {"status": "passed", "detail": verifier_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "created stage-1.txt"},
+                        {"id": "R4", "status": "done", "evidence": "ran the verifier"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "blocked",
+                    "summary": "stage-2 and stage-3 were never created"
+                }),
+            ),
         ],
         false,
     )
@@ -1727,42 +1853,107 @@ async fn a_narrow_acceptance_cannot_commit_the_users_full_request() {
         .unwrap();
 
     assert_eq!(
-        report.stop_reason,
-        leveler_agent::StopReason::Answered,
-        "a refused commit leaves the turn a Chat answer: {report:?}"
-    );
-    assert!(
-        goal_records(&fx).await.is_empty(),
-        "a task whose acceptance drops user deliverables must not be bound"
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Blocked,
+        "a narrow plan cannot make an incomplete goal complete: {report:?}"
     );
     assert!(
         events.iter().any(|event| matches!(
             event,
             leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
-                if kind == "acceptance_narrowed"
+                if kind == "requirements_refused"
                     && detail.contains("stage-2.txt")
                     && detail.contains("stage-3.txt")
         )),
-        "the refusal must name every dropped deliverable: {events:?}"
+        "the refusal must name the requirements the plan omitted: {events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "the commit binds against the full request");
+    assert_eq!(
+        goals[0].acceptance.len(),
+        1,
+        "the model's acceptance plan is recorded as written"
+    );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        requirements.len(),
+        4,
+        "the declared requirement set is what completion is measured against"
+    );
+    assert!(
+        requirements
+            .iter()
+            .any(|item| item.text.contains("stage-2.txt")
+                && item.state == leveler_lifecycle::RequirementState::Active),
+        "the omitted deliverable is still owed: {requirements:?}"
     );
 }
 
-/// A deterministic scope refusal cannot be satisfied by sending the exact
-/// same objective and acceptance again. The second answer must say that
-/// nothing changed, so the model knows to alter its plan instead of looping.
+/// A deterministic gate refusal cannot be satisfied by sending the exact same
+/// completion account again. The repeated verdict is counted, and the drive
+/// stops once the facts it reads have not changed across
+/// [`MAX_IDENTICAL_GATE_REFUSALS`] attempts, instead of looping forever.
 #[tokio::test]
-async fn an_identical_commit_refusal_is_named_as_a_repeat() {
+async fn an_identical_gate_refusal_stops_instead_of_looping() {
+    let incomplete_completion = || {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "stage-1 is done",
+                "verification": {"status": "passed", "detail": verifier_label()},
+                "requirements": [
+                    {"id": "R1", "status": "done", "evidence": "created stage-1.txt"},
+                    {"id": "R2", "status": "done", "evidence": "created stage-2.txt"},
+                    {"id": "R3", "status": "done", "evidence": "created stage-3.txt"},
+                    {"id": "R4", "status": "done", "evidence": "ran the verifier"}
+                ]
+            }),
+        )
+    };
     let fx = fixture(
         vec![
-            commit_with(vec!["stage-1.txt 存在"], staged_objective()),
-            commit_with(vec!["stage-1.txt 存在"], staged_objective()),
-            Scripted::Text("I will change the acceptance checks."),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": staged_objective(),
+                    "acceptance": ["stage-1.txt 存在", "stage-2.txt 存在", "stage-3.txt 存在"],
+                    "task_relation": "continue",
+                    "requirements": [
+                        {"kind": "artifact", "text": "stage-1.txt 存在",
+                         "target": "stage-1.txt", "source_quote": "创建 stage-1.txt"},
+                        {"kind": "artifact", "text": "stage-2.txt 存在",
+                         "target": "stage-2.txt", "source_quote": "stage-2.txt"},
+                        {"kind": "artifact", "text": "stage-3.txt 存在",
+                         "target": "stage-3.txt", "source_quote": "stage-3.txt"},
+                        {"kind": "command", "text": "verify.sh 通过",
+                         "target": verifier_label(),
+                         "source_quote": format!("运行 {}", verifier_label())}
+                    ]
+                }),
+            ),
+            write_stage(),
+            Scripted::Tool("run_command", verifier_call()),
+            incomplete_completion(),
+            // Real work between identical verdicts keeps the no-progress
+            // watchdog quiet; the stuck-verdict bound must own this case.
+            Scripted::Tool("run_command", verifier_call()),
+            incomplete_completion(),
+            Scripted::Tool("run_command", verifier_call()),
+            incomplete_completion(),
+            Scripted::Tool("run_command", verifier_call()),
         ],
         false,
     )
     .await;
+    write_verifier(fx.dir.path());
     let mut events = Vec::new();
-    fx.coding
+    let report = fx
+        .coding
         .chat(
             &fx.session,
             &spec_for(&fx, staged_objective()),
@@ -1779,7 +1970,7 @@ async fn an_identical_commit_refusal_is_named_as_a_repeat() {
         .iter()
         .filter_map(|event| match event {
             leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
-                if kind == "acceptance_narrowed" =>
+                if kind == "requirements_refused" =>
             {
                 Some(detail)
             }
@@ -1787,18 +1978,39 @@ async fn an_identical_commit_refusal_is_named_as_a_repeat() {
         })
         .collect();
     assert!(
-        refusals.len() >= 2,
-        "both refusals must be visible: {events:?}"
+        refusals.len() >= 3,
+        "every identical refusal must be visible: {events:?}"
     );
     assert!(
-        refusals
+        refusals.iter().any(|detail| detail.contains("stage-2.txt")),
+        "the refusal names the unaccounted deliverable: {refusals:?}"
+    );
+    let detail = report.stop_detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("same refusal") && detail.contains("retrying cannot satisfy it"),
+        "a repeated deterministic verdict must stop the loop: {report:?}"
+    );
+    assert_ne!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "a refused completion is never a delivered task: {report:?}"
+    );
+    // The window ends as a failed run, but the declaration it was measured
+    // against is still in durable history: stopping cannot erase the two
+    // deliverables the model never produced.
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert!(
+        requirements
             .iter()
-            .any(|detail| detail.contains("refusal #2") && detail.contains("have not changed")),
-        "a repeated deterministic refusal must say it is unchanged: {refusals:?}"
-    );
-    assert!(
-        goal_records(&fx).await.is_empty(),
-        "a refused commit must not create a task"
+            .any(|item| item.text.contains("stage-2.txt")
+                && item.state == leveler_lifecycle::RequirementState::Active),
+        "the unterminated requirement survives the failed window: {requirements:?}"
     );
 }
 
@@ -1867,17 +2079,47 @@ async fn markdown_headings_do_not_become_commit_requirements() {
 async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
     let fx = fixture(
         vec![
-            commit_with(
-                vec![
-                    "stage-1.txt 存在",
-                    "stage-2.txt 存在",
-                    "stage-3.txt 存在",
-                    verifier_acceptance(),
-                ],
-                staged_objective(),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": staged_objective(),
+                    "acceptance": [
+                        "stage-1.txt 存在",
+                        "stage-2.txt 存在",
+                        "stage-3.txt 存在",
+                        verifier_acceptance(),
+                    ],
+                    "task_relation": "continue",
+                    "requirements": [
+                        {"kind": "artifact", "text": "stage-1.txt 存在",
+                         "target": "stage-1.txt", "source_quote": "创建 stage-1.txt"},
+                        {"kind": "artifact", "text": "stage-2.txt 存在",
+                         "target": "stage-2.txt", "source_quote": "stage-2.txt"},
+                        {"kind": "artifact", "text": "stage-3.txt 存在",
+                         "target": "stage-3.txt", "source_quote": "stage-3.txt"},
+                        {"kind": "command", "text": "verify.sh 通过",
+                         "target": verifier_label(), "source_quote": format!("运行 {}", verifier_label())}
+                    ]
+                }),
             ),
             Scripted::Text("stage-1 is done; continuing."),
             write_stage(),
+            // The waiver is the model's structured declaration, anchored to the
+            // user's own resume message. The runtime checks the quote exists;
+            // it does not decide from the words whether a waiver happened.
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [
+                        {"op": "waive", "requirement_id": "R2",
+                         "source_quote": "stage-2.txt、stage-3.txt 暂时不做",
+                         "reason": "the user deferred stages 2 and 3"},
+                        {"op": "waive", "requirement_id": "R3",
+                         "source_quote": "stage-2.txt、stage-3.txt 暂时不做",
+                         "reason": "the user deferred stages 2 and 3"}
+                    ]
+                }),
+            ),
             Scripted::Tool("run_command", verifier_call()),
             Scripted::Tool(
                 "update_goal",
@@ -1886,10 +2128,8 @@ async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
                     "summary": "stage 1 delivered; stages 2-3 were waived by the user",
                     "verification": {"status": "passed", "detail": verifier_label()},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done",
-                         "evidence": "created stage-1.txt"},
-                        {"requirement": verifier_path(), "status": "done",
-                         "evidence": "ran the verifier"}
+                        {"id": "R1", "status": "done", "evidence": "created stage-1.txt"},
+                        {"id": "R4", "status": "done", "evidence": "ran the verifier"}
                     ]
                 }),
             ),
@@ -1930,7 +2170,7 @@ async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
     assert_eq!(
         resumed.outcome,
         leveler_lifecycle::TaskOutcome::Completed,
-        "the user's own waiver is authority: {resumed:?}"
+        "the user's declared waiver is authority: {resumed:?}"
     );
     let goals = goal_records(&fx).await;
     assert_eq!(goals.len(), 1);
@@ -1941,30 +2181,94 @@ async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
             .amendments
             .iter()
             .any(|amendment| amendment.contains("暂时不做")),
-        "the waiver must be durable with its source: {goals:?}"
+        "the user's own message stays recorded verbatim: {goals:?}"
+    );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goal_id)
+        .await
+        .unwrap();
+    let state_of = |id: &str| {
+        requirements
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.state)
+    };
+    assert_eq!(
+        state_of("R1"),
+        Some(leveler_lifecycle::RequirementState::Active),
+        "{requirements:?}"
+    );
+    assert_eq!(
+        state_of("R2"),
+        Some(leveler_lifecycle::RequirementState::Waived),
+        "the deferred stage is no longer owed: {requirements:?}"
+    );
+    assert_eq!(
+        state_of("R3"),
+        Some(leveler_lifecycle::RequirementState::Waived),
+        "{requirements:?}"
+    );
+    assert_eq!(
+        state_of("R4"),
+        Some(leveler_lifecycle::RequirementState::Active),
+        "{requirements:?}"
+    );
+    let history = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirement_log(&goal_id)
+        .await
+        .unwrap();
+    assert!(
+        history.iter().any(|record| {
+            record.event.operation == leveler_lifecycle::ScopeOperationKind::Waive
+                && record.event.source_quote.contains("暂时不做")
+        }),
+        "the waiver event carries the user's authorizing words: {history:?}"
     );
 }
 
 #[tokio::test]
-async fn a_test_requirement_cannot_be_satisfied_by_a_build_check() {
+async fn a_tests_requirement_needs_a_cited_passing_run() {
     let objective = "实现全部接口，并通过完整测试。";
     let fx = fixture(
         vec![
-            commit_with(vec!["sh run-tests.sh 通过"], objective),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": objective,
+                    "acceptance": ["完整测试通过"],
+                    "task_relation": "continue",
+                    "requirements": [
+                        {"kind": "tests", "text": "完整测试通过",
+                         "source_quote": "通过完整测试"}
+                    ]
+                }),
+            ),
             Scripted::Tool("run_command", checker_call()),
+            // A passing build check does not cite the test run: the runtime
+            // does not infer that a command it cannot classify is the suite.
             Scripted::Tool(
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "the interfaces compile",
-                    "verification": {"status": "passed", "detail": checker_label()}
+                    "verification": {"status": "passed", "detail": checker_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "the interfaces compile"}
+                    ]
                 }),
             ),
+            Scripted::run_tests(),
             Scripted::Tool(
                 "update_goal",
                 serde_json::json!({
-                    "status": "blocked",
-                    "summary": "the required test suite has not run"
+                    "status": "complete",
+                    "summary": "the interfaces are implemented and the suite passes",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": test_runner_label()}
+                    ]
                 }),
             ),
         ],
@@ -1988,18 +2292,21 @@ async fn a_test_requirement_cannot_be_satisfied_by_a_build_check() {
         .await
         .unwrap();
 
-    assert_eq!(
-        report.outcome,
-        leveler_lifecycle::TaskOutcome::Blocked,
-        "a build check is not the tests the user asked for: {report:?}"
-    );
     assert!(
         events.iter().any(|event| matches!(
             event,
             leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
-                if kind == "requirements_refused" && detail.contains("test")
+                if kind == "requirements_refused"
+                    && detail.contains("R1")
+                    && detail.contains("test run")
+                    && detail.contains("does not cite")
         )),
-        "the refusal must name the test requirement: {events:?}"
+        "a build check without a citation must not satisfy the test requirement: {events:?}"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "a cited passing suite resolves the goal: {report:?}"
     );
 }
 
@@ -3468,18 +3775,24 @@ async fn a_status_question_in_a_paused_goal_is_not_scope() {
     let paused = goal_records(&fx).await;
     assert_eq!(paused[0].amendments.len(), 0, "{paused:?}");
 
-    say(
-        &fx,
-        "刚才阶段 1 修改了哪些文件？测试通过了吗？现在进度怎么样？",
-    )
-    .await;
+    let question = "刚才阶段 1 修改了哪些文件？测试通过了吗？现在进度怎么样？";
+    say(&fx, question).await;
 
     let goals = goal_records(&fx).await;
     assert_eq!(goals.len(), 1, "{goals:?}");
     assert_eq!(
         goals[0].amendments,
-        Vec::<String>::new(),
-        "a question about the work changes no scope: {goals:?}"
+        vec![question.to_string()],
+        "the user's message is recorded verbatim: {goals:?}"
+    );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert!(
+        requirements.is_empty(),
+        "a status question can never become a declared requirement: {requirements:?}"
     );
     assert!(goals[0].user_paused_at.is_some(), "{goals:?}");
     std::fs::remove_dir_all(fx.dir.path()).ok();
@@ -3493,14 +3806,24 @@ async fn an_independent_request_with_no_deliverable_is_not_scope() {
     write_verifier(fx.dir.path());
     pause_a_goal(&fx).await;
 
-    say(&fx, "另外帮我检查一下 README 有没有过时的说明。").await;
+    let request = "另外帮我检查一下 README 有没有过时的说明。";
+    say(&fx, request).await;
 
     let goals = goal_records(&fx).await;
     assert_eq!(goals.len(), 1, "{goals:?}");
     assert_eq!(
         goals[0].amendments,
-        Vec::<String>::new(),
-        "an open-ended request enumerates no deliverable, so it adds no scope: {goals:?}"
+        vec![request.to_string()],
+        "the user's message is recorded verbatim: {goals:?}"
+    );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert!(
+        requirements.is_empty(),
+        "without a structured declaration the message enumerates no requirement: {requirements:?}"
     );
     assert!(
         goals[0].user_paused_at.is_some(),
@@ -3530,8 +3853,30 @@ async fn a_dynamic_requirement_needs_its_own_mechanical_evidence() {
         )
     }
     let mut script = pause_stage_one_script();
-    script.push(Scripted::Text("补充要求已记下；阶段 2 仍等你确认。"));
     script.extend([
+        // The paused window adopts the goal without releasing the pause, then
+        // records the supplement as a structured requirement anchored to the
+        // user's own words. Scope is a declaration, never an extraction.
+        Scripted::Tool(
+            "declare_intent",
+            serde_json::json!({
+                "source_quote": "顺便把 stage-extra.txt 也补上",
+                "operations": [{"kind": "amend_current_task"}]
+            }),
+        ),
+        Scripted::Tool(
+            "declare_scope",
+            serde_json::json!({
+                "operations": [{
+                    "op": "add",
+                    "kind": "artifact",
+                    "text": "stage-extra.txt 存在",
+                    "target": "stage-extra.txt",
+                    "source_quote": "顺便把 stage-extra.txt 也补上"
+                }]
+            }),
+        ),
+        Scripted::Text("补充要求已记下；阶段 2 仍等你确认。"),
         // The user's continuation releases the pause and continues the same
         // goal; only a validated declaration can do that.
         declare_continue("继续阶段 2"),
@@ -3541,25 +3886,35 @@ async fn a_dynamic_requirement_needs_its_own_mechanical_evidence() {
         Scripted::Tool("run_command", verifier_call()),
         stage_plan("completed", "completed"),
         complete(serde_json::json!([
-            {"requirement": "stage-1.txt", "status": "done", "evidence": "created stage-1.txt"},
-            {"requirement": "stage-2.txt", "status": "done", "evidence": "created stage-2.txt"},
-            {"requirement": "stage-extra.txt", "status": "done", "evidence": "created stage-extra.txt"},
-            {"requirement": verifier_path(), "status": "done", "evidence": "ran the verifier"}
+            {"id": "R1", "status": "done", "evidence": "created stage-extra.txt"}
         ])),
         // The refusal is answered with the real work.
         write_named("stage-extra.txt"),
         Scripted::Tool("run_command", verifier_call()),
         complete(serde_json::json!([
-            {"requirement": "stage-1.txt", "status": "done", "evidence": "created stage-1.txt"},
-            {"requirement": "stage-2.txt", "status": "done", "evidence": "created stage-2.txt"},
-            {"requirement": "stage-extra.txt", "status": "done", "evidence": "created stage-extra.txt"},
-            {"requirement": verifier_path(), "status": "done", "evidence": "ran the verifier"}
+            {"id": "R1", "status": "done", "evidence": "created stage-extra.txt"}
         ])),
     ]);
     let fx = fixture(script, false).await;
     write_verifier(fx.dir.path());
     pause_a_goal(&fx).await;
     say(&fx, supplement_request()).await;
+    let recorded = goal_records(&fx).await;
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&recorded[0].id)
+        .await
+        .unwrap();
+    assert!(
+        requirements
+            .iter()
+            .any(|item| item.target.as_deref() == Some("stage-extra.txt")),
+        "the supplement is recorded as a structured requirement: {requirements:?}"
+    );
+    assert!(
+        recorded[0].user_paused_at.is_some(),
+        "declaring a requirement does not release the pause: {recorded:?}"
+    );
 
     let staged = staged_pause_objective();
     let mut events = Vec::new();
@@ -3676,7 +4031,18 @@ async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
     let objective = "本地启动项目，把全部功能真实测试一遍。";
     let fx = fixture(
         vec![
-            commit_with(vec!["全部功能实测完成", "make up 成功"], objective),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": objective,
+                    "acceptance": ["全部功能实测完成", "make up 成功"],
+                    "task_relation": "continue",
+                    "requirements": [
+                        {"kind": "named", "text": "全部功能实测",
+                         "source_quote": "把全部功能真实测试一遍"}
+                    ]
+                }),
+            ),
             Scripted::Tool(
                 "update_goal",
                 serde_json::json!({
@@ -3684,7 +4050,7 @@ async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
                     "summary": "全部功能实测完成",
                     "verification": {"status": "not_applicable", "detail": "只做了验证，没有改文件"},
                     "requirements": [
-                        {"requirement": "全部功能", "status": "done",
+                        {"id": "R1", "status": "done",
                          "evidence": "门户页面、运营接口与 MCP 工具都实测过"}
                     ]
                 }),

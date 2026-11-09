@@ -14,9 +14,7 @@ use async_trait::async_trait;
 use leveler_execution::RiskLevel;
 use leveler_model::{FinishReason, Message, TokenUsage};
 
-/// Why a lifecycle port refused. Both variants are terminal for the run: the
-/// engine could not make a fact durable, or this runtime no longer owns the
-/// task it was writing for.
+/// Why a lifecycle port refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PortError {
     #[error("persistence error: {0}")]
@@ -24,6 +22,11 @@ pub enum PortError {
     /// The runtime lost task ownership: a newer OwnerEpoch exists.
     #[error("stale runtime ownership: {0}")]
     StaleOwnership(String),
+    /// The declaration is well-formed as a request but illegal against the
+    /// recorded state (unknown identity, illegal transition, or bounds).
+    /// It is the model's to correct; the run itself is still healthy.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// The ownership fence: proves the runtime still owns its task before a
@@ -54,8 +57,9 @@ pub enum TaskRelation {
 ///
 /// `objective` is the user's request verbatim; `acceptance` is the model's
 /// candidate plan and never the authority over the objective; `amendments`
-/// are later user-authored scope instructions in their own words. The harness
-/// derives requirements from the user-authored fields only.
+/// record the user's own later messages verbatim. The requirement set is
+/// declared by the model over quoted user spans and read separately through
+/// [`GoalBinder::requirements`]; no layer re-derives it from this prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalScope {
     /// The durable goal identity this scope belongs to.
@@ -77,6 +81,27 @@ pub struct GoalScope {
     pub pause_boundary: Option<leveler_lifecycle::PauseBoundary>,
 }
 
+/// One accepted requirement event as the model's query path reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequirementEvent {
+    /// Per-goal sequence, starting at 1.
+    pub seq: u32,
+    /// The turn whose user message the event quoted.
+    pub turn_id: String,
+    /// The accepted operation and its payload.
+    pub event: leveler_lifecycle::AppliedRequirementEvent,
+}
+
+/// What one `bind` call did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundGoal {
+    /// The goal this turn now serves.
+    pub goal: leveler_core::GoalId,
+    /// Whether this call opened the goal. When false, the goal predates this
+    /// commit and its requirement history was not replaced by the seeds.
+    pub opened: bool,
+}
+
 /// Durable goal identity for a turn that was not started as a Goal turn.
 ///
 /// `/goal <task>` can arrive while a Chat turn is already running. The
@@ -93,14 +118,36 @@ pub struct GoalScope {
 pub trait GoalBinder: Send + Sync {
     /// Bind `objective` (or the session's durable pending declaration, when
     /// one exists) to this turn, recording the model's candidate acceptance
-    /// checks atomically with the goal row. Idempotent: the same turn binds
-    /// once.
+    /// checks and initial requirement declarations atomically with the goal
+    /// row. Idempotent: the same turn binds once.
+    ///
+    /// `opened` states whether this call created the goal. Seeds are recorded
+    /// only when it did: an existing goal's requirement set is its recorded
+    /// history, never a fresh commit declaration.
     async fn bind(
         &self,
         objective: &str,
         acceptance: &[String],
+        requirements: &[leveler_lifecycle::RequirementSeed],
         relation: Option<TaskRelation>,
-    ) -> Result<leveler_core::GoalId, PortError>;
+    ) -> Result<BoundGoal, PortError>;
+
+    /// The current requirement set of the goal this turn serves, folded from
+    /// its recorded history. Empty before a goal exists.
+    async fn requirements(&self) -> Result<Vec<leveler_lifecycle::RequirementItem>, PortError>;
+
+    /// The ordered requirement-event history of the bound goal, oldest first.
+    async fn requirement_history(&self) -> Result<Vec<RequirementEvent>, PortError>;
+
+    /// Apply one model scope declaration to the bound goal.
+    ///
+    /// The caller has already validated that every operation's `source_quote`
+    /// occurs in the user input that authorized it. The store owns identity,
+    /// ownership, transition legality and atomicity.
+    async fn record_scope(
+        &self,
+        declaration: &leveler_lifecycle::ScopeDeclaration,
+    ) -> Result<leveler_lifecycle::ScopeProjection, PortError>;
 
     /// The durable scope of the goal this turn serves, once it has one.
     /// Reading it at completion is what makes resume and compaction unable to

@@ -50,8 +50,8 @@ mod ledger;
 mod objective;
 mod plan;
 mod progress;
+mod requirement;
 pub mod runtime;
-mod user_boundary;
 mod user_intent;
 pub mod workflow;
 
@@ -65,9 +65,13 @@ pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{ABANDONED, PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
-pub use user_boundary::{
-    AuthorizationSignal, UserPauseBoundary, authorizes_continuation, effective_user_pause,
-    extract_user_pause, latest_authorization_signal, pause_in_force, user_pause_reached,
+pub use requirement::{
+    AppliedRequirementEvent, REQUIREMENT_REASON_MAX_CHARS, REQUIREMENT_TARGET_MAX_CHARS,
+    REQUIREMENT_TEXT_MAX_CHARS, RequirementItem, RequirementKind, RequirementSeed,
+    RequirementState, SCOPE_OPERATIONS_MAX, SCOPE_REQUIREMENTS_MAX, SCOPE_SOURCE_QUOTE_MAX_CHARS,
+    ScopeDeclaration, ScopeError, ScopeOperation, ScopeOperationKind, ScopeProjection,
+    apply_scope_declaration, fold_scope_events, initial_scope, next_requirement_id,
+    validate_declaration,
 };
 pub use user_intent::{
     INTENT_OPERATIONS_MAX, INTENT_SOURCE_QUOTE_MAX_CHARS, IntentError, IntentProjection,

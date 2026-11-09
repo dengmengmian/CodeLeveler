@@ -4,12 +4,12 @@ mod agent_spawn;
 pub mod closeout;
 mod dispatch;
 mod drive;
-/// The user's explicit requirements and the mechanical acceptance gate.
-pub(crate) mod goal_scope;
 pub(crate) mod goal_verification;
 mod handlers;
 pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
+/// Mechanical completion accounting for the structured requirement set.
+pub(crate) mod scope_gate;
 
 use std::sync::Arc;
 
@@ -759,6 +759,11 @@ pub enum AgentError {
     StaleOwnership(String),
     #[error("invalid execution budget: {0}")]
     InvalidBudget(String),
+    /// A lifecycle declaration reached a path that could not hand it back to
+    /// the model. The declaration is illegal, but the run itself is healthy;
+    /// it is not a persistence failure and is not resumable work.
+    #[error("invalid declaration: {0}")]
+    InvalidDeclaration(String),
     #[error("optional summary does not fit the remaining task budget")]
     AuxiliaryBudgetUnavailable,
     /// Context compaction could not establish a request that fits the model's
@@ -793,6 +798,7 @@ impl AgentError {
             AgentError::Cancelled | AgentError::BudgetExhausted(_) => true,
             AgentError::StaleOwnership(_)
             | AgentError::InvalidBudget(_)
+            | AgentError::InvalidDeclaration(_)
             | AgentError::AuxiliaryBudgetUnavailable
             | AgentError::ContextManagementFailure(_)
             | AgentError::Persistence(_) => false,
@@ -838,12 +844,14 @@ impl From<PortError> for DriveAborted {
 }
 
 impl From<PortError> for AgentError {
-    /// A lifecycle port refused. Both cases abort the run: the engine could
-    /// not make a fact durable, or this runtime no longer owns the task.
+    /// A lifecycle port refused. A persistence failure and an ownership loss
+    /// abort the run; an invalid declaration is a model-correctable fact that
+    /// only aborts when a caller had no way to return it to the model.
     fn from(error: PortError) -> Self {
         match error {
             PortError::Persistence(detail) => AgentError::Persistence(detail),
             PortError::StaleOwnership(detail) => AgentError::StaleOwnership(detail),
+            PortError::Invalid(detail) => AgentError::InvalidDeclaration(detail),
         }
     }
 }
@@ -2571,6 +2579,9 @@ impl Executor {
                  complete. Satisfying part of the objective and exempting the conflicting part \
                  is the same false completion. An objective that conflicts with a constraint \
                  that must not be changed is blocked.\n\
+                 Record the user's stated deliverables and constraints with declare_scope, each \
+                 anchored to a verbatim source_quote from the user's message; the completion \
+                 gate enforces exactly that recorded set.\n\
                  A delegated sub-task that returns is input to the goal, not a resolution of \
                  the goal.\n",
             );

@@ -29,21 +29,7 @@ use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::coding::policy::IndependentReviewPolicy;
 use crate::coding::turn::{TurnInput, content_objective_text, drive_turn};
 use crate::coding::workspace::GitWorkspace;
-use crate::executor::goal_scope;
 use crate::{ContinuationPolicy, StepLimits};
-
-/// Which reading decides whether a user message joins a goal's durable
-/// instruction sequence.
-///
-/// The two are deliberately different: a Goal window's instruction IS the
-/// goal's, including a constraint the user stated for it; a Chat message only
-/// joins the goal when it adds or waives work, so a constraint said about a
-/// side request is not remembered as the goal's own.
-#[derive(Debug, Clone, Copy)]
-enum InstructionBar {
-    GoalWindow,
-    ChatMessage,
-}
 
 const FINALIZATION_REVIEW: &str = "review";
 const FINALIZATION_RESOLVING_OUTCOME: &str = "resolving_outcome";
@@ -182,6 +168,11 @@ fn continuation_root_is_valid(
     })
 }
 
+/// Whether a persisted V1 turn carried one of the two bare continuation
+/// words that version accepted. This reads old turn payloads to recover their
+/// lineage; it never classifies a live user message. Current turns record an
+/// explicit objective, and a live message's meaning is the model's declared
+/// intent.
 fn is_bare_legacy_continuation(message: &Message) -> bool {
     let text = message.text_content();
     let trimmed = text.trim();
@@ -240,7 +231,7 @@ const MAX_COMPACTION_FACTS_CHARS: usize = 3_500;
 
 struct CompactionFactsInput<'a> {
     objective: Option<&'a str>,
-    effective: &'a [crate::executor::goal_scope::Requirement],
+    effective: &'a [leveler_lifecycle::RequirementItem],
     amendments: &'a [String],
     plan: Option<&'a leveler_lifecycle::PlanState>,
     progress: Option<&'a leveler_lifecycle::ProgressLedger>,
@@ -262,9 +253,14 @@ fn render_compaction_facts(input: &CompactionFactsInput<'_>) -> Option<String> {
     if let Some(objective) = input.objective.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str(&format!("Task objective: {}\n", clip(objective, 400)));
     }
-    if !input.effective.is_empty() {
-        out.push_str("Effective acceptance (the Gate uses exactly this set):\n");
-        for requirement in input.effective.iter().take(8) {
+    let owed: Vec<&leveler_lifecycle::RequirementItem> = input
+        .effective
+        .iter()
+        .filter(|item| item.is_owed())
+        .collect();
+    if !owed.is_empty() {
+        out.push_str("Recorded user requirements (the Gate uses exactly this set):\n");
+        for requirement in owed.iter().take(8) {
             out.push_str(&format!(
                 "- {} [{}] {}\n",
                 requirement.id,
@@ -272,16 +268,16 @@ fn render_compaction_facts(input: &CompactionFactsInput<'_>) -> Option<String> {
                 clip(&requirement.text, 200)
             ));
         }
-        if input.effective.len() > 8 {
+        if owed.len() > 8 {
             out.push_str(&format!(
-                "…and {} more effective requirements the Gate still enforces; call get_goal_scope to read them.\n",
-                input.effective.len() - 8
+                "…and {} more recorded requirements the Gate still enforces; call get_goal_scope to read them.\n",
+                owed.len() - 8
             ));
         }
     }
     if !input.amendments.is_empty() {
         out.push_str(
-            "User instructions, oldest to newest (a later instruction supersedes an earlier one):\n",
+            "User instructions, oldest to newest (recorded verbatim; requirement changes are declared separately):\n",
         );
         let start = input.amendments.len().saturating_sub(8);
         for amendment in &input.amendments[start..] {
@@ -1121,12 +1117,11 @@ impl CodingRuntime {
     /// Record one user-authored message in the goal's durable instruction
     /// sequence.
     ///
-    /// The authority is the user's own words, and the reading is the `bar`:
-    /// [`InstructionBar::GoalWindow`] for the instruction of a window that IS
-    /// the goal (a new deliverable, a prohibition, a waiver, a pause or an
-    /// authorization), [`InstructionBar::ChatMessage`] for a Chat message that
-    /// only joins the goal when it adds or waives WORK. A status question is
-    /// neither and is not recorded.
+    /// This is a verbatim user record, not a scope decision: whether the words
+    /// add, amend or waive a requirement is declared by the model through
+    /// `declare_scope`, anchored to a quote. Recording every message here
+    /// keeps the user's own instructions available across resume and
+    /// compaction without letting a keyword menu decide what became scope.
     ///
     /// This writes the user's instruction only. It never executes the new
     /// requirement, never binds the window to the goal and never touches
@@ -1138,7 +1133,6 @@ impl CodingRuntime {
         token: &leveler_core::OwnershipToken,
         goal_id: &leveler_core::GoalId,
         text: &str,
-        bar: InstructionBar,
     ) -> Result<(), EngineError> {
         let text = text.trim();
         if text.is_empty() {
@@ -1154,17 +1148,6 @@ impl CodingRuntime {
             return Ok(());
         }
         if record.amendments.iter().any(|value| value.trim() == text) {
-            return Ok(());
-        }
-        let joins = match bar {
-            InstructionBar::GoalWindow => {
-                goal_scope::is_goal_instruction(&record.objective, &record.amendments, text)
-            }
-            InstructionBar::ChatMessage => {
-                goal_scope::is_chat_goal_instruction(&record.objective, &record.amendments, text)
-            }
-        };
-        if !joins {
             return Ok(());
         }
         self.engine
@@ -1399,10 +1382,10 @@ impl CodingRuntime {
             .as_ref()
             .map(|goal| goal.objective.as_str())
             .or(objective);
-        let effective = goal
-            .as_ref()
-            .map(|goal| crate::executor::goal_scope::extract(&goal.objective, &goal.amendments))
-            .unwrap_or_default();
+        let effective = match goal.as_ref() {
+            Some(goal) => stores.goals.requirements(&goal.id).await?,
+            None => Vec::new(),
+        };
         let input = CompactionFactsInput {
             objective,
             effective: &effective,
@@ -2269,21 +2252,13 @@ impl CodingRuntime {
                 return result;
             }
         };
-        // A message that continues a running goal is user scope authority for
-        // that goal: a requirement it adds must reach the completion gate, or
-        // the goal could be resolved on the narrower original wording. The
-        // declaration-free path records it here through the same reading the
-        // gate uses, so a status question adds nothing while a new
-        // deliverable, a prohibition or a waiver becomes durable scope.
-        // `/goal` and resume record theirs through their own amendment paths.
+        // A message that continues a running goal is recorded verbatim as a
+        // user instruction. Requirement changes are not inferred from it:
+        // the model declares them with `declare_scope` and a verbatim quote,
+        // so a status question is recorded but can never become a deliverable.
         if continued_running {
-            self.record_goal_instruction(
-                &token,
-                &goal,
-                spec.runtime.goal.trim(),
-                InstructionBar::GoalWindow,
-            )
-            .await?;
+            self.record_goal_instruction(&token, &goal, spec.runtime.goal.trim())
+                .await?;
         }
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
@@ -2474,17 +2449,14 @@ impl CodingRuntime {
             .next()
             .map(str::to_string);
         // A Chat turn can add work to the one goal this task still owes. The
-        // user's own words are durable scope, never a binding: the goal keeps
-        // its identity, its window and its authorization, and this turn stays
-        // a Chat turn. Recording it here is what keeps a supplement from being
-        // lost when the user did not type `继续` (the resume path records the
-        // same text for a continuation).
+        // user's own words are recorded verbatim; binding and requirement
+        // changes remain explicit model declarations, so this turn stays a
+        // Chat turn.
         let running_goal = self.single_running_goal(&token.task_id).await?;
         if let Some(goal_id) = running_goal.as_ref()
             && let Some(text) = objective_hint.as_deref()
         {
-            self.record_goal_instruction(&token, goal_id, text, InstructionBar::ChatMessage)
-                .await?;
+            self.record_goal_instruction(&token, goal_id, text).await?;
         }
         let runner = TurnRunner {
             stores: &self.engine.stores,
@@ -2673,9 +2645,10 @@ impl CodingRuntime {
     ///
     /// Same resume path as [`Self::resume`]: the logical task, goal, plan,
     /// ledger and progress are the ones the session already owns. The
-    /// instruction is recorded as this turn's user message and appended after
-    /// the seeded transcript, so the original objective remains the anchor and
-    /// the amendment is an addition to it, never a replacement.
+    /// instruction is recorded verbatim as this turn's user message and
+    /// appended after the seeded transcript, so the original objective remains
+    /// the anchor. Whether the words amend the goal's scope is declared by the
+    /// model through `declare_scope`, never derived from their phrasing.
     pub async fn resume_with_instruction(
         &self,
         session_id: &SessionId,
@@ -3116,20 +3089,17 @@ impl CodingRuntime {
         if lineage_was_chat && (lineage.goal_id.is_some() || (goal_axis && pending.is_some())) {
             lineage.kind = ResumeTurnKind::Goal;
         }
-        let asks_for_new_work = instruction.as_ref().is_some_and(|message| {
-            !is_bare_legacy_continuation(message)
-                || message
-                    .content
-                    .iter()
-                    .any(|part| matches!(part, leveler_model::ContentPart::Image { .. }))
-        });
+        // Any user message asks the running model to read what the person said;
+        // whether the words continue the task, amend its scope or ask a
+        // question is the model's declaration, never a comparison against a
+        // fixed phrase. Only a resume that carries no message may replay a
+        // durable delivery instead of driving the model.
         // A fully committed Chat delivery is replayed, not regenerated. This
         // is the D6 cut: the task terminal is durable but the client may not
         // have received the final frame. Taking a new ownership or starting a
         // turn here would both re-drive the model and make the answer a
         // transaction side effect.
         if instruction.is_none()
-            && !asks_for_new_work
             && lineage.goal_id.is_none()
             && matches!(lineage.kind, ResumeTurnKind::Chat)
             && let Some(delivery) = self.committed_chat_delivery(session_id).await?
@@ -3229,11 +3199,11 @@ impl CodingRuntime {
         // A crash between the drive's published delivery and the task terminal
         // leaves the answer durable and the task unfinished. Re-driving the
         // model here would make it answer a second time; the recorded delivery
-        // is already the answer the user is owed. A resume that carries a new
-        // instruction asks for new work, so only a bare continuation (or no
-        // instruction at all) recovers the recorded answer.
+        // is already the answer the user is owed. A resume that carries a
+        // message asks for new work, so only a resume with no message recovers
+        // the recorded answer.
         if pending.is_none()
-            && !asks_for_new_work
+            && instruction.is_none()
             && let Some(goal_id) = lineage.goal_id.clone()
             && let Some(delivery) = self
                 .uncommitted_delivery(session_id, Some(&goal_id), false)
@@ -3307,7 +3277,7 @@ impl CodingRuntime {
         // are the whole evidence. Replay that answer and commit the missing
         // terminals; never ask the model for a second one.
         if pending.is_none()
-            && !asks_for_new_work
+            && instruction.is_none()
             && lineage.goal_id.is_none()
             && matches!(lineage.kind, ResumeTurnKind::Chat)
             && let Some(delivery) = self.uncommitted_delivery(session_id, None, false).await?
@@ -3380,11 +3350,7 @@ impl CodingRuntime {
                 .iter()
                 .filter(|part| matches!(part, leveler_model::ContentPart::Image { .. }))
                 .count();
-            let mut amendment = if is_bare_legacy_continuation(message) {
-                String::new()
-            } else {
-                message.text_content()
-            };
+            let mut amendment = message.text_content();
             if image_count > 0 {
                 if !amendment.is_empty() {
                     amendment.push('\n');
@@ -5601,19 +5567,22 @@ mod compaction_facts_tests {
         render_compaction_facts,
     };
 
-    fn requirement(text: &str) -> crate::executor::goal_scope::Requirement {
-        crate::executor::goal_scope::Requirement {
-            id: "R1".into(),
+    fn requirement(id: &str, text: &str) -> leveler_lifecycle::RequirementItem {
+        leveler_lifecycle::RequirementItem {
+            id: id.into(),
             text: text.into(),
-            kind: crate::executor::goal_scope::RequirementKind::Named,
-            source: crate::executor::goal_scope::RequirementSource::Objective,
+            kind: leveler_lifecycle::RequirementKind::Named,
             target: None,
+            source_quote: text.into(),
+            check: None,
+            state: leveler_lifecycle::RequirementState::Active,
+            superseded_by: None,
         }
     }
 
     fn render(
         objective: Option<&str>,
-        effective: &[crate::executor::goal_scope::Requirement],
+        effective: &[leveler_lifecycle::RequirementItem],
         amendments: &[String],
         progress: Option<&leveler_lifecycle::ProgressLedger>,
     ) -> Option<String> {
@@ -5630,13 +5599,13 @@ mod compaction_facts_tests {
     }
 
     #[test]
-    fn the_facts_block_names_the_objective_acceptance_and_ordered_constraints() {
-        let acceptance = vec![requirement("tests pass")];
+    fn the_facts_block_names_the_objective_requirements_and_ordered_instructions() {
+        let recorded = vec![requirement("R1", "tests pass")];
         let amendments = vec![
             "use an env var".to_string(),
             "do not edit config".to_string(),
         ];
-        let text = render(Some("ship the feature"), &acceptance, &amendments, None).unwrap();
+        let text = render(Some("ship the feature"), &recorded, &amendments, None).unwrap();
         assert!(text.starts_with(COMPACTION_FACTS_MARKER), "{text}");
         assert!(text.contains("ship the feature"));
         assert!(text.contains("tests pass"));
@@ -5644,7 +5613,19 @@ mod compaction_facts_tests {
         let first = text.find("use an env var").unwrap();
         let later = text.find("do not edit config").unwrap();
         assert!(first < later, "oldest-to-newest order is preserved: {text}");
-        assert!(text.contains("later instruction supersedes"));
+        assert!(text.contains("declared separately"));
+    }
+
+    /// The facts block mirrors the gate: a waived requirement is recorded
+    /// history, not owed work, so it must not reappear as an obligation.
+    #[test]
+    fn a_waived_requirement_is_not_rendered_as_owed() {
+        let mut waived = requirement("R1", "old docs");
+        waived.state = leveler_lifecycle::RequirementState::Waived;
+        let active = requirement("R2", "new docs");
+        let text = render(Some("task"), &[waived, active], &[], None).unwrap();
+        assert!(text.contains("R2"), "{text}");
+        assert!(!text.contains("old docs"), "{text}");
     }
 
     #[test]
@@ -5687,21 +5668,23 @@ mod compaction_facts_tests {
 #[cfg(test)]
 mod effective_acceptance_facts_tests {
     use super::{COMPACTION_FACTS_MARKER, CompactionFactsInput, render_compaction_facts};
-    use crate::executor::goal_scope::{Requirement, RequirementKind, RequirementSource, extract};
 
-    fn req(id: usize, text: &str) -> Requirement {
-        Requirement {
+    fn req(id: usize, text: &str) -> leveler_lifecycle::RequirementItem {
+        leveler_lifecycle::RequirementItem {
             id: format!("R{id}"),
             text: text.into(),
-            kind: RequirementKind::Named,
-            source: RequirementSource::Objective,
+            kind: leveler_lifecycle::RequirementKind::Named,
             target: None,
+            source_quote: text.into(),
+            check: None,
+            state: leveler_lifecycle::RequirementState::Active,
+            superseded_by: None,
         }
     }
 
     #[test]
-    fn more_than_eight_effective_requirements_are_not_claimed_as_complete() {
-        let effective: Vec<Requirement> = (0..10)
+    fn more_than_eight_recorded_requirements_are_not_claimed_as_complete() {
+        let effective: Vec<leveler_lifecycle::RequirementItem> = (0..10)
             .map(|i| req(i, &format!("deliverable-{i}")))
             .collect();
         let text = render_compaction_facts(&CompactionFactsInput {
@@ -5721,40 +5704,6 @@ mod effective_acceptance_facts_tests {
             !text.contains("deliverable-8"),
             "only eight are expanded: {text}"
         );
-        assert!(
-            text.contains("…and 2 more effective requirements"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn facts_render_the_same_effective_set_as_the_gate() {
-        let effective = extract(
-            "创建 config.yaml、setup.py。",
-            &["config.yaml 改用环境变量完成。".to_string()],
-        );
-        let text = render_compaction_facts(&CompactionFactsInput {
-            objective: Some("创建 config.yaml、setup.py。"),
-            effective: &effective,
-            amendments: &[],
-            plan: None,
-            progress: None,
-            verification: &[],
-            dangling: &[],
-            background: &[],
-        })
-        .unwrap();
-        assert!(
-            !effective
-                .iter()
-                .any(|requirement| requirement.text.contains("config.yaml")),
-            "the effective set must not contain the replaced deliverable: {effective:?}"
-        );
-        assert_eq!(
-            text.matches("config.yaml").count(),
-            1,
-            "only the historical objective may mention it: {text}"
-        );
-        assert!(text.contains("Effective acceptance"), "{text}");
+        assert!(text.contains("…and 2 more recorded requirements"), "{text}");
     }
 }

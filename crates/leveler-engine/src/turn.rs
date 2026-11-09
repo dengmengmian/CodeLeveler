@@ -583,15 +583,19 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
         &self,
         objective: &str,
         acceptance: &[String],
+        requirements: &[leveler_lifecycle::RequirementSeed],
         relation: Option<crate::ports::TaskRelation>,
-    ) -> Result<GoalId, PortError> {
+    ) -> Result<crate::ports::BoundGoal, PortError> {
         if let Some(bound) = self
             .bound
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            return Ok(bound);
+            return Ok(crate::ports::BoundGoal {
+                goal: bound,
+                opened: false,
+            });
         }
         // The session's durable declaration wins: it was written atomically
         // with the Goal axis and may be the only surviving copy of the
@@ -652,14 +656,22 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             }
         }
         let existing = same_objective.or_else(|| adopted.then(|| &running[0]));
-        let goal = match existing {
-            Some(goal) => goal.id.clone(),
-            None => self
-                .stores
-                .goals
-                .open_scoped(&self.token, objective, acceptance, leveler_core::now())
-                .await
-                .map_err(binder_ownership_error)?,
+        let (goal, opened) = match existing {
+            Some(goal) => (goal.id.clone(), false),
+            None => (
+                self.stores
+                    .goals
+                    .open_scoped(
+                        &self.token,
+                        objective,
+                        acceptance,
+                        requirements,
+                        leveler_core::now(),
+                    )
+                    .await
+                    .map_err(binder_ownership_error)?,
+                true,
+            ),
         };
         if adopted {
             // The user's instruction for this window is scope authority for the
@@ -680,7 +692,65 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
                 .await
                 .map_err(binder_store_error)?;
         }
-        Ok(goal)
+        Ok(crate::ports::BoundGoal { goal, opened })
+    }
+
+    async fn requirements(&self) -> Result<Vec<leveler_lifecycle::RequirementItem>, PortError> {
+        let Some(goal_id) = self.bound() else {
+            return Ok(Vec::new());
+        };
+        self.stores
+            .goals
+            .requirements(&goal_id)
+            .await
+            .map_err(binder_store_error)
+    }
+
+    async fn requirement_history(&self) -> Result<Vec<crate::ports::RequirementEvent>, PortError> {
+        let Some(goal_id) = self.bound() else {
+            return Ok(Vec::new());
+        };
+        let records = self
+            .stores
+            .goals
+            .requirement_log(&goal_id)
+            .await
+            .map_err(binder_store_error)?;
+        Ok(records
+            .into_iter()
+            .map(|record| crate::ports::RequirementEvent {
+                seq: record.seq,
+                turn_id: record.turn_id,
+                event: record.event,
+            })
+            .collect())
+    }
+
+    async fn record_scope(
+        &self,
+        declaration: &leveler_lifecycle::ScopeDeclaration,
+    ) -> Result<leveler_lifecycle::ScopeProjection, PortError> {
+        let Some(goal_id) = self.bound() else {
+            return Err(PortError::Persistence(
+                "no goal is bound to this turn; a scope declaration needs a target".to_string(),
+            ));
+        };
+        self.stores
+            .goals
+            .record_scope(
+                &self.token,
+                &goal_id,
+                &self.turn_id,
+                declaration,
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|error| match error {
+                leveler_storage::ScopeWriteError::Ownership(error) => binder_ownership_error(error),
+                leveler_storage::ScopeWriteError::Scope(error) => {
+                    PortError::Invalid(error.to_string())
+                }
+            })
     }
 
     fn bound(&self) -> Option<GoalId> {

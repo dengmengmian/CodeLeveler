@@ -19,7 +19,10 @@ use async_trait::async_trait;
 
 use leveler_core::{GoalId, OwnershipToken, TaskId, Timestamp, TurnId};
 use leveler_lifecycle::{
-    IntentProjection, PauseBoundary, UserIntentDeclaration, UserIntentOperation,
+    AppliedRequirementEvent, IntentProjection, PauseBoundary, RequirementItem, RequirementKind,
+    RequirementSeed, ScopeDeclaration, ScopeError, ScopeOperationKind, ScopeProjection,
+    UserIntentDeclaration, UserIntentOperation, apply_scope_declaration, fold_scope_events,
+    initial_scope,
 };
 
 use crate::{Database, OwnershipError, StorageError};
@@ -135,19 +138,62 @@ pub struct GoalIntentRecord {
     pub created_at: Timestamp,
 }
 
+/// One accepted requirement event, in order, for audit and replay.
+///
+/// History, not authority: the current requirement set is folded from these
+/// rows. `turn_id` identifies the window whose transcript holds the user span
+/// the event quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalRequirementRecord {
+    /// Per-goal monotonic sequence, starting at 1.
+    pub seq: u32,
+    /// The turn whose newest user input the quote came from.
+    pub turn_id: String,
+    /// The accepted operation and its normalized payload.
+    pub event: AppliedRequirementEvent,
+    /// When the event was accepted.
+    pub created_at: Timestamp,
+}
+
+/// Why a scope write did not apply.
+///
+/// The declaration is checked against the goal's own history: an unknown
+/// requirement identity, an illegal transition and a malformed event chain are
+/// distinguished from ownership or storage failure so the model can correct the
+/// declaration instead of retrying blindly.
+#[derive(Debug, thiserror::Error)]
+pub enum ScopeWriteError {
+    /// The caller does not own the task, the goal is settled, or the store
+    /// failed.
+    #[error(transparent)]
+    Ownership(#[from] OwnershipError),
+    /// The declaration itself was refused.
+    #[error(transparent)]
+    Scope(#[from] ScopeError),
+}
+
+impl From<StorageError> for ScopeWriteError {
+    fn from(error: StorageError) -> Self {
+        Self::Ownership(OwnershipError::Storage(error))
+    }
+}
+
 /// Access to durable goals.
 #[async_trait]
 pub trait GoalStore: Send + Sync {
     /// Open a goal against the task currently owned by `token`, recording the
-    /// model's candidate acceptance checks in the same insert.
+    /// model's candidate acceptance checks and its initial requirement
+    /// declarations in the same atomic write.
     ///
-    /// The ownership assertion and insert are one atomic write. A stale token
-    /// creates no goal and returns a typed ownership error.
+    /// The ownership assertion, the goal insert and its requirement events are
+    /// one transaction. A stale token creates no goal and returns a typed
+    /// ownership error; an invalid seed creates neither.
     async fn open_scoped(
         &self,
         token: &OwnershipToken,
         objective: &str,
         acceptance: &[String],
+        requirements: &[RequirementSeed],
         now: Timestamp,
     ) -> Result<GoalId, OwnershipError>;
 
@@ -159,7 +205,7 @@ pub trait GoalStore: Send + Sync {
         objective: &str,
         now: Timestamp,
     ) -> Result<GoalId, OwnershipError> {
-        self.open_scoped(token, objective, &[], now).await
+        self.open_scoped(token, objective, &[], &[], now).await
     }
 
     /// Append one verbatim user amendment to the goal's scope. Idempotent for
@@ -224,6 +270,40 @@ pub trait GoalStore: Send + Sync {
     /// The ordered intent history for one goal, oldest first.
     async fn intent_log(&self, goal_id: &GoalId) -> Result<Vec<GoalIntentRecord>, StorageError>;
 
+    /// Apply one scope declaration atomically: fold the goal's recorded
+    /// history, validate the declaration against it, and append the accepted
+    /// events in order.
+    ///
+    /// The caller has already validated that each operation's `source_quote`
+    /// occurs in the user input that authorized it. This method owns identity,
+    /// ownership, settled-state refusal, transition legality and atomicity.
+    async fn record_scope(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        turn_id: &TurnId,
+        declaration: &ScopeDeclaration,
+        now: Timestamp,
+    ) -> Result<ScopeProjection, ScopeWriteError>;
+
+    /// The ordered requirement-event history for one goal, oldest first.
+    async fn requirement_log(
+        &self,
+        goal_id: &GoalId,
+    ) -> Result<Vec<GoalRequirementRecord>, StorageError>;
+
+    /// The current requirement set, folded from the recorded history.
+    async fn requirements(&self, goal_id: &GoalId) -> Result<Vec<RequirementItem>, StorageError> {
+        let records = self.requirement_log(goal_id).await?;
+        let events: Vec<AppliedRequirementEvent> =
+            records.into_iter().map(|record| record.event).collect();
+        fold_scope_events(&events).map_err(|error| {
+            StorageError::InvalidData(format!(
+                "goal {goal_id} requirement history cannot be folded: {error}"
+            ))
+        })
+    }
+
     /// Reopen this exact settled goal for an explicit continuation. This does
     /// not create or select a goal by objective text; ownership and task
     /// identity are checked atomically with the state transition.
@@ -263,11 +343,22 @@ impl GoalStore for Database {
         token: &OwnershipToken,
         objective: &str,
         acceptance: &[String],
+        requirements: &[RequirementSeed],
         now: Timestamp,
     ) -> Result<GoalId, OwnershipError> {
+        let initial = initial_scope(requirements).map_err(|error| {
+            OwnershipError::Storage(StorageError::InvalidData(format!(
+                "invalid initial requirements: {error}"
+            )))
+        })?;
         let id = GoalId::new(leveler_core::new_uuid_string());
         let acceptance = serde_json::to_string(acceptance)
             .map_err(|e| StorageError::InvalidData(format!("unencodable acceptance: {e}")))?;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)?;
         let inserted = sqlx::query(
             "INSERT INTO goals \
              (id, task_id, objective, state, opened_at, windows_run, acceptance, amendments) \
@@ -282,13 +373,19 @@ impl GoalStore for Database {
         .bind(GoalState::Running.as_str())
         .bind(now.to_rfc3339())
         .bind(acceptance)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(StorageError::from)?;
-        if inserted.rows_affected() == 1 {
-            return Ok(id);
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
         }
-        Err(crate::ownership_store::sqlite_stale_error(self, token).await)
+        for (offset, event) in initial.events.iter().enumerate() {
+            insert_requirement_event(&mut tx, id.as_str(), offset as i64 + 1, "", event, now)
+                .await?;
+        }
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(id)
     }
 
     async fn append_amendment(
@@ -603,6 +700,74 @@ impl GoalStore for Database {
             .collect()
     }
 
+    async fn record_scope(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        turn_id: &TurnId,
+        declaration: &ScopeDeclaration,
+        now: Timestamp,
+    ) -> Result<ScopeProjection, ScopeWriteError> {
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT goals.state FROM goals \
+             JOIN tasks ON tasks.id = goals.task_id \
+             WHERE goals.id = ?1 AND goals.task_id = ?2 \
+             AND tasks.owner_runtime_id = ?3 AND tasks.owner_epoch = ?4",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        let Some((state,)) = row else {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return match goal_write_miss(self, token, goal_id, false).await {
+                Ok(()) => Err(StorageError::InvalidData(format!(
+                    "goal {goal_id} rejected the requested requirement change"
+                ))
+                .into()),
+                Err(error) => Err(error.into()),
+            };
+        };
+        if state != GoalState::Running.as_str() {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return Err(StorageError::InvalidData(format!(
+                "goal {goal_id} is settled; a settled goal cannot change its requirements"
+            ))
+            .into());
+        }
+        let records = requirement_rows(&mut tx, goal_id.as_str()).await?;
+        let history: Vec<AppliedRequirementEvent> =
+            records.iter().map(|record| record.event.clone()).collect();
+        let current = fold_scope_events(&history)?;
+        let projection = apply_scope_declaration(&current, declaration)?;
+        let mut seq = records.last().map(|record| record.seq).unwrap_or(0) as i64;
+        for event in &projection.events {
+            seq += 1;
+            insert_requirement_event(&mut tx, goal_id.as_str(), seq, turn_id.as_str(), event, now)
+                .await?;
+        }
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(projection)
+    }
+
+    async fn requirement_log(
+        &self,
+        goal_id: &GoalId,
+    ) -> Result<Vec<GoalRequirementRecord>, StorageError> {
+        let mut tx = self.pool().begin().await.map_err(StorageError::from)?;
+        let records = requirement_rows(&mut tx, goal_id.as_str()).await?;
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(records)
+    }
+
     async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
         if self.get(goal_id).await?.is_none() {
             return Err(StorageError::InvalidData(format!(
@@ -754,6 +919,121 @@ async fn goal_write_miss(
     }
 }
 
+/// One accepted requirement event. `operation` and `kind` are stored as their
+/// wire spellings; an unknown spelling is refused rather than decoded as a
+/// different obligation.
+async fn insert_requirement_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    goal_id: &str,
+    seq: i64,
+    turn_id: &str,
+    event: &AppliedRequirementEvent,
+    now: Timestamp,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO goal_requirement_events \
+         (goal_id, seq, turn_id, operation, requirement_id, supersedes, kind, text, target, \
+          source_quote, check_text, reason, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    )
+    .bind(goal_id)
+    .bind(seq)
+    .bind(turn_id)
+    .bind(event.operation.as_str())
+    .bind(&event.requirement_id)
+    .bind(event.supersedes.as_deref())
+    .bind(event.kind.map(|kind| kind.as_str()))
+    .bind(event.text.as_deref())
+    .bind(event.target.as_deref())
+    .bind(&event.source_quote)
+    .bind(event.check.as_deref())
+    .bind(event.reason.as_deref())
+    .bind(now.to_rfc3339())
+    .execute(&mut **tx)
+    .await
+    .map_err(StorageError::from)?;
+    Ok(())
+}
+
+async fn requirement_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    goal_id: &str,
+) -> Result<Vec<GoalRequirementRecord>, StorageError> {
+    type RequirementRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let rows: Vec<RequirementRow> = sqlx::query_as(
+        "SELECT seq, turn_id, operation, requirement_id, supersedes, kind, text, target, \
+         source_quote, check_text, reason, created_at \
+         FROM goal_requirement_events WHERE goal_id = ?1 ORDER BY seq",
+    )
+    .bind(goal_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(StorageError::from)?;
+    rows.into_iter()
+        .map(
+            |(
+                seq,
+                turn_id,
+                operation,
+                requirement_id,
+                supersedes,
+                kind,
+                text,
+                target,
+                source_quote,
+                check,
+                reason,
+                created_at,
+            )| {
+                let operation = ScopeOperationKind::parse(&operation).ok_or_else(|| {
+                    StorageError::InvalidData(format!(
+                        "unknown requirement operation `{operation}` for goal {goal_id}"
+                    ))
+                })?;
+                let kind = kind
+                    .as_deref()
+                    .map(|kind| {
+                        RequirementKind::parse(kind).ok_or_else(|| {
+                            StorageError::InvalidData(format!(
+                                "unknown requirement kind `{kind}` for goal {goal_id}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                Ok(GoalRequirementRecord {
+                    seq: seq.max(0) as u32,
+                    turn_id,
+                    event: AppliedRequirementEvent {
+                        operation,
+                        requirement_id,
+                        supersedes,
+                        kind,
+                        text,
+                        target,
+                        source_quote,
+                        check,
+                        reason,
+                    },
+                    created_at: parse_ts(&created_at)?,
+                })
+            },
+        )
+        .collect()
+}
+
 fn record_from_row(
     row: (
         String,
@@ -829,6 +1109,7 @@ fn parse_ts(s: &str) -> Result<Timestamp, StorageError> {
 pub struct MemoryGoalStore {
     pub(crate) rows: Mutex<Vec<GoalRecord>>,
     intents: Mutex<Vec<(String, GoalIntentRecord)>>,
+    requirements: Mutex<Vec<(String, GoalRequirementRecord)>>,
     capabilities: Mutex<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>,
     ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
@@ -838,6 +1119,7 @@ impl Default for MemoryGoalStore {
         Self {
             rows: Mutex::new(Vec::new()),
             intents: Mutex::new(Vec::new()),
+            requirements: Mutex::new(Vec::new()),
             capabilities: Mutex::new(std::collections::BTreeMap::new()),
             ownership: std::sync::OnceLock::new(),
         }
@@ -865,6 +1147,7 @@ impl GoalStore for MemoryGoalStore {
         token: &OwnershipToken,
         objective: &str,
         acceptance: &[String],
+        requirements: &[RequirementSeed],
         now: Timestamp,
     ) -> Result<GoalId, OwnershipError> {
         let Some(ownership) = self.ownership.get() else {
@@ -872,6 +1155,11 @@ impl GoalStore for MemoryGoalStore {
                 "memory goal store has no ownership authority configured".to_string(),
             )));
         };
+        let initial = initial_scope(requirements).map_err(|error| {
+            OwnershipError::Storage(StorageError::InvalidData(format!(
+                "invalid initial requirements: {error}"
+            )))
+        })?;
         let id = GoalId::new(leveler_core::new_uuid_string());
         ownership.with_current(token, || {
             self.rows.lock().unwrap().push(GoalRecord {
@@ -887,6 +1175,18 @@ impl GoalStore for MemoryGoalStore {
                 user_paused_at: None,
                 pause_boundary: None,
             });
+            let mut records = self.requirements.lock().unwrap();
+            for (offset, event) in initial.events.iter().enumerate() {
+                records.push((
+                    id.to_string(),
+                    GoalRequirementRecord {
+                        seq: offset as u32 + 1,
+                        turn_id: String::new(),
+                        event: event.clone(),
+                        created_at: now,
+                    },
+                ));
+            }
         })?;
         Ok(id)
     }
@@ -1122,6 +1422,85 @@ impl GoalStore for MemoryGoalStore {
         Ok(records)
     }
 
+    async fn record_scope(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        turn_id: &TurnId,
+        declaration: &ScopeDeclaration,
+        now: Timestamp,
+    ) -> Result<ScopeProjection, ScopeWriteError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )
+            .into());
+        };
+        let outcome = ownership.with_current(token, || {
+            let rows = self.rows.lock().unwrap();
+            let goal = rows
+                .iter()
+                .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                .ok_or_else(|| {
+                    ScopeWriteError::from(StorageError::InvalidData(format!(
+                        "goal {goal_id} not found for task {}",
+                        token.task_id
+                    )))
+                })?;
+            if goal.state != GoalState::Running {
+                return Err(StorageError::InvalidData(format!(
+                    "goal {goal_id} is settled; a settled goal cannot change its requirements"
+                ))
+                .into());
+            }
+            let history: Vec<AppliedRequirementEvent> = {
+                let records = self.requirements.lock().unwrap();
+                records
+                    .iter()
+                    .filter(|(id, _)| id == goal_id.as_str())
+                    .map(|(_, record)| record.event.clone())
+                    .collect()
+            };
+            let current = fold_scope_events(&history)?;
+            let projection = apply_scope_declaration(&current, declaration)?;
+            let mut records = self.requirements.lock().unwrap();
+            let mut seq = records
+                .iter()
+                .filter(|(id, _)| id == goal_id.as_str())
+                .map(|(_, record)| record.seq)
+                .max()
+                .unwrap_or(0);
+            for event in &projection.events {
+                seq += 1;
+                records.push((
+                    goal_id.to_string(),
+                    GoalRequirementRecord {
+                        seq,
+                        turn_id: turn_id.to_string(),
+                        event: event.clone(),
+                        created_at: now,
+                    },
+                ));
+            }
+            Ok(projection)
+        });
+        outcome?
+    }
+
+    async fn requirement_log(
+        &self,
+        goal_id: &GoalId,
+    ) -> Result<Vec<GoalRequirementRecord>, StorageError> {
+        let records = self.requirements.lock().unwrap();
+        let mut rows: Vec<GoalRequirementRecord> = records
+            .iter()
+            .filter(|(id, _)| id == goal_id.as_str())
+            .map(|(_, record)| record.clone())
+            .collect();
+        rows.sort_by_key(|record| record.seq);
+        Ok(rows)
+    }
+
     async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
         if self.get(goal_id).await?.is_none() {
             return Err(StorageError::InvalidData(format!(
@@ -1354,6 +1733,7 @@ mod tests {
                 token,
                 "complete all three stages",
                 &acceptance,
+                &[],
                 leveler_core::now(),
             )
             .await
@@ -1654,6 +2034,184 @@ mod tests {
         let db = Database::connect_in_memory().await.unwrap();
         let (_, token) = seeded_task(&db).await;
         assert_goal_scope_contract(&db, &token).await;
+    }
+
+    /// Requirement identity, transition legality and event order are one
+    /// durable contract. The current set is always folded from the history, so
+    /// a resumed window and a replay see the same obligations.
+    async fn assert_goal_requirement_contract(store: &dyn GoalStore, token: &OwnershipToken) {
+        use leveler_lifecycle::{
+            RequirementKind, RequirementSeed, ScopeDeclaration, ScopeError, ScopeOperation,
+        };
+
+        let unusable = store
+            .open_scoped(
+                token,
+                "an invalid seed creates nothing",
+                &[],
+                &[RequirementSeed {
+                    kind: RequirementKind::Content,
+                    text: "Verified.".into(),
+                    target: None,
+                    source_quote: "append Verified.".into(),
+                    check: None,
+                }],
+                leveler_core::now(),
+            )
+            .await;
+        assert!(unusable.is_err(), "a content seed needs its file");
+        assert!(
+            store.unfinished().await.unwrap().is_empty(),
+            "an invalid initial scope leaves no goal behind"
+        );
+
+        let goal = store
+            .open_scoped(
+                token,
+                "ship stage one; do not touch the legacy module",
+                &[],
+                &[
+                    RequirementSeed {
+                        kind: RequirementKind::Named,
+                        text: "stage one shipped".into(),
+                        target: None,
+                        source_quote: "ship stage one".into(),
+                        check: None,
+                    },
+                    RequirementSeed {
+                        kind: RequirementKind::Constraint,
+                        text: "do not touch the legacy module".into(),
+                        target: None,
+                        source_quote: "do not touch the legacy module".into(),
+                        check: None,
+                    },
+                ],
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let items = store.requirements(&goal).await.unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.id.as_str(), item.kind, item.is_owed()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("R1", RequirementKind::Named, true),
+                ("R2", RequirementKind::Constraint, false),
+            ]
+        );
+
+        let turn = TurnId::new("turn-2");
+        let declaration = ScopeDeclaration {
+            operations: vec![
+                ScopeOperation::Replace {
+                    requirement_id: "R1".into(),
+                    kind: RequirementKind::Named,
+                    text: "stage one shipped with tests".into(),
+                    target: None,
+                    source_quote: "stage one must also have tests".into(),
+                    check: None,
+                    reason: None,
+                },
+                ScopeOperation::Add {
+                    kind: RequirementKind::Named,
+                    text: "stage two shipped".into(),
+                    target: None,
+                    source_quote: "and stage two".into(),
+                    check: None,
+                    reason: None,
+                },
+            ],
+        };
+        let projection = store
+            .record_scope(token, &goal, &turn, &declaration, leveler_core::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .events
+                .iter()
+                .map(|event| event.requirement_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R3", "R4"]
+        );
+        let items = store.requirements(&goal).await.unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.id.as_str(), item.state))
+                .collect::<Vec<_>>(),
+            vec![
+                ("R1", leveler_lifecycle::RequirementState::Superseded),
+                ("R2", leveler_lifecycle::RequirementState::Active),
+                ("R3", leveler_lifecycle::RequirementState::Active),
+                ("R4", leveler_lifecycle::RequirementState::Active),
+            ]
+        );
+
+        // An unknown identity is refused and writes nothing.
+        let refused = store
+            .record_scope(
+                token,
+                &goal,
+                &turn,
+                &ScopeDeclaration {
+                    operations: vec![ScopeOperation::Waive {
+                        requirement_id: "R9".into(),
+                        source_quote: "drop it".into(),
+                        reason: None,
+                    }],
+                },
+                leveler_core::now(),
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(ScopeWriteError::Scope(
+                ScopeError::UnknownRequirement { .. }
+            ))
+        ));
+        assert_eq!(
+            store.requirement_log(&goal).await.unwrap().len(),
+            4,
+            "the refused declaration appended no events"
+        );
+
+        // The log is the ordered, turn-attributed history of the set.
+        let log = store.requirement_log(&goal).await.unwrap();
+        assert_eq!(
+            log.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(log[2].turn_id, "turn-2");
+        assert_eq!(log[0].event.source_quote, "ship stage one");
+    }
+
+    #[tokio::test]
+    async fn memory_store_persists_structured_requirements() {
+        let state = std::sync::Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("t1");
+        state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(state.clone());
+        let token = ownership
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
+            .await
+            .unwrap();
+        let store = MemoryGoalStore::new().with_ownership(state);
+        assert_goal_requirement_contract(&store, &token).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_persists_structured_requirements() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (_, token) = seeded_task(&db).await;
+        assert_goal_requirement_contract(&db, &token).await;
     }
 
     #[tokio::test]

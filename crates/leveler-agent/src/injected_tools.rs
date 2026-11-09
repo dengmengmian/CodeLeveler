@@ -147,9 +147,10 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             actually ran, one per line in `detail` (checked against the \
             runtime's execution record, after your last change), or \
             `not_applicable` with the reason in `detail`. A failed test or \
-            build cannot be closed as complete. When the user enumerated \
-            deliverables or required tests, `requirements` must account for \
-            every one; a missing or `not_done` requirement refuses completion. \
+            build cannot be closed as complete. When the goal has a recorded \
+            requirement set, `requirements` must account for every active \
+            deliverable by its stable id; a missing or `not_done` requirement \
+            refuses completion. \
             `unverifiable` marks delivered work the runtime cannot prove, not \
             work you skipped.",
     );
@@ -197,19 +198,17 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 },
                 "requirements": {
                     "type": "array",
-                    // No fixed `maxItems`: the cap is the number of
-                    // requirements the runtime extracted for THIS goal, which
-                    // the schema cannot know when the tool is defined. A fixed
-                    // 20 made a legitimate 132-requirement goal impossible to
-                    // complete. `parse_accounting` enforces the real cap and
-                    // names it in the refusal.
-                    "description": "For complete: one entry per explicitly enumerated user requirement.",
+                    // No fixed `maxItems`: the cap is the number of active
+                    // deliverables in THIS goal, which the schema cannot know
+                    // when the tool is defined. `parse_accounting` enforces the
+                    // real cap and names it in the refusal.
+                    "description": "For complete: one entry per active deliverable id in the goal's recorded requirement set (`get_goal_scope` lists the ids). Keyed by id, not by restating the requirement text.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "requirement": {
+                            "id": {
                                 "type": "string",
-                                "description": "The user's words for it."
+                                "description": "The requirement's stable id, for example \"R1\"."
                             },
                             "status": {
                                 "type": "string",
@@ -217,10 +216,10 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                             },
                             "evidence": {
                                 "type": "string",
-                                "description": "What proves it, or why it has no mechanical check."
+                                "description": "What proves it. For a `tests` requirement, put `call_id:<id>` of the passing run, or the exact command, on its own line."
                             }
                         },
-                        "required": ["requirement", "status", "evidence"],
+                        "required": ["id", "status", "evidence"],
                         "additionalProperties": false
                     }
                 }
@@ -272,13 +271,14 @@ pub(crate) fn completion_receipt(resolution: &str, warnings: &[String]) -> Strin
 pub const COMMIT_TASK_TOOL: &str = "commit_task";
 
 /// The structured `GoalIntercepted` kind the executor emits when it refuses a
-/// `commit_task` declaration because the acceptance array does not cover the
-/// user's explicitly named deliverables.
+/// `commit_task` declaration. The declaration is what leaves the work
+/// unregistered, whatever field the refusal names.
 ///
-/// This is the durable registration fact: the refused declaration is what
-/// leaves the work unregistered. Clients must not infer that state from the
-/// terminal's warning list — a plain Chat answer can carry an unrelated
-/// review warning without ever attempting a declaration.
+/// This is the durable registration fact: clients must not infer that state
+/// from the terminal's warning list — a plain Chat answer can carry an
+/// unrelated review warning without ever attempting a declaration. The wire
+/// value is kept for event-log replay; it names the first refusal reason, not
+/// the only one.
 pub const COMMIT_REFUSED_KIND: &str = "acceptance_narrowed";
 
 /// Commit the current Chat turn to the Goal lifecycle.
@@ -291,18 +291,15 @@ pub const COMMIT_REFUSED_KIND: &str = "acceptance_narrowed";
 /// The name of the read-only effective-scope tool.
 pub(crate) const GET_GOAL_SCOPE_TOOL: &str = "get_goal_scope";
 
-/// Read-only paging over the **effective** acceptance set the Gate uses.
-/// It is the discoverable escape hatch when the compaction facts block only
-/// expands the first eight requirements.
+/// Read-only projection of the goal's recorded requirement set and history.
 pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: GET_GOAL_SCOPE_TOOL.to_string(),
-        description: "Read the user scope the acceptance Gate enforces, page by page. Before \
-            commit_task this previews the exact set the acceptance list must cover; after \
-            registration it reads the committed goal's effective acceptance. Call it when the \
-            retained-facts block says more requirements exist than it expanded, or before \
-            writing an acceptance list for a task with many explicit deliverables. Read-only; \
-            it never registers or changes a goal."
+        description: "Read this goal's recorded requirement set and, on request, its ordered \
+            change history. Every requirement carries a stable id, kind, state, the verbatim \
+            user span it was declared from, and the acceptance check the model associated with \
+            it. The runtime never re-derives this set from prose, so this is the exact set the \
+            completion gate reads. Read-only; it never registers or changes a goal."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -316,9 +313,107 @@ pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 50,
-                    "description": "Maximum requirements to return (default 20)."
+                    "description": "Maximum requirements (and history events) to return (default 20)."
+                },
+                "history": {
+                    "type": "boolean",
+                    "description": "Also list the ordered requirement-change events with the turn that authorized each one."
                 }
             },
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// The name of the structured requirement-scope tool.
+pub(crate) const DECLARE_SCOPE_TOOL: &str = "declare_scope";
+
+/// Declare what the user's newest message changes about the goal's
+/// requirements.
+///
+/// The runtime validates that each operation's `source_quote` occurs in the
+/// newest user input, that referenced requirement ids exist in this goal, and
+/// that the operation sequence is legal over the recorded history. It never
+/// interprets the text: the model supplies the reading, the runtime supplies
+/// identity, order and durability.
+pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
+    let description = String::from(
+        "Change this goal's recorded requirements when the user's newest message adds, \
+            amends, replaces, waives or restores something. `source_quote` must copy the part \
+            of the user's newest message that carries the change — the runtime checks that it \
+            really occurs there, so never paraphrase or invent one. Use requirement ids from \
+            commit_task or get_goal_scope. `add` mints a new id and needs `kind` and `text`; \
+            `amend` changes fields of an active requirement; `replace` retires an active \
+            requirement and mints a new id carrying the replacement; `waive` marks an active \
+            requirement no longer owed without deleting its history; `restore` revives a \
+            waived requirement. Constraints use the same operations as deliverables. Do not \
+            waive or replace an unrelated requirement the user did not mention: every \
+            operation must quote the user's own words for that change.",
+    );
+    ToolDefinition {
+        name: DECLARE_SCOPE_TOOL.to_string(),
+        description,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": ["add", "amend", "replace", "waive", "restore"]
+                            },
+                            "requirement_id": {
+                                "type": "string",
+                                "description": "The existing requirement this operation targets. Required for amend, replace, waive and restore."
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "artifact",
+                                    "artifact_absent",
+                                    "command",
+                                    "named",
+                                    "content",
+                                    "tests",
+                                    "forbidden",
+                                    "baseline",
+                                    "preparation",
+                                    "constraint"
+                                ],
+                                "description": "Required for add and replace; optional for amend. `content` needs `target` (the file holding the literal); `command` needs `target` (the exact command)."
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "The requirement in the user's terms. Required for add and replace; optional for amend."
+                            },
+                            "target": {
+                                "type": "string",
+                                "description": "The file for `content`, or the exact command for `command`."
+                            },
+                            "source_quote": {
+                                "type": "string",
+                                "description": "Verbatim span of the user's newest message that states this change. Whitespace differences are tolerated; paraphrases are not."
+                            },
+                            "check": {
+                                "type": "string",
+                                "description": "An acceptance check that covers this requirement, copied exactly from the goal's acceptance list. Omit when none covers it."
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Optional short note, especially for waive or replace: why the requirement changed."
+                            }
+                        },
+                        "required": ["op", "source_quote"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["operations"],
             "additionalProperties": false
         }),
     }
@@ -441,9 +536,11 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             call it. `objective` is the user's stated end state, not a narrower version of it \
             and never an enlargement of it; when the user's message itself is non-empty the \
             runtime records that message as the durable objective, so `objective` is unused. \
-            `acceptance` lists the concrete checks that will prove it. Before a \
-            many-deliverable commit, call `get_goal_scope`: it pages the exact set the commit \
-            is judged against. After the commit, the \
+            `acceptance` lists the concrete checks that will prove it. If the user stated \
+            explicit deliverables or constraints, declare them in `requirements`, one entry \
+            each, with a verbatim `source_quote` from the user's message: that structured set \
+            is what the completion gate reads, and the runtime never re-derives it from prose. \
+            After the commit, the \
             runtime keeps this turn running: a stage summary or a quiet end does NOT finish the \
             task. Continue the work and resolve it with update_goal(complete|blocked). Do not \
             substitute update_plan for the acceptance contract: a plan records intended steps, \
@@ -466,7 +563,51 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                     "items": {"type": "string"},
                     "minItems": 1,
                     "maxItems": 20,
-                    "description": "Concrete checks that will prove the objective. Cover every deliverable the user enumerated; one check may name several related deliverables. A commit that leaves an explicit deliverable uncovered is refused."
+                    "description": "The model's concrete checks. Cover every deliverable; one check may name several related deliverables. A plan, not the user's scope."
+                },
+                "requirements": {
+                    "type": "array",
+                    "maxItems": 40,
+                    "description": "The user's stated deliverables and constraints, one entry each with a verbatim quote. Omit if none beyond the objective.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "artifact",
+                                    "artifact_absent",
+                                    "command",
+                                    "named",
+                                    "content",
+                                    "tests",
+                                    "forbidden",
+                                    "baseline",
+                                    "preparation",
+                                    "constraint"
+                                ],
+                                "description": "artifact = file/dir must exist; artifact_absent = must be gone; command = exact command; named = deliverable with no mechanical check; content = literal in target; tests = passing test run; other kinds are not owed. `content`/`command` need `target`."
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "The requirement in the user's terms."
+                            },
+                            "target": {
+                                "type": "string",
+                                "description": "The file for `content`, or the exact command for `command`."
+                            },
+                            "source_quote": {
+                                "type": "string",
+                                "description": "Verbatim span of the user's message that states it; the runtime checks it occurs there."
+                            },
+                            "check": {
+                                "type": "string",
+                                "description": "One `acceptance` entry covering it, copied exactly."
+                            }
+                        },
+                        "required": ["kind", "text", "source_quote"],
+                        "additionalProperties": false
+                    }
                 },
                 "task_relation": {
                     "type": "string",
@@ -1336,6 +1477,11 @@ mod tests {
 
     /// The Chat delegation surface is a fixed cost on every ordinary turn.
     /// Keep it small and make the number visible to the performance record.
+    ///
+    /// The budget includes the structured `requirements` declaration: the
+    /// alternative is a second `declare_scope` round after the commit, which
+    /// costs one full model request (thousands of cached tokens and a round
+    /// trip) instead of ~300 definition tokens.
     #[test]
     fn commit_task_surface_stays_small() {
         let tool = commit_task_tool_definition();
@@ -1343,7 +1489,7 @@ mod tests {
             + leveler_model::estimate_text(&tool.input_schema.to_string());
         let guidance = leveler_model::estimate_text(TASK_COMMIT_GUIDANCE);
         println!("commit_task schema tokens: {tokens}; guidance tokens: {guidance}");
-        assert!(tokens < 700, "commit_task surface grew to {tokens} tokens");
+        assert!(tokens < 1000, "commit_task surface grew to {tokens} tokens");
         assert!(guidance < 300, "task guidance grew to {guidance} tokens");
     }
 

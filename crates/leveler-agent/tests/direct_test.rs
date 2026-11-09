@@ -171,6 +171,56 @@ fn text(value: &str) -> ModelResponse {
     }
 }
 
+/// The model's structured scope declaration: `(kind, text, target, quote)` per
+/// requirement, where `quote` must occur verbatim in the user's newest message.
+/// The harness never derives requirements from the goal's prose.
+fn declare_requirements(id: &str, requirements: &[(&str, &str, &str, &str)]) -> ModelResponse {
+    let operations: Vec<serde_json::Value> = requirements
+        .iter()
+        .map(|(kind, text, target, quote)| {
+            serde_json::json!({
+                "op": "add",
+                "kind": kind,
+                "text": text,
+                "target": target,
+                "source_quote": quote,
+            })
+        })
+        .collect();
+    tool_call(
+        id,
+        "declare_scope",
+        serde_json::json!({"operations": operations}),
+    )
+}
+
+/// The three staged files most goal-mode fixtures ask for (R1..R3).
+fn declare_stages(id: &str) -> ModelResponse {
+    declare_requirements(
+        id,
+        &[
+            (
+                "artifact",
+                "stage-1.txt exists with stage 1",
+                "stage-1.txt",
+                "stage-1.txt",
+            ),
+            (
+                "artifact",
+                "stage-2.txt exists with stage 2",
+                "stage-2.txt",
+                "stage-2.txt",
+            ),
+            (
+                "artifact",
+                "stage-3.txt exists with stage 3",
+                "stage-3.txt",
+                "stage-3.txt",
+            ),
+        ],
+    )
+}
+
 fn patch_then_resolve() -> Vec<ModelResponse> {
     vec![
         tool_call(
@@ -4490,11 +4540,12 @@ async fn a_failed_verification_cannot_be_closed_as_complete() {
 }
 
 /// A `/goal` turn (not a Chat `commit_task`) is bound to the same scope
-/// contract: the durable goal's objective names three deliverables, and a
-/// completion that claims all three while only one exists is refused.
+/// contract: the model declares the three deliverables from the objective, and
+/// a completion that claims all three while only one exists is refused.
 #[tokio::test]
 async fn a_goal_turn_cannot_complete_part_of_an_enumerated_scope() {
     let h = harness(vec![
+        declare_stages("d1"),
         tool_call(
             "w1",
             "write_file",
@@ -4508,9 +4559,7 @@ async fn a_goal_turn_cannot_complete_part_of_an_enumerated_scope() {
                 "summary": "all stages done",
                 "verification": {"status": "not_applicable", "detail": "fixture"},
                 "requirements": [
-                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "stage-3.txt", "status": "done", "evidence": "created"}
+                    {"id": "R1", "status": "done", "evidence": "created"}
                 ]
             }),
         ),
@@ -4567,11 +4616,12 @@ async fn a_goal_turn_cannot_complete_part_of_an_enumerated_scope() {
     );
 }
 
-/// The same scope, fully delivered: the gate accepts it, so the protection is
-/// not a blanket refusal of multi-deliverable goals.
+/// The same scope, fully declared and delivered: the gate accepts it, so the
+/// protection is not a blanket refusal of multi-deliverable goals.
 #[tokio::test]
 async fn a_goal_turn_completes_when_every_named_deliverable_exists() {
     let h = harness(vec![
+        declare_stages("d1"),
         tool_call(
             "w1",
             "write_file",
@@ -4595,9 +4645,9 @@ async fn a_goal_turn_completes_when_every_named_deliverable_exists() {
                 "summary": "all three stages are delivered",
                 "verification": {"status": "not_applicable", "detail": "fixture"},
                 "requirements": [
-                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "stage-3.txt", "status": "done", "evidence": "created"}
+                    {"id": "R1", "status": "done", "evidence": "created"},
+                    {"id": "R2", "status": "done", "evidence": "created"},
+                    {"id": "R3", "status": "done", "evidence": "created"}
                 ]
             }),
         ),
@@ -4624,6 +4674,35 @@ async fn a_goal_turn_completes_when_every_named_deliverable_exists() {
 async fn a_refused_premature_completion_recovers_within_the_same_run() {
     let h = harness_with(
         vec![
+            declare_requirements(
+                "d1",
+                &[
+                    (
+                        "artifact",
+                        "stage-1.txt exists",
+                        "stage-1.txt",
+                        "stage-1.txt",
+                    ),
+                    (
+                        "artifact",
+                        "stage-2.txt exists",
+                        "stage-2.txt",
+                        "stage-2.txt",
+                    ),
+                    (
+                        "artifact",
+                        "stage-3.txt exists",
+                        "stage-3.txt",
+                        "stage-3.txt",
+                    ),
+                    (
+                        "command",
+                        "run the acceptance script",
+                        "./verify.sh",
+                        "sh ./verify.sh",
+                    ),
+                ],
+            ),
             tool_call(
                 "w1",
                 "write_file",
@@ -4639,7 +4718,7 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
                     "summary": "stage 1 is done",
                     "verification": {"status": "not_applicable", "detail": "fixture"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                        {"id": "R1", "status": "done", "evidence": "created"}
                     ]
                 }),
             ),
@@ -4671,10 +4750,10 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
                     "summary": "all three stages delivered and verified",
                     "verification": {"status": "passed", "detail": "sh ./verify.sh"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                        {"id": "R1", "status": "done", "evidence": "created"},
+                        {"id": "R2", "status": "done", "evidence": "created"},
+                        {"id": "R3", "status": "done", "evidence": "created"},
+                        {"id": "R4", "status": "done", "evidence": "call_id:v1"}
                     ]
                 }),
             ),
@@ -4776,12 +4855,13 @@ async fn repeated_refused_completions_are_bounded() {
                 "summary": "stage 1 is done",
                 "verification": {"status": "not_applicable", "detail": "fixture"},
                 "requirements": [
-                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                    {"id": "R1", "status": "done", "evidence": "created"}
                 ]
             }),
         )
     };
     let h = harness(vec![
+        declare_stages("d1"),
         premature("g1"),
         premature("g2"),
         premature("g3"),
@@ -4828,8 +4908,8 @@ async fn repeated_refused_completions_are_bounded() {
     );
     assert_eq!(
         h.requests.lock().unwrap().len(),
-        2,
-        "the third scripted completion is never requested"
+        3,
+        "the declaration, then exactly two refused completions, are all that is requested"
     );
 }
 
@@ -4848,7 +4928,7 @@ async fn a_changing_requirements_verdict_keeps_the_goal_recoverable() {
             .iter()
             .map(|id| {
                 serde_json::json!({
-                    "requirement": id,
+                    "id": id,
                     "status": "done",
                     "evidence": format!("{id} created and verified")
                 })
@@ -4862,6 +4942,7 @@ async fn a_changing_requirements_verdict_keeps_the_goal_recoverable() {
         })
     };
     let h = harness(vec![
+        declare_stages("d1"),
         tool_call(
             "w1",
             "write_file",
@@ -4878,22 +4959,15 @@ async fn a_changing_requirements_verdict_keeps_the_goal_recoverable() {
             serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
         ),
         // First attempt: one of three deliverables accounted.
-        tool_call("g1", "update_goal", accounting(&["stage-1.txt"], "part 1")),
+        tool_call("g1", "update_goal", accounting(&["R1"], "part 1")),
         // Second attempt: the model took the refusal seriously and accounted
         // one more. Different verdict, still incomplete.
-        tool_call(
-            "g2",
-            "update_goal",
-            accounting(&["stage-1.txt", "stage-2.txt"], "parts 1-2"),
-        ),
+        tool_call("g2", "update_goal", accounting(&["R1", "R2"], "parts 1-2")),
         // Third attempt: complete accounting. This must be reachable.
         tool_call(
             "g3",
             "update_goal",
-            accounting(
-                &["stage-1.txt", "stage-2.txt", "stage-3.txt"],
-                "all three stages",
-            ),
+            accounting(&["R1", "R2", "R3"], "all three stages"),
         ),
     ])
     .await;
@@ -4935,9 +5009,10 @@ async fn a_changing_requirements_verdict_keeps_the_goal_recoverable() {
     assert_eq!(report.stop_reason, StopReason::Completed);
     assert_eq!(
         h.requests.lock().unwrap().len(),
-        7,
-        "every scripted round ran (with the delivery round after the accepted \
-         completion): the third completion was not cut off"
+        8,
+        "every scripted round ran (the declaration, six work/attempt rounds, \
+         and the delivery round after the accepted completion): the third \
+         completion was not cut off"
     );
 }
 
@@ -4948,6 +5023,35 @@ async fn a_changing_requirements_verdict_keeps_the_goal_recoverable() {
 async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
     let h = harness_with(
         vec![
+            declare_requirements(
+                "d1",
+                &[
+                    (
+                        "artifact",
+                        "stage-1.txt exists",
+                        "stage-1.txt",
+                        "stage-1.txt",
+                    ),
+                    (
+                        "artifact",
+                        "stage-2.txt exists",
+                        "stage-2.txt",
+                        "stage-2.txt",
+                    ),
+                    (
+                        "artifact",
+                        "stage-3.txt exists",
+                        "stage-3.txt",
+                        "stage-3.txt",
+                    ),
+                    (
+                        "command",
+                        "run the acceptance script",
+                        "./verify.sh",
+                        "sh ./verify.sh",
+                    ),
+                ],
+            ),
             tool_call(
                 "w1",
                 "write_file",
@@ -4961,10 +5065,10 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
                     "summary": "all stages are done",
                     "verification": {"status": "not_applicable", "detail": "fixture"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                        {"id": "R1", "status": "done", "evidence": "created"},
+                        {"id": "R2", "status": "done", "evidence": "created"},
+                        {"id": "R3", "status": "done", "evidence": "created"},
+                        {"id": "R4", "status": "done", "evidence": "exit 0"}
                     ]
                 }),
             ),
@@ -4987,10 +5091,10 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
                     "summary": "all stages are done",
                     "verification": {"status": "not_applicable", "detail": "fixture"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                        {"id": "R1", "status": "done", "evidence": "created"},
+                        {"id": "R2", "status": "done", "evidence": "created"},
+                        {"id": "R3", "status": "done", "evidence": "created"},
+                        {"id": "R4", "status": "done", "evidence": "exit 0"}
                     ]
                 }),
             ),
@@ -5011,10 +5115,10 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
                     "summary": "all three stages delivered and verified",
                     "verification": {"status": "passed", "detail": "sh ./verify.sh"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                        {"id": "R1", "status": "done", "evidence": "created"},
+                        {"id": "R2", "status": "done", "evidence": "created"},
+                        {"id": "R3", "status": "done", "evidence": "created"},
+                        {"id": "R4", "status": "done", "evidence": "call_id:v1"}
                     ]
                 }),
             ),
@@ -5101,13 +5205,7 @@ async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all stages are done",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
-                    "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
-                    ]
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"}
                 }),
             ),
             tool_call(
@@ -5130,13 +5228,7 @@ async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all three stages delivered and verified",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
-                    "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
-                    ]
+                    "verification": {"status": "passed", "detail": "sh ./verify.sh"}
                 }),
             ),
         ],
@@ -5194,6 +5286,35 @@ async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
 #[tokio::test]
 async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume() {
     let responses_a = vec![
+        declare_requirements(
+            "d1",
+            &[
+                (
+                    "artifact",
+                    "stage-1.txt exists",
+                    "stage-1.txt",
+                    "stage-1.txt",
+                ),
+                (
+                    "artifact",
+                    "stage-2.txt exists",
+                    "stage-2.txt",
+                    "stage-2.txt",
+                ),
+                (
+                    "artifact",
+                    "stage-3.txt exists",
+                    "stage-3.txt",
+                    "stage-3.txt",
+                ),
+                (
+                    "command",
+                    "run the acceptance script",
+                    "./verify.sh",
+                    "sh ./verify.sh",
+                ),
+            ],
+        ),
         tool_call(
             "w1",
             "write_file",
@@ -5207,7 +5328,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
                 "summary": "stage 1 is done",
                 "verification": {"status": "not_applicable", "detail": "fixture"},
                 "requirements": [
-                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                    {"id": "R1", "status": "done", "evidence": "created"}
                 ]
             }),
         ),
@@ -5293,10 +5414,10 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
                 "summary": "all three stages delivered and verified",
                 "verification": {"status": "passed", "detail": "sh ./verify.sh"},
                 "requirements": [
-                    {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                    {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                    {"id": "R1", "status": "done", "evidence": "created"},
+                    {"id": "R2", "status": "done", "evidence": "created"},
+                    {"id": "R3", "status": "done", "evidence": "created"},
+                    {"id": "R4", "status": "done", "evidence": "call_id:v1"}
                 ]
             }),
         ),
@@ -5398,6 +5519,35 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
 async fn a_compacted_context_still_owes_the_users_full_scope() {
     let h = harness_with_overrides(
         vec![
+            declare_requirements(
+                "d1",
+                &[
+                    (
+                        "artifact",
+                        "stage-1.txt exists",
+                        "stage-1.txt",
+                        "stage-1.txt",
+                    ),
+                    (
+                        "artifact",
+                        "stage-2.txt exists",
+                        "stage-2.txt",
+                        "stage-2.txt",
+                    ),
+                    (
+                        "artifact",
+                        "stage-3.txt exists",
+                        "stage-3.txt",
+                        "stage-3.txt",
+                    ),
+                    (
+                        "command",
+                        "run the acceptance script",
+                        "./verify.sh",
+                        "sh ./verify.sh",
+                    ),
+                ],
+            ),
             tool_call(
                 "w1",
                 "write_file",
@@ -5411,7 +5561,7 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
                     "summary": "stage 1 is done",
                     "verification": {"status": "not_applicable", "detail": "fixture"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"}
+                        {"id": "R1", "status": "done", "evidence": "created"}
                     ]
                 }),
             ),
@@ -5429,8 +5579,8 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
                     "summary": "both stages are done",
                     "verification": {"status": "not_applicable", "detail": "fixture"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"}
+                        {"id": "R1", "status": "done", "evidence": "created"},
+                        {"id": "R2", "status": "done", "evidence": "created"}
                     ]
                 }),
             ),
@@ -5456,10 +5606,10 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
                     "summary": "all three stages delivered and verified",
                     "verification": {"status": "passed", "detail": "sh ./verify.sh"},
                     "requirements": [
-                        {"requirement": "stage-1.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-2.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "stage-3.txt", "status": "done", "evidence": "created"},
-                        {"requirement": "./verify.sh", "status": "done", "evidence": "exit 0"}
+                        {"id": "R1", "status": "done", "evidence": "created"},
+                        {"id": "R2", "status": "done", "evidence": "created"},
+                        {"id": "R3", "status": "done", "evidence": "created"},
+                        {"id": "R4", "status": "done", "evidence": "call_id:v1"}
                     ]
                 }),
             ),

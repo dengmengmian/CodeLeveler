@@ -221,6 +221,14 @@ async fn goal_mode_states_the_resolution_contract_only() {
         goal.text
             .contains("must not be rewritten into an easier objective")
     );
+    // The gate enforces a recorded set, so the contract must state who records
+    // it. This is protocol, not strategy: the model reads the user's words and
+    // supplies the declaration; the runtime supplies identity and durability.
+    assert!(
+        goal.text.contains("declare_scope") && goal.text.contains("source_quote"),
+        "the goal contract names the only scope writer: {}",
+        goal.text
+    );
     for banned in [
         "Greeting",
         "Q&A",
