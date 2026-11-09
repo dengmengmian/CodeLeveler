@@ -907,6 +907,18 @@ mod tests {
         )
         .await;
         user(&db, &sid, t0 + ms(10), "做三个交付物").await;
+        // The executor records the refused declaration as a structured
+        // interception before the answer; the terminal carries the warning.
+        event(
+            &db,
+            &sid,
+            t0 + ms(900),
+            EngineEvent::GoalIntercepted {
+                kind: "acceptance_narrowed".into(),
+                detail: "commit_task refused".into(),
+            },
+        )
+        .await;
         event(
             &db,
             &sid,
@@ -935,7 +947,52 @@ mod tests {
                     ..
                 }
             )),
-            "legacy replay must read the durable fact, not the reason: {entries:?}"
+            "replay must read the structured refusal, not the warning text: {entries:?}"
+        );
+    }
+
+    /// A plain Chat answer with a review warning replays with that warning and
+    /// no unregistered fact: no declaration was attempted, so the durable log
+    /// has no refusal to carry.
+    #[tokio::test]
+    async fn a_plain_chat_review_warning_replays_as_completed_with_warnings() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        user(&db, &sid, t0 + ms(10), "看一下这个改动").await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: vec!["required independent review reported 1 finding(s)".into()],
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert!(
+            entries.iter().any(|entry| matches!(
+                entry.event,
+                RuntimeEvent::TurnCompletedWithWarnings {
+                    unregistered_task: false,
+                    ref reason,
+                } if reason.contains("required independent review")
+            )),
+            "a review warning is not a registration failure: {entries:?}"
         );
     }
 

@@ -400,6 +400,7 @@ fn task_finished_event(
     failure: Option<leveler_model::ModelError>,
     stop: Option<StopReason>,
     warnings: Vec<String>,
+    unregistered_task: bool,
 ) -> RuntimeEvent {
     let detail_with_warnings = || {
         let mut parts = Vec::new();
@@ -422,15 +423,15 @@ fn task_finished_event(
         // either warning terminal would settle the wrong lifecycle.
         return turn_end_event(StopReason::Answered, reason);
     }
-    if outcome == leveler_lifecycle::TaskOutcome::Completed && !warnings.is_empty() {
-        // An `Answered` stop is the executor's structured fact that the model
-        // answered rather than resolved a committed task, so no execution task
-        // was registered on this terminal. That is the refused-registration
-        // warning, or a Chat turn whose only warnings are advisory review
-        // findings; either way it must not inherit the goal-completion meaning
-        // of `Completed`. A goal that really completed (with review or
-        // verification warnings) stops at `Completed`, never `Answered`.
-        let unregistered_task = stop == Some(StopReason::Answered);
+    if outcome == leveler_lifecycle::TaskOutcome::Completed
+        && (!warnings.is_empty() || unregistered_task)
+    {
+        // `unregistered_task` is the executor's structured registration fact
+        // (a refused `commit_task` declaration never since followed by a
+        // successful one), tracked from its own events. It is NOT derived from
+        // the warning list: a plain Chat answer can carry an unrelated review
+        // warning with no declaration ever attempted. A goal that really
+        // completed stops at `Completed` and never carries this fact.
         return RuntimeEvent::TurnCompletedWithWarnings {
             reason: detail_with_warnings(),
             unregistered_task,
@@ -510,6 +511,14 @@ pub struct EventBridge {
     /// Role per in-flight child, so the terminal event can carry the role the
     /// spawn announced instead of an empty string.
     child_roles: HashMap<String, String>,
+    /// The turn's last explicit registration fact: a refused `commit_task`
+    /// declaration that has not since been followed by a successful one.
+    ///
+    /// Set by the executor's structured refusal interception and cleared by a
+    /// successful declaration's tool result. The terminal must read THIS, not
+    /// the presence of warnings: a plain Chat answer can carry an unrelated
+    /// review warning without ever attempting a declaration.
+    registration_refused: bool,
     /// A TaskFinished event is the one terminal authority. Once projected,
     /// post-terminal timing/cleanup events can never move the client back to a
     /// busy state, and the interactive wrapper knows not to emit a duplicate.
@@ -685,6 +694,7 @@ impl EventBridge {
             recent_assistant_texts: std::collections::VecDeque::new(),
             round_after_closeout_nudge: false,
             child_roles: HashMap::new(),
+            registration_refused: false,
             terminal_published: false,
             terminal_publisher: None,
             progress: None,
@@ -791,6 +801,9 @@ impl EventBridge {
                 // A nudge whose round never produced a message must not follow
                 // the reader into the next turn.
                 self.round_after_closeout_nudge = false;
+                // Registration is per turn: a refusal in an earlier turn says
+                // nothing about this one.
+                self.registration_refused = false;
             }
             EngineEvent::AssistantMessage { text, reasoning } => {
                 // Live rounds already streamed their reasoning as deltas, and
@@ -950,6 +963,11 @@ impl EventBridge {
                 // Such a result is still this round's own call, so it also ends
                 // the nudge fold scope (see the ToolCallStarted arm).
                 self.round_after_closeout_nudge = false;
+                if name == leveler_agent::COMMIT_TASK_TOOL && !is_error {
+                    // A successful declaration binds the goal: whatever an
+                    // earlier attempt refused, the task IS registered now.
+                    self.registration_refused = false;
+                }
                 let start = match self.tool_starts.remove(&id) {
                     Some(start) => start,
                     None => {
@@ -1065,7 +1083,12 @@ impl EventBridge {
                 });
             }
 
-            EngineEvent::GoalIntercepted { .. } => {
+            EngineEvent::GoalIntercepted { kind, .. } => {
+                // The executor's own refusal of a `commit_task` declaration is
+                // the durable registration fact this turn's terminal reads.
+                if kind == leveler_agent::COMMIT_REFUSED_KIND {
+                    self.registration_refused = true;
+                }
                 // Surface as a localized activity label; the gate's kind and the
                 // model-facing English account ride the tool result's preview
                 // (tagged), where the client states the reason in the user's
@@ -1404,7 +1427,14 @@ impl EventBridge {
             } => {
                 if !self.terminal_published {
                     self.terminal_published = true;
-                    let event = task_finished_event(outcome, reason, failure, stop, warnings);
+                    let event = task_finished_event(
+                        outcome,
+                        reason,
+                        failure,
+                        stop,
+                        warnings,
+                        self.registration_refused,
+                    );
                     if let Some(publish) = self.terminal_publisher.take() {
                         publish(event);
                     } else {
@@ -3052,6 +3082,29 @@ mod projection_equivalence {
         }
     }
 
+    /// The turnover's one terminal event, skipping the activity and rows that
+    /// precede it.
+    fn terminal_of(rx: &mut broadcast::Receiver<RuntimeEvent>) -> Option<RuntimeEvent> {
+        let mut terminal = None;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                    | RuntimeEvent::TurnAnswered
+                    | RuntimeEvent::TurnPaused { .. }
+                    | RuntimeEvent::TurnTruncated { .. }
+                    | RuntimeEvent::TurnIncomplete { .. }
+                    | RuntimeEvent::TurnFailed { .. }
+                    | RuntimeEvent::TurnCancelled
+                    | RuntimeEvent::TaskCancelled
+            ) {
+                terminal = Some(event);
+            }
+        }
+        terminal
+    }
+
     /// A tool row's duration is how long the command ran, not how long the
     /// user took to allow it. The clock started when the MODEL asked, so a
     /// live turn reported `✓ 执行命令 · 已完成 · 3m 40s` for a script that ran
@@ -3348,9 +3401,15 @@ mod projection_equivalence {
 
     #[test]
     fn an_answered_stop_with_a_warning_is_an_unregistered_task() {
-        let (tx, mut rx) = broadcast::channel(4);
+        let (tx, mut rx) = broadcast::channel(8);
         let mut bridge = EventBridge::new(tx);
 
+        // The executor records a refused declaration as this structured
+        // interception before the turn answers. That event is the fact.
+        bridge.forward(EngineEvent::GoalIntercepted {
+            kind: "acceptance_narrowed".into(),
+            detail: "commit_task refused".into(),
+        });
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Completed,
             reason: Some("no execution task was registered".into()),
@@ -3360,12 +3419,102 @@ mod projection_equivalence {
         });
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(RuntimeEvent::TurnCompletedWithWarnings {
+            terminal_of(&mut rx),
+            Some(RuntimeEvent::TurnCompletedWithWarnings {
                 unregistered_task: true,
                 ..
             })
         ));
+    }
+
+    /// A plain Chat turn can carry a review warning and still finish on its
+    /// own answer: no execution task was requested, so nothing failed to
+    /// register. The warning is real; the unregistered claim would be
+    /// invented from it.
+    #[test]
+    fn a_plain_chat_review_warning_is_not_an_unregistered_task() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: vec!["required independent review reported 1 finding(s)".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedWithWarnings {
+                reason,
+                unregistered_task: false,
+            }) if reason.contains("required independent review")
+        ));
+    }
+
+    /// A successful declaration clears an earlier refusal: the task IS
+    /// registered, so a later warning terminal is not an unregistered answer.
+    #[test]
+    fn a_successful_commit_clears_an_earlier_refusal() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::GoalIntercepted {
+            kind: "acceptance_narrowed".into(),
+            detail: "commit_task refused".into(),
+        });
+        bridge.forward(tool_finished("c1", "commit_task", false, None));
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: vec!["required independent review reported 1 finding(s)".into()],
+        });
+
+        assert!(matches!(
+            terminal_of(&mut rx),
+            Some(RuntimeEvent::TurnCompletedWithWarnings {
+                unregistered_task: false,
+                ..
+            })
+        ));
+    }
+
+    /// The registration fact and the other warnings are independent facts:
+    /// a review finding recorded beside a refused declaration still reaches
+    /// the client.
+    #[test]
+    fn a_refused_registration_keeps_the_other_warnings() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::GoalIntercepted {
+            kind: "acceptance_narrowed".into(),
+            detail: "commit_task refused".into(),
+        });
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: vec![
+                "no execution task was registered: a commit_task declaration was refused".into(),
+                "required independent review reported 1 finding(s)".into(),
+            ],
+        });
+
+        match terminal_of(&mut rx) {
+            Some(RuntimeEvent::TurnCompletedWithWarnings {
+                reason,
+                unregistered_task: true,
+            }) => {
+                assert!(reason.contains("no execution task was registered"));
+                assert!(reason.contains("required independent review"));
+            }
+            other => panic!("unexpected terminal: {other:?}"),
+        }
     }
 
     /// A paused goal can still receive a review or verification warning. The

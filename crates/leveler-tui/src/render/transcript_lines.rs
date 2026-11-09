@@ -868,7 +868,8 @@ fn turn_end_lines(
     let mut stats = turn_receipt_stats(block, t);
     let star = "* ";
     let mut detail_below = false;
-    let detail = if block.status == TurnEndStatus::AnsweredUnregistered {
+    let unregistered = block.status == TurnEndStatus::AnsweredUnregistered;
+    let detail = if unregistered {
         Some(t.turn_unregistered_detail)
     } else {
         block.detail.as_deref()
@@ -921,6 +922,26 @@ fn turn_end_lines(
     if detail_below && let Some(detail) = detail {
         for line in wrap(
             localized_turn_detail(detail, t),
+            width.saturating_sub(4).max(8),
+        ) {
+            out.push(Line::from(Span::styled(
+                format!("   {line}"),
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
+    }
+    // The fixed sentence only names the registration fact. Whatever else the
+    // terminal reported — a review finding, for example — is still the
+    // runtime's own warning and stays readable beside it.
+    if unregistered
+        && let Some(actual) = block
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+    {
+        for line in wrap(
+            localized_turn_detail(actual, t),
             width.saturating_sub(4).max(8),
         ) {
             out.push(Line::from(Span::styled(
@@ -3053,6 +3074,20 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The unregistered status names the registration fact. It must not
+    /// replace the terminal's own warnings: a review finding recorded beside
+    /// the refusal stays visible.
+    #[test]
+    fn an_unregistered_answer_still_shows_its_warnings() {
+        let warning = "required independent review reported 1 finding(s)";
+        let text = turn_end_text(TurnEndStatus::AnsweredUnregistered, Some(warning));
+        assert!(text.contains("任务未登记"), "{text:?}");
+        assert!(
+            text.contains(warning),
+            "the warning must not be folded into the fixed sentence: {text:?}"
+        );
     }
 
     /// A reason is appended to the marker line only if it fits there. It was
