@@ -8,8 +8,10 @@
 //! - an account declared `not_done` refuses completion;
 //! - an `artifact`, `artifact_absent`, `content` or `command` requirement is
 //!   checked against the current workspace or the recorded command runs;
-//! - a `tests` requirement must cite a passing run recorded after the last
-//!   change, so the runtime does not have to recognise a runner's name;
+//! - a `tests` requirement declares its exact test command in `target` and
+//!   needs a passing recorded run of it after the last change; the runtime does
+//!   not recognise a runner's name, and command success without a structured
+//!   test result is reported as unverified test coverage, never as Verified;
 //! - a `named` requirement is accepted with an explicit unverified boundary.
 //!
 //! The model's `done` claim never overrides a fact the runtime can observe.
@@ -244,13 +246,13 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
             }
             AccountStatus::Done => match check_mechanical(facts, item, account) {
                 Mechanical::Failed(refusal) => refusals.push(refusal),
-                Mechanical::Unverified(warning) => {
+                Mechanical::Unverified(warning, run) => {
                     warnings.push(warning.clone());
                     records.push(record(
                         item,
                         VerificationRecordState::Unverified,
                         warning,
-                        None,
+                        run,
                         facts.mutation_ops,
                     ));
                 }
@@ -361,8 +363,10 @@ enum Mechanical<'a> {
     NotCheckable,
     /// The fact is observable and contradicts the account.
     Failed(String),
-    /// Checked where possible, but the observation boundary is unknown.
-    Unverified(String),
+    /// Checked where possible, but the observation boundary is unknown or the
+    /// available evidence is only partial. The run, when present, is the real
+    /// execution the record rests on.
+    Unverified(String, Option<&'a VerificationRun>),
 }
 
 fn check_mechanical<'a>(
@@ -386,12 +390,15 @@ fn check_mechanical<'a>(
                     item.id,
                     clip(&item.text, 120)
                 )),
-                ArtifactState::Unknown => Mechanical::Unverified(format!(
-                    "requirement `{}` [artifact] `{}` is accounted done, but the runtime could \
-                     not inspect `{target}`; it is unverified",
-                    item.id,
-                    clip(&item.text, 120)
-                )),
+                ArtifactState::Unknown => Mechanical::Unverified(
+                    format!(
+                        "requirement `{}` [artifact] `{}` is accounted done, but the runtime could \
+                         not inspect `{target}`; it is unverified",
+                        item.id,
+                        clip(&item.text, 120)
+                    ),
+                    None,
+                ),
             }
         }
         RequirementKind::ArtifactAbsent => {
@@ -409,12 +416,15 @@ fn check_mechanical<'a>(
                     item.id,
                     clip(&item.text, 120)
                 )),
-                ArtifactState::Unknown => Mechanical::Unverified(format!(
-                    "requirement `{}` [absent-artifact] `{}` is accounted deleted, but the \
-                     runtime could not inspect `{target}`; it is unverified",
-                    item.id,
-                    clip(&item.text, 120)
-                )),
+                ArtifactState::Unknown => Mechanical::Unverified(
+                    format!(
+                        "requirement `{}` [absent-artifact] `{}` is accounted deleted, but the \
+                         runtime could not inspect `{target}`; it is unverified",
+                        item.id,
+                        clip(&item.text, 120)
+                    ),
+                    None,
+                ),
             }
         }
         RequirementKind::Content => {
@@ -429,12 +439,15 @@ fn check_mechanical<'a>(
                     item.id,
                     clip(&item.text, 120)
                 )),
-                LiteralState::Unknown => Mechanical::Unverified(format!(
-                    "requirement `{}` [content] `{}` is accounted done, but the runtime could \
-                     not read `{target}`; it is unverified",
-                    item.id,
-                    clip(&item.text, 120)
-                )),
+                LiteralState::Unknown => Mechanical::Unverified(
+                    format!(
+                        "requirement `{}` [content] `{}` is accounted done, but the runtime could \
+                         not read `{target}`; it is unverified",
+                        item.id,
+                        clip(&item.text, 120)
+                    ),
+                    None,
+                ),
             }
         }
         RequirementKind::Command => {
@@ -466,27 +479,62 @@ fn check_mechanical<'a>(
                 )),
             }
         }
-        RequirementKind::Tests => match cited_passing_run(facts, &account.evidence) {
-            RunCheck::Found(run) => Mechanical::Satisfied(Some(run)),
-            RunCheck::Pending(started) => {
-                Mechanical::Failed(pending_refusal(item, &started.label, started))
+        RequirementKind::Tests => {
+            // A requirement persisted before `tests` required a `target`
+            // cannot be matched to a run. It stays finishable at the explicit
+            // unverified boundary instead of blocking a legally recorded goal.
+            let Some(target) = item.target.as_deref() else {
+                return Mechanical::Unverified(
+                    format!(
+                        "requirement `{}` [tests] `{}` was recorded without a declared test \
+                         command, so no recorded run can be matched to it; the completion \
+                         carries an unverified boundary",
+                        item.id,
+                        clip(&item.text, 120)
+                    ),
+                    None,
+                );
+            };
+            match successful_run(facts, target, &account.evidence) {
+                // The runtime recorded the declared command and it exited 0.
+                // That is command success, not test-execution success: the
+                // execution record carries no structured test result, so a
+                // command that ran zero tests is indistinguishable here. The
+                // requirement is complete but its coverage stays unverified.
+                RunCheck::Found(run) => Mechanical::Unverified(
+                    format!(
+                        "`{}` [tests] `{}` {} at workspace version {} (step {}), but the runtime \
+                         observed no structured test result: command success does not establish \
+                         that any test executed, so the test coverage remains unverified",
+                        item.id,
+                        run.label,
+                        exit_description(run),
+                        run.mutation_ops,
+                        run.model_step
+                    ),
+                    Some(run),
+                ),
+                RunCheck::Pending(started) => {
+                    Mechanical::Failed(pending_refusal(item, target, started))
+                }
+                RunCheck::Stale(run) => Mechanical::Failed(format!(
+                    "`{}` [tests] `{target}` last passed before the most recent change \
+                     (step {}); run the declared test command against the current workspace",
+                    item.id, run.model_step
+                )),
+                RunCheck::Failed(run) => Mechanical::Failed(format!(
+                    "`{}` [tests] `{target}` was cited but its last run failed (step {})",
+                    item.id, run.model_step
+                )),
+                RunCheck::Missing => Mechanical::Failed(format!(
+                    "`{}` [tests] is accounted done, but no passing run of the declared test \
+                     command `{target}` was recorded after the last change. Put `call_id:<id>` \
+                     or the exact command on its own line of `evidence`, and run the declared \
+                     command now if it did not run.",
+                    item.id
+                )),
             }
-            RunCheck::Stale(run) => Mechanical::Failed(format!(
-                "`{}` [tests] cites `{}`, which passed before the most recent change \
-                 (step {}); cite a passing run against the current workspace",
-                item.id, run.label, run.model_step
-            )),
-            RunCheck::Failed(run) => Mechanical::Failed(format!(
-                "`{}` [tests] cites `{}`, whose last run failed (step {})",
-                item.id, run.label, run.model_step
-            )),
-            RunCheck::Missing => Mechanical::Failed(format!(
-                "`{}` [tests] requires a passing test run, but the evidence does not cite one. \
-                 Put `call_id:<id>` of the tool call that ran it, or the exact command, on its \
-                 own line of `evidence`.",
-                item.id
-            )),
-        },
+        }
         RequirementKind::Named
         | RequirementKind::Forbidden
         | RequirementKind::Baseline
@@ -546,38 +594,6 @@ fn successful_run<'a>(facts: &ScopeFacts<'a>, command: &str, evidence: &str) -> 
         return RunCheck::Pending(started);
     }
     RunCheck::Missing
-}
-
-/// A passing run the account's evidence names, of any command.
-fn cited_passing_run<'a>(facts: &ScopeFacts<'a>, evidence: &str) -> RunCheck<'a> {
-    let mut cited = None;
-    for line in evidence.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(run) = crate::executor::goal_verification::cited_run_in(line, facts.runs) {
-            cited = Some(run);
-            break;
-        }
-    }
-    let Some(run) = cited else {
-        let started = evidence.lines().find_map(|line| {
-            let line = line.trim();
-            (!line.is_empty())
-                .then(|| {
-                    facts.pending.iter().rev().find(|started| {
-                        crate::executor::goal_verification::cites(&started.label, line)
-                    })
-                })
-                .flatten()
-        });
-        return match started {
-            Some(started) => RunCheck::Pending(started),
-            None => RunCheck::Missing,
-        };
-    };
-    classify(run, facts.mutation_ops)
 }
 
 fn classify(run: &VerificationRun, mutation_ops: u64) -> RunCheck<'_> {
@@ -693,6 +709,17 @@ mod tests {
                 records
             }
             other => panic!("expected a verified acceptance, got {other:?}"),
+        }
+    }
+
+    fn accept_unverified(decision: ScopeDecision) -> Vec<VerificationRecord> {
+        match decision {
+            ScopeDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                records,
+                ..
+            } => records,
+            other => panic!("expected an unverified acceptance, got {other:?}"),
         }
     }
 
@@ -873,9 +900,9 @@ mod tests {
     fn an_accepted_record_carries_the_execution_evidence() {
         let requirements = [item(
             "R1",
-            RequirementKind::Tests,
-            "the suite must pass",
-            None,
+            RequirementKind::Command,
+            "the verifier must pass",
+            Some("make regression"),
         )];
         let accounts = [account("R1", AccountStatus::Done, "call_id:call-9")];
         let passed = [run("make regression", true, 4, "call-9")];
@@ -890,7 +917,7 @@ mod tests {
         let records = accept_verified(decision);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].requirement_id, "R1");
-        assert_eq!(records[0].kind, "tests");
+        assert_eq!(records[0].kind, "command");
         assert_eq!(records[0].call_id.as_deref(), Some("call-9"));
         assert_eq!(records[0].command.as_deref(), Some("make regression"));
         assert_eq!(records[0].exit_code, Some(0));
@@ -926,13 +953,18 @@ mod tests {
         }
     }
 
+    /// A passing command proves that the command exited 0. It does not prove
+    /// that a test ran, or that any test result exists: the runtime has no
+    /// structured test-result channel. A `tests` requirement therefore reaches
+    /// the explicit unverified boundary even with its declared command's run,
+    /// and the record keeps the execution evidence.
     #[test]
-    fn a_tests_requirement_is_satisfied_by_a_cited_passing_run() {
+    fn a_declared_test_command_that_passed_is_unverified_with_its_evidence() {
         let requirements = [item(
             "R1",
             RequirementKind::Tests,
             "the suite must pass",
-            None,
+            Some("make regression"),
         )];
         let accounts = [account("R1", AccountStatus::Done, "call_id:call-9")];
         let passed = [run("make regression", true, 4, "call-9")];
@@ -944,19 +976,82 @@ mod tests {
             &absent,
             &unknown_literal,
         );
-        let records = accept_verified(decision);
+        let records = accept_unverified(decision);
         assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.kind, "tests");
+        assert_eq!(record.state, VerificationRecordState::Unverified);
+        assert_eq!(record.call_id.as_deref(), Some("call-9"));
+        assert_eq!(record.command.as_deref(), Some("make regression"));
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.workspace_version, 4);
+        assert!(
+            record.detail.contains("no structured test result"),
+            "{}",
+            record.detail
+        );
     }
 
-    /// The runtime does not recognise a runner by name: an unrecognised command
-    /// counts when the account cites it and the run passed after the change.
+    /// A `true` or `echo` command is not a test suite. Declaring one as the
+    /// test command and running it still cannot yield verified coverage.
     #[test]
-    fn a_tests_requirement_accepts_an_unrecognised_suite_when_cited() {
+    fn a_test_command_that_ran_no_tests_cannot_claim_verified_coverage() {
         let requirements = [item(
             "R1",
             RequirementKind::Tests,
             "the suite must pass",
-            None,
+            Some("true"),
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "call_id:call-7")];
+        let passed = [run("true", true, 1, "call-7")];
+        let decision = accept_with(
+            &requirements,
+            &accounts,
+            &passed,
+            1,
+            &absent,
+            &unknown_literal,
+        );
+        let records = accept_unverified(decision);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, VerificationRecordState::Unverified);
+    }
+
+    /// The declared test command defines the evidence. Another command's
+    /// success — including `cat` or `echo` — cannot satisfy it.
+    #[test]
+    fn an_unrelated_passing_command_cannot_satisfy_a_tests_requirement() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the suite must pass",
+            Some("make regression"),
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "echo ok")];
+        let passed = [run("echo ok", true, 1, "call-2")];
+        let decision = accept_with(
+            &requirements,
+            &accounts,
+            &passed,
+            1,
+            &absent,
+            &unknown_literal,
+        );
+        let ScopeDecision::Refuse(message) = decision else {
+            panic!("an unrelated command satisfied a tests requirement");
+        };
+        assert!(message.contains("make regression"), "{message}");
+    }
+
+    /// Custom test commands remain first-class: the declared command is
+    /// matched exactly, with no runner-name vocabulary.
+    #[test]
+    fn a_declared_custom_test_command_is_matched_by_its_declaration() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the project's own check must pass",
+            Some("project-own-check --all"),
         )];
         let accounts = [account(
             "R1",
@@ -972,40 +1067,38 @@ mod tests {
             &absent,
             &unknown_literal,
         );
-        let records = accept_verified(decision);
+        let records = accept_unverified(decision);
         assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].command.as_deref(),
+            Some("project-own-check --all")
+        );
     }
 
     #[test]
-    fn a_tests_requirement_without_a_citation_refuses() {
+    fn a_tests_requirement_without_a_declared_run_refuses() {
         let requirements = [item(
             "R1",
             RequirementKind::Tests,
             "the suite must pass",
-            None,
+            Some("make regression"),
         )];
         let accounts = [account("R1", AccountStatus::Done, "I ran the tests")];
-        let passed = [run("make regression", true, 1, "call-3")];
-        let decision = accept_with(
-            &requirements,
-            &accounts,
-            &passed,
-            1,
-            &absent,
-            &unknown_literal,
-        );
-        assert!(
-            matches!(decision, ScopeDecision::Refuse(message) if message.contains("does not cite one"))
-        );
+        let decision = accept_with(&requirements, &accounts, &[], 1, &absent, &unknown_literal);
+        let ScopeDecision::Refuse(message) = decision else {
+            panic!("a tests requirement was satisfied without a run");
+        };
+        assert!(message.contains("make regression"), "{message}");
+        assert!(message.contains("no passing run"), "{message}");
     }
 
     #[test]
-    fn a_failed_cited_run_refuses_a_done_claim() {
+    fn a_failed_declared_test_command_refuses_a_done_claim() {
         let requirements = [item(
             "R1",
             RequirementKind::Tests,
             "the suite must pass",
-            None,
+            Some("make regression"),
         )];
         let accounts = [account("R1", AccountStatus::Done, "call_id:call-3")];
         let failed = [run("make regression", false, 1, "call-3")];
@@ -1018,6 +1111,62 @@ mod tests {
             &unknown_literal,
         );
         assert!(matches!(decision, ScopeDecision::Refuse(message) if message.contains("failed")));
+    }
+
+    #[test]
+    fn a_stale_declared_test_command_refuses_a_done_claim() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the suite must pass",
+            Some("make regression"),
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "call_id:call-3")];
+        let passed = [run("make regression", true, 1, "call-3")];
+        let decision = accept_with(
+            &requirements,
+            &accounts,
+            &passed,
+            2,
+            &absent,
+            &unknown_literal,
+        );
+        assert!(
+            matches!(decision, ScopeDecision::Refuse(message) if message.contains("before the most recent change"))
+        );
+    }
+
+    /// Requirements persisted before `tests` required a `target` cannot be
+    /// matched to a run. They remain finishable at the explicit unverified
+    /// boundary instead of blocking a goal that was legally recorded.
+    #[test]
+    fn a_legacy_tests_requirement_without_a_target_is_unverified() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the suite must pass",
+            None,
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "call_id:call-9")];
+        let passed = [run("make regression", true, 1, "call-9")];
+        let decision = accept_with(
+            &requirements,
+            &accounts,
+            &passed,
+            1,
+            &absent,
+            &unknown_literal,
+        );
+        let records = accept_unverified(decision);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, VerificationRecordState::Unverified);
+        assert!(
+            records[0]
+                .detail
+                .contains("without a declared test command"),
+            "{}",
+            records[0].detail
+        );
     }
 
     #[test]

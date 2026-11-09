@@ -73,8 +73,12 @@ pub enum PauseBoundary {
     /// working on. Mechanically identical to [`Self::Now`]; kept because the
     /// model's declaration should preserve the distinction the user made.
     AfterAnyStep,
-    /// Stop once the referenced plan step is completed (or no longer exists in
-    /// the plan — a step that vanished cannot still be pending).
+    /// Stop once the referenced plan step is declared `completed`.
+    ///
+    /// A step that disappears from a later plan is NOT completed: the model
+    /// may rename, replace, split or merge steps while the work is still
+    /// outstanding, and none of those transitions is a completion. Only an
+    /// explicit `completed` status on the same stable id reaches the boundary.
     AfterStep { step: StageRef },
 }
 
@@ -89,10 +93,12 @@ impl PauseBoundary {
 
     /// Whether the boundary is in force at a closeout of `plan`.
     ///
-    /// A named step that is absent is treated as reached: the model replaced
-    /// or abandoned the stage the user wanted to see finished. Erring toward
-    /// pausing keeps the user's authorization gate intact; the model can
-    /// declare a new boundary when the plan really changed.
+    /// Only an explicit `completed` status on the named step reaches the
+    /// boundary. A step that was deleted, renamed without keeping its id,
+    /// replaced, split or merged is still outstanding: those transitions move
+    /// the plan, they do not finish the work the user asked to see finished.
+    /// The model may adjust the plan freely and can re-declare the boundary
+    /// when the stage really moved.
     pub fn reached(&self, plan: &PlanState) -> bool {
         match self {
             PauseBoundary::Now | PauseBoundary::AfterAnyStep => true,
@@ -100,7 +106,7 @@ impl PauseBoundary {
                 .steps
                 .iter()
                 .find(|candidate| candidate.id.as_deref() == Some(step.step_id.as_str()))
-                .is_none_or(|candidate| candidate.status == "completed"),
+                .is_some_and(|candidate| candidate.status == "completed"),
         }
     }
 
@@ -603,14 +609,54 @@ mod tests {
     }
 
     #[test]
-    fn a_step_that_vanished_from_the_plan_counts_as_reached() {
+    fn a_step_that_vanished_from_the_plan_is_not_reached() {
         let boundary = PauseBoundary::AfterStep {
             step: StageRef {
-                step_id: "gone".into(),
+                step_id: "s2".into(),
                 label: None,
             },
         };
-        assert!(boundary.reached(&plan(&[("s1", "completed")])));
+        // Deleted outright.
+        assert!(!boundary.reached(&plan(&[("s1", "completed")])));
+        // Renamed without keeping the stable id.
+        assert!(!boundary.reached(&plan(&[("s1", "completed"), ("renamed", "completed"),])));
+        // Replaced by a different step.
+        assert!(!boundary.reached(&plan(&[
+            ("s1", "completed"),
+            ("replacement", "in_progress"),
+        ])));
+        // Split into two steps.
+        assert!(!boundary.reached(&plan(&[
+            ("s1", "completed"),
+            ("s2a", "completed"),
+            ("s2b", "pending"),
+        ])));
+        // Merged into a later step.
+        assert!(!boundary.reached(&plan(&[("s1", "completed"), ("s2-and-s3", "in_progress"),])));
+    }
+
+    #[test]
+    fn a_boundary_needs_an_explicit_completed_step() {
+        let boundary = PauseBoundary::AfterStep {
+            step: StageRef {
+                step_id: "s2".into(),
+                label: None,
+            },
+        };
+        assert!(!boundary.reached(&plan(&[("s2", "pending")])));
+        assert!(!boundary.reached(&plan(&[("s2", "in_progress")])));
+        assert!(!boundary.reached(&plan(&[("s2", "abandoned")])));
+        assert!(boundary.reached(&plan(&[("s2", "completed")])));
+        // A rename that keeps the stable id follows the same step.
+        let renamed = PlanState {
+            steps: vec![PlanStep {
+                step: "the renamed stage".into(),
+                status: "completed".into(),
+                id: Some("s2".into()),
+                origin: PlanOrigin::ModelExplicit,
+            }],
+        };
+        assert!(boundary.reached(&renamed));
     }
 
     #[test]

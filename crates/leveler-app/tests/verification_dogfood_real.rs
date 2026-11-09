@@ -2,9 +2,11 @@
 //!
 //! This drives the real provider, the real executor, the real tool surface,
 //! the real SQLite stores and the real terminal projection. It proves the
-//! property the scripted suites cannot: a live model's completion carries a
-//! structured verification report, and every command the report names was a
-//! command the runtime actually executed.
+//! property the scripted suites cannot: a live model declares a structured
+//! requirement, completes it, and the terminal's verification report names
+//! only executions the runtime actually ran. A completion with no declared
+//! requirement is deliberately not verified here: command success alone is not
+//! a delivered requirement.
 //!
 //! Ignored by default because it spends real tokens:
 //!
@@ -219,8 +221,11 @@ async fn a_real_goal_completion_carries_only_executions_that_happened() {
         ClientCommand::SubmitMessage {
             session_id: session.clone(),
             content: "在仓库根目录创建 hello.txt，内容为一行 hello；然后运行 `cat hello.txt` \
-                      确认内容；最后调用 update_goal(status=\"complete\")，并在 \
-                      verification.detail 里用 `call_id:<id>` 引用刚才那次 cat 运行。"
+                      确认内容。运行 `cat hello.txt` 确认内容 这句话是用户原文：请用 \
+                      declare_scope 声明一个 command 需求，target 为 `cat hello.txt`，\
+                      source_quote 必须逐字复制上面这句话。然后用 get_goal_scope 读出该需求的 \
+                      id，最后调用 update_goal(status=\"complete\")，在 requirements 里把该 id \
+                      记为 done，并在 verification.detail 里用 `call_id:<id>` 引用刚才那次 cat 运行。"
                 .to_string(),
             attachments: vec![],
         },

@@ -113,11 +113,13 @@ impl RequirementKind {
     }
 
     /// Whether this kind needs a named target: the file for `artifact`,
-    /// `artifact_absent` and `content`, or the exact command for `command`.
+    /// `artifact_absent` and `content`, or the exact command for `command` and
+    /// `tests`. A tests requirement declares the command whose run is its
+    /// evidence, so custom test commands need no recognised runner name.
     pub fn requires_target(self) -> bool {
         matches!(
             self,
-            Self::Artifact | Self::ArtifactAbsent | Self::Command | Self::Content
+            Self::Artifact | Self::ArtifactAbsent | Self::Command | Self::Content | Self::Tests
         )
     }
 }
@@ -1096,6 +1098,23 @@ mod tests {
         )
         .expect_err("target required");
         assert_eq!(error, ScopeError::TargetRequired { kind: "command" });
+    }
+
+    #[test]
+    fn a_tests_requirement_must_name_its_command() {
+        let error = apply_scope_declaration(
+            &[],
+            &declaration(vec![ScopeOperation::Add {
+                kind: RequirementKind::Tests,
+                text: "the suite must pass".to_string(),
+                target: None,
+                source_quote: "run the suite".to_string(),
+                check: None,
+                reason: None,
+            }]),
+        )
+        .expect_err("target required");
+        assert_eq!(error, ScopeError::TargetRequired { kind: "tests" });
     }
 
     #[test]
