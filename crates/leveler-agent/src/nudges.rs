@@ -43,7 +43,7 @@ pub(crate) fn goal_settled_delivery_nudge() -> String {
 /// blocks it). The harness does not choose the work and does not require the
 /// plan to reach 100%: a step that is no longer necessary only has to stop
 /// being declared open.
-pub(crate) fn plan_unresolved_nudge(open_steps: &[String]) -> String {
+pub(crate) fn plan_unresolved_nudge(open_steps: &[String], unregistered_gaps: usize) -> String {
     // Listing more than this pushes the plan into a prompt budget it does not
     // deserve; the model owns the full list in its own transcript.
     const MAX_LISTED: usize = 12;
@@ -57,6 +57,18 @@ pub(crate) fn plan_unresolved_nudge(open_steps: &[String]) -> String {
     }
     if open_steps.len() > MAX_LISTED {
         text.push_str(&format!("- (and {} more)\n", open_steps.len() - MAX_LISTED));
+    }
+    // The plan and the refusal are separate facts about the same turn. The
+    // plan remains the reason for this continuation; stating the refusal here
+    // keeps the model from reading a plan-only nudge as proof that the task
+    // got registered. Neither fact outranks the other.
+    if unregistered_gaps > 0 {
+        text.push_str(&format!(
+            "Separately, this turn's commit_task declaration was refused: {unregistered_gaps} \
+             deliverable(s) the user explicitly named still have no covering acceptance check, \
+             so this work remains unregistered. A completed plan step does not register the \
+             task or prove the deliverable exists.\n"
+        ));
     }
     text.push_str(
         "The plan is your own declaration, so nothing else resolves this. Continue the work, \
@@ -113,7 +125,7 @@ mod tests {
     /// demand an all-completed plan.
     #[test]
     fn the_plan_nudge_states_the_open_steps_and_offers_every_exit() {
-        let n = plan_unresolved_nudge(&["step seven".to_string(), "step nine".to_string()]);
+        let n = plan_unresolved_nudge(&["step seven".to_string(), "step nine".to_string()], 0);
         assert!(n.contains("- step seven"), "{n}");
         assert!(n.contains("- step nine"), "{n}");
         assert!(n.contains("publish an updated plan"), "{n}");
@@ -129,6 +141,30 @@ mod tests {
         ] {
             assert!(!n.contains(banned), "must not coach (`{banned}`): {n}");
         }
+    }
+
+    /// An open plan and a refused declaration are two facts about the same
+    /// turn. The plan stays the continuation reason — the registration fact is
+    /// added, never substituted or used to reorder anything — so the model
+    /// cannot read a plan-only nudge as proof that its task got registered.
+    #[test]
+    fn the_plan_nudge_keeps_the_unregistered_fact_when_both_are_open() {
+        let n = plan_unresolved_nudge(&["step seven".to_string()], 2);
+        assert!(n.contains("- step seven"), "{n}");
+        assert!(n.contains("commit_task"), "{n}");
+        assert!(n.contains("2 deliverable"), "{n}");
+        assert!(n.contains("unregistered"), "{n}");
+        assert!(n.contains("publish an updated plan"), "{n}");
+        assert!(!n.contains("task failed"), "{n}");
+    }
+
+    /// With no refused declaration there is nothing to say about registration:
+    /// a clean plan nudge must not invent a task contract.
+    #[test]
+    fn a_clean_plan_nudge_does_not_mention_registration() {
+        let n = plan_unresolved_nudge(&["step seven".to_string()], 0);
+        assert!(!n.contains("commit_task"), "{n}");
+        assert!(!n.contains("unregistered"), "{n}");
     }
 
     /// The registration nudge states a contract fact and every honest exit. It
@@ -156,7 +192,7 @@ mod tests {
     #[test]
     fn the_plan_nudge_caps_a_long_plan() {
         let steps: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
-        let n = plan_unresolved_nudge(&steps);
+        let n = plan_unresolved_nudge(&steps, 0);
         assert!(n.contains("- s11"), "{n}");
         assert!(!n.contains("- s12"), "{n}");
         assert!(n.contains("(and 8 more)"), "{n}");

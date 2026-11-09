@@ -47,6 +47,29 @@ pub(crate) enum RequirementKind {
     /// said it and the model must still see it, and it is surfaced to the model
     /// as a constraint rather than as work.
     Forbidden,
+    /// What an earlier phase already shipped, stated as context.
+    ///
+    /// A baseline path is mentioned because the new work builds on it, not
+    /// because the user asked for it again. It stays visible to the model and
+    /// is never owed: gating it made `commit_task` reject every honest
+    /// acceptance list for a task that quoted its own baseline.
+    Baseline,
+    /// A step the user asked the model to perform before delivering
+    /// (`阅读 docs/...`, `运行基线测试`).
+    ///
+    /// Preparation is process, not a deliverable. A path read during
+    /// preparation is not an artifact the user wants created, and a baseline
+    /// test run is not the delivery's test demand.
+    Preparation,
+    /// A quality bar or constraint with no mechanical check
+    /// (`所有新增代码必须有中文注释`).
+    ///
+    /// It stays in the set so the model sees it and the final report can
+    /// mention it, but it does not demand a per-item acceptance check: the
+    /// acceptance contract is about deliverables, and treating every quality
+    /// sentence as a named deliverable inflated the scope without adding
+    /// evidence.
+    Constraint,
 }
 
 impl RequirementKind {
@@ -55,7 +78,10 @@ impl RequirementKind {
     /// Only `false` for [`Self::Forbidden`]: everything else names something
     /// the user asked to exist, run, or pass.
     pub(crate) fn is_deliverable(self) -> bool {
-        !matches!(self, Self::Forbidden)
+        !matches!(
+            self,
+            Self::Forbidden | Self::Baseline | Self::Preparation | Self::Constraint
+        )
     }
 
     /// Human-readable class for tool results and diagnostics.
@@ -68,6 +94,9 @@ impl RequirementKind {
             Self::Content => "content",
             Self::Tests => "tests",
             Self::Forbidden => "forbidden",
+            Self::Baseline => "baseline",
+            Self::Preparation => "preparation",
+            Self::Constraint => "constraint",
         }
     }
 }
@@ -399,7 +428,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
         Vec::new();
     collect_segments(objective, &RequirementSource::Objective, &mut collected);
 
-    let mut tests_demanded = test_demanded(objective);
+    let mut test_phrase = test_demanded(objective);
     for amendment in amendments {
         // An explicit replacement retires the earlier deliverable named before
         // the verb. The durable amendment keeps its full text for history; only
@@ -420,7 +449,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
             }
             if removed || mentions_tests(replaced) {
                 if mentions_tests(replaced) {
-                    tests_demanded = false;
+                    test_phrase = None;
                     replaced_tests = true;
                 }
                 effective_amendment = rest;
@@ -459,7 +488,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
                     continue;
                 }
                 if mentions_tests(clause) {
-                    tests_demanded = false;
+                    test_phrase = None;
                 }
                 collected.retain(|(text, kind, _, _)| {
                     !matches!(kind, RequirementKind::Tests) && !mentioned(text, clause)
@@ -482,8 +511,10 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
             .chain(asked)
             .collect::<Vec<_>>()
             .join("\n");
-        if test_demanded(&kept) && !replaced_tests {
-            tests_demanded = true;
+        if let Some(phrase) = test_demanded(&kept)
+            && !replaced_tests
+        {
+            test_phrase = Some(phrase);
         }
         collect_segments(
             &kept,
@@ -492,9 +523,9 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
         );
     }
 
-    if tests_demanded {
+    if let Some(phrase) = test_phrase {
         collected.push((
-            "tests".to_string(),
+            phrase,
             RequirementKind::Tests,
             RequirementSource::Objective,
             None,
@@ -506,7 +537,7 @@ pub(crate) fn extract(objective: &str, amendments: &[String]) -> Vec<Requirement
         // name it and the completion account has to cover it, while the record
         // states that the coverage is the model's account, not proof.
         for text in std::iter::once(objective).chain(amendments.iter().map(String::as_str)) {
-            if let Some(subject) = verification_subject(text) {
+            if let Some(subject) = verification_subject(&demand_text(text)) {
                 collected.push((
                     subject,
                     RequirementKind::Named,
@@ -678,9 +709,18 @@ pub(crate) fn uncovered(requirements: &[Requirement], acceptance: &[String]) -> 
             // A prohibition has no deliverable to name; requiring a check for
             // it would ask the model to "prove" a negative and made
             // `commit_task` refuse honest contracts for things the user asked
-            // NOT to be built.
-            RequirementKind::Forbidden => false,
-            RequirementKind::Tests => !checks.iter().any(|check| mentions_tests(check)),
+            // NOT to be built. Background, preparation and quality prose are
+            // context the model must see, not items the delivery owes.
+            RequirementKind::Forbidden
+            | RequirementKind::Baseline
+            | RequirementKind::Preparation
+            | RequirementKind::Constraint => false,
+            RequirementKind::Tests => {
+                let need = normalize(&requirement.text);
+                !checks
+                    .iter()
+                    .any(|check| test_requirement_covered(check, &need))
+            }
             RequirementKind::Named => !covers_named(&checks, &requirement.text),
             _ => {
                 let need = normalize(&requirement.text);
@@ -691,6 +731,27 @@ pub(crate) fn uncovered(requirements: &[Requirement], acceptance: &[String]) -> 
         .collect()
 }
 
+/// Whether one acceptance check proves the user's test demand.
+///
+/// The check must name the test and carry a run/pass signal. Merely naming a
+/// test artifact (`新增测试文件`) is not a suite run. This applies to every
+/// `Tests` requirement, not only the generic word: a specific phrase like
+/// `完整测试` is still proven by the user's own suite invocation
+/// (`sh run-tests.sh 通过`), which is the check the contract should accept.
+fn test_requirement_covered(check: &str, requirement: &str) -> bool {
+    let names_test = check.contains(requirement)
+        || check.contains("测试")
+        || check
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token.contains("test"));
+    let passes = [
+        "通过", "执行", "运行", "跑", "成功", "pass", "run", "green", "绿",
+    ]
+    .iter()
+    .any(|word| check.contains(word));
+    names_test && passes
+}
+
 /// The most accounting entries one `update_goal` call may carry.
 ///
 /// It is a bound on the tool payload, not a statement about how much work a
@@ -698,12 +759,12 @@ pub(crate) fn uncovered(requirements: &[Requirement], acceptance: &[String]) -> 
 /// so a legitimate long task can always account for every requirement it has.
 pub(crate) const MIN_ACCOUNTING_ENTRIES: usize = 20;
 
-/// How many entries a tool may carry for a requirement set of `requirements`.
+/// How many entries the completion accounting may carry for a requirement set
+/// of `requirements`.
 ///
-/// Both the commit declaration and the completion accounting must be able to
-/// name every requirement the Gate extracts. A fixed floor alone made a
-/// request that enumerates more deliverables than the floor impossible to
-/// declare or complete.
+/// The accounting must be able to name every requirement the Gate extracts. A
+/// fixed floor alone made a request that enumerates more deliverables than the
+/// floor impossible to complete.
 pub(crate) fn entry_limit(requirements: usize) -> usize {
     requirements.max(MIN_ACCOUNTING_ENTRIES)
 }
@@ -803,8 +864,13 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
             // Nothing is owed for a prohibition: it constrains how the work is
             // done and is enforced by the tool/authority boundary, not by a
             // completion account. It cannot be "done" and must not be reported
-            // as an unaccounted deliverable either.
-            RequirementKind::Forbidden => {}
+            // as an unaccounted deliverable either. Background, preparation and
+            // quality prose are context, not delivery: they stay visible in the
+            // scope page and impose no per-item account.
+            RequirementKind::Forbidden
+            | RequirementKind::Baseline
+            | RequirementKind::Preparation
+            | RequirementKind::Constraint => {}
             RequirementKind::Tests => {
                 let Some(fresh) =
                     facts.runs.iter().rev().find(|run| {
@@ -1035,11 +1101,71 @@ fn find_account<'a>(
     })
 }
 
-/// Whether an acceptance check names the requirement. The requirement must
-/// appear in the check, never the reverse: a narrower check does not cover the
-/// user's deliverable.
+/// A conservative paraphrase reading built from the deliverable nouns the user
+/// named: generic verbs and particles are dropped, and every remaining anchor
+/// must appear in the check. A check that shares only a generic verb or a
+/// category noun still fails. The anchors are pre-split on real list
+/// conjunctions, so a leading `和` in `和平协议文档` stays part of the word.
 fn covers(check: &str, requirement: &str) -> bool {
-    requirement.chars().count() >= 2 && check.contains(requirement)
+    if requirement.chars().count() < 2 {
+        return false;
+    }
+    if check.contains(requirement) {
+        return true;
+    }
+    requirement.chars().any(is_cjk) && paraphrase_covers(check, requirement)
+}
+
+/// The deliverable nouns in a requirement, with generic demand words removed.
+/// Removing a generic word also splits the phrase, so
+/// `内容权限校验覆盖作者与管理员` yields three anchors rather than one long
+/// string no check could name.
+fn requirement_anchors(requirement: &str) -> Vec<String> {
+    let mut anchors = Vec::new();
+    for part in named_parts(requirement) {
+        let mut current = String::new();
+        let chars: Vec<char> = part.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            let mut removed = 0;
+            for word in GENERIC_REQUIREMENT_WORDS {
+                let word_chars: Vec<char> = word.chars().collect();
+                if chars[index..].starts_with(&word_chars) {
+                    removed = word_chars.len();
+                    break;
+                }
+            }
+            if removed > 0 {
+                if current.chars().count() >= 2 {
+                    anchors.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+                index += removed;
+                continue;
+            }
+            let ch = chars[index];
+            if is_cjk(ch) || ch.is_alphanumeric() {
+                current.push(ch);
+            } else if !current.is_empty() {
+                if current.chars().count() >= 2 {
+                    anchors.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            index += 1;
+        }
+        if current.chars().count() >= 2 {
+            anchors.push(current);
+        }
+    }
+    anchors
+}
+
+fn paraphrase_covers(check: &str, requirement: &str) -> bool {
+    let anchors = requirement_anchors(requirement);
+    !anchors.is_empty() && anchors.iter().all(|anchor| check.contains(anchor))
 }
 
 /// Generic category nouns a user appends after a counted list
@@ -1252,19 +1378,75 @@ fn mentions_tests(text: &str) -> bool {
         || lower.contains("spec")
 }
 
-/// What an introduced list is doing in the request.
+/// What a section of the user's message is for.
 ///
-/// Only `Deliverable` items are work the completion contract can ask the model
-/// to account for. A list that restates what already exists, names reading
-/// material, or lists setup steps is context the model must read but must not
-/// prove as an end state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ListRole {
+/// A long task brief mixes four kinds of text in one message: what an earlier
+/// phase already shipped, what to read or run first, the quality bar, and the
+/// work this phase owes. The document's own headings and lead-ins are the
+/// structure the user wrote; this type lets extraction read them instead of
+/// flattening every line into a deliverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeRole {
     Deliverable,
-    Context,
-    Reference,
-    Procedure,
+    Baseline,
+    Preparation,
+    Constraint,
 }
+
+/// Section labels, matched against a heading or a short lead-in label.
+///
+/// This is document structure, not an attempt to understand prose: only a
+/// Markdown heading or a line that ends in `:` is read, and a lead-in label
+/// must OPEN with its marker. A sentence that mentions a marker in passing
+/// does not switch the role of everything below it.
+const SECTION_MARKERS: &[(&str, ScopeRole)] = &[
+    ("执行前准备", ScopeRole::Preparation),
+    ("准备工作", ScopeRole::Preparation),
+    ("前置条件", ScopeRole::Preparation),
+    ("preparation", ScopeRole::Preparation),
+    ("prerequisite", ScopeRole::Preparation),
+    ("前置", ScopeRole::Preparation),
+    ("准备", ScopeRole::Preparation),
+    ("质量与约束", ScopeRole::Constraint),
+    ("质量要求", ScopeRole::Constraint),
+    ("禁止事项", ScopeRole::Constraint),
+    ("非目标", ScopeRole::Constraint),
+    ("验收", ScopeRole::Constraint),
+    ("constraints", ScopeRole::Constraint),
+    ("constraint", ScopeRole::Constraint),
+    ("quality", ScopeRole::Constraint),
+    ("约束", ScopeRole::Constraint),
+    ("限制", ScopeRole::Constraint),
+    ("以下能力已经上线", ScopeRole::Baseline),
+    ("已经完成", ScopeRole::Baseline),
+    ("已经上线", ScopeRole::Baseline),
+    ("已实现", ScopeRole::Baseline),
+    ("已完成", ScopeRole::Baseline),
+    ("已上线", ScopeRole::Baseline),
+    ("基线", ScopeRole::Baseline),
+    ("背景", ScopeRole::Baseline),
+    ("现状", ScopeRole::Baseline),
+    ("baseline", ScopeRole::Baseline),
+    ("background", ScopeRole::Baseline),
+    ("already shipped", ScopeRole::Baseline),
+    ("context", ScopeRole::Baseline),
+    ("交付内容", ScopeRole::Deliverable),
+    ("本轮交付", ScopeRole::Deliverable),
+    ("本轮任务", ScopeRole::Deliverable),
+    ("实现内容", ScopeRole::Deliverable),
+    ("工作内容", ScopeRole::Deliverable),
+    ("开发内容", ScopeRole::Deliverable),
+    ("任务目标", ScopeRole::Deliverable),
+    ("交付物", ScopeRole::Deliverable),
+    ("交付", ScopeRole::Deliverable),
+    ("任务", ScopeRole::Deliverable),
+    ("需求", ScopeRole::Deliverable),
+    ("目标", ScopeRole::Deliverable),
+    ("实现", ScopeRole::Deliverable),
+    ("deliverables", ScopeRole::Deliverable),
+    ("requirements", ScopeRole::Deliverable),
+    ("scope of work", ScopeRole::Deliverable),
+];
 
 /// Words that introduce reading material, not a deliverable set.
 const REFERENCE_CUES: &[&str] = &[
@@ -1279,10 +1461,6 @@ const REFERENCE_CUES: &[&str] = &[
 
 /// Words that introduce a state of the world that already exists. Checked
 /// before [`DELIVERY_VERBS`] because `已经完成` itself contains `完成`.
-///
-/// Deliberately narrow: only explicit completion markers. A topical cue
-/// (`上轮遗留问题：`, `背景：`) may introduce work, so it does not suppress the
-/// list that follows.
 const CONTEXT_CUES: &[&str] = &[
     "已经完成",
     "已完成",
@@ -1308,45 +1486,136 @@ const PROCEDURE_CUES: &[&str] = &[
     "setup",
 ];
 
-/// The role of the list this segment introduces, if the segment ends with a
-/// colon. Only the introducing clause decides: an item that merely mentions
-/// `已验收` inside a genuine delivery list does not suppress its siblings.
-fn list_role(segment: &str) -> Option<ListRole> {
-    if bullet_item(segment).is_some() {
+fn section_marker_role(line: &str) -> Option<ScopeRole> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let trimmed = segment.trim();
-    let head = trimmed
-        .strip_suffix('：')
-        .or_else(|| trimmed.strip_suffix(':'))?
-        .trim();
-    if head.is_empty() {
+    let lower = trimmed.to_lowercase();
+    if is_markdown_heading(trimmed) {
+        return earliest_marker(&lower);
+    }
+    let (label, tail) = trimmed.rsplit_once(['：', ':'])?;
+    if !tail.trim().is_empty() || label.chars().count() > 40 {
         return None;
     }
-    let lower = head.to_lowercase();
+    lead_in_role(label.trim())
+}
+
+/// The role a lead-in label introduces for the list that follows.
+///
+/// The document's own labels are read in precedence order: an explicit section
+/// label first, then reading material, then completed history (before delivery
+/// verbs, because `已完成` contains `完成`), then a delivery verb, then setup
+/// steps. An unknown label introduces work by default; the caller resets the
+/// role so an earlier preparation list cannot swallow a later delivery list.
+fn lead_in_role(label: &str) -> Option<ScopeRole> {
+    if let Some(role) = leading_marker(&label.to_lowercase()) {
+        return Some(role);
+    }
+    let lower = label.to_lowercase();
     if REFERENCE_CUES
         .iter()
-        .any(|cue| head.starts_with(cue) || lower.starts_with(cue))
-        && !has_any(head, DELIVERY_VERBS)
+        .any(|cue| label.starts_with(cue) || lower.starts_with(cue))
+        && !has_any(label, DELIVERY_VERBS)
     {
-        return Some(ListRole::Reference);
+        return Some(ScopeRole::Preparation);
     }
     if CONTEXT_CUES
         .iter()
-        .any(|cue| head.contains(cue) || lower.contains(cue))
+        .any(|cue| label.contains(cue) || lower.contains(cue))
     {
-        return Some(ListRole::Context);
+        return Some(ScopeRole::Baseline);
     }
-    if has_any(head, DELIVERY_VERBS) {
-        return Some(ListRole::Deliverable);
+    if has_any(label, DELIVERY_VERBS) {
+        return Some(ScopeRole::Deliverable);
     }
     if PROCEDURE_CUES
         .iter()
-        .any(|cue| head.contains(cue) || lower.contains(cue))
+        .any(|cue| label.contains(cue) || lower.contains(cue))
     {
-        return Some(ListRole::Procedure);
+        return Some(ScopeRole::Preparation);
     }
     None
+}
+
+/// Whether a line is a new list introduction that names no known role.
+fn unrecognized_lead_in(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || is_markdown_heading(trimmed) || bullet_item(trimmed).is_some() {
+        return false;
+    }
+    let Some((label, tail)) = trimmed.rsplit_once(['：', ':']) else {
+        return false;
+    };
+    tail.trim().is_empty() && label.chars().count() <= 40
+}
+
+fn earliest_marker(text: &str) -> Option<ScopeRole> {
+    let mut best: Option<(usize, usize, ScopeRole)> = None;
+    for (marker, role) in SECTION_MARKERS {
+        if let Some(at) = text.find(marker)
+            && best.is_none_or(|(position, length, _)| {
+                at < position || (at == position && marker.len() > length)
+            })
+        {
+            best = Some((at, marker.len(), *role));
+        }
+    }
+    best.map(|(_, _, role)| role)
+}
+
+fn leading_marker(label: &str) -> Option<ScopeRole> {
+    SECTION_MARKERS
+        .iter()
+        .filter(|(marker, _)| label.starts_with(*marker))
+        .max_by_key(|(marker, _)| marker.len())
+        .map(|(_, role)| *role)
+}
+
+struct ScopeSection {
+    role: ScopeRole,
+    text: String,
+}
+
+/// Split a message along its own section labels, keeping the role in force for
+/// each line. A section ends only when a new label changes the role.
+fn split_sections(text: &str) -> Vec<ScopeSection> {
+    let mut sections: Vec<ScopeSection> = Vec::new();
+    let mut role = ScopeRole::Deliverable;
+    for line in text.lines() {
+        match section_marker_role(line) {
+            Some(next) => role = next,
+            // A new, unknown lead-in starts a fresh list. Keeping the previous
+            // preparation role would demote a later delivery list the user
+            // introduced without a marker this extractor knows.
+            None if unrecognized_lead_in(line) => role = ScopeRole::Deliverable,
+            None => {}
+        }
+        match sections.last_mut() {
+            Some(section) if section.role == role => {
+                section.text.push('\n');
+                section.text.push_str(line);
+            }
+            _ => sections.push(ScopeSection {
+                role,
+                text: line.to_string(),
+            }),
+        }
+    }
+    sections
+}
+
+/// The delivery sections only. Background and preparation state what already
+/// exists or what to read first; a test run there proves the baseline, not the
+/// work the task owes.
+fn demand_text(text: &str) -> String {
+    split_sections(text)
+        .into_iter()
+        .filter(|section| !matches!(section.role, ScopeRole::Baseline | ScopeRole::Preparation))
+        .map(|section| section.text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn collect_segments(
@@ -1354,34 +1623,104 @@ fn collect_segments(
     source: &RequirementSource,
     out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
-    let mut role: Option<ListRole> = None;
-    for segment in split_segments(text) {
-        let segment = segment.trim();
-        if segment.is_empty() {
+    for section in split_sections(text) {
+        let start = out.len();
+        for segment in split_segments(&section.text) {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            collect_segment(segment, source, out);
+            collect_constraint_clauses(segment, source, out);
+        }
+        apply_role(section.role, &section.text, &mut out[start..]);
+    }
+}
+
+/// Demote requirements a section does not owe.
+///
+/// A path named under `## 背景` is context, not an artifact to produce; a file
+/// read under `## 执行前准备` is not a deliverable. An item that itself opens
+/// with a delivery instruction is the exception: the user asked for it in that
+/// clause, whatever heading it sits under.
+fn apply_role(
+    role: ScopeRole,
+    section: &str,
+    items: &mut [(String, RequirementKind, RequirementSource, Option<String>)],
+) {
+    if role == ScopeRole::Deliverable {
+        return;
+    }
+    for (text, kind, _, _) in items {
+        // A prohibition is a constraint wherever it is written.
+        if matches!(kind, RequirementKind::Forbidden) {
             continue;
         }
-        let introduced = list_role(segment);
-        if is_markdown_heading(segment) {
-            role = None;
-        } else if let Some(introduced) = introduced {
-            role = Some(introduced);
-        } else if bullet_item(segment).is_none() {
-            // A paragraph that is neither a heading nor a list item ends the
-            // list it followed; the next list must introduce its own role.
-            role = None;
+        if delivery_expected(section, text) {
+            continue;
         }
-        let contextual = matches!(
-            role,
-            Some(ListRole::Context | ListRole::Reference | ListRole::Procedure)
-        );
-        let part_of_list = introduced.is_some() || bullet_item(segment).is_some();
-        if !(contextual && part_of_list) {
-            collect_segment(segment, source, out);
+        match role {
+            ScopeRole::Baseline => *kind = RequirementKind::Baseline,
+            ScopeRole::Preparation => *kind = RequirementKind::Preparation,
+            ScopeRole::Constraint => match kind {
+                // A constraints section can still name a concrete artifact, a
+                // command, a literal or a test demand (`交付必须包含迁移脚本`,
+                // `完成后运行 cargo test 并确保通过`). Those are mechanically
+                // checkable and stay owed; only semantic prose becomes a
+                // constraint.
+                RequirementKind::Artifact { .. }
+                | RequirementKind::Command
+                | RequirementKind::Tests
+                | RequirementKind::Content => continue,
+                _ => *kind = RequirementKind::Constraint,
+            },
+            ScopeRole::Deliverable => {}
         }
-        // Constraints stay requirements even inside a context, reading or
-        // setup list: `不修改并发 P3 工作区` still forbids touching it.
-        collect_constraint_clauses(segment, source, out);
     }
+}
+
+/// Whether the nearest verb governing `token` asks for it to be produced.
+///
+/// The read is scoped to the token's own line: a verb in the previous bullet
+/// (`不得修改 …`) must not turn the next quality sentence into a deliverable.
+fn delivery_expected(section: &str, token: &str) -> bool {
+    if starts_with_delivery_instruction(token) {
+        return true;
+    }
+    let line = section
+        .lines()
+        .find(|line| line.contains(token))
+        .unwrap_or(section);
+    let clause = clause_around(line, token);
+    let Some(end) = last_match_end(clause, token) else {
+        return false;
+    };
+    // `last_match_end` points AFTER the token; the verbs governing it are
+    // before its own characters.
+    let start = end.saturating_sub(token.len());
+    let prefix = &clause[..start];
+    let nearest = REMOVAL_VERBS
+        .iter()
+        .map(|needle| (needle, false))
+        .chain(DELIVERY_VERBS.iter().map(|needle| (needle, true)))
+        .chain(NEGATIONS.iter().map(|needle| (needle, false)))
+        .filter_map(|(needle, delivery)| {
+            last_match_end(prefix, needle).map(|end| (end, *needle, delivery))
+        })
+        .max_by_key(|(end, _, _)| *end);
+    match nearest {
+        // `已完成 X` and `已实现 X` describe an existing state, not an
+        // instruction to produce X.
+        Some((end, needle, true)) => !completed_state_before(prefix, end - needle.len()),
+        _ => false,
+    }
+}
+
+fn completed_state_before(prefix: &str, verb_start: usize) -> bool {
+    let before = prefix[..verb_start].trim_end();
+    ["已", "已经", "此前", "前期", "上一阶段"]
+        .iter()
+        .any(|marker| before.ends_with(marker))
 }
 
 /// Prohibitions written as a standalone constraint clause, not as a bullet
@@ -1784,6 +2123,16 @@ fn collect_enumerations(
         Some((head, tail)) if has_any(head, DELIVERY_VERBS) => tail,
         _ => segment,
     };
+    // A colon after a delivery verb can do two different things:
+    // `实现订阅计划管理：创建、修改、暂停、恢复` names ONE deliverable and the
+    // operations on it, while `本轮交付物：新增 A、修复 B` is a preamble and
+    // the items are separate deliverables. Only the first has operation verbs
+    // on both sides of the colon; the item is kept whole there, so the head is
+    // not dropped and bare verbs are not counted as deliverables.
+    let compound = compound_deliverable_head(segment);
+    if compound && items.is_empty() {
+        items.push(segment.to_string());
+    }
     // An ideographic-comma list is an enumeration only when the clause that
     // holds it is itself a delivery instruction. Splitting every `、` turned
     // descriptive phrases into requirements: `把文章、讨论、评论三条业务链路做成
@@ -1793,18 +2142,21 @@ fn collect_enumerations(
     // contract. The gate is STRUCTURAL (does this clause start with an
     // instruction to deliver?) not a word list about what the list "means".
     let mut enumerated_ideographically = false;
-    for clause in enumerated.split([',', '，']) {
-        if !starts_with_delivery_instruction(clause) {
-            continue;
+    if !compound {
+        for clause in enumerated.split([',', '，']) {
+            if !starts_with_delivery_instruction(clause) {
+                continue;
+            }
+            let ideographic: Vec<&str> = clause.split('、').collect();
+            if ideographic.len() < 2 {
+                continue;
+            }
+            enumerated_ideographically = true;
+            items.extend(ideographic.iter().map(|item| (*item).to_string()));
         }
-        let ideographic: Vec<&str> = clause.split('、').collect();
-        if ideographic.len() < 2 {
-            continue;
-        }
-        enumerated_ideographically = true;
-        items.extend(ideographic.iter().map(|item| (*item).to_string()));
     }
-    if let Some((head, tail)) = segment.rsplit_once(['：', ':'])
+    if !compound
+        && let Some((head, tail)) = segment.rsplit_once(['：', ':'])
         && !enumerated_ideographically
         && has_any(head, DELIVERY_VERBS)
     {
@@ -1851,6 +2203,81 @@ fn collect_enumerations(
         };
         out.push((text, kind, source.clone(), None));
     }
+}
+
+/// Operations a user performs on one deliverable. A colon tail made only of
+/// these names parts of the head, not separate deliverables.
+const OPERATION_VERBS: &[&str] = &[
+    "创建", "新增", "添加", "修改", "更新", "编辑", "删除", "移除", "查询", "查看", "预览", "暂停",
+    "恢复", "启用", "禁用", "启动", "停止", "重试", "取消", "提交", "撤回", "导出", "导入", "同步",
+    "审核", "审批", "作废", "冲正", "对账", "结算", "开票", "关闭", "开启", "create", "update",
+    "edit", "delete", "remove", "query", "list", "pause", "resume", "enable", "disable", "start",
+    "stop", "retry", "cancel", "export", "import", "sync",
+];
+
+/// Whether the colon introduces the operations of ONE deliverable.
+fn compound_deliverable_head(segment: &str) -> bool {
+    let Some((head, tail)) = segment.rsplit_once(['：', ':']) else {
+        return false;
+    };
+    if !tail.contains('、') || !tail_is_operations(tail) {
+        return false;
+    }
+    let head = strip_list_marker(head);
+    let after_obligation = strip_obligation_prefix(&head);
+    let Some(noun) = leading_delivery_verb_rest(after_obligation) else {
+        return false;
+    };
+    !generic_container_label(noun)
+}
+
+fn tail_is_operations(tail: &str) -> bool {
+    let items: Vec<&str> = tail
+        .split(['、', '。', '；', ';'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
+    !items.is_empty()
+        && items.iter().all(|item| {
+            let lower = item.to_lowercase();
+            OPERATION_VERBS.contains(&lower.as_str())
+        })
+}
+
+fn leading_delivery_verb_rest(text: &str) -> Option<&str> {
+    DELIVERY_VERBS
+        .iter()
+        .filter(|verb| text.starts_with(**verb))
+        .max_by_key(|verb| verb.len())
+        .map(|verb| text[verb.len()..].trim_start_matches([' ', '\t', '：', ':']))
+        .filter(|rest| !rest.is_empty())
+}
+
+/// A head such as `以下功能` names a container, not the deliverable itself; its
+/// colon introduces a list of separate deliverables.
+fn generic_container_label(noun: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "内容",
+        "功能",
+        "需求",
+        "任务",
+        "工作",
+        "事项",
+        "清单",
+        "交付物",
+        "能力",
+        "范围",
+        "部分",
+        "方面",
+        "结果",
+        "产物",
+    ];
+    GENERIC
+        .iter()
+        .any(|label| noun == *label || noun.ends_with(label))
+        || ["以下", "如下", "这些", "上述", "全部", "所有"]
+            .iter()
+            .any(|prefix| noun.starts_with(prefix))
 }
 
 /// Whether a clause opens with an instruction to produce something.
@@ -1909,6 +2336,9 @@ fn kind_key(kind: RequirementKind) -> u8 {
         RequirementKind::Tests => 4,
         RequirementKind::Forbidden => 5,
         RequirementKind::Content => 6,
+        RequirementKind::Baseline => 7,
+        RequirementKind::Preparation => 8,
+        RequirementKind::Constraint => 9,
     }
 }
 
@@ -2332,8 +2762,14 @@ fn request_clauses(question: &str) -> Vec<String> {
     clauses
 }
 
-fn test_demanded(text: &str) -> bool {
-    for segment in split_segments(text) {
+/// The user's own words for the test demand, or `None`.
+///
+/// The returned phrase is what the acceptance list must name. Returning a
+/// generic `"tests"` token let any check that mentioned the word stand in for
+/// `完整测试` or `cargo test --workspace`; the gate must hold the model to the
+/// suite the user actually named.
+fn test_demanded(text: &str) -> Option<String> {
+    for segment in split_segments(&demand_text(text)) {
         if is_waiver(&segment) && mentions_tests(&segment) {
             continue;
         }
@@ -2348,19 +2784,22 @@ fn test_demanded(text: &str) -> bool {
             .collect::<Vec<_>>()
             .join(" ");
         let lower = prose.to_lowercase();
-        if lower.contains("cargo test")
-            || lower.contains("go test")
-            || lower.contains("npm test")
-            || lower.contains("pnpm test")
-            || lower.contains("yarn test")
-            || lower.contains("mvn test")
-            || lower.contains("pytest")
-            || lower.contains("unittest")
-            || lower.contains("ctest")
-            || lower.contains("jest")
-            || lower.contains("vitest")
-        {
-            return true;
+        for command in [
+            "cargo test",
+            "go test",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "mvn test",
+            "pytest",
+            "unittest",
+            "ctest",
+            "jest",
+            "vitest",
+        ] {
+            if lower.contains(command) {
+                return Some(command.to_string());
+            }
         }
         if has_any(
             &segment,
@@ -2375,7 +2814,7 @@ fn test_demanded(text: &str) -> bool {
                 "must test",
             ],
         ) {
-            return true;
+            return Some("测试".to_string());
         }
         if !mentions_tests(&prose) {
             continue;
@@ -2395,6 +2834,10 @@ fn test_demanded(text: &str) -> bool {
             "添加",
             "修改",
             "更新",
+            "全绿",
+            "都绿",
+            "都要绿",
+            "regression",
             "pass",
             "run",
             "must",
@@ -2408,11 +2851,171 @@ fn test_demanded(text: &str) -> bool {
             "update",
         ];
         if has_any(&prose, DEMAND) {
-            return true;
+            return Some(test_phrase(&prose));
         }
     }
-    false
+    None
 }
+
+/// The noun phrase the demand was attached to, as the user wrote it.
+///
+/// `并通过完整测试` names `完整测试`; `运行 cargo test` is handled by the
+/// command branch above. The scan stops at a generic demand verb so the phrase
+/// stays a deliverable (`完整测试`), not the whole sentence.
+fn test_phrase(text: &str) -> String {
+    const TEST_WORDS: &[&str] = &[
+        "测试", "test", "tests", "pytest", "unittest", "jest", "vitest",
+    ];
+    let Some((start, matched)) = TEST_WORDS
+        .iter()
+        .filter_map(|word| find_ignore_ascii_case(text, word).map(|at| (at, *word)))
+        .min_by_key(|(at, _)| *at)
+    else {
+        return "测试".to_string();
+    };
+    if matched.is_ascii() {
+        // `tests` must not be cut to `test`; take the whole ASCII word and
+        // keep a leading universal quantifier (`all tests`) when the user
+        // wrote one.
+        let mut end = start + matched.len();
+        while end < text.len() && text.as_bytes()[end].is_ascii_alphanumeric() {
+            end += 1;
+        }
+        let word = &text[start..end];
+        let before = text[..start].trim_end();
+        for quantifier in ["all", "every"] {
+            if let Some(head) = before.strip_suffix(quantifier) {
+                let boundary = head.is_empty()
+                    || !head
+                        .as_bytes()
+                        .last()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric());
+                if boundary {
+                    return format!("{quantifier} {word}");
+                }
+            }
+        }
+        return word.to_string();
+    }
+    // The nearest preceding generic demand word starts the phrase; everything
+    // between it and the test word is the deliverable the user named.
+    let before = &text[..start];
+    let kept: String = before
+        .chars()
+        .rev()
+        .take_while(|c| is_cjk(*c) || c.is_alphanumeric() || c.is_whitespace())
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let mut cut = 0;
+    for word in GENERIC_DEMAND_WORDS {
+        if let Some(at) = kept.rfind(word) {
+            cut = cut.max(at + word.len());
+        }
+    }
+    let phrase = format!("{}{}", kept[cut..].trim(), matched);
+    if phrase.chars().count() >= 2 {
+        phrase
+    } else {
+        matched.to_string()
+    }
+}
+
+/// Find `needle` in `haystack`, folding ASCII case only, and return a byte
+/// offset into `haystack`.
+///
+/// The offset must come from the original string: lowercasing can change a
+/// character's byte length (`İ` → `i̇`), so an offset found in the lowercased
+/// copy may not be a char boundary in the original and would panic a slice.
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.char_indices().find_map(|(at, _)| {
+        haystack[at..]
+            .get(..needle.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(needle))
+            .map(|_| at)
+    })
+}
+
+/// Demand words and connectors that introduce a test instruction rather than
+/// name the suite. Used only to locate the user's phrase, never to widen a
+/// requirement.
+const GENERIC_DEMAND_WORDS: &[&str] = &[
+    "并且",
+    "然后",
+    "最后",
+    "还要",
+    "还需",
+    "还需要",
+    "需要",
+    "必须",
+    "确保",
+    "同时",
+    "通过",
+    "完成",
+    "运行",
+    "执行",
+    "实现",
+    "进行",
+    "并",
+    "且",
+    "再",
+    "还",
+    "请",
+];
+
+/// Generic action words and particles that do not name a deliverable. Used by
+/// the paraphrase matcher to find the nouns the user actually named.
+const GENERIC_REQUIREMENT_WORDS: &[&str] = &[
+    "可访问",
+    "可提交",
+    "可见",
+    "可用",
+    "生效",
+    "通过",
+    "覆盖",
+    "包含",
+    "包括",
+    "具备",
+    "拥有",
+    "支持",
+    "提供",
+    "实现",
+    "完成",
+    "新增",
+    "添加",
+    "修改",
+    "更新",
+    "接入",
+    "集成",
+    "发布",
+    "删除",
+    "修复",
+    "优化",
+    "调整",
+    "确保",
+    "必须",
+    "需要",
+    "能够",
+    "可以",
+    "进行",
+    "满足",
+    "达到",
+    "保持",
+    "兼容",
+    "正常",
+    "有效",
+    "正确",
+    "成功",
+    "全部",
+    "所有",
+    "并且",
+    "以及",
+    "同时",
+    "然后",
+    "的",
+];
 
 /// Words that ask for verification of something rather than name a deliverable.
 const VERIFY_WORDS: &[&str] = &["测试", "实测", "验证", "检验", "检查", "test", "verify"];
@@ -2894,16 +3497,29 @@ mod tests {
             本轮目标是：\n\
             - 实现订阅计费。\n";
         let requirements = extract(request, &[]);
-        let texts = texts(&requirements);
+        // Completed history stays visible with its role so the model can read
+        // it, but it is not work this turn owes.
+        let deliverables: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind.is_deliverable())
+            .map(|requirement| requirement.text.as_str())
+            .collect();
         assert!(
-            texts
+            deliverables
                 .iter()
                 .all(|text| !text.contains("数据库基础架构") && !text.contains("交易可靠性")),
-            "{texts:?}"
+            "{deliverables:?}"
         );
         assert!(
-            texts.iter().any(|text| text.contains("订阅计费")),
-            "{texts:?}"
+            deliverables.iter().any(|text| text.contains("订阅计费")),
+            "{deliverables:?}"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.kind == RequirementKind::Baseline
+                    && requirement.text.contains("数据库基础架构")
+            }),
+            "the completed baseline keeps its non-deliverable role"
         );
     }
 
@@ -2921,14 +3537,24 @@ mod tests {
             必须实现：\n\
             - 订阅计费。\n";
         let requirements = extract(request, &[]);
-        let texts = texts(&requirements);
+        let deliverables: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind.is_deliverable())
+            .map(|requirement| requirement.text.as_str())
+            .collect();
         assert!(
-            texts.iter().all(|text| !text.contains("AGENTS.md")
+            deliverables.iter().all(|text| !text.contains("AGENTS.md")
                 && !text.contains("设计文档")
                 && !text.contains("当前订单、合同模块源码")),
-            "{texts:?}"
+            "{deliverables:?}"
         );
-        assert!(texts.iter().any(|text| *text == "订阅计费"), "{texts:?}");
+        assert!(deliverables.contains(&"订阅计费"), "{deliverables:?}");
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Preparation),
+            "the reading list keeps its preparation role"
+        );
     }
 
     /// Setup checklists are steps to execute before the work, not end states
@@ -2947,11 +3573,23 @@ mod tests {
             - 合同审批。\n";
         let requirements = extract(request, &[]);
         let texts = texts(&requirements);
+        let deliverables: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind.is_deliverable())
+            .map(|requirement| requirement.text.as_str())
+            .collect();
         assert!(
-            texts
+            deliverables
                 .iter()
                 .all(|text| !text.contains("确认 P1") && !text.contains("建立 P2 独立分支")),
-            "{texts:?}"
+            "{deliverables:?}"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.kind == RequirementKind::Preparation
+                    && requirement.text.contains("确认 P1")
+            }),
+            "the setup checklist keeps its preparation role"
         );
         assert!(
             requirements.iter().any(|requirement| {
@@ -2968,8 +3606,8 @@ mod tests {
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text.contains("合同审批")),
-            "{texts:?}"
+            deliverables.iter().any(|text| text.contains("合同审批")),
+            "{deliverables:?}"
         );
     }
 
@@ -5372,6 +6010,181 @@ mod tests {
         );
     }
 
+    /// A long, structured P2 request carries four different kinds of text in
+    /// one message: what an earlier phase already shipped, what the model must
+    /// read first, what the quality bar is, and what this phase actually owes.
+    /// Only the last is the delivery contract. Treating the first three as
+    /// deliverables inflated a 24-item task into more than a hundred
+    /// requirements, and no honest acceptance list could cover them.
+    const P2_REQUEST: &str =
+        include_str!("../../../../testdata/regression/p2_scope_classification.zh-CN.md");
+
+    #[test]
+    fn section_labels_are_read_from_document_structure() {
+        assert_eq!(
+            section_marker_role("## 质量与约束"),
+            Some(ScopeRole::Constraint)
+        );
+        assert_eq!(
+            section_marker_role("## 背景（P0/P1 已完成基线）"),
+            Some(ScopeRole::Baseline)
+        );
+        let sections = split_sections("## 质量与约束\n- 所有新增代码必须有中文注释。\n");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].role, ScopeRole::Constraint);
+        let requirements = extract("## 质量与约束\n- 所有新增代码必须有中文注释。\n", &[]);
+        assert_eq!(
+            requirements[0].kind,
+            RequirementKind::Constraint,
+            "{requirements:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_p2_request_separates_background_from_the_work_it_owes() {
+        let requirements = extract(P2_REQUEST, &[]);
+        let by_kind = |label: &str| -> Vec<&str> {
+            requirements
+                .iter()
+                .filter(|requirement| requirement.kind.label() == label)
+                .map(|requirement| requirement.text.as_str())
+                .collect()
+        };
+
+        let baseline = by_kind("baseline");
+        assert!(
+            baseline.contains(&"crates/billing/src/tenant.rs"),
+            "baseline code is not work: {requirements:?}"
+        );
+        assert!(baseline.contains(&"crates/finance/src/invoice.rs"));
+        assert!(baseline.contains(&"docs/BILLING_BASELINE.md"));
+
+        let preparation = by_kind("preparation");
+        assert!(
+            preparation.contains(&"crates/billing/src/tenant.rs"),
+            "reading a file is not delivering it: {requirements:?}"
+        );
+        assert!(preparation.contains(&"docs/BILLING_BASELINE.md"));
+
+        let constraints = by_kind("constraint");
+        assert!(
+            constraints.iter().any(|text| text.contains("中文注释")),
+            "quality prose stays visible without becoming a deliverable: {requirements:?}"
+        );
+
+        assert!(
+            by_kind("forbidden")
+                .iter()
+                .any(|text| text.contains("数据库表结构")),
+            "a prohibition is recorded as a constraint: {requirements:?}"
+        );
+        assert!(
+            by_kind("artifact").contains(&"migrations/0007_billing.sql"),
+            "an artifact demanded under the quality heading is still owed: {requirements:?}"
+        );
+        assert_eq!(
+            by_kind("tests"),
+            vec!["cargo test"],
+            "the delivery section still carries the test demand: {requirements:?}"
+        );
+
+        let deliverables: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| requirement.kind.is_deliverable())
+            .map(|requirement| requirement.text.as_str())
+            .collect();
+        assert!(
+            deliverables.len() > 20,
+            "the fixture must cross the 20-item scale: {deliverables:?}"
+        );
+        for background in [
+            "crates/billing/src/tenant.rs",
+            "crates/finance/src/invoice.rs",
+            "docs/BILLING_BASELINE.md",
+        ] {
+            assert!(
+                !deliverables.contains(&background),
+                "background must not be owed: {deliverables:?}"
+            );
+        }
+        for named in ["订阅计划管理", "退款申请与审批", "对账差异处理工作台"]
+        {
+            assert!(
+                deliverables.contains(&named),
+                "the real deliverable `{named}` is missing: {deliverables:?}"
+            );
+        }
+    }
+
+    /// `实现 X：A、B、C` names one deliverable with three sub-operations, not
+    /// four deliverables. Splitting the colon tail dropped X on the floor and
+    /// demanded checks for bare verbs that no acceptance list can honestly
+    /// cover.
+    #[test]
+    fn a_colon_after_a_delivery_verb_names_one_deliverable_not_its_sub_operations() {
+        let requirements = extract("实现订阅计划管理：创建、修改、暂停、恢复。", &[]);
+        assert_eq!(
+            texts(&requirements),
+            vec!["订阅计划管理"],
+            "the head is the deliverable; the tail describes it: {requirements:?}"
+        );
+        let checks = vec!["订阅计划管理支持创建、修改、暂停与恢复".to_string()];
+        assert!(uncovered(&requirements, &checks).is_empty());
+    }
+
+    /// The acceptance array keeps its 20-item cap. A task with more than 20
+    /// real deliverables is covered by grouping related ones into one check,
+    /// not by raising the cap or by narrowing the user's scope.
+    #[test]
+    fn a_grouped_acceptance_under_the_twenty_item_cap_covers_every_deliverable() {
+        let requirements = extract(P2_REQUEST, &[]);
+        let deliverables: Vec<&str> = requirements
+            .iter()
+            .filter(|requirement| {
+                requirement.kind.is_deliverable() && requirement.kind != RequirementKind::Tests
+            })
+            .map(|requirement| requirement.text.as_str())
+            .collect();
+        assert!(deliverables.len() > 20, "{deliverables:?}");
+        assert!(deliverables.contains(&"订阅计划管理"), "{deliverables:?}");
+        assert!(
+            !deliverables.contains(&"创建"),
+            "a sub-operation is not a deliverable: {deliverables:?}"
+        );
+
+        let mut checks: Vec<String> = deliverables
+            .chunks(8)
+            .map(|group| format!("{} 均已交付并可用", group.join("、")))
+            .collect();
+        checks.push("cargo test -p billing 通过".to_string());
+        assert!(checks.len() <= 20, "{checks:?}");
+        assert!(
+            uncovered(&requirements, &checks).is_empty(),
+            "uncovered: {:?}",
+            uncovered(&requirements, &checks)
+        );
+    }
+
+    /// A test run the user asked for BEFORE the work starts proves the
+    /// baseline, not the delivery. Reading it as the goal's test demand made a
+    /// preparation step outrank the work itself.
+    #[test]
+    fn a_test_run_during_preparation_is_not_the_delivered_test_demand() {
+        let objective = "## 执行前准备\n\n1. 运行 `cargo test -p billing` 确认基线通过。\n\n\
+                         ## 本轮交付物\n\n1. 实现退款流程。\n";
+        let requirements = extract(objective, &[]);
+        assert!(
+            !requirements
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Tests),
+            "a baseline check is not a delivery demand: {requirements:?}"
+        );
+        assert!(
+            texts(&requirements).contains(&"退款流程"),
+            "{requirements:?}"
+        );
+    }
+
     /// The completion gate must read a joined phrase the same way the commit
     /// gate does. Before this, per-part checks were accepted at commit and a
     /// per-part account was then refused as "not accounted for".
@@ -5641,5 +6454,100 @@ mod goal_scope_page_tests {
         let (empty, start) = page(&requirements, 99, 8);
         assert!(empty.is_empty());
         assert_eq!(start, 3);
+    }
+}
+
+#[cfg(test)]
+mod acceptance_contract_tests {
+    use super::*;
+
+    fn uncovered_texts(objective: &str, acceptance: &[&str]) -> Vec<String> {
+        let requirements = extract(objective, &[]);
+        let acceptance: Vec<String> = acceptance.iter().map(|item| item.to_string()).collect();
+        uncovered(&requirements, &acceptance)
+    }
+
+    /// A model that names the same deliverables in its own words has covered
+    /// the user's contract: the gate checks coverage, not the model's choice of
+    /// verbs. Every deliverable remains named; none may be generalized away.
+    #[test]
+    fn a_paraphrased_acceptance_covers_the_users_deliverables() {
+        let objective = "实现三件事：\n\
+             1. 文章发布可访问\n\
+             2. 评论回复可提交且可见\n\
+             3. 内容权限校验覆盖作者与管理员";
+        let missing = uncovered_texts(
+            objective,
+            &[
+                "发布后的文章可以正常访问",
+                "用户能提交评论回复并看到结果",
+                "内容权限校验覆盖作者和管理员",
+            ],
+        );
+        assert!(
+            missing.is_empty(),
+            "honest paraphrase was refused: {missing:?}"
+        );
+    }
+
+    /// Paraphrase tolerance must not turn into keyword matching: a check that
+    /// shares only a generic verb or a category noun does not cover a
+    /// different deliverable.
+    #[test]
+    fn a_generic_word_does_not_cover_an_unrelated_deliverable() {
+        let missing = uncovered_texts(
+            "1. 删除支付模块\n2. 用户登录功能",
+            &["删除旧日志模块", "登录页面样式调整"],
+        );
+        assert_eq!(missing, vec!["支付模块", "用户登录功能"]);
+    }
+
+    /// The user demanded the full suite; a check that only mentions adding a
+    /// test file does not cover that demand. The user's own phrase is what the
+    /// acceptance must name, not the generic word "test".
+    #[test]
+    fn a_general_test_mention_does_not_cover_the_users_test_demand() {
+        let missing = uncovered_texts("实现全部接口，并通过完整测试。", &["新增测试文件"]);
+        assert_eq!(missing, vec!["完整测试"]);
+    }
+
+    /// The user's own suite name remains sufficient coverage.
+    #[test]
+    fn the_users_own_test_command_covers_the_test_demand() {
+        let missing = uncovered_texts(
+            "完成后运行 cargo test --workspace 并通过",
+            &["cargo test --workspace 通过"],
+        );
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// A check may name several deliverables. Grouping is the contract's own
+    /// escape hatch when the user enumerated more items than the acceptance
+    /// array can hold.
+    #[test]
+    fn one_acceptance_check_may_cover_several_deliverables() {
+        let objective = "1. 文章发布可访问\n2. 评论回复可提交\n3. 内容权限校验覆盖作者与管理员";
+        let missing = uncovered_texts(
+            objective,
+            &["文章发布可访问、评论回复可提交、内容权限校验覆盖作者与管理员全部完成"],
+        );
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// A prohibition is a constraint, never a deliverable to prove.
+    #[test]
+    fn a_prohibition_never_requires_an_acceptance_check() {
+        let missing = uncovered_texts("实现登录功能。禁止实现支付功能。", &["登录功能可用"]);
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// Lowercasing can change a character's byte length (`İ` is two bytes,
+    /// `i̇` is three), so a byte offset found in the lowercased copy is not
+    /// safe to slice out of the original. The phrase search must stay on
+    /// char boundaries in the text it returns.
+    #[test]
+    fn a_case_changing_character_before_the_test_word_does_not_break_the_phrase() {
+        assert_eq!(test_phrase("İ测试"), "İ测试");
+        assert_eq!(test_phrase("İ all TESTS pass"), "all TESTS");
     }
 }

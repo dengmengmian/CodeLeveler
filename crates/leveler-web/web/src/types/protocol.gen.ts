@@ -432,7 +432,7 @@ export type RuntimeEvent =
   /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
   | { type: 'tool_call_output'; chunk: string; id: ToolCallId; stream: string }
   /** The execution plan was created or a step's status changed (spec §20). */
-  | { type: 'plan_updated'; plan: UiPlan }
+  | { type: 'plan_updated'; call_id?: string | null; created?: boolean; plan: UiPlan }
   /** The working-tree diff changed or was explicitly requested (spec §21). */
   | { type: 'diff_updated'; diff: UiDiff; query_id?: CommandId | null }
   /** A requested working-tree diff could not be computed. Distinct from `DiffUpdated` with zero files, which is a real "no changes" answer: clients must never present an unreadable workspace as clean. */
@@ -477,8 +477,8 @@ export type RuntimeEvent =
   | { type: 'away_summary'; text: string }
   /** The current turn finished successfully. */
   | { type: 'turn_completed' }
-  /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. */
-  | { type: 'turn_completed_with_warnings'; reason: string }
+  /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. `unregistered_task` is a structured terminal fact, not a reading of `reason`: the turn was an answer whose `commit_task` declaration was refused, so no durable task was registered. It must never settle a Goal. Omitted on legacy events, where the old semantics apply. */
+  | { type: 'turn_completed_with_warnings'; reason: string; unregistered_task?: boolean }
   /** The assistant naturally finished its answer, without claiming that an external task was independently verified as complete. */
   | { type: 'turn_answered' }
   /** The turn ended at the user's own pause boundary. The goal still owes the work the user withheld authorization to continue; nothing failed and nothing is complete. Only the user's own continuation releases it. */

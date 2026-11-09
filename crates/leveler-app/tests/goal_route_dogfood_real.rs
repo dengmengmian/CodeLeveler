@@ -93,7 +93,7 @@ async fn run_turn(
                 facts.terminal = true;
                 facts.outcome = Some("completed".into());
             }
-            Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })) => {
+            Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { reason, .. })) => {
                 facts.terminal = true;
                 facts.outcome = Some(format!("completed_with_warnings: {reason}"));
             }

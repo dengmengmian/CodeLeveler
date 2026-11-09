@@ -223,6 +223,8 @@ mod tests {
             started_elapsed_secs: 0,
             applied_diff: None,
             supersedes_refusal: false,
+            plan_created: None,
+            plan_steps: None,
         }
     }
 

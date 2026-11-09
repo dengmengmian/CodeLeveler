@@ -889,6 +889,140 @@ mod tests {
         .await;
     }
 
+    /// A refused declaration replays as the same structured terminal a live
+    /// client saw: an answer with the unregistered-task fact, never a
+    /// completed delivery.
+    #[tokio::test]
+    async fn an_unregistered_answer_replays_as_an_unregistered_terminal() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        user(&db, &sid, t0 + ms(10), "做三个交付物").await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: vec![
+                    "no execution task was registered: a commit_task declaration was refused \
+                     because 2 of the user's explicitly named deliverables had no acceptance \
+                     check. This turn ended with an answer, not with a verified delivery."
+                        .into(),
+                ],
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert!(
+            entries.iter().any(|entry| matches!(
+                entry.event,
+                RuntimeEvent::TurnCompletedWithWarnings {
+                    unregistered_task: true,
+                    ..
+                }
+            )),
+            "legacy replay must read the durable fact, not the reason: {entries:?}"
+        );
+    }
+
+    /// A paused window that also received a review warning replays as paused.
+    /// The warning must not turn the terminal into a completed one.
+    #[tokio::test]
+    async fn a_paused_goal_with_a_warning_replays_as_paused() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        user(&db, &sid, t0 + ms(10), "完成阶段 1 后停下等我确认").await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: Some(leveler_agent::closeout::user_pause_detail()),
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: vec!["required independent review reported 1 finding(s)".into()],
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.event, RuntimeEvent::TurnPaused { .. })),
+            "a pause stays the terminal even beside a warning: {entries:?}"
+        );
+    }
+
+    /// A genuinely completed Goal keeps its warning terminal and is not
+    /// mislabelled as an unregistered answer.
+    #[tokio::test]
+    async fn a_completed_goal_with_a_warning_replays_as_completed() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        user(&db, &sid, t0 + ms(10), "完成并验收").await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: Some("required independent review did not complete".into()),
+                failure: None,
+                stop: Some(StopReason::Completed),
+                warnings: vec!["required independent review did not complete".into()],
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert!(
+            entries.iter().any(|entry| matches!(
+                entry.event,
+                RuntimeEvent::TurnCompletedWithWarnings {
+                    unregistered_task: false,
+                    ..
+                }
+            )),
+            "a real completion keeps its own terminal: {entries:?}"
+        );
+    }
+
     #[tokio::test]
     async fn interrupted_raw_body_reopens_once_without_promoting_user_markers() {
         let (db, sid) = session().await;

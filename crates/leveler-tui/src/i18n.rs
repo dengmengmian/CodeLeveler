@@ -332,6 +332,12 @@ pub struct UiText {
     /// Shown instead of the internal validation error when an update_plan is
     /// rejected (e.g. an empty plan).
     pub plan_update_rejected: &'static str,
+    /// Row labels for `update_plan`, chosen by the operation the runtime
+    /// recorded: a first declaration creates the plan, a later one updates it.
+    pub plan_created: &'static str,
+    pub plan_updated: &'static str,
+    /// The size fact a plan row shows: stored steps, never output text lines.
+    pub plan_steps: &'static str,
     /// Cause-neutral fallback for a refused `update_goal` whose gate the
     /// runtime did not name (a session recorded before the tag existed).
     ///
@@ -1002,6 +1008,12 @@ pub struct UiText {
     /// declared complete. Both are clean ends; only the second is a completion
     /// claim, so the two never share wording.
     pub turn_end_answered: &'static str,
+    /// The turn answered, but its task declaration was refused. The task was
+    /// never registered, so this is not a completion and not a Goal terminal.
+    pub turn_end_answered_unregistered: &'static str,
+    /// The one-line explanation for that terminal. Kept short; the tool row
+    /// carries the runtime's detailed refusal.
+    pub turn_unregistered_detail: &'static str,
     /// The loop ended cleanly with no answer committed (§12). Not a failure and
     /// not a completion — the marker says which half is missing.
     pub turn_no_final_answer: &'static str,
@@ -1760,6 +1772,9 @@ static ZH: UiText = UiText {
     unsupported_task_action: "委派（不支持）",
     unsupported_task_hint: "不支持 task，请改用 spawn_agent",
     plan_update_rejected: "计划未更新",
+    plan_created: "创建计划",
+    plan_updated: "更新计划",
+    plan_steps: "{} 步",
     goal_update_rejected: "目标未更新：收尾请求被拒绝",
     goal_refused_children: "目标未更新：子任务仍在运行，结果到齐后才能收尾",
     goal_refused_pause: "目标未更新：目标已暂停，等你授权继续",
@@ -2491,6 +2506,8 @@ static ZH: UiText = UiText {
     failure_retries_label: "重试",
     turn_end_completed: "任务已完成",
     turn_end_answered: "回答结束",
+    turn_end_answered_unregistered: "回答结束 · 任务未登记",
+    turn_unregistered_detail: "本轮只回答了问题，未登记执行任务；不构成验收完成。",
     turn_no_final_answer: "执行已结束，但未提交最终回答",
     completion_files_changed: "修改 {} 个文件",
     completion_diff_hint: "/diff 查看改动",
@@ -2831,6 +2848,9 @@ static EN: UiText = UiText {
     unsupported_task_action: "Delegation (unsupported)",
     unsupported_task_hint: "task is unsupported; use spawn_agent",
     plan_update_rejected: "plan not updated",
+    plan_created: "Plan created",
+    plan_updated: "Plan updated",
+    plan_steps: "{} steps",
     goal_update_rejected: "goal not updated: the closeout request was refused",
     goal_refused_children: "goal not updated: sub-agents are still running; their results must land first",
     goal_refused_pause: "goal not updated: the goal is paused until you authorize continuation",
@@ -3562,6 +3582,8 @@ static EN: UiText = UiText {
     failure_retries_label: "Retries",
     turn_end_completed: "Task completed",
     turn_end_answered: "Answer finished",
+    turn_end_answered_unregistered: "Answer finished · task not registered",
+    turn_unregistered_detail: "This turn answered without registering an execution task; it is not a verified completion.",
     turn_no_final_answer: "run ended without a final answer",
     completion_files_changed: "{} files changed",
     completion_diff_hint: "/diff to view changes",

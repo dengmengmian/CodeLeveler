@@ -1625,6 +1625,7 @@ fn turn_end_status(status: TurnEndStatus) -> &'static str {
         TurnEndStatus::Completed => "completed",
         TurnEndStatus::CompletedWithWarnings => "completed_with_warnings",
         TurnEndStatus::Answered => "answered",
+        TurnEndStatus::AnsweredUnregistered => "answered_unregistered",
         TurnEndStatus::Truncated => "truncated",
         TurnEndStatus::Incomplete => "incomplete",
         TurnEndStatus::NoFinalAnswer => "no_final_answer",

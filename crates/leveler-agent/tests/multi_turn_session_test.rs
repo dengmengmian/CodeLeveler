@@ -294,6 +294,79 @@ async fn fresh_chat_keeps_a_terminal_partial_plan_historical_only() {
     );
 }
 
+/// A fresh Chat turn owns a fresh plan. The previous turn's declaration is
+/// durable history, not the new task's baseline, so the new declaration is a
+/// CREATION even when it lists the same steps. This is what keeps the UI from
+/// calling every later turn "update" and from offering the old checklist as
+/// current work.
+#[tokio::test]
+async fn a_fresh_turn_creates_its_own_plan_instead_of_updating_the_old_one() {
+    let plan_call = |id: &str| {
+        tool_call(
+            id,
+            "update_plan",
+            serde_json::json!({
+                "plan": [{"step": "the only step", "status": "completed"}]
+            }),
+        )
+    };
+    let h = harness(vec![
+        plan_call("p1"),
+        text("first answer"),
+        plan_call("p2"),
+        text("second answer"),
+    ])
+    .await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut first = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "first question".into(),
+            }],
+            &mut |event| first.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first chat");
+    let mut second = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "a different question".into(),
+            }],
+            &mut |event| second.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second chat");
+
+    let operation = |events: &[EngineEvent]| {
+        events.iter().find_map(|event| match event {
+            EngineEvent::PlanUpdated {
+                created, call_id, ..
+            } => Some((*created, call_id.clone())),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        operation(&first),
+        Some((true, Some("p1".to_string()))),
+        "the first turn's declaration creates its plan"
+    );
+    assert_eq!(
+        operation(&second),
+        Some((true, Some("p2".to_string()))),
+        "a fresh turn starts from an empty mirror; the old plan is history"
+    );
+}
+
 #[tokio::test]
 async fn explicit_resume_reactivates_the_persisted_unfinished_plan() {
     let h = harness(vec![
@@ -327,7 +400,7 @@ async fn explicit_resume_reactivates_the_persisted_unfinished_plan() {
         .await
         .expect("explicit resume");
     let activated = resumed.iter().find_map(|event| match event {
-        EngineEvent::PlanUpdated { steps } => Some(steps),
+        EngineEvent::PlanUpdated { steps, .. } => Some(steps),
         _ => None,
     });
     let activated = activated.expect("explicit resume must reactivate the persisted plan");

@@ -87,7 +87,7 @@ fn render_event_text(event: AgentEvent) {
             );
         }
         AgentEvent::ContextSnapshot { .. } => {}
-        AgentEvent::PlanUpdated { steps } => {
+        AgentEvent::PlanUpdated { steps, .. } => {
             println!("{} plan", console::style("☰").blue());
             for s in steps {
                 let mark = match s.status.as_str() {
@@ -413,7 +413,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::ContextSnapshot { messages, .. } => serde_json::json!({
             "type": "context_snapshot", "messages": messages,
         }),
-        AgentEvent::PlanUpdated { steps } => serde_json::json!({
+        AgentEvent::PlanUpdated { steps, .. } => serde_json::json!({
             "type": "plan_updated", "steps": steps,
         }),
         AgentEvent::SubAgentStarted {

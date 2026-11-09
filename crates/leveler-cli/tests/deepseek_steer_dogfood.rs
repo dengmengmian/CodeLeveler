@@ -293,7 +293,7 @@ async fn run_and_steer(
                     turn.outcome = "completed".into();
                     return turn;
                 }
-                RuntimeEvent::TurnCompletedWithWarnings { reason } => {
+                RuntimeEvent::TurnCompletedWithWarnings { reason, .. } => {
                     turn.outcome = format!("completed_with_warnings: {reason}");
                     return turn;
                 }

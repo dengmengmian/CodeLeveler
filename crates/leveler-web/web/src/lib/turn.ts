@@ -9,6 +9,7 @@ export type TurnOutcome =
   | 'completed'
   | 'completed_with_warnings'
   | 'answered'
+  | 'answered_unregistered'
   | 'no_final_answer'
   | 'incomplete'
   | 'truncated'
@@ -27,7 +28,12 @@ export function turnEndFromEvent(ev: RuntimeEvent): TurnEnd | null {
     case 'turn_completed':
       return { outcome: 'completed', detail: null };
     case 'turn_completed_with_warnings':
-      return { outcome: 'completed_with_warnings', detail: ev.reason };
+      // A refused declaration means no durable task was registered. The model
+      // answered, but the answer does not prove the user's deliverables exist,
+      // so it must not read as a completed task.
+      return ev.unregistered_task
+        ? { outcome: 'answered_unregistered', detail: ev.reason }
+        : { outcome: 'completed_with_warnings', detail: ev.reason };
     case 'turn_answered':
       return { outcome: 'answered', detail: null };
     case 'turn_truncated':
@@ -86,6 +92,15 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
         label: '已完成，但有警告',
         tone: 'warn',
         detail: token,
+      };
+    case 'answered_unregistered':
+      // 回答结束，但声明被拒：没有登记执行任务。不是完成，也不是失败；
+      // 文案对齐 TUI turn_end_answered_unregistered / turn_unregistered_detail。
+      return {
+        glyph: '⚠',
+        label: '回答结束 · 任务未登记',
+        tone: 'warn',
+        detail: '本轮只回答了问题，未登记执行任务；不构成验收完成。',
       };
     case 'answered':
       return { glyph: '✓', label: '已回答', tone: 'success', detail: null };

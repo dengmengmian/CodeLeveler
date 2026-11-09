@@ -609,7 +609,7 @@ async fn last_plan(
         return Ok(None);
     };
     match EngineEvent::from_payload(&row.payload)? {
-        EngineEvent::PlanUpdated { steps } => Ok(Some(leveler_lifecycle::PlanState { steps })),
+        EngineEvent::PlanUpdated { steps, .. } => Ok(Some(leveler_lifecycle::PlanState { steps })),
         _ => Err(EngineError::Corrupt(
             "plan_updated row carried a different event".into(),
         )),
@@ -902,6 +902,8 @@ mod tests {
                 id: None,
                 origin: Default::default(),
             }],
+            created: false,
+            call_id: None,
         };
         let (event_type, payload) = plan.to_row().unwrap();
         events

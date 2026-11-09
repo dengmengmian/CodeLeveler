@@ -200,6 +200,8 @@ fn a_terminal_turn_moves_the_exact_partial_plan_into_history() {
                 ("步骤二", PlanStepStatus::Done),
                 ("步骤三", PlanStepStatus::Pending),
             ]),
+            created: false,
+            call_id: None,
         }),
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
@@ -239,6 +241,8 @@ fn a_fully_done_plan_is_kept_until_terminal_then_disappears() {
                 ("步骤二", PlanStepStatus::Done),
                 ("步骤三", PlanStepStatus::Done),
             ]),
+            created: false,
+            call_id: None,
         }),
     );
     assert!(
@@ -278,6 +282,8 @@ fn replay_archives_a_terminal_plan_without_making_it_live() {
                     turn_start: true,
                     event: RuntimeEvent::PlanUpdated {
                         plan: plan(&[("历史步骤", PlanStepStatus::Running)]),
+                        created: false,
+                        call_id: None,
                     },
                 },
                 UiHistoryEntry {
@@ -314,6 +320,8 @@ fn failed_turn_archives_its_exact_plan_without_leaving_active_work() {
                 ("失败步骤", PlanStepStatus::Failed),
                 ("未开始", PlanStepStatus::Pending),
             ]),
+            created: false,
+            call_id: None,
         }),
     );
     reduce(
@@ -345,6 +353,8 @@ fn historical_and_current_plans_render_on_separate_surfaces() {
         &mut s,
         Action::Runtime(RuntimeEvent::PlanUpdated {
             plan: plan(&[("旧计划步骤", PlanStepStatus::Pending)]),
+            created: false,
+            call_id: None,
         }),
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCancelled));
@@ -353,6 +363,8 @@ fn historical_and_current_plans_render_on_separate_surfaces() {
         &mut s,
         Action::Runtime(RuntimeEvent::PlanUpdated {
             plan: plan(&[("当前计划步骤", PlanStepStatus::Running)]),
+            created: false,
+            call_id: None,
         }),
     );
 

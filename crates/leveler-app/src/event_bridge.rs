@@ -410,9 +410,30 @@ fn task_finished_event(
         }
         parts.join("; ")
     };
+    if outcome == leveler_lifecycle::TaskOutcome::Completed
+        && stop == Some(StopReason::Answered)
+        && reason
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail)
+    {
+        // A pause is an authorization boundary, not a completion. A residual
+        // review/verification warning must not turn it into a completed or
+        // unregistered terminal: the goal still owes the withheld work, and
+        // either warning terminal would settle the wrong lifecycle.
+        return turn_end_event(StopReason::Answered, reason);
+    }
     if outcome == leveler_lifecycle::TaskOutcome::Completed && !warnings.is_empty() {
+        // An `Answered` stop is the executor's structured fact that the model
+        // answered rather than resolved a committed task, so no execution task
+        // was registered on this terminal. That is the refused-registration
+        // warning, or a Chat turn whose only warnings are advisory review
+        // findings; either way it must not inherit the goal-completion meaning
+        // of `Completed`. A goal that really completed (with review or
+        // verification warnings) stops at `Completed`, never `Answered`.
+        let unregistered_task = stop == Some(StopReason::Answered);
         return RuntimeEvent::TurnCompletedWithWarnings {
             reason: detail_with_warnings(),
+            unregistered_task,
         };
     }
     if outcome == leveler_lifecycle::TaskOutcome::Completed && stop == Some(StopReason::Completed) {
@@ -1031,9 +1052,17 @@ impl EventBridge {
             EngineEvent::ContextSnapshot { .. } => {
                 // Engine durability metadata; no standalone UI cell.
             }
-            EngineEvent::PlanUpdated { steps } => {
+            EngineEvent::PlanUpdated {
+                steps,
+                created,
+                call_id,
+            } => {
                 let plan = ui_plan(steps);
-                let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
+                let _ = self.events.send(RuntimeEvent::PlanUpdated {
+                    plan,
+                    created,
+                    call_id,
+                });
             }
 
             EngineEvent::GoalIntercepted { .. } => {
@@ -1849,6 +1878,8 @@ mod bridge_tests {
                         origin: leveler_agent::PlanOrigin::ModelExplicit,
                     },
                 ],
+                created: true,
+                call_id: Some("plan_call_1".to_string()),
             },
         );
 
@@ -1856,13 +1887,19 @@ mod bridge_tests {
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
-        let plan = events
+        let (plan, created, call_id) = events
             .iter()
             .find_map(|e| match e {
-                RuntimeEvent::PlanUpdated { plan } => Some(plan.clone()),
+                RuntimeEvent::PlanUpdated {
+                    plan,
+                    created,
+                    call_id,
+                } => Some((plan.clone(), *created, call_id.clone())),
                 _ => None,
             })
             .expect("PlanUpdated must be forwarded");
+        assert!(created);
+        assert_eq!(call_id.as_deref(), Some("plan_call_1"));
         assert_eq!(plan.steps.len(), 4);
         assert_eq!(plan.steps[0].status, PlanStepStatus::Done);
         assert_eq!(plan.steps[1].status, PlanStepStatus::Running);
@@ -2958,7 +2995,7 @@ mod projection_equivalence {
             RuntimeEvent::CommandProgress { label, elapsed_ms } => {
                 format!("cmd:{label}@{elapsed_ms}")
             }
-            RuntimeEvent::PlanUpdated { plan } => {
+            RuntimeEvent::PlanUpdated { plan, .. } => {
                 let steps: Vec<String> = plan
                     .steps
                     .iter()
@@ -3301,8 +3338,55 @@ mod projection_equivalence {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })
-                if reason == "required independent review did not complete"
+            Ok(RuntimeEvent::TurnCompletedWithWarnings {
+                reason,
+                unregistered_task,
+            }) if reason == "required independent review did not complete"
+                && !unregistered_task
+        ));
+    }
+
+    #[test]
+    fn an_answered_stop_with_a_warning_is_an_unregistered_task() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: Some("no execution task was registered".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: vec!["no execution task was registered".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnCompletedWithWarnings {
+                unregistered_task: true,
+                ..
+            })
+        ));
+    }
+
+    /// A paused goal can still receive a review or verification warning. The
+    /// pause remains the terminal truth: the withheld work is owed, and a
+    /// completed/unregistered warning terminal would settle the wrong state.
+    #[test]
+    fn a_paused_goal_with_a_warning_stays_paused() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: Some(leveler_agent::closeout::user_pause_detail()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Answered),
+            warnings: vec!["required independent review reported 1 finding(s)".into()],
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeEvent::TurnPaused { reason }) if reason.contains("暂停")
         ));
     }
 

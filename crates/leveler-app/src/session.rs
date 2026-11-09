@@ -154,7 +154,15 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             delay_ms,
         },
 
-        EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
+        EngineEvent::PlanUpdated {
+            steps,
+            created,
+            call_id,
+        } => AgentEvent::PlanUpdated {
+            steps,
+            created,
+            call_id,
+        },
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }
         }

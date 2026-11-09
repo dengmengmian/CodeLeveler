@@ -234,6 +234,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                         crate::transcript::TurnEndStatus::Completed
                             | crate::transcript::TurnEndStatus::CompletedWithWarnings
                             | crate::transcript::TurnEndStatus::Answered
+                            | crate::transcript::TurnEndStatus::AnsweredUnregistered
                     )
                 });
             if successful_turn && state.composer.is_empty() && state.prompt_suggestion.is_none() {

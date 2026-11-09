@@ -1694,3 +1694,150 @@ fn a_replayed_call_without_a_terminal_fact_stays_unknown() {
         "an unobserved outcome is not a failure: {rows:#?}"
     );
 }
+
+/// The runtime's plan operation and stored step count ride the event, so a
+/// reopened session labels each declaration the way it ran: the first one
+/// created the plan, the second replaced it. Replay must not infer this from
+/// transcript order, and must not duplicate plan rows.
+#[test]
+fn plan_operation_and_step_count_survive_a_reopen() {
+    use leveler_client_protocol::{PlanStepStatus, UiPlan, UiPlanStep};
+
+    let plan = |count: usize| UiPlan {
+        steps: (0..count)
+            .map(|index| UiPlanStep {
+                index,
+                description: format!("step {index}"),
+                status: PlanStepStatus::Pending,
+            })
+            .collect(),
+        state: Default::default(),
+    };
+    let declare = |id: &str, count: usize, created: bool| -> [RuntimeEvent; 2] {
+        [
+            RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "update_plan".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                model_step: Some(1),
+                answer_effect: Some(AnswerEffect::Bookkeeping),
+            },
+            RuntimeEvent::PlanUpdated {
+                plan: plan(count),
+                created,
+                call_id: Some(id.to_string()),
+            },
+        ]
+    };
+    let events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "做三件事"),
+        },
+        declare("p1", 3, true)[0].clone(),
+        declare("p1", 3, true)[1].clone(),
+        declare("p2", 2, false)[0].clone(),
+        declare("p2", 2, false)[1].clone(),
+    ];
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(&mut replayed, vec![message(UiRole::User, "做三件事")]);
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    for (label, s) in [("live", &live), ("replayed", &replayed)] {
+        let plans: Vec<_> = s
+            .transcript
+            .tool_calls()
+            .into_iter()
+            .filter(|call| call.name == "update_plan")
+            .collect();
+        assert_eq!(plans.len(), 2, "{label}: one row per declaration");
+        assert_eq!(plans[0].plan_created, Some(true), "{label}");
+        assert_eq!(plans[0].plan_steps, Some(3), "{label}");
+        assert_eq!(plans[1].plan_created, Some(false), "{label}");
+        assert_eq!(plans[1].plan_steps, Some(2), "{label}");
+    }
+}
+
+/// Events recorded before the operation fact existed carry no `call_id`.
+/// Replay must attach nothing and keep the historical label instead of
+/// inventing a creation or an update.
+#[test]
+fn a_legacy_plan_event_does_not_invent_an_operation() {
+    let mut s = state();
+    let effects = open(&mut s, vec![message(UiRole::User, "旧会话")]);
+    let entries = vec![
+        entry(
+            0,
+            true,
+            RuntimeEvent::UserMessageAdded {
+                message: message(UiRole::User, "旧会话"),
+            },
+        ),
+        entry(
+            10,
+            false,
+            RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new("p1"),
+                name: "update_plan".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                model_step: None,
+                answer_effect: None,
+            },
+        ),
+        entry(
+            10,
+            false,
+            RuntimeEvent::PlanUpdated {
+                plan: leveler_client_protocol::UiPlan {
+                    steps: vec![leveler_client_protocol::UiPlanStep {
+                        index: 0,
+                        description: "old step".into(),
+                        status: leveler_client_protocol::PlanStepStatus::Pending,
+                    }],
+                    state: Default::default(),
+                },
+                created: false,
+                call_id: None,
+            },
+        ),
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let call = s
+        .transcript
+        .tool_calls()
+        .into_iter()
+        .find(|call| call.name == "update_plan")
+        .expect("the row is still history");
+    assert_eq!(call.plan_created, None);
+    assert_eq!(call.plan_steps, None);
+}

@@ -371,7 +371,11 @@ fn s05_long_plan() {
     ];
     reduce(
         &mut s,
-        Action::Runtime(RuntimeEvent::PlanUpdated { plan: plan(&steps) }),
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&steps),
+            created: false,
+            call_id: None,
+        }),
     );
     say(&mut s, "a1", "计划已更新，现在补单测。");
     tool(
@@ -410,6 +414,8 @@ fn s11_command_focus_and_stop() {
                 ("运行受影响测试与静态检查，确认没有回归", Pending),
                 ("提交改动并跟踪远端 CI 验证结果", Pending),
             ]),
+            created: false,
+            call_id: None,
         }),
     );
     say(
@@ -617,6 +623,8 @@ fn s03_long_task() {
                 ("落库", Pending),
                 ("补测试", Pending),
             ]),
+            created: false,
+            call_id: None,
         }),
     );
     for i in 0..12 {
@@ -897,7 +905,11 @@ fn d03_plan_viewport_under_pressure() {
     ];
     reduce(
         &mut s,
-        Action::Runtime(RuntimeEvent::PlanUpdated { plan: plan(&steps) }),
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&steps),
+            created: false,
+            call_id: None,
+        }),
     );
     say(&mut s, "a1", "正在回填。");
     for (label, h) in [

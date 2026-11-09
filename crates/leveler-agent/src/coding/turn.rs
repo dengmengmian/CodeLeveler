@@ -705,7 +705,7 @@ pub(crate) async fn last_persisted_plan(
 ) -> Result<Option<PlanState>, EngineError> {
     Ok(
         match last_event_of_type(events, session_id, "plan_updated", None).await? {
-            Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
+            Some(EngineEvent::PlanUpdated { steps, .. }) => Some(PlanState { steps }),
             _ => None,
         },
     )
@@ -718,7 +718,7 @@ async fn persisted_plan(
 ) -> Result<Option<PlanState>, EngineError> {
     Ok(
         match last_event_of_type(events, session_id, "plan_updated", turn_ids).await? {
-            Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
+            Some(EngineEvent::PlanUpdated { steps, .. }) => Some(PlanState { steps }),
             _ => None,
         },
     )

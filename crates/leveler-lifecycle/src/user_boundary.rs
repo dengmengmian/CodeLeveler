@@ -119,11 +119,18 @@ impl UserPauseBoundary {
 pub fn extract_user_pause(text: &str) -> Option<UserPauseBoundary> {
     let mut boundary: Option<UserPauseBoundary> = None;
     for sentence in split_sentences(text) {
-        if releases_pause(sentence) {
-            boundary = None;
-            continue;
-        }
-        if let Some(found) = pause_in_sentence(sentence) {
+        // A release is scoped to the clause that states it. The newest
+        // statement wins: text after the last release clause may state a new
+        // boundary (`不需要等我确认，但阶段一结束后要暂停`), and that boundary is
+        // the user's actual instruction.
+        let examined = match release_cut(sentence) {
+            Some(cut) => {
+                boundary = None;
+                &sentence[cut..]
+            }
+            None => sentence,
+        };
+        if let Some(found) = pause_in_sentence(examined) {
             boundary = Some(match boundary {
                 Some(existing) => merge_boundaries(existing, found),
                 None => found,
@@ -131,6 +138,20 @@ pub fn extract_user_pause(text: &str) -> Option<UserPauseBoundary> {
         }
     }
     boundary
+}
+
+/// Byte offset just past the last clause in `sentence` that releases a pause.
+fn release_cut(sentence: &str) -> Option<usize> {
+    let mut cut = None;
+    let mut offset = 0;
+    for part in sentence.split_inclusive(['，', ',', '；', ';', '：', ':']) {
+        let clause = part.trim_end_matches(['，', ',', '；', ';', '：', ':', ' ', '\t']);
+        if releases_pause(clause) {
+            cut = Some(offset + part.len());
+        }
+        offset += part.len();
+    }
+    cut
 }
 
 /// Whether a plan step is the user's boundary itself rather than work.
@@ -438,78 +459,159 @@ fn first_positive_pause_cue(sentence: &str) -> Option<usize> {
     best
 }
 
-/// Negation markers that can govern a pause cue.
-const PAUSE_NEGATIONS_CJK: &[&str] = &[
-    "不要",
-    "不用",
-    "不必",
-    "无需",
-    "不需要",
-    "别",
-    "勿",
-    "禁止",
-    "不",
-];
-
-const PAUSE_NEGATIONS_ASCII: &[&str] = &[
-    "do not",
-    "don't",
-    "dont",
-    "never",
-    "without",
-    "no need to",
-    "not",
-];
+/// A negation that governs the pause cue.
+///
+/// A negation word scopes over the modifiers before the cue, not only the token
+/// immediately before it: `不需要逐步等待确认` and `不用每一步都等我确认` keep the
+/// model working, and reading the pause word while losing the negation ended
+/// the window at a boundary the user never set. The scope ends at the latest
+/// clause separator, and only pause modifiers may sit between the negation and
+/// the cue: a predicate (`不要忘记等待确认`) keeps the pause, because the user is
+/// reminding the model to wait, not cancelling the wait.
+fn cue_negated(before: &str) -> bool {
+    // Only the clause that contains the cue participates: a negation in an
+    // earlier clause says nothing about this one.
+    let clause = before
+        .rsplit(['，', ',', '；', ';', '。', '！', '!', '？', '?', '：', ':'])
+        .next()
+        .unwrap_or(before);
+    let clause = clause.trim_end_matches([' ', '\t']).to_ascii_lowercase();
+    let Some((negation, gap)) = last_negation_scope(&clause) else {
+        return false;
+    };
+    // A contrast starts a new statement; the negation no longer governs it.
+    if starts_contrast(gap, negation) {
+        return false;
+    }
+    // `不需要逐步等待确认` negates the wait; `不要忘记等待确认` does not. Only
+    // modifiers may separate the negation from the cue.
+    only_pause_modifiers(gap)
+}
 
 /// Adverbs a person puts between the negation and the cue. They do not change
 /// which verb is negated: `不需要逐步等待确认` means `不需要等待确认`.
-const PAUSE_NEGATION_FILLERS: &[&str] = &[
+const PAUSE_MODIFIERS: &[&str] = &[
+    "每一步都",
+    "每次都",
+    "每步都",
+    "每一步",
+    "每步",
     "逐步",
     "逐个",
     "逐一",
     "一一",
     "每次",
-    "每次都",
-    "再",
+    "中途",
+    "途中",
     "一直",
     "反复",
-    "都",
     "继续",
+    "再",
+    "都",
 ];
 
-/// A negation governing the cue ("不要等我", "不需要逐步等待确认", "do not wait").
-///
-/// The negation is read inside the cue's own clause: a `不需要` that governs a
-/// different verb earlier in the sentence (`不需要修改 CI，完成后等待确认`) does not
-/// cancel the later pause. Only adverbs may sit between the negation and the
-/// cue; a reminder verb (`不要忘记等待确认`) keeps the pause.
-fn cue_negated(before: &str) -> bool {
-    let clause = before
-        .rsplit([
-            '，', ',', '。', '；', ';', '：', ':', '！', '!', '？', '?', '\n',
-        ])
-        .next()
-        .unwrap_or(before);
-    let mut tail = clause.trim();
-    loop {
-        let mut stripped = false;
-        for filler in PAUSE_NEGATION_FILLERS {
-            if let Some(rest) = tail.strip_suffix(filler) {
-                tail = rest.trim_end();
-                stripped = true;
+/// Whether the whole gap consists of pause modifiers.
+fn only_pause_modifiers(gap: &str) -> bool {
+    let mut rest = gap.trim();
+    while !rest.is_empty() {
+        let Some(modifier) = PAUSE_MODIFIERS
+            .iter()
+            .filter(|modifier| rest.starts_with(**modifier))
+            .max_by_key(|modifier| modifier.len())
+        else {
+            return false;
+        };
+        rest = rest[modifier.len()..].trim_start();
+    }
+    true
+}
+
+/// The last negation word in a clause and the text between its end and the cue.
+fn last_negation_scope(clause: &str) -> Option<(&str, &str)> {
+    const NEGATIONS: &[&str] = &[
+        "不需要",
+        "不用",
+        "不必",
+        "无需",
+        "无须",
+        "毋须",
+        "没必要",
+        "用不着",
+        "不要",
+        "不允许",
+        "不能",
+        "不可以",
+        "不准",
+        "不得",
+        "不该",
+        "不应",
+        "别",
+        "勿",
+        "甭",
+        "禁止",
+        "do not",
+        "don't",
+        "dont",
+        "never",
+        "without",
+        "no need to",
+        "not",
+        "不",
+    ];
+    let mut best: Option<(usize, usize, usize)> = None;
+    for negation in NEGATIONS {
+        let mut from = 0;
+        while let Some(offset) = clause[from..].find(negation) {
+            let start = from + offset;
+            from = start + negation.len();
+            if !negation_stands_alone(clause, start, negation) {
+                continue;
+            }
+            if best.is_none_or(|(current, current_end, _)| {
+                start > current || (start == current && start + negation.len() > current_end)
+            }) {
+                best = Some((start, start + negation.len(), negation.len()));
             }
         }
-        if !stripped {
-            break;
-        }
     }
-    let lower = tail.to_ascii_lowercase();
-    PAUSE_NEGATIONS_CJK
+    let (start, end, _) = best?;
+    Some((&clause[start..end], &clause[end..]))
+}
+
+/// Whether an occurrence is the negation word itself, not a particle inside
+/// another word (`特别`, `区别`, `类别`, `cannot`, `annotation`).
+fn negation_stands_alone(clause: &str, start: usize, negation: &str) -> bool {
+    if negation.is_ascii() {
+        return !clause[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    }
+    if !matches!(negation, "别" | "勿" | "甭") {
+        return true;
+    }
+    let before = clause[..start].chars().next_back();
+    !before.is_some_and(|c| {
+        matches!(
+            c,
+            '特' | '区' | '分' | '类' | '级' | '告' | '个' | '性' | '派'
+        )
+    })
+}
+
+/// Whether a contrast word sits between the negation and the cue.
+fn starts_contrast(gap: &str, negation: &str) -> bool {
+    if ["但", "可是", "不过", "然而", "而是", "却"]
         .iter()
-        .any(|negation| lower.ends_with(negation))
-        || PAUSE_NEGATIONS_ASCII
-            .iter()
-            .any(|negation| lower.ends_with(negation))
+        .any(|marker| gap.contains(marker))
+    {
+        return true;
+    }
+    let padded = format!(" {gap} ");
+    [" but ", " however ", " yet ", " though ", " instead "]
+        .iter()
+        .any(|marker| padded.contains(marker))
+        || (negation.is_ascii() && gap.trim_start().starts_with("but "))
 }
 
 /// A whole-sentence negation of stopping: "一次做完，中间不要停下来等我确认".
@@ -814,32 +916,38 @@ mod tests {
         );
     }
 
-    /// A negation reaches the pause cue across the adverbs a person actually
-    /// puts between them. The negation is scoped to its own clause: an
-    /// unrelated `不需要` earlier in the sentence does not cancel a later,
-    /// genuine pause.
+    /// A negation scopes over the rest of its clause, not just the token right
+    /// before the cue. `不需要逐步等待确认` and `不用每一步都等我确认` authorize the
+    /// model to continue; reading the pause word while losing the negation
+    /// ended the work window early and skipped the continuation the user asked
+    /// for.
+    #[test]
+    fn a_negated_wait_with_a_modifier_is_not_a_pause() {
+        assert_eq!(
+            extract_user_pause("直接基于真实代码推进开发，不需要逐步等待确认。"),
+            None
+        );
+        assert_eq!(
+            extract_user_pause("你不用每一步都等我确认，直接做完。"),
+            None
+        );
+        assert_eq!(extract_user_pause("不必每次确认，连续执行完。"), None);
+    }
+
+    /// The modifiers a person actually puts between the negation and the cue
+    /// do not turn the authorization into a pause.
     #[test]
     fn an_adverb_between_the_negation_and_the_cue_does_not_create_a_pause() {
         for sentence in [
-            "直接基于真实代码推进开发，不需要逐步等待确认。",
             "不需要逐步等待确认。",
             "不用每次都等我确认。",
             "不要一直等待确认。",
             "不要逐个等待确认。",
+            "不要中途停下来问我。",
             "不暂停，直接做完。",
         ] {
             assert_eq!(extract_user_pause(sentence), None, "`{sentence}`");
         }
-    }
-
-    #[test]
-    fn a_negation_in_another_clause_does_not_release_a_pause() {
-        let boundary = extract_user_pause("不需要修改 CI，完成后等待确认。").unwrap();
-        assert_eq!(
-            boundary,
-            UserPauseBoundary::AfterAny,
-            "the second clause still asks to wait after completion"
-        );
     }
 
     /// `不要忘记…` is a reminder to wait, not a cancellation of the wait.
@@ -852,24 +960,40 @@ mod tests {
         assert!(extract_user_pause("别忘了完成后等我确认。").is_some());
     }
 
-    /// The sentence that ended the audited session: it authorizes direct
-    /// progress. Reading it as `Now` let closeout finish the turn before the
-    /// refused commitment could continue.
-    #[test]
-    fn the_audited_objective_states_no_pause() {
-        assert_eq!(
-            extract_user_pause("直接基于真实代码推进开发，不需要逐步等待确认。"),
-            None
-        );
-    }
-
-    /// The English negation list carried trailing spaces, so a cue preceded by
-    /// `do not ` never matched after the tail was trimmed.
+    /// The English list is matched after trimming, so the negation before its
+    /// cue must still count.
     #[test]
     fn english_negation_matches_before_its_cue() {
         assert!(cue_negated("do not "));
         assert!(cue_negated("please do not "));
         assert!(!cue_negated("do not forget "));
+    }
+
+    /// The same sentence must leave every closeout reader off: no boundary is
+    /// reached, no effective pause exists, and the newest authorization signal
+    /// is not `Pause`. The brief's sentence previously read as `Now`, which
+    /// ended the authorized window before the unregistered-task continuation
+    /// could run.
+    #[test]
+    fn a_negated_wait_does_not_reach_the_closeout_boundary() {
+        let text = "直接基于真实代码推进开发，不需要逐步等待确认。";
+        let plan = plan(vec![step("实现接口", "completed")]);
+        assert!(!user_pause_reached(text, &plan));
+        assert_eq!(effective_user_pause([text]), None);
+        assert_eq!(latest_authorization_signal([text]), None);
+    }
+
+    /// The negation stops at a contrast and at a clause boundary: a real pause
+    /// stated after `但` (or in the next clause) is still the user's boundary.
+    #[test]
+    fn a_negation_does_not_erase_a_pause_in_the_next_clause() {
+        let boundary = extract_user_pause("不需要等我确认，但阶段一结束后要暂停。").unwrap();
+        assert_eq!(
+            boundary,
+            UserPauseBoundary::AfterStages(vec!["stage1".into()])
+        );
+        let boundary = extract_user_pause("不要修改现有代码，完成后暂停。").unwrap();
+        assert_eq!(boundary, UserPauseBoundary::AfterAny);
     }
 
     #[test]

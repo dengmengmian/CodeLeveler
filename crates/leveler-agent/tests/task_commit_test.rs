@@ -773,7 +773,9 @@ async fn the_scope_tool_is_readable_before_commit() {
 /// The commit gate extracts one requirement per deliverable, so a request that
 /// enumerates more than the old fixed cap of 20 must still be declarable. The
 /// audited session's request extracted 132 requirements while the tool schema
-/// advertised `maxItems: 20`; the model could never satisfy both.
+/// advertised `maxItems: 20`; the model could never satisfy both. The bounded
+/// payload stays, and related deliverables share one check, so the same request
+/// is committable without letting an inflated extraction set grow the schema.
 #[tokio::test]
 async fn a_request_with_more_than_twenty_deliverables_can_be_committed() {
     let deliverables: Vec<String> = (1..=22)
@@ -790,8 +792,17 @@ async fn a_request_with_more_than_twenty_deliverables_can_be_committed() {
         )
         .into_boxed_str(),
     );
-    let mut acceptance = deliverables;
+    // 22 deliverables + the test demand in 19 grouped checks.
+    let mut acceptance: Vec<String> = Vec::new();
+    for pair in deliverables.chunks(2).take(4) {
+        acceptance.push(pair.join(" 与 "));
+    }
+    acceptance.extend(deliverables.iter().skip(8).cloned());
     acceptance.push("完成后通过测试".to_string());
+    assert!(
+        acceptance.len() <= 20,
+        "the declaration stays inside the bounded payload"
+    );
     let fx = fixture(
         vec![
             Scripted::Tool(
@@ -821,8 +832,8 @@ async fn a_request_with_more_than_twenty_deliverables_can_be_committed() {
             .expect("a pre-commit surface offers commit_task");
         assert_eq!(
             schema_limit,
-            serde_json::json!(acceptance.len()),
-            "the advertised capacity follows the extracted requirement set"
+            serde_json::json!(20),
+            "the acceptance payload keeps its fixed bound"
         );
         let commit_result = requests[1]
             .messages
@@ -836,7 +847,7 @@ async fn a_request_with_more_than_twenty_deliverables_can_be_committed() {
             .expect("the commit result reaches the model");
         assert!(
             !commit_result.is_error && commit_result.content.contains("Execution task committed"),
-            "23 checks covering 23 requirements are not refused: {}",
+            "grouped checks cover 23 requirements without exceeding 20: {}",
             commit_result.content
         );
     }
@@ -904,6 +915,344 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
         goals[0].state
     );
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+}
+
+/// The scope the acceptance gate enforces is readable BEFORE registration,
+/// from the same extraction the commit uses. The model reads it and writes a
+/// covering list on its first declaration instead of learning the gaps one
+/// refusal at a time.
+#[tokio::test]
+async fn the_goal_scope_is_previewable_before_registration() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "get_goal_scope",
+                serde_json::json!({"offset": 0, "limit": 20}),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": [
+                        "文章发布可访问",
+                        "评论回复可提交且可见",
+                        "内容权限校验覆盖作者与管理员",
+                        "sh run-tests.sh 通过"
+                    ]
+                }),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "三项社区业务完成",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"requirement": "文章发布", "status": "done", "evidence": "发布链路可访问"},
+                        {"requirement": "评论回复", "status": "done", "evidence": "回复可见"},
+                        {"requirement": "内容权限校验", "status": "done", "evidence": "作者/管理员/只读"},
+                        {"requirement": "tests", "status": "done", "evidence": test_runner_label()}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        assert!(
+            tool_names(&requests[0]).contains(&"get_goal_scope"),
+            "the preview is advertised before any declaration: {:?}",
+            tool_names(&requests[0])
+        );
+        let preview = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("Goal scope preview"))
+            .expect("the model reads the pre-registration scope");
+        assert!(preview.contains("not registered yet"), "{preview}");
+        for deliverable in ["文章发布", "评论回复", "内容权限校验"] {
+            assert!(
+                preview.contains(deliverable),
+                "the preview names every deliverable ({deliverable}): {preview}"
+            );
+        }
+        assert!(
+            preview.contains("[tests]"),
+            "the classification reaches the model: {preview}"
+        );
+    }
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "the preview does not register anything");
+    assert_eq!(goals[0].objective, STAGED_REQUEST);
+    assert!(
+        goals[0].state == leveler_storage::GoalState::Settled,
+        "the covering declaration registers and completes: {:?}",
+        goals[0].state
+    );
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+}
+
+#[tokio::test]
+async fn a_long_p2_request_registers_from_the_classified_scope() {
+    const P2: &str = include_str!("../../../testdata/regression/p2_scope_classification.zh-CN.md");
+    const DELIVERABLES: &[&str] = &[
+        "订阅计划管理",
+        "按量计费采集",
+        "账单周期生成",
+        "账单明细查询接口",
+        "发票开具流程",
+        "发票红冲流程",
+        "付款记录登记",
+        "付款核销与账单匹配",
+        "逾期账单提醒",
+        "退款申请与审批",
+        "退款执行与账单回滚",
+        "客户信用额度管理",
+        "多币种结算与汇率快照",
+        "税率配置与按地区计税",
+        "收入确认表",
+        "应收账龄表",
+        "现金流日报",
+        "渠道账与系统账自动比对",
+        "对账差异处理工作台",
+        "财务审计日志",
+        "财务数据导出",
+        "计费规则版本管理与灰度发布",
+        "账单冲正接口",
+        "财务指标看板",
+    ];
+    // More than 20 real deliverables fit the unchanged 20-item acceptance cap
+    // by grouping; the cap is a payload bound, not a scope bound.
+    let mut acceptance: Vec<String> = DELIVERABLES
+        .chunks(8)
+        .map(|group| format!("{} 均已交付并可用", group.join("、")))
+        .collect();
+    acceptance.push("迁移脚本 migrations/0007_billing.sql 已创建".to_string());
+    acceptance.push("cargo test -p billing 通过".to_string());
+
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "get_goal_scope",
+                serde_json::json!({"offset": 0, "limit": 20}),
+            ),
+            Scripted::Tool(
+                "get_goal_scope",
+                serde_json::json!({"offset": 20, "limit": 20}),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({"objective": P2, "acceptance": acceptance}),
+            ),
+            Scripted::Text("已按分类后的范围注册任务。"),
+        ],
+        false,
+    )
+    .await;
+
+    let _report = chat_with_request(&fx, P2, CancellationToken::new()).await;
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let tool_results: Vec<String> = requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .collect();
+        let preview = tool_results
+            .iter()
+            .filter(|content| content.contains("Goal scope preview"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "[baseline]",
+            "[preparation]",
+            "[constraint]",
+            "[deliverable]",
+            "订阅计划管理",
+            "crates/billing/src/tenant.rs",
+            "所有新增代码必须有中文注释",
+        ] {
+            assert!(
+                preview.contains(expected),
+                "the preview lacks `{expected}`: {preview}"
+            );
+        }
+        assert!(
+            !tool_results
+                .iter()
+                .any(|content| content.contains("commit_task refused")),
+            "the classified scope must be registrable: {tool_results:#?}"
+        );
+    }
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "the declaration registers one goal");
+    assert_eq!(goals[0].objective, P2.trim());
+}
+
+fn plan_shrink_objective() -> &'static str {
+    "## 本轮交付物\n\n\
+     1. 实现订阅计费。\n\
+     2. 实现发票管理。\n\
+     3. 实现财务对账。"
+}
+
+/// A plan is the model's own intent record. It may shrink — the incident's
+/// model replaced a ten-step billing/finance plan with six refund/close steps
+/// — but that must not narrow the user's scope, retire a deliverable, or turn
+/// an incomplete goal into a completed one.
+#[tokio::test]
+async fn shrinking_the_plan_does_not_narrow_the_goals_scope() {
+    let objective = plan_shrink_objective();
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": objective,
+                    "acceptance": [
+                        "订阅计费可用",
+                        "发票管理可用",
+                        "财务对账可用"
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "订阅计费", "status": "in_progress"},
+                    {"step": "发票管理", "status": "pending"},
+                    {"step": "财务对账", "status": "pending"}
+                ]}),
+            ),
+            // The model replaces the whole plan with what it actually did.
+            Scripted::Tool(
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "退款流程", "status": "completed"},
+                    {"step": "日终关账", "status": "completed"}
+                ]}),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "退款与关账完成",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"requirement": "退款流程", "status": "done", "evidence": "已完成"},
+                        {"requirement": "日终关账", "status": "done", "evidence": "已完成"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "get_goal_scope",
+                serde_json::json!({"offset": 0, "limit": 20}),
+            ),
+            Scripted::Text("退款与关账已完成。"),
+            Scripted::Text("退款与关账已完成。"),
+        ],
+        false,
+    )
+    .await;
+
+    let mut intercepted = Vec::new();
+    let mut plans = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, objective),
+            vec![ContentPart::Text {
+                text: objective.into(),
+            }],
+            &mut |event| match event {
+                leveler_engine::EngineEvent::GoalIntercepted { kind, detail } => {
+                    intercepted.push((kind, detail))
+                }
+                leveler_engine::EngineEvent::PlanUpdated { steps, created, .. } => {
+                    plans.push((steps, created))
+                }
+                _ => {}
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plans.len(), 2, "the model replaced its plan once");
+    assert_eq!(plans[0].0.len(), 3);
+    assert_eq!(plans[1].0.len(), 2);
+    assert!(!plans[1].1, "the second declaration is an update");
+    assert_eq!(plans[1].0[0].step, "退款流程");
+
+    let refusal = intercepted
+        .iter()
+        .find(|(kind, _)| kind == "requirements_refused")
+        .map(|(_, detail)| detail)
+        .expect("completion through the shrunken plan is refused");
+    for deliverable in ["订阅计费", "发票管理", "财务对账"] {
+        assert!(
+            refusal.contains(deliverable),
+            "a plan edit cannot retire `{deliverable}`: {refusal}"
+        );
+    }
+
+    let scope = {
+        let requests = fx.runtime.requests.lock().unwrap();
+        requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("Effective acceptance"))
+            .expect("the scope is readable after the plan change")
+    };
+    for deliverable in ["订阅计费", "发票管理", "财务对账"] {
+        assert!(
+            scope.contains(deliverable),
+            "the goal still owes `{deliverable}`: {scope}"
+        );
+    }
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Stalled,
+        "the turn cannot close a goal it left unresolved: {report:?}"
+    );
+    assert!(
+        report
+            .stop_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("goal_unresolved")),
+        "the closeout names the unresolved goal, not a delivery: {report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    assert_eq!(goals[0].objective, objective);
 }
 
 #[tokio::test]
@@ -1831,6 +2180,21 @@ fn staged_full_objective() -> &'static str {
     }
 }
 
+/// A fresh long-task objective whose authorization is stated as a negation
+/// ("不需要逐步确认"). It names two artifacts plus their verification, so the
+/// runtime can hold the model to an explicit scope without inventing one.
+fn authorized_long_objective() -> &'static str {
+    if cfg!(windows) {
+        "分两阶段交付：第一阶段创建 long-1.txt 并运行 cmd /c verify.cmd 验收；\
+         第二阶段创建 long-2.txt 并运行 cmd /c verify.cmd 验收。\
+         全过程不需要逐步确认，也不要中途停下来问我，直到两项都完成并验收。"
+    } else {
+        "分两阶段交付：第一阶段创建 long-1.txt 并运行 sh ./verify.sh 验收；\
+         第二阶段创建 long-2.txt 并运行 sh ./verify.sh 验收。\
+         全过程不需要逐步确认，也不要中途停下来问我，直到两项都完成并验收。"
+    }
+}
+
 fn stage_plan(status1: &'static str, status2: &'static str) -> Scripted {
     Scripted::Tool(
         "update_plan",
@@ -1934,6 +2298,138 @@ async fn a_goal_bound_pause_keeps_the_goal_open_and_unpressured() {
     );
     assert!(fx.dir.path().join("stage-1.txt").exists());
     std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// A required review can report a finding on a window that stopped at the
+/// user's pause. The pause is still the terminal truth: the report stays
+/// `Completed` + `Answered` with the pause detail and the warning beside it,
+/// the durable Goal stays open and paused, and no consumer may read the
+/// warning as an accepted delivery of the withheld stage.
+#[tokio::test]
+async fn a_paused_goal_with_a_review_warning_keeps_the_pause_terminal() {
+    let mut script = pause_stage_one_script();
+    script.push(Scripted::Tool(
+        "report_finding",
+        serde_json::json!({
+            "kind": "correctness",
+            "summary": "stage-1.txt is empty",
+            "file": "stage-1.txt",
+            "blocking": true
+        }),
+    ));
+    script.push(Scripted::Text("reviewed stage-1.txt: one finding reported"));
+    script.push(Scripted::Text("reviewed stage-1.txt: one finding reported"));
+
+    let mut fx = fixture(script, false).await;
+    fx.coding.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    write_verifier(fx.dir.path());
+
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged_pause_objective()),
+            vec![ContentPart::Text {
+                text: staged_pause_objective().into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Answered);
+    assert!(
+        report
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the pause detail must survive the review: {report:?}"
+    );
+    assert!(
+        !report.completion_warnings.is_empty(),
+        "the reviewer finding must stay on the report: {report:?}"
+    );
+
+    // The live terminal and its durable row carry the same facts the client
+    // projection reads on replay.
+    let live = events
+        .iter()
+        .find_map(|event| match event {
+            leveler_engine::EngineEvent::TaskFinished {
+                outcome,
+                reason,
+                stop,
+                warnings,
+                ..
+            } => Some((*outcome, reason.clone(), *stop, warnings.clone())),
+            _ => None,
+        })
+        .expect("the task terminal must be published");
+    assert_eq!(live.0, leveler_lifecycle::TaskOutcome::Completed);
+    assert_eq!(live.2, Some(leveler_agent::StopReason::Answered));
+    assert!(
+        live.1
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the live terminal must say the user paused: {live:?}"
+    );
+    assert!(!live.3.is_empty(), "the live terminal keeps the warning");
+
+    let stores = leveler_storage::EngineStores::from_database(&fx.db);
+    let durable = stores
+        .events
+        .load(&fx.session)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|row| {
+            (row.event_type == "task_finished")
+                .then(|| leveler_engine::EngineEvent::from_payload(&row.payload).unwrap())
+                .and_then(|event| match event {
+                    leveler_engine::EngineEvent::TaskFinished {
+                        outcome,
+                        reason,
+                        stop,
+                        warnings,
+                        ..
+                    } => Some((outcome, reason, stop, warnings)),
+                    _ => None,
+                })
+        })
+        .expect("the task terminal must be durable");
+    assert_eq!(durable.0, leveler_lifecycle::TaskOutcome::Completed);
+    assert_eq!(durable.2, Some(leveler_agent::StopReason::Answered));
+    assert!(
+        durable
+            .1
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "the durable terminal must say the user paused: {durable:?}"
+    );
+    assert!(
+        !durable.3.is_empty(),
+        "the durable terminal keeps the warning"
+    );
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Running);
+    assert!(
+        goals[0].user_paused_at.is_some(),
+        "the warning must not release the pause: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].acceptance.len(),
+        3,
+        "the full acceptance plan is preserved: {goals:?}"
+    );
+    assert!(
+        !fx.dir.path().join("stage-2.txt").exists(),
+        "the withheld stage must not be executed"
+    );
 }
 
 #[tokio::test]
@@ -2159,6 +2655,111 @@ async fn a_model_claimed_confirmation_does_not_pause_a_goal() {
     assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
     assert!(goals[0].user_paused_at.is_none());
     assert!(fx.dir.path().join("stage-2.txt").exists());
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// A fresh, isolated long task: the user explicitly refuses step-by-step
+/// confirmation, names two artifacts plus verification, and the model tries to
+/// end after the first stage. The runtime must not read that answer as a pause
+/// or as completion: it continues the SAME scope, and only the window that
+/// produces the second artifact and re-runs the verifier may close the goal.
+#[tokio::test]
+async fn a_long_task_without_step_confirmation_continues_instead_of_pausing() {
+    let objective = authorized_long_objective();
+    let fx = fixture(
+        vec![
+            commit_with(
+                vec!["long-1.txt 存在", "long-2.txt 存在", verifier_acceptance()],
+                objective,
+            ),
+            stage_plan("in_progress", "pending"),
+            write_named("long-1.txt"),
+            stage_plan("completed", "pending"),
+            // The model stops with prose after stage 1. The user authorized no
+            // step boundary, so this is an unfinished task, not a pause.
+            Scripted::Text("第一阶段已交付。第二阶段我接下来继续处理。"),
+            write_named("long-2.txt"),
+            Scripted::Tool("run_command", verifier_call()),
+            stage_plan("completed", "completed"),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "两个阶段都已完成并验收",
+                    "verification": {"status": "passed", "detail": verifier_label()},
+                    "requirements": [
+                        {"requirement": "long-1.txt", "status": "done",
+                         "evidence": "created long-1.txt"},
+                        {"requirement": "long-2.txt", "status": "done",
+                         "evidence": "created long-2.txt"},
+                        {"requirement": verifier_path(), "status": "done",
+                         "evidence": "ran the verifier"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    write_verifier(fx.dir.path());
+    let mut events = Vec::new();
+
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, objective),
+            vec![ContentPart::Text {
+                text: objective.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the task reached its declared completion: {report:?}"
+    );
+    assert!(
+        !report
+            .stop_detail
+            .as_deref()
+            .is_some_and(leveler_agent::closeout::is_user_pause_detail),
+        "a negated confirmation request is not a pause: {report:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::RuntimeInjection { kind, .. }
+                if kind.contains("goal_unresolved")
+        )),
+        "the early answer must trigger a continuation, not a terminal: {events:?}"
+    );
+
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the continuation stays in one goal: {goals:?}"
+    );
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+    assert!(
+        goals[0].user_paused_at.is_none(),
+        "the user never asked to wait: {goals:?}"
+    );
+    assert_eq!(
+        goals[0].acceptance.len(),
+        3,
+        "both artifacts and their verification stay in scope: {goals:?}"
+    );
+    assert!(fx.dir.path().join("long-1.txt").exists());
+    assert!(
+        fx.dir.path().join("long-2.txt").exists(),
+        "the runtime continued the withheld stage instead of accepting the answer"
+    );
     std::fs::remove_dir_all(fx.dir.path()).ok();
 }
 
@@ -2997,4 +3598,211 @@ async fn b12_a_background_write_expires_the_verification_it_followed() {
         "the re-run must permit completion: {report:?}"
     );
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+}
+
+/// Every tool result the scripted model was shown, in call order.
+fn tool_results(fx: &Fixture) -> Vec<String> {
+    fx.runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result.content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_containing(fx: &Fixture, needle: &str) -> String {
+    tool_results(fx)
+        .into_iter()
+        .find(|content| content.contains(needle))
+        .unwrap_or_else(|| panic!("no tool result contained `{needle}`"))
+}
+
+/// A malformed acceptance element names the exact array index, the actual JSON
+/// type and the allowed shape, so the model can repair the call instead of
+/// guessing what the generic contract sentence meant.
+#[tokio::test]
+async fn a_malformed_acceptance_entry_names_the_index_and_the_actual_type() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    "acceptance": ["go test ./... 通过", 42]
+                }),
+            ),
+            Scripted::Text("这条声明没有登记成功。"),
+        ],
+        false,
+    )
+    .await;
+
+    chat(&fx).await;
+
+    let result = tool_result_containing(&fx, "acceptance[1]");
+    assert!(result.contains("must be a string"), "{result}");
+    assert!(result.contains("number"), "{result}");
+    assert!(result.contains("Fix:"), "{result}");
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "no malformed declaration may register a goal"
+    );
+}
+
+/// More checks than the schema allows is a grouping decision, and the error
+/// says so instead of repeating the generic contract.
+#[tokio::test]
+async fn too_many_acceptance_checks_ask_the_model_to_group() {
+    let acceptance: Vec<String> = (0..21).map(|index| format!("检查 {index}")).collect();
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    "acceptance": acceptance
+                }),
+            ),
+            Scripted::Text("无法以这么多条验收登记。"),
+        ],
+        false,
+    )
+    .await;
+
+    chat(&fx).await;
+
+    let result = tool_result_containing(&fx, "acceptance");
+    assert!(result.contains("21"), "{result}");
+    assert!(result.contains("20"), "{result}");
+    assert!(result.contains("group"), "{result}");
+}
+
+/// The user's text is the durable objective. When it is present, the model's
+/// `objective` is replaced by it and must not be able to veto the declaration
+/// by being absent or longer than the model-facing limit.
+#[tokio::test]
+async fn the_users_text_replaces_the_model_objective_without_duplicate_validation() {
+    for arguments in [
+        serde_json::json!({
+            "acceptance": ["go test ./... 通过", "MCP 读写工具与页面能力一致"]
+        }),
+        serde_json::json!({
+            "objective": "x".repeat(4001),
+            "acceptance": ["go test ./... 通过", "MCP 读写工具与页面能力一致"]
+        }),
+    ] {
+        let fx = fixture(
+            vec![
+                Scripted::Tool("commit_task", arguments),
+                Scripted::run_tests(),
+                Scripted::complete(),
+            ],
+            false,
+        )
+        .await;
+
+        let report = chat(&fx).await;
+
+        assert_eq!(
+            report.outcome,
+            leveler_lifecycle::TaskOutcome::Completed,
+            "{report:?}"
+        );
+        let goals = goal_records(&fx).await;
+        assert_eq!(goals.len(), 1, "the declaration must bind one task");
+        assert_eq!(
+            goals[0].objective, USER_REQUEST,
+            "the durable objective is the user's own text"
+        );
+    }
+}
+
+/// A relation with the wrong JSON type is not the same fact as an omitted
+/// relation. It must be named, not silently ignored.
+#[tokio::test]
+async fn a_task_relation_with_the_wrong_type_is_named() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    "acceptance": ["go test ./... 通过", "MCP 读写工具与页面能力一致"],
+                    "task_relation": 7
+                }),
+            ),
+            Scripted::Text("登记失败。"),
+        ],
+        false,
+    )
+    .await;
+
+    chat(&fx).await;
+
+    let result = tool_result_containing(&fx, "task_relation");
+    assert!(result.contains("string"), "{result}");
+    assert!(result.contains("number"), "{result}");
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "no malformed declaration may register a goal"
+    );
+}
+
+/// A blank check is not a check. The error names the exact element so the
+/// model can repair the array instead of guessing which entry it lost.
+#[tokio::test]
+async fn an_empty_acceptance_entry_names_its_index() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    "acceptance": ["go test ./... 通过", "   "]
+                }),
+            ),
+            Scripted::Text("登记失败。"),
+        ],
+        false,
+    )
+    .await;
+
+    chat(&fx).await;
+
+    let result = tool_result_containing(&fx, "acceptance[1]");
+    assert!(result.contains("empty"), "{result}");
+    assert!(result.contains("Fix:"), "{result}");
+}
+
+/// An over-long check reports both the measured length and the limit, so the
+/// model knows how much to remove rather than retrying blindly.
+#[tokio::test]
+async fn an_over_long_acceptance_entry_names_its_length_and_limit() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    "acceptance": ["x".repeat(501)]
+                }),
+            ),
+            Scripted::Text("登记失败。"),
+        ],
+        false,
+    )
+    .await;
+
+    chat(&fx).await;
+
+    let result = tool_result_containing(&fx, "acceptance[0]");
+    assert!(result.contains("501"), "{result}");
+    assert!(result.contains("500"), "{result}");
+    assert!(result.contains("Fix:"), "{result}");
 }

@@ -159,7 +159,15 @@ impl From<AgentEvent> for EngineEvent {
                     elapsed_ms,
                 }
             }
-            A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
+            A::PlanUpdated {
+                steps,
+                created,
+                call_id,
+            } => EngineEvent::PlanUpdated {
+                steps,
+                created,
+                call_id,
+            },
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
             A::RuntimeInjection {
                 kind,
