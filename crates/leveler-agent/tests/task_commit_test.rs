@@ -722,6 +722,129 @@ async fn a_refused_declaration_buys_a_continuation_and_does_not_create_a_goal() 
     );
 }
 
+/// Before the declaration is committed there is no goal row, but the commit
+/// gate already derives an effective requirement set from the user's request.
+/// The audited session was refused three times while only an eight-item sample
+/// of that set was visible, and the model finally guessed the cause wrong.
+#[tokio::test]
+async fn the_scope_tool_is_readable_before_commit() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool("get_goal_scope", serde_json::json!({})),
+            Scripted::Text("范围已读取，继续处理。"),
+        ],
+        false,
+    )
+    .await;
+
+    let _report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+
+    let requests = fx.runtime.requests.lock().unwrap();
+    let tools = tool_names(&requests[0]);
+    assert!(
+        tools.contains(&"get_goal_scope"),
+        "the commit gate's reader must be on the pre-commit surface: {tools:?}"
+    );
+    let result = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .find(|result| result.call_id.as_str() == "call-1")
+        .expect("the scope result reaches the model");
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("[deliverable]"),
+        "the candidate scope is typed like the committed one: {}",
+        result.content
+    );
+    for deliverable in ["文章发布", "评论回复", "内容权限校验"] {
+        assert!(
+            result.content.contains(deliverable),
+            "the candidate scope names `{deliverable}`: {}",
+            result.content
+        );
+    }
+}
+
+/// The commit gate extracts one requirement per deliverable, so a request that
+/// enumerates more than the old fixed cap of 20 must still be declarable. The
+/// audited session's request extracted 132 requirements while the tool schema
+/// advertised `maxItems: 20`; the model could never satisfy both.
+#[tokio::test]
+async fn a_request_with_more_than_twenty_deliverables_can_be_committed() {
+    let deliverables: Vec<String> = (1..=22)
+        .map(|index| format!("模块{index:02} 能力"))
+        .collect();
+    let request: &'static str = Box::leak(
+        format!(
+            "完成以下功能，完成后通过测试：\n{}",
+            deliverables
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+        .into_boxed_str(),
+    );
+    let mut acceptance = deliverables;
+    acceptance.push("完成后通过测试".to_string());
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": request,
+                    "acceptance": acceptance
+                }),
+            ),
+            Scripted::Text("任务已声明，继续执行。"),
+            Scripted::Text("先到这里。"),
+            Scripted::Text("剩下的下次继续。"),
+        ],
+        false,
+    )
+    .await;
+
+    let _report = chat_with_request(&fx, request, CancellationToken::new()).await;
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let schema_limit = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "commit_task")
+            .map(|tool| tool.input_schema["properties"]["acceptance"]["maxItems"].clone())
+            .expect("a pre-commit surface offers commit_task");
+        assert_eq!(
+            schema_limit,
+            serde_json::json!(acceptance.len()),
+            "the advertised capacity follows the extracted requirement set"
+        );
+        let commit_result = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id.as_str() == "call-1")
+            .expect("the commit result reaches the model");
+        assert!(
+            !commit_result.is_error && commit_result.content.contains("Execution task committed"),
+            "23 checks covering 23 requirements are not refused: {}",
+            commit_result.content
+        );
+    }
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "exactly one durable task");
+    assert_eq!(goals[0].objective, request);
+}
+
 /// The other honest recovery: the model fixes the contract and re-declares.
 #[tokio::test]
 async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
