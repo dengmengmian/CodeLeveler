@@ -39,6 +39,11 @@ pub enum TurnInput {
         /// its durable events. The completion gate judges the task, not just
         /// the window that happens to be open.
         verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+        /// This turn continues a goal that already ran windows, rather than
+        /// opening one. The goal's plan belongs to the same goal, so it is the
+        /// active declaration again: a new window must see the steps it
+        /// already completed instead of re-planning from nothing.
+        continuing: bool,
     },
     /// A resumed transcript (drive continues mid-conversation).
     ///
@@ -114,11 +119,21 @@ pub async fn drive_turn(
     ports: TurnPorts,
     cancellation: CancellationToken,
 ) -> Result<TurnFacts<AgentOutcome>, TurnFailure> {
-    // Only an explicit resume continues the prior task epoch's active Plan.
-    // Fresh Goal/Content turns still seed runtime truth such as ledger,
-    // progress and running children, but a terminal historical Plan must not
-    // become active merely because its final declaration retained open rows.
+    // Only a turn that continues the prior task epoch's work continues its
+    // active Plan: an explicit resume, or a Goal turn that continues the
+    // goal which declared the plan. Fresh Goal/Content turns still seed
+    // runtime truth such as ledger, progress and running children, but a
+    // terminal historical Plan must not become active merely because its
+    // final declaration retained open rows.
     let resumes_task_epoch = matches!(&input, TurnInput::Resume { .. });
+    let continues_goal = matches!(
+        &input,
+        TurnInput::Goal {
+            continuing: true,
+            ..
+        }
+    );
+    let continues_epoch = resumes_task_epoch || continues_goal;
     let seed_scope = match &input {
         TurnInput::Resume {
             lineage_turn_ids, ..
@@ -238,10 +253,11 @@ pub async fn drive_turn(
     }
 
     // Open task state keeps ledger/progress (including running-child truth)
-    // across boundaries. Plan is narrower: only explicit Resume makes the
-    // prior declaration active again; fresh inputs retain it as history.
+    // across boundaries. Plan is narrower: only a turn that continues the
+    // prior epoch's work makes the prior declaration active again; fresh
+    // inputs retain it as history.
     if let Some(seeds) = seeds {
-        if resumes_task_epoch && let Some(plan) = seeds.plan {
+        if continues_epoch && let Some(plan) = seeds.plan {
             executor = executor.with_seeded_plan(plan);
         }
         if let Some(ledger) = seeds.ledger {
@@ -335,6 +351,7 @@ pub async fn drive_turn(
             prior,
             goal_id: _,
             verification_runs: _,
+            continuing: _,
         } => {
             let objective = leveler_lifecycle::ObjectiveAnchor::from_session_goal(goal.as_str());
             executor

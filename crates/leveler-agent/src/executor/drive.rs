@@ -34,10 +34,11 @@ use super::{
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::executor::goal_scope;
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope,
-    PermissionRequestOutcome, REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL,
-    TurnPermissionGrants, UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants,
-    claim_write_scope_tool_definition, commit_task_tool_definition, escalation_action,
+    CLAIM_WRITE_SCOPE_TOOL, COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL, DECLARE_INTENT_TOOL,
+    GET_GOAL_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
+    REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
+    advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
+    commit_task_tool_definition, declare_intent_tool_definition, escalation_action,
     escalation_missing_axis_message, get_goal_scope_tool_definition, is_escalatable_tool,
     is_user_input_tool, parse_escalation, parse_permission_request,
     permission_already_denied_message, report_finding_tool_definition,
@@ -318,6 +319,16 @@ pub(crate) struct Drive<'a> {
     /// work tool; cleared when a later work tool runs. A process sentence
     /// that a tool call followed is not this, and neither is [`Self::last_text`].
     terminal_answer: Option<String>,
+    /// The newest user directive this window has delivered to the model.
+    /// A structured intent declaration must quote a span of it.
+    latest_user_input: String,
+    /// The model declared the newest input a question about the goal rather
+    /// than an authorization to continue it. This window only answers.
+    answer_only: bool,
+    /// The model declared the user cancelled the bound goal. The goal row is
+    /// already settled by the intent write; this window ends after the round's
+    /// results commit instead of driving more work.
+    cancelled_goal: Option<String>,
     /// The one model request issued after wrap-up tool results, so the model
     /// can write the answer it has not written yet. A further tool round does
     /// not schedule another one.
@@ -649,6 +660,13 @@ impl Executor {
         if self.depth > 0 {
             tools.push(report_finding_tool_definition());
         }
+        // The one structured entry through which a user message can continue,
+        // pause, re-bound or cancel a goal. It is advertised whenever the turn
+        // could own a goal — including a Chat turn, because the message that
+        // continues a goal may be the one that starts this turn.
+        if self.depth == 0 && self.goal_binder().is_some() && !self.tool_context.policy.read_only {
+            tools.push(declare_intent_tool_definition());
+        }
         // A Chat turn can be delegated as a task. The model declares it; the
         // runtime never classifies the user's text. Read-only surfaces have
         // no authoring, so they cannot declare execution work at all.
@@ -929,6 +947,26 @@ impl Executor {
                 || progress.cumulative_model_steps > 0
                 || progress.cumulative_duration_ms > 0
                 || progress.cumulative_modified_files > 0);
+        // The newest user directive this window has shown the model. A
+        // declaration must quote it; an older message cannot authorize a
+        // transition the newest one may already have reversed.
+        //
+        // The transcript is the source, not the objective anchor: a Goal turn
+        // or resume carries the goal's objective as its anchor, while the
+        // message that actually authorizes this window is the newest
+        // user-authored row (an instruction, a steer, or a fresh `/goal`).
+        // Harness notices and protocol repairs are Role::User rows too, so the
+        // origin — not the role alone — decides what counts as the user
+        // speaking.
+        let latest_user_input = messages
+            .iter()
+            .rev()
+            .filter(|message| message.role == Role::User)
+            .find(|message| matches!(message.origin.as_ref(), Some(TranscriptOrigin::UserInput)))
+            .map(Message::text_content)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| objective.latest_instruction().to_string());
         let mut harness = Drive {
             executor: self,
             observer,
@@ -982,6 +1020,9 @@ impl Executor {
             settled_goal: None,
             settled_rounds: 0,
             terminal_answer: None,
+            latest_user_input,
+            answer_only: false,
+            cancelled_goal: None,
             delivery_followup_issued: false,
             decode_retries: 0,
             length_continuations: 0,
@@ -1951,7 +1992,279 @@ struct ParallelJob {
     admitted: crate::executor::host::AdmittedCall,
 }
 
+/// Outcome of applying a `declare_intent` call.
+enum IntentCall {
+    /// The declaration was refused; the message is model-visible and the turn
+    /// continues with its prior state.
+    Refused(String),
+    /// The runtime could not read or write the durable state; the run aborts.
+    Fatal(AgentError),
+}
+
+/// A durable-state failure during intent application aborts the run: the
+/// transition is either recorded or it is not, and pretending either way would
+/// be a false success.
+fn intent_fatal(error: leveler_engine::PortError) -> IntentCall {
+    IntentCall::Fatal(AgentError::Persistence(error.to_string()))
+}
+
 impl Drive<'_> {
+    /// State the running goals of this task while this turn does not yet serve
+    /// one.
+    ///
+    /// The fact is durable and may predate the transcript (resume, compaction,
+    /// a new session), so the model cannot be expected to recover it by
+    /// re-reading history. The block is removed as soon as the turn binds a
+    /// goal: from then on `get_goal_scope` and the goal contract are the
+    /// readers, and a stale second copy would compete with them.
+    async fn refresh_running_goals_fact(&mut self) -> Result<(), AgentError> {
+        self.control_context
+            .blocks
+            .retain(|block| block.name != "running_goals");
+        let Some(binder) = self.executor.goal_binder().cloned() else {
+            return Ok(());
+        };
+        if binder.bound().is_some() {
+            return Ok(());
+        }
+        let goals = binder
+            .running_goals()
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        if goals.is_empty() {
+            return Ok(());
+        }
+        let mut text = String::from(
+            "TASK GOALS: this task still owes the running goal(s) below from earlier windows. \
+             They are durable facts, not transcript echoes.\n",
+        );
+        for goal in goals.iter().take(3) {
+            let objective = leveler_core::truncate_head_bytes(&goal.objective, 240, "…");
+            text.push_str(&format!(
+                "- goal {}: {}\n",
+                goal.goal_id,
+                objective.split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
+            if let Some(boundary) = &goal.pause_boundary {
+                text.push_str(&format!(
+                    "  declared pause boundary: {}\n",
+                    boundary.describe()
+                ));
+            }
+            if goal.user_paused_at.is_some() {
+                text.push_str(
+                    "  state: PAUSED by the user; no work on it continues until the user's \
+                     newest message authorizes it\n",
+                );
+            } else {
+                text.push_str("  state: running; it still owes work\n");
+            }
+        }
+        text.push_str(
+            "If the newest user message continues, amends, pauses or cancels one of these \
+             goals, call declare_intent with a verbatim source_quote before acting; the runtime \
+             will not resume a paused goal from your own reading. If the message asks a \
+             question, declare answer_only. If it is unrelated work, declare \
+             start_independent_task and call commit_task with task_relation \"new\".",
+        );
+        self.control_context
+            .blocks
+            .push(crate::executor::PromptSegment::control(
+                "running_goals",
+                crate::executor::PromptSource::ExecutionState,
+                crate::executor::PromptAuthority::RuntimeFact,
+                crate::executor::SegmentLifecycle::RequestEphemeral,
+                false,
+                text,
+            ));
+        Ok(())
+    }
+
+    /// Apply one `declare_intent` call.
+    ///
+    /// Three mechanical checks and nothing else: the quote exists in the
+    /// newest user input, the named goal is a running goal of this task, and
+    /// the operation sequence is legal over the durable state. The model's
+    /// reading of the message is the input; the runtime never re-derives it
+    /// from keywords.
+    async fn apply_user_intent(&mut self, call: &ToolCall) -> Result<String, IntentCall> {
+        use leveler_lifecycle::{
+            IntentError, IntentProjection, UserIntentDeclaration, UserIntentOperation,
+            project_intent, quote_is_in_input,
+        };
+
+        let quote = call
+            .arguments
+            .get("source_quote")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if quote.is_empty() {
+            return Err(IntentCall::Refused(IntentError::EmptyQuote.to_string()));
+        }
+        if !quote_is_in_input(quote, &self.latest_user_input) {
+            return Err(IntentCall::Refused(format!(
+                "{} Newest user message: \"{}\"",
+                IntentError::QuoteNotInInput,
+                leveler_core::truncate_head_bytes(&self.latest_user_input, 400, "…")
+            )));
+        }
+        let operations: Vec<UserIntentOperation> = serde_json::from_value(
+            call.arguments
+                .get("operations")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        )
+        .map_err(|error| {
+            IntentCall::Refused(format!(
+                "declare_intent operations are not a valid operation list: {error}"
+            ))
+        })?;
+        let declaration = UserIntentDeclaration {
+            source_quote: quote.to_string(),
+            operations,
+        };
+
+        let Some(binder) = self.executor.goal_binder().cloned() else {
+            return Err(IntentCall::Refused(
+                "This turn has no goal lifecycle attached, so there is no goal to continue, \
+                 pause or cancel. Call commit_task if the user asked for execution work."
+                    .to_string(),
+            ));
+        };
+        let explicit = call
+            .arguments
+            .get("goal_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        // These two readings deliberately do NOT adopt a goal: the model is
+        // saying the input is not a continuation of one. Adopting would turn
+        // the window into Goal mode and demand a resolution the user never
+        // asked for.
+        if declaration
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, UserIntentOperation::AnswerOnly))
+        {
+            self.answer_only = true;
+            return Ok(
+                "Recorded: this input is a question about the task, not an authorization to \
+                 continue it. Answer it; the goal's state is unchanged."
+                    .to_string(),
+            );
+        }
+        if declaration
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, UserIntentOperation::StartIndependentTask))
+        {
+            return Ok(
+                "Recorded: this input is an independent task, not a continuation of a running \
+                 goal. Call commit_task with task_relation \"new\" if it needs the task \
+                 lifecycle; the running goals keep their state."
+                    .to_string(),
+            );
+        }
+
+        let bound = binder.bound();
+        let target = match (bound, explicit) {
+            (Some(bound), Some(explicit)) if bound.as_str() != explicit => {
+                return Err(IntentCall::Refused(format!(
+                    "this turn already serves goal {bound}; the declaration names {explicit}. \
+                     Finish or resolve the current goal before acting on another one."
+                )));
+            }
+            (Some(bound), _) => bound,
+            (None, Some(explicit)) => leveler_core::GoalId::new(explicit.to_string()),
+            (None, None) => {
+                let running = binder.running_goals().await.map_err(intent_fatal)?;
+                match running.len() {
+                    0 => {
+                        return Err(IntentCall::Refused(
+                            "No running goal exists for this task, so there is nothing to \
+                             continue, pause or cancel. Call commit_task if the user asked for \
+                             execution work."
+                                .to_string(),
+                        ));
+                    }
+                    1 => running[0].goal_id.clone(),
+                    _ => {
+                        let ids = running
+                            .iter()
+                            .map(|goal| goal.goal_id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(IntentCall::Refused(format!(
+                            "This task owes {} running goals ({ids}); set `goal_id` to the one \
+                             the user's message refers to. The runtime will not guess.",
+                            running.len()
+                        )));
+                    }
+                }
+            }
+        };
+
+        binder.adopt(&target).await.map_err(intent_fatal)?;
+        let scope = binder.scope().await.map_err(intent_fatal)?.ok_or_else(|| {
+            IntentCall::Fatal(AgentError::Persistence(format!(
+                "adopted goal {target} has no durable row"
+            )))
+        })?;
+        let current = IntentProjection {
+            pause_in_force: scope.user_paused_at.is_some(),
+            pause_boundary: scope.pause_boundary.clone(),
+            cancel: false,
+            answer_only: false,
+            independent_task: false,
+        };
+        let projection = project_intent(&declaration, &current, &self.plan_state)
+            .map_err(|error| IntentCall::Refused(error.to_string()))?;
+        binder
+            .record_intent(&declaration, &projection)
+            .await
+            .map_err(intent_fatal)?;
+
+        if projection.cancel {
+            self.cancelled_goal = Some(target.to_string());
+        }
+        // Adoption can turn a Chat turn into a Goal turn, which changes the
+        // advertised surface from the next request on.
+        let tools = self.executor.request_tool_definitions();
+        if tools != self.tools {
+            self.tools = tools;
+        }
+        self.refresh_running_goals_fact()
+            .await
+            .map_err(IntentCall::Fatal)?;
+
+        let state = if projection.cancel {
+            "The goal is settled. Do not continue its work: this window ends after this round's \
+             results commit."
+                .to_string()
+        } else if projection.pause_in_force {
+            "The goal is paused now; no further work round starts without a new user \
+             authorization."
+                .to_string()
+        } else if let Some(boundary) = &projection.pause_boundary {
+            format!("The pause boundary is: {}.", boundary.describe())
+        } else {
+            "The goal continues with no pause boundary in force.".to_string()
+        };
+        let mut receipt = format!(
+            "Recorded {} operation(s) for goal {target}. {state}",
+            declaration.operations.len()
+        );
+        if !projection.cancel {
+            receipt.push_str(
+                " This turn serves that goal: resolve it with update_goal(complete|blocked) when \
+                 the work is done.",
+            );
+        }
+        Ok(receipt)
+    }
+
     /// Drop the "you can enable this" hint once nothing it mentions is still
     /// unexposed. A hint that outlives its fact is worse than none.
     fn retract_surface_growth_notice(&mut self) {
@@ -2298,24 +2611,20 @@ impl Drive<'_> {
 /// The user's pause authorization for the bound goal, in the two forms the
 /// harness needs.
 ///
-/// `goal_paused` is the DURABLE fact recorded when an earlier window reached
-/// the boundary; `reached` is the same boundary re-proved by THIS window's
-/// plan. Both read the user's own instruction sequence (the objective plus
-/// every durable amendment), never the model's prose, and an instruction that
-/// is neither a pause nor a continuation leaves the previous boundary in force.
+/// Both facts are STRUCTURED state, never a reading of the conversation:
+/// `goal_paused` is the durable pause flag written by a validated intent
+/// declaration (or by the window that ended at the boundary), and `reached`
+/// asks the declared [`leveler_lifecycle::PauseBoundary`] whether the model's
+/// own plan has completed the step it names. Nothing here classifies the
+/// user's wording.
 async fn user_pause_state(
     executor: &Executor,
-    objective: &leveler_lifecycle::ObjectiveAnchor,
     plan: &PlanState,
 ) -> Result<(bool, bool), AgentError> {
     if !executor.goal_mode() {
-        // A Chat turn with no goal has only this turn's objective anchor.
-        let boundary = leveler_lifecycle::effective_user_pause(anchor_user_texts(objective));
-        let reached = plan.is_model_explicit()
-            && boundary
-                .as_ref()
-                .is_some_and(|boundary| boundary.reached(plan));
-        return Ok((false, reached));
+        // A Chat turn with no goal does not continue a plan; there is no
+        // boundary to reach.
+        return Ok((false, false));
     }
     let scope = match executor.goal_binder() {
         Some(binder) => binder
@@ -2324,31 +2633,16 @@ async fn user_pause_state(
             .map_err(|error| AgentError::Persistence(error.to_string()))?,
         None => None,
     };
-    let mut texts: Vec<&str> = anchor_user_texts(objective);
-    if let Some(scope) = scope.as_ref() {
-        texts.extend(scope.amendments.iter().map(String::as_str));
-    }
-    // The durable column says an earlier window reached the user's boundary.
-    // The user's own NEWEST directive decides whether it is still in force:
-    // the column is cleared only at a window's end, so during the window they
-    // just authorized it still reads as paused. Only an explicit continuation
-    // releases it; a status question or a supplement leaves it in force.
-    let goal_paused = scope.as_ref().is_some_and(|scope| {
-        leveler_lifecycle::pause_in_force(scope.user_paused_at.is_some(), texts.iter().copied())
-    });
-    let boundary = leveler_lifecycle::effective_user_pause(texts);
+    let Some(scope) = scope else {
+        return Ok((false, false));
+    };
+    let goal_paused = scope.user_paused_at.is_some();
     let reached = plan.is_model_explicit()
-        && boundary
+        && scope
+            .pause_boundary
             .as_ref()
             .is_some_and(|boundary| boundary.reached(plan));
     Ok((goal_paused, reached))
-}
-
-/// The user-authored texts of an objective anchor, in recorded order.
-fn anchor_user_texts(anchor: &leveler_lifecycle::ObjectiveAnchor) -> Vec<&str> {
-    let mut texts: Vec<&str> = vec![anchor.primary.as_deref().unwrap_or(anchor.text.as_str())];
-    texts.extend(anchor.amendments.iter().map(String::as_str));
-    texts
 }
 
 impl Drive<'_> {
@@ -2736,6 +3030,9 @@ impl AgentHarness for Drive<'_> {
         rt: &mut LoopContext,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
+        // Durable goals may predate this transcript; state them before the
+        // model is asked anything, and retract the fact once this turn binds.
+        self.refresh_running_goals_fact().await?;
         // A host-owned catalog (an MCP server) can come up while this turn is
         // running. Ask it once per request so one long turn is not stuck with
         // the surface it started with, then re-derive exposure from the
@@ -2781,6 +3078,8 @@ impl AgentHarness for Drive<'_> {
         if let Some(source) = &self.executor.steering
             && let Some(declaration) = source.take_goal_declaration()
         {
+            // A `/goal` declaration is itself the newest user input.
+            self.latest_user_input = declaration.clone();
             // A Chat turn that becomes a Goal here has no durable goal yet.
             // Open it and bind this running turn to it BEFORE the contract is
             // advertised: a goal that exists only in memory would be lost on
@@ -2831,6 +3130,10 @@ impl AgentHarness for Drive<'_> {
                 if text.is_empty() {
                     continue;
                 }
+                // The user just spoke; a declaration about the newest input
+                // must quote this one, not an earlier message the runtime has
+                // already acted on.
+                self.latest_user_input = text.to_string();
                 let message = Message::user_input(text);
                 // A journalled input is appended and settled in one durable
                 // transaction. `false` means the user cancelled it while this
@@ -3292,16 +3595,13 @@ impl AgentHarness for Drive<'_> {
                     .map(|refusal| refusal.uncovered)
                     .unwrap_or(0)
             };
-            // The user's own authorization sequence for this goal, in recorded
-            // order. In Goal mode the durable scope contributes the cross-turn
-            // user turns; the goal's own objective is already the anchor's
-            // primary, so it is not read a second time.
-            //
-            // Reading the sequence — not the newest message alone — is what lets
-            // a status question leave the pause in force while an explicit
-            // "继续阶段 2" releases it.
+            // The durable pause state and the declared boundary, both
+            // structured. `answer_only` is this window's own reading: the
+            // model declared the user asked a question, so the goal is not
+            // driven further in this round even when it is not paused.
             let (goal_user_paused, user_pause_reached) =
-                user_pause_state(self.executor, &self.objective, &self.plan_state).await?;
+                user_pause_state(self.executor, &self.plan_state).await?;
+            let goal_user_paused = goal_user_paused || self.answer_only;
             let pause_finish =
                 self.executor.goal_mode() && (user_pause_reached || goal_user_paused);
             let action = decide(&CloseoutInput {
@@ -3914,6 +4214,43 @@ impl AgentHarness for Drive<'_> {
                 continue;
             }
 
+            // The one structured entry through which the user's message can
+            // continue, pause, re-bound or cancel a goal. The model supplies
+            // the meaning; the runtime validates provenance, identity and the
+            // transition. No reader classifies the message's words.
+            if call.name == DECLARE_INTENT_TOOL && self.executor.depth == 0 {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: DECLARE_INTENT_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
+                let (content, is_error) = match self.apply_user_intent(&call).await {
+                    Ok(receipt) => (receipt, false),
+                    Err(IntentCall::Refused(message)) => (message, true),
+                    Err(IntentCall::Fatal(error)) => return Err(error),
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: DECLARE_INTENT_TOOL.to_string(),
+                    is_error,
+                    preview: preview(&content),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content,
+                        is_error,
+                    },
+                });
+                continue;
+            }
+
             // Chat delegation: the model declares that the user's request is
             // work this turn must carry to completion. The declaration is the
             // ONLY authority that turns a Chat window into a task window; the
@@ -4361,7 +4698,7 @@ impl AgentHarness for Drive<'_> {
                 // end normally; the closeout records the pause.
                 if reason == StopReason::Blocked {
                     let (goal_paused, reached) =
-                        user_pause_state(self.executor, &self.objective, &self.plan_state).await?;
+                        user_pause_state(self.executor, &self.plan_state).await?;
                     if self.executor.goal_mode() && (goal_paused || reached) {
                         denied_calls_this_round += 1;
                         let message = "update_goal(blocked) is not the resolution for this \
@@ -6456,6 +6793,23 @@ impl AgentHarness for Drive<'_> {
             self.terminal_answer = None;
         } else if round_spoke {
             self.terminal_answer = Some(round_prose.trim().to_string());
+        }
+
+        // A cancellation declared from the user's own message is a settled
+        // goal, not a resolution the model may walk back. The durable write
+        // happened in the tool handler; end this window once the round's
+        // results are committed so no further work round starts.
+        if let Some(goal) = self.cancelled_goal.take() {
+            return Ok(Flow::Stop(
+                self.stop_now(
+                    rt,
+                    messages,
+                    StopReason::Answered,
+                    &format!("the user cancelled goal {goal}"),
+                    "Stopped: the user cancelled this task.",
+                )
+                .await?,
+            ));
         }
 
         // Goal mode: an explicit update_goal resolved the goal, and its result

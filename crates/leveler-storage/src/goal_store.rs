@@ -17,7 +17,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use leveler_core::{GoalId, OwnershipToken, TaskId, Timestamp};
+use leveler_core::{GoalId, OwnershipToken, TaskId, Timestamp, TurnId};
+use leveler_lifecycle::{
+    IntentProjection, PauseBoundary, UserIntentDeclaration, UserIntentOperation,
+};
 
 use crate::{Database, OwnershipError, StorageError};
 
@@ -96,10 +99,40 @@ pub struct GoalRecord {
     ///
     /// This is an authorization fact, not a verdict: `state` stays `running`
     /// while a paused goal still owes the work the user withheld permission to
-    /// start. It is set only from a user directive whose boundary the model's
-    /// own plan reached, and cleared only by a user instruction that authorizes
-    /// continuing (or by settling).
+    /// start. It is set only from a validated
+    /// [`leveler_lifecycle::UserIntentDeclaration`] that the model quoted from
+    /// the user's own message, and cleared only by a later declaration that
+    /// authorizes continuing (or by settling).
     pub user_paused_at: Option<Timestamp>,
+    /// The structured boundary the user's pause waits on. `None` = no pending
+    /// boundary. Replaced or released by a later declaration; never derived
+    /// from natural-language text by a client or a reader.
+    pub pause_boundary: Option<PauseBoundary>,
+}
+
+/// One applied user-intent declaration, in order, for audit and replay.
+///
+/// This is history, not authority: the current authorization state lives on
+/// [`GoalRecord`]. The log makes "who authorized this, with which words, in
+/// which order" answerable after a restart. `turn_id` identifies the window
+/// whose transcript holds the raw user message the quote was taken from; the
+/// transcript row, not this log, remains the message's authoritative copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalIntentRecord {
+    /// Per-goal monotonic sequence, starting at 1.
+    pub seq: u32,
+    /// The turn whose newest user input the quote came from.
+    pub turn_id: String,
+    /// The span the model quoted from the user's newest input.
+    pub source_quote: String,
+    /// The ordered operations the runtime accepted.
+    pub operations: Vec<UserIntentOperation>,
+    /// Authorization state after applying the declaration.
+    pub pause_in_force: bool,
+    /// Boundary after applying the declaration.
+    pub pause_boundary: Option<PauseBoundary>,
+    /// When the declaration was accepted.
+    pub created_at: Timestamp,
 }
 
 /// Access to durable goals.
@@ -169,6 +202,27 @@ pub trait GoalStore: Send + Sync {
         goal_id: &GoalId,
         paused_at: Option<Timestamp>,
     ) -> Result<(), OwnershipError>;
+
+    /// Apply one validated user-intent declaration atomically: the durable
+    /// pause/boundary state, an optional cancellation, and the ordered history
+    /// row are one write.
+    ///
+    /// The caller has already validated that `declaration.source_quote` occurs
+    /// in the newest user input and that `projection` is a legal transition.
+    /// This method owns only identity, ownership, settled-state refusal and
+    /// atomicity.
+    async fn record_intent(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        turn_id: &TurnId,
+        declaration: &UserIntentDeclaration,
+        projection: &IntentProjection,
+        now: Timestamp,
+    ) -> Result<(), OwnershipError>;
+
+    /// The ordered intent history for one goal, oldest first.
+    async fn intent_log(&self, goal_id: &GoalId) -> Result<Vec<GoalIntentRecord>, StorageError>;
 
     /// Reopen this exact settled goal for an explicit continuation. This does
     /// not create or select a goal by objective text; ownership and task
@@ -335,7 +389,8 @@ impl GoalStore for Database {
         // `state = 'running'` in the predicate makes a second settle a no-op
         // and keeps the first settled_at, which is the one that is true.
         let updated = sqlx::query(
-            "UPDATE goals SET state = ?2, settled_at = ?3 \
+            "UPDATE goals SET state = ?2, settled_at = ?3, user_paused_at = NULL, \
+             pause_boundary = NULL \
              WHERE id = ?1 AND task_id = ?4 AND state = 'running' AND EXISTS (\
                  SELECT 1 FROM tasks WHERE id = ?4 \
                  AND owner_runtime_id = ?5 AND owner_epoch = ?6\
@@ -358,7 +413,8 @@ impl GoalStore for Database {
 
     async fn reopen(&self, token: &OwnershipToken, goal_id: &GoalId) -> Result<(), OwnershipError> {
         let updated = sqlx::query(
-            "UPDATE goals SET state = 'running', settled_at = NULL \
+            "UPDATE goals SET state = 'running', settled_at = NULL, user_paused_at = NULL, \
+             pause_boundary = NULL \
              WHERE id = ?1 AND task_id = ?2 AND state IN ('settled', 'running') AND EXISTS (\
                  SELECT 1 FROM tasks WHERE id = ?2 \
                  AND owner_runtime_id = ?3 AND owner_epoch = ?4\
@@ -404,6 +460,147 @@ impl GoalStore for Database {
             return Ok(());
         }
         goal_write_miss(self, token, goal_id, false).await
+    }
+
+    async fn record_intent(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        turn_id: &TurnId,
+        declaration: &UserIntentDeclaration,
+        projection: &IntentProjection,
+        now: Timestamp,
+    ) -> Result<(), OwnershipError> {
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT goals.state FROM goals \
+             JOIN tasks ON tasks.id = goals.task_id \
+             WHERE goals.id = ?1 AND goals.task_id = ?2 \
+             AND tasks.owner_runtime_id = ?3 AND tasks.owner_epoch = ?4",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        let Some((state,)) = row else {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return goal_write_miss(self, token, goal_id, false).await;
+        };
+        if state != GoalState::Running.as_str() && !projection.cancel {
+            tx.rollback().await.map_err(StorageError::from)?;
+            return Err(StorageError::InvalidData(format!(
+                "goal {goal_id} is settled; an intent that does not reopen it cannot apply"
+            ))
+            .into());
+        }
+        let boundary = projection
+            .pause_boundary
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                StorageError::InvalidData(format!("unencodable pause boundary: {error}"))
+            })?;
+        let operations = serde_json::to_string(&declaration.operations).map_err(|error| {
+            StorageError::InvalidData(format!("unencodable intent operations: {error}"))
+        })?;
+        if projection.cancel {
+            sqlx::query(
+                "UPDATE goals SET state = ?3, settled_at = ?4, user_paused_at = NULL, \
+                 pause_boundary = NULL WHERE id = ?1 AND task_id = ?2",
+            )
+            .bind(goal_id.as_str())
+            .bind(token.task_id.as_str())
+            .bind(GoalState::Settled.as_str())
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+        } else {
+            sqlx::query(
+                "UPDATE goals SET user_paused_at = ?3, pause_boundary = ?4 \
+                 WHERE id = ?1 AND task_id = ?2",
+            )
+            .bind(goal_id.as_str())
+            .bind(token.task_id.as_str())
+            .bind(projection.pause_in_force.then(|| now.to_rfc3339()))
+            .bind(boundary)
+            .execute(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+        }
+        let seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM goal_intents WHERE goal_id = ?1",
+        )
+        .bind(goal_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        sqlx::query(
+            "INSERT INTO goal_intents \
+             (goal_id, seq, turn_id, source_quote, operations, pause_in_force, pause_boundary, \
+              created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(goal_id.as_str())
+        .bind(seq)
+        .bind(turn_id.as_str())
+        .bind(&declaration.source_quote)
+        .bind(operations)
+        .bind(i64::from(projection.pause_in_force))
+        .bind(
+            projection
+                .pause_boundary
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    StorageError::InvalidData(format!("unencodable pause boundary: {error}"))
+                })?,
+        )
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(())
+    }
+
+    async fn intent_log(&self, goal_id: &GoalId) -> Result<Vec<GoalIntentRecord>, StorageError> {
+        let rows: Vec<(i64, String, String, String, i64, Option<String>, String)> = sqlx::query_as(
+            "SELECT seq, turn_id, source_quote, operations, pause_in_force, pause_boundary, \
+             created_at \
+             FROM goal_intents WHERE goal_id = ?1 ORDER BY seq",
+        )
+        .bind(goal_id.as_str())
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(
+                |(seq, turn_id, source_quote, operations, pause_in_force, boundary, created_at)| {
+                    Ok(GoalIntentRecord {
+                        seq: seq.max(0) as u32,
+                        turn_id,
+                        source_quote,
+                        operations: serde_json::from_str(&operations).map_err(|error| {
+                            StorageError::InvalidData(format!(
+                                "bad goal intent operations JSON `{operations}`: {error}"
+                            ))
+                        })?,
+                        pause_in_force: pause_in_force != 0,
+                        pause_boundary: parse_boundary(boundary.as_deref())?,
+                        created_at: parse_ts(&created_at)?,
+                    })
+                },
+            )
+            .collect()
     }
 
     async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
@@ -459,9 +656,10 @@ impl GoalStore for Database {
             String,
             String,
             Option<String>,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
-             acceptance, amendments, user_paused_at FROM goals WHERE id = ?1",
+             acceptance, amendments, user_paused_at, pause_boundary FROM goals WHERE id = ?1",
         )
         .bind(goal_id.as_str())
         .fetch_optional(self.pool())
@@ -481,9 +679,10 @@ impl GoalStore for Database {
             String,
             String,
             Option<String>,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
-             acceptance, amendments, user_paused_at FROM goals WHERE state = 'running' \
+             acceptance, amendments, user_paused_at, pause_boundary FROM goals WHERE state = 'running' \
              ORDER BY opened_at DESC",
         )
         .fetch_all(self.pool())
@@ -503,9 +702,10 @@ impl GoalStore for Database {
             String,
             String,
             Option<String>,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT id, task_id, objective, state, opened_at, settled_at, windows_run, \
-             acceptance, amendments, user_paused_at FROM goals WHERE task_id = ?1 \
+             acceptance, amendments, user_paused_at, pause_boundary FROM goals WHERE task_id = ?1 \
              ORDER BY opened_at DESC",
         )
         .bind(task_id.as_str())
@@ -566,6 +766,7 @@ fn record_from_row(
         String,
         String,
         Option<String>,
+        Option<String>,
     ),
 ) -> Result<GoalRecord, StorageError> {
     let (
@@ -579,6 +780,7 @@ fn record_from_row(
         acceptance,
         amendments,
         user_paused_at,
+        pause_boundary,
     ) = row;
     Ok(GoalRecord {
         id: GoalId::new(id),
@@ -592,7 +794,20 @@ fn record_from_row(
         acceptance: parse_list(&acceptance, "acceptance")?,
         amendments: parse_list(&amendments, "amendments")?,
         user_paused_at: user_paused_at.as_deref().map(parse_ts).transpose()?,
+        pause_boundary: parse_boundary(pause_boundary.as_deref())?,
     })
+}
+
+/// A structured boundary column. A row we cannot decode is refused, never
+/// treated as "no boundary": forgetting a user's pause would resume work they
+/// withheld authorization for.
+fn parse_boundary(raw: Option<&str>) -> Result<Option<PauseBoundary>, StorageError> {
+    raw.map(|raw| {
+        serde_json::from_str(raw).map_err(|error| {
+            StorageError::InvalidData(format!("bad goal pause_boundary JSON `{raw}`: {error}"))
+        })
+    })
+    .transpose()
 }
 
 /// A malformed scope column is refused, never defaulted: a goal whose
@@ -613,6 +828,7 @@ fn parse_ts(s: &str) -> Result<Timestamp, StorageError> {
 /// contract as the SQLite adapter.
 pub struct MemoryGoalStore {
     pub(crate) rows: Mutex<Vec<GoalRecord>>,
+    intents: Mutex<Vec<(String, GoalIntentRecord)>>,
     capabilities: Mutex<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>,
     ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
@@ -621,6 +837,7 @@ impl Default for MemoryGoalStore {
     fn default() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
+            intents: Mutex::new(Vec::new()),
             capabilities: Mutex::new(std::collections::BTreeMap::new()),
             ownership: std::sync::OnceLock::new(),
         }
@@ -668,6 +885,7 @@ impl GoalStore for MemoryGoalStore {
                 acceptance: acceptance.to_vec(),
                 amendments: Vec::new(),
                 user_paused_at: None,
+                pause_boundary: None,
             });
         })?;
         Ok(id)
@@ -767,6 +985,8 @@ impl GoalStore for MemoryGoalStore {
                 if goal.state == GoalState::Running {
                     goal.state = GoalState::Settled;
                     goal.settled_at = Some(now);
+                    goal.user_paused_at = None;
+                    goal.pause_boundary = None;
                 }
                 Ok::<_, StorageError>(())
             })?
@@ -793,6 +1013,8 @@ impl GoalStore for MemoryGoalStore {
                     })?;
                 goal.state = GoalState::Running;
                 goal.settled_at = None;
+                goal.user_paused_at = None;
+                goal.pause_boundary = None;
                 Ok::<_, StorageError>(())
             })?
             .map_err(OwnershipError::Storage)
@@ -825,6 +1047,79 @@ impl GoalStore for MemoryGoalStore {
                 Ok::<_, StorageError>(())
             })?
             .map_err(OwnershipError::Storage)
+    }
+
+    async fn record_intent(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        turn_id: &TurnId,
+        declaration: &UserIntentDeclaration,
+        projection: &IntentProjection,
+        now: Timestamp,
+    ) -> Result<(), OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let mut rows = self.rows.lock().unwrap();
+                let goal = rows
+                    .iter_mut()
+                    .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {goal_id} not found for task {}",
+                            token.task_id
+                        ))
+                    })?;
+                if goal.state != GoalState::Running && !projection.cancel {
+                    return Err(StorageError::InvalidData(format!(
+                        "goal {goal_id} is settled; an intent that does not reopen it cannot apply"
+                    )));
+                }
+                if projection.cancel {
+                    goal.state = GoalState::Settled;
+                    goal.settled_at = Some(now);
+                }
+                goal.user_paused_at = projection.pause_in_force.then_some(now);
+                goal.pause_boundary = projection.pause_boundary.clone();
+                let mut intents = self.intents.lock().unwrap();
+                let seq = intents
+                    .iter()
+                    .filter(|(id, _)| id == goal_id.as_str())
+                    .map(|(_, record)| record.seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                intents.push((
+                    goal_id.to_string(),
+                    GoalIntentRecord {
+                        seq,
+                        turn_id: turn_id.to_string(),
+                        source_quote: declaration.source_quote.clone(),
+                        operations: declaration.operations.clone(),
+                        pause_in_force: projection.pause_in_force,
+                        pause_boundary: projection.pause_boundary.clone(),
+                        created_at: now,
+                    },
+                ));
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
+    }
+
+    async fn intent_log(&self, goal_id: &GoalId) -> Result<Vec<GoalIntentRecord>, StorageError> {
+        let intents = self.intents.lock().unwrap();
+        let mut records: Vec<GoalIntentRecord> = intents
+            .iter()
+            .filter(|(id, _)| id == goal_id.as_str())
+            .map(|(_, record)| record.clone())
+            .collect();
+        records.sort_by_key(|record| record.seq);
+        Ok(records)
     }
 
     async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
@@ -1111,6 +1406,228 @@ mod tests {
             vec!["stage-2.txt 暂时不做".to_string()],
             "the refused amendment is not recorded"
         );
+    }
+
+    /// Structured intent is the only writer of pause authorization, and its
+    /// ordered log is written atomically with the state it produced.
+    async fn assert_goal_intent_contract(store: &dyn GoalStore, token: &OwnershipToken) {
+        use leveler_lifecycle::{
+            StageRef, UserIntentDeclaration, UserIntentOperation, project_intent,
+        };
+
+        let goal = store
+            .open(token, "continue until the third stage", leveler_core::now())
+            .await
+            .unwrap();
+        let idle = IntentProjection {
+            pause_in_force: false,
+            pause_boundary: None,
+            cancel: false,
+            answer_only: false,
+            independent_task: false,
+        };
+        let plan = leveler_lifecycle::PlanState {
+            steps: vec![
+                leveler_lifecycle::PlanStep {
+                    step: "stage one".into(),
+                    status: "completed".into(),
+                    id: Some("s1".into()),
+                    origin: leveler_lifecycle::PlanOrigin::ModelExplicit,
+                },
+                leveler_lifecycle::PlanStep {
+                    step: "stage two".into(),
+                    status: "pending".into(),
+                    id: Some("s2".into()),
+                    origin: leveler_lifecycle::PlanOrigin::ModelExplicit,
+                },
+            ],
+        };
+        let pause = UserIntentDeclaration {
+            source_quote: "pause after stage one".into(),
+            operations: vec![UserIntentOperation::PauseTask {
+                boundary: PauseBoundary::AfterStep {
+                    step: StageRef {
+                        step_id: "s1".into(),
+                        label: None,
+                    },
+                },
+            }],
+        };
+        let projected = project_intent(&pause, &idle, &plan).unwrap();
+        let first_turn = TurnId::new("turn-1");
+        store
+            .record_intent(
+                token,
+                &goal,
+                &first_turn,
+                &pause,
+                &projected,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let record = store.get(&goal).await.unwrap().unwrap();
+        assert!(record.user_paused_at.is_some());
+        assert_eq!(
+            record.pause_boundary,
+            Some(PauseBoundary::AfterStep {
+                step: StageRef {
+                    step_id: "s1".into(),
+                    label: None,
+                }
+            })
+        );
+
+        let release = UserIntentDeclaration {
+            source_quote: "keep going, but pause after stage two".into(),
+            operations: vec![
+                UserIntentOperation::ContinueTask,
+                UserIntentOperation::SetPauseBoundary {
+                    boundary: PauseBoundary::AfterStep {
+                        step: StageRef {
+                            step_id: "s2".into(),
+                            label: None,
+                        },
+                    },
+                },
+            ],
+        };
+        let projected = project_intent(
+            &release,
+            &IntentProjection {
+                pause_in_force: true,
+                pause_boundary: record.pause_boundary.clone(),
+                cancel: false,
+                answer_only: false,
+                independent_task: false,
+            },
+            &plan,
+        )
+        .unwrap();
+        let second_turn = TurnId::new("turn-2");
+        store
+            .record_intent(
+                token,
+                &goal,
+                &second_turn,
+                &release,
+                &projected,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let record = store.get(&goal).await.unwrap().unwrap();
+        assert!(record.user_paused_at.is_none(), "the old pause is released");
+        assert_eq!(
+            record.pause_boundary,
+            Some(PauseBoundary::AfterStep {
+                step: StageRef {
+                    step_id: "s2".into(),
+                    label: None,
+                }
+            }),
+            "the new boundary replaces the old one"
+        );
+
+        let log = store.intent_log(&goal).await.unwrap();
+        assert_eq!(log.len(), 2, "every accepted declaration is history");
+        assert_eq!(log[0].seq, 1);
+        assert_eq!(log[0].turn_id, "turn-1", "the quoting window is recorded");
+        assert_eq!(log[0].source_quote, "pause after stage one");
+        assert_eq!(log[1].seq, 2);
+        assert_eq!(log[1].turn_id, "turn-2");
+        assert_eq!(log[1].operations, release.operations);
+        assert!(!log[1].pause_in_force);
+
+        let cancel = UserIntentDeclaration {
+            source_quote: "cancel this".into(),
+            operations: vec![UserIntentOperation::CancelTask],
+        };
+        let projected = project_intent(
+            &cancel,
+            &IntentProjection {
+                pause_in_force: false,
+                pause_boundary: record.pause_boundary.clone(),
+                cancel: false,
+                answer_only: false,
+                independent_task: false,
+            },
+            &plan,
+        )
+        .unwrap();
+        store
+            .record_intent(
+                token,
+                &goal,
+                &second_turn,
+                &cancel,
+                &projected,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let cancelled = store.get(&goal).await.unwrap().unwrap();
+        assert_eq!(cancelled.state, GoalState::Settled);
+        assert!(cancelled.user_paused_at.is_none());
+        assert!(cancelled.pause_boundary.is_none());
+
+        let after = UserIntentDeclaration {
+            source_quote: "go on".into(),
+            operations: vec![UserIntentOperation::ContinueTask],
+        };
+        let projected = project_intent(
+            &after,
+            &IntentProjection {
+                pause_in_force: false,
+                pause_boundary: None,
+                cancel: false,
+                answer_only: false,
+                independent_task: false,
+            },
+            &plan,
+        )
+        .unwrap();
+        assert!(
+            store
+                .record_intent(
+                    token,
+                    &goal,
+                    &second_turn,
+                    &after,
+                    &projected,
+                    leveler_core::now(),
+                )
+                .await
+                .is_err(),
+            "a settled goal does not accept a continuation without an explicit reopen"
+        );
+        assert_eq!(store.intent_log(&goal).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn memory_store_persists_structured_intent() {
+        let state = std::sync::Arc::new(MemoryOwnershipState::new());
+        let task = TaskId::new("t1");
+        state.register_task(&task);
+        let ownership = MemoryOwnershipStore::new(state.clone());
+        let token = ownership
+            .acquire(
+                &task,
+                &RuntimeId::new("rt"),
+                &leveler_core::BootId::new("test-boot"),
+                OwnerEpoch::UNOWNED,
+            )
+            .await
+            .unwrap();
+        let store = MemoryGoalStore::new().with_ownership(state);
+        assert_goal_intent_contract(&store, &token).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_persists_structured_intent() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (_, token) = seeded_task(&db).await;
+        assert_goal_intent_contract(&db, &token).await;
     }
 
     #[tokio::test]

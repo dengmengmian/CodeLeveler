@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+- Continuation, pause, amendment, cancellation and questions are decided by the model in the running turn, not by a wording pattern. The model declares the meaning with `declare_intent`, quoting the newest user message verbatim; the runtime checks that the quote really came from that message, which goal it targets (and refuses to guess when several are running and none is named), the legal ordered operations, and the plan step a boundary names by stable id. Any language, phrasing or compound instruction ("继续执行，但第三阶段完成后暂停") uses the same path, and no extra classification call is made.
+- A pause is released only by a validated `continue_task`. Clients submit the user's text unchanged and project the runtime's goal state; "继续" no longer turns into a special client-side resume intent. A supplement or a status question neither releases a pause nor starts work, and a declaration cannot create authority the user did not state.
+- Accepted declarations are stored in order with the turn that carried the quoted user message (migrations 0053, 0054), so a restart can still answer who authorized what, with which words. A turn that continues the same goal reuses its plan instead of re-planning the completed stages from nothing.
+- `docs/INTENT_CONTRACT.md` records the ownership boundaries for the declaration, validation, persistence and client projection.
+
 ## [1.0.25] - 2026-11-09
 
 - Input integrity has one boundary. Secrets are classified by value instead of by field name, so PEM blocks, `DB_PASS`, JSON/YAML credentials and `Authorization` values are redacted while code identifiers, prose and JSON keys stay byte-identical; a placeholder can no longer be written back to disk through `write_file`, an added file or a new patch line.

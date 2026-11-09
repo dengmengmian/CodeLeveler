@@ -63,6 +63,36 @@ fn finish_frame(reason: &str) -> String {
     serde_json::json!({"choices": [{"delta": {}, "finish_reason": reason}]}).to_string()
 }
 
+/// One model round that states its structured reading of the newest user
+/// message. The runtime validates the quote and the operations; it never reads
+/// the message itself.
+fn declare_intent_frame(id: &str, quote: &str, operations: serde_json::Value) -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            id,
+            "declare_intent",
+            serde_json::json!({"source_quote": quote, "operations": operations}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
+/// The pause boundary from `PAUSED_OBJECTIVE`, expressed against the plan's
+/// stable step id instead of the step's wording.
+fn declare_pause_after_stage_one() -> MockResponse {
+    declare_intent_frame(
+        "i-pause",
+        "阶段 1 完成后停下，等待我确认再执行阶段 2",
+        serde_json::json!([{
+            "kind": "set_pause_boundary",
+            "boundary": {
+                "kind": "after_step",
+                "step": {"step_id": "stage-1", "label": "阶段 1：创建 stage-1.txt 并确认"}
+            }
+        }]),
+    )
+}
+
 /// One assistant message with text and no tool calls: the shape of an answer.
 fn answer_frame(text: &str) -> String {
     serde_json::json!({"choices": [{"delta": {"content": text}}]}).to_string()
@@ -670,13 +700,14 @@ fn paused_after_stage_one() -> Vec<MockResponse> {
                 "p1",
                 "update_plan",
                 serde_json::json!({"plan": [
-                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "in_progress"},
+                    {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "in_progress"},
                     {"step": "阶段 1 完成后停下，等待我确认", "status": "pending"},
-                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                    {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
                 ]}),
             ),
             finish_frame("tool_calls"),
         ]),
+        declare_pause_after_stage_one(),
         sse(vec![
             tool_call_frame(
                 "w1",
@@ -690,9 +721,9 @@ fn paused_after_stage_one() -> Vec<MockResponse> {
                 "p2",
                 "update_plan",
                 serde_json::json!({"plan": [
-                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "completed"},
+                    {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "completed"},
                     {"step": "阶段 1 完成后停下，等待我确认", "status": "completed"},
-                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                    {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
                 ]}),
             ),
             finish_frame("tool_calls"),
@@ -708,6 +739,13 @@ const SUPPLEMENT: &str = "顺便把 stage-extra.txt 也补上，内容为一行 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_supplement_to_a_paused_goal_is_scope_and_keeps_the_pause() {
     let mut responses = paused_after_stage_one();
+    // The model reads the supplement as an amendment to the same goal; it is
+    // scope, not an authorization to continue.
+    responses.push(declare_intent_frame(
+        "i-amend",
+        SUPPLEMENT,
+        serde_json::json!([{"kind": "amend_current_task"}]),
+    ));
     responses.push(plain_answer("补充要求已记下；阶段 2 仍等你的确认。"));
     let f = fixture(responses, leveler_agent::CollaborationMode::Goal).await;
     run_goal_turn(&f, PAUSED_OBJECTIVE).await;
@@ -770,6 +808,13 @@ async fn a_supplement_to_a_paused_goal_is_scope_and_keeps_the_pause() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_status_question_inside_a_paused_goal_adds_no_scope() {
     let mut responses = paused_after_stage_one();
+    // The model reads the message as a question about the task, not as an
+    // authorization to drive the withheld stage.
+    responses.push(declare_intent_frame(
+        "i-query",
+        "刚才修改了哪些文件？测试通过了吗？",
+        serde_json::json!([{"kind": "answer_only"}]),
+    ));
     responses.push(plain_answer("阶段 1 创建了 stage-1.txt；没有跑测试。"));
     let f = fixture(responses, leveler_agent::CollaborationMode::Goal).await;
     run_goal_turn(&f, PAUSED_OBJECTIVE).await;
@@ -827,13 +872,14 @@ fn committed_pause_turn() -> Vec<MockResponse> {
                 "p1",
                 "update_plan",
                 serde_json::json!({"plan": [
-                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "in_progress"},
+                    {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "in_progress"},
                     {"step": "阶段 1 完成后停下，等待我确认", "status": "pending"},
-                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                    {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
                 ]}),
             ),
             finish_frame("tool_calls"),
         ]),
+        declare_pause_after_stage_one(),
         sse(vec![
             tool_call_frame(
                 "w1",
@@ -847,9 +893,9 @@ fn committed_pause_turn() -> Vec<MockResponse> {
                 "p2",
                 "update_plan",
                 serde_json::json!({"plan": [
-                    {"step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "completed"},
+                    {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt 并运行 sh -c 'cat stage-1.txt' 确认", "status": "completed"},
                     {"step": "阶段 1 完成后停下，等待我确认", "status": "completed"},
-                    {"step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
+                    {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt 并运行 sh -c 'cat stage-2.txt' 确认", "status": "pending"}
                 ]}),
             ),
             finish_frame("tool_calls"),

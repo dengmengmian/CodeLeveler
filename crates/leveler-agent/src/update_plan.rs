@@ -39,6 +39,14 @@ struct PlanItem {
     step: String,
     /// One of `pending`, `in_progress`, `completed`.
     status: StepStatus,
+    /// Stable identity for this step. Keep it unchanged when the text is
+    /// reworded: a user pause boundary names this id, so a boundary that
+    /// follows a rename must follow the same stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Stable id such as \"stage-1\"; keep it when you rename the step. A user pause boundary names this id."
+    )]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -112,13 +120,16 @@ impl Tool for UpdatePlanTool {
          judgement of its top-level status changes, publish the updated full \
          plan. Sub-agent plans are local and never change yours.\n\n\
          Arguments: optional `explanation` (a note stored with this update) and \
-         `plan` (the ordered items). Each item has `step` (text) and `status` \
-         (`pending`, `in_progress`, or `completed`). The list must contain at \
-         least one item. At most one item may be `in_progress`; more than one \
-         is an error and the previous plan is left unchanged. Each call \
-         replaces the whole list.\n\n\
+         `plan` (the ordered items). Each item has `step` (text), `status` \
+         (`pending`, `in_progress`, or `completed`) and an optional stable `id`. \
+         The list must contain at least one item. At most one item may be \
+         `in_progress`; more than one is an error and the previous plan is left \
+         unchanged. Each call replaces the whole list.\n\n\
          `pending` is not done. `in_progress` is the current item. `completed` \
-         is done. The tool does not check those claims."
+         is done. The tool does not check those claims.\n\n\
+         Give every step a stable `id` (for example `stage-1`) and keep the id \
+         when you rename or split the step. A user pause boundary is declared \
+         against a step id, so it follows the stage rather than its wording."
     }
 
     fn input_schema(&self) -> serde_json::Value {

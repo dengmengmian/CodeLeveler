@@ -324,6 +324,106 @@ pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     }
 }
 
+/// The name of the structured user-intent tool.
+pub(crate) const DECLARE_INTENT_TOOL: &str = "declare_intent";
+
+/// Translate the user's newest message into the lifecycle transition it means.
+///
+/// This is the only entry point through which a user message can continue,
+/// pause, re-bound, amend or cancel a goal. The runtime never reads the
+/// message's words: it validates that `source_quote` really occurs in the
+/// newest user input, that every named plan step exists in the model's own
+/// declared plan, and that the operation sequence is a legal transition over
+/// the durable goal state. Every language, length and phrasing is equally
+/// valid — the model supplies the meaning, the runtime supplies the mechanics.
+pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
+    let description = String::from(
+        "State what the user's newest message means for the task lifecycle. Call this \
+            BEFORE continuing, pausing, changing or cancelling an existing goal, from any \
+            language or phrasing. `source_quote` must copy the part of the user's newest \
+            message that carries the instruction — the runtime checks that it really occurs \
+            there, so never paraphrase or invent one. Put the operations in the order the \
+            user meant them: `continue_task` releases a pause, `pause_task` stops at a \
+            boundary, `set_pause_boundary` / `replace_pause_boundary` move a future boundary \
+            without releasing a current pause, `amend_current_task` records a refinement of \
+            the same goal, `cancel_task` ends it, `start_independent_task` says the request is \
+            unrelated to any running goal, `answer_only` says the user asked a question and \
+            no goal drive is authorized. Compose them for a compound instruction such as \
+            \"continue, but pause after stage three\": continue_task, then \
+            set_pause_boundary. A boundary names a `step_id` from your own plan, so call \
+            update_plan with stable `id` values first. Only a declaration of this tool can \
+            release a pause or cancel a goal; your own prose cannot. If the user's message \
+            does not change the lifecycle, do not call this.",
+    );
+    ToolDefinition {
+        name: DECLARE_INTENT_TOOL.to_string(),
+        description,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source_quote": {
+                    "type": "string",
+                    "description": "Verbatim span of the user's newest message that this declaration interprets. Whitespace differences are tolerated; paraphrases are not."
+                },
+                "goal_id": {
+                    "type": "string",
+                    "description": "The running goal this applies to. Omit when exactly one running goal exists for this task; the runtime refuses to guess among several."
+                },
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "continue_task",
+                                    "pause_task",
+                                    "set_pause_boundary",
+                                    "replace_pause_boundary",
+                                    "amend_current_task",
+                                    "start_independent_task",
+                                    "cancel_task",
+                                    "answer_only"
+                                ]
+                            },
+                            "boundary": {
+                                "type": "object",
+                                "description": "Required for pause_task, set_pause_boundary and replace_pause_boundary.",
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": ["now", "after_any_step", "after_step"]
+                                    },
+                                    "step": {
+                                        "type": "object",
+                                        "description": "Required when kind is after_step.",
+                                        "properties": {
+                                            "step_id": {"type": "string"},
+                                            "label": {"type": "string"}
+                                        },
+                                        "required": ["step_id"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "required": ["kind"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": false
+                    },
+                    "description": "Ordered operations. Applied in this order."
+                }
+            },
+            "required": ["source_quote", "operations"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Declare that the user's request is execution work this turn must carry \

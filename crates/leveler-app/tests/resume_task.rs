@@ -53,6 +53,20 @@ fn finish_frame(reason: &str) -> String {
     serde_json::json!({"choices": [{"delta": {}, "finish_reason": reason}]}).to_string()
 }
 
+/// One model round stating its reading of the user's message through the
+/// structured intent contract. Pauses, continuations and cancellations are
+/// declared by the model, never inferred by the runtime from the user's words.
+fn declare_intent_frame(id: &str, quote: &str, operations: serde_json::Value) -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            id,
+            "declare_intent",
+            serde_json::json!({"source_quote": quote, "operations": operations}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
 fn write_config(root: &std::path::Path, base_url: &str) {
     std::fs::create_dir_all(root.join("configs/providers")).unwrap();
     std::fs::create_dir_all(root.join("configs/models")).unwrap();
@@ -93,7 +107,7 @@ struct Fixture {
     app: Arc<Application>,
     session: leveler_core::SessionId,
     _tmp: tempfile::TempDir,
-    _server: MockServer,
+    server: MockServer,
 }
 
 async fn fixture(responses: Vec<MockResponse>, axis: leveler_agent::CollaborationMode) -> Fixture {
@@ -124,7 +138,7 @@ async fn fixture(responses: Vec<MockResponse>, axis: leveler_agent::Collaboratio
         app,
         session,
         _tmp: tmp,
-        _server: server,
+        server,
     }
 }
 
@@ -495,8 +509,41 @@ async fn bounded_interrupted_fixture() -> Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ordinary_submit_continuation_cannot_reopen_cancelled_task() {
-    let f = bounded_interrupted_fixture().await;
+async fn a_cancelled_task_cannot_be_reopened_by_a_continuation_declaration() {
+    // The bounded run consumes the first two scripted rounds. The next message
+    // is an ordinary turn; the model reads `继续` as a continuation and states
+    // that through the structured contract. The runtime refuses it: the goal
+    // is settled, so there is nothing to continue. The refusal is the authority
+    // here — the client does not keyword-reject the message.
+    let mut responses = interrupted_work();
+    responses.push(declare_intent_frame(
+        "c-continue",
+        "继续",
+        serde_json::json!([{"kind": "continue_task"}]),
+    ));
+    responses.push(sse(vec![
+        serde_json::json!({"choices": [{"delta": {
+            "content": "该任务已取消，没有可继续的工作。"
+        }}]})
+        .to_string(),
+        finish_frame("stop"),
+    ]));
+    let f = fixture(responses, leveler_agent::CollaborationMode::Goal).await;
+    f.app
+        .run_in_session_bounded(
+            &f.session,
+            &ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            "finish the inventory work",
+            Arc::new(AutoApprove),
+            false,
+            &mut |_| {},
+            CancellationToken::new(),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
     let client = InProcessRuntimeClient::new(
         f.app.clone(),
         ModelRef::new("mock", "m"),
@@ -509,30 +556,67 @@ async fn ordinary_submit_continuation_cannot_reopen_cancelled_task() {
         })
         .await
         .unwrap();
-    let error = client
+    client
         .send(ClientCommand::SubmitMessage {
             session_id: f.session.clone(),
             content: "继续".into(),
             attachments: Vec::new(),
         })
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("已被取消"), "{error}");
-    let db = f.app.open_database().await.unwrap();
-    assert_eq!(
-        TurnRepository::new(&db)
-            .list(&f.session)
-            .await
-            .unwrap()
-            .len(),
-        1
+        .expect("a message after a cancellation is an ordinary message");
+    settled(&f.app, &f.session, 2).await;
+
+    // The model really did declare the continuation and really did read the
+    // runtime's refusal, rather than never asking.
+    let bodies = f.server.request_bodies().await;
+    let refusal = bodies.iter().any(|body| {
+        body.contains("No running goal exists for this task") && body.contains("declare_intent")
+    });
+    assert!(
+        refusal,
+        "the model must be told the runtime refused the continuation: {bodies:#?}"
     );
-    let terminal = EventRepository::new(&db)
-        .load_last_by_type(&f.session, "task_finished", None)
+
+    let db = f.app.open_database().await.unwrap();
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(turns.len(), 2, "the cancelled task was not reopened");
+    assert_eq!(
+        turns[1].kind, "chat",
+        "with a settled goal the message stays an ordinary turn"
+    );
+    let task = EngineStores::from_database(&db)
+        .tasks
+        .task_for_session(&f.session)
         .await
         .unwrap()
         .unwrap();
-    assert!(terminal.payload.contains("cancelled"));
+    let goals = EngineStores::from_database(&db)
+        .goals
+        .for_task(&task)
+        .await
+        .unwrap();
+    assert_eq!(goals.len(), 1, "no second goal was opened: {goals:?}");
+    assert_eq!(
+        goals[0].state,
+        GoalState::Settled,
+        "the cancelled goal stays settled"
+    );
+    // The cancellation terminal was written when the user cancelled; the later
+    // ordinary turn adds its own terminal, so the cancel fact is looked up by
+    // its reason rather than by "last".
+    let terminals: Vec<_> = EventRepository::new(&db)
+        .load(&f.session)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event_type == "task_finished")
+        .collect();
+    assert!(
+        terminals
+            .iter()
+            .any(|row| row.payload.contains("user_cancelled_task")),
+        "the cancellation is a durable terminal: {terminals:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1506,12 +1590,20 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
                     "c-plan-1",
                     "update_plan",
                     serde_json::json!({"plan": [
-                        {"step": "阶段 1：创建 stage-1.txt", "status": "in_progress"},
-                        {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                        {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt", "status": "in_progress"},
+                        {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt", "status": "pending"}
                     ]}),
                 ),
                 finish_frame("tool_calls"),
             ]),
+            declare_intent_frame(
+                "c-bound",
+                "阶段 1 完成后停下，等待我确认再执行阶段 2",
+                serde_json::json!([{
+                    "kind": "set_pause_boundary",
+                    "boundary": {"kind": "after_step", "step": {"step_id": "stage-1"}}
+                }]),
+            ),
             sse(vec![
                 tool_call_frame(
                     "c-write-1",
@@ -1525,8 +1617,8 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
                     "c-plan-2",
                     "update_plan",
                     serde_json::json!({"plan": [
-                        {"step": "阶段 1：创建 stage-1.txt", "status": "completed"},
-                        {"step": "阶段 2：创建 stage-2.txt", "status": "pending"}
+                        {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt", "status": "completed"},
+                        {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt", "status": "pending"}
                     ]}),
                 ),
                 finish_frame("tool_calls"),
@@ -1538,7 +1630,13 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
                 .to_string(),
                 finish_frame("stop"),
             ]),
-            // Turn 2: the user authorizes the rest. The model continues.
+            // Turn 2: the user authorizes the rest. The model reads it as a
+            // continuation of the paused goal and says so before acting.
+            declare_intent_frame(
+                "c-continue",
+                "确认，继续阶段 2",
+                serde_json::json!([{"kind": "continue_task"}]),
+            ),
             sse(vec![
                 tool_call_frame(
                     "c-write-2",
@@ -1552,8 +1650,8 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
                     "c-plan-3",
                     "update_plan",
                     serde_json::json!({"plan": [
-                        {"step": "阶段 1：创建 stage-1.txt", "status": "completed"},
-                        {"step": "阶段 2：创建 stage-2.txt", "status": "completed"}
+                        {"id": "stage-1", "step": "阶段 1：创建 stage-1.txt", "status": "completed"},
+                        {"id": "stage-2", "step": "阶段 2：创建 stage-2.txt", "status": "completed"}
                     ]}),
                 ),
                 finish_frame("tool_calls"),
@@ -1667,9 +1765,13 @@ async fn a_continuation_authorization_reenters_the_paused_goal_from_chat() {
     );
     let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
     assert_eq!(turns.len(), 2);
+    // The client started an ordinary message; that is what the row records.
+    // The goal is re-entered by the model's structured declaration inside the
+    // turn (`declare_intent continue_task`), not by a client-side route that
+    // would have to read the user's wording.
     assert_eq!(
-        turns[1].kind, "user",
-        "the continuation enters the goal resume path, not a fresh chat turn"
+        turns[1].kind, "chat",
+        "an ordinary message starts an ordinary turn; the goal is adopted by declaration"
     );
     assert!(f._tmp.path().join("stage-2.txt").exists());
 }

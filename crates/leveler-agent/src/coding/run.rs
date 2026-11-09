@@ -4235,6 +4235,7 @@ impl CodingRuntime {
                             prior,
                             goal_id: goal_id.clone(),
                             verification_runs,
+                            continuing: continuing_goal,
                         },
                         prior_epoch_open,
                         runner.session_id.clone(),
@@ -4498,11 +4499,12 @@ impl CodingRuntime {
     /// committed a task); a plain Chat turn passes its turn id and has no goal
     /// row, so this is a no-op there.
     ///
-    /// Set when this window ended at the user's own boundary. Clear only when
-    /// the user's own NEWEST authorization signal is a continuation, or the
-    /// goal no longer owes work. An absent pause wording is never read as a
-    /// release: a goal declared by `commit_task` may not quote the user's pause
-    /// verbatim, and forgetting a boundary is the one error this must not make.
+    /// Only SET here: the window reached the structured boundary the user
+    /// declared. Release is owned by the validated intent declaration
+    /// (`Goaler::record_intent`), and settlement clears it atomically with the
+    /// goal row. No reader of the user's words runs in this path — an absent
+    /// pause wording is never read as a release, and a status question cannot
+    /// silently lift a boundary the person set.
     async fn sync_goal_user_pause(
         &self,
         token: &leveler_core::OwnershipToken,
@@ -4517,26 +4519,11 @@ impl CodingRuntime {
             .stop_detail
             .as_deref()
             .is_some_and(crate::executor::closeout::is_user_pause_detail);
-        if paused {
-            if record.user_paused_at.is_none() {
-                self.engine
-                    .stores
-                    .goals
-                    .set_user_pause(token, &goal_id, Some(leveler_core::now()))
-                    .await?;
-            }
-            return Ok(());
-        }
-        let released = leveler_lifecycle::latest_authorization_signal(
-            std::iter::once(record.objective.as_str())
-                .chain(record.amendments.iter().map(String::as_str)),
-        ) == Some(leveler_lifecycle::AuthorizationSignal::Continue);
-        let settled = record.state == leveler_storage::GoalState::Settled;
-        if record.user_paused_at.is_some() && (released || settled) {
+        if paused && record.user_paused_at.is_none() {
             self.engine
                 .stores
                 .goals
-                .set_user_pause(token, &goal_id, None)
+                .set_user_pause(token, &goal_id, Some(leveler_core::now()))
                 .await?;
         }
         Ok(())

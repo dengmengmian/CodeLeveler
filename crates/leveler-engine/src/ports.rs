@@ -58,6 +58,8 @@ pub enum TaskRelation {
 /// derives requirements from the user-authored fields only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalScope {
+    /// The durable goal identity this scope belongs to.
+    pub goal_id: leveler_core::GoalId,
     pub objective: String,
     pub acceptance: Vec<String>,
     pub amendments: Vec<String>,
@@ -68,6 +70,11 @@ pub struct GoalScope {
     /// must honor it: the goal still owes work, but the user withheld the
     /// authorization to continue it.
     pub user_paused_at: Option<leveler_core::Timestamp>,
+    /// The structured stage boundary the user declared, when one is in force.
+    ///
+    /// Persisted only from a validated intent declaration; no reader derives
+    /// it from the wording of the user's message.
+    pub pause_boundary: Option<leveler_lifecycle::PauseBoundary>,
 }
 
 /// Durable goal identity for a turn that was not started as a Goal turn.
@@ -100,6 +107,36 @@ pub trait GoalBinder: Send + Sync {
     /// narrow the scope: the authority is the persisted goal row, not the
     /// live transcript.
     async fn scope(&self) -> Result<Option<GoalScope>, PortError>;
+
+    /// Bind an EXISTING goal to this turn without opening or changing it.
+    ///
+    /// A user can continue, amend, pause or cancel a goal from an ordinary
+    /// message in a turn that did not start as a Goal turn. The model states
+    /// that reading with a structured intent declaration; this is how the turn
+    /// gains the durable identity the declaration applies to. Adoption never
+    /// changes the goal's state: only a validated declaration does.
+    ///
+    /// Fail-closed: an id that does not belong to this task, or a goal that is
+    /// no longer running, is an error rather than a silent no-op.
+    async fn adopt(&self, goal: &leveler_core::GoalId) -> Result<(), PortError>;
+
+    /// Running goals of this task, with their durable pause state.
+    ///
+    /// The fact is durable and may predate the live transcript (resume,
+    /// compaction, a new session), so the runtime states it instead of asking
+    /// the model to infer it from history. A declaration that names no goal is
+    /// resolved against this set; more than one is ambiguous.
+    async fn running_goals(&self) -> Result<Vec<GoalScope>, PortError>;
+
+    /// Persist a validated intent declaration for the bound goal and apply the
+    /// state it projects. This is the single authority for pause release,
+    /// boundary replacement and cancellation; no keyword reader may substitute
+    /// for it.
+    async fn record_intent(
+        &self,
+        declaration: &leveler_lifecycle::UserIntentDeclaration,
+        projection: &leveler_lifecycle::IntentProjection,
+    ) -> Result<(), PortError>;
 
     /// Append one verbatim user-authored scope instruction to the bound goal.
     /// No-op before a goal exists; fail-closed if the durable write fails.
