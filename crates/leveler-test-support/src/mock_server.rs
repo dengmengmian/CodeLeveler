@@ -205,6 +205,13 @@ impl MockServer {
         self.queue.lock().await.push_back(response);
     }
 
+    /// Drop every response still queued. A test with two sessions shares one
+    /// mock script; the first session's held-last response would otherwise be
+    /// inherited by the second session's first request.
+    pub async fn clear(&self) {
+        self.queue.lock().await.clear();
+    }
+
     /// The base URL to point a provider at, e.g. `http://127.0.0.1:54321`.
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
