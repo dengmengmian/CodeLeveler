@@ -384,6 +384,16 @@ async fn wait_hosted_task(
     client: &LocalSocketRuntimeClient,
     session: &str,
 ) -> (String, Option<u32>) {
+    wait_hosted_task_with(client, session, None).await
+}
+
+/// As [`wait_hosted_task`], but on timeout include the runtime's captured
+/// stderr (the only place the supervisor-unavailable reason is written).
+async fn wait_hosted_task_with(
+    client: &LocalSocketRuntimeClient,
+    session: &str,
+    env: Option<&Environment>,
+) -> (String, Option<u32>) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = client
@@ -397,10 +407,26 @@ async fn wait_hosted_task(
         {
             return (task.task_id.clone(), task.pid);
         }
-        assert!(
-            Instant::now() < deadline,
-            "the production tool never published a supervised task"
-        );
+        if Instant::now() >= deadline {
+            let mut report = String::new();
+            if let Some(env) = env {
+                for entry in std::fs::read_dir(&env.home).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with("-stderr.txt"))
+                    {
+                        report.push_str(&format!(
+                            "\n--- {} ---\n{}",
+                            path.display(),
+                            std::fs::read_to_string(&path).unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            panic!("the production tool never published a supervised task{report}");
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -1417,15 +1443,29 @@ fn b10_b13_two_sessions_keep_background_ownership_and_cleanup_isolated() {
             mock.push(spawn_response("b10-spawn-a", script_a)).await;
             mock.push(MockResponse::NeverResponds).await;
             submit(&client, &session_a, "Start service A.").await;
-            let (task_a, pid_a) = wait_hosted_task(&client, &session_a).await;
+            let (task_a, pid_a) = wait_hosted_task_with(&client, &session_a, Some(&env)).await;
             let pid_a = pid_a.expect("pid a");
+
+            // A's continuation round consumes its own held response before B
+            // starts. Wait for that request, then drop the held entry: the
+            // mock repeats its last response, so it would otherwise be the
+            // first thing B's first request received.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while mock.request_count() < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "A's continuation round never reached the model"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            mock.clear().await;
 
             let session_b = create_goal_session(&client, "b10 session B").await;
             let script_b = "echo $$ > b10-b.pid; echo READY_B; sleep 300";
             mock.push(spawn_response("b10-spawn-b", script_b)).await;
             mock.push(MockResponse::NeverResponds).await;
             submit(&client, &session_b, "Start service B.").await;
-            let (task_b, pid_b) = wait_hosted_task(&client, &session_b).await;
+            let (task_b, pid_b) = wait_hosted_task_with(&client, &session_b, Some(&env)).await;
             let pid_b = pid_b.expect("pid b");
             assert_ne!(task_a, task_b);
             assert!(alive(pid_a) && alive(pid_b));
@@ -1471,6 +1511,17 @@ fn b10_b13_two_sessions_keep_background_ownership_and_cleanup_isolated() {
                 .await
                 .unwrap();
             wait_until(|| Ok(!alive(pid_b)), "B's cancelled service")
+                .await
+                .unwrap();
+            // The durable record catches up at a snapshot boundary: a client
+            // that reconnects reads it there. Ask once per session, as a
+            // reconnecting client would, before reading the log.
+            let _ = client
+                .snapshot(&leveler_client_protocol::SessionId::new(&session_a))
+                .await
+                .unwrap();
+            let _ = client
+                .snapshot(&leveler_client_protocol::SessionId::new(&session_b))
                 .await
                 .unwrap();
             // Each session's terminal fact stays in its own transcript.
