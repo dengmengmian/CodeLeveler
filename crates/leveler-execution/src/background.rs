@@ -70,6 +70,10 @@ const MAX_RETAINED_TERMINAL_TASKS: usize = 64;
 /// gone. Low frequency on purpose: an owned dev server can run for hours, and
 /// this is a single `signal(0)` probe, not a process scan.
 const GROUP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long the terminal fact waits for every group member to disappear after
+/// the workload has been killed. A zombie that nobody reaps cannot mutate, so
+/// it must not hold the durable terminal fact forever.
+const GROUP_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long the reaper lets the output pumps flush after the process group is
 /// confirmed gone, before it finishes the task anyway. Bounded on purpose: an
@@ -1716,6 +1720,13 @@ impl BackgroundTaskRegistry {
             // failure; the task stays running and stoppable until the group ends.
             if let Some(identity) = identity {
                 let mut announced = false;
+                // A zombie grandchild left in the group keeps `killpg` from
+                // reporting ESRCH until its new parent reaps it; a container
+                // whose PID 1 does not reap would otherwise hold the task
+                // forever. A zombie cannot mutate, so bound the wait and keep
+                // the terminal fact rather than blocking on an unreapable
+                // member.
+                let group_deadline = tokio::time::Instant::now() + GROUP_TERMINAL_WAIT;
                 while !identity.group_gone().await {
                     if !announced && failed_launcher {
                         announced = true;
@@ -1725,6 +1736,13 @@ impl BackgroundTaskRegistry {
                         {
                             task.done.notify_waiters();
                         }
+                    }
+                    if tokio::time::Instant::now() >= group_deadline {
+                        tracing::warn!(
+                            task = %tid,
+                            "process group still has members after the terminal wait"
+                        );
+                        break;
                     }
                     tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
                 }
@@ -1968,8 +1986,18 @@ impl BackgroundTaskRegistry {
                     )
                 }
             };
-            // The process group, not the launcher, owns the workload.
+            // The process group, not the launcher, owns the workload. Bound
+            // the wait: a zombie member cannot mutate, and a task must not
+            // stay "Killing" forever because nobody reaped it.
+            let group_deadline = tokio::time::Instant::now() + GROUP_TERMINAL_WAIT;
             while !reaper_identity.group_gone().await {
+                if tokio::time::Instant::now() >= group_deadline {
+                    tracing::warn!(
+                        task = %tid,
+                        "process group still has members after the terminal wait"
+                    );
+                    break;
+                }
                 tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
             }
             // Group identity expires when the group is gone, before a slow
