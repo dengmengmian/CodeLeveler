@@ -438,32 +438,78 @@ fn first_positive_pause_cue(sentence: &str) -> Option<usize> {
     best
 }
 
-/// A negation immediately before the cue ("不要等我", "do not wait").
+/// Negation markers that can govern a pause cue.
+const PAUSE_NEGATIONS_CJK: &[&str] = &[
+    "不要",
+    "不用",
+    "不必",
+    "无需",
+    "不需要",
+    "别",
+    "勿",
+    "禁止",
+    "不",
+];
+
+const PAUSE_NEGATIONS_ASCII: &[&str] = &[
+    "do not",
+    "don't",
+    "dont",
+    "never",
+    "without",
+    "no need to",
+    "not",
+];
+
+/// Adverbs a person puts between the negation and the cue. They do not change
+/// which verb is negated: `不需要逐步等待确认` means `不需要等待确认`.
+const PAUSE_NEGATION_FILLERS: &[&str] = &[
+    "逐步",
+    "逐个",
+    "逐一",
+    "一一",
+    "每次",
+    "每次都",
+    "再",
+    "一直",
+    "反复",
+    "都",
+    "继续",
+];
+
+/// A negation governing the cue ("不要等我", "不需要逐步等待确认", "do not wait").
+///
+/// The negation is read inside the cue's own clause: a `不需要` that governs a
+/// different verb earlier in the sentence (`不需要修改 CI，完成后等待确认`) does not
+/// cancel the later pause. Only adverbs may sit between the negation and the
+/// cue; a reminder verb (`不要忘记等待确认`) keeps the pause.
 fn cue_negated(before: &str) -> bool {
-    let tail: String = before
-        .chars()
-        .rev()
-        .take(10)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let tail = tail.trim_end_matches([' ', '\t', '，', ',', '：', ':']);
-    ["不要", "不用", "不必", "无需", "不需要", "别", "勿", "禁止"]
+    let clause = before
+        .rsplit([
+            '，', ',', '。', '；', ';', '：', ':', '！', '!', '？', '?', '\n',
+        ])
+        .next()
+        .unwrap_or(before);
+    let mut tail = clause.trim();
+    loop {
+        let mut stripped = false;
+        for filler in PAUSE_NEGATION_FILLERS {
+            if let Some(rest) = tail.strip_suffix(filler) {
+                tail = rest.trim_end();
+                stripped = true;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    let lower = tail.to_ascii_lowercase();
+    PAUSE_NEGATIONS_CJK
         .iter()
-        .any(|negation| tail.ends_with(negation))
-        || [
-            "do not ",
-            "don't ",
-            "dont ",
-            "never ",
-            "without ",
-            "no need to ",
-            "not ",
-        ]
-        .iter()
-        .any(|negation| tail.ends_with(negation))
+        .any(|negation| lower.ends_with(negation))
+        || PAUSE_NEGATIONS_ASCII
+            .iter()
+            .any(|negation| lower.ends_with(negation))
 }
 
 /// A whole-sentence negation of stopping: "一次做完，中间不要停下来等我确认".
@@ -766,6 +812,64 @@ mod tests {
             extract_user_pause("Please do it all in one go, do not stop and wait for me."),
             None
         );
+    }
+
+    /// A negation reaches the pause cue across the adverbs a person actually
+    /// puts between them. The negation is scoped to its own clause: an
+    /// unrelated `不需要` earlier in the sentence does not cancel a later,
+    /// genuine pause.
+    #[test]
+    fn an_adverb_between_the_negation_and_the_cue_does_not_create_a_pause() {
+        for sentence in [
+            "直接基于真实代码推进开发，不需要逐步等待确认。",
+            "不需要逐步等待确认。",
+            "不用每次都等我确认。",
+            "不要一直等待确认。",
+            "不要逐个等待确认。",
+            "不暂停，直接做完。",
+        ] {
+            assert_eq!(extract_user_pause(sentence), None, "`{sentence}`");
+        }
+    }
+
+    #[test]
+    fn a_negation_in_another_clause_does_not_release_a_pause() {
+        let boundary = extract_user_pause("不需要修改 CI，完成后等待确认。").unwrap();
+        assert_eq!(
+            boundary,
+            UserPauseBoundary::AfterAny,
+            "the second clause still asks to wait after completion"
+        );
+    }
+
+    /// `不要忘记…` is a reminder to wait, not a cancellation of the wait.
+    #[test]
+    fn a_reminder_to_wait_is_still_a_pause() {
+        assert_eq!(
+            extract_user_pause("不要忘记等待确认。"),
+            Some(UserPauseBoundary::Now)
+        );
+        assert!(extract_user_pause("别忘了完成后等我确认。").is_some());
+    }
+
+    /// The sentence that ended the audited session: it authorizes direct
+    /// progress. Reading it as `Now` let closeout finish the turn before the
+    /// refused commitment could continue.
+    #[test]
+    fn the_audited_objective_states_no_pause() {
+        assert_eq!(
+            extract_user_pause("直接基于真实代码推进开发，不需要逐步等待确认。"),
+            None
+        );
+    }
+
+    /// The English negation list carried trailing spaces, so a cue preceded by
+    /// `do not ` never matched after the tail was trimmed.
+    #[test]
+    fn english_negation_matches_before_its_cue() {
+        assert!(cue_negated("do not "));
+        assert!(cue_negated("please do not "));
+        assert!(!cue_negated("do not forget "));
     }
 
     #[test]
