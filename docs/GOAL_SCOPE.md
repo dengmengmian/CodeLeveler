@@ -42,10 +42,11 @@ Kinds: `artifact`, `artifact_absent`, `command`, `named`, `content`, `tests`,
 `forbidden`, `baseline`, `preparation`, `constraint`. Deliverables are the kinds
 the gate holds the model to; `forbidden`, `baseline`, `preparation` and
 `constraint` are context the model must honour but cannot be "completed".
-`artifact`, `artifact_absent`, `content` and `command` require `target`. For
-`content`, `text` is the exact literal line the gate compares against `target`;
-a description of the line is refused, and the model must amend `text` to the
-literal rather than rewrite the file.
+`artifact`, `artifact_absent`, `content`, `command` and `tests` require
+`target`; for `tests`, `target` is the exact test command whose run is its
+evidence. For `content`, `text` is the exact literal line the gate compares
+against `target`; a description of the line is refused, and the model must
+amend `text` to the literal rather than rewrite the file.
 
 ## Declaration
 
@@ -117,15 +118,24 @@ stable id** (`requirements=[{id, status, evidence}]`):
 - `content` is checked as a line of the target file;
 - `command` must match a successful recorded run after the last change — the
   evidence may cite `call_id:<id>` or the command line;
-- `tests` must cite a passing recorded run after the last change, so no runner
-  name or output format is recognised by vocabulary;
+- `tests` declares its exact command in `target`; a passing recorded run of
+  that command after the last change accounts for the requirement. The runtime
+  has no structured test result, so command success alone is reported as
+  `unverified` test coverage and the record states that limitation: a command
+  that exits 0 without running a test cannot claim test coverage. No runner
+  name or output format is recognised. Legacy `tests` requirements recorded
+  without a `target` are accepted at the same explicit unverified boundary
+  instead of blocking a goal that was legally recorded;
 - `named` is accepted with an explicit "no mechanical check" warning.
 
 The gate reads the durable set on every completion claim, so a compacted
 transcript or a restarted process cannot narrow the scope. A model that never
 declares a set has nothing for the gate to enforce; Goal mode therefore states
 the declaration obligation in its contract, and `get_goal_scope` always shows
-the exact set the gate will read.
+the exact set the gate will read. With no owed requirement there is nothing
+requirement-level to verify, so such a completion is never reported `Verified`:
+a citation may prove that a command ran, but no declared deliverable was
+checked.
 
 ## Verification report
 
@@ -149,9 +159,9 @@ An accepted completion persists a `VerificationReport` on the task terminal
 {
   "status": "unverified",
   "records": [
-    {"requirement_id": "R1", "kind": "tests", "state": "verified",
-     "detail": "verified against the execution record: `sh run-tests.sh` exited 0 at workspace version 4",
-     "call_id": "call-12", "command": "sh run-tests.sh", "exit_code": 0,
+    {"requirement_id": "R2", "kind": "tests", "state": "unverified",
+     "detail": "`make regression` exited 0 at workspace version 4 (step 7), but the runtime observed no structured test result: command success does not establish that any test executed, so the test coverage remains unverified",
+     "call_id": "call-12", "command": "make regression", "exit_code": 0,
      "workspace_version": 4, "model_step": 7}
   ]
 }
@@ -162,6 +172,8 @@ carries the evidence fields only when a recorded execution backed it; otherwise
 `call_id`/`command`/`exit_code` are absent and `detail` says what the runtime
 could not check. `workspace_version` is the mutation counter the verdict was
 taken against, so a stale verdict is visible without replaying the transcript.
+`Verified` requires at least one owed requirement record and every record
+`verified`; a partial or empty record set is `unverified`.
 
 Replay is additive. Terminals written before 2026-09-23 carry the removed
 host-owned verdict as a bare string under the same field

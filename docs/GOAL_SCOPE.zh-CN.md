@@ -39,8 +39,9 @@ quote 只证明来源存在，不证明模型的解释正确；原始用户消�
 `forbidden`、`baseline`、`preparation`、`constraint`。交付类是 Gate 会追究的
 种类；`forbidden`、`baseline`、`preparation`、`constraint` 是模型必须遵守、
 但不能被「完成」的上下文。`artifact`、`artifact_absent`、`content`、`command`
-必须提供 `target`。`content` 的 `text` 是 Gate 与 `target` 逐行比对的字面内容
-本身；若写成对该行的描述，Gate 会拒绝并要求模型 amend `text`，而不是继续改文件。
+和 `tests` 必须提供 `target`；`tests` 的 `target` 是作为其证据的精确测试命令。
+`content` 的 `text` 是 Gate 与 `target` 逐行比对的字面内容本身；若写成对该行的
+描述，Gate 会拒绝并要求模型 amend `text`，而不是继续改文件。
 
 ## 声明方式
 
@@ -103,13 +104,19 @@ id，`restore` 恢复已 waived 的需求。声明按数组顺序应用，复合
 - `content` 按目标文件的一行检查；
 - `command` 必须匹配最后一次变更之后的成功运行记录，evidence 可写
   `call_id:<id>` 或命令行；
-- `tests` 必须引用最后一次变更之后的通过运行记录，因此 Runtime 不认识任何
-  runner 名称或输出格式；
+- `tests` 在 `target` 中声明精确的测试命令；该命令在最后一次变更之后的通过
+  运行记录可以记账。Runtime 没有结构化测试结果，因此只有命令成功时，报告为
+  **未验证的测试覆盖**，并在记录中说明这一局限：一个没有运行任何测试却退出 0
+  的命令不能声称测试覆盖。Runtime 不认识任何 runner 名称或输出格式。历史上
+  未带 `target` 的 `tests` 需求，按同一显式未验证边界接受，而不是阻塞一个
+  合法记录的 Goal；
 - `named` 接受，但附带「无机械检查」的显式警告。
 
 Gate 在每次完成声明时读取持久集合，因此被折叠的 transcript 或重启的进程都
 无法缩小范围。模型完全不声明时 Gate 没有可执行集合；所以 Goal mode 在契约里
-写明声明义务，`get_goal_scope` 始终展示 Gate 将读取的精确集合。
+写明声明义务，`get_goal_scope` 始终展示 Gate 将读取的精确集合。没有应交付项
+时，没有任何需求级事实可供验证，因此这种完成永远不会报告为 `Verified`：
+引用也许能证明某个命令运行过，但没有检查任何已声明的交付物。
 
 ## 验证报告
 
@@ -132,9 +139,9 @@ Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命�
 {
   "status": "unverified",
   "records": [
-    {"requirement_id": "R1", "kind": "tests", "state": "verified",
-     "detail": "verified against the execution record: `sh run-tests.sh` exited 0 at workspace version 4",
-     "call_id": "call-12", "command": "sh run-tests.sh", "exit_code": 0,
+    {"requirement_id": "R2", "kind": "tests", "state": "unverified",
+     "detail": "`make regression` exited 0 at workspace version 4 (step 7), but the runtime observed no structured test result: command success does not establish that any test executed, so the test coverage remains unverified",
+     "call_id": "call-12", "command": "make regression", "exit_code": 0,
      "workspace_version": 4, "model_step": 7}
   ]
 }
@@ -143,7 +150,8 @@ Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命�
 `records` 按需求顺序、每个应交付项一条。只有真实执行记录支撑时才会出现证据
 字段；否则 `call_id`/`command`/`exit_code` 缺省，`detail` 说明 Runtime 无法
 检查什么。`workspace_version` 是判定针对的变更计数器，因此无需重放 transcript
-就能看出结论是否过期。
+就能看出结论是否过期。`Verified` 要求至少有一条应交付项记录，且每条记录都是
+`verified`；部分或空记录集一律是 `unverified`。
 
 重放是增量的。2026-09-23 之前的终态把已移除的宿主验证结论写成同一个字段里的
 裸字符串（`"verification": "not_run"`）；它不是报告，读作「没有报告」，旧会话

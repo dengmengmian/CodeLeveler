@@ -8,7 +8,7 @@ use leveler_context::{
 };
 use leveler_lifecycle::{
     EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
-    VerificationReport,
+    VerificationReport, VerificationStatus,
 };
 use leveler_model::{
     CompactionRecord, ContentPart, ControlContext, FinishReason, Message, ModelError,
@@ -2253,7 +2253,7 @@ impl Drive<'_> {
         if !projection.cancel {
             receipt.push_str(
                 " This turn serves that goal: resolve it with update_goal(complete|blocked) when \
-                 the work is done.",
+                 the work is done. declare_scope can now change what it must deliver.",
             );
         }
         Ok(receipt)
@@ -4309,15 +4309,64 @@ impl AgentHarness for Drive<'_> {
                             let (text, _) = leveler_core::sanitize_model_visible(&text);
                             (text, false)
                         }
-                        None => (
-                            "No committed goal exists for this turn. The runtime does not \
-                             extract requirements from prose: when the work should be carried \
-                             to completion, call commit_task and declare each requirement with \
-                             its `kind`, `text` and a verbatim `source_quote` from the user's \
-                             message."
-                                .to_string(),
-                            false,
-                        ),
+                        None => {
+                            // A turn that does not serve a goal may still be the
+                            // turn of a task that owes one. Those are different
+                            // facts: saying "no goal exists" to a model looking
+                            // at real requirements sends it to open a second
+                            // goal. The durable fact is read-only here; the
+                            // adoption remains the model's declaration.
+                            let running = binder.running_goals().await?;
+                            if running.is_empty() {
+                                (
+                                    "No committed goal exists for this turn. The runtime does \
+                                     not extract requirements from prose: when the work should \
+                                     be carried to completion, call commit_task and declare each \
+                                     requirement with its `kind`, `text` and a verbatim \
+                                     `source_quote` from the user's message."
+                                        .to_string(),
+                                    false,
+                                )
+                            } else {
+                                let owed = running
+                                    .iter()
+                                    .take(3)
+                                    .map(|goal| {
+                                        let objective = leveler_core::truncate_head_bytes(
+                                            &goal.objective,
+                                            240,
+                                            "…",
+                                        );
+                                        let objective = objective
+                                            .split_whitespace()
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        match goal.user_paused_at {
+                                            Some(_) => format!(
+                                                "- goal {} (paused by the user): {objective}",
+                                                goal.goal_id
+                                            ),
+                                            None => format!("- goal {}: {objective}", goal.goal_id),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                (
+                                    format!(
+                                        "This turn does not serve a goal yet, but the task still \
+                                         owes {} running goal(s):\n{owed}\nTo change what one of \
+                                         them must deliver, first call declare_intent with \
+                                         `amend_current_task` (or `continue_task` to release a \
+                                         pause) and a verbatim `source_quote` from the user's \
+                                         newest message; that goal is then bound to this turn and \
+                                         get_goal_scope / declare_scope address it. Requirements \
+                                         are never extracted from prose.",
+                                        running.len()
+                                    ),
+                                    false,
+                                )
+                            }
+                        }
                     },
                     None => (
                         "This execution has no durable goal store, so there is no goal scope to \
@@ -4969,6 +5018,25 @@ impl AgentHarness for Drive<'_> {
                                 continue;
                             }
                         }
+                    }
+                    // `Verified` means a declared requirement was checked and
+                    // held. With no owed requirement there is nothing to check,
+                    // and a citation-only `Verified` would carry an empty
+                    // record set — a claim of coverage the runtime never
+                    // established. The completion still stands; its report
+                    // says exactly what was and was not verified.
+                    if self.completion_verification.as_ref().is_some_and(|report| {
+                        report.status == VerificationStatus::Verified && report.records.is_empty()
+                    }) {
+                        self.completion_verification = Some(VerificationReport::new(
+                            VerificationStatus::Unverified,
+                            Vec::new(),
+                        ));
+                        self.completion_warnings.push(
+                            "the goal recorded no owed requirement, so no declared deliverable \
+                             was mechanically verified; the completion is unverified"
+                                .to_string(),
+                        );
                     }
                 }
                 // The plan is the model's declared progress, not a completion

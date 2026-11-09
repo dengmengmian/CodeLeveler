@@ -500,8 +500,8 @@ async fn a_chat_delegation_commits_the_task_and_continues_past_a_stage_summary()
 /// see the name and refused to close the goal (session `1c3bf9aa`).
 ///
 /// The structured contract has no runner vocabulary: the model declares the
-/// `tests` requirement and cites the recorded run by the command it actually
-/// ran. Any repository name works, because the citation is identity, not a
+/// `tests` requirement together with the exact command whose run is its
+/// evidence. Any repository name works, because the match is identity, not a
 /// recognised word.
 #[cfg(unix)]
 #[tokio::test]
@@ -519,6 +519,7 @@ async fn a_suite_named_in_the_repositorys_own_words_resolves_the_goal() {
                     "requirements": [{
                         "kind": "tests",
                         "text": "完整测试通过",
+                        "target": "bin/make regression",
                         "source_quote": "完成后通过测试"
                     }]
                 }),
@@ -798,6 +799,118 @@ async fn the_scope_tool_is_readable_before_commit() {
     );
 }
 
+/// A task that still owes a running goal HAS a scope; it is only this turn
+/// that has not adopted it yet. The reader must state that durable fact and
+/// name the structured adoption path, not tell a model facing real requirements
+/// that no goal exists and that it must commit the task again.
+#[tokio::test]
+async fn the_scope_reader_names_an_owed_goal_before_the_turn_adopts_it() {
+    let mut script = pause_stage_one_script();
+    script.extend([
+        Scripted::Tool("get_goal_scope", serde_json::json!({})),
+        Scripted::Text("这一项先记下，本回合不继续执行。"),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+    let paused = goal_records(&fx).await;
+    let goal_id = paused[0].id.clone();
+    assert!(paused[0].user_paused_at.is_some(), "{paused:?}");
+
+    let _ = say(&fx, "这一项先记下，暂时不继续。").await;
+
+    let requests = fx.runtime.requests.lock().unwrap();
+    let result = requests
+        .last()
+        .expect("the turn reached the model")
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .find(|result| {
+            result.content.contains("running goal") || result.content.contains("committed goal")
+        })
+        .expect("the scope result reaches the model");
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains(goal_id.as_str()),
+        "the reader names the goal the task still owes: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("declare_intent"),
+        "the reader names the structured adoption path: {}",
+        result.content
+    );
+    assert!(
+        !result
+            .content
+            .contains("No committed goal exists for this turn"),
+        "a paused owed goal is not 'no goal for this task': {}",
+        result.content
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// Adoption is the act that gives this turn a scope to change. The writer must
+/// be on the surface of the very next request — a model told to adopt but left
+/// without the writer cannot record the user's own waiver.
+#[tokio::test]
+async fn adopting_an_owed_goal_adds_the_scope_writer_to_the_next_request() {
+    let mut script = pause_stage_one_script();
+    script.extend([
+        Scripted::Tool(
+            "declare_intent",
+            serde_json::json!({
+                "source_quote": "这一项先记下",
+                "operations": [{"kind": "amend_current_task"}]
+            }),
+        ),
+        Scripted::Text("已记下，本回合不继续执行。"),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    pause_a_goal(&fx).await;
+
+    let _ = say(&fx, "这一项先记下，暂时不继续。").await;
+
+    let requests = fx.runtime.requests.lock().unwrap();
+    let after = requests.last().expect("the turn reached the model");
+    let receipt = after
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .find(|result| result.content.starts_with("Recorded 1 operation(s)"))
+        .expect("the declaration receipt reaches the model");
+    assert!(
+        receipt.content.contains("declare_scope"),
+        "the receipt names the writer that adoption just made available: {}",
+        receipt.content
+    );
+    let tools = tool_names(after);
+    assert!(
+        tools.contains(&"declare_scope"),
+        "the adopting turn must be able to write the scope it adopted: {tools:?}"
+    );
+    assert!(
+        tools.contains(&"get_goal_scope"),
+        "the adopting turn must be able to read the scope it adopted: {tools:?}"
+    );
+    let paused = goal_records(&fx).await;
+    assert!(
+        paused[0].user_paused_at.is_some(),
+        "amending a paused goal does not release the pause: {paused:?}"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
 /// The commit gate extracts one requirement per deliverable, so a request that
 /// enumerates more than the old fixed cap of 20 must still be declarable. The
 /// audited session's request extracted 132 requirements while the tool schema
@@ -921,7 +1034,7 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
                         {"kind": "named", "text": "评论回复", "source_quote": "评论回复"},
                         {"kind": "named", "text": "内容权限校验",
                          "source_quote": "内容权限校验"},
-                        {"kind": "tests", "text": "测试通过", "source_quote": "完成后通过测试"}
+                        {"kind": "tests", "text": "测试通过", "target": test_runner_label(), "source_quote": "完成后通过测试"}
                     ]
                 }),
             ),
@@ -1094,7 +1207,7 @@ async fn an_accepted_completion_carries_the_structured_verification_records() {
                     "objective": STAGED_REQUEST,
                     "acceptance": [format!("{} 通过", test_runner_label())],
                     "requirements": [
-                        {"kind": "tests", "text": "测试通过", "source_quote": "完成后通过测试"}
+                        {"kind": "command", "text": "验证命令通过", "target": test_runner_label(), "source_quote": "完成后通过测试"}
                     ]
                 }),
             ),
@@ -1123,12 +1236,12 @@ async fn an_accepted_completion_carries_the_structured_verification_records() {
     assert_eq!(
         verification.status,
         leveler_lifecycle::VerificationStatus::Verified,
-        "the declared tests requirement has a current passing run: {verification:?}"
+        "the declared command requirement has a current passing run: {verification:?}"
     );
     assert_eq!(verification.records.len(), 1);
     let record = &verification.records[0];
     assert_eq!(record.requirement_id, "R1");
-    assert_eq!(record.kind, "tests");
+    assert_eq!(record.kind, "command");
     assert_eq!(
         record.state,
         leveler_lifecycle::VerificationRecordState::Verified
@@ -1362,6 +1475,7 @@ async fn the_same_requirement_contract_holds_in_any_language() {
                         "requirements": [{
                             "kind": "tests",
                             "text": case.requirement,
+                            "target": test_runner_label(),
                             "source_quote": case.quote
                         }]
                     }),
@@ -1393,13 +1507,22 @@ async fn the_same_requirement_contract_holds_in_any_language() {
         let verification = report
             .verification
             .unwrap_or_else(|| panic!("{}: no verification report", case.label));
+        // The declared command ran and passed in every language. Its coverage
+        // stays unverified because no structured test result exists, not
+        // because of the language it was declared in.
         assert_eq!(
             verification.status,
-            leveler_lifecycle::VerificationStatus::Verified,
+            leveler_lifecycle::VerificationStatus::Unverified,
             "{}: {verification:?}",
             case.label
         );
         assert_eq!(verification.records.len(), 1, "{}", case.label);
+        assert_eq!(
+            verification.records[0].state,
+            leveler_lifecycle::VerificationRecordState::Unverified,
+            "{}",
+            case.label
+        );
         assert_eq!(
             verification.records[0].command.as_deref(),
             Some(test_runner_label()),
@@ -1458,6 +1581,173 @@ async fn a_success_claim_in_any_language_is_not_verification() {
     }
 }
 
+/// A passing command proves an execution, not a delivered requirement. A
+/// model that records no requirement — field absent or explicitly empty — and
+/// then cites `echo ready` must not leave the terminal as
+/// `Completed + Verified` with an empty record set: nothing was verified.
+#[tokio::test]
+async fn a_passing_command_cannot_verify_an_undeclared_requirement() {
+    const REQUEST: &str = "创建一个文件，然后运行 echo ready 确认。";
+    for requirements in [None, Some(serde_json::json!([]))] {
+        let mut commit = serde_json::json!({
+            "objective": REQUEST,
+            "acceptance": ["echo ready 输出 ready"]
+        });
+        if let Some(requirements) = requirements.clone() {
+            commit["requirements"] = requirements;
+        }
+        let fx = fixture(
+            vec![
+                Scripted::Tool("commit_task", commit),
+                write_stage(),
+                Scripted::Tool(
+                    "run_command",
+                    serde_json::json!({
+                        "program": "echo",
+                        "args": ["ready"],
+                        "reason": "confirm the workspace state"
+                    }),
+                ),
+                Scripted::Tool(
+                    "update_goal",
+                    serde_json::json!({
+                        "status": "complete",
+                        "summary": "文件已创建，echo ready 通过",
+                        "verification": {"status": "passed", "detail": "echo ready"}
+                    }),
+                ),
+            ],
+            false,
+        )
+        .await;
+
+        let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+        assert_eq!(
+            report.outcome,
+            leveler_lifecycle::TaskOutcome::Completed,
+            "{requirements:?}: the work still finishes"
+        );
+        let verification = report
+            .verification
+            .unwrap_or_else(|| panic!("{requirements:?}: no verification report"));
+        assert_eq!(
+            verification.status,
+            leveler_lifecycle::VerificationStatus::Unverified,
+            "{requirements:?}: a passing command verified an undeclared requirement"
+        );
+        assert!(
+            verification.records.is_empty(),
+            "{requirements:?}: no requirement produced a record"
+        );
+    }
+}
+
+/// A requirement that the runtime can check mechanically still reaches
+/// Verified, with the record naming the requirement and the evidence.
+#[tokio::test]
+async fn a_declared_artifact_requirement_is_verified_by_the_workspace() {
+    const REQUEST: &str = "创建 stage-1.txt，完成后确认。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact",
+                        "text": "stage-1.txt 存在",
+                        "target": "stage-1.txt",
+                        "source_quote": "创建 stage-1.txt"
+                    }]
+                }),
+            ),
+            write_stage(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "stage-1.txt 已创建",
+                    "verification": {
+                        "status": "not_applicable",
+                        "detail": "the artifact is checked against the workspace"
+                    },
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "created stage-1.txt"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let verification = report.verification.expect("report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified,
+        "{verification:?}"
+    );
+    assert_eq!(verification.records.len(), 1);
+    assert_eq!(verification.records[0].kind, "artifact");
+    assert_eq!(
+        verification.records[0].state,
+        leveler_lifecycle::VerificationRecordState::Verified
+    );
+}
+
+/// A semantic requirement the runtime cannot check is delivered, but its
+/// report says so: `named` is unverified, never silently verified.
+#[tokio::test]
+async fn a_semantic_requirement_completes_unverified() {
+    const REQUEST: &str = "实现文章发布，完成后确认。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["文章发布可用"],
+                    "requirements": [{
+                        "kind": "named",
+                        "text": "文章发布",
+                        "source_quote": "实现文章发布"
+                    }]
+                }),
+            ),
+            Scripted::Text("文章发布已实现。"),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "文章发布已实现",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "implemented the publish flow"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let verification = report.verification.expect("report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Unverified
+    );
+    assert_eq!(verification.records.len(), 1);
+    assert_eq!(verification.records[0].kind, "deliverable");
+    assert_eq!(
+        verification.records[0].state,
+        leveler_lifecycle::VerificationRecordState::Unverified
+    );
+}
+
 #[tokio::test]
 async fn a_long_p2_request_registers_its_declared_requirements() {
     const P2: &str = include_str!("../../../testdata/regression/p2_scope_classification.zh-CN.md");
@@ -1499,6 +1789,7 @@ async fn a_long_p2_request_registers_its_declared_requirements() {
                          "source_quote": "交付必须包含迁移脚本 `migrations/0007_billing.sql`"},
                         {"kind": "tests",
                          "text": "cargo test -p billing 通过",
+                         "target": "cargo test -p billing",
                          "source_quote": "完成后运行 `cargo test -p billing` 并确保通过"}
                     ]
                 }),
@@ -2607,7 +2898,7 @@ async fn a_user_can_explicitly_narrow_the_scope_on_continuation() {
 }
 
 #[tokio::test]
-async fn a_tests_requirement_needs_a_cited_passing_run() {
+async fn a_tests_requirement_needs_its_declared_command_to_run() {
     let objective = "实现全部接口，并通过完整测试。";
     let fx = fixture(
         vec![
@@ -2619,13 +2910,14 @@ async fn a_tests_requirement_needs_a_cited_passing_run() {
                     "task_relation": "continue",
                     "requirements": [
                         {"kind": "tests", "text": "完整测试通过",
+                         "target": test_runner_label(),
                          "source_quote": "通过完整测试"}
                     ]
                 }),
             ),
             Scripted::Tool("run_command", checker_call()),
-            // A passing build check does not cite the test run: the runtime
-            // does not infer that a command it cannot classify is the suite.
+            // A passing build check is not the declared test command. The
+            // runtime matches the declaration, not a command it guesses at.
             Scripted::Tool(
                 "update_goal",
                 serde_json::json!({
@@ -2676,15 +2968,30 @@ async fn a_tests_requirement_needs_a_cited_passing_run() {
             leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
                 if kind == "requirements_refused"
                     && detail.contains("R1")
-                    && detail.contains("test run")
-                    && detail.contains("does not cite")
+                    && detail.contains(test_runner_label())
+                    && detail.contains("no passing run")
         )),
-        "a build check without a citation must not satisfy the test requirement: {events:?}"
+        "a build check is not the declared test command: {events:?}"
     );
     assert_eq!(
         report.outcome,
         leveler_lifecycle::TaskOutcome::Completed,
-        "a cited passing suite resolves the goal: {report:?}"
+        "the declared test command's passing run resolves the goal: {report:?}"
+    );
+    let verification = report.verification.expect("report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Unverified,
+        "the run proves command success, not structured test results: {verification:?}"
+    );
+    assert_eq!(verification.records.len(), 1);
+    assert_eq!(
+        verification.records[0].state,
+        leveler_lifecycle::VerificationRecordState::Unverified
+    );
+    assert_eq!(
+        verification.records[0].command.as_deref(),
+        Some(test_runner_label())
     );
 }
 

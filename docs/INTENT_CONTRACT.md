@@ -62,7 +62,10 @@ instruction is one declaration, not two decisions.
    Everything else composes.
 5. **State.** A settled goal accepts no transition except an explicit cancel
    acknowledgement; a paused goal accepts `continue_task`; a boundary is
-   "reached" when its step is completed or no longer exists in the plan.
+   "reached" only when its step carries an explicit `completed` status. A step
+   that was deleted, renamed without its id, replaced, split or merged is still
+   outstanding — a plan edit is not a completion. The model may adjust the plan
+   freely and re-declare the boundary when the stage really moved.
 
 ## State writers
 

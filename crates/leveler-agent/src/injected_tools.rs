@@ -154,7 +154,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             recorded requirement set, `requirements` must account for every \
             active deliverable by its stable id; a missing or `not_done` \
             requirement refuses completion, and the requirement's own account \
-            is the evidence the terminal carries. \
+            is the evidence the terminal carries. A `tests` requirement names \
+            its exact test command in `target`; a passing recorded run of that \
+            command accounts for it, but command success alone is reported as \
+            unverified test coverage — the runtime has no structured test \
+            result to confirm that any test executed. \
             `unverifiable` marks delivered work the runtime cannot prove, not \
             work you skipped.",
     );
@@ -220,7 +224,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                             },
                             "evidence": {
                                 "type": "string",
-                                "description": "What proves it. For a `tests` requirement, put `call_id:<id>` of the passing run, or the exact command, on its own line."
+                                "description": "What proves it. For a `tests` requirement, put `call_id:<id>` of a passing run of the declared test command (`target`), or that exact command, on its own line."
                             }
                         },
                         "required": ["id", "status", "evidence"],
@@ -590,7 +594,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                                     "preparation",
                                     "constraint"
                                 ],
-                                "description": "artifact = file/dir must exist; artifact_absent = must be gone; command = exact command; named = deliverable with no mechanical check; content = literal in target; tests = passing test run; other kinds are not owed. `content`/`command` need `target`."
+                                "description": "artifact = must exist; artifact_absent = must be gone; command = exact command; named = no mechanical check; content = literal in target; tests = suite run by `target`; other kinds are not owed. `content`/`command`/`tests` need `target`."
                             },
                             "text": {
                                 "type": "string",
@@ -598,7 +602,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                             },
                             "target": {
                                 "type": "string",
-                                "description": "The file for `content`, or the exact command for `command`."
+                                "description": "The file for `content`, or the exact command for `command`/`tests`."
                             },
                             "source_quote": {
                                 "type": "string",
