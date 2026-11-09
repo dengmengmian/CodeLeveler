@@ -1001,7 +1001,12 @@ impl ExecutionHostClient {
         let mut child = command
             .spawn()
             .map_err(|e| format!("could not launch Execution Host: {e}"))?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // A cold host on a loaded runner (a CI shard starting several real
+        // runtimes) can need more than ten seconds to bind and answer. The
+        // wait only delays the visible fallback when the host is genuinely
+        // broken; a host that exits early is detected immediately by
+        // `try_wait`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(c) = Self::connect(config.clone()).await {
                 std::thread::spawn(move || {

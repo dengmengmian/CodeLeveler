@@ -148,8 +148,14 @@ async fn m1_real_stdio_call_executes_one_side_effect() {
     assert_eq!(std::fs::read_to_string(&f.counter).unwrap(), "x");
 }
 
+/// The timeout seam is a process-wide environment variable. Two tests set it;
+/// they must not run at the same time or one removes the other's value while
+/// its call is still in flight. An async mutex because the guard spans awaits.
+static MCP_TIMEOUT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn m2_response_timeout_is_unknown_and_not_retried() {
+    let _env = MCP_TIMEOUT_ENV.lock().await;
     // Single test in this binary owns the variable.
     unsafe { std::env::set_var("LEVELER_TEST_MCP_TIMEOUT_MS", "400") };
     let f = fixture();
@@ -240,6 +246,7 @@ async fn m3_user_cancel_is_unknown_and_does_not_replay_the_side_effect() {
 
 #[tokio::test]
 async fn m5_server_ignores_cancel_and_still_writes_once() {
+    let _env = MCP_TIMEOUT_ENV.lock().await;
     unsafe { std::env::set_var("LEVELER_TEST_MCP_TIMEOUT_MS", "400") };
     let f = fixture();
     let tool = tool(&f).await;
