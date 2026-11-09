@@ -86,6 +86,7 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
             failure: None,
             stop: None,
             warnings: Vec::new(),
+            verification: None,
         },
         &mut |_| {},
     )
@@ -101,6 +102,7 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
             failure: None,
             stop: None,
             warnings: Vec::new(),
+            verification: None,
         }],
         "transient delta dropped; canonical completion recovered"
     );

@@ -324,6 +324,7 @@ mod tests {
             stop: Some(stop),
             failure: None,
             warnings: vec![],
+            verification: None,
         }
         .to_row()
         .unwrap();
@@ -349,6 +350,7 @@ mod tests {
             reason: None,
             failure: None,
             warnings: Vec::new(),
+            verification: None,
         };
         facts.terminal.as_mut().unwrap().payload = event.to_row().unwrap().1;
         let (status, terminal) =

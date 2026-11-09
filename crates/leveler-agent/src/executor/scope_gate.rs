@@ -14,8 +14,11 @@
 //!
 //! The model's `done` claim never overrides a fact the runtime can observe.
 
-use crate::executor::goal_verification::VerificationRun;
-use leveler_lifecycle::{RequirementItem, RequirementKind};
+use crate::executor::goal_verification::{PendingCommand, VerificationRun};
+use leveler_lifecycle::{
+    RequirementItem, RequirementKind, VerificationRecord, VerificationRecordState,
+    VerificationStatus,
+};
 
 /// The floor for accounting capacity. A goal with fewer deliverables may still
 /// carry this many entries; the caller raises it to the number of owed items so
@@ -70,6 +73,10 @@ pub(crate) struct ScopeFacts<'a> {
     pub requirements: &'a [RequirementItem],
     pub accounting: Option<&'a [RequirementAccount]>,
     pub runs: &'a [VerificationRun],
+    /// Commands this task started and has not seen a result for. They are not
+    /// evidence in either direction; naming one as satisfied is refused for
+    /// the real reason (no result yet) instead of "no run".
+    pub pending: &'a [PendingCommand],
     pub mutation_ops: u64,
     pub artifact: &'a dyn Fn(&str) -> ArtifactState,
     /// Reads the workspace for a `content` requirement:
@@ -80,9 +87,15 @@ pub(crate) struct ScopeFacts<'a> {
 /// The gate's answer for one `update_goal(complete)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScopeDecision {
-    /// Completion may proceed. Warnings name every boundary the runtime could
-    /// not verify mechanically.
-    Accept { warnings: Vec<String> },
+    /// Completion may proceed. `status` is `None` when nothing was owed;
+    /// otherwise `Verified` only when every owed requirement has a mechanical
+    /// record and `Unverified` when at least one rests on the model's account.
+    /// `warnings` and `records` are persisted on the terminal.
+    Accept {
+        status: Option<VerificationStatus>,
+        warnings: Vec<String>,
+        records: Vec<VerificationRecord>,
+    },
     /// Completion is refused; the goal stays active and the model sees exactly
     /// which requirement ids it did not account for.
     Refuse(String),
@@ -164,12 +177,15 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
         .collect();
     if owed.is_empty() {
         return ScopeDecision::Accept {
+            status: None,
             warnings: Vec::new(),
+            records: Vec::new(),
         };
     }
     let accounting = facts.accounting.unwrap_or(&[]);
     let mut refusals: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut records: Vec<VerificationRecord> = Vec::with_capacity(owed.len());
 
     for item in &owed {
         let Some(account) = accounting.iter().find(|account| account.id == item.id) else {
@@ -206,35 +222,122 @@ pub(crate) fn decide(facts: &ScopeFacts<'_>) -> ScopeDecision {
                 if let Some(refusal) = contradicted(facts, item, account) {
                     refusals.push(refusal);
                 } else {
+                    let detail = format!(
+                        "explicitly unverifiable ({}); the completion carries an unverified \
+                         boundary",
+                        clip(&account.evidence, 200)
+                    );
                     warnings.push(format!(
-                        "requirement `{}` [{}] `{}` is explicitly unverifiable ({}); the \
-                         completion carries an unverified boundary",
+                        "requirement `{}` [{}] `{}` is {detail}",
                         item.id,
                         item.kind.label(),
-                        clip(&item.text, 120),
-                        clip(&account.evidence, 200)
+                        clip(&item.text, 120)
+                    ));
+                    records.push(record(
+                        item,
+                        VerificationRecordState::Unverified,
+                        detail,
+                        None,
+                        facts.mutation_ops,
                     ));
                 }
             }
             AccountStatus::Done => match check_mechanical(facts, item, account) {
                 Mechanical::Failed(refusal) => refusals.push(refusal),
-                Mechanical::Unverified(warning) => warnings.push(warning),
-                Mechanical::Satisfied => {}
-                Mechanical::NotCheckable => warnings.push(format!(
-                    "requirement `{}` [{}] `{}` is reported done but has no mechanical check; \
-                     the completion rests on the model's account, not runtime evidence",
-                    item.id,
-                    item.kind.label(),
-                    clip(&item.text, 120)
-                )),
+                Mechanical::Unverified(warning) => {
+                    warnings.push(warning.clone());
+                    records.push(record(
+                        item,
+                        VerificationRecordState::Unverified,
+                        warning,
+                        None,
+                        facts.mutation_ops,
+                    ));
+                }
+                Mechanical::Satisfied(run) => {
+                    let detail = match run {
+                        Some(run) => format!(
+                            "verified against the execution record: `{}` {} at workspace version {}",
+                            run.label,
+                            exit_description(run),
+                            run.mutation_ops
+                        ),
+                        None => "verified against the current workspace".to_string(),
+                    };
+                    records.push(record(
+                        item,
+                        VerificationRecordState::Verified,
+                        detail,
+                        run,
+                        facts.mutation_ops,
+                    ));
+                }
+                Mechanical::NotCheckable => {
+                    let detail = "reported done but has no mechanical check; the completion rests \
+                                  on the model's account, not runtime evidence";
+                    warnings.push(format!(
+                        "requirement `{}` [{}] `{}` is {detail}",
+                        item.id,
+                        item.kind.label(),
+                        clip(&item.text, 120)
+                    ));
+                    records.push(record(
+                        item,
+                        VerificationRecordState::Unverified,
+                        detail.to_string(),
+                        None,
+                        facts.mutation_ops,
+                    ));
+                }
             },
         }
     }
 
-    if refusals.is_empty() {
-        ScopeDecision::Accept { warnings }
+    if !refusals.is_empty() {
+        return ScopeDecision::Refuse(refusal_message(&refusals));
+    }
+    let status = if records
+        .iter()
+        .all(|record| record.state == VerificationRecordState::Verified)
+    {
+        VerificationStatus::Verified
     } else {
-        ScopeDecision::Refuse(refusal_message(&refusals))
+        VerificationStatus::Unverified
+    };
+    ScopeDecision::Accept {
+        status: Some(status),
+        warnings,
+        records,
+    }
+}
+
+/// One requirement's place in the accepted completion. Evidence fields come
+/// from the cited run when the requirement had one; otherwise the record says
+/// plainly what the runtime could not check.
+fn record(
+    item: &RequirementItem,
+    state: VerificationRecordState,
+    detail: String,
+    run: Option<&VerificationRun>,
+    workspace_version: u64,
+) -> VerificationRecord {
+    VerificationRecord {
+        requirement_id: item.id.clone(),
+        kind: item.kind.label().to_string(),
+        state,
+        detail,
+        call_id: run.and_then(|run| run.call_id.clone()),
+        command: run.map(|run| run.label.clone()),
+        exit_code: run.and_then(|run| run.exit_code),
+        workspace_version: run.map_or(workspace_version, |run| run.mutation_ops),
+        model_step: run.map_or(0, |run| run.model_step),
+    }
+}
+
+fn exit_description(run: &VerificationRun) -> String {
+    match run.exit_code {
+        Some(code) => format!("exited {code}"),
+        None => "succeeded without a reported exit status".to_string(),
     }
 }
 
@@ -251,8 +354,10 @@ fn contradicted(
     }
 }
 
-enum Mechanical {
-    Satisfied,
+enum Mechanical<'a> {
+    /// The runtime observed the declared fact. The run is present when the
+    /// check was an execution record.
+    Satisfied(Option<&'a VerificationRun>),
     NotCheckable,
     /// The fact is observable and contradicts the account.
     Failed(String),
@@ -260,11 +365,11 @@ enum Mechanical {
     Unverified(String),
 }
 
-fn check_mechanical(
-    facts: &ScopeFacts<'_>,
+fn check_mechanical<'a>(
+    facts: &ScopeFacts<'a>,
     item: &RequirementItem,
     account: &RequirementAccount,
-) -> Mechanical {
+) -> Mechanical<'a> {
     match item.kind {
         RequirementKind::Artifact => {
             let Some(target) = item.target.as_deref() else {
@@ -274,7 +379,7 @@ fn check_mechanical(
                 ));
             };
             match (facts.artifact)(target) {
-                ArtifactState::Present => Mechanical::Satisfied,
+                ArtifactState::Present => Mechanical::Satisfied(None),
                 ArtifactState::Absent => Mechanical::Failed(format!(
                     "`{}` [artifact] `{}` is accounted done, but `{target}` does not exist in \
                      the workspace and no recorded change created it",
@@ -298,7 +403,7 @@ fn check_mechanical(
                 ));
             };
             match (facts.artifact)(target) {
-                ArtifactState::Absent => Mechanical::Satisfied,
+                ArtifactState::Absent => Mechanical::Satisfied(None),
                 ArtifactState::Present => Mechanical::Failed(format!(
                     "`{}` [absent-artifact] `{}` is accounted deleted, but `{target}` still exists",
                     item.id,
@@ -315,7 +420,7 @@ fn check_mechanical(
         RequirementKind::Content => {
             let target = item.target.as_deref().unwrap_or("");
             match (facts.literal)(target, &item.text) {
-                LiteralState::Present => Mechanical::Satisfied,
+                LiteralState::Present => Mechanical::Satisfied(None),
                 LiteralState::Absent => Mechanical::Failed(format!(
                     "`{}` [content] `{}` is accounted done, but it does not appear as a line \
                      of `{target}`",
@@ -339,7 +444,10 @@ fn check_mechanical(
                 ));
             };
             match successful_run(facts, target, &account.evidence) {
-                RunCheck::Found => Mechanical::Satisfied,
+                RunCheck::Found(run) => Mechanical::Satisfied(Some(run)),
+                RunCheck::Pending(started) => {
+                    Mechanical::Failed(pending_refusal(item, target, started))
+                }
                 RunCheck::Stale(run) => Mechanical::Failed(format!(
                     "`{}` [command] `{target}` last passed before the most recent change \
                      (step {}); run it against the current workspace",
@@ -357,7 +465,10 @@ fn check_mechanical(
             }
         }
         RequirementKind::Tests => match cited_passing_run(facts, &account.evidence) {
-            RunCheck::Found => Mechanical::Satisfied,
+            RunCheck::Found(run) => Mechanical::Satisfied(Some(run)),
+            RunCheck::Pending(started) => {
+                Mechanical::Failed(pending_refusal(item, &started.label, started))
+            }
             RunCheck::Stale(run) => Mechanical::Failed(format!(
                 "`{}` [tests] cites `{}`, which passed before the most recent change \
                  (step {}); cite a passing run against the current workspace",
@@ -382,8 +493,29 @@ fn check_mechanical(
     }
 }
 
+/// A command that has only started is not a satisfied requirement: its result
+/// is unknown. Name the real missing fact and the exact action that resolves it.
+fn pending_refusal(item: &RequirementItem, command: &str, started: &PendingCommand) -> String {
+    let task = match started.task_id.as_deref() {
+        Some(id) => format!(" as background task {id}"),
+        None => String::new(),
+    };
+    let wait = match started.task_id.as_deref() {
+        Some(id) => format!("wait_task with task_id {id}"),
+        None => "wait_task for that task".to_string(),
+    };
+    format!(
+        "`{}` [{}] `{command}` has only STARTED{task} and reported no result yet. Wait for it \
+         ({wait}) and account for it again once it exits.",
+        item.id,
+        item.kind.label()
+    )
+}
+
 enum RunCheck<'a> {
-    Found,
+    Found(&'a VerificationRun),
+    /// The command started and has no result yet.
+    Pending(&'a PendingCommand),
     Stale(&'a VerificationRun),
     Failed(&'a VerificationRun),
     Missing,
@@ -406,18 +538,42 @@ fn successful_run<'a>(facts: &ScopeFacts<'a>, command: &str, evidence: &str) -> 
     if let Some(run) = facts.runs.iter().rev().find(matching) {
         return classify(run, facts.mutation_ops);
     }
+    if let Some(started) = facts.pending.iter().rev().find(|started| {
+        crate::executor::goal_verification::run_matches_command(&started.label, command)
+    }) {
+        return RunCheck::Pending(started);
+    }
     RunCheck::Missing
 }
 
 /// A passing run the account's evidence names, of any command.
 fn cited_passing_run<'a>(facts: &ScopeFacts<'a>, evidence: &str) -> RunCheck<'a> {
-    let Some(run) = evidence.lines().find_map(|line| {
+    let mut cited = None;
+    for line in evidence.lines() {
         let line = line.trim();
-        (!line.is_empty())
-            .then(|| crate::executor::goal_verification::cited_run_in(line, facts.runs))
-            .flatten()
-    }) else {
-        return RunCheck::Missing;
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(run) = crate::executor::goal_verification::cited_run_in(line, facts.runs) {
+            cited = Some(run);
+            break;
+        }
+    }
+    let Some(run) = cited else {
+        let started = evidence.lines().find_map(|line| {
+            let line = line.trim();
+            (!line.is_empty())
+                .then(|| {
+                    facts.pending.iter().rev().find(|started| {
+                        crate::executor::goal_verification::cites(&started.label, line)
+                    })
+                })
+                .flatten()
+        });
+        return match started {
+            Some(started) => RunCheck::Pending(started),
+            None => RunCheck::Missing,
+        };
     };
     classify(run, facts.mutation_ops)
 }
@@ -429,7 +585,7 @@ fn classify(run: &VerificationRun, mutation_ops: u64) -> RunCheck<'_> {
     if run.mutation_ops < mutation_ops {
         return RunCheck::Stale(run);
     }
-    RunCheck::Found
+    RunCheck::Found(run)
 }
 
 fn refusal_message(refusals: &[String]) -> String {
@@ -486,6 +642,7 @@ mod tests {
         VerificationRun {
             label: label.to_string(),
             ok,
+            exit_code: Some(if ok { 0 } else { 1 }),
             model_step: 1,
             mutation_ops,
             call_id: Some(call_id.to_string()),
@@ -512,6 +669,7 @@ mod tests {
             requirements,
             accounting: Some(accounts),
             runs,
+            pending: &[],
             mutation_ops,
             artifact,
             literal,
@@ -520,6 +678,20 @@ mod tests {
 
     fn absent(_: &str) -> ArtifactState {
         ArtifactState::Absent
+    }
+
+    fn accept_verified(decision: ScopeDecision) -> Vec<VerificationRecord> {
+        match decision {
+            ScopeDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings,
+                records,
+            } => {
+                assert!(warnings.is_empty(), "{warnings:?}");
+                records
+            }
+            other => panic!("expected a verified acceptance, got {other:?}"),
+        }
     }
 
     fn unknown_literal(_: &str, _: &str) -> LiteralState {
@@ -561,12 +733,8 @@ mod tests {
         let accounts = [account("R1", AccountStatus::Done, "created done.txt")];
         let present = |_: &str| ArtifactState::Present;
         let decision = accept_with(&requirements, &accounts, &[], 0, &present, &unknown_literal);
-        assert_eq!(
-            decision,
-            ScopeDecision::Accept {
-                warnings: Vec::new()
-            }
-        );
+        let records = accept_verified(decision);
+        assert_eq!(records.len(), 1);
     }
 
     #[test]
@@ -612,12 +780,8 @@ mod tests {
         let accounts = [account("R1", AccountStatus::Done, "appended the line")];
         let present = |_: &str, _: &str| LiteralState::Present;
         let decision = accept_with(&requirements, &accounts, &[], 0, &absent, &present);
-        assert_eq!(
-            decision,
-            ScopeDecision::Accept {
-                warnings: Vec::new()
-            }
-        );
+        let records = accept_verified(decision);
+        assert_eq!(records.len(), 1);
 
         let missing = |_: &str, _: &str| LiteralState::Absent;
         let decision = accept_with(&requirements, &accounts, &[], 0, &absent, &missing);
@@ -644,12 +808,8 @@ mod tests {
             &absent,
             &unknown_literal,
         );
-        assert_eq!(
-            decision,
-            ScopeDecision::Accept {
-                warnings: Vec::new()
-            }
-        );
+        let records = accept_verified(decision);
+        assert_eq!(records.len(), 1);
 
         let decision = accept_with(&requirements, &accounts, &[], 3, &absent, &unknown_literal);
         assert!(
@@ -670,6 +830,100 @@ mod tests {
         );
     }
 
+    /// A command that only started has no result yet. Accounting for it as
+    /// done is refused for the real missing fact, and the refusal names the
+    /// background task to wait on.
+    #[test]
+    fn a_started_command_is_not_a_satisfied_command_requirement() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Command,
+            "run the verifier",
+            Some("sh verify.sh"),
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "sh verify.sh")];
+        let pending = [PendingCommand {
+            label: "sh verify.sh".to_string(),
+            task_id: Some("bg-1".to_string()),
+            call_id: Some("call-1".to_string()),
+        }];
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounts),
+            runs: &[],
+            pending: &pending,
+            mutation_ops: 0,
+            artifact: &absent,
+            literal: &unknown_literal,
+        });
+        let ScopeDecision::Refuse(message) = decision else {
+            panic!("a start is not a pass");
+        };
+        assert!(message.contains("only STARTED"), "{message}");
+        assert!(message.contains("bg-1"), "{message}");
+        assert!(message.contains("wait_task"), "{message}");
+    }
+
+    /// The record is the boundary between the declaration and the evidence:
+    /// it names the exact execution, its exit status, and the workspace
+    /// version it judged.
+    #[test]
+    fn an_accepted_record_carries_the_execution_evidence() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the suite must pass",
+            None,
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "call_id:call-9")];
+        let passed = [run("make regression", true, 4, "call-9")];
+        let decision = accept_with(
+            &requirements,
+            &accounts,
+            &passed,
+            4,
+            &absent,
+            &unknown_literal,
+        );
+        let records = accept_verified(decision);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].requirement_id, "R1");
+        assert_eq!(records[0].kind, "tests");
+        assert_eq!(records[0].call_id.as_deref(), Some("call-9"));
+        assert_eq!(records[0].command.as_deref(), Some("make regression"));
+        assert_eq!(records[0].exit_code, Some(0));
+        assert_eq!(records[0].workspace_version, 4);
+        assert_eq!(records[0].model_step, 1);
+    }
+
+    /// One requirement resting on the model's account is enough to make the
+    /// aggregate unverified, and the verified record keeps its own state.
+    #[test]
+    fn one_unverifiable_requirement_makes_the_aggregate_unverified() {
+        let requirements = [
+            item("R1", RequirementKind::Artifact, "report", Some("done.txt")),
+            item("R2", RequirementKind::Named, "nice messages", None),
+        ];
+        let accounts = [
+            account("R1", AccountStatus::Done, "created done.txt"),
+            account("R2", AccountStatus::Done, "rewrote the message"),
+        ];
+        let present = |_: &str| ArtifactState::Present;
+        let decision = accept_with(&requirements, &accounts, &[], 0, &present, &unknown_literal);
+        match decision {
+            ScopeDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                records,
+                ..
+            } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].state, VerificationRecordState::Verified);
+                assert_eq!(records[1].state, VerificationRecordState::Unverified);
+            }
+            other => panic!("one unverified boundary makes the whole unverified: {other:?}"),
+        }
+    }
+
     #[test]
     fn a_tests_requirement_is_satisfied_by_a_cited_passing_run() {
         let requirements = [item(
@@ -688,12 +942,8 @@ mod tests {
             &absent,
             &unknown_literal,
         );
-        assert_eq!(
-            decision,
-            ScopeDecision::Accept {
-                warnings: Vec::new()
-            }
-        );
+        let records = accept_verified(decision);
+        assert_eq!(records.len(), 1);
     }
 
     /// The runtime does not recognise a runner by name: an unrecognised command
@@ -720,12 +970,8 @@ mod tests {
             &absent,
             &unknown_literal,
         );
-        assert_eq!(
-            decision,
-            ScopeDecision::Accept {
-                warnings: Vec::new()
-            }
-        );
+        let records = accept_verified(decision);
+        assert_eq!(records.len(), 1);
     }
 
     #[test]
@@ -782,9 +1028,22 @@ mod tests {
         )];
         let accounts = [account("R1", AccountStatus::Done, "rewrote the message")];
         let decision = accept_with(&requirements, &accounts, &[], 0, &absent, &unknown_literal);
-        assert!(
-            matches!(decision, ScopeDecision::Accept { warnings } if warnings.len() == 1 && warnings[0].contains("no mechanical check"))
-        );
+        match decision {
+            ScopeDecision::Accept {
+                status: Some(VerificationStatus::Unverified),
+                warnings,
+                records,
+            } => {
+                assert!(
+                    warnings.len() == 1 && warnings[0].contains("no mechanical check"),
+                    "{warnings:?}"
+                );
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].requirement_id, "R1");
+                assert_eq!(records[0].state, VerificationRecordState::Unverified);
+            }
+            other => panic!("a named deliverable is accepted as unverified: {other:?}"),
+        }
     }
 
     #[test]
@@ -799,7 +1058,9 @@ mod tests {
         assert_eq!(
             decision,
             ScopeDecision::Accept {
-                warnings: Vec::new()
+                status: None,
+                warnings: Vec::new(),
+                records: Vec::new(),
             }
         );
     }
@@ -812,7 +1073,9 @@ mod tests {
         assert_eq!(
             decision,
             ScopeDecision::Accept {
-                warnings: Vec::new()
+                status: None,
+                warnings: Vec::new(),
+                records: Vec::new(),
             }
         );
     }

@@ -255,6 +255,7 @@ mod tests {
             reason: None,
             failure: None,
             warnings: Vec::new(),
+            verification: None,
         };
         let (tag, payload) = terminal.to_row().unwrap();
         events
@@ -403,6 +404,7 @@ mod tests {
             stop: Some(leveler_lifecycle::StopReason::Answered),
             failure: None,
             warnings: Vec::new(),
+            verification: None,
         };
         let (tag, payload) = event.to_row().unwrap();
         leveler_storage::EventRepository::new(&db)

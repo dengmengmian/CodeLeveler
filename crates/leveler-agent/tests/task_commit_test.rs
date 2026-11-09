@@ -1080,6 +1080,118 @@ async fn the_goal_scope_reads_the_declared_requirements_by_id() {
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }
 
+/// The accepted completion carries the runtime's structured verification, not
+/// the model's prose: the record names the requirement it belongs to and the
+/// exact execution that proved it. The model's `verification.status` is a
+/// declaration; these fields are the evidence.
+#[tokio::test]
+async fn an_accepted_completion_carries_the_structured_verification_records() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": [format!("{} 通过", test_runner_label())],
+                    "requirements": [
+                        {"kind": "tests", "text": "测试通过", "source_quote": "完成后通过测试"}
+                    ]
+                }),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "测试通过",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "call_id:call-2"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let verification = report
+        .verification
+        .expect("an accepted completion carries its verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified,
+        "the declared tests requirement has a current passing run: {verification:?}"
+    );
+    assert_eq!(verification.records.len(), 1);
+    let record = &verification.records[0];
+    assert_eq!(record.requirement_id, "R1");
+    assert_eq!(record.kind, "tests");
+    assert_eq!(
+        record.state,
+        leveler_lifecycle::VerificationRecordState::Verified
+    );
+    assert_eq!(record.call_id.as_deref(), Some("call-2"));
+    assert_eq!(record.command.as_deref(), Some(test_runner_label()));
+    assert_eq!(record.exit_code, Some(0));
+    assert!(record.model_step > 0);
+}
+
+/// A completion the runtime cannot mechanically check still completes: it is
+/// accepted as unverified and the terminal says exactly which requirement
+/// rests on the model's account. An unverified boundary is not a gate that
+/// waits for the user to confirm anything.
+#[tokio::test]
+async fn an_unverified_completion_is_accepted_and_records_the_boundary() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["文章发布可访问"],
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "文章发布完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "发布链路已可用"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let verification = report
+        .verification
+        .expect("an accepted completion carries its verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Unverified
+    );
+    assert_eq!(verification.records.len(), 1);
+    let record = &verification.records[0];
+    assert_eq!(record.requirement_id, "R1");
+    assert_eq!(
+        record.state,
+        leveler_lifecycle::VerificationRecordState::Unverified
+    );
+    assert!(record.call_id.is_none());
+    assert!(record.command.is_none());
+}
+
 #[tokio::test]
 async fn a_long_p2_request_registers_its_declared_requirements() {
     const P2: &str = include_str!("../../../testdata/regression/p2_scope_classification.zh-CN.md");

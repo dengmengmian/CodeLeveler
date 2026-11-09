@@ -1424,6 +1424,12 @@ impl EventBridge {
                 failure,
                 stop,
                 warnings,
+                // The structured verification report is engine-only state:
+                // the turn event already carries its user-visible consequence
+                // (a completion with any unverified boundary produces
+                // `TurnCompletedWithWarnings`). Clients read the report from
+                // the persisted terminal, not from this transient bridge.
+                verification: _,
             } => {
                 if !self.terminal_published {
                     self.terminal_published = true;
@@ -1767,6 +1773,7 @@ mod bridge_tests {
             failure: Some(model),
             stop: None,
             warnings: Vec::new(),
+            verification: None,
         });
         match rx.try_recv() {
             Ok(RuntimeEvent::TurnFailed { failure, .. }) => {
@@ -2703,6 +2710,7 @@ mod bridge_tests {
             objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
             completion_warnings: Vec::new(),
             bound_goal: None,
+            verification: None,
         }
     }
 
@@ -3324,6 +3332,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
             warnings: Vec::new(),
+            verification: None,
         });
 
         let mut events = Vec::new();
@@ -3371,6 +3380,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
             warnings: Vec::new(),
+            verification: None,
         });
 
         assert!(terminal_was_visible.load(Ordering::SeqCst));
@@ -3387,6 +3397,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
             warnings: vec!["required independent review did not complete".into()],
+            verification: None,
         });
 
         assert!(matches!(
@@ -3416,6 +3427,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Answered),
             warnings: vec!["no execution task was registered".into()],
+            verification: None,
         });
 
         assert!(matches!(
@@ -3442,6 +3454,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Answered),
             warnings: vec!["required independent review reported 1 finding(s)".into()],
+            verification: None,
         });
 
         assert!(matches!(
@@ -3471,6 +3484,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Answered),
             warnings: vec!["required independent review reported 1 finding(s)".into()],
+            verification: None,
         });
 
         assert!(matches!(
@@ -3503,6 +3517,7 @@ mod projection_equivalence {
                 "no execution task was registered: a commit_task declaration was refused".into(),
                 "required independent review reported 1 finding(s)".into(),
             ],
+            verification: None,
         });
 
         match terminal_of(&mut rx) {
@@ -3531,6 +3546,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Answered),
             warnings: vec!["required independent review reported 1 finding(s)".into()],
+            verification: None,
         });
 
         assert!(matches!(
@@ -3550,6 +3566,7 @@ mod projection_equivalence {
             failure: None,
             stop: None,
             warnings: Vec::new(),
+            verification: None,
         });
 
         assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)));
@@ -3565,6 +3582,7 @@ mod projection_equivalence {
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
             warnings: Vec::new(),
+            verification: None,
         });
         assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)));
 
@@ -3585,6 +3603,7 @@ mod projection_equivalence {
             failure: None,
             stop: None,
             warnings: Vec::new(),
+            verification: None,
         });
 
         assert!(

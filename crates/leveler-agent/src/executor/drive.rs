@@ -8,6 +8,7 @@ use leveler_context::{
 };
 use leveler_lifecycle::{
     EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
+    VerificationReport,
 };
 use leveler_model::{
     CompactionRecord, ContentPart, ControlContext, FinishReason, Message, ModelError,
@@ -291,6 +292,10 @@ pub(crate) struct Drive<'a> {
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
     completion_warnings: Vec<String>,
+    /// How far the runtime could verify the completion it accepted. Set by the
+    /// completion gate and the requirement gate of every accepted attempt, and
+    /// cleared at the start of each attempt so a refused one leaves no verdict.
+    completion_verification: Option<VerificationReport>,
     /// The resolution accepted this drive (`update_goal` completed/blocked) and
     /// its summary.
     ///
@@ -1010,6 +1015,7 @@ impl Executor {
             registration_refused: false,
             registration_nudged: false,
             completion_warnings: Vec::new(),
+            completion_verification: None,
             settled_goal: None,
             settled_rounds: 0,
             terminal_answer: None,
@@ -1918,6 +1924,7 @@ impl<'a> Drive<'a> {
         outcome
             .completion_warnings
             .extend(std::mem::take(&mut self.completion_warnings));
+        outcome.verification = self.completion_verification.take();
         Ok(Flow::Stop(outcome))
     }
 
@@ -4744,6 +4751,9 @@ impl AgentHarness for Drive<'_> {
                 // actually passed after the change or an explicit
                 // `not_applicable` reason. No semantic judgement is made here.
                 if reason == StopReason::Completed {
+                    // A refused attempt leaves no verdict behind: the next
+                    // attempt re-derives it from its own declaration and facts.
+                    self.completion_verification = None;
                     // What the model declared about its visible text. Read on
                     // every completion attempt, accepted or refused: a refused
                     // attempt's declaration is the answer candidate, and a
@@ -4791,10 +4801,13 @@ impl AgentHarness for Drive<'_> {
                         self.ledger.total_mutation_ops,
                         modified,
                     ) {
-                        super::goal_verification::VerificationDecision::Accept { warning } => {
-                            if let Some(warning) = warning {
-                                self.completion_warnings.push(warning);
-                            }
+                        super::goal_verification::VerificationDecision::Accept {
+                            status,
+                            warnings,
+                        } => {
+                            self.completion_warnings.extend(warnings);
+                            self.completion_verification =
+                                status.map(|status| VerificationReport::new(status, Vec::new()));
                             self.repeated_gate_refusal = None;
                         }
                         super::goal_verification::VerificationDecision::Refuse(message) => {
@@ -4890,12 +4903,19 @@ impl AgentHarness for Drive<'_> {
                             requirements: &requirements,
                             accounting: accounting.as_deref(),
                             runs: &self.verification_runs,
+                            pending: &self.pending_commands,
                             mutation_ops: self.ledger.total_mutation_ops,
                             artifact: &artifact,
                             literal: &literal,
                         }) {
-                            scope_gate::ScopeDecision::Accept { warnings } => {
+                            scope_gate::ScopeDecision::Accept {
+                                status,
+                                warnings,
+                                records,
+                            } => {
                                 self.completion_warnings.extend(warnings);
+                                self.completion_verification =
+                                    status.map(|status| VerificationReport::new(status, records));
                                 self.repeated_gate_refusal = None;
                                 self.requirements_refusal = None;
                             }
@@ -5882,25 +5902,6 @@ impl AgentHarness for Drive<'_> {
             // rule) and only advances on success.
             let mut content = content;
             let mut is_error = is_error;
-            // A test command that exits 0 while executing no tests is not
-            // evidence of a passing suite. Record it as a failed verification
-            // — the existing completion contract and a resumed turn already
-            // understand that fact, so no new state is introduced.
-            if self.executor.goal_mode()
-                && !is_error
-                && let Some(label) =
-                    super::goal_verification::command_label(&call.name, &call.arguments)
-                && super::goal_verification::is_verification_command(&label)
-                && super::goal_verification::reports_no_tests(&content)
-            {
-                content.push_str(&format!(
-                    "\n\n[verification] `{label}` exited 0 but executed no tests. \
-                     A skipped or empty suite does not verify the objective; run the \
-                     real tests, or call update_goal(status=\"blocked\") if they cannot \
-                     run."
-                ));
-                is_error = true;
-            }
             if let Some(steps) = plan
                 && !is_error
             {
@@ -6001,6 +6002,7 @@ impl AgentHarness for Drive<'_> {
                         .push(super::goal_verification::VerificationRun {
                             label: label.clone(),
                             ok: !is_error,
+                            exit_code: command_facts.exit_code,
                             model_step: model_steps,
                             mutation_ops: self.ledger.total_mutation_ops,
                             call_id: Some(call.id.as_str().to_string()),
@@ -6063,6 +6065,7 @@ impl AgentHarness for Drive<'_> {
                         .push(super::goal_verification::VerificationRun {
                             label,
                             ok: result.ok,
+                            exit_code: result.exit_code,
                             model_step: model_steps,
                             mutation_ops: self.ledger.total_mutation_ops,
                             call_id: started_call,

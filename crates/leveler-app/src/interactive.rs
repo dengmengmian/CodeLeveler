@@ -10152,6 +10152,7 @@ mod context_ops_tests {
                     failure: None,
                     stop: Some(leveler_lifecycle::StopReason::Answered),
                     warnings: Vec::new(),
+                    verification: None,
                 },
             ] {
                 let (tag, payload) = event.to_row().unwrap();
@@ -10215,6 +10216,7 @@ mod context_ops_tests {
                 failure: None,
                 stop: Some(leveler_lifecycle::StopReason::Answered),
                 warnings: Vec::new(),
+                verification: None,
             },
         ] {
             let (tag, payload) = event.to_row().unwrap();
@@ -10399,6 +10401,7 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                 failure: None,
                 stop: Some(leveler_agent::StopReason::Completed),
                 warnings: Vec::new(),
+                verification: None,
             });
         });
         published_rx.await.unwrap();
@@ -10522,6 +10525,7 @@ mod session_declaration_tests {
                 stop,
                 failure: None,
                 warnings: Vec::new(),
+                verification: None,
             };
             let (tag, payload) = event.to_row().unwrap();
             leveler_storage::EventRepository::new(&db)
@@ -10596,6 +10600,7 @@ mod recovered_continuation_tests {
                 stop: None,
                 failure: None,
                 warnings: Vec::new(),
+                verification: None,
             };
             let (kind, payload) = event.to_row().unwrap();
             leveler_storage::EventRepository::new(&db)
@@ -10683,6 +10688,7 @@ mod recovered_continuation_tests {
                 stop: None,
                 failure: None,
                 warnings: Vec::new(),
+                verification: None,
             };
             let (kind, payload) = event.to_row().unwrap();
             leveler_storage::EventRepository::new(&db)

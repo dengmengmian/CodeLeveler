@@ -10,7 +10,7 @@
 //! of agent produced it.
 
 use leveler_core::{GoalId, SessionId, TaskId, TurnId};
-use leveler_lifecycle::{AgentState, SessionStatus, StopReason};
+use leveler_lifecycle::{AgentState, SessionStatus, StopReason, VerificationReport};
 use leveler_storage::{EngineStores, EventStore, SessionRecord};
 
 use crate::log::{DanglingCall, EventLog, SnapshotView};
@@ -220,6 +220,9 @@ pub struct TaskTerminal {
     pub goal: Option<leveler_storage::GoalTerminalUpdate>,
     /// Completion-contract warnings.
     pub warnings: Vec<String>,
+    /// How far the runtime could verify an accepted completion. The engine
+    /// persists it verbatim on `TaskFinished`; it never derives a verdict.
+    pub verification: Option<VerificationReport>,
 }
 
 impl TaskEngine {
@@ -244,6 +247,7 @@ impl TaskEngine {
             failure: terminal.failure,
             stop: terminal.stop,
             warnings: terminal.warnings,
+            verification: terminal.verification,
         };
         let (event_type, payload) = event.to_row()?;
         let commit = self

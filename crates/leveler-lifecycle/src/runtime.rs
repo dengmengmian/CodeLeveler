@@ -154,6 +154,55 @@ impl FromStr for TaskOutcome {
     }
 }
 
+/// How far the runtime could verify an accepted completion.
+///
+/// Present only on a completion the runtime accepted: the model declared the
+/// work done and every recorded requirement that admits a mechanical check was
+/// checked against the execution record. `Verified` means every such check was
+/// satisfied and no requirement rests on the model's account; `Unverified`
+/// means the completion is accepted with at least one boundary the runtime
+/// could not check. Neither is a claim that the user's objective was met, and
+/// neither blocks the completion or waits for user confirmation.
+///
+/// The other two completion semantics are not verification states:
+/// `Incomplete` is [`TaskOutcome`] plus a non-delivery [`StopReason`], and
+/// `Blocked` is [`TaskOutcome::Blocked`]. A task that never declared a
+/// verification obligation carries `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// Every mechanical check the runtime had was satisfied.
+    Verified,
+    /// At least one accepted requirement rests on the model's account.
+    Unverified,
+}
+
+impl VerificationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerificationStatus::Verified => "verified",
+            VerificationStatus::Unverified => "unverified",
+        }
+    }
+}
+
+impl FromStr for VerificationStatus {
+    type Err = UnknownVariant;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "verified" => VerificationStatus::Verified,
+            "unverified" => VerificationStatus::Unverified,
+            other => {
+                return Err(UnknownVariant {
+                    kind: "verification status",
+                    value: other.to_string(),
+                });
+            }
+        })
+    }
+}
+
 /// A turn's terminal execution status.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

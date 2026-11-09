@@ -280,6 +280,7 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
         progress: Default::default(),
         objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
         completion_warnings: report.completion_warnings,
+        verification: report.verification,
         bound_goal: None,
     })
 }
@@ -371,6 +372,7 @@ pub(crate) async fn checkpoint_reaped_sessions(
                         state: leveler_lifecycle::AgentState::Cancelled,
                         goal,
                         warnings: Vec::new(),
+                        verification: None,
                     },
                     &mut |_| {},
                 )
@@ -1103,6 +1105,7 @@ impl Application {
                     state: AgentState::Cancelled,
                     goal,
                     warnings: Vec::new(),
+                    verification: None,
                 },
                 &mut |event| events.push(event),
             )

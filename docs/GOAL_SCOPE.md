@@ -124,6 +124,56 @@ declares a set has nothing for the gate to enforce; Goal mode therefore states
 the declaration obligation in its contract, and `get_goal_scope` always shows
 the exact set the gate will read.
 
+## Verification report
+
+Completion has two layers, and they are different kinds of fact:
+
+| Layer | Source | What it establishes |
+| --- | --- | --- |
+| `update_goal(verification)` | Model declaration | Which executions the model says it ran |
+| `VerificationRun` | Runtime execution record (`ToolCallStarted` + `ToolCallFinished`, background completion) | The command, its call id, exit status, workspace version and model step |
+
+The gate resolves each citation against the record. A citation may name a
+`call_id`, the exact command line, or the command plus a trailing note; a run
+that failed, that predates the last change, or that a later run of the same
+command contradicted is refused for that exact reason. Whether a command "is a
+test runner" is never decided from its name or its output.
+
+An accepted completion persists a `VerificationReport` on the task terminal
+(`TaskFinished.verification`, and the same report on `TaskReport`):
+
+```json
+{
+  "status": "unverified",
+  "records": [
+    {"requirement_id": "R1", "kind": "tests", "state": "verified",
+     "detail": "verified against the execution record: `sh run-tests.sh` exited 0 at workspace version 4",
+     "call_id": "call-12", "command": "sh run-tests.sh", "exit_code": 0,
+     "workspace_version": 4, "model_step": 7}
+  ]
+}
+```
+
+`records` has one entry per owed requirement, in requirement order. A record
+carries the evidence fields only when a recorded execution backed it; otherwise
+`call_id`/`command`/`exit_code` are absent and `detail` says what the runtime
+could not check. `workspace_version` is the mutation counter the verdict was
+taken against, so a stale verdict is visible without replaying the transcript.
+
+The four user-visible outcomes are projections of two facts, not a separate
+computed verdict:
+
+| Outcome | Representation |
+| --- | --- |
+| Verified | `TaskOutcome::Completed` + `VerificationStatus::Verified` |
+| CompletedUnverified | `TaskOutcome::Completed` + `VerificationStatus::Unverified` |
+| Incomplete | a non-delivery `StopReason` (budget, interruption) |
+| Blocked | `TaskOutcome::Blocked` |
+
+An unverified completion is accepted and delivered. It is not held for user
+confirmation: the warning and the report tell the user what the runtime could
+and could not prove, and the user decides what to do about it.
+
 ## Not in this contract
 
 - No keyword, negation-word, section-heading, test-runner or status-word table.

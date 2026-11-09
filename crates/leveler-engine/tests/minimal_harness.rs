@@ -357,6 +357,7 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
                 state: AgentState::Complete,
                 goal: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             &mut |_| terminal_observations += 1,
         )
@@ -375,6 +376,7 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
                 state: AgentState::Complete,
                 goal: None,
                 warnings: Vec::new(),
+                verification: None,
             },
             &mut |_| terminal_observations += 1,
         )

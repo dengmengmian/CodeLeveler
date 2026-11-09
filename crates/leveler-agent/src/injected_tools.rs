@@ -143,14 +143,18 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             delivering that part while quietly exempting the rest — with or \
             without a rationalization — is still a false completion. Blocked, \
             naming which part cannot be satisfied and why. \
-            `complete` needs `verification`: `passed` with the commands you \
-            actually ran, one per line in `detail` (checked against the \
-            runtime's execution record, after your last change), or \
-            `not_applicable` with the reason in `detail`. A failed test or \
-            build cannot be closed as complete. When the goal has a recorded \
-            requirement set, `requirements` must account for every active \
-            deliverable by its stable id; a missing or `not_done` requirement \
-            refuses completion. \
+            `complete` needs `verification`: `passed` citing the executions \
+            you rely on, one per line in `detail` (each citation is checked \
+            against the runtime's execution record, after your last change), or \
+            `not_applicable` with the reason in `detail`. The runtime never \
+            classifies a command by its name: the citation is what makes an \
+            execution evidence, and a completion that changed the workspace \
+            with no citation is accepted as unverified, never as a verified \
+            success. When the goal has a \
+            recorded requirement set, `requirements` must account for every \
+            active deliverable by its stable id; a missing or `not_done` \
+            requirement refuses completion, and the requirement's own account \
+            is the evidence the terminal carries. \
             `unverifiable` marks delivered work the runtime cannot prove, not \
             work you skipped.",
     );
@@ -183,7 +187,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 },
                 "verification": {
                     "type": "object",
-                    "description": "For complete: what the runtime can check.",
+                    "description": "For complete: the executions you cite as evidence. The runtime checks every citation against its own record; it does not classify commands by name.",
                     "properties": {
                         "status": {
                             "type": "string",
@@ -191,7 +195,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                         },
                         "detail": {
                             "type": "string",
-                            "description": "For passed: cite each check on its own line. Prefer `call_id:<id>` of the tool call that ran it. A full command line also matches. A trailing result note (`→ ...` or a parenthetical) is not part of the command. Do not abbreviate a command, and do not rerun a check only to make the citation match. For not_applicable: why no executable check exists."
+                            "description": "For passed: cite each execution you rely on, one per line. Prefer `call_id:<id>` of the tool call that ran it. A full command line also matches; its name is not classified. A trailing result note (`→ ...` or a parenthetical) is not part of the command. Do not abbreviate a command, and do not rerun a check only to make the citation match. For not_applicable: why no executable check exists."
                         }
                     },
                     "required": ["status", "detail"]
