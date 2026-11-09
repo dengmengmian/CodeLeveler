@@ -698,6 +698,16 @@ pub(crate) fn uncovered(requirements: &[Requirement], acceptance: &[String]) -> 
 /// so a legitimate long task can always account for every requirement it has.
 pub(crate) const MIN_ACCOUNTING_ENTRIES: usize = 20;
 
+/// How many entries a tool may carry for a requirement set of `requirements`.
+///
+/// Both the commit declaration and the completion accounting must be able to
+/// name every requirement the Gate extracts. A fixed floor alone made a
+/// request that enumerates more deliverables than the floor impossible to
+/// declare or complete.
+pub(crate) fn entry_limit(requirements: usize) -> usize {
+    requirements.max(MIN_ACCOUNTING_ENTRIES)
+}
+
 /// Parse the optional `requirements` accounting array from `update_goal`.
 ///
 /// `limit` exists so the cap can follow the requirement set: a fixed 20 made a
@@ -716,7 +726,7 @@ pub(crate) fn parse_accounting(
                 .to_string(),
         );
     };
-    let limit = limit.max(MIN_ACCOUNTING_ENTRIES);
+    let limit = entry_limit(limit);
     if items.len() > limit {
         return Err(format!(
             "`requirements` may list at most {limit} entries; group related checks or account              for the requirements the user actually stated"
@@ -1242,17 +1252,134 @@ fn mentions_tests(text: &str) -> bool {
         || lower.contains("spec")
 }
 
+/// What an introduced list is doing in the request.
+///
+/// Only `Deliverable` items are work the completion contract can ask the model
+/// to account for. A list that restates what already exists, names reading
+/// material, or lists setup steps is context the model must read but must not
+/// prove as an end state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListRole {
+    Deliverable,
+    Context,
+    Reference,
+    Procedure,
+}
+
+/// Words that introduce reading material, not a deliverable set.
+const REFERENCE_CUES: &[&str] = &[
+    "读取",
+    "阅读",
+    "参考",
+    "查阅",
+    "read the following",
+    "reference",
+    "refer to",
+];
+
+/// Words that introduce a state of the world that already exists. Checked
+/// before [`DELIVERY_VERBS`] because `已经完成` itself contains `完成`.
+///
+/// Deliberately narrow: only explicit completion markers. A topical cue
+/// (`上轮遗留问题：`, `背景：`) may introduce work, so it does not suppress the
+/// list that follows.
+const CONTEXT_CUES: &[&str] = &[
+    "已经完成",
+    "已完成",
+    "已验收",
+    "already completed",
+    "already done",
+];
+
+/// Words that introduce setup or inspection steps. A delivery verb in the same
+/// introducing clause wins (`必须检查并实现：` delivers; `首先检查 Git 工作区：`
+/// prepares), so a checklist about the work never suppresses the work itself.
+const PROCEDURE_CUES: &[&str] = &[
+    "检查",
+    "确认",
+    "核对",
+    "准备",
+    "前置",
+    "执行前",
+    "first check",
+    "check first",
+    "before starting",
+    "prerequisites",
+    "setup",
+];
+
+/// The role of the list this segment introduces, if the segment ends with a
+/// colon. Only the introducing clause decides: an item that merely mentions
+/// `已验收` inside a genuine delivery list does not suppress its siblings.
+fn list_role(segment: &str) -> Option<ListRole> {
+    if bullet_item(segment).is_some() {
+        return None;
+    }
+    let trimmed = segment.trim();
+    let head = trimmed
+        .strip_suffix('：')
+        .or_else(|| trimmed.strip_suffix(':'))?
+        .trim();
+    if head.is_empty() {
+        return None;
+    }
+    let lower = head.to_lowercase();
+    if REFERENCE_CUES
+        .iter()
+        .any(|cue| head.starts_with(cue) || lower.starts_with(cue))
+        && !has_any(head, DELIVERY_VERBS)
+    {
+        return Some(ListRole::Reference);
+    }
+    if CONTEXT_CUES
+        .iter()
+        .any(|cue| head.contains(cue) || lower.contains(cue))
+    {
+        return Some(ListRole::Context);
+    }
+    if has_any(head, DELIVERY_VERBS) {
+        return Some(ListRole::Deliverable);
+    }
+    if PROCEDURE_CUES
+        .iter()
+        .any(|cue| head.contains(cue) || lower.contains(cue))
+    {
+        return Some(ListRole::Procedure);
+    }
+    None
+}
+
 fn collect_segments(
     text: &str,
     source: &RequirementSource,
     out: &mut Vec<(String, RequirementKind, RequirementSource, Option<String>)>,
 ) {
+    let mut role: Option<ListRole> = None;
     for segment in split_segments(text) {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
         }
-        collect_segment(segment, source, out);
+        let introduced = list_role(segment);
+        if is_markdown_heading(segment) {
+            role = None;
+        } else if let Some(introduced) = introduced {
+            role = Some(introduced);
+        } else if bullet_item(segment).is_none() {
+            // A paragraph that is neither a heading nor a list item ends the
+            // list it followed; the next list must introduce its own role.
+            role = None;
+        }
+        let contextual = matches!(
+            role,
+            Some(ListRole::Context | ListRole::Reference | ListRole::Procedure)
+        );
+        let part_of_list = introduced.is_some() || bullet_item(segment).is_some();
+        if !(contextual && part_of_list) {
+            collect_segment(segment, source, out);
+        }
+        // Constraints stay requirements even inside a context, reading or
+        // setup list: `不修改并发 P3 工作区` still forbids touching it.
         collect_constraint_clauses(segment, source, out);
     }
 }
@@ -1325,6 +1452,18 @@ fn starts_with_prohibition(text: &str) -> bool {
         "不要",
         "不能",
         "别",
+        // A negated mutation is a prohibition with no other reading:
+        // `不修改并发 P3 工作区` forbids touching it, it does not ask for a
+        // deliverable named "不修改…".
+        "不修改",
+        "不覆盖",
+        "不破坏",
+        "不改变",
+        "不删除",
+        "不新增",
+        "不引入",
+        "不进行",
+        "不再",
         "must not",
         "may not",
         "do not",
@@ -2399,6 +2538,17 @@ fn segment_is_negated(segment: &str) -> bool {
             "别",
             "跳过",
             "禁止",
+            // A negated mutation inside a deliverable list is still a
+            // constraint, not an item to account for.
+            "不修改",
+            "不覆盖",
+            "不破坏",
+            "不改变",
+            "不删除",
+            "不新增",
+            "不引入",
+            "不进行",
+            "不再",
             "skip",
             "don't",
             "do not",
@@ -2715,6 +2865,140 @@ mod tests {
             source: RequirementSource::Objective,
             target: None,
         }
+    }
+
+    /// A request with more explicit requirements than the floor must still be
+    /// declarable and accountable: the limit is a payload bound, never a
+    /// statement that the user asked for too much.
+    #[test]
+    fn entry_limit_follows_the_requirement_set_above_the_floor() {
+        assert_eq!(entry_limit(3), MIN_ACCOUNTING_ENTRIES);
+        assert_eq!(entry_limit(MIN_ACCOUNTING_ENTRIES), MIN_ACCOUNTING_ENTRIES);
+        assert_eq!(
+            entry_limit(MIN_ACCOUNTING_ENTRIES + 1),
+            MIN_ACCOUNTING_ENTRIES + 1
+        );
+        assert_eq!(entry_limit(132), 132);
+    }
+
+    /// A request often restates what already exists before asking for the new
+    /// work. Those bullets are context: requiring an acceptance check for each
+    /// one forces the model to prove finished history as an end state. The
+    /// audited session extracted its five completed-phase bullets this way.
+    #[test]
+    fn a_completed_context_list_is_not_a_deliverable_set() {
+        let request = "当前平台已经完成：\n\
+            - P0：数据库基础架构。\n\
+            - P1：交易可靠性。\n\
+            \n\
+            本轮目标是：\n\
+            - 实现订阅计费。\n";
+        let requirements = extract(request, &[]);
+        let texts = texts(&requirements);
+        assert!(
+            texts
+                .iter()
+                .all(|text| !text.contains("数据库基础架构") && !text.contains("交易可靠性")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("订阅计费")),
+            "{texts:?}"
+        );
+    }
+
+    /// A reading list names material to open, not artifacts to deliver. The
+    /// audited request's `读取以下资料：` bullets (including a module list that
+    /// is not a path) were counted as deliverables; a commit can never cover
+    /// `docs/设计文档/`.
+    #[test]
+    fn a_reading_list_is_not_a_deliverable_set() {
+        let request = "读取以下资料：\n\
+            - `AGENTS.md`\n\
+            - `docs/设计文档/`\n\
+            - 当前订单、合同模块源码及测试。\n\
+            \n\
+            必须实现：\n\
+            - 订阅计费。\n";
+        let requirements = extract(request, &[]);
+        let texts = texts(&requirements);
+        assert!(
+            texts.iter().all(|text| !text.contains("AGENTS.md")
+                && !text.contains("设计文档")
+                && !text.contains("当前订单、合同模块源码")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|text| *text == "订阅计费"), "{texts:?}");
+    }
+
+    /// Setup checklists are steps to execute before the work, not end states
+    /// to prove. Their constraints still bind: `不修改并发 P3 工作区` is a
+    /// prohibition, not a deliverable named "不修改…". The audited refusal
+    /// listed `确认 P1 已验收变更是否提交` as a missing deliverable.
+    #[test]
+    fn a_setup_checklist_is_not_a_deliverable_set_but_its_constraints_survive() {
+        let request = "首先检查 Git 工作区：\n\
+            1. 确认 P1 已验收变更是否提交。\n\
+            2. 在稳定基线上建立 P2 独立分支及 Worktree。\n\
+            3. 不修改并发 P3 工作区。\n\
+            4. 不覆盖其他任务的未提交内容。\n\
+            \n\
+            必须补齐：\n\
+            - 合同审批。\n";
+        let requirements = extract(request, &[]);
+        let texts = texts(&requirements);
+        assert!(
+            texts
+                .iter()
+                .all(|text| !text.contains("确认 P1") && !text.contains("建立 P2 独立分支")),
+            "{texts:?}"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.kind == RequirementKind::Forbidden
+                    && requirement.text.contains("不修改并发 P3 工作区")
+            }),
+            "{texts:?}"
+        );
+        assert!(
+            requirements.iter().any(|requirement| {
+                requirement.kind == RequirementKind::Forbidden
+                    && requirement.text.contains("不覆盖其他任务的未提交内容")
+            }),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("合同审批")),
+            "{texts:?}"
+        );
+    }
+
+    /// The role comes from the introducing clause only. A genuine delivery
+    /// item that mentions finished work is still work to deliver.
+    #[test]
+    fn a_context_word_inside_a_delivery_item_does_not_suppress_it() {
+        let request = "必须实现：\n- 已验收订单的历史追溯。\n";
+        let requirements = extract(request, &[]);
+        let texts = texts(&requirements);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("已验收订单的历史追溯")),
+            "{texts:?}"
+        );
+    }
+
+    /// A topical cue is not a completion fact. `上轮遗留问题：` introduces work
+    /// to do, not history to restate.
+    #[test]
+    fn a_topical_intro_does_not_suppress_the_work_it_lists() {
+        let request = "上轮遗留问题：\n- 修复登录崩溃。\n";
+        let requirements = extract(request, &[]);
+        let texts = texts(&requirements);
+        assert!(
+            texts.iter().any(|text| text.contains("登录崩溃")),
+            "{texts:?}"
+        );
     }
 
     fn content(text: &str, target: &str) -> Requirement {

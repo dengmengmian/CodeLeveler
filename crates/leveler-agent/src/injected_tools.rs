@@ -197,7 +197,12 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 },
                 "requirements": {
                     "type": "array",
-                    "maxItems": 20,
+                    // No fixed `maxItems`: the cap is the number of
+                    // requirements the runtime extracted for THIS goal, which
+                    // the schema cannot know when the tool is defined. A fixed
+                    // 20 made a legitimate 132-requirement goal impossible to
+                    // complete. `parse_accounting` enforces the real cap and
+                    // names it in the refusal.
                     "description": "For complete: one entry per explicitly enumerated user requirement.",
                     "items": {
                         "type": "object",
@@ -282,10 +287,13 @@ pub(crate) const GET_GOAL_SCOPE_TOOL: &str = "get_goal_scope";
 pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: GET_GOAL_SCOPE_TOOL.to_string(),
-        description: "Read the current effective acceptance set for this committed goal, page by \
-            page. The completion Gate uses exactly this set. Call it when the retained-facts \
-            block says more requirements exist than it expanded, or before declaring completion \
-            when the task has many explicit deliverables. Read-only; it never changes the goal."
+        description: "Read the effective acceptance set for this turn, page by page. Before a \
+            commit there is no goal row: the result is the candidate set `commit_task` will \
+            enforce, derived from the user's request. After the commit it is the goal's durable \
+            scope. The completion Gate uses exactly this set. Call it when the retained-facts \
+            block says more requirements exist than it expanded, before declaring completion \
+            when the task has many explicit deliverables, and before a `commit_task` whose \
+            request enumerates many deliverables. Read-only; it never changes the goal."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -307,7 +315,7 @@ pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     }
 }
 
-pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
+pub(crate) fn commit_task_tool_definition(acceptance_limit: usize) -> ToolDefinition {
     let description = String::from(
         "Declare that the user's request is execution work this turn must carry \
             to completion, and commit the turn to the task lifecycle. Call it before the \
@@ -323,7 +331,9 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             not to modify anything. If you are unsure whether this is execution work, do not \
             call it. `objective` is the user's stated end state, not a narrower version of it \
             and never an enlargement of it. `acceptance` lists the concrete checks that will \
-            prove it. After the commit, the runtime keeps this turn running: a stage summary \
+            prove it. When the request enumerates many deliverables, call `get_goal_scope` \
+            first: it pages the exact set a commit is judged against. After the commit, the \
+            runtime keeps this turn running: a stage summary \
             or a quiet end does NOT finish the task. Continue the work and resolve it with \
             update_goal(complete|blocked). The session itself stays a Chat session.",
     );
@@ -341,7 +351,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
-                    "maxItems": 20,
+                    "maxItems": acceptance_limit,
                     "description": "Concrete checks that will prove the objective. Every deliverable the user enumerated needs its own check; a commit that drops one is refused."
                 },
                 "task_relation": {
@@ -1214,7 +1224,7 @@ mod tests {
     /// Keep it small and make the number visible to the performance record.
     #[test]
     fn commit_task_surface_stays_small() {
-        let tool = commit_task_tool_definition();
+        let tool = commit_task_tool_definition(20);
         let tokens = leveler_model::estimate_text(&tool.description)
             + leveler_model::estimate_text(&tool.input_schema.to_string());
         let guidance = leveler_model::estimate_text(TASK_COMMIT_GUIDANCE);
@@ -1223,13 +1233,43 @@ mod tests {
         assert!(guidance < 300, "task guidance grew to {guidance} tokens");
     }
 
+    /// Capacity is a property of the request, not a constant: the commit gate
+    /// extracts one requirement per deliverable, so the declaration must be
+    /// able to carry at least that many checks.
+    #[test]
+    fn commit_task_capacity_follows_the_requirement_set() {
+        let floor = commit_task_tool_definition(20);
+        let wide = commit_task_tool_definition(132);
+        assert_eq!(
+            floor.input_schema["properties"]["acceptance"]["maxItems"],
+            20
+        );
+        assert_eq!(
+            wide.input_schema["properties"]["acceptance"]["maxItems"],
+            132
+        );
+    }
+
+    /// The completion account has the same dynamic cap as the commit
+    /// declaration. A fixed `maxItems` in the schema would reject a legitimate
+    /// long task before `parse_accounting` could apply the real bound.
+    #[test]
+    fn update_goal_accounting_has_no_fixed_schema_cap() {
+        let tool = update_goal_tool_definition();
+        let requirements = &tool.input_schema["properties"]["requirements"];
+        assert!(
+            requirements.get("maxItems").is_none(),
+            "the accounting cap is the extracted requirement set, not a schema constant"
+        );
+    }
+
     /// The upgrade decision is semantic evidence about the request, not a
     /// mechanical trigger. A question, a status/verification check and an
     /// explanation must all be excluded by name, and no counting rule (message
     /// length, tool count, keyword list) may appear as the trigger.
     #[test]
     fn the_task_upgrade_needs_evidence_and_never_counts_words() {
-        let def = commit_task_tool_definition();
+        let def = commit_task_tool_definition(20);
         let rule = format!("{} {}", def.description, TASK_COMMIT_GUIDANCE);
         for required in [
             "perform work",
