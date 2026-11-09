@@ -112,8 +112,13 @@ async fn fixture() -> Fixture {
     let base_url = hold_open_model_endpoint().await;
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), &base_url);
+    // The repository is a child of the state root: an Execution Host refuses
+    // a state dir inside its own workspace write authority, and these tests
+    // start the real host to observe owner loss while its process still runs.
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
     let layout = Layout::from_parts(
-        tmp.path().to_path_buf(),
+        repo.clone(),
         tmp.path().join("configs"),
         tmp.path().join("state"),
     );
@@ -138,7 +143,6 @@ async fn fixture() -> Fixture {
         .expect("create session")
         .session
         .id;
-    let repo = tmp.path().to_path_buf();
     Fixture {
         app,
         runtime,
@@ -642,6 +646,8 @@ impl Fixture {
             finished_at_ms: Some(2),
             log_end: 12,
             log_prefix_len: 0,
+            owner_boot: None,
+            owner_loss: None,
             loss: None,
             result: None,
         };
@@ -831,6 +837,185 @@ async fn a_hosted_terminal_fact_proves_completion_after_the_runtime_died() {
         assert_eq!(record.exit_code, Some(0));
         assert!(record.output.contains("hosted done"), "{record:?}");
     }
+}
+
+/// The fixture's real Execution Host. A goal task can only be genuinely
+/// owner-lost while the host that admitted it is still alive; an archive
+/// without a host is recovered as an unobserved terminal record instead, which
+/// is a different fact.
+async fn start_execution_host(f: &Fixture) -> tokio::task::JoinHandle<Result<(), String>> {
+    let config = leveler_app::execution_host_config(&f.app.layout).unwrap();
+    let server = tokio::spawn(leveler_execution::execution_host::serve(config.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if leveler_execution::execution_host::ExecutionHostClient::probe(&config)
+                .await
+                .is_ok_and(|probe| probe.client.is_some())
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Execution Host became reachable");
+    server
+}
+
+/// A goal task the Execution Host still runs for a generation that is gone is
+/// Lost, not Running: no runtime can deliver its result. Its clock stops at
+/// the proven loss instead of growing for as long as the snapshot is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owner_lost_task_is_lost_even_while_its_process_still_runs() {
+    let f = fixture().await;
+    let server = start_execution_host(&f).await;
+    let config = leveler_app::execution_host_config(&f.app.layout).unwrap();
+    let crashed = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    let crashed_boot = crashed.id().clone();
+    f.app.background_tasks().bind_runtime_boot(
+        crashed.id().clone(),
+        Arc::new(leveler_app::runtime_boot::StateDirBootLiveness::new(
+            &f.app.layout.state_dir,
+        )),
+    );
+    let id = f
+        .spawn(Some("call-goal"), "while :; do echo HEARTBEAT; done")
+        .await;
+    f.record_background_start(
+        None,
+        "call-goal",
+        &id,
+        "sh",
+        &["-c", "while :; do echo HEARTBEAT; done"],
+    )
+    .await;
+    let client = leveler_execution::execution_host::ExecutionHostClient::connect(config.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !client
+            .get_owned(&id, f.session.as_str())
+            .await
+            .unwrap()
+            .log
+            .contains("HEARTBEAT")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hosted task produced output");
+
+    drop(crashed);
+    f.app.reconcile_execution_services().await.unwrap();
+
+    let snapshot = f.snapshot().await;
+    assert!(
+        !snapshot
+            .active_background_tasks
+            .iter()
+            .any(|task| task.task_id == id),
+        "a task whose owner is gone must not be this runtime's live work"
+    );
+    let record = record_of(&snapshot, &id);
+    assert_eq!(record.state, UiBackgroundTaskState::Lost, "{record:?}");
+    assert_eq!(record.call_id.as_deref(), Some("call-goal"));
+    assert_eq!(record.exit_code, None);
+    assert!(record.output.contains("HEARTBEAT"), "{record:?}");
+
+    let archive = leveler_execution::execution_host::HostRecords::read(&config.state_dir).unwrap();
+    let archived = archive.task(&id).expect("the host kept the record");
+    let loss = archived.owner_loss.as_ref().expect("loss is recorded");
+    assert_eq!(loss.owner_boot, crashed_boot.as_str());
+    assert_eq!(
+        archived.snapshot.status,
+        leveler_execution::BackgroundTaskStatus::Running,
+        "owner loss never signals the process"
+    );
+    let expected = loss.observed_at_ms.saturating_sub(archived.started_at_ms);
+    assert_eq!(record.duration_ms, Some(expected), "{record:?}");
+
+    // A second recovery in the same generation converges on the same fact:
+    // no new timestamp and no changed projection.
+    f.app.reconcile_execution_services().await.unwrap();
+    let repeated = leveler_execution::execution_host::HostRecords::read(&config.state_dir).unwrap();
+    assert_eq!(
+        repeated
+            .task(&id)
+            .expect("the host kept the record")
+            .owner_loss
+            .as_ref()
+            .expect("loss is recorded")
+            .observed_at_ms,
+        loss.observed_at_ms,
+        "repeated recovery must not restamp the loss"
+    );
+    let repeated_snapshot = f.snapshot().await;
+    assert_eq!(
+        record_of(&repeated_snapshot, &id).duration_ms,
+        Some(expected),
+        "a repeated recovery must not move the frozen clock"
+    );
+
+    f.app
+        .background_tasks()
+        .kill_owned(&id, f.session.as_str())
+        .await
+        .unwrap();
+    server.abort();
+}
+
+/// A crash inside the spawn call can lose the engine's start row while the
+/// host still admitted the process. The archive is the only record left, and
+/// it must appear as Lost rather than vanish or claim a live owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owner_lost_task_with_no_start_fact_is_never_dropped() {
+    let f = fixture().await;
+    let server = start_execution_host(&f).await;
+    let crashed = RuntimeBootLease::acquire(&f.app.layout.state_dir).unwrap();
+    f.app.background_tasks().bind_runtime_boot(
+        crashed.id().clone(),
+        Arc::new(leveler_app::runtime_boot::StateDirBootLiveness::new(
+            &f.app.layout.state_dir,
+        )),
+    );
+    let id = f
+        .spawn(Some("call-before-log"), "while :; do echo HEARTBEAT; done")
+        .await;
+    let config = leveler_app::execution_host_config(&f.app.layout).unwrap();
+    let client = leveler_execution::execution_host::ExecutionHostClient::connect(config.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !client
+            .get_owned(&id, f.session.as_str())
+            .await
+            .unwrap()
+            .log
+            .contains("HEARTBEAT")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hosted task produced output");
+
+    drop(crashed);
+    f.app.reconcile_execution_services().await.unwrap();
+
+    let snapshot = f.snapshot().await;
+    let record = record_of(&snapshot, &id);
+    assert_eq!(record.state, UiBackgroundTaskState::Lost, "{record:?}");
+    assert_eq!(record.call_id.as_deref(), Some("call-before-log"));
+    assert!(record.output.contains("HEARTBEAT"), "{record:?}");
+    assert!(record.duration_ms.is_some(), "{record:?}");
+
+    f.app
+        .background_tasks()
+        .kill_owned(&id, f.session.as_str())
+        .await
+        .unwrap();
+    server.abort();
 }
 
 /// The archive is evidence only for the start it belongs to. A record for the

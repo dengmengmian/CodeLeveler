@@ -1139,6 +1139,33 @@ fn hosted_terminal_facts(
     }
 }
 
+/// Live goal tasks whose admitting runtime generation is proven gone.
+///
+/// The Execution Host still owns the process, but the generation that asked
+/// for the work cannot receive its result. The projection reports the task as
+/// Lost even when the engine never wrote a start row, so a crash inside the
+/// spawn call does not erase the work from view. Reading the archive claims no
+/// process; an unreadable archive is reported and treated as absent.
+fn hosted_owner_lost_facts(
+    app: &Application,
+    session_id: &SessionId,
+) -> Vec<leveler_execution::BackgroundTaskSnapshot> {
+    match app
+        .background_tasks()
+        .hosted_owner_lost_snapshots_for_scope(session_id.as_str())
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session = session_id.as_str(),
+                "cannot read Execution Host owner-loss facts"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Persist the terminal fact for an execution that completed in the background.
 ///
 /// The original foreground ownership token is stale once another turn acquires
@@ -7810,12 +7837,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // durable record must be completed here, not only at a turn boundary.
         reconcile_background_evidence(&self.app, session_id).await;
         let hosted_terminal = hosted_terminal_facts(&self.app, session_id);
+        let owner_lost = hosted_owner_lost_facts(&self.app, session_id);
         let background_tasks = project_background_tasks(
             &db,
             &probe,
             session_id,
             &active_background_tasks,
             &hosted_terminal,
+            &owner_lost,
         )
         .await?;
         let foreign_origin = project_foreign_origin(&db, session_id).await;
@@ -7942,12 +7971,18 @@ async fn project_interrupted_tool_calls(
 /// the owning boot's liveness separates `Lost` from `Unknown`. A live entry
 /// never gets a terminal it does not have: the snapshot reports what it can
 /// prove, not what would be convenient.
+///
+/// A task the Execution Host marked owner-lost is `Lost` even when a live
+/// process still exists: the process cannot deliver its result to the runtime
+/// generation that admitted it, so presenting it as this runtime's Running work
+/// would be a false claim. Its duration ends at the proven loss.
 async fn project_background_tasks(
     db: &leveler_storage::Database,
     probe: &dyn BootLivenessProbe,
     session_id: &SessionId,
     live: &[leveler_client_protocol::UiActiveBackgroundTask],
     hosted_terminal: &[leveler_execution::BackgroundTaskSnapshot],
+    owner_lost: &[leveler_execution::BackgroundTaskSnapshot],
 ) -> Result<Vec<leveler_client_protocol::UiBackgroundTaskRecord>, ClientError> {
     use leveler_client_protocol::{UiBackgroundTaskRecord, UiBackgroundTaskState};
 
@@ -7992,6 +8027,10 @@ async fn project_background_tasks(
     for task in hosted_terminal {
         hosted_by_id.entry(task.id.as_str()).or_default().push(task);
     }
+    let lost_by_id: HashMap<&str, &leveler_execution::BackgroundTaskSnapshot> = owner_lost
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect();
 
     // One record per id. Repeated ids are an identity conflict, not two
     // tasks: the client keys its chrome by task id, and neither the live
@@ -8029,14 +8068,15 @@ async fn project_background_tasks(
         let hosted_conflict = fact.terminal.is_none()
             && hosted_by_id.contains_key(fact.task_id.as_str())
             && hosted.is_none();
+        let lost = lost_by_id.get(fact.task_id.as_str()).copied();
+        // An owner-lost task is not live work of this runtime even while its
+        // process runs, so it never creates the live/terminal conflict case.
+        let live_here = live_by_id.contains_key(fact.task_id.as_str()) && lost.is_none();
         let is_conflict = starts.len() > 1
             || hosted_conflict
-            || (live_by_id.contains_key(fact.task_id.as_str())
-                && (starts.iter().any(|s| s.terminal.is_some()) || hosted.is_some()));
+            || (live_here && (starts.iter().any(|s| s.terminal.is_some()) || hosted.is_some()));
         let state = if is_conflict {
             UiBackgroundTaskState::Conflict
-        } else if live_by_id.contains_key(fact.task_id.as_str()) {
-            UiBackgroundTaskState::Running
         } else if let Some(terminal) = &fact.terminal {
             terminal_state(terminal)
         } else if let Some(record) = hosted {
@@ -8046,6 +8086,10 @@ async fn project_background_tasks(
                 record.status != leveler_execution::BackgroundTaskStatus::Exited
                     || record.exit_code != Some(0),
             )
+        } else if lost.is_some() {
+            UiBackgroundTaskState::Lost
+        } else if live_here {
+            UiBackgroundTaskState::Running
         } else {
             match latest.turn_id.as_deref().and_then(&mut boot_of) {
                 Some(BootLiveness::Dead) => UiBackgroundTaskState::Lost,
@@ -8056,29 +8100,35 @@ async fn project_background_tasks(
                 }
             }
         };
-        let (exit_code, output, output_truncated) = match (&state, &fact.terminal, hosted) {
-            (UiBackgroundTaskState::Conflict, _, _) | (_, None, None) => {
-                (None, String::new(), false)
-            }
-            (_, Some(terminal), _) => (
+        let (exit_code, output, output_truncated) = if state == UiBackgroundTaskState::Conflict {
+            (None, String::new(), false)
+        } else if let Some(terminal) = &fact.terminal {
+            (
                 terminal.exit_code,
                 terminal.output.clone(),
                 terminal.output_truncated,
-            ),
-            (_, None, Some(record)) => {
-                // Same tail bound the durable fact uses, so a reconnect and a
-                // later turn boundary describe the result identically.
-                const OUTPUT_TAIL_BYTES: usize = 4096;
-                let start = leveler_core::ceil_char_boundary(
-                    &record.log,
-                    record.log.len().saturating_sub(OUTPUT_TAIL_BYTES),
-                );
-                (
-                    record.exit_code,
-                    record.log[start..].to_owned(),
-                    record.log_truncated || start != 0,
-                )
-            }
+            )
+        } else if let Some(record) = hosted {
+            // Same tail bound the durable fact uses, so a reconnect and a
+            // later turn boundary describe the result identically.
+            let (output, output_truncated) = output_tail(&record.log, record.log_truncated);
+            (record.exit_code, output, output_truncated)
+        } else if let Some(task) = lost {
+            let (output, output_truncated) = output_tail(&task.log, task.log_truncated);
+            (None, output, output_truncated)
+        } else {
+            (None, String::new(), false)
+        };
+        let duration_ms = match state {
+            UiBackgroundTaskState::Conflict => None,
+            UiBackgroundTaskState::Running => live_by_id
+                .get(fact.task_id.as_str())
+                .map(|task| task.elapsed_ms),
+            UiBackgroundTaskState::Lost => lost.map(|task| task.duration_ms),
+            UiBackgroundTaskState::Completed
+            | UiBackgroundTaskState::Failed
+            | UiBackgroundTaskState::Cancelled
+            | UiBackgroundTaskState::Unknown => hosted.map(|record| record.duration_ms),
         };
         records.push(UiBackgroundTaskRecord {
             task_id: fact.task_id.clone(),
@@ -8090,13 +8140,16 @@ async fn project_background_tasks(
             exit_code,
             output,
             output_truncated,
+            duration_ms,
         });
     }
 
     // A live task with no durable start (a log written before starts were
     // recorded) is still running work; dropping it would be a silent loss.
     for task in live {
-        if starts_by_id.contains_key(task.task_id.as_str()) {
+        if starts_by_id.contains_key(task.task_id.as_str())
+            || lost_by_id.contains_key(task.task_id.as_str())
+        {
             continue;
         }
         records.push(UiBackgroundTaskRecord {
@@ -8109,9 +8162,42 @@ async fn project_background_tasks(
             exit_code: None,
             output: String::new(),
             output_truncated: false,
+            duration_ms: Some(task.elapsed_ms),
+        });
+    }
+
+    // An owner-lost task whose start never reached the engine log is still a
+    // real execution: the host admitted it, and the process may still be
+    // running for a generation that is gone. Dropping it would erase work the
+    // user started; reporting it Running would claim an owner that does not
+    // exist. Lost is the only honest record.
+    for task in owner_lost {
+        if starts_by_id.contains_key(task.id.as_str()) {
+            continue;
+        }
+        let (output, output_truncated) = output_tail(&task.log, task.log_truncated);
+        records.push(UiBackgroundTaskRecord {
+            task_id: task.id.clone(),
+            call_id: task.origin_call_id.clone(),
+            program: task.program.clone(),
+            args: task.args.clone(),
+            lifetime: Some(task.lifetime.as_str().to_string()),
+            state: UiBackgroundTaskState::Lost,
+            exit_code: None,
+            output,
+            output_truncated,
+            duration_ms: Some(task.duration_ms),
         });
     }
     Ok(records)
+}
+
+/// The bounded output tail retained with a durable fact, so every projection
+/// describes the same result with the same bound.
+fn output_tail(log: &str, log_truncated: bool) -> (String, bool) {
+    const OUTPUT_TAIL_BYTES: usize = 4096;
+    let start = leveler_core::ceil_char_boundary(log, log.len().saturating_sub(OUTPUT_TAIL_BYTES));
+    (log[start..].to_owned(), log_truncated || start != 0)
 }
 
 /// Read a durable terminal as the state it proves. A zero exit is the only
@@ -9169,12 +9255,14 @@ async fn compact_conversation(
             return false;
         };
         let hosted_terminal = hosted_terminal_facts(app, session_id);
+        let owner_lost = hosted_owner_lost_facts(app, session_id);
         let Ok(background_tasks) = project_background_tasks(
             &db,
             &probe,
             session_id,
             &active_background_tasks,
             &hosted_terminal,
+            &owner_lost,
         )
         .await
         else {

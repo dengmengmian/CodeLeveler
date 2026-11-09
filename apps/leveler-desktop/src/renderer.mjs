@@ -14,6 +14,7 @@ import {
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
   workspaceDraftText, attachmentSubmissionError, permissionCommand, permissionConfirmed,
   beginDiffQuery, expireDiffQuery, retainInterruptedThoughts, mergeRestoredConversation,
+  reconcileBackgroundJobs,
 } from './state.mjs';
 import { brandMark, fileIcon } from './icons.mjs';
 import {
@@ -1053,6 +1054,10 @@ function jobSettledState(job) {
   // A stopped task is not a failure however its exit code reads (the exit
   // event's own rule); check the stop fact before the ok flag.
   if (job.stopped) return { label: '已停止', dot: 'warning' };
+  // A task whose owning runtime is gone has no provable outcome: the process
+  // may have died with it, and nothing here may claim completion or failure.
+  if (job.status === 'lost') return { label: '状态未知', dot: 'failed' };
+  if (job.status === 'conflict') return { label: '标识冲突', dot: 'failed' };
   if (job.status === 'unknown') return { label: '结果未知', dot: 'failed' };
   if (job.status === 'failed') return { label: '已失败', dot: 'failed' };
   return { label: '已完成', dot: 'done' };
@@ -4383,9 +4388,14 @@ async function refreshSnapshot() {
   current.approvals = replayed.approvals;
   current.clarifications = replayed.clarifications;
   current.settledBackgroundTasks = settledBackgroundTasks;
-  const activeJobs = (snapshot.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks));
-  const activeIds = new Set(activeJobs.map(job => job.task_id));
-  current.backgroundTasks = [...activeJobs, ...priorBackgroundTasks.filter(job => !activeIds.has(job.task_id))];
+  const reconciled = reconcileBackgroundJobs({
+    active: (snapshot.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks)),
+    prior: priorBackgroundTasks,
+    records: snapshot.background_tasks ?? [],
+    settled: settledBackgroundTasks,
+  });
+  current.backgroundTasks = reconciled.backgroundTasks;
+  current.settledBackgroundTasks = reconciled.settledBackgroundTasks;
   current.diffQuery = diffQuery;
   if (!snapshot.diff) current.diffError = diffError;
   render();
@@ -7925,9 +7935,14 @@ api.onEvent(frame => {
     current.approvals = replayed.approvals;
     current.clarifications = replayed.clarifications;
     current.settledBackgroundTasks = settledBackgroundTasks;
-    const activeJobs = (frame.data.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks));
-    const activeIds = new Set(activeJobs.map(job => job.task_id));
-    current.backgroundTasks = [...activeJobs, ...priorBackgroundTasks.filter(job => !activeIds.has(job.task_id))];
+    const reconciled = reconcileBackgroundJobs({
+      active: (frame.data.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks)),
+      prior: priorBackgroundTasks,
+      records: frame.data.background_tasks ?? [],
+      settled: settledBackgroundTasks,
+    });
+    current.backgroundTasks = reconciled.backgroundTasks;
+    current.settledBackgroundTasks = reconciled.settledBackgroundTasks;
     current.contextUsage = priorContext;
     current.diffQuery = diffQuery;
     if (!frame.data.diff) current.diffError = diffError;

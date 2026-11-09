@@ -1400,6 +1400,98 @@ fn a_background_command_row_settles_when_the_process_exits() {
     );
 }
 
+/// A task whose owning runtime died has no terminal event to replay. The
+/// snapshot's Lost record is the only fact that can settle its starter row;
+/// without it the row keeps its last live wording forever.
+#[test]
+fn a_replayed_task_whose_owner_died_never_reads_as_running() {
+    let mut s = state();
+    let mut session = snapshot(vec![message(UiRole::User, "后台睡一下")]);
+    session.background_tasks = vec![leveler_client_protocol::UiBackgroundTaskRecord {
+        task_id: "t-lost".into(),
+        call_id: Some("c-lost".into()),
+        program: "sleep".into(),
+        args: vec!["25".into()],
+        lifetime: Some("goal".into()),
+        state: leveler_client_protocol::UiBackgroundTaskState::Lost,
+        exit_code: None,
+        output: String::new(),
+        output_truncated: false,
+        duration_ms: Some(25_000),
+    }];
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session }),
+    );
+    let entries: Vec<_> = background_sleep_events("lost")
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+    open_process_receipts(&mut s);
+    let row = conversation_rows(&s)
+        .into_iter()
+        .find(|line| line.contains("sleep 25"))
+        .expect("replayed row");
+    assert!(
+        !row.contains("后台运行") && !row.contains('\u{2197}'),
+        "a lost task's row still reads as running: {row}"
+    );
+    assert!(
+        row.contains("状态未知"),
+        "a lost task's row must say the outcome is unknown: {row}"
+    );
+}
+
+/// The live unknown event is the same honesty boundary as a Lost record: the
+/// process's state cannot be proven, so the starter row may not keep saying it
+/// is running.
+#[test]
+fn a_background_task_with_no_provable_outcome_settles_its_command_row() {
+    let mut s = state();
+    for event in background_sleep_events("unknown") {
+        reduce(&mut s, Action::Runtime(event));
+    }
+    open_process_receipts(&mut s);
+    assert!(
+        conversation_rows(&s)
+            .iter()
+            .any(|line| line.contains("sleep 25") && line.contains("后台运行")),
+        "the task starts out running"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskUnknown {
+            task_id: "t-unknown".into(),
+            duration_ms: 5_000,
+            output: String::new(),
+        }),
+    );
+    open_process_receipts(&mut s);
+    let row = conversation_rows(&s)
+        .into_iter()
+        .find(|line| line.contains("sleep 25"))
+        .expect("row");
+    assert!(
+        !row.contains("后台运行") && !row.contains('\u{2197}'),
+        "an unknown outcome still reads as running: {row}"
+    );
+    assert!(
+        row.contains("状态未知"),
+        "an unknown outcome must be named as unknown: {row}"
+    );
+}
+
 fn background_sleep_events(name: &str) -> Vec<RuntimeEvent> {
     let task_id = format!("t-{name}");
     vec![

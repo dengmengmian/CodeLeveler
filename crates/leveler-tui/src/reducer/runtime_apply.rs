@@ -1333,6 +1333,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             duration_ms,
             output,
         } => {
+            // The starter row is the only place the process's progress is
+            // visible without opening the jobs page: an unprovable outcome has
+            // to land there too, not just on the chrome.
+            state.transcript.note_background_unknown(&task_id);
             let label = match state.background_task_labels.get_mut(&task_id) {
                 Some(chrome) => {
                     chrome.ok = Some(false);
@@ -1946,6 +1950,13 @@ fn apply_background_record(
         }
     }
     chrome.exit_code = record.exit_code;
+    // A durable end freezes the clock. Without this, a task whose owner died
+    // keeps accumulating time for as long as the view stays open.
+    if record.state != State::Running
+        && let Some(duration_ms) = record.duration_ms
+    {
+        chrome.duration_ms = Some(duration_ms);
+    }
     if !record.output.is_empty() {
         chrome.output = record.output.clone();
         cap_background_output(&mut chrome.output);
@@ -2052,6 +2063,64 @@ fn replace_active_background_tasks(
     if matches!(&state.activity_open, Some(crate::activity::ActivityId::Background(id)) if !known(id))
     {
         state.activity_open = None;
+    }
+}
+
+/// Settle command rows from the chrome's already-reconciled outcome.
+///
+/// A replayed `BackgroundTaskExited` event settles its own starter row. A task
+/// that lost its owner, or whose terminal never reached the engine log, has no
+/// such event; the snapshot's reconciled record is then the only truth. Without
+/// this pass the row keeps its last live wording ("running in background")
+/// indefinitely, even though the strip and the jobs list say otherwise.
+fn settle_background_rows_from_chrome(state: &mut AppState) {
+    use crate::state::BackgroundOutcome;
+    let settled: Vec<_> = state
+        .background_task_labels
+        .iter()
+        .filter_map(|(task_id, chrome)| match chrome.outcome() {
+            BackgroundOutcome::Running => None,
+            outcome => Some((
+                task_id.clone(),
+                outcome,
+                chrome.exit_code,
+                chrome.duration_ms,
+            )),
+        })
+        .collect();
+    for (task_id, outcome, exit_code, duration_ms) in settled {
+        match outcome {
+            BackgroundOutcome::Running => {}
+            BackgroundOutcome::Completed => {
+                state.transcript.note_background_settled(
+                    &task_id,
+                    "exited",
+                    exit_code,
+                    duration_ms,
+                );
+            }
+            BackgroundOutcome::Failed => {
+                state.transcript.note_background_settled(
+                    &task_id,
+                    "failed",
+                    exit_code,
+                    duration_ms,
+                );
+            }
+            BackgroundOutcome::Stopped => {
+                state.transcript.note_background_settled(
+                    &task_id,
+                    "stopped",
+                    exit_code,
+                    duration_ms,
+                );
+            }
+            // No terminal fact exists: the row may say only that its state
+            // cannot be proven, never that it finished or failed.
+            BackgroundOutcome::Lost | BackgroundOutcome::Conflict | BackgroundOutcome::Unknown => {
+                state.transcript.note_background_unknown(&task_id);
+            }
+        }
     }
 }
 
@@ -2218,6 +2287,7 @@ fn restore_history(
             state.transcript.push_input(id, text, delivery);
         }
     }
+    settle_background_rows_from_chrome(state);
     // The rebuilt transcript has its own positions; an index from the previous
     // transcript would name another entry.
 }

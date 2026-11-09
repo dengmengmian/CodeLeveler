@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use leveler_core::GoalId;
+use leveler_core::{BootId, BootLiveness, BootLivenessProbe, GoalId};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -527,6 +527,17 @@ pub struct BackgroundTaskRegistry {
     supervisor_unavailable: Arc<std::sync::atomic::AtomicBool>,
     retain_process_facts: bool,
     hosted_monitors: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The runtime generation this registry belongs to. Startup reconciliation
+    /// uses it to prove whether the generation that admitted a hosted goal
+    /// task still exists. Unbound (tests, standalone helpers) disables
+    /// owner-loss convergence rather than guessing.
+    runtime_boot: Arc<std::sync::Mutex<Option<RuntimeBootBinding>>>,
+}
+
+#[derive(Clone)]
+struct RuntimeBootBinding {
+    boot: BootId,
+    probe: Arc<dyn BootLivenessProbe>,
 }
 
 impl Default for BackgroundTaskRegistry {
@@ -668,6 +679,7 @@ impl BackgroundTaskRegistry {
             supervisor_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retain_process_facts: false,
             hosted_monitors: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            runtime_boot: Arc::new(std::sync::Mutex::new(None)),
             runner: CommandRunner::with_environment(environment).without_parent_death_signal(),
             lifecycle_events,
         }
@@ -708,6 +720,102 @@ impl BackgroundTaskRegistry {
     ) -> Self {
         self.execution_host = Some(config);
         self
+    }
+
+    /// Bind this registry to the runtime generation whose tools it serves.
+    ///
+    /// The boot id is written into every hosted spawn, and the probe is the
+    /// only authority startup recovery consults before marking a goal task's
+    /// owner lost. Binding is idempotent: a runtime has exactly one boot.
+    pub fn bind_runtime_boot(&self, boot: BootId, probe: Arc<dyn BootLivenessProbe>) {
+        *self
+            .runtime_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(RuntimeBootBinding { boot, probe });
+    }
+
+    fn runtime_boot_binding(&self) -> Option<RuntimeBootBinding> {
+        self.runtime_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn owner_boot_wire(&self) -> Option<String> {
+        self.runtime_boot_binding()
+            .map(|binding| binding.boot.as_str().to_string())
+    }
+
+    /// Durably record goal tasks whose admitting runtime generation is gone.
+    ///
+    /// Only `BootLiveness::Dead` authorizes the record: an alive owner keeps
+    /// the task, and an unknowable one is left for a later probe rather than
+    /// being called lost. The host keeps owning the process, so this pass
+    /// never signals, replays or forgets it. Returns the ids marked in this
+    /// pass; an already-marked record is left untouched, which is what makes
+    /// repeated startups idempotent.
+    async fn converge_owner_loss(
+        &self,
+        client: &crate::execution_host::ExecutionHostClient,
+        tasks: &[crate::execution_host::HostedTask],
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let mut lost = std::collections::HashSet::new();
+        let Some(binding) = self.runtime_boot_binding() else {
+            return Ok(lost);
+        };
+        for task in tasks {
+            if !task.is_live()
+                || task.lifetime != BackgroundTaskLifetime::Goal
+                || task.owner_loss.is_some()
+            {
+                continue;
+            }
+            let Some(owner_boot) = task.owner_boot.as_deref() else {
+                // A spawn from a client that predates attribution. The engine
+                // can still tell the story from its own start fact, but the
+                // host cannot be given a fact it has no field for.
+                continue;
+            };
+            if owner_boot == binding.boot.as_str() {
+                continue;
+            }
+            match binding.probe.liveness(&BootId::new(owner_boot)) {
+                BootLiveness::Dead => {
+                    if !client.supports(crate::execution_host::OWNER_LOSS_CAPABILITY) {
+                        tracing::warn!(
+                            task = %task.snapshot.id,
+                            owner_boot,
+                            "execution host cannot record owner loss; the task stays attributed to its dead generation only in the engine"
+                        );
+                        continue;
+                    }
+                    let owner = task
+                        .snapshot
+                        .owner_scope
+                        .as_deref()
+                        .ok_or("hosted goal task has no session owner")?;
+                    client
+                        .owner_lost(&task.snapshot.id, owner, owner_boot)
+                        .await?;
+                    tracing::warn!(
+                        task = %task.snapshot.id,
+                        owner_boot,
+                        "goal background task lost its runtime generation; the host retained the process and its output"
+                    );
+                    lost.insert(task.snapshot.id.clone());
+                }
+                BootLiveness::Alive => {}
+                BootLiveness::Unknown => {
+                    tracing::warn!(
+                        task = %task.snapshot.id,
+                        owner_boot,
+                        "cannot prove the owning runtime generation gone; task attribution retained"
+                    );
+                }
+            }
+        }
+        Ok(lost)
     }
 
     fn journal(&self) -> Result<crate::host_settlement::SettlementJournal, String> {
@@ -771,8 +879,17 @@ impl BackgroundTaskRegistry {
             return Ok(probe.recovery);
         };
         let journal = self.journal()?;
-        for task in client.list().await? {
+        let tasks = client.list().await?;
+        let owner_lost = self.converge_owner_loss(&client, &tasks).await?;
+        for task in tasks {
             if task.is_live() {
+                // A task whose admitting generation is gone is not this
+                // runtime's work to adopt: monitoring it here would rewrite
+                // its eventual result as this boot's event. The host keeps
+                // draining it, and a later read still finds its output.
+                if task.owner_loss.is_some() || owner_lost.contains(&task.snapshot.id) {
+                    continue;
+                }
                 self.monitor_hosted(task.snapshot)?;
                 continue;
             }
@@ -936,6 +1053,46 @@ impl BackgroundTaskRegistry {
             .collect())
     }
 
+    /// Live goal tasks whose admitting runtime generation is proven gone.
+    ///
+    /// The host's archive is the durable fact; this read claims nothing and
+    /// signals nothing. The projection needs the record even when the engine
+    /// never wrote a start row (a crash before the tool could report), so the
+    /// task is reported Lost instead of silently disappearing.
+    ///
+    /// The reported duration ends when the loss was proven. Time the process
+    /// spends afterwards has no runtime owner and must not keep extending the
+    /// work's apparent lifetime.
+    pub fn hosted_owner_lost_snapshots_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        let Some(config) = &self.execution_host else {
+            return Ok(Vec::new());
+        };
+        let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
+        let mut tasks: Vec<_> = records
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.is_live()
+                    && task.owner_loss.is_some()
+                    && task.snapshot.owner_scope.as_deref() == Some(scope)
+            })
+            .collect();
+        tasks.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms));
+        Ok(tasks
+            .into_iter()
+            .map(|task| {
+                let mut snapshot = task.snapshot.clone();
+                if let Some(loss) = &task.owner_loss {
+                    snapshot.duration_ms = loss.observed_at_ms.saturating_sub(task.started_at_ms);
+                }
+                snapshot
+            })
+            .collect())
+    }
+
     pub async fn try_all_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
         let mut snapshots = {
             let st = self.inner.lock().await;
@@ -951,7 +1108,18 @@ impl BackgroundTaskRegistry {
         if let Some(config) = &self.execution_host {
             let probe = crate::execution_host::ExecutionHostClient::probe(config).await?;
             if let Some(client) = probe.client {
-                for mut task in client.list().await? {
+                let tasks = client.list().await?;
+                let owner_lost = self.converge_owner_loss(&client, &tasks).await?;
+                for mut task in tasks {
+                    // A live task whose admitting generation is gone is not
+                    // live work of this runtime. Excluding it here is what
+                    // lets the durable projection report Lost instead of a
+                    // process that appears to belong to a healthy runtime.
+                    if task.is_live()
+                        && (task.owner_loss.is_some() || owner_lost.contains(&task.snapshot.id))
+                    {
+                        continue;
+                    }
                     if task.settlement_proven() {
                         let journal = self.journal()?;
                         let settled = if task.loss.is_some() {
@@ -1103,6 +1271,9 @@ impl BackgroundTaskRegistry {
                 owner,
                 BackgroundTaskLifetime::Session,
                 BackgroundTaskOrigin::default(),
+                // A session terminal survives runtime replacement by design;
+                // it is not owned by the generation that opened it.
+                None,
             )
             .await
         {
@@ -1275,7 +1446,15 @@ impl BackgroundTaskRegistry {
             .await?;
         // Transport failure is ambiguous: retain the prepared write reservation.
         let task = match client
-            .spawn(&id, request, owner, writer, lifetime, origin)
+            .spawn(
+                &id,
+                request,
+                owner,
+                writer,
+                lifetime,
+                origin,
+                self.owner_boot_wire().as_deref(),
+            )
             .await
         {
             Ok(task) => task,
@@ -2913,17 +3092,26 @@ impl BackgroundTaskRegistry {
         // Goal-lifetime work is owned by this runtime generation even when the
         // host supervises its process: a graceful runtime shutdown ends it.
         // Session/Runtime/Persistent services are deliberately left alive.
+        //
+        // "This generation" is literal: a goal task another boot admitted is
+        // already owner-lost and must not be killed by an unrelated shutdown.
+        // Legacy records without attribution keep the previous contract.
         if let Some(config) = &self.execution_host
             && let Ok(client) =
                 crate::execution_host::ExecutionHostClient::connect(config.clone()).await
             && let Ok(tasks) = client.list().await
         {
+            let current_boot = self.owner_boot_wire();
             ids.extend(
                 tasks
                     .into_iter()
                     .filter(|task| {
                         task.lifetime == BackgroundTaskLifetime::Goal
                             && task.snapshot.status.is_active()
+                            && match (current_boot.as_deref(), task.owner_boot.as_deref()) {
+                                (Some(current), Some(owner)) => owner == current,
+                                _ => true,
+                            }
                     })
                     .map(|task| task.snapshot.id),
             );
@@ -4915,6 +5103,136 @@ mod tests {
             Err(broadcast::error::RecvError::Lagged(_))
         ));
         assert!(reg.active_snapshots_for_scope("session-a").await.is_empty());
+    }
+
+    /// Answers from a fixed table so a test controls what the engine can prove.
+    struct LivenessByBoot(HashMap<&'static str, BootLiveness>);
+
+    impl BootLivenessProbe for LivenessByBoot {
+        fn liveness(&self, boot: &BootId) -> BootLiveness {
+            self.0
+                .get(boot.as_str())
+                .copied()
+                .unwrap_or(BootLiveness::Unknown)
+        }
+    }
+
+    /// Graceful shutdown ends this generation's goal work and nothing else.
+    /// A goal task admitted by a dead generation is not this boot's to kill:
+    /// the host kept its process because no runtime can own its result, and
+    /// `kill_all` must not turn that retained evidence into a silent kill.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_all_spares_goal_work_admitted_by_another_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let config = crate::execution_host::ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        let server = tokio::spawn(crate::execution_host::serve(config.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::execution_host::ExecutionHostClient::connect(config.clone())
+                .await
+                .is_err()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Execution Host became reachable");
+        let probe = || {
+            let mut table = HashMap::new();
+            table.insert("boot-a", BootLiveness::Dead);
+            table.insert("boot-b", BootLiveness::Alive);
+            Arc::new(LivenessByBoot(table)) as Arc<dyn BootLivenessProbe>
+        };
+        let goal_request = || {
+            ProcessRequest::new(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "while :; do echo HEARTBEAT; sleep 0.05; done".into(),
+                ],
+                repo.clone(),
+            )
+        };
+
+        let crashed = host_registry().with_execution_host(config.clone());
+        crashed.bind_runtime_boot(BootId::new("boot-a"), probe());
+        let orphan = crashed
+            .spawn_owned_with_lifetime(
+                goal_request(),
+                None,
+                Some("session-1"),
+                BackgroundTaskLifetime::Goal,
+            )
+            .await
+            .expect("dead generation's goal task");
+
+        let current = host_registry().with_execution_host(config.clone());
+        current.bind_runtime_boot(BootId::new("boot-b"), probe());
+        let owned = current
+            .spawn_owned_with_lifetime(
+                goal_request(),
+                None,
+                Some("session-1"),
+                BackgroundTaskLifetime::Goal,
+            )
+            .await
+            .expect("current generation's goal task");
+
+        let client = crate::execution_host::ExecutionHostClient::connect(config.clone())
+            .await
+            .expect("host client");
+        let orphan_pid = client
+            .get_owned(&orphan, "session-1")
+            .await
+            .expect("orphan record")
+            .pid
+            .expect("host reports a pid");
+        let owned_pid = client
+            .get_owned(&owned, "session-1")
+            .await
+            .expect("owned record")
+            .pid
+            .expect("host reports a pid");
+
+        current.reconcile_hosted().await.unwrap();
+        let records = crate::execution_host::HostRecords::read(&config.state_dir).unwrap();
+        assert!(
+            records.task(&orphan).unwrap().owner_loss.is_some(),
+            "the dead generation's task must be marked lost before shutdown"
+        );
+        assert!(
+            records.task(&owned).unwrap().owner_loss.is_none(),
+            "the live generation's task must stay attributed to it"
+        );
+
+        current.kill_all().await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(owned_pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_alive(owned_pid),
+            "graceful shutdown must end this generation's goal work"
+        );
+        assert!(
+            process_alive(orphan_pid),
+            "another generation's goal task is not this shutdown's to kill"
+        );
+
+        current.kill_owned(&orphan, "session-1").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(orphan_pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!process_alive(orphan_pid), "explicit cleanup must reap it");
+        server.abort();
     }
 
     /// R004 F7 / T7: kill_all reaps everything for daemon shutdown paths.

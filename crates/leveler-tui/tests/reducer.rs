@@ -13184,6 +13184,7 @@ fn background_record(
         exit_code,
         output: String::new(),
         output_truncated: false,
+        duration_ms: None,
     }
 }
 

@@ -729,7 +729,9 @@ pub(crate) fn run_needs_attention(members: &[&ToolCallBlock], now_secs: u64) -> 
                         && running_for(call, now_secs) < BACKGROUND_RUN_ATTENTION_SECS
                 }
                 DetachedOutcome::Failed { .. } => true,
-                DetachedOutcome::Exited { .. } | DetachedOutcome::Stopped { .. } => false,
+                DetachedOutcome::Exited { .. }
+                | DetachedOutcome::Stopped { .. }
+                | DetachedOutcome::Unknown => false,
             }
     })
 }
@@ -1044,6 +1046,9 @@ fn process_receipt_line(
                     || (status == ToolStatus::Cancelled
                         && started_in_background(c)
                         && matches!(detached_outcome(c), DetachedOutcome::Stopped { .. }))
+                    || (status == ToolStatus::Unknown
+                        && started_in_background(c)
+                        && matches!(detached_outcome(c), DetachedOutcome::Unknown))
             })
             .count();
         if count > 0 {
@@ -2630,6 +2635,13 @@ fn command_head(
                 vec![Some(t.command_stopped.to_string()), duration],
                 false,
             ),
+            // No outcome can be proven: the row must not keep its live wording.
+            DetachedOutcome::Unknown => head(
+                "?",
+                theme.status.warning,
+                vec![Some(t.command_unknown.to_string())],
+                false,
+            ),
         },
         ToolStatus::Ok => head(
             "\u{2713}",
@@ -3858,6 +3870,9 @@ enum DetachedOutcome {
     Stopped {
         duration: Option<String>,
     },
+    /// The owning runtime is gone and no terminal fact exists. The process may
+    /// still be running, so the row says neither started nor finished.
+    Unknown,
 }
 
 fn detached_outcome(call: &ToolCallBlock) -> DetachedOutcome {
@@ -3877,6 +3892,9 @@ fn detached_outcome(call: &ToolCallBlock) -> DetachedOutcome {
                     exit_code: None,
                 },
                 "stopped" => DetachedOutcome::Stopped { duration: None },
+                // `lost` is the same lack of proof as `unknown`: the owning
+                // runtime is gone and no terminal fact exists.
+                "lost" | "unknown" => DetachedOutcome::Unknown,
                 _ => DetachedOutcome::Running,
             };
         } else if let Some(rest) = line.strip_prefix("duration_ms:") {
@@ -3893,6 +3911,7 @@ fn detached_outcome(call: &ToolCallBlock) -> DetachedOutcome {
             exit_code,
         },
         DetachedOutcome::Stopped { .. } => DetachedOutcome::Stopped { duration },
+        DetachedOutcome::Unknown => DetachedOutcome::Unknown,
         DetachedOutcome::Running => DetachedOutcome::Running,
     }
 }
