@@ -657,16 +657,34 @@ impl Executor {
             && self.goal_binder().is_some()
             && !self.tool_context.policy.read_only
         {
-            tools.push(commit_task_tool_definition());
+            // Capacity follows the same requirement set the commit Gate
+            // enforces: a request that enumerates more deliverables than the
+            // fixed floor must still be declarable. The host seeds the
+            // objective before a turn that can declare a task.
+            let acceptance_limit = self
+                .seeded_objective
+                .as_ref()
+                .map(|objective| {
+                    goal_scope::entry_limit(
+                        goal_scope::extract(objective.text(), &objective.amendments).len(),
+                    )
+                })
+                .unwrap_or(goal_scope::MIN_ACCOUNTING_ENTRIES);
+            tools.push(commit_task_tool_definition(acceptance_limit));
         }
         // Goal mode: the model resolves the objective explicitly.
         if self.goal_mode() {
             tools.push(update_goal_tool_definition());
         }
+        // The reader rides with the commit contract: before a declaration the
+        // durable scope does not exist yet, but the commit gate already has an
+        // effective requirement set derived from the user's own request. The
+        // audited session could call `commit_task` three times and never read
+        // the exact set it was refused against.
         if self.goal_mode()
-            || self
-                .goal_binder()
-                .is_some_and(|binder| binder.bound().is_some())
+            || (self.depth == 0
+                && self.goal_binder().is_some()
+                && !self.tool_context.policy.read_only)
         {
             tools.push(get_goal_scope_tool_definition());
         }
@@ -2342,6 +2360,42 @@ fn anchor_user_texts(anchor: &leveler_lifecycle::ObjectiveAnchor) -> Vec<&str> {
     texts
 }
 
+/// Render one page of a requirement set for `get_goal_scope`.
+///
+/// Before a declaration there is no goal row, so the turn's objective anchor
+/// stands in as the candidate set; after binding, the durable scope is
+/// authoritative. Both are fed through here so the reader and the commit gate
+/// cannot describe different sets.
+fn render_goal_scope(
+    header: &str,
+    requirements: &[goal_scope::Requirement],
+    offset: usize,
+    limit: usize,
+) -> String {
+    let (slice, start) = goal_scope::page(requirements, offset, limit);
+    let end = start + slice.len();
+    let mut text = format!(
+        "{header}: {} requirement(s), showing {start}..{end} of {}.\n",
+        requirements.len(),
+        requirements.len()
+    );
+    for requirement in slice {
+        text.push_str(&format!(
+            "- {} [{}] {}\n",
+            requirement.id,
+            requirement.kind.label(),
+            requirement.text
+        ));
+    }
+    if end < requirements.len() {
+        text.push_str(&format!(
+            "More requirements exist: call get_goal_scope with offset={end}.\n"
+        ));
+    }
+    let (text, _) = leveler_core::sanitize_model_visible(&text);
+    text
+}
+
 impl Drive<'_> {
     /// Execute the deferred parallel-safe calls, then fold their results into
     /// the original call slots. Grouping is by CONSECUTIVE parallel-safe calls:
@@ -3926,47 +3980,45 @@ impl AgentHarness for Drive<'_> {
                     parallel: true,
                     model_step: Some(model_steps),
                 });
-                let scope = match self.executor.goal_binder() {
+                let durable = match self.executor.goal_binder() {
                     Some(binder) => binder.scope().await?,
                     None => None,
                 };
-                let (content, is_error) = match scope {
+                let (content, is_error) = match durable {
                     Some(scope) => {
                         let requirements = goal_scope::extract(&scope.objective, &scope.amendments);
-                        let (slice, start) = goal_scope::page(&requirements, offset, limit);
-                        let end = start + slice.len();
-                        let mut text = format!(
-                            "Effective acceptance: {} requirement(s), showing {}..{} of {}.
-",
-                            requirements.len(),
-                            start,
-                            end,
-                            requirements.len()
-                        );
-                        for requirement in slice {
-                            text.push_str(&format!(
-                                "- {} [{}] {}
-",
-                                requirement.id,
-                                requirement.kind.label(),
-                                requirement.text
-                            ));
-                        }
-                        if end < requirements.len() {
-                            text.push_str(&format!(
-                                "More requirements exist: call get_goal_scope with offset={end}.
-"
-                            ));
-                        }
-                        let (text, _) = leveler_core::sanitize_model_visible(&text);
-                        (text, false)
+                        (
+                            render_goal_scope("Effective acceptance", &requirements, offset, limit),
+                            false,
+                        )
                     }
-                    None => (
-                        "No committed goal exists for this turn; there is no effective \
-                         acceptance set to read."
-                            .to_string(),
-                        true,
-                    ),
+                    None => {
+                        // The commit gate extracts from the same anchor, so the
+                        // reader can show the exact set a declaration would be
+                        // judged against before any goal row exists.
+                        let objective = self.objective.text().trim();
+                        if objective.is_empty() {
+                            (
+                                "No committed goal exists for this turn and the turn has no \
+                                 user request to derive an acceptance set from."
+                                    .to_string(),
+                                true,
+                            )
+                        } else {
+                            let requirements =
+                                goal_scope::extract(objective, &self.objective.amendments);
+                            (
+                                render_goal_scope(
+                                    "Candidate acceptance (no task is committed yet; the \
+                                     commit gate will enforce exactly this set)",
+                                    &requirements,
+                                    offset,
+                                    limit,
+                                ),
+                                false,
+                            )
+                        }
+                    }
                 };
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
@@ -4002,11 +4054,26 @@ impl AgentHarness for Drive<'_> {
                     .map(str::trim)
                     .filter(|text| !text.is_empty() && text.chars().count() <= 4000)
                     .map(str::to_string);
+                // The declaration capacity follows the requirement set the
+                // commit Gate will enforce. A request that enumerates more
+                // deliverables than the fixed floor would otherwise be
+                // uncommittable by construction.
+                let gate_objective = {
+                    let user = self.objective.text().trim();
+                    if user.is_empty() {
+                        objective.clone().unwrap_or_default()
+                    } else {
+                        user.to_string()
+                    }
+                };
+                let gate_requirements =
+                    goal_scope::extract(&gate_objective, &self.objective.amendments);
+                let acceptance_limit = goal_scope::entry_limit(gate_requirements.len());
                 let acceptance: Option<Vec<String>> = call
                     .arguments
                     .get("acceptance")
                     .and_then(|value| value.as_array())
-                    .filter(|items| (1..=20).contains(&items.len()))
+                    .filter(|items| (1..=acceptance_limit).contains(&items.len()))
                     .and_then(|items| {
                         items
                             .iter()
@@ -4060,20 +4127,14 @@ impl AgentHarness for Drive<'_> {
                          and resolve it with update_goal; do not declare it again."
                             .to_string(),
                     )
-                } else if let (Some(objective), Some(acceptance)) = (objective, acceptance) {
+                } else if let (Some(_), Some(acceptance)) = (objective, acceptance) {
                     // The durable objective is the user's own request, not the
                     // model's restatement. A model cannot narrow the task by
                     // declaring a smaller objective; its `acceptance` checks
                     // are the part it owns — but they must still cover every
                     // deliverable the user explicitly enumerated.
-                    let user_objective = self.objective.text().trim();
-                    let goal_objective = if user_objective.is_empty() {
-                        objective.clone()
-                    } else {
-                        user_objective.to_string()
-                    };
-                    let requirements =
-                        goal_scope::extract(&goal_objective, &self.objective.amendments);
+                    let goal_objective = gate_objective;
+                    let requirements = gate_requirements;
                     let uncovered = goal_scope::uncovered(&requirements, &acceptance);
                     if !uncovered.is_empty() {
                         let repeats = match &self.commit_refusal {
@@ -4094,10 +4155,9 @@ impl AgentHarness for Drive<'_> {
                         });
                         // Structured refusal: the model needs to know WHAT is
                         // uncovered and HOW to fix it, not a multi-kilobyte
-                        // dump it cannot act on. The full requirement set stays
-                        // in the goal row and is readable through the model's
-                        // own objective; this lists a bounded, stable sample
-                        // with the source ids the runtime itself assigned.
+                        // dump it cannot act on. The full requirement set is
+                        // exactly what `get_goal_scope` pages; this lists a
+                        // bounded sample and points at the reader for the rest.
                         const REFUSAL_SAMPLE: usize = 8;
                         let deliverables = requirements
                             .iter()
@@ -4125,14 +4185,16 @@ impl AgentHarness for Drive<'_> {
                         }
                         if uncovered.len() > REFUSAL_SAMPLE {
                             detail.push_str(&format!(
-                                "- …and {} more (the complete list is the user's own request in \
-                                 this session)\n",
-                                uncovered.len() - REFUSAL_SAMPLE
+                                "- …and {} more. Call get_goal_scope to page through all {} \
+                                 requirements with their ids and exact text.\n",
+                                uncovered.len() - REFUSAL_SAMPLE,
+                                requirements.len()
                             ));
                         }
                         detail.push_str(
-                            "Fix: add one concrete `acceptance` check per item above, quoting \
-                             the deliverable's own words. One check may name several related \
+                            "Fix: call get_goal_scope to read every uncovered requirement, then \
+                             add one concrete `acceptance` check per item, quoting the \
+                             deliverable's own words. One check may name several related \
                              deliverables. Do not drop or reword the user's deliverables to make \
                              them match the checks you already have — the refusal conditions are \
                              the user's text, not the plan. Prohibitions (`forbidden`) never need \
@@ -4255,9 +4317,12 @@ impl AgentHarness for Drive<'_> {
                 } else {
                     (
                         false,
-                        "commit_task requires a non-empty `objective` (up to 4000 characters) \
-                         and 1-20 non-empty `acceptance` checks (up to 500 characters each)."
-                            .to_string(),
+                        format!(
+                            "commit_task requires a non-empty `objective` (up to 4000 \
+                             characters) and 1-{acceptance_limit} non-empty `acceptance` checks \
+                             (up to 500 characters each). The upper bound follows the number of \
+                             explicit requirements in the user's request."
+                        ),
                     )
                 };
                 (self.observer)(AgentEvent::ToolResult {
