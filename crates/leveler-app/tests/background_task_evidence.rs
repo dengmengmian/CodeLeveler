@@ -274,6 +274,72 @@ async fn a_finished_background_command_becomes_durable_evidence() {
     }
 }
 
+/// A terminal fact is never persisted without its start. A foreground call
+/// handed to the background can exit before the live start row reaches the
+/// log; the terminal writer must restore the start first, with the same call,
+/// argv and lifetime, so a replay sees a complete lifecycle.
+#[tokio::test]
+async fn a_terminal_fact_ensures_its_start_is_durable_first() {
+    let f = fixture().await;
+    let mut events = f.runtime.subscribe_session(&f.session);
+    f.record_starting_call("call-bg-pair", "sh", &["-c", "exit 0"])
+        .await;
+    let id = f.spawn(Some("call-bg-pair"), "exit 0").await;
+    f.wait_for_events(&mut events).await;
+
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let db = f.app.open_database().await.expect("db");
+            let rows = db
+                .load_by_types(
+                    &f.session,
+                    &["background_task_started", "background_task_finished"],
+                )
+                .await
+                .expect("load");
+            if rows
+                .iter()
+                .any(|row| row.event_type == "background_task_finished")
+            {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the durable result is written");
+
+    let starts: Vec<_> = rows
+        .iter()
+        .filter(|row| row.event_type == "background_task_started")
+        .collect();
+    assert_eq!(starts.len(), 1, "exactly one start fact: {rows:?}");
+    let finished = rows
+        .iter()
+        .find(|row| row.event_type == "background_task_finished")
+        .expect("terminal fact");
+    assert!(
+        starts[0].sequence < finished.sequence,
+        "the start must be durable before the result"
+    );
+    match leveler_engine::EngineEvent::from_payload(&starts[0].payload).unwrap() {
+        leveler_engine::EngineEvent::BackgroundTaskStarted {
+            call_id,
+            task_id,
+            program,
+            args,
+            lifetime,
+        } => {
+            assert_eq!(call_id, "call-bg-pair", "attributed to the starting call");
+            assert_eq!(task_id, id);
+            assert_eq!(program, "sh");
+            assert_eq!(args, vec!["-c".to_string(), "exit 0".to_string()]);
+            assert_eq!(lifetime, "goal", "the start keeps the spawn lifetime");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+}
+
 /// A real failure stays a failure: it can never be cited as a pass.
 #[tokio::test]
 async fn a_failed_background_command_is_recorded_as_a_failure() {

@@ -35,7 +35,7 @@ use super::{
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::executor::scope_gate;
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL, DECLARE_INTENT_TOOL,
+    CLAIM_WRITE_SCOPE_TOOL, COMMIT_INVALID_DECLARATION_KIND, COMMIT_TASK_TOOL, DECLARE_INTENT_TOOL,
     DECLARE_SCOPE_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope, PermissionRequestOutcome,
     REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
     UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
@@ -250,6 +250,11 @@ pub(crate) struct Drive<'a> {
     /// reason (no result yet) and names the task to wait on. Bounded: this is
     /// feedback, not a ledger.
     pending_commands: Vec<super::goal_verification::PendingCommand>,
+    /// Background task executions whose terminal result this drive already
+    /// registered, by task id. The auto-delivered notice and an active
+    /// `wait_task`/`get_task` read are two observations of ONE execution; this
+    /// is the shared idempotency key, not the command text.
+    recorded_background_tasks: HashSet<String>,
     /// Consecutive rounds with no executed tool call in which a
     /// goal-verification refusal arrived, including a round that also refused
     /// another call before it ran. Not the generic no-progress streak: the
@@ -361,7 +366,7 @@ pub(crate) struct Drive<'a> {
 
 /// What the delivery round is told once `update_goal` resolved the goal.
 ///
-/// Facts only: the resolution is recorded, the person has not been answered,
+/// Facts only: the resolution is recorded, no final answer has been delivered,
 /// and these background tasks are still running under the lifetime they were
 /// started with. A running task is not unfinished goal work. The model decides
 /// what to say; the runtime never writes the answer.
@@ -372,7 +377,7 @@ fn settled_delivery_notice(reason: StopReason, running: &[String]) -> String {
     };
     let mut notice = format!(
         "update_goal(status=\"{resolution}\") was accepted and is recorded for this goal. \
-         Nothing has been said to the person who asked yet: this round is the delivery, not \
+         No final answer has been delivered for this goal yet: this round is the delivery, not \
          more goal work.\n\n\
          Write the answer for them now, from what actually happened: what you did, which checks \
          really ran and what they returned, what is still true afterwards, and anything that did \
@@ -1007,6 +1012,7 @@ impl Executor {
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
             verification_runs: self.seeded_verification_runs.clone(),
             pending_commands: Vec::new(),
+            recorded_background_tasks: HashSet::new(),
             goal_gate_recovery_rounds: 0,
             answer_candidate: None,
             preserve_running_epoch,
@@ -1338,6 +1344,68 @@ impl<'a> Drive<'a> {
         }
     }
 
+    /// Register a terminal background result when it belongs to this drive.
+    ///
+    /// A task this drive started (its pending start is still recorded) is
+    /// certainly this execution's work. A task from an earlier drive belongs
+    /// only when its durable goal attribution names the goal this drive serves:
+    /// an unowned result, or one owned by another goal, is not evidence for
+    /// this goal. Both the auto-delivery notice and an active lifecycle read
+    /// call this, so they share one idempotent registration keyed by task id.
+    #[allow(clippy::too_many_arguments)]
+    fn register_background_result(
+        &mut self,
+        task_id: &str,
+        start_call_id: Option<&str>,
+        goal_id: Option<&leveler_core::GoalId>,
+        observed_label: Option<String>,
+        ok: bool,
+        exit_code: Option<i32>,
+        evidence: bool,
+        model_step: u32,
+    ) -> bool {
+        let started = self
+            .pending_commands
+            .iter()
+            .rev()
+            .find(|pending| pending.task_id.as_deref() == Some(task_id))
+            .cloned();
+        let belongs = started.is_some()
+            || goal_id.is_some_and(|owner| {
+                self.executor
+                    .goal_binder()
+                    .and_then(|binder| binder.bound())
+                    .as_ref()
+                    == Some(owner)
+            });
+        if !belongs {
+            return false;
+        }
+        let label = started
+            .as_ref()
+            .map(|pending| pending.label.clone())
+            .or(observed_label);
+        let start_call_id = started
+            .as_ref()
+            .and_then(|pending| pending.call_id.clone())
+            .or_else(|| start_call_id.map(str::to_string));
+        super::goal_verification::record_background_result(
+            &mut self.verification_runs,
+            &mut self.pending_commands,
+            &mut self.recorded_background_tasks,
+            super::goal_verification::BackgroundResultFact {
+                task_id: task_id.to_string(),
+                start_call_id,
+                label,
+                ok,
+                exit_code,
+                evidence,
+            },
+            model_step,
+            self.ledger.total_mutation_ops,
+        )
+    }
+
     /// Reconcile at request admission against the registry and durable log.
     /// An exit concurrent with this read remains available for the next
     /// admission. The transcript append is the delivery commit, so recovery
@@ -1345,6 +1413,7 @@ impl<'a> Drive<'a> {
     async fn deliver_background_task_results(
         &mut self,
         messages: &mut Vec<Message>,
+        model_steps: u32,
     ) -> Result<(), AgentError> {
         let (Some(registry), Some(owner)) = (
             self.executor.background_tasks.as_ref(),
@@ -1355,12 +1424,11 @@ impl<'a> Drive<'a> {
         if self.executor.depth != 0 || self.executor.tool_context.writer_scope() != "parent" {
             return Ok(());
         }
-        let delivered = match self.delivered_background_tasks.as_mut() {
-            Some(delivered) => delivered,
+        let mut delivered = match self.delivered_background_tasks.as_ref() {
+            Some(delivered) => delivered.clone(),
             None => {
                 let ids = self.sink.delivered_background_task_ids().await?;
-                self.delivered_background_tasks
-                    .insert(ids.into_iter().collect())
+                ids.into_iter().collect()
             }
         };
         // Bound fresh notices independently of each task's retained log.
@@ -1369,8 +1437,12 @@ impl<'a> Drive<'a> {
         let mut admitted = HashSet::new();
         for event in self.sink.background_task_results().await? {
             let leveler_engine::EngineEvent::BackgroundTaskFinished {
+                call_id,
                 task_id,
                 goal_id,
+                program,
+                args,
+                is_error,
                 exit_code,
                 status,
                 output,
@@ -1383,6 +1455,24 @@ impl<'a> Drive<'a> {
             if delivered.contains(&task_id) || !admitted.insert(task_id.clone()) {
                 continue;
             }
+            // The notice and the ledger entry are the same fact. Registering
+            // at delivery is what makes the first citation of this result
+            // enough: the alternative was an agent rerunning a suite it had
+            // already run because the runtime forgot its own observation.
+            self.register_background_result(
+                &task_id,
+                Some(&call_id),
+                goal_id.as_ref(),
+                super::goal_verification::background_command_label(&program, &args),
+                !is_error,
+                exit_code,
+                // A natural exit is the command's own outcome. A stopped or
+                // unobservable task has no command result: it ends the pending
+                // start but is not a pass and is not a failed check.
+                status
+                    .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited),
+                model_steps,
+            );
             results.push(background_task_result_message(
                 task_id,
                 owner,
@@ -1406,6 +1496,17 @@ impl<'a> Drive<'a> {
                 .await
             {
                 admitted.insert(task.id.clone());
+                self.register_background_result(
+                    &task.id,
+                    task.origin_call_id.as_deref(),
+                    task.goal_id.as_ref(),
+                    super::goal_verification::background_command_label(&task.program, &task.args),
+                    task.status == leveler_execution::BackgroundTaskStatus::Exited
+                        && task.exit_code == Some(0),
+                    task.exit_code,
+                    task.status == leveler_execution::BackgroundTaskStatus::Exited,
+                    model_steps,
+                );
                 results.push(background_task_result_message(
                     task.id,
                     owner,
@@ -1422,6 +1523,7 @@ impl<'a> Drive<'a> {
             delivered.extend(admitted);
             messages.extend(results);
         }
+        self.delivered_background_tasks = Some(delivered);
         Ok(())
     }
 
@@ -2414,7 +2516,7 @@ impl Drive<'_> {
         let previous_schema_tokens = leveler_model::estimate_tool_definitions(&self.tools);
         self.tools = tools;
         let request = self.objective.text();
-        let mut optional = self.executor.system_segments(request);
+        let mut optional = self.executor.system_segments_with(request, None);
         optional.retain(|segment| {
             matches!(
                 segment.name.as_str(),
@@ -2423,7 +2525,7 @@ impl Drive<'_> {
         });
         let extra = self
             .executor
-            .turn_control_context_inner(request, request, false);
+            .turn_control_context_inner(request, request, false, None);
         optional.extend(extra.blocks.into_iter().filter(|segment| {
             matches!(
                 segment.name.as_str(),
@@ -2570,12 +2672,14 @@ impl Drive<'_> {
             return Vec::new();
         };
         let candidates = scoped_rule_sources(&root, &self.scoped_paths);
+        self.set_scoped_rule_errors(&candidates.errors);
+        let documents = candidates.documents;
         let mut dropped = false;
         let mut retained: Vec<leveler_model::PromptSegment> =
             Vec::with_capacity(self.control_context.blocks.len());
         for block in self.control_context.blocks.drain(..) {
             if let Some(source) = block.name.strip_prefix("scoped_rules:") {
-                let still_valid = candidates
+                let still_valid = documents
                     .iter()
                     .any(|rule| rule.source == source && scoped_rule_body(rule) == block.text);
                 if !still_valid {
@@ -2586,7 +2690,7 @@ impl Drive<'_> {
             retained.push(block);
         }
         self.control_context.blocks = retained;
-        let injected = self.inject_scoped_rules(&candidates);
+        let injected = self.inject_scoped_rules(&documents);
         if dropped {
             // The rules that no longer apply are gone from the request; say so
             // without quoting them.
@@ -2599,12 +2703,55 @@ impl Drive<'_> {
     }
 
     /// The nested rule documents that scope over `paths` (whether or not they
-    /// are already in the context).
-    fn applicable_scoped_rules(&self, paths: &[String]) -> Vec<ProjectInstruction> {
+    /// are already in the context), plus any read failures.
+    fn applicable_scoped_rules(&self, paths: &[String]) -> leveler_context::ScopedRules {
         let Some(root) = self.scoped_rule_root() else {
-            return Vec::new();
+            return leveler_context::ScopedRules::default();
         };
         scoped_rule_sources(&root, paths)
+    }
+
+    /// Keep one runtime-fact block naming nested rules that exist but could
+    /// not be read. The block is replaced or removed on the next reconcile, so
+    /// a fixed file stops producing a stale warning.
+    fn set_scoped_rule_errors(&mut self, errors: &[leveler_context::RuleReadError]) {
+        self.control_context
+            .blocks
+            .retain(|block| block.name != "scoped_rule_errors");
+        if errors.is_empty() {
+            return;
+        }
+        let mut text = String::from("\n\nNested project rules could not be read:\n");
+        for error in errors {
+            tracing::warn!(
+                event = "scoped_rule_unreadable",
+                source = %error.source,
+                kind = error.kind.as_key(),
+                detail = %error.detail
+            );
+            text.push_str(&format!(
+                "- `{}` ({}): {}\n",
+                error.source,
+                error.kind.as_key(),
+                error.detail
+            ));
+        }
+        text.push_str(
+            "Their content is NOT in your context; do not treat this as an absence of rules \n\
+             for that path.",
+        );
+        self.control_context
+            .blocks
+            .push(leveler_model::PromptSegment::control(
+                "scoped_rule_errors",
+                crate::executor::PromptSource::ProjectRules {
+                    paths: errors.iter().map(|error| error.source.clone()).collect(),
+                },
+                crate::executor::PromptAuthority::RuntimeFact,
+                crate::executor::SegmentLifecycle::Turn,
+                false,
+                text,
+            ));
     }
 
     fn scoped_rule_root(&self) -> Option<std::path::PathBuf> {
@@ -3274,7 +3421,8 @@ impl AgentHarness for Drive<'_> {
             ));
             self.model_step_note_sent = true;
         }
-        self.deliver_background_task_results(messages).await?;
+        self.deliver_background_task_results(messages, model_steps)
+            .await?;
         Ok(Flow::Continue)
     }
 
@@ -3555,18 +3703,24 @@ impl AgentHarness for Drive<'_> {
             // model's answer rather than with a bare tool call. A silent round
             // still gets one request for that answer, then the turn ends with
             // the facts it has.
+            // This quiet round's own prose is the latest text the model wrote
+            // without a work tool. Once the goal is settled it IS the delivery.
+            // While the goal is still active it is the text a later
+            // bookkeeping-only `update_goal(deliver_answer = true)` names, so it
+            // must not live only in the transcript. `last_text` is not used
+            // unless a length continuation joined the text: a process sentence
+            // from before a tool call stays there, and the turn did not end on
+            // it. Recording prose is not a control decision — only the model's
+            // structured declaration can deliver it.
+            let prose = assistant.text_content();
+            if !prose.trim().is_empty() {
+                self.terminal_answer = Some(if self.continued_text.is_empty() {
+                    prose.trim().to_string()
+                } else {
+                    self.last_text.trim().to_string()
+                });
+            }
             if self.settled_goal.is_some() {
-                // This quiet round's own prose is the answer. `last_text` is
-                // not: a process sentence from before a tool call stays there,
-                // and the turn did not end on it.
-                let prose = assistant.text_content();
-                if !prose.trim().is_empty() {
-                    self.terminal_answer = Some(if self.continued_text.is_empty() {
-                        prose.trim().to_string()
-                    } else {
-                        self.last_text.trim().to_string()
-                    });
-                }
                 if self.terminal_answer.is_none()
                     && self.settled_rounds == 0
                     && !self.delivery_followup_issued
@@ -4601,8 +4755,10 @@ impl AgentHarness for Drive<'_> {
                             // The refused declaration is the durable registration
                             // fact the terminal reads. It is emitted as the
                             // refusal happens, not inferred from warnings later.
+                            // The kind names what the gate actually found: a
+                            // declaration whose arguments are not valid.
                             (self.observer)(AgentEvent::GoalIntercepted {
-                                kind: COMMIT_REFUSED_KIND.to_string(),
+                                kind: COMMIT_INVALID_DECLARATION_KIND.to_string(),
                                 detail: message.clone(),
                             });
                             (false, message)
@@ -4642,6 +4798,25 @@ impl AgentHarness for Drive<'_> {
                     parallel: false,
                     model_step: Some(model_steps),
                 });
+                // What the model declared about its visible text, read on every
+                // resolution attempt — including the ones this gate refuses
+                // before it looks at the claim. `deliver_answer` offers this
+                // round's text as the answer; `revise_answer` says it replaces
+                // an answer already offered. Only the second may replace a
+                // candidate. A refusal of the settlement is not a refusal of
+                // the answer it declared, so these declarations are recorded on
+                // every exit path below.
+                let revises_answer = call
+                    .arguments
+                    .get("revise_answer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let declares_answer = revises_answer
+                    || call
+                        .arguments
+                        .get("deliver_answer")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 // A resolution without an explicit status is not accepted as
                 // completion — feed the error back so the model resolves
                 // deliberately instead of by omission.
@@ -4681,6 +4856,12 @@ impl AgentHarness for Drive<'_> {
                         kind: "outstanding_children".to_string(),
                         detail: waiting.join(", "),
                     });
+                    self.note_refused_completion(
+                        &round_prose,
+                        declares_answer,
+                        revises_answer,
+                        round_has_work,
+                    );
                     (self.observer)(AgentEvent::ToolResult {
                         exit_code: None,
                         stop: None,
@@ -4720,6 +4901,12 @@ impl AgentHarness for Drive<'_> {
                             kind: "invalid_status".to_string(),
                             detail: other.unwrap_or("no status").to_string(),
                         });
+                        self.note_refused_completion(
+                            &round_prose,
+                            declares_answer,
+                            revises_answer,
+                            round_has_work,
+                        );
                         (self.observer)(AgentEvent::ToolResult {
                             exit_code: None,
                             stop: None,
@@ -4740,21 +4927,6 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
-                // What the model declared about its visible text, read on every
-                // resolution attempt. `deliver_answer` offers this round's text
-                // as the answer; `revise_answer` says it replaces an answer
-                // already offered. Only the second may replace a candidate.
-                let revises_answer = call
-                    .arguments
-                    .get("revise_answer")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let declares_answer = revises_answer
-                    || call
-                        .arguments
-                        .get("deliver_answer")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
                 // The user's pause is not the model's obstruction. A model
                 // that reaches the authorized boundary truthfully reports
                 // "waiting for the user", and `blocked` is the only terminal
@@ -4780,6 +4952,12 @@ impl AgentHarness for Drive<'_> {
                             kind: "user_pause_boundary".to_string(),
                             detail: message.clone(),
                         });
+                        self.note_refused_completion(
+                            &round_prose,
+                            declares_answer,
+                            revises_answer,
+                            round_has_work,
+                        );
                         (self.observer)(AgentEvent::ToolResult {
                             exit_code: None,
                             stop: None,
@@ -5506,6 +5684,23 @@ impl AgentHarness for Drive<'_> {
                 let mut call_paths = Vec::new();
                 collect_scoped_paths_from_call(&call, &mut call_paths);
                 let applicable = self.applicable_scoped_rules(&call_paths);
+                let scoped_errors = applicable.errors;
+                if !scoped_errors.is_empty() {
+                    // Keep the path so the next reconcile re-checks it and the
+                    // runtime-fact block can appear/clear with the file.
+                    for path in &call_paths {
+                        push_unique_path(&mut self.scoped_paths, path);
+                    }
+                    for error in &scoped_errors {
+                        tracing::warn!(
+                            event = "scoped_rule_unreadable",
+                            source = %error.source,
+                            kind = error.kind.as_key(),
+                            detail = %error.detail
+                        );
+                    }
+                }
+                let applicable = applicable.documents;
                 let unread = applicable
                     .iter()
                     .filter(|rule| !self.has_scoped_rule(&rule.source))
@@ -6082,12 +6277,15 @@ impl AgentHarness for Drive<'_> {
                             mutation_ops: self.ledger.total_mutation_ops,
                             call_id: Some(call.id.as_str().to_string()),
                         });
-                    if self.verification_runs.len() > 64 {
+                    if self.verification_runs.len()
+                        > super::goal_verification::MAX_VERIFICATION_RUNS
+                    {
                         self.verification_runs.remove(0);
                     }
-                    // The command now HAS a result; it is no longer pending.
-                    self.pending_commands
-                        .retain(|pending| !pending.label.eq_ignore_ascii_case(&label));
+                    // A pending start is retired only by ITS task's terminal
+                    // result (see `register_background_result`). Clearing by
+                    // command text here would drop a still-running execution
+                    // because an unrelated run of the same command finished.
                 } else {
                     // A start is not evidence, but it is a fact: the completion
                     // gate must not call this command "never ran" while it is
@@ -6113,42 +6311,26 @@ impl AgentHarness for Drive<'_> {
             // test handed to the background after 15 seconds could pass and
             // still leave `update_goal(complete)` with no evidence to cite.
             //
-            // Observed twice is one result, not two runs: the same task's
-            // repeated terminal reads collapse into the run it already added.
-            if let Some(result) = command_facts.background_result.as_ref()
-                && let Some(label) = super::goal_verification::background_command_label(
-                    &result.program,
-                    &result.args,
-                )
-            {
-                // The task produced its result: it is no longer a pending
-                // start, whatever label the process reports.
-                let started_call = self
-                    .pending_commands
-                    .iter()
-                    .rev()
-                    .find(|pending| pending.task_id.as_deref() == Some(result.task_id.as_str()))
-                    .and_then(|pending| pending.call_id.clone());
-                self.pending_commands
-                    .retain(|pending| pending.task_id.as_deref() != Some(result.task_id.as_str()));
-                let duplicate = self
-                    .verification_runs
-                    .last()
-                    .is_some_and(|last| last.label == label && last.ok == result.ok);
-                if !duplicate {
-                    self.verification_runs
-                        .push(super::goal_verification::VerificationRun {
-                            label,
-                            ok: result.ok,
-                            exit_code: result.exit_code,
-                            model_step: model_steps,
-                            mutation_ops: self.ledger.total_mutation_ops,
-                            call_id: started_call,
-                        });
-                    if self.verification_runs.len() > 64 {
-                        self.verification_runs.remove(0);
-                    }
-                }
+            // This is the SAME registration the auto-delivery notice uses, so
+            // observing a task twice (notice + poll) is one execution, not two
+            // runs, and a task the notice already recorded adds nothing here.
+            if let Some(result) = command_facts.background_result.as_ref() {
+                self.register_background_result(
+                    &result.task_id,
+                    result.start_call_id.as_deref(),
+                    result.goal_id.as_ref(),
+                    super::goal_verification::background_command_label(
+                        &result.program,
+                        &result.args,
+                    ),
+                    result.ok,
+                    result.exit_code,
+                    // The lifecycle tool only reports a result when the command
+                    // itself produced one (a natural exit or a child failure);
+                    // a stopped task has no result to report.
+                    true,
+                    model_steps,
+                );
             }
 
             for path in &self.modified_files {

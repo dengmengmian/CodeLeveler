@@ -20,7 +20,13 @@
 //! declaration says which executions it cites, and the requirement set says
 //! which requirements need executable evidence.
 
+use std::collections::HashSet;
+
 use leveler_lifecycle::VerificationStatus;
+
+/// Bound on the retained execution record. The newest runs are the ones a
+/// completion can cite; older entries only cost memory and mismatch work.
+pub(crate) const MAX_VERIFICATION_RUNS: usize = 64;
 
 /// One command execution the runtime observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +90,79 @@ pub(crate) struct PendingCommand {
     pub task_id: Option<String>,
     /// The tool call that started it, so the result can be cited by that id.
     pub call_id: Option<String>,
+}
+
+/// A terminal observation of one background task execution.
+///
+/// `task_id` is the execution identity: the same task observed twice (the
+/// auto-delivery notice and a `wait_task` read) is ONE result, while a command
+/// that genuinely ran twice has two task ids and therefore two records.
+pub(crate) struct BackgroundResultFact {
+    pub task_id: String,
+    /// The tool call that started the process, when the observation knows it.
+    pub start_call_id: Option<String>,
+    /// The command's label, when the execution can be cited at all.
+    pub label: Option<String>,
+    /// The command reached this result (exit 0 is the only pass).
+    pub ok: bool,
+    pub exit_code: Option<i32>,
+    /// True when this observation is the command's own outcome. A cancelled or
+    /// unobservable task ends the pending start but is not evidence in either
+    /// direction: it is not a pass, and calling it a failed check would invent
+    /// a result the command never produced.
+    pub evidence: bool,
+}
+
+/// Register one background task's terminal result exactly once.
+///
+/// Both routes into the ledger — the auto-delivered notice and an active
+/// `wait_task`/`get_task` read — go through this function, so the fact exists
+/// once no matter which route the model used or in which order they arrived.
+/// Identity is the task execution, never the command text plus exit status: a
+/// command that really ran twice must remain two executions.
+///
+/// The pending start is cleared for every terminal outcome, including a
+/// cancelled one, because the task will produce no later result. Returns
+/// whether a new verification run was recorded.
+pub(crate) fn record_background_result(
+    runs: &mut Vec<VerificationRun>,
+    pending: &mut Vec<PendingCommand>,
+    recorded: &mut HashSet<String>,
+    fact: BackgroundResultFact,
+    model_step: u32,
+    mutation_ops: u64,
+) -> bool {
+    pending.retain(|started| started.task_id.as_deref() != Some(fact.task_id.as_str()));
+    if !recorded.insert(fact.task_id.clone()) {
+        return false;
+    }
+    if !fact.evidence {
+        return false;
+    }
+    let Some(label) = fact.label.filter(|label| !label.trim().is_empty()) else {
+        return false;
+    };
+    // A run rebuilt from the durable log already names this execution by its
+    // starting call. Re-registering it would count the same execution twice.
+    if fact
+        .start_call_id
+        .as_deref()
+        .is_some_and(|id| runs.iter().any(|run| run.call_id.as_deref() == Some(id)))
+    {
+        return false;
+    }
+    runs.push(VerificationRun {
+        label,
+        ok: fact.ok,
+        exit_code: fact.exit_code,
+        model_step,
+        mutation_ops,
+        call_id: fact.start_call_id,
+    });
+    if runs.len() > MAX_VERIFICATION_RUNS {
+        runs.remove(0);
+    }
+    true
 }
 
 /// Decide whether `update_goal(complete)` may resolve the goal.
@@ -239,8 +318,12 @@ fn unmatched_citation(
 ) -> String {
     // A command this task started is not a command that never ran. Saying so
     // about a live process hid the real missing fact (its result) and pointed
-    // the model at the wrong problem.
-    if let Some(started) = pending.iter().rev().find(|p| cites(&p.label, cited)) {
+    // the model at the wrong problem. The model writes the same result note it
+    // would write beside a finished run (`cmd → result`), so the pending
+    // lookup reads that form too.
+    if let Some(started) = pending.iter().rev().find(|p| {
+        cites(&p.label, cited) || cites_recorded_command_with_result_note(&p.label, cited)
+    }) {
         let task = match started.task_id.as_deref() {
             Some(id) => format!(" as background task {id}"),
             None => String::new(),
@@ -1142,6 +1225,180 @@ mod tests {
     /// `make up`, which HAD started as background task `bg-1` and was still
     /// running. The missing fact was its result, not its existence; naming that
     /// (and the task to wait on) is what makes the refusal actionable.
+    fn pending_start(label: &str, task_id: &str, call_id: &str) -> PendingCommand {
+        PendingCommand {
+            label: label.to_string(),
+            task_id: Some(task_id.to_string()),
+            call_id: Some(call_id.to_string()),
+        }
+    }
+
+    fn background_fact(
+        task_id: &str,
+        call_id: &str,
+        label: &str,
+        ok: bool,
+        evidence: bool,
+    ) -> BackgroundResultFact {
+        BackgroundResultFact {
+            task_id: task_id.to_string(),
+            start_call_id: Some(call_id.to_string()),
+            label: Some(label.to_string()),
+            ok,
+            exit_code: Some(if ok { 0 } else { 1 }),
+            evidence,
+        }
+    }
+
+    #[test]
+    fn one_background_execution_registers_once_across_notice_and_poll() {
+        let mut runs = Vec::new();
+        let mut pending = vec![pending_start("go test ./... -count=1", "task-a", "call-a")];
+        let mut recorded = HashSet::new();
+        let fact = || background_fact("task-a", "call-a", "go test ./... -count=1", true, true);
+
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            fact(),
+            4,
+            7
+        ));
+        // The second observation is the same execution, even when it arrives
+        // through the other route (auto-delivery then `wait_task`, or the
+        // reverse). It must not add a run.
+        assert!(!record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            fact(),
+            5,
+            7
+        ));
+        assert_eq!(runs.len(), 1);
+        assert!(pending.is_empty(), "a terminal result retires its start");
+        assert_eq!(runs[0].call_id.as_deref(), Some("call-a"));
+        assert_eq!(runs[0].model_step, 4, "the first observation owns the step");
+    }
+
+    #[test]
+    fn two_real_executions_of_one_command_keep_two_records() {
+        let mut runs = Vec::new();
+        let mut pending = Vec::new();
+        let mut recorded = HashSet::new();
+        let label = "go test ./...";
+
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", label, true, true),
+            4,
+            7
+        ));
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-b", "call-b", label, true, true),
+            9,
+            7
+        ));
+        assert_eq!(
+            runs.len(),
+            2,
+            "command text plus exit status is not identity"
+        );
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.call_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["call-a", "call-b"]
+        );
+    }
+
+    #[test]
+    fn a_failed_background_result_is_recorded_as_failed_evidence() {
+        let mut runs = Vec::new();
+        let mut pending = vec![pending_start("cargo test", "task-a", "call-a")];
+        let mut recorded = HashSet::new();
+
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "cargo test", false, true),
+            6,
+            3
+        ));
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].ok);
+        assert_eq!(runs[0].exit_code, Some(1));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_background_task_is_not_pass_or_failure_evidence() {
+        let mut runs = Vec::new();
+        let mut pending = vec![pending_start("npm run dev", "task-a", "call-a")];
+        let mut recorded = HashSet::new();
+
+        assert!(!record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "npm run dev", false, false),
+            6,
+            3
+        ));
+        assert!(runs.is_empty(), "a cancel has no command result to cite");
+        assert!(
+            pending.is_empty(),
+            "the cancelled task will produce no later result"
+        );
+        assert!(recorded.contains("task-a"));
+    }
+
+    #[test]
+    fn a_run_rebuilt_from_the_log_is_not_registered_twice() {
+        let mut runs = vec![run_id("go test ./...", true, 2, 1, "call-a")];
+        let mut pending = vec![pending_start("go test ./...", "task-a", "call-a")];
+        let mut recorded = HashSet::new();
+
+        assert!(!record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "go test ./...", true, true),
+            8,
+            4
+        ));
+        assert_eq!(runs.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_start_of_a_different_task_is_not_retired_by_a_result() {
+        let mut runs = Vec::new();
+        let mut pending = vec![
+            pending_start("go test ./...", "task-a", "call-a"),
+            pending_start("go test ./...", "task-b", "call-b"),
+        ];
+        let mut recorded = HashSet::new();
+
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-b", "call-b", "go test ./...", true, true),
+            5,
+            2
+        ));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_id.as_deref(), Some("task-a"));
+    }
+
     #[test]
     fn a_citation_of_a_started_command_names_the_task_to_wait_for() {
         let pending = vec![PendingCommand {
@@ -1161,6 +1418,37 @@ mod tests {
         };
         assert!(message.contains("only STARTED"), "{message}");
         assert!(message.contains("bg-1"), "{message}");
+        assert!(
+            !message.contains("never ran"),
+            "the command did run; its result is what is missing: {message}"
+        );
+    }
+
+    /// The result-note form the model writes for a real background run:
+    /// `go test ./... -count=1 → …`. The command itself is still the same
+    /// execution record, so a pending start must be recognized through the
+    /// note and reported as unfinished, not as a command that never ran.
+    #[test]
+    fn a_pending_start_cited_with_a_result_note_is_reported_as_unfinished() {
+        let pending = vec![PendingCommand {
+            label: "go test ./... -count=1".to_string(),
+            task_id: Some("host-42".to_string()),
+            call_id: Some("call-start".to_string()),
+        }];
+        let decision = decide(
+            &VerificationClaim::Passed(vec![
+                "go test ./... -count=1 → 全部包 ok（含 internal/npc），退出码 0".into(),
+            ]),
+            &[],
+            &pending,
+            0,
+            false,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a start is not a pass");
+        };
+        assert!(message.contains("only STARTED"), "{message}");
+        assert!(message.contains("host-42"), "{message}");
         assert!(
             !message.contains("never ran"),
             "the command did run; its result is what is missing: {message}"

@@ -304,6 +304,12 @@ pub enum EngineEvent {
     ReasoningCompleted {
         elapsed_ms: u64,
     },
+    /// Durable project-rule delivery audit, emitted once at turn start after
+    /// the turn's control context was built. Records selection into the turn's
+    /// context, not proof that a provider received or followed the text.
+    RuleDelivery {
+        audit: leveler_context::RuleDeliveryAudit,
+    },
     AssistantMessage {
         text: String,
         /// Displayable reasoning segments the model produced this round, each
@@ -1000,6 +1006,7 @@ impl EngineEvent {
             | EngineEvent::ReasoningStarted
             | EngineEvent::ReasoningDelta { .. }
             | EngineEvent::ReasoningCompleted { .. }
+            | EngineEvent::RuleDelivery { .. }
             | EngineEvent::AssistantMessage { .. }
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallFinished { .. }
@@ -1173,6 +1180,7 @@ impl EngineEvent {
             | EngineEvent::ReasoningStarted
             | EngineEvent::ReasoningDelta { .. }
             | EngineEvent::ReasoningCompleted { .. }
+            | EngineEvent::RuleDelivery { .. }
             | EngineEvent::AssistantMessage { .. }
             | EngineEvent::ToolExecutionTiming { .. }
             | EngineEvent::ToolCallStarted { .. }
@@ -1656,6 +1664,45 @@ mod contract_tests {
         assert!(event.public_projection().is_none());
         let (tag, payload) = event.to_row().unwrap();
         assert_eq!(tag, "delegation_stage");
+        assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
+    }
+
+    /// The rule-delivery audit is durable local evidence: it replays exactly,
+    /// is never transient, and never enters a remote projection because it
+    /// names workspace paths and source identities.
+    #[test]
+    fn rule_delivery_audit_is_persisted_local_only_and_round_trips() {
+        let event = EngineEvent::RuleDelivery {
+            audit: leveler_context::RuleDeliveryAudit {
+                workspace: Some("/workspace/demo".to_string()),
+                turn_id: Some("turn-1".to_string()),
+                policy: leveler_context::RulePolicyAudit {
+                    source: leveler_context::RulePolicySource::ProjectConfig,
+                    error: None,
+                },
+                sources: vec![leveler_context::RuleSourceAudit {
+                    source: "AGENTS.md".to_string(),
+                    bytes: 21,
+                    sha256: Some("a".repeat(64)),
+                    status: leveler_context::RuleSourceStatus::Delivered,
+                }],
+                report: leveler_context::RuleDeliveryReport {
+                    budget_bytes: 65_536,
+                    delivered_sections: vec!["AGENTS.md#rules".to_string()],
+                    read_errors: vec![leveler_context::RuleReadError::new(
+                        "src/AGENTS.md",
+                        leveler_context::RuleReadErrorKind::InvalidUtf8,
+                        "invalid UTF-8 at byte 3",
+                    )],
+                    ..leveler_context::RuleDeliveryReport::default()
+                },
+            },
+        };
+        assert!(!event.is_transient());
+        assert_eq!(event.data_class(), DataClass::LocalOnly);
+        assert!(event.public_projection().is_none());
+        let (tag, payload) = event.to_row().unwrap();
+        assert_eq!(tag, "rule_delivery");
         assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
     }
 

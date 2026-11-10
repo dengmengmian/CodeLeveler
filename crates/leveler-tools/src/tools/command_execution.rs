@@ -826,6 +826,8 @@ fn foreground_handoff_output(
         "task_id": task_id,
         "status": "running",
         "background": true,
+        "program": program,
+        "args": args,
         "lifetime": lifetime.as_str(),
         "deadline_seconds": deadline_secs,
     }))
@@ -1395,6 +1397,25 @@ mod foreground_handoff_tests {
             .map(str::to_string)
     }
 
+    #[test]
+    fn a_handoff_result_carries_the_start_metadata() {
+        let out = foreground_handoff_output(
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            "host-7",
+            Duration::from_secs(15),
+            None,
+            BackgroundTaskLifetime::Goal,
+        );
+        // The engine's `BackgroundTaskStarted` is built from exactly these
+        // fields; a handoff without them is a start that never reaches the log.
+        assert_eq!(out.metadata["background"], true);
+        assert_eq!(out.metadata["program"], "sh");
+        assert_eq!(out.metadata["args"], serde_json::json!(["-c", "sleep 30"]));
+        assert_eq!(out.metadata["task_id"], "host-7");
+        assert_eq!(out.metadata["lifetime"], "goal");
+    }
+
     #[tokio::test]
     async fn a_short_command_still_returns_its_exit_and_registers_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1559,6 +1580,19 @@ mod foreground_handoff_tests {
             "a handoff must not report an exit code: {out:?}"
         );
         let task_id = task_id_of(&out.content).expect("task id");
+        // The handoff is the durable start of a real task. The engine records
+        // `BackgroundTaskStarted` from this metadata; without the argv and the
+        // id it could not name what started, and the later terminal fact would
+        // have no start to pair with.
+        assert_eq!(out.metadata["background"], true, "{out:?}");
+        assert_eq!(out.metadata["program"], "sh", "{out:?}");
+        assert_eq!(
+            out.metadata["args"],
+            serde_json::json!(["-c", "echo before; sleep 16; echo hi > created.txt"]),
+            "{out:?}"
+        );
+        assert_eq!(out.metadata["task_id"], task_id.as_str(), "{out:?}");
+        assert_eq!(out.metadata["lifetime"], "goal", "{out:?}");
         let snap = reg.get(&task_id).await.expect("registered");
         assert_eq!(snap.status, BackgroundTaskStatus::Running);
         let pid = snap.pid.expect("the adopted process keeps its pid");

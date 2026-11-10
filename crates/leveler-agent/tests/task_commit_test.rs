@@ -2735,7 +2735,7 @@ async fn markdown_headings_do_not_become_commit_requirements() {
         !events.iter().any(|event| matches!(
             event,
             leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
-                if kind == "acceptance_narrowed" && detail.contains("##")
+                if leveler_agent::is_commit_refusal_kind(kind) && detail.contains("##")
         )),
         "a Markdown heading must never be the reason a commit is refused: {events:?}"
     );
@@ -3512,13 +3512,82 @@ async fn a_plain_chat_review_warning_is_not_a_registration_failure() {
         !events.iter().any(|event| matches!(
             event,
             leveler_engine::EngineEvent::GoalIntercepted { kind, .. }
-                if kind == "acceptance_narrowed"
+                if leveler_agent::is_commit_refusal_kind(kind)
         )),
         "a plain Chat answer attempted no declaration: {events:?}"
     );
     assert!(
         goal_records(&fx).await.is_empty(),
         "a plain Chat registers no goal"
+    );
+    std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// Invalid arguments are refused as an invalid declaration. They are not an
+/// acceptance that narrowed the user's scope, and the gate stays strict: the
+/// call registers nothing and tells the model which field to fix.
+#[tokio::test]
+async fn a_schema_invalid_declaration_is_named_as_invalid_arguments() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": USER_REQUEST,
+                    // A string, not an array: the arguments do not have the
+                    // shape the tool declares.
+                    "acceptance": "go test ./... 通过",
+                    "task_relation": "continue",
+                }),
+            ),
+            Scripted::Text("I could not commit the task."),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, USER_REQUEST),
+            vec![ContentPart::Text {
+                text: USER_REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refusal = events
+        .iter()
+        .find_map(|event| match event {
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "invalid_declaration" || kind == "acceptance_narrowed" =>
+            {
+                Some((kind.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .expect("the malformed declaration is refused");
+    assert_eq!(
+        refusal.0, "invalid_declaration",
+        "a schema error is not a narrowed acceptance: {refusal:?}"
+    );
+    assert!(
+        refusal.1.contains("acceptance"),
+        "the refusal names the field to fix: {refusal:?}"
+    );
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "invalid arguments register no goal"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "the turn ends on the model's own answer: {report:?}"
     );
     std::fs::remove_dir_all(fx.dir.path()).ok();
 }

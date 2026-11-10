@@ -1216,6 +1216,119 @@ async fn progress_between_the_refused_answer_and_settlement_keeps_the_answer() {
     assert_eq!(run.final_text(), answer);
 }
 
+/// An answer the model wrote on a quiet round, before it attempted to settle,
+/// is still the text a later refused settlement explicitly declared. The
+/// repair round must not force the model to write the answer again.
+#[tokio::test]
+async fn an_answer_written_before_a_refused_settlement_is_reused_after_the_repair() {
+    let run = run_goal(vec![
+        assistant_text(ANSWER),
+        assistant_calls(&[(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Goal complete.",
+                "deliver_answer": true,
+                "verification": {"status": "passed", "detail": "go test ./... → exit 0"},
+            }),
+        )]),
+        assistant_calls(&[(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Goal complete.",
+                "deliver_answer": true,
+                "verification": {"status": "not_applicable", "detail": "no executable check applies"},
+            }),
+        )]),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "verification_refused"
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(deliveries_of(&run), vec![ANSWER]);
+    assert_eq!(run.final_text(), ANSWER);
+    assert_eq!(
+        run.outcome.model_steps, 3,
+        "the accepted repair reused the answer instead of asking for it again"
+    );
+}
+
+/// A refused update_goal is a refusal of the SETTLEMENT, not of the answer it
+/// declared. The declaration survives even a later work round, so the accepted
+/// settlement delivers it instead of asking the model to write it again.
+#[tokio::test]
+async fn a_refused_status_declaration_keeps_the_answer_it_declared() {
+    let refused_round = ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Text {
+                    text: ANSWER.to_string(),
+                },
+                ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new("w1"),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({"path": "."}),
+                    },
+                },
+                ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new("g1"),
+                        name: "update_goal".to_string(),
+                        arguments: serde_json::json!({
+                            "status": "done",
+                            "summary": "Goal complete.",
+                            "deliver_answer": true,
+                        }),
+                    },
+                },
+            ],
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    };
+    let run = run_goal(vec![
+        assistant_text(ANSWER),
+        refused_round,
+        goal_complete("g2", Some(true)),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "invalid_status"
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(deliveries_of(&run), vec![ANSWER]);
+    assert_eq!(run.final_text(), ANSWER);
+    assert_eq!(
+        run.outcome.model_steps, 3,
+        "the accepted settlement reused the declared answer"
+    );
+}
+
 /// A refusal that follows real work in the same round must not reach back for
 /// the prose written before that work. The declaration promises "the answer I
 /// wrote", and after a work round with no visible text there is no such answer

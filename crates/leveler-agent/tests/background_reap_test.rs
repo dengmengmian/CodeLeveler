@@ -32,6 +32,16 @@ struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
     error_when_exhausted: Mutex<ModelError>,
     cancel_before_closeout: Mutex<Option<(Database, leveler_core::SessionId)>>,
+    /// When set, every response after the first waits for the session's
+    /// background tasks to reach a terminal state before it is produced.
+    ///
+    /// A real model takes time to write its status text, which gives the
+    /// registry driver time to observe a process exit before the next request
+    /// admission. A zero-latency scripted model does not, so a test that needs
+    /// an auto-delivered result would otherwise race the reaper. The wait is a
+    /// real condition wait on the registry, not a fixed sleep.
+    wait_for_background_terminal: Option<Arc<BackgroundTaskRegistry>>,
+    generated: Mutex<usize>,
 }
 
 /// Append the answer a real model must write after it resolves its goal.
@@ -55,6 +65,13 @@ fn with_delivery(mut responses: Vec<ModelResponse>) -> Vec<ModelResponse> {
 
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
+        Self::with_background_wait(responses, None)
+    }
+
+    fn with_background_wait(
+        responses: Vec<ModelResponse>,
+        registry: Option<Arc<BackgroundTaskRegistry>>,
+    ) -> Self {
         let responses = with_delivery(responses);
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
@@ -63,6 +80,32 @@ impl MockRuntime {
                 "no more responses",
             )),
             cancel_before_closeout: Mutex::new(None),
+            wait_for_background_terminal: registry,
+            generated: Mutex::new(0),
+        }
+    }
+
+    /// Wait until no task in this session is still active, using the
+    /// registry's own completion notification.
+    async fn settle_background_tasks(registry: &BackgroundTaskRegistry) -> Result<(), ModelError> {
+        loop {
+            let active = registry.active_snapshots_for_scope(SESSION_SCOPE).await;
+            let Some(task) = active.into_iter().next() else {
+                return Ok(());
+            };
+            registry
+                .wait(
+                    &task.id,
+                    Some(Duration::from_secs(30)),
+                    &CancellationToken::new(),
+                )
+                .await
+                .map_err(|error| {
+                    ModelError::new(
+                        leveler_model::ModelErrorKind::Other,
+                        format!("background task {} did not settle: {error}", task.id),
+                    )
+                })?;
         }
     }
 }
@@ -74,6 +117,17 @@ impl ModelRuntime for MockRuntime {
         _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
+        let index = {
+            let mut generated = self.generated.lock().unwrap();
+            let index = *generated;
+            *generated += 1;
+            index
+        };
+        if index > 0
+            && let Some(registry) = self.wait_for_background_terminal.as_ref()
+        {
+            Self::settle_background_tasks(registry).await?;
+        }
         let response = self
             .responses
             .lock()
@@ -234,6 +288,18 @@ struct Harness {
 }
 
 async fn harness(responses: Vec<ModelResponse>) -> Harness {
+    harness_with(responses, false).await
+}
+
+/// The same harness, with a scripted model whose later responses wait for the
+/// session's background tasks to finish. A test about auto-delivery needs the
+/// exit to be observable by the next request admission; the zero-latency mock
+/// otherwise races the registry driver.
+async fn harness_waiting_for_background(responses: Vec<ModelResponse>) -> Harness {
+    harness_with(responses, true).await
+}
+
+async fn harness_with(responses: Vec<ModelResponse>, wait_for_background: bool) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
@@ -270,7 +336,11 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         .with_background_tasks(registry.clone());
     let tool_registry =
         leveler_tools::model_surface(leveler_tools::CapabilityPacks::ALL, &capabilities);
-    let runtime = Arc::new(MockRuntime::new(responses));
+    let runtime = Arc::new(if wait_for_background {
+        MockRuntime::with_background_wait(responses, Some(registry.clone()))
+    } else {
+        MockRuntime::new(responses)
+    });
     let db = Database::connect_in_memory().await.unwrap();
     let engine = CodingRuntime {
         engine: TaskEngine {
@@ -315,6 +385,95 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         registry,
         runtime,
     }
+}
+
+/// A background command's terminal result is a verification fact even when
+/// the model never polls it. Auto-delivery must register the same execution
+/// the active `wait_task` path records, so the first citation of the command
+/// can close the goal instead of being refused as a command that never ran.
+///
+/// The audit session ran `go test ./... -count=1` in the background, let its
+/// exit-0 notice arrive on its own, then cited it in `update_goal`; the gate
+/// said the command "never ran in this task" because only the `wait_task`
+/// path fed the ledger.
+#[tokio::test]
+async fn auto_delivered_background_result_is_citable_without_a_rerun() {
+    let (program, args) = leveler_test_support::sleep_command(0);
+    let citation = format!("{} {} → 退出码 0", program, args.join(" "));
+    // The mock waits for the real task exit before its next response, so the
+    // auto-delivery admission — not a sleep in the test — decides when the
+    // result becomes citable.
+    let h = harness_waiting_for_background(vec![
+        tool_call(
+            "bg-auto",
+            "run_command",
+            serde_json::json!({
+                "program": program,
+                "args": args,
+                "background": true
+            }),
+        ),
+        text("后台检查已启动，等待它结束。"),
+        text("仍在等待后台检查结束。"),
+        tool_call(
+            "resolve",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": citation },
+                "deliver_answer": true
+            }),
+        ),
+    ])
+    .await;
+    let s = spec(&h, "运行检查并报告结果");
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve on the auto-delivered result");
+
+    let verification = report.verification.as_ref().unwrap_or_else(|| {
+        panic!("a passed citation must produce a verification report; intercepts: {intercepted:?}")
+    });
+    assert!(
+        intercepted.is_empty(),
+        "the auto-delivered result must satisfy the gate, not be refused: {intercepted:?}"
+    );
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Unverified,
+        "this harness declares no owed requirement, so a matched citation is downgraded to \
+         Unverified by the requirement-coverage rule: {verification:?}"
+    );
+    assert!(
+        report
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("no owed requirement")),
+        "the downgrade must be the no-requirement rule, not a missing check: {:?}",
+        report.completion_warnings
+    );
+    assert!(
+        !report
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("without executable verification")),
+        "a matched citation is executable verification: {:?}",
+        report.completion_warnings
+    );
 }
 
 fn spec(h: &Harness, goal: &str) -> TaskSpec {

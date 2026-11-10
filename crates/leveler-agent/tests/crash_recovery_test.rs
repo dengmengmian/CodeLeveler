@@ -452,6 +452,57 @@ async fn a_dangling_read_tool_stops_resume_until_acknowledged() {
     );
 }
 
+/// A resumed turn rebuilds its control context from disk. The rule written
+/// after the crashed turn and after the refused resume attempt must still be
+/// in the request the model actually receives: resume must not restore a stale
+/// snapshot or skip rule loading.
+#[tokio::test]
+async fn resume_rebuilds_root_rules_from_disk() {
+    const SENTINEL: &str = "RESUME-RULE-SENTINEL-8b1e: cite the covenant.";
+    let (engine, db, dir, requests) =
+        harness_captured(Arc::new(AutoApprove), resume_to_completion()).await;
+    let spec = direct_spec(dir.path());
+    let session = engine.create_task(&spec).await.unwrap();
+    seed_transcript(&db, &session).await;
+    seed_dangling_call(
+        &db,
+        &engine,
+        &session,
+        "read_file",
+        serde_json::json!({"path": "README.md"}).to_string(),
+    )
+    .await;
+
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect_err("the dangling call must stop the first resume");
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        format!("# Rules\n{SENTINEL}\n"),
+    )
+    .unwrap();
+
+    engine.acknowledge_crash_window(&session).await.unwrap();
+    engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("resume proceeds after acknowledgement");
+
+    let captured = requests.lock().unwrap();
+    assert!(
+        !captured.is_empty(),
+        "the resumed turn must send at least one model request"
+    );
+    for request in captured.iter() {
+        let context = request.control_context.text();
+        assert!(
+            context.contains(SENTINEL),
+            "every resumed request rebuilds root rules from disk: {context}"
+        );
+    }
+}
+
 /// A mutating tool cannot be proven un-done. Resume must stop before consulting
 /// an approver, replaying the tool, or re-driving the model (which could issue
 /// the same side effect again).

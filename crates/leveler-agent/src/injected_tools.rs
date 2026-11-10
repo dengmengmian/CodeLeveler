@@ -284,10 +284,25 @@ pub const COMMIT_TASK_TOOL: &str = "commit_task";
 ///
 /// This is the durable registration fact: clients must not infer that state
 /// from the terminal's warning list — a plain Chat answer can carry an
-/// unrelated review warning without ever attempting a declaration. The wire
-/// value is kept for event-log replay; it names the first refusal reason, not
-/// the only one.
+/// unrelated review warning without ever attempting a declaration. This wire
+/// value is retained for replay of records written before
+/// [`COMMIT_INVALID_DECLARATION_KIND`] existed; new refusals use the accurate
+/// kind below.
 pub const COMMIT_REFUSED_KIND: &str = "acceptance_narrowed";
+
+/// The structured kind for a `commit_task` whose arguments are not a valid
+/// declaration at all: a missing or mistyped field, a value over its limit, a
+/// requirement that cannot be anchored, or an acceptance check that does not
+/// exist. Naming this "acceptance_narrowed" stated a cause the refusal never
+/// established. The gate itself is unchanged — the declaration is still
+/// refused and the work remains unregistered.
+pub const COMMIT_INVALID_DECLARATION_KIND: &str = "invalid_declaration";
+
+/// Whether this `GoalIntercepted` kind is a refused `commit_task` declaration.
+/// Both values mean the same durable fact; one is the legacy wire value.
+pub fn is_commit_refusal_kind(kind: &str) -> bool {
+    kind == COMMIT_REFUSED_KIND || kind == COMMIT_INVALID_DECLARATION_KIND
+}
 
 /// Commit the current Chat turn to the Goal lifecycle.
 ///

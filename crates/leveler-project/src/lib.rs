@@ -11,7 +11,8 @@ pub mod hygiene;
 pub mod layout;
 
 pub use config::{
-    CommandSpec, IndependentReview, ProjectConfig, RulesConfig, RunLimitsConfig, VerifySpec,
+    CommandSpec, IndependentReview, LoadedRulesPolicy, ProjectConfig, RulesConfig,
+    RulesPolicyDiagnostic, RulesPolicyReadFailure, RunLimitsConfig, VerifySpec,
 };
 pub use detect::{Language, detect_languages};
 pub use layout::{EphemeralHome, Layout, NoWorkspace};
