@@ -947,9 +947,9 @@ fn workspace_contains(root: &Path, target: &Path) -> bool {
     {
         let root = root.to_string_lossy().to_lowercase();
         let target = target.to_string_lossy().to_lowercase();
-        return target.strip_prefix(&root).is_some_and(|rest| {
-            rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/')
-        });
+        target
+            .strip_prefix(&root)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/'))
     }
     #[cfg(not(windows))]
     false

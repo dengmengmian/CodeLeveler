@@ -245,6 +245,9 @@ fn render_event_text(event: AgentEvent) {
         // The text was already printed by its `AssistantText`; this durable
         // decision is evidence, not a transcript line of its own.
         AgentEvent::DeliveryCommitted { .. } => {}
+        // Durable local audit evidence. It has no presentation surface; the
+        // event log keeps the typed fact for later inspection.
+        AgentEvent::RuleDelivery { .. } => {}
         AgentEvent::Finished(_) => {}
     }
 }
@@ -346,6 +349,13 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "model_steps": model_steps,
             "modified_files": modified_files,
             "transcript_ordinal": transcript_ordinal,
+        }),
+        // Durable local audit evidence for the turn's rule selection. Not a
+        // transcript entry; emitted so a JSONL consumer can join it to the
+        // turn without reading the local event store.
+        AgentEvent::RuleDelivery { audit } => serde_json::json!({
+            "type": "rule_delivery",
+            "audit": audit,
         }),
         AgentEvent::ToolCall {
             id,
