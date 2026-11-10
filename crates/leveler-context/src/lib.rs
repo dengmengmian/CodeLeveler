@@ -22,9 +22,11 @@ pub use compaction::{
 pub use guard::{ContentFingerprint, FileStateTracker};
 pub use repo_map::RepositoryMap;
 pub use rules::{
-    MAX_RULE_BYTES, ProjectInstruction, READ_PROJECT_RULES_TOOL, RuleDeliveryPlan,
-    RuleDeliveryPolicy, RuleDeliveryReport, RuleSection, is_rule_document, load_rules,
-    plan_instructions, plan_rule_delivery, read_rule_source, render_instructions,
-    scoped_rule_sources, split_rule_sections,
+    MAX_RULE_BYTES, LoadedRuleSet, ProjectInstruction, READ_PROJECT_RULES_TOOL, RuleDeliveryAudit,
+    RuleDeliveryPlan, RuleDeliveryPolicy, RuleDeliveryReport, RulePolicyAudit, RulePolicySource,
+    RuleReadError, RuleReadErrorKind, RuleSection, RuleSourceAudit, RuleSourceRead,
+    RuleSourceStatus, ScopedRules, is_rule_document, load_rules, plan_instructions,
+    plan_rule_delivery, read_rule_source, render_instructions, scoped_rule_sources,
+    split_rule_sections,
 };
 pub use symbols::{defines, extract_symbols};

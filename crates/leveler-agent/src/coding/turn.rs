@@ -211,6 +211,7 @@ pub async fn drive_turn(
             model_steps: 0,
             modified_files: Vec::new(),
         })?
+        .with_turn_id(turn_id.clone())
         .with_approver(approver)
         .with_clarifier(clarifier)
         // Side-effect barrier: tool dispatch waits until the announcing

@@ -791,6 +791,9 @@ impl EventBridge {
                     .events
                     .send(RuntimeEvent::ReasoningCompleted { elapsed_ms });
             }
+            // Durable local audit evidence. It has no presentation surface;
+            // the event store keeps the typed fact for later inspection.
+            EngineEvent::RuleDelivery { .. } => {}
             EngineEvent::RuntimeInjection { kind, .. } => {
                 // The ONE lifecycle opening that scopes the fold below: the
                 // harness re-drove a quiet round, so the next assistant text
@@ -1086,7 +1089,9 @@ impl EventBridge {
             EngineEvent::GoalIntercepted { kind, .. } => {
                 // The executor's own refusal of a `commit_task` declaration is
                 // the durable registration fact this turn's terminal reads.
-                if kind == leveler_agent::COMMIT_REFUSED_KIND {
+                // New refusals name the invalid declaration; records written
+                // before that kind existed still replay as a refusal.
+                if leveler_agent::is_commit_refusal_kind(&kind) {
                     self.registration_refused = true;
                 }
                 // Surface as a localized activity label; the gate's kind and the

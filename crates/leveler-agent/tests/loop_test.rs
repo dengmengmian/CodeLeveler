@@ -1564,11 +1564,14 @@ async fn project_agents_md_is_injected_before_the_first_user_message() {
         tool_context,
         ModelRef::new("mock", "m"),
         5,
-    );
+    )
+    .with_turn_id(leveler_core::TurnId::new("turn-project-rules"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
     executor
         .run(
             "hello",
-            &mut |_| {},
+            &mut move |event| observed.lock().unwrap().push(event),
             &mut NoopSink,
             CancellationToken::new(),
         )
@@ -1592,6 +1595,137 @@ async fn project_agents_md_is_injected_before_the_first_user_message() {
         system_text.contains("Always run cargo fmt before finishing."),
         "AGENTS.md content missing: {system_text}"
     );
+
+    // The delivery is auditable without persisting the rule body: path,
+    // content identity, size, policy provenance, section ids and turn id.
+    let events = events.lock().unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::RuleDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn must emit its rule-delivery audit");
+    assert_eq!(audit.turn_id.as_deref(), Some("turn-project-rules"));
+    assert_eq!(
+        audit.workspace.as_deref(),
+        Some(dir.canonicalize().unwrap().to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        audit.policy.source,
+        leveler_context::RulePolicySource::Default
+    );
+    assert!(audit.policy.error.is_none());
+    assert_eq!(audit.sources.len(), 1);
+    assert_eq!(audit.sources[0].source, "AGENTS.md");
+    assert_eq!(
+        audit.sources[0].status,
+        leveler_context::RuleSourceStatus::Delivered
+    );
+    assert_eq!(
+        audit.sources[0].bytes,
+        "Always run cargo fmt before finishing.".len()
+    );
+    assert!(audit.sources[0].sha256.is_some());
+    assert_eq!(
+        audit.report.delivered_sections,
+        vec!["AGENTS.md#document".to_string()]
+    );
+    assert!(audit.report.read_errors.is_empty());
+    // The audit is evidence about selection, not the rule text itself.
+    assert!(
+        !format!("{audit:?}").contains("Always run cargo fmt"),
+        "the audit must not embed the rule body"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A rule document that exists but cannot be decoded, and a policy file that
+/// cannot be parsed, must reach the model as diagnostics — never as "no rules
+/// configured", and never as fabricated rule text.
+#[tokio::test]
+async fn unreadable_rules_are_diagnosed_and_never_laundered_into_the_prompt() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-rules-unreadable-{}",
+        std::process::id() as u64 * 29 + 9
+    ));
+    std::fs::create_dir_all(dir.join(".leveler")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), [0xff, 0xfe]).unwrap();
+    std::fs::write(dir.join(".leveler/config.yaml"), "rules: [unclosed\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(RecordingRuntime {
+        responses: Mutex::new(VecDeque::from(vec![assistant_text("ok")])),
+        seen: seen.clone(),
+    });
+
+    let executor = Executor::new(
+        runtime,
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        5,
+    )
+    .with_turn_id(leveler_core::TurnId::new("turn-unreadable-rules"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    executor
+        .run(
+            "hello",
+            &mut move |event| observed.lock().unwrap().push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = seen.lock().unwrap();
+    let system_text = requests[0].control_context.text();
+    // No rule body was invented, and the failure is visible to the model.
+    assert!(
+        !system_text.contains("Project rules:"),
+        "unreadable rules must not appear as delivered content: {system_text}"
+    );
+    assert!(
+        system_text.contains("rule delivery policy could not be read or parsed"),
+        "the policy failure must be delivered as a diagnostic: {system_text}"
+    );
+
+    let events = events.lock().unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::RuleDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn must emit its rule-delivery audit");
+    assert_eq!(
+        audit.policy.source,
+        leveler_context::RulePolicySource::ProjectConfig
+    );
+    let policy_error = audit
+        .policy
+        .error
+        .as_ref()
+        .expect("the unparsable policy must be audited");
+    assert_eq!(policy_error.kind, leveler_context::RuleReadErrorKind::Parse);
+    assert_eq!(audit.sources.len(), 1);
+    assert_eq!(
+        audit.sources[0].status,
+        leveler_context::RuleSourceStatus::Unreadable
+    );
+    assert_eq!(audit.sources[0].sha256, None);
+    assert_eq!(audit.report.read_errors.len(), 1);
+    assert_eq!(
+        audit.report.read_errors[0].kind,
+        leveler_context::RuleReadErrorKind::InvalidUtf8
+    );
+    assert!(audit.report.delivered_sections.is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1881,9 +2015,14 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
 /// A runtime that reports a huge token count every round (to force compaction)
 /// and records whether any request it received carried the compaction
 /// breadcrumb — proof the `drive` loop actually folded the transcript.
+const ROOT_RULE_SENTINEL: &str = "ROOT-RULE-SENTINEL-compaction";
 struct CompactingRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
     saw_breadcrumb: Arc<std::sync::atomic::AtomicBool>,
+    /// Main-loop requests that carried the root rule sentinel, and main-loop
+    /// requests overall. A fold must not drop the turn's root rules.
+    rule_requests: Arc<std::sync::atomic::AtomicUsize>,
+    main_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct UsageRuntime {
@@ -2136,6 +2275,15 @@ impl ModelRuntime for CompactingRuntime {
         _c: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         use leveler_model::ModelEvent;
+        let is_summary = matches!(request.tool_choice, leveler_model::ToolChoice::None);
+        if !is_summary {
+            self.main_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if request.control_context.text().contains(ROOT_RULE_SENTINEL) {
+                self.rule_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         if request
             .messages
             .iter()
@@ -2199,6 +2347,11 @@ async fn long_run_auto_compacts_when_over_budget() {
         std::process::id() as u64 * 17 + 5
     ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("AGENTS.md"),
+        format!("# Root\n{ROOT_RULE_SENTINEL}\n"),
+    )
+    .unwrap();
     for i in 0..16 {
         std::fs::write(
             dir.join(format!("src/f{i}.rs")),
@@ -2227,9 +2380,13 @@ async fn long_run_auto_compacts_when_over_budget() {
     responses.push(assistant_text("done reading"));
 
     let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rule_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let main_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let runtime = Arc::new(CompactingRuntime {
         responses: Mutex::new(VecDeque::from(responses)),
         saw_breadcrumb: saw.clone(),
+        rule_requests: rule_requests.clone(),
+        main_requests: main_requests.clone(),
     });
 
     let executor = Executor::new(
@@ -2261,6 +2418,16 @@ async fn long_run_auto_compacts_when_over_budget() {
     assert!(
         saw.load(std::sync::atomic::Ordering::SeqCst),
         "a later request should carry the compaction breadcrumb"
+    );
+    // A fold rewrites the transcript only. The turn's root rules are control
+    // context, and every main-loop request must still carry them — including
+    // the ones after the transcript was replaced.
+    let main_requests = main_requests.load(std::sync::atomic::Ordering::SeqCst);
+    let rule_requests = rule_requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(main_requests > 2, "the turn should span many rounds");
+    assert_eq!(
+        rule_requests, main_requests,
+        "root rules must survive compaction on every round"
     );
     assert!(
         context_snapshots > 0,
@@ -9483,6 +9650,8 @@ async fn a_failed_checkpoint_keeps_the_context_unfolded() {
     let runtime = Arc::new(CompactingRuntime {
         responses: Mutex::new(read_rounds(16)),
         saw_breadcrumb: saw_breadcrumb.clone(),
+        rule_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let executor = Executor::new(
@@ -9840,6 +10009,8 @@ async fn a_folds_summarization_is_recorded_as_a_compaction_call() {
     let runtime = Arc::new(CompactingRuntime {
         responses: Mutex::new(VecDeque::from(responses)),
         saw_breadcrumb: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rule_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     let ledger = Arc::new(Mutex::new(Vec::new()));

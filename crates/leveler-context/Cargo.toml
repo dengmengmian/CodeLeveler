@@ -12,6 +12,7 @@ description = "Repository context, project rules, and compaction."
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 leveler-project = { workspace = true }

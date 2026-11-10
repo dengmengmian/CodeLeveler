@@ -141,8 +141,69 @@ pub struct ProjectConfig {
     pub ignore: Vec<String>,
 }
 
-/// The result of reading the rule delivery policy: the policy itself plus why
-/// it could not be read when it could not.
+/// Why the rule delivery policy could not be read. Parse failures are
+/// separate: the file was readable but its content was not valid config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulesPolicyReadFailure {
+    PermissionDenied,
+    IsADirectory,
+    InvalidUtf8,
+    Io,
+}
+
+impl RulesPolicyReadFailure {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "permission_denied",
+            Self::IsADirectory => "not_a_file",
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::Io => "io",
+        }
+    }
+}
+
+impl std::fmt::Display for RulesPolicyReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_key())
+    }
+}
+
+/// A structured reason the rule policy is not in force. `Read` means the file
+/// exists but its bytes could not be obtained; `Parse` means the bytes were
+/// obtained but are not valid config. They are never collapsed into "absent".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RulesPolicyDiagnostic {
+    Read {
+        failure: RulesPolicyReadFailure,
+        detail: String,
+    },
+    Parse {
+        detail: String,
+    },
+}
+
+impl RulesPolicyDiagnostic {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Read { failure, .. } => failure.as_key(),
+            Self::Parse { .. } => "parse",
+        }
+    }
+}
+
+impl std::fmt::Display for RulesPolicyDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { failure, detail } => {
+                write!(f, ".leveler/config.yaml: {failure} ({detail})")
+            }
+            Self::Parse { detail } => write!(f, ".leveler/config.yaml: {detail}"),
+        }
+    }
+}
+
+/// The result of reading the rule delivery policy: the policy itself, whether
+/// the file exists, and why it could not be used when it could not.
 ///
 /// `.leveler/config.yaml` is a whole-project file, so one malformed key
 /// (a `limits:` typo, say) used to make the rule policy vanish in silence. For
@@ -151,7 +212,10 @@ pub struct ProjectConfig {
 /// value.
 pub struct LoadedRulesPolicy {
     pub policy: RulesConfig,
-    pub diagnostic: Option<String>,
+    pub diagnostic: Option<RulesPolicyDiagnostic>,
+    /// The file exists (even if unreadable). Distinguishes "project stated no
+    /// mandatory rules" from "the host cannot know what it stated".
+    pub present: bool,
 }
 
 impl ProjectConfig {
@@ -163,25 +227,67 @@ impl ProjectConfig {
         serde_yaml::from_str(&raw).ok()
     }
 
-    /// The rule delivery policy, with the reason when the file exists but
-    /// cannot be parsed. An absent file is not a diagnostic: a project without
-    /// `.leveler/config.yaml` simply has no mandatory declarations.
+    /// The rule delivery policy, with a structured reason when the file exists
+    /// but cannot be read or parsed. An absent file is not a diagnostic: a
+    /// project without `.leveler/config.yaml` simply has no mandatory
+    /// declarations.
     pub fn load_rules_policy(root: &std::path::Path) -> LoadedRulesPolicy {
         let path = root.join(".leveler/config.yaml");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return LoadedRulesPolicy {
-                policy: RulesConfig::default(),
-                diagnostic: None,
-            };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return LoadedRulesPolicy {
+                    policy: RulesConfig::default(),
+                    diagnostic: None,
+                    present: false,
+                };
+            }
+            Err(error) => {
+                let failure = match error.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        RulesPolicyReadFailure::PermissionDenied
+                    }
+                    std::io::ErrorKind::IsADirectory => RulesPolicyReadFailure::IsADirectory,
+                    _ => RulesPolicyReadFailure::Io,
+                };
+                return LoadedRulesPolicy {
+                    policy: RulesConfig::default(),
+                    diagnostic: Some(RulesPolicyDiagnostic::Read {
+                        failure,
+                        detail: error.to_string(),
+                    }),
+                    present: true,
+                };
+            }
+        };
+        let raw = match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return LoadedRulesPolicy {
+                    policy: RulesConfig::default(),
+                    diagnostic: Some(RulesPolicyDiagnostic::Read {
+                        failure: RulesPolicyReadFailure::InvalidUtf8,
+                        detail: format!(
+                            "invalid UTF-8 at byte {}",
+                            error.utf8_error().valid_up_to()
+                        ),
+                    }),
+                    present: true,
+                };
+            }
         };
         match serde_yaml::from_str::<ProjectConfig>(&raw) {
             Ok(config) => LoadedRulesPolicy {
                 policy: config.rules,
                 diagnostic: None,
+                present: true,
             },
             Err(error) => LoadedRulesPolicy {
                 policy: RulesConfig::default(),
-                diagnostic: Some(format!(".leveler/config.yaml: {error}")),
+                diagnostic: Some(RulesPolicyDiagnostic::Parse {
+                    detail: error.to_string(),
+                }),
+                present: true,
             },
         }
     }
@@ -307,5 +413,93 @@ ignore:
         let yaml = "version: 1\npermissions:\n  allow: [read]\nmodel: x/y\n";
         let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.model.as_deref(), Some("x/y"));
+    }
+
+    fn policy_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-rules-policy-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join(".leveler")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_absent_policy_file_is_not_a_diagnostic() {
+        let dir = policy_dir("absent");
+        let loaded = ProjectConfig::load_rules_policy(&dir);
+        assert!(!loaded.present);
+        assert!(loaded.diagnostic.is_none());
+        assert!(loaded.policy.always_delivered.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_parse_error_is_a_parse_diagnostic_not_a_read_one() {
+        let dir = policy_dir("parse");
+        std::fs::write(dir.join(".leveler/config.yaml"), "rules: [unclosed\n").unwrap();
+        let loaded = ProjectConfig::load_rules_policy(&dir);
+        assert!(loaded.present);
+        assert!(matches!(
+            loaded.diagnostic,
+            Some(RulesPolicyDiagnostic::Parse { .. })
+        ));
+        assert!(loaded.policy.always_delivered.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_utf8_policy_bytes_are_a_read_diagnostic() {
+        let dir = policy_dir("invalid-utf8");
+        std::fs::write(dir.join(".leveler/config.yaml"), [0xff, 0xfe]).unwrap();
+        let loaded = ProjectConfig::load_rules_policy(&dir);
+        assert!(loaded.present);
+        assert!(matches!(
+            loaded.diagnostic,
+            Some(RulesPolicyDiagnostic::Read {
+                failure: RulesPolicyReadFailure::InvalidUtf8,
+                ..
+            })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_policy_is_a_read_diagnostic() {
+        let dir = policy_dir("directory");
+        std::fs::create_dir_all(dir.join(".leveler/config.yaml")).unwrap();
+        let loaded = ProjectConfig::load_rules_policy(&dir);
+        assert!(loaded.present);
+        assert!(matches!(
+            loaded.diagnostic,
+            Some(RulesPolicyDiagnostic::Read { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_policy_file_is_a_read_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = policy_dir("unreadable");
+        let path = dir.join(".leveler/config.yaml");
+        std::fs::write(&path, "rules:\n  budget_bytes: 10\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!("skipping: this process can read mode-000 files (running as root?)");
+            return;
+        }
+        let loaded = ProjectConfig::load_rules_policy(&dir);
+        assert!(loaded.present);
+        assert!(matches!(
+            loaded.diagnostic,
+            Some(RulesPolicyDiagnostic::Read {
+                failure: RulesPolicyReadFailure::PermissionDenied,
+                ..
+            })
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

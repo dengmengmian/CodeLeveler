@@ -410,7 +410,20 @@ fn emit_project_rules(events: &crate::event_bridge::RuntimeEventSender, repo: Op
     let Some(repo) = repo else {
         return;
     };
-    let sources = leveler_context::load_rules(repo)
+    let loaded = leveler_context::load_rules(repo);
+    for error in &loaded.errors {
+        // This channel only names loaded sources to the UI; a failed read is
+        // evidence, not a source, so it goes to the operator log rather than
+        // being counted as a loaded rule.
+        tracing::warn!(
+            event = "project_rule_unreadable",
+            source = %error.source,
+            kind = error.kind.as_key(),
+            detail = %error.detail
+        );
+    }
+    let sources = loaded
+        .documents
         .into_iter()
         .map(|rule| rule.source)
         .collect::<Vec<_>>();
@@ -1048,6 +1061,18 @@ pub(crate) async fn persist_background_task_finished(
         task.log.len().saturating_sub(OUTPUT_TAIL_BYTES),
     );
     let task_id = &task.id;
+    // The start must be durable before the result. A task handed off from a
+    // foreground call can exit before the live start row reaches the log, and
+    // a lifecycle replayed from the log must still pair this result with what
+    // ran, under which call and lifetime. The insert is a no-op when the live
+    // start is already recorded.
+    let start = leveler_engine::EngineEvent::BackgroundTaskStarted {
+        call_id: call_id.clone(),
+        task_id: task.id.clone(),
+        program: task.program.clone(),
+        args: task.args.clone(),
+        lifetime: task.lifetime.as_str().to_string(),
+    };
     let event = leveler_engine::EngineEvent::BackgroundTaskFinished {
         call_id,
         task_id: task_id.clone(),
@@ -1069,18 +1094,28 @@ pub(crate) async fn persist_background_task_finished(
         let db = app.open_database().await?;
         let runtime = app.runtime_id()?;
         let boot = app.boot_id()?;
-        let (_, payload) = event
+        let now = leveler_core::now();
+        let (_, start_payload) = start
             .to_row()
             .map_err(crate::session::app_error_from_engine)?;
-        db.append_background_task_finished(
+        // The start is required before the terminal fact; if it cannot be
+        // written, the finish is not written either and the reconcile path
+        // retries both later. A terminal row without a start would be an
+        // orphan that replay has to guess at.
+        db.append_background_task_started_if_missing(
             &session_id,
             &runtime,
             &boot,
             task_id,
-            &payload,
-            leveler_core::now(),
+            &start_payload,
+            now,
         )
         .await?;
+        let (_, payload) = event
+            .to_row()
+            .map_err(crate::session::app_error_from_engine)?;
+        db.append_background_task_finished(&session_id, &runtime, &boot, task_id, &payload, now)
+            .await?;
         Ok::<_, crate::AppError>(())
     }
     .await;

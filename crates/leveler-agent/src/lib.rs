@@ -36,7 +36,9 @@ pub use executor::{
     SteeringSource, StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy,
     auxiliary_budget_available, closeout,
 };
-pub use injected_tools::{COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL};
+pub use injected_tools::{
+    COMMIT_INVALID_DECLARATION_KIND, COMMIT_REFUSED_KIND, COMMIT_TASK_TOOL, is_commit_refusal_kind,
+};
 pub use leveler_agent_core::{
     BudgetDimension, BudgetExhaustion, DEFAULT_MODEL_STEP_CEILING, ModelStepLimits,
 };

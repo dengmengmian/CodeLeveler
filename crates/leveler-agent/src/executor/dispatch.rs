@@ -79,6 +79,15 @@ pub(crate) struct BackgroundResultFacts {
     pub program: String,
     pub args: Vec<String>,
     pub task_id: String,
+    /// The call that started the task, when the registry retained it. The
+    /// result is attributed to that execution, not to the polling call.
+    pub start_call_id: Option<String>,
+    /// The goal this task was started under. A result owned by another goal is
+    /// not this goal's evidence.
+    pub goal_id: Option<leveler_core::GoalId>,
+    /// The registry's status at observation. Running here means the task's
+    /// direct child already exited while descendants kept the group alive.
+    pub status: Option<leveler_execution::BackgroundTaskStatus>,
     /// The task reached this result: any exit but zero is a failure.
     pub ok: bool,
     pub exit_code: Option<i32>,
@@ -113,6 +122,16 @@ pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFact
                 })
                 .unwrap_or_default(),
             task_id: value.get("task_id")?.as_str()?.to_string(),
+            start_call_id: value
+                .get("origin_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            goal_id: value
+                .get("goal_id")
+                .and_then(|goal| serde_json::from_value(goal.clone()).ok()),
+            status: value
+                .get("status")
+                .and_then(|status| serde_json::from_value(status.clone()).ok()),
             ok: value.get("ok")?.as_bool()?,
             exit_code: value
                 .get("exit_code")
@@ -886,6 +905,9 @@ mod background_result_tests {
                 "program": "cargo",
                 "args": ["test", "--lib"],
                 "task_id": "bg-7",
+                "origin_call_id": "call-start",
+                "goal_id": "goal-9",
+                "status": "Exited",
                 "ok": true,
                 "exit_code": 0
             }
@@ -895,6 +917,18 @@ mod background_result_tests {
         assert_eq!(result.program, "cargo");
         assert_eq!(result.args, vec!["test".to_string(), "--lib".to_string()]);
         assert_eq!(result.task_id, "bg-7");
+        // The result is attributed to the execution that started it, not to
+        // the `wait_task` call that observed it, and it carries the goal and
+        // terminal status the registry recorded.
+        assert_eq!(result.start_call_id.as_deref(), Some("call-start"));
+        assert_eq!(
+            result.goal_id.as_ref().map(leveler_core::GoalId::as_str),
+            Some("goal-9")
+        );
+        assert_eq!(
+            result.status,
+            Some(leveler_execution::BackgroundTaskStatus::Exited)
+        );
         assert!(result.ok);
         assert_eq!(result.exit_code, Some(0));
         // The call itself is still a start: no execution status is invented.
@@ -903,6 +937,29 @@ mod background_result_tests {
             facts.started_task.is_none(),
             "a terminal result is not a pending start"
         );
+    }
+
+    /// The foreground handoff metadata is the engine's only source for the
+    /// durable start row. Without the argv it cannot name what ran, and the
+    /// later terminal fact would have no start to pair with.
+    #[test]
+    fn a_foreground_handoff_carries_a_complete_start() {
+        let metadata = serde_json::json!({
+            "task_id": "host-4",
+            "status": "running",
+            "background": true,
+            "program": "sh",
+            "args": ["-c", "sleep 16"],
+            "lifetime": "goal",
+            "deadline_seconds": 15,
+        });
+        let facts = extract_command_facts(&metadata);
+        let start = facts.started_background.expect("a handoff starts a task");
+        assert_eq!(start.task_id, "host-4");
+        assert_eq!(start.program, "sh");
+        assert_eq!(start.args, vec!["-c".to_string(), "sleep 16".to_string()]);
+        assert_eq!(start.lifetime, "goal");
+        assert!(facts.background_result.is_none());
     }
 
     /// A start reports the task id and nothing else: no exit, no status. The id

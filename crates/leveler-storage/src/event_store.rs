@@ -232,7 +232,61 @@ impl Database {
         payload: &str,
         now: Timestamp,
     ) -> Result<(), StorageError> {
-        let event_type = "background_task_finished";
+        self.append_out_of_turn_task_fact(
+            session_id,
+            runtime,
+            boot,
+            "background_task_finished",
+            task_id,
+            payload,
+            now,
+        )
+        .await
+    }
+
+    /// Ensure a background task's durable START exists before its terminal
+    /// fact.
+    ///
+    /// The live start row is written while the starting turn is open. A task
+    /// handed off from a foreground call can exit before that row reaches the
+    /// log, so the terminal writer also ensures the start exists: a lifecycle
+    /// replayed from the log must pair every result with what ran. The insert
+    /// is fenced by the same authority as the terminal fact and is a no-op
+    /// when a start for this task id is already recorded.
+    pub async fn append_background_task_started_if_missing(
+        &self,
+        session_id: &SessionId,
+        runtime: &leveler_core::RuntimeId,
+        boot: &leveler_core::BootId,
+        task_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        self.append_out_of_turn_task_fact(
+            session_id,
+            runtime,
+            boot,
+            "background_task_started",
+            task_id,
+            payload,
+            now,
+        )
+        .await
+    }
+
+    /// One fenced, idempotent out-of-turn insert keyed by `(type, task_id)`.
+    /// Both background lifecycle facts share the authority check: only the
+    /// owning boot, or an idle session, may extend its canonical log.
+    async fn append_out_of_turn_task_fact(
+        &self,
+        session_id: &SessionId,
+        runtime: &leveler_core::RuntimeId,
+        boot: &leveler_core::BootId,
+        event_type: &str,
+        task_id: &str,
+        payload: &str,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
         let payload = redact_validated(event_type, payload, session_id)?;
         let created_at = now.to_rfc3339();
         // Enough for every concurrent writer on this session to land once.

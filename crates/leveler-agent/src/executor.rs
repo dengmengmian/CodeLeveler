@@ -61,6 +61,44 @@ struct SelectedSkills {
     text: String,
 }
 
+/// Project rules as selected for one turn. Loaded once when the turn's control
+/// context is built, then reused for every round, so a rule edit takes effect
+/// on the NEXT turn and the cached request prefix stays stable. The audit is
+/// the durable record of what this selection read and delivered.
+struct RuleTurnContext {
+    documents: Vec<leveler_context::ProjectInstruction>,
+    diagnostics: Vec<String>,
+    audit: leveler_context::RuleDeliveryAudit,
+}
+
+fn policy_read_error(
+    diagnostic: &leveler_project::RulesPolicyDiagnostic,
+) -> leveler_context::RuleReadError {
+    use leveler_project::{RulesPolicyDiagnostic, RulesPolicyReadFailure};
+    match diagnostic {
+        RulesPolicyDiagnostic::Read { failure, detail } => {
+            let kind = match failure {
+                RulesPolicyReadFailure::PermissionDenied => {
+                    leveler_context::RuleReadErrorKind::PermissionDenied
+                }
+                RulesPolicyReadFailure::IsADirectory => {
+                    leveler_context::RuleReadErrorKind::NotAFile
+                }
+                RulesPolicyReadFailure::InvalidUtf8 => {
+                    leveler_context::RuleReadErrorKind::InvalidUtf8
+                }
+                RulesPolicyReadFailure::Io => leveler_context::RuleReadErrorKind::Io,
+            };
+            leveler_context::RuleReadError::new(".leveler/config.yaml", kind, detail.clone())
+        }
+        RulesPolicyDiagnostic::Parse { detail } => leveler_context::RuleReadError::new(
+            ".leveler/config.yaml",
+            leveler_context::RuleReadErrorKind::Parse,
+            detail.clone(),
+        ),
+    }
+}
+
 /// Events emitted as the loop progresses, for the CLI to render.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -80,6 +118,12 @@ pub enum AgentEvent {
     /// output or at message completion. `elapsed_ms` is the kernel's own
     /// measurement. A segment that never receives this was interrupted.
     ReasoningCompleted { elapsed_ms: u64 },
+    /// The turn's project-rule selection, read once at turn start. Durable
+    /// evidence of which sources were read, their content identity and the
+    /// delivery outcome; not a receipt from the provider.
+    RuleDelivery {
+        audit: leveler_context::RuleDeliveryAudit,
+    },
     /// The model produced assistant text this round (the whole message; also
     /// marks the end of any streamed deltas for the round). `reasoning`
     /// carries the round's displayable reasoning segments, each with the
@@ -1435,6 +1479,9 @@ pub struct Executor {
     steering: Option<Arc<dyn SteeringSource>>,
     /// Durable identity of the input this turn was promoted from.
     seed_input_id: Option<String>,
+    /// Durable identity of this turn, when the host owns one. Stamped into
+    /// the rule-delivery audit so an event can be joined to its turn.
+    turn_id: Option<leveler_core::TurnId>,
     runtime: Arc<dyn ModelRuntime>,
     registry: Arc<ToolRegistry>,
     /// Tools that became available after this turn's surface was composed (an
@@ -1617,6 +1664,7 @@ impl Executor {
             policy: TurnPolicy::default(),
             steering: None,
             seed_input_id: None,
+            turn_id: None,
             depth: 0,
             agent_role: AgentRole::Default,
             write_allowlist: None,
@@ -2205,6 +2253,9 @@ impl Executor {
             // top-level turn the user is watching.
             steering: None,
             seed_input_id: None,
+            // A child's rule audit is not part of the durable turn record;
+            // only the top-level turn emits the one audit for its request.
+            turn_id: None,
             policy: TurnPolicy {
                 // Loop shape comes from the role's resolved policy…
                 max_parallel_tools: child_policy.max_parallel_tools,
@@ -2429,6 +2480,12 @@ impl Executor {
         self
     }
 
+    /// Stamp the durable turn identity into this turn's rule-delivery audit.
+    pub fn with_turn_id(mut self, turn_id: leveler_core::TurnId) -> Self {
+        self.turn_id = Some(turn_id);
+        self
+    }
+
     /// Replace the entire turn policy (minimal direct mode / custom hosts).
     /// Prefer the narrow builders unless a host really owns the whole policy.
     pub fn with_turn_policy(mut self, policy: TurnPolicy) -> Self {
@@ -2445,63 +2502,130 @@ impl Executor {
             .collect()
     }
 
+    #[cfg(test)]
     fn system_segments(&self, request: &str) -> Vec<PromptSegment> {
+        let rules = self.rule_turn_context();
+        self.system_segments_with(request, Some(&rules))
+    }
+
+    /// Read and select this turn's project rules. Called ONCE per turn when the
+    /// control context is built; capability refreshes reuse the existing
+    /// blocks instead of re-reading, so a mid-turn edit cannot change the
+    /// cached prefix under the model.
+    fn rule_turn_context(&self) -> RuleTurnContext {
         let root = self
             .tool_context
             .execution
             .workspace
             .as_ref()
             .map(|workspace| workspace.root());
+        let Some(root) = root else {
+            return RuleTurnContext {
+                documents: Vec::new(),
+                diagnostics: Vec::new(),
+                audit: leveler_context::RuleDeliveryAudit::default(),
+            };
+        };
         // The delivery policy is project data read from the same
         // `.leveler/config.yaml` the rest of the runtime reads. Composing it
         // here keeps the selection next to the rules it selects, and keeps a
         // model from ever being the thing that decides which rules matter.
-        let loaded = root.map(leveler_project::ProjectConfig::load_rules_policy);
-        let policy = loaded
+        let loaded = leveler_project::ProjectConfig::load_rules_policy(root);
+        let policy = leveler_context::RuleDeliveryPolicy {
+            always: loaded.policy.always_delivered.clone(),
+            budget_bytes: loaded.policy.budget_bytes,
+        };
+        let mut diagnostics = Vec::new();
+        let policy_audit = leveler_context::RulePolicyAudit {
+            source: if loaded.present {
+                leveler_context::RulePolicySource::ProjectConfig
+            } else {
+                leveler_context::RulePolicySource::Default
+            },
+            error: loaded.diagnostic.as_ref().map(policy_read_error),
+        };
+        if let Some(diagnostic) = &loaded.diagnostic {
+            // A `.leveler/config.yaml` that cannot be read or parsed used to
+            // fall back to "no mandatory rules, default budget" in silence,
+            // which turns pinned authority into prose that may be omitted. The
+            // model is told; the operator sees a warning.
+            tracing::warn!(
+                event = "rule_policy_unreadable",
+                kind = diagnostic.kind(),
+                %diagnostic
+            );
+            diagnostics.push(format!(
+                "The project's rule delivery policy could not be read or parsed ({diagnostic}); \
+                 no section is treated as mandatory this turn."
+            ));
+        }
+        let plan = leveler_context::plan_rule_delivery(root, &policy);
+        let report = &plan.report;
+        tracing::info!(
+            event = "rule_delivery",
+            budget_bytes = report.budget_bytes,
+            mandatory_bytes = report.mandatory_bytes,
+            optional_bytes = report.optional_bytes,
+            index_bytes = report.index_bytes,
+            sections_delivered = report.delivered_sections.len(),
+            sections_omitted = report.omitted_sections.len(),
+            mandatory_undelivered = report.undelivered_mandatory.len(),
+            mandatory_unmatched = report.unmatched_mandatory.len(),
+            read_errors = report.read_errors.len(),
+            sources = ?plan.documents.iter().map(|rule| rule.source.as_str()).collect::<Vec<_>>(),
+            "project rule delivery"
+        );
+        for entry in &report.unmatched_mandatory {
+            tracing::warn!(event = "mandatory_rule_unmatched", entry = %entry);
+        }
+        for error in &report.read_errors {
+            // The source is workspace-relative and the detail carries no
+            // document body, so this is safe in an ordinary log.
+            tracing::warn!(
+                event = "rule_source_unreadable",
+                source = %error.source,
+                kind = error.kind.as_key(),
+                detail = %error.detail
+            );
+            diagnostics.push(format!(
+                "The project rule source `{}` could not be loaded ({}: {}). Its rules are NOT \
+                 in your context; do not treat this as an empty rule set.",
+                error.source,
+                error.kind.as_key(),
+                error.detail
+            ));
+        }
+        let audit = leveler_context::RuleDeliveryAudit {
+            workspace: Some(root.to_string_lossy().into_owned()),
+            turn_id: self.turn_id.as_ref().map(ToString::to_string),
+            policy: policy_audit,
+            sources: plan.sources,
+            report: plan.report,
+        };
+        RuleTurnContext {
+            documents: plan.documents,
+            diagnostics,
+            audit,
+        }
+    }
+
+    /// Compose the control segments. `rules` is the turn-start selection;
+    /// `None` means "do not read rules again" (capability refresh), not "the
+    /// project has no rules".
+    fn system_segments_with(
+        &self,
+        request: &str,
+        rules: Option<&RuleTurnContext>,
+    ) -> Vec<PromptSegment> {
+        let root = self
+            .tool_context
+            .execution
+            .workspace
             .as_ref()
-            .map(|loaded| leveler_context::RuleDeliveryPolicy {
-                always: loaded.policy.always_delivered.clone(),
-                budget_bytes: loaded.policy.budget_bytes,
-            })
-            .unwrap_or_default();
-        let mut rule_diagnostics = Vec::new();
-        let project_rules = match root {
-            Some(root) => {
-                if let Some(diagnostic) =
-                    loaded.as_ref().and_then(|loaded| loaded.diagnostic.clone())
-                {
-                    // A `.leveler/config.yaml` that cannot be parsed used to
-                    // fall back to "no mandatory rules, default budget" in
-                    // silence, which turns pinned authority into prose that
-                    // may be omitted. The model is told; the operator sees a
-                    // warning.
-                    tracing::warn!(event = "rule_policy_unreadable", %diagnostic);
-                    rule_diagnostics.push(format!(
-                        "The project's rule delivery policy could not be read ({diagnostic}); \
-                         no section is treated as mandatory this turn."
-                    ));
-                }
-                let plan = leveler_context::plan_rule_delivery(root, &policy);
-                let report = &plan.report;
-                tracing::info!(
-                    event = "rule_delivery",
-                    budget_bytes = report.budget_bytes,
-                    mandatory_bytes = report.mandatory_bytes,
-                    optional_bytes = report.optional_bytes,
-                    index_bytes = report.index_bytes,
-                    sections_delivered = report.sections_delivered,
-                    sections_omitted = report.sections_omitted,
-                    mandatory_undelivered = report.undelivered_mandatory.len(),
-                    mandatory_unmatched = report.unmatched_mandatory.len(),
-                    sources = ?plan.documents.iter().map(|rule| rule.source.as_str()).collect::<Vec<_>>(),
-                    "project rule delivery"
-                );
-                for entry in &report.unmatched_mandatory {
-                    tracing::warn!(event = "mandatory_rule_unmatched", entry = %entry);
-                }
-                plan.documents
-            }
-            None => Vec::new(),
+            .map(|workspace| workspace.root());
+        let (project_rules, rule_diagnostics) = match rules {
+            Some(rules) => (rules.documents.clone(), rules.diagnostics.clone()),
+            None => (Vec::new(), Vec::new()),
         };
         let mut segments = PromptBuilder::new()
             .optional_guidance(
@@ -2631,7 +2755,22 @@ impl Executor {
         procedure_request: &str,
         continuing: bool,
     ) -> ControlContext {
-        self.turn_control_context_inner(request, procedure_request, continuing)
+        let rules = self.rule_turn_context();
+        self.turn_control_context_inner(request, procedure_request, continuing, Some(&rules))
+    }
+
+    /// Build the turn control once and hand back the rule-delivery audit for
+    /// the durable event. Rule loading stays here, at turn start.
+    fn turn_control_context_with_rules(
+        &self,
+        request: &str,
+        procedure_request: &str,
+        continuing: bool,
+    ) -> (ControlContext, leveler_context::RuleDeliveryAudit) {
+        let rules = self.rule_turn_context();
+        let control =
+            self.turn_control_context_inner(request, procedure_request, continuing, Some(&rules));
+        (control, rules.audit)
     }
 
     pub(crate) fn measurement_control_context(
@@ -2640,7 +2779,7 @@ impl Executor {
         procedure_request: &str,
         continuing: bool,
     ) -> ControlContext {
-        self.turn_control_context_inner(request, procedure_request, continuing)
+        self.turn_control_context(request, procedure_request, continuing)
     }
 
     fn turn_control_context_inner(
@@ -2648,8 +2787,9 @@ impl Executor {
         request: &str,
         procedure_request: &str,
         continuing: bool,
+        rules: Option<&RuleTurnContext>,
     ) -> ControlContext {
-        let mut blocks = self.system_segments(request);
+        let mut blocks = self.system_segments_with(request, rules);
         if let Some(selected) = self.skill_turn_injection(procedure_request) {
             blocks.push(PromptSegment::control(
                 "selected_skills",
@@ -2956,7 +3096,7 @@ impl Executor {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, DriveAborted> {
         let request = text_of(&content);
-        let control = self.turn_control_context(&request, &request, false);
+        let (control, rule_audit) = self.turn_control_context_with_rules(&request, &request, false);
         // depth 0 is a person. A child task is the parent agent's text.
         let origin = if self.depth == 0 {
             TranscriptOrigin::UserInput
@@ -2967,6 +3107,7 @@ impl Executor {
         };
         let seed = vec![Message::from_parts(Role::User, content, Some(origin))];
         self.append_seed(sink, &seed[0]).await?;
+        observer(AgentEvent::RuleDelivery { audit: rule_audit });
         let mut facts = AbortedFacts::default();
         self.drive(
             seed,
@@ -3097,7 +3238,8 @@ impl Executor {
         // Persist only the new user message; prior + system are not re-stored.
         self.append_seed(sink, &user).await?;
 
-        let control = self.turn_control_context(&request, &request, false);
+        let (control, rule_audit) = self.turn_control_context_with_rules(&request, &request, false);
+        observer(AgentEvent::RuleDelivery { audit: rule_audit });
         let mut seed = prior;
         seed.push(user);
         let mut facts = AbortedFacts::default();
@@ -3161,7 +3303,9 @@ impl Executor {
             .or_else(|| objective.amendments.last().map(String::as_str))
             .unwrap_or(&objective.text);
         let procedure_request = format!("{}\n{request}", objective.text);
-        let control = self.turn_control_context(request, &procedure_request, true);
+        let (control, rule_audit) =
+            self.turn_control_context_with_rules(request, &procedure_request, true);
+        observer(AgentEvent::RuleDelivery { audit: rule_audit });
         self.drive(
             prior,
             control,

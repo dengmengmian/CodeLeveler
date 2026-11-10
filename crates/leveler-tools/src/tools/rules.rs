@@ -18,7 +18,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_context::{READ_PROJECT_RULES_TOOL, load_rules, read_rule_source, split_rule_sections};
+use leveler_context::{
+    READ_PROJECT_RULES_TOOL, RuleReadErrorKind, RuleSourceRead, load_rules, read_rule_source,
+    split_rule_sections,
+};
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -80,16 +83,44 @@ impl Tool for ReadProjectRulesTool {
                     "`section` needs a `source`; call with no arguments to list sources.",
                 ));
             }
-            if rules.is_empty() {
-                return Ok(ToolOutput::ok("No project rules are configured."));
+            if rules.documents.is_empty() {
+                if rules.errors.is_empty() {
+                    return Ok(ToolOutput::ok("No project rules are configured."));
+                }
+                // Existing-but-unreadable is not "none configured": saying so
+                // would turn a host failure into a false claim about the
+                // project.
+                let mut listing = String::from(
+                    "No project rules could be read. The following sources exist but failed:\n",
+                );
+                for error in &rules.errors {
+                    listing.push_str(&format!(
+                        "  {}: {} ({})\n",
+                        error.source,
+                        error.kind.as_key(),
+                        error.detail
+                    ));
+                }
+                return Ok(ToolOutput::error(listing));
             }
             let mut listing = String::from("Project rules available:\n");
-            for instruction in &rules {
+            for instruction in &rules.documents {
                 listing.push_str(&format!("\n=== {} ===\n", instruction.source));
                 for section in split_rule_sections(&instruction.content) {
                     listing.push_str(&format!(
                         "  [{}] {} ({} bytes)\n",
                         section.id, section.heading, section.bytes
+                    ));
+                }
+            }
+            if !rules.errors.is_empty() {
+                listing.push_str("\nSources that could not be read:\n");
+                for error in &rules.errors {
+                    listing.push_str(&format!(
+                        "  {}: {} ({})\n",
+                        error.source,
+                        error.kind.as_key(),
+                        error.detail
                     ));
                 }
             }
@@ -100,17 +131,41 @@ impl Tool for ReadProjectRulesTool {
         // uses, and a nested one (`src/AGENTS.md`) is read through the same
         // `read_rule_source` the scoped loader uses. The two can never return
         // different bytes for the same file.
-        let instruction = rules
+        let instruction = match rules
+            .documents
             .iter()
             .find(|rule| rule.source == source)
             .cloned()
-            .or_else(|| read_rule_source(root, source));
-        let Some(instruction) = instruction else {
-            return Ok(ToolOutput::error(format!(
-                "`{source}` is not a project-rule document. Rule documents are \
-                 `AGENTS.md` in any directory, `.leveler/instructions.md` and \
-                 `.leveler/rules/*.md`; call with no arguments to list the root ones."
-            )));
+            .map(|rule| Ok(RuleSourceRead::Loaded(rule)))
+            .unwrap_or_else(|| read_rule_source(root, source))
+        {
+            Ok(RuleSourceRead::Loaded(instruction)) => instruction,
+            Ok(RuleSourceRead::Empty) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{source}` exists but contains no rule text."
+                )));
+            }
+            Ok(RuleSourceRead::Absent) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{source}` does not exist. Rule documents are `AGENTS.md` in any directory, \
+                     `.leveler/instructions.md` and `.leveler/rules/*.md`; call with no arguments \
+                     to list the root ones."
+                )));
+            }
+            Err(error) if error.kind == RuleReadErrorKind::NotARuleDocument => {
+                return Ok(ToolOutput::error(format!(
+                    "`{source}` is not a project-rule document. Rule documents are `AGENTS.md` \
+                     in any directory, `.leveler/instructions.md` and `.leveler/rules/*.md`; \
+                     call with no arguments to list the root ones."
+                )));
+            }
+            Err(error) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{source}` could not be read ({}): {}",
+                    error.kind.as_key(),
+                    error.detail
+                )));
+            }
         };
         let sections = split_rule_sections(&instruction.content);
         let Some(section_id) = input.section.as_deref() else {
@@ -254,10 +309,39 @@ mod tests {
             .unwrap();
         assert!(!section.is_error);
         let loaded = leveler_context::scoped_rule_sources(dir.path(), &["src/lib.rs".to_string()]);
-        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.documents.len(), 1);
         assert!(
-            section.content.contains(loaded[0].content.trim()),
+            section.content.contains(loaded.documents[0].content.trim()),
             "the tool and the injector must return the same bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_source_is_not_reported_as_absent() {
+        let (dir, ctx) = workspace();
+        std::fs::write(dir.path().join("AGENTS.md"), [0xff, 0xfe]).unwrap();
+        let bare = ReadProjectRulesTool
+            .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(bare.is_error, "{}", bare.content);
+        assert!(bare.content.contains("invalid_utf8"), "{}", bare.content);
+        assert!(!bare.content.contains("No project rules are configured"));
+
+        let named = ReadProjectRulesTool
+            .execute(
+                serde_json::json!({"source": "AGENTS.md"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(named.is_error);
+        assert!(
+            named.content.contains("could not be read"),
+            "{}",
+            named.content
+        );
+        assert!(named.content.contains("invalid_utf8"), "{}", named.content);
     }
 }
