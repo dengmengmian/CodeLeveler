@@ -731,6 +731,19 @@ pub struct ProjectInstruction {
     pub content: String,
 }
 
+/// A rule source identity as it is delivered: workspace-relative and joined
+/// with `/` on every host. A source is a wire value (prompt provenance,
+/// delivery audit, tool results), not a native path, so the same rule must
+/// have the same identity everywhere.
+fn workspace_relative_identity(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
+}
+
 /// Every root rule document under `root`, in priority order.
 ///
 /// An absent optional document is normal; a document that exists but cannot be
@@ -799,17 +812,15 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
                         let Some(rel) = path
                             .strip_prefix(&canonical_root)
                             .ok()
-                            .and_then(|rel| rel.to_str())
-                            .map(str::to_string)
+                            .and_then(|rel| rel.to_str().map(|_| workspace_relative_identity(rel)))
                         else {
                             // The failure is diagnosable without logging the
                             // absolute location: the source stays workspace-
                             // relative like every other rule source.
                             let source = path
                                 .strip_prefix(&canonical_root)
-                                .unwrap_or(&path)
-                                .to_string_lossy()
-                                .into_owned();
+                                .map(workspace_relative_identity)
+                                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
                             out.errors.push(RuleReadError::new(
                                 source,
                                 RuleReadErrorKind::InvalidUtf8,
@@ -1059,7 +1070,7 @@ fn scoped_document_paths(path: &str, is_dir: bool) -> Vec<String> {
 
     ancestors
         .into_iter()
-        .map(|ancestor| format!("{}/AGENTS.md", ancestor.display()))
+        .map(|ancestor| format!("{}/AGENTS.md", workspace_relative_identity(&ancestor)))
         .collect()
 }
 
