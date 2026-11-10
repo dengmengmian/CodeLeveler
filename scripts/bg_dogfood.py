@@ -37,6 +37,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -268,6 +269,50 @@ def wait_for(fn, timeout=30.0, interval=0.25):
     return fn()
 
 
+TASK_ID_LINE = re.compile(r"task_id: ((?:bg-[0-9a-f-]+-\d+)|(?:host-[0-9a-f]+))")
+ORDINAL_TASK_ID = re.compile(r"bg-(\d+)")
+
+
+def resolve_ordinal_task_ids(body: str, frames: list[str]) -> list[str]:
+    """Replace the script's `bg-1`, `bg-2`, ... placeholders with the ids the
+    runtime actually issued, in start order.
+
+    Task ids are runtime-owned: a local background task is `bg-<instance>-<n>`,
+    a hosted one is `host-<id>`. A real model reads the id from the tool result
+    before calling `wait_task`/`kill_task`. The scripted model reads the same
+    ids from the request body that carries those tool results, so the fixture
+    cannot drift from the id format.
+    """
+    ids = list(dict.fromkeys(TASK_ID_LINE.findall(body)))
+    if not ids:
+        return frames
+    resolved = []
+    for frame in frames:
+        try:
+            value = json.loads(frame)
+        except Exception:
+            resolved.append(frame)
+            continue
+        changed = False
+        for choice in value.get("choices", []):
+            for call in choice.get("delta", {}).get("tool_calls", []) or []:
+                raw = call.get("function", {}).get("arguments")
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    arguments = json.loads(raw)
+                except Exception:
+                    continue
+                task_id = arguments.get("task_id")
+                ordinal = ORDINAL_TASK_ID.fullmatch(task_id) if isinstance(task_id, str) else None
+                if ordinal and 1 <= int(ordinal.group(1)) <= len(ids):
+                    arguments["task_id"] = ids[int(ordinal.group(1)) - 1]
+                    call["function"]["arguments"] = json.dumps(arguments)
+                    changed = True
+        resolved.append(json.dumps(value) if changed else frame)
+    return resolved
+
+
 class Layer:
     def __init__(self, provider: str, mock):
         self.provider = provider
@@ -283,6 +328,7 @@ class Layer:
         self.mock.turns = list(turns)
         self.mock.calls = 0
         self.mock.requests = []
+        self.mock.transform = resolve_ordinal_task_ids
 
     def env(self):
         env = H.make_env(self.provider, self.mock)
@@ -1461,11 +1507,8 @@ def scenario_evidence_recovery(report: H.Report, layer: Layer):
             bool(delivered),
             repr(delivered)[:400],
         )
-        settled = H.wait_until(
-            pty_, lambda s: "✓ 任务已完成" in s or "目标已完成" in s, timeout=120
-        )
-        report.dump("evidence-2-recovered", pty_)
         states = settled_goal_states(env.home, timeout=60)
+        report.dump("evidence-2-recovered", pty_)
         report.check(
             "bg-evidence",
             "GR-10 the corrected completion is accepted",
@@ -1474,11 +1517,28 @@ def scenario_evidence_recovery(report: H.Report, layer: Layer):
             and [row[1] for row in session_rows(env.home)] == ["completed"],
             repr((states, session_rows(env.home))),
         )
+        # The recovery is the model's own second `update_goal` in the SAME
+        # turn. Assert the durable turn fact, not a screen phrase: the row's
+        # wording (and whether it is still in the viewport) is presentation.
+        turns = [
+            (kind, json.loads(payload))
+            for kind, payload in query(
+                env.home,
+                "select type, payload from events where type in "
+                "('turn_started','turn_finished') order by sequence",
+            )
+        ]
+        finished = [value.get("payload", value) for kind, value in turns if kind == "turn_finished"]
+        same_turn = (
+            sum(1 for kind, _ in turns if kind == "turn_started") == 1
+            and len(finished) == 1
+            and finished[0].get("stop") == "completed"
+        )
         report.check(
             "bg-evidence",
             "GR-07 the recovery round happened inside the same turn",
-            settled,
-            pty_.screen.text()[-700:],
+            same_turn,
+            repr(turns)[:700],
         )
         goals = query(env.home, "select count(*) from goals")
         report.check(
