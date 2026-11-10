@@ -187,7 +187,7 @@
       }
     },
     {
-      "description": "Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn.\n\nThe client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message.\n\n`content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it.",
+      "description": "Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn.\n\nThis is an EXPLICIT client command: the user chose to resume, so the client does not need to classify their words. The runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message.\n\n`content` is the user's own text, preserved alongside the original objective and added to it, never replacing it.",
       "type": "object",
       "required": [
         "content",

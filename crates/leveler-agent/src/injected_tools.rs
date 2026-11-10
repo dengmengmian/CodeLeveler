@@ -537,13 +537,12 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             (3) finishing it needs several steps, tracking or acceptance, so a stage summary \
             would not prove it done — or the user said to finish everything before stopping. \
             Call it even when you expect to finish this turn: the commitment is what keeps it \
-            alive if the work outlasts it, and call it instead of summarizing when requested \
-            work is still unfinished. Do NOT call it for a question, an explanation, a status \
+            alive if the work outlasts it. Do NOT call it for a question, an explanation, a status \
             or verification check, a discussion, a single small fix, or when the user asked you \
             not to modify anything. If you are unsure whether this is execution work, do not \
-            call it. `objective` is the user's stated end state, not a narrower version of it \
-            and never an enlargement of it; when the user's message itself is non-empty the \
-            runtime records that message as the durable objective, so `objective` is unused. \
+            call it. `objective` is the user's stated end state, neither narrower nor larger; \
+            when the user's message itself is non-empty the runtime records it as the durable \
+            objective, so `objective` is unused. \
             `acceptance` lists the concrete checks that will prove it. If the user stated \
             explicit deliverables or constraints, declare them in `requirements`, one entry \
             each, with a verbatim `source_quote` from the user's message: that structured set \

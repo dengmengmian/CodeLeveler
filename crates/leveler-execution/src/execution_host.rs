@@ -10,6 +10,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -864,6 +865,70 @@ fn active_intents(state_dir: &Path) -> Result<Vec<SpawnIntent>, String> {
     }
 }
 
+/// Bytes of a failed host's stderr retained for the readiness diagnostic.
+const STDERR_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+
+/// Drain a child host's stderr on its own thread.
+///
+/// The host reports through tracing on stderr; an undrained pipe would block
+/// it once the pipe buffer filled. Every byte is consumed, while the retained
+/// diagnostic keeps only a bounded tail.
+fn capture_child_stderr(
+    child: &mut std::process::Child,
+) -> (
+    Arc<std::sync::Mutex<Vec<u8>>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (done, finished) = std::sync::mpsc::channel();
+    let Some(mut pipe) = child.stderr.take() else {
+        return (captured, finished);
+    };
+    let sink = Arc::clone(&captured);
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    sink.extend_from_slice(&buffer[..count]);
+                    let excess = sink.len().saturating_sub(STDERR_DIAGNOSTIC_LIMIT);
+                    if excess > 0 {
+                        sink.drain(..excess);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = done.send(());
+    });
+    (captured, finished)
+}
+
+/// The readiness error plus the host's own last words.
+///
+/// The wait is diagnostic, not lifecycle: a descendant that inherited the
+/// stderr pipe must not hold the start failure open.
+fn readiness_failure(
+    reason: String,
+    captured: &Arc<std::sync::Mutex<Vec<u8>>>,
+    finished: &std::sync::mpsc::Receiver<()>,
+) -> String {
+    let _ = finished.recv_timeout(Duration::from_secs(2));
+    let captured = captured
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stderr = String::from_utf8_lossy(&captured);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        reason
+    } else {
+        format!("{reason}; stderr: {stderr}")
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionHostClient {
     config: ExecutionHostConfig,
@@ -1052,7 +1117,7 @@ impl ExecutionHostClient {
             .arg(&config.repo_root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -1066,6 +1131,7 @@ impl ExecutionHostClient {
         let mut child = command
             .spawn()
             .map_err(|e| format!("could not launch Execution Host: {e}"))?;
+        let (stderr_tail, stderr_done) = capture_child_stderr(&mut child);
         // A cold host on a loaded runner (a CI shard starting several real
         // runtimes) can need more than ten seconds to bind and answer. The
         // wait only delays the visible fallback when the host is genuinely
@@ -1080,12 +1146,20 @@ impl ExecutionHostClient {
                 return Ok(c);
             }
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                return Err(format!("Execution Host exited before readiness: {status}"));
+                return Err(readiness_failure(
+                    format!("Execution Host exited before readiness: {status}"),
+                    &stderr_tail,
+                    &stderr_done,
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Execution Host readiness timed out".into());
+                return Err(readiness_failure(
+                    "Execution Host readiness timed out".into(),
+                    &stderr_tail,
+                    &stderr_done,
+                ));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -3239,6 +3313,44 @@ mod tests {
         );
         generation.kill_owned(&id, "session-1").await.unwrap();
         server.abort();
+    }
+
+    /// A host that dies before readiness is otherwise invisible: its stderr
+    /// was sent to the null device, so the failure named only an exit status.
+    /// The diagnostic must carry the host's own last words.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_failure_reports_the_host_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let executable = root.path().join("fake-host");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'refusing to start: state directory is not writable' >&2\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo,
+            executable,
+        };
+
+        let error = match ExecutionHostClient::ensure(config).await {
+            Ok(_) => panic!("a host that exits before readiness must not be adopted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("exited before readiness"),
+            "the readiness failure keeps its own identity: {error}"
+        );
+        assert!(
+            error.contains("refusing to start: state directory is not writable"),
+            "the host's stderr is the evidence: {error}"
+        );
     }
 
     #[cfg(unix)]

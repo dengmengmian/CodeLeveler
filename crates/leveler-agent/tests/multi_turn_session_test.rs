@@ -505,10 +505,19 @@ async fn resume_after_chat_provider_failure_keeps_chat_objective_not_old_running
     let continuation =
         leveler_engine::decode_turn_continuation(turns.last().unwrap().payload.as_deref().unwrap())
             .unwrap();
+    assert!(
+        continuation
+            .objective
+            .text()
+            .starts_with("ARK_CHAT_OBJECTIVE_MARKER: configure Ark image support"),
+        "the host-pinned active objective must come from the interrupted Chat turn: {}",
+        continuation.objective.text()
+    );
     assert_eq!(
-        continuation.objective.text(),
-        "ARK_CHAT_OBJECTIVE_MARKER: configure Ark image support",
-        "the host-pinned active objective must come from the interrupted Chat turn"
+        continuation.objective.latest_instruction(),
+        "继续",
+        "the continuation message is recorded as the newest user instruction, \
+         not as a replacement objective"
     );
 }
 

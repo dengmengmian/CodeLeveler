@@ -389,23 +389,53 @@ export function attachmentSubmissionError(attachments){return attachments.some(r
  * no longer holds settles from its record and is never silently kept as
  * running. A row with no record at all cannot prove any outcome, so it becomes
  * unknown rather than either running or completed.
+ *
+ * A cold start has no prior rows. Durable Lost/Unknown outcomes are still
+ * restored, because hiding work whose result cannot be proven is as false as
+ * showing it as running; completed history is not resurrected.
  */
 export function reconcileBackgroundJobs({active=[],prior=[],records=[],settled=[]}={}){
-  const activeJobs=[...active];
-  const activeIds=new Set(activeJobs.map(job=>job.task_id));
+  const activeJobs=[];
+  const activeIds=new Set();
   const settledJobs=[...settled];
   const settledIds=new Set(settledJobs.map(job=>job.task_id));
   const byId=new Map((records??[]).map(record=>[record.task_id,record]));
+  for(const job of active??[]){
+    // The durable record is the authority even while the registry still lists
+    // the task: an outcome that is already lost or unknown cannot be shown as
+    // this client's live work.
+    const record=byId.get(job.task_id);
+    if(record&&record.state!=='running'){
+      settledJobs.push({...job,...settledBackgroundRow(job,record)});
+      settledIds.add(job.task_id);
+      continue;
+    }
+    activeJobs.push(job);
+    activeIds.add(job.task_id);
+  }
   for(const job of prior??[]){
     if(activeIds.has(job.task_id)||settledIds.has(job.task_id))continue;
     const record=byId.get(job.task_id);
     // The durable record still says the live registry holds this task: its
     // absence from the blocker list is not proof of termination.
-    if(record?.state==='running'){activeJobs.push(job);continue;}
+    if(record?.state==='running'){activeJobs.push(job);activeIds.add(job.task_id);continue;}
     settledJobs.push({...job,...settledBackgroundRow(job,record)});
     settledIds.add(job.task_id);
   }
-  return {backgroundTasks:activeJobs,settledBackgroundTasks:settledJobs.slice(-20)};
+  // Restore the records no client row covered. The runtime's durable log is
+  // the only evidence a newly opened window has, and an unprovable outcome
+  // must remain visible as such.
+  const restored=[];
+  for(const record of records??[]){
+    if(!['lost','unknown'].includes(record?.state))continue;
+    if(activeIds.has(record.task_id)||settledIds.has(record.task_id))continue;
+    const job={task_id:record.task_id,program:record.program,args:record.args,output:record.output};
+    restored.push({...job,...settledBackgroundRow(job,record)});
+    settledIds.add(record.task_id);
+  }
+  // Record order is start order, so older history precedes rows this client
+  // settled after the snapshot.
+  return {backgroundTasks:activeJobs,settledBackgroundTasks:[...restored,...settledJobs].slice(-20)};
 }
 
 function settledBackgroundRow(job,record){
@@ -425,6 +455,22 @@ function settledBackgroundRow(job,record){
     duration_ms:duration,
     stopped,
   };
+}
+
+/**
+ * Wording and tone for a settled background row. A row whose outcome cannot be
+ * proven keeps its own words and a warning tone; only a recorded failure is
+ * presented as a failure.
+ */
+export function settledJobState(job){
+  // A stopped task is not a failure however its exit code reads (the exit
+  // event's own rule); check the stop fact before the ok flag.
+  if(job.stopped)return {label:'已停止',dot:'warning'};
+  if(job.status==='lost')return {label:'状态未知',dot:'warning'};
+  if(job.status==='conflict')return {label:'标识冲突',dot:'failed'};
+  if(job.status==='unknown')return {label:'结果未知',dot:'warning'};
+  if(job.status==='failed')return {label:'已失败',dot:'failed'};
+  return {label:'已完成',dot:'done'};
 }
 
 export function permissionCommand(sessionId,mode){if(!sessionId||!['full_access','assisted','request_approval'].includes(mode))throw new Error('无效的权限模式');return {type:'set_permission_profile',session_id:sessionId,mode};}

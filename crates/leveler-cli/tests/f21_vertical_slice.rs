@@ -995,7 +995,11 @@ fn a_restarted_runtime_observes_and_stops_the_same_running_task() {
             let arguments = serde_json::json!({
                 "program": "sh",
                 "args": ["-c", format!("echo READY {nonce}; sleep 300")],
-                "background": true
+                "background": true,
+                // A host-owned lifetime survives the runtime generation; a
+                // goal-lifetime task is deliberately never adopted by its
+                // replacement (see background_crash_matrix::b15).
+                "background_lifetime": "runtime"
             });
             mock.push(sse(vec![
                 serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "spawn-live", "function": {"name": "run_command", "arguments": arguments.to_string()}}]}}]}),
