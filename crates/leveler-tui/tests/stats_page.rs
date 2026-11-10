@@ -449,13 +449,13 @@ fn the_usage_section_renders_the_runtimes_report() {
     assert!(text.contains("Total tokens"), "{text}");
     assert!(
         text.lines()
-            .any(|line| line.contains("Total tokens") && line.contains("13.5k")),
+            .any(|line| line.contains("Total tokens") && line.contains("13,500")),
         "total: {text}"
     );
     assert!(text.contains("Requests"), "{text}");
     assert!(text.contains("输入"), "{text}");
     assert!(
-        text.contains("缓存输入 6k"),
+        text.contains("缓存输入 6,000"),
         "cached is a slice of input: {text}"
     );
     assert!(text.contains("输出"), "{text}");
@@ -465,7 +465,7 @@ fn the_usage_section_renders_the_runtimes_report() {
     );
     assert!(text.contains("$0.0012"), "{text}");
     assert!(text.contains("deepseek / deepseek-flash"), "{text}");
-    assert!(text.contains("3 次 · 13.5k tokens"), "{text}");
+    assert!(text.contains("3 次 · 13,500 tokens"), "{text}");
     // No second diamond chart for usage: the map belongs to Context only.
     let usage_lines: Vec<&str> = text
         .lines()
@@ -788,7 +788,7 @@ fn the_page_holds_its_geometry_at_eighty_and_forty_columns() {
             "width {w}: a line overflowed:\n{text}"
         );
         assert!(text.contains("模型用量"), "width {w}:\n{text}");
-        assert!(text.contains("6.1k"), "width {w}:\n{text}");
+        assert!(text.contains("6,100"), "width {w}:\n{text}");
     }
 }
 

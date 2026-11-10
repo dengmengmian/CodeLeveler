@@ -833,11 +833,10 @@ fn turn_receipt_stats(block: &TurnEndBlock, t: &crate::i18n::UiText) -> String {
     }
     let tokens = block.input_tokens.saturating_add(block.output_tokens);
     if tokens > 0 {
-        parts.push(t.turn_tokens.replacen(
-            "{}",
-            &crate::status_line::fmt_tokens_compact(tokens),
-            1,
-        ));
+        parts.push(
+            t.turn_tokens
+                .replacen("{}", &crate::status_line::fmt_tokens_u64(tokens), 1),
+        );
     }
     if block.input_tokens > 0 && block.cached_tokens > 0 {
         let pct = (block.cached_tokens * 100 / block.input_tokens).min(100);
@@ -3282,7 +3281,7 @@ mod tests {
         let text = line_text(&lines[0]);
         assert_eq!(
             text.trim(),
-            "* ✓ 回答结束 · 14:04 · 8m 06s · 2 轮 · 13 次工具 · 3.5k tokens · 本轮缓存 99%"
+            "* ✓ 回答结束 · 14:04 · 8m 06s · 2 轮 · 13 次工具 · 3,530 tokens · 本轮缓存 99%"
         );
         assert!(!text.contains("%/"), "not the window gauge: {text}");
         // The status word takes the verdict accent; the receipt stays secondary.

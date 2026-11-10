@@ -49,6 +49,12 @@ pub(crate) fn fmt_clock(time: chrono::NaiveTime) -> String {
 }
 
 pub(crate) fn fmt_tokens(n: u32) -> String {
+    fmt_tokens_u64(u64::from(n))
+}
+
+/// Exact token count with thousands separators. Settled usage is a `u64`; the
+/// receipt and `/usage` must print every digit the ledger holds.
+pub(crate) fn fmt_tokens_u64(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().rev().enumerate() {
