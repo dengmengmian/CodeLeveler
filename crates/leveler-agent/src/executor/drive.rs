@@ -5699,6 +5699,33 @@ impl AgentHarness for Drive<'_> {
                             detail = %error.detail
                         );
                     }
+                    // A nested rule that exists but cannot be read is not an
+                    // absent rule: the edit would otherwise run without the
+                    // rule that governs its path. Refuse this call and say
+                    // why; the model can repair the document and retry.
+                    let reasons = scoped_errors
+                        .iter()
+                        .map(|error| {
+                            format!(
+                                "{} ({}: {})",
+                                error.source,
+                                error.kind.as_key(),
+                                error.detail
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(
+                        &mut *self.observer,
+                        call,
+                        format!(
+                            "Edit paused before execution: project rules that apply to this \
+                             path could not be read: {reasons}. Fix the rule document, then retry."
+                        ),
+                        model_steps,
+                    ));
+                    continue;
                 }
                 let applicable = applicable.documents;
                 let unread = applicable
