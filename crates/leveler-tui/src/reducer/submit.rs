@@ -1395,7 +1395,13 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
     // `/goal cancel` is the explicit-task-cancellation entry: it cancels the
     // logical task, not just the current window, so a later `继续` cannot
     // reopen it. With nothing to cancel it is only a goal-mode clear.
-    if was_busy_goal || state.resumable_task {
+    //
+    // The runtime's projection of owed work outranks this client's two busy
+    // flags: between submitting a continuation and receiving `TurnStarted`,
+    // `goal_mode_active` and `resumable_task` can both be false while the
+    // durable task still owes the goal. The runtime arbitrates a cancel that
+    // finds nothing left to end.
+    if was_busy_goal || state.resumable_task || state.execution_task_active {
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
             message: t.goal_cleared_and_cancel.to_string(),
@@ -1891,5 +1897,58 @@ mod copy_diff_tests {
                 );
             }
         }
+    }
+}
+
+/// `/goal cancel` must reach the runtime whenever the session still owes a
+/// goal. The client's own busy flags are a view, not the authority; between
+/// submitting a continuation and receiving `TurnStarted`, a keystroke can find
+/// `goal_mode_active` and `resumable_task` both false while the durable task
+/// still owes the goal.
+#[cfg(test)]
+mod goal_clear_tests {
+    use super::*;
+    use crate::state::Boot;
+    use crate::theme::Theme;
+    use leveler_client_protocol::{RuntimeStatus, SessionId};
+
+    fn state() -> AppState {
+        AppState::new(
+            Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s-goal-clear"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        )
+    }
+
+    #[test]
+    fn cancelling_a_goal_that_is_still_owed_reaches_the_runtime() {
+        let mut s = state();
+        // The runtime projected an owed goal; a continuation turn has been
+        // submitted, so the client is busy, but its two cancel flags have not
+        // converged yet.
+        s.execution_task_active = true;
+        s.resumable_task = false;
+        s.goal_mode_active = false;
+        s.status = RuntimeStatus::Busy;
+
+        let effects = clear_goal(&mut s);
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(ClientCommand::CancelTask { .. }))),
+            "`/goal cancel` must cancel the logical task, not clear a local mode: {effects:?}"
+        );
     }
 }
