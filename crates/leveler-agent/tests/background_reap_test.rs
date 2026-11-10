@@ -398,7 +398,12 @@ async fn harness_with(responses: Vec<ModelResponse>, wait_for_background: bool) 
 /// path fed the ledger.
 #[tokio::test]
 async fn auto_delivered_background_result_is_citable_without_a_rerun() {
-    let (program, args) = leveler_test_support::sleep_command(0);
+    // The fixture must terminate successfully under the sandbox on every host
+    // and on every runner: `echo` is what the runtime's own confined-background
+    // canary uses. A zero-second sleep is not that guarantee — on Windows it is
+    // `ping`, whose exit under the runner's confined background path is not
+    // part of any contract, while this gate only accepts a run that exited 0.
+    let (program, args) = leveler_test_support::echo_command("background-check");
     let citation = format!("{} {} → 退出码 0", program, args.join(" "));
     // The mock waits for the real task exit before its next response, so the
     // auto-delivery admission — not a sleep in the test — decides when the
