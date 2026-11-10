@@ -348,8 +348,36 @@ pub(crate) fn get_goal_scope_tool_definition() -> ToolDefinition {
     }
 }
 
-/// The name of the structured requirement-scope tool.
+/// The structured requirement-scope tool.
 pub(crate) const DECLARE_SCOPE_TOOL: &str = "declare_scope";
+
+/// The `kind` enum the model sees, from the runtime's own kind list.
+fn requirement_kind_enum() -> serde_json::Value {
+    serde_json::json!(
+        leveler_lifecycle::RequirementKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+    )
+}
+
+/// The conditional `target` contract, generated from the runtime's own
+/// `requires_target` truth. A schema cannot conditionally require a field
+/// without an `if`/`then` construct that not every provider accepts, so the
+/// contract is stated in the field descriptions and enforced by validation.
+/// Generating the kind list keeps the model's copy and the runtime from
+/// drifting apart.
+fn requirement_target_contract() -> String {
+    let kinds = leveler_lifecycle::RequirementKind::ALL
+        .iter()
+        .filter(|kind| kind.requires_target())
+        .map(|kind| format!("`{}`", kind.as_str()))
+        .collect::<Vec<_>>();
+    format!(
+        "{} need `target` (path, file or exact command).",
+        kinds.join(", ")
+    )
+}
 
 /// Declare what the user's newest message changes about the goal's
 /// requirements.
@@ -373,6 +401,8 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
             waive or replace an unrelated requirement the user did not mention: every \
             operation must quote the user's own words for that change.",
     );
+    let kind_enum = requirement_kind_enum();
+    let target_contract = requirement_target_contract();
     ToolDefinition {
         name: DECLARE_SCOPE_TOOL.to_string(),
         description,
@@ -396,19 +426,10 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             },
                             "kind": {
                                 "type": "string",
-                                "enum": [
-                                    "artifact",
-                                    "artifact_absent",
-                                    "command",
-                                    "named",
-                                    "content",
-                                    "tests",
-                                    "forbidden",
-                                    "baseline",
-                                    "preparation",
-                                    "constraint"
-                                ],
-                                "description": "Required for add and replace; optional for amend. `content` needs `target` (the file holding the literal); `command` needs `target` (the exact command)."
+                                "enum": kind_enum,
+                                "description": format!(
+                                    "Required for add and replace; optional for amend. {target_contract}"
+                                )
                             },
                             "text": {
                                 "type": "string",
@@ -416,7 +437,9 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             },
                             "target": {
                                 "type": "string",
-                                "description": "The file for `content`, or the exact command for `command`."
+                                "description": format!(
+                                    "The path, file or exact command named by `kind`. For `amend`, set it when changing `kind` to one of these. {target_contract}"
+                                )
                             },
                             "source_quote": {
                                 "type": "string",
@@ -570,6 +593,8 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             an execution task in CodeLeveler and does not stage, commit or alter repository \
             files. The session itself stays a Chat session.",
     );
+    let kind_enum = requirement_kind_enum();
+    let target_contract = requirement_target_contract();
     ToolDefinition {
         name: COMMIT_TASK_TOOL.to_string(),
         description,
@@ -596,19 +621,13 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                         "properties": {
                             "kind": {
                                 "type": "string",
-                                "enum": [
-                                    "artifact",
-                                    "artifact_absent",
-                                    "command",
-                                    "named",
-                                    "content",
-                                    "tests",
-                                    "forbidden",
-                                    "baseline",
-                                    "preparation",
-                                    "constraint"
-                                ],
-                                "description": "artifact = must exist; artifact_absent = must be gone; command = exact command; named = no mechanical check; content = literal in target; tests = suite run by `target`; other kinds are not owed. `content`/`command`/`tests` need `target`."
+                                "enum": kind_enum,
+                                "description": format!(
+                                    "artifact = must exist; artifact_absent = must be gone; \
+                                     command = exact command; named = no mechanical check; \
+                                     content = literal in target; tests = suite run by `target`; \
+                                     others not owed. {target_contract}"
+                                )
                             },
                             "text": {
                                 "type": "string",
@@ -616,7 +635,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                             },
                             "target": {
                                 "type": "string",
-                                "description": "The file for `content`, or the exact command for `command`/`tests`."
+                                "description": "The path, file or exact command named by `kind`."
                             },
                             "source_quote": {
                                 "type": "string",
@@ -1496,6 +1515,79 @@ mod scope_fidelity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A requirement kind is tied to `target` in prose only when one clause
+    /// names the kind and the field together.
+    fn schema_states_target_for(description: &str, kind: &str) -> bool {
+        description
+            .split([';', '.', '\n'])
+            .any(|clause| clause.contains(&format!("`{kind}`")) && clause.contains("`target`"))
+    }
+
+    /// The model reads the schema; the runtime enforces it. Both requirement
+    /// declarations must state the same conditional `target` contract, derived
+    /// from the runtime's own `requires_target` truth. The first Goal
+    /// submission in real sessions omitted `target` on `artifact` because the
+    /// schema said only `content`/`command`/`tests` needed one.
+    #[test]
+    fn requirement_schemas_state_the_runtime_target_contract() {
+        use leveler_lifecycle::RequirementKind;
+
+        const ALL_KINDS: [&str; 10] = [
+            "artifact",
+            "artifact_absent",
+            "command",
+            "named",
+            "content",
+            "tests",
+            "forbidden",
+            "baseline",
+            "preparation",
+            "constraint",
+        ];
+        for (tool_name, items) in [
+            (
+                COMMIT_TASK_TOOL,
+                commit_task_tool_definition().input_schema["properties"]["requirements"]["items"]
+                    .clone(),
+            ),
+            (
+                DECLARE_SCOPE_TOOL,
+                declare_scope_tool_definition().input_schema["properties"]["operations"]["items"]
+                    .clone(),
+            ),
+        ] {
+            let declared: Vec<&str> = items["properties"]["kind"]["enum"]
+                .as_array()
+                .expect("kind enum")
+                .iter()
+                .map(|value| value.as_str().expect("kind name"))
+                .collect();
+            assert_eq!(
+                declared, ALL_KINDS,
+                "{tool_name} must expose every requirement kind"
+            );
+            let kind_description = items["properties"]["kind"]["description"]
+                .as_str()
+                .expect("kind description");
+            let target_description = items["properties"]["target"]["description"]
+                .as_str()
+                .expect("target description");
+            for name in ALL_KINDS {
+                let requires_target = RequirementKind::parse(name)
+                    .expect("a schema kind parses")
+                    .requires_target();
+                let stated = schema_states_target_for(kind_description, name)
+                    || schema_states_target_for(target_description, name);
+                assert_eq!(
+                    stated, requires_target,
+                    "{tool_name}: the schema must state the target contract for `{name}` \
+                     (requires_target={requires_target}). kind: {kind_description}\n\
+                     target: {target_description}"
+                );
+            }
+        }
+    }
 
     /// The Chat delegation surface is a fixed cost on every ordinary turn.
     /// Keep it small and make the number visible to the performance record.

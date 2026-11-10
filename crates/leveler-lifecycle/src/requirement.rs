@@ -54,6 +54,20 @@ pub enum RequirementKind {
 }
 
 impl RequirementKind {
+    /// Every requirement kind, in the order the model-facing schemas list it.
+    pub const ALL: [Self; 10] = [
+        Self::Artifact,
+        Self::ArtifactAbsent,
+        Self::Command,
+        Self::Named,
+        Self::Content,
+        Self::Tests,
+        Self::Forbidden,
+        Self::Baseline,
+        Self::Preparation,
+        Self::Constraint,
+    ];
+
     /// Whether this kind is a deliverable the runtime can hold the model to.
     pub fn is_deliverable(self) -> bool {
         !matches!(
@@ -112,15 +126,33 @@ impl RequirementKind {
         }
     }
 
+    /// What `target` must hold for this kind, or `None` when the kind has no
+    /// mechanical anchor. This is the single source for both validation and
+    /// the model-facing schema: a kind that returns `Some` is exactly a kind
+    /// the runtime refuses without `target`.
+    pub fn target_purpose(self) -> Option<&'static str> {
+        match self {
+            Self::Artifact => Some("the workspace-relative path or bare file name the user named"),
+            Self::ArtifactAbsent => {
+                Some("the workspace-relative path or bare file name that must be gone")
+            }
+            Self::Command => Some("the exact command line"),
+            Self::Content => Some("the file that must contain the literal `text`"),
+            Self::Tests => Some("the exact test command line"),
+            Self::Named
+            | Self::Forbidden
+            | Self::Baseline
+            | Self::Preparation
+            | Self::Constraint => None,
+        }
+    }
+
     /// Whether this kind needs a named target: the file for `artifact`,
     /// `artifact_absent` and `content`, or the exact command for `command` and
     /// `tests`. A tests requirement declares the command whose run is its
     /// evidence, so custom test commands need no recognised runner name.
     pub fn requires_target(self) -> bool {
-        matches!(
-            self,
-            Self::Artifact | Self::ArtifactAbsent | Self::Command | Self::Content | Self::Tests
-        )
+        self.target_purpose().is_some()
     }
 }
 
@@ -344,8 +376,11 @@ pub enum ScopeError {
     EmptyText,
     #[error("the requirement text is {length} characters; the limit is {max}")]
     TextTooLong { length: usize, max: usize },
-    #[error("a `{kind}` requirement needs its path or exact command in `target`")]
-    TargetRequired { kind: &'static str },
+    #[error("the `{kind}` requirement needs `target`: {purpose}")]
+    TargetRequired {
+        kind: &'static str,
+        purpose: &'static str,
+    },
     #[error("the target is {length} characters; the limit is {max}")]
     TargetTooLong { length: usize, max: usize },
     #[error("the reason is {length} characters; the limit is {max}")]
@@ -460,10 +495,14 @@ fn validate_target(kind: RequirementKind, target: Option<&str>) -> Result<(), Sc
                 });
             }
         }
-        None if kind.requires_target() => {
-            return Err(ScopeError::TargetRequired { kind: kind.label() });
+        None => {
+            if let Some(purpose) = kind.target_purpose() {
+                return Err(ScopeError::TargetRequired {
+                    kind: kind.as_str(),
+                    purpose,
+                });
+            }
         }
-        None => {}
     }
     Ok(())
 }
@@ -1097,7 +1136,13 @@ mod tests {
             }]),
         )
         .expect_err("target required");
-        assert_eq!(error, ScopeError::TargetRequired { kind: "command" });
+        assert_eq!(
+            error,
+            ScopeError::TargetRequired {
+                kind: "command",
+                purpose: "the exact command line"
+            }
+        );
     }
 
     #[test]
@@ -1114,7 +1159,36 @@ mod tests {
             }]),
         )
         .expect_err("target required");
-        assert_eq!(error, ScopeError::TargetRequired { kind: "tests" });
+        assert_eq!(
+            error,
+            ScopeError::TargetRequired {
+                kind: "tests",
+                purpose: "the exact test command line"
+            }
+        );
+    }
+
+    /// The target contract is one set: changing it here changes the model
+    /// schema and the completion gate together.
+    #[test]
+    fn the_kinds_that_require_a_target_are_the_path_and_command_kinds() {
+        let requiring: Vec<&str> = RequirementKind::ALL
+            .iter()
+            .filter(|kind| kind.requires_target())
+            .map(|kind| kind.as_str())
+            .collect();
+        assert_eq!(
+            requiring,
+            ["artifact", "artifact_absent", "command", "content", "tests"]
+        );
+        for kind in RequirementKind::ALL {
+            assert_eq!(
+                kind.requires_target(),
+                kind.target_purpose().is_some(),
+                "`{}` must derive both answers from the same contract",
+                kind.as_str()
+            );
+        }
     }
 
     #[test]
