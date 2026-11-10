@@ -989,6 +989,14 @@ async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
         .await
         .unwrap();
     settled(&f, 1).await;
+    // The turn row turns terminal inside `run_turn`; the conclusion that
+    // writes this window's goal facts — including the pause — runs after it
+    // (the same ordering `wait_for_goals` documents). Wait for the durable
+    // fact this assertion is about, not only for the turn row.
+    wait_for_goals(&f, |goals| {
+        goals.len() == 1 && goals[0].user_paused_at.is_some()
+    })
+    .await;
     let after_pause = goals(&f).await;
     assert_eq!(after_pause.len(), 1, "{after_pause:?}");
     let goal_a = after_pause[0].id.clone();
