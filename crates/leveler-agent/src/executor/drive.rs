@@ -8552,6 +8552,15 @@ fn parse_commit_declaration(
     })
 }
 
+/// The `kind` values the model may use, from the runtime's own list.
+fn requirement_kind_names() -> String {
+    leveler_lifecycle::RequirementKind::ALL
+        .iter()
+        .map(|kind| format!("`{}`", kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse the model's structured requirement declarations.
 ///
 /// The shape is checked here with field-level errors so the model can fix a
@@ -8591,16 +8600,16 @@ fn parse_commit_requirements(
         };
         let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
             return Err(format!(
-                "`requirements[{index}].kind` is required and must be a string. Fix: use \
-                 `artifact`, `artifact_absent`, `command`, `named`, `content`, `tests`, \
-                 `forbidden`, `baseline`, `preparation` or `constraint`."
+                "`requirements[{index}].kind` is required and must be a string. Fix: use one of \
+                 {}.",
+                requirement_kind_names()
             ));
         };
         let Some(kind) = leveler_lifecycle::RequirementKind::parse(kind) else {
             return Err(format!(
                 "`requirements[{index}].kind` is `{kind}`, which is not a requirement kind. Fix: \
-                 use `artifact`, `artifact_absent`, `command`, `named`, `content`, `tests`, \
-                 `forbidden`, `baseline`, `preparation` or `constraint`."
+                 use one of {}.",
+                requirement_kind_names()
             ));
         };
         let Some(text) = object.get("text").and_then(serde_json::Value::as_str) else {
@@ -8629,6 +8638,18 @@ fn parse_commit_requirements(
                 ));
             }
         };
+        if let Some(purpose) = kind.target_purpose()
+            && target
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "`requirements[{index}].target` is required for the `{}` requirement: {purpose}. \
+                 Fix: set `target` to {purpose}; use kind `named` only when the user stated a \
+                 deliverable with no checkable path or command. Do not drop the requirement.",
+                kind.as_str()
+            ));
+        }
         let check = match object.get("check") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => Some(text.clone()),
@@ -8762,6 +8783,54 @@ mod commit_declaration_tests {
         assert!(too_long.contains("`acceptance[0]`"), "{too_long}");
         assert!(too_long.contains("501"), "{too_long}");
         assert!(too_long.contains("500"), "{too_long}");
+    }
+
+    /// A declaration that omits a mechanically required target is refused at
+    /// the exact element, and the refusal says what the field must hold. The
+    /// schema is the model's contract, but a refusal that names only
+    /// `requirements` leaves it to guess which entry was wrong.
+    #[test]
+    fn a_requirement_without_its_required_target_names_the_element_and_the_fix() {
+        let error = parse_commit_declaration(
+            &json!({
+                "objective": "补齐管理后台页面并更新验收报告",
+                "acceptance": ["验收报告已更新"],
+                "requirements": [
+                    {"kind": "named", "text": "页面补齐", "source_quote": "补齐管理后台页面"},
+                    {"kind": "artifact", "text": "更新后的验收报告", "source_quote": "更新验收报告"}
+                ]
+            }),
+            "补齐管理后台页面并更新验收报告",
+        )
+        .expect_err("an artifact without a target is invalid");
+        assert!(
+            error.contains("`requirements[1].target`"),
+            "the refusal must name the exact element: {error}"
+        );
+        assert!(
+            error.contains("workspace-relative path"),
+            "the refusal must say what target holds: {error}"
+        );
+        assert!(error.contains("Fix:"), "{error}");
+    }
+
+    /// The target rule is conditional on the kind: a semantic deliverable has
+    /// no mechanical path and must stay committable without one.
+    #[test]
+    fn a_named_requirement_needs_no_target() {
+        let declaration = parse_commit_declaration(
+            &json!({
+                "objective": "交付调研报告",
+                "acceptance": ["调研报告已交付"],
+                "requirements": [
+                    {"kind": "named", "text": "调研报告", "source_quote": "交付调研报告"}
+                ]
+            }),
+            "交付调研报告",
+        )
+        .expect("a named requirement has no mechanical target");
+        assert_eq!(declaration.requirements.len(), 1);
+        assert_eq!(declaration.requirements[0].target, None);
     }
 
     #[test]

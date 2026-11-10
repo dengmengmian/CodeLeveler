@@ -1108,6 +1108,353 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }
 
+/// A first declaration that omits the conditional `target` is refused as
+/// invalid arguments, not as an execution failure. The refusal names the exact
+/// element and what the field must hold, registers no goal, and the corrected
+/// call registers exactly one goal identity. Real sessions failed here because
+/// the model-visible schema said only `content`/`command`/`tests` needed
+/// `target`; this locks the schema contract's observable consequence end to
+/// end.
+#[tokio::test]
+async fn a_declaration_that_omits_the_required_target_is_refused_then_registers_once() {
+    const REQUEST: &str = "创建 stage-1.txt，完成后确认。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact",
+                        "text": "stage-1.txt 存在",
+                        "source_quote": "创建 stage-1.txt"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact",
+                        "text": "stage-1.txt 存在",
+                        "target": "stage-1.txt",
+                        "source_quote": "创建 stage-1.txt"
+                    }]
+                }),
+            ),
+            write_stage(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "stage-1.txt 已创建",
+                    "verification": {
+                        "status": "not_applicable",
+                        "detail": "the artifact is checked against the workspace"
+                    },
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "created stage-1.txt"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let refusal = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id.as_str() == "call-1")
+            .expect("the first declaration's refusal reaches the model");
+        assert!(refusal.is_error, "{}", refusal.content);
+        assert!(
+            refusal.content.contains("`requirements[0].target`")
+                && refusal.content.contains("workspace-relative path")
+                && refusal.content.contains("Fix:"),
+            "the refusal must name the element, what it holds and the fix: {}",
+            refusal.content
+        );
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == leveler_agent::COMMIT_INVALID_DECLARATION_KIND
+                    && detail.contains("requirements[0].target")
+        )),
+        "the refusal is an invalid declaration, not an execution failure: {events:?}"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "the corrected declaration must still execute the task: {report:?}"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "{report:?}"
+    );
+    assert_eq!(
+        fx.runtime.calls.load(Ordering::SeqCst),
+        5,
+        "refusal, corrected declaration, work, completion and delivery: no hidden auto-retry"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the corrected declaration creates exactly one goal identity"
+    );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        requirements.len(),
+        1,
+        "only the corrected call's requirement is recorded: {requirements:?}"
+    );
+    assert_eq!(
+        requirements[0].target.as_deref(),
+        Some("stage-1.txt"),
+        "the accepted declaration's target is the durable contract"
+    );
+    let log = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirement_log(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "the refused call recorded nothing; the corrected call recorded one add: {log:?}"
+    );
+    assert_eq!(
+        log[0].event.operation,
+        leveler_lifecycle::ScopeOperationKind::Add
+    );
+    let verification = report.verification.expect("a verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified,
+        "the artifact requirement is checked against the workspace: {verification:?}"
+    );
+}
+
+/// The refusal alone leaves no half-registered task behind: no goal row and no
+/// requirement history. A later turn starts clean.
+#[tokio::test]
+async fn an_artifact_without_a_target_creates_no_half_registered_goal() {
+    const REQUEST: &str = "创建 stage-1.txt，完成后确认。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact",
+                        "text": "stage-1.txt 存在",
+                        "source_quote": "创建 stage-1.txt"
+                    }]
+                }),
+            ),
+            Scripted::Text("声明未通过，我没有创建任务。"),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let refusal = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id.as_str() == "call-1")
+            .expect("the refusal reaches the model");
+        assert!(refusal.is_error, "{}", refusal.content);
+        assert!(
+            refusal.content.contains("`requirements[0].target`")
+                && refusal.content.contains("workspace-relative path")
+                && refusal.content.contains("Fix:"),
+            "{}",
+            refusal.content
+        );
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == leveler_agent::COMMIT_INVALID_DECLARATION_KIND
+                    && detail.contains("requirements[0].target")
+        )),
+        "{events:?}"
+    );
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "a refusal is not a partially created task"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "the turn answered; the refusal is about the declaration, not the user's request: {report:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Answered);
+}
+
+/// Every requirement kind the schema advertises is committable in one mixed
+/// declaration. The runtime's target rule is conditional, so the five
+/// mechanically anchored kinds carry a target and the five semantic kinds do
+/// not; none is narrowed or rejected for lacking a path.
+#[tokio::test]
+async fn every_requirement_kind_commits_in_one_mixed_declaration() {
+    const REQUEST: &str = "完成全部交付：a.txt 必须存在；b.txt 必须不存在；\
+        运行 sh check.sh 检查；发布功能为命名交付物；c.txt 包含文字 hello；\
+        运行 sh run-tests.sh 测试；禁止修改 Cargo.toml；保持现有基线；\
+        先阅读源码；保持中文注释。完成后确认。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["全部交付完成"],
+                    "requirements": [
+                        {"kind": "artifact", "text": "a.txt 必须存在",
+                         "target": "a.txt", "source_quote": "a.txt 必须存在"},
+                        {"kind": "artifact_absent", "text": "b.txt 必须不存在",
+                         "target": "b.txt", "source_quote": "b.txt 必须不存在"},
+                        {"kind": "command", "text": "运行 sh check.sh 检查",
+                         "target": "sh check.sh", "source_quote": "运行 sh check.sh 检查"},
+                        {"kind": "named", "text": "发布功能",
+                         "source_quote": "发布功能为命名交付物"},
+                        {"kind": "content", "text": "hello",
+                         "target": "c.txt", "source_quote": "c.txt 包含文字 hello"},
+                        {"kind": "tests", "text": "运行 sh run-tests.sh 测试",
+                         "target": "sh run-tests.sh", "source_quote": "运行 sh run-tests.sh 测试"},
+                        {"kind": "forbidden", "text": "禁止修改 Cargo.toml",
+                         "source_quote": "禁止修改 Cargo.toml"},
+                        {"kind": "baseline", "text": "保持现有基线",
+                         "source_quote": "保持现有基线"},
+                        {"kind": "preparation", "text": "先阅读源码",
+                         "source_quote": "先阅读源码"},
+                        {"kind": "constraint", "text": "保持中文注释",
+                         "source_quote": "保持中文注释"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "blocked",
+                    "summary": "scope recorded; execution is outside this contract test"
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+
+    let _report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, .. }
+                if leveler_agent::is_commit_refusal_kind(kind)
+        )),
+        "every advertised kind must commit: {events:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    let recorded: Vec<(&str, Option<&str>)> = requirements
+        .iter()
+        .map(|item| (item.kind.as_str(), item.target.as_deref()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            ("artifact", Some("a.txt")),
+            ("artifact_absent", Some("b.txt")),
+            ("command", Some("sh check.sh")),
+            ("named", None),
+            ("content", Some("c.txt")),
+            ("tests", Some("sh run-tests.sh")),
+            ("forbidden", None),
+            ("baseline", None),
+            ("preparation", None),
+            ("constraint", None),
+        ],
+        "the committed set preserves every kind and only the anchored kinds' targets"
+    );
+}
+
 /// The committed requirement set is readable by stable id. What the model
 /// declared at commit is what the completion gate reads; a read cannot invent
 /// or drop a requirement because it never re-parses the objective.
