@@ -10,7 +10,7 @@ a second classifier call, or a client-side route.
 | Decision | Owner |
 | --- | --- |
 | What the user meant (continue, pause, amend, cancel, question, new task) | The model, in the current turn |
-| That the declaration quotes the user's own words | Runtime (`quote_is_in_input`) |
+| That the quote or span resolves to the user's own words | Runtime (`quote_is_in_input` / `resolve_source_span`) |
 | Which goal it applies to | Runtime (bound goal, explicit id, or the single running goal) |
 | Whether the transition is legal and ordered | `leveler_lifecycle::project_intent` |
 | Which plan step a boundary names | The model's declared plan, by stable step id |
@@ -38,6 +38,23 @@ turn that has a goal lifecycle attached, including a Chat turn):
 }
 ```
 
+`source_quote` may be replaced by `source_span`:
+
+```json
+{
+  "source_span": {"start_line": 2, "end_line": 2},
+  "operations": [{"kind": "continue_task"}]
+}
+```
+
+A span is a 1-based inclusive line range of the newest user message
+(`\n` separates lines; a final trailing newline adds no line). The runtime cuts
+the exact bytes out of the message and stores them as the durable
+`source_quote`. The model therefore names a position instead of reproducing
+punctuation; exactness is preserved because the cut is from the original text.
+Exactly one of the two forms is accepted, and a paraphrase never is. Supplying
+both is refused rather than resolved by preference.
+
 Operations: `continue_task`, `pause_task`, `set_pause_boundary`,
 `replace_pause_boundary`, `amend_current_task`, `start_independent_task`,
 `cancel_task`, `answer_only`. They are applied in array order, so a compound
@@ -47,8 +64,9 @@ instruction is one declaration, not two decisions.
 
 1. **Provenance.** `source_quote` must be non-empty and occur in the newest
    user-authored input of the transcript (exact, or with whitespace runs
-   collapsed). A quote from an older message is refused: an authorization that
-   a newer message may already have reversed cannot be reused.
+   collapsed); a `source_span` is cut from that input first. A quote from an
+   older message is refused: an authorization that a newer message may already
+   have reversed cannot be reused.
 2. **Identity.** The target is the turn's bound goal, an explicitly named
    `goal_id`, or the single running goal of the task. Zero running goals and an
    unnamed declaration among several both refuse; the refusal lists the ids.

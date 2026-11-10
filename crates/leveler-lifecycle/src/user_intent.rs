@@ -261,6 +261,127 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A structural reference to lines of a user-authored message.
+///
+/// Line numbers are 1-based and inclusive, counted over the authoritative
+/// message text the runtime holds (the newest user-authored input). A line is
+/// the text between `\n` separators; a `\r` immediately before the separator
+/// is not part of the line, and a final trailing newline creates no extra
+/// line. The resolved quote is the exact byte range from the start of
+/// `start_line` through the last character of `end_line`, so it is always a
+/// verbatim substring of the message.
+///
+/// The model names a position instead of reproducing the characters. That
+/// keeps provenance strict — the quote still comes from the original message —
+/// while removing byte-for-byte copying (punctuation width, Unicode
+/// normalization, accidental rewrapping) as a failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSpan {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// Why a [`SourceSpan`] cannot be resolved.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SourceSpanError {
+    #[error("`start_line` and `end_line` are 1-based; line 0 does not exist")]
+    ZeroLine,
+    #[error("`end_line` ({end_line}) is before `start_line` ({start_line})")]
+    Reversed { start_line: u32, end_line: u32 },
+    #[error(
+        "lines {start_line}-{end_line} are outside the user's message, which has {lines} line(s)"
+    )]
+    OutOfRange {
+        start_line: u32,
+        end_line: u32,
+        lines: usize,
+    },
+    #[error("the span selects only blank text; name the line(s) that state the requirement")]
+    Empty,
+    #[error(
+        "the span selects {chars} characters; the limit is {max_chars}. Name fewer lines or use \
+         `source_quote` with a shorter verbatim fragment"
+    )]
+    TooLong { chars: usize, max_chars: usize },
+}
+
+/// Resolve `span` against the authoritative message text.
+///
+/// The returned string is cut from `input` by byte offsets derived from the
+/// line boundaries; it is never reconstructed from the model's tokens.
+pub fn resolve_source_span(
+    span: SourceSpan,
+    input: &str,
+    max_chars: usize,
+) -> Result<String, SourceSpanError> {
+    if span.start_line == 0 || span.end_line == 0 {
+        return Err(SourceSpanError::ZeroLine);
+    }
+    if span.end_line < span.start_line {
+        return Err(SourceSpanError::Reversed {
+            start_line: span.start_line,
+            end_line: span.end_line,
+        });
+    }
+    let lines = line_ranges(input);
+    let (Ok(start_index), Ok(end_index)) = (
+        usize::try_from(span.start_line),
+        usize::try_from(span.end_line),
+    ) else {
+        return Err(SourceSpanError::OutOfRange {
+            start_line: span.start_line,
+            end_line: span.end_line,
+            lines: lines.len(),
+        });
+    };
+    let Some((start, _)) = lines.get(start_index - 1) else {
+        return Err(SourceSpanError::OutOfRange {
+            start_line: span.start_line,
+            end_line: span.end_line,
+            lines: lines.len(),
+        });
+    };
+    let Some((_, end)) = lines.get(end_index - 1) else {
+        return Err(SourceSpanError::OutOfRange {
+            start_line: span.start_line,
+            end_line: span.end_line,
+            lines: lines.len(),
+        });
+    };
+    let quote = &input[*start..*end];
+    if quote.trim().is_empty() {
+        return Err(SourceSpanError::Empty);
+    }
+    let chars = quote.chars().count();
+    if chars > max_chars {
+        return Err(SourceSpanError::TooLong { chars, max_chars });
+    }
+    Ok(quote.to_string())
+}
+
+/// Byte ranges `(content_start, content_end)` of every line in `input`.
+///
+/// Mirrors the line model documented on [`SourceSpan`]: `\n` separates lines,
+/// a `\r` directly before it is excluded from the line, and a final trailing
+/// newline adds no empty line. The empty string has no lines.
+fn line_ranges(input: &str) -> Vec<(usize, usize)> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for segment in input.split_inclusive('\n') {
+        let content = match segment.strip_suffix('\n') {
+            Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
+            None => segment,
+        };
+        ranges.push((start, start + content.len()));
+        start += segment.len();
+    }
+    ranges
+}
+
 fn validate_boundary(boundary: &PauseBoundary, plan: &PlanState) -> Result<(), IntentError> {
     let PauseBoundary::AfterStep { step } = boundary else {
         return Ok(());
@@ -329,6 +450,10 @@ pub fn project_intent(
         return Err(IntentError::TooManyOperations {
             count: declaration.operations.len(),
         });
+    }
+    let quote_chars = declaration.source_quote.trim().chars().count();
+    if quote_chars > INTENT_SOURCE_QUOTE_MAX_CHARS {
+        return Err(IntentError::QuoteTooLong { chars: quote_chars });
     }
     let mut state = IntentProjection {
         pause_in_force: current.pause_in_force,
@@ -472,6 +597,130 @@ mod tests {
             "pause after stage four",
             "Keep going, but pause after stage three."
         ));
+    }
+
+    fn span(start_line: u32, end_line: u32) -> SourceSpan {
+        SourceSpan {
+            start_line,
+            end_line,
+        }
+    }
+
+    #[test]
+    fn a_line_span_resolves_to_the_exact_message_bytes() {
+        let input = "第一行\n第二行：创建 stage-2.txt！\n第三行";
+        let quote = resolve_source_span(span(2, 2), input, 8000).expect("line two resolves");
+        assert_eq!(quote, "第二行：创建 stage-2.txt！");
+        assert!(input.contains(&quote));
+    }
+
+    #[test]
+    fn punctuation_width_is_never_compared_because_the_runtime_cuts_the_text() {
+        // The user wrote both widths on purpose; no model copy participates.
+        let input = "run `echo hi!`\nThen verify it worked！\nDone.";
+        let quote = resolve_source_span(span(2, 2), input, 8000).expect("span resolves");
+        assert_eq!(quote, "Then verify it worked！");
+        assert!(quote.contains('！'));
+        assert!(!quote.contains("worked!"));
+    }
+
+    #[test]
+    fn a_multi_line_span_keeps_every_character_between_the_boundaries() {
+        let input = "one\ntwo\t  and spaces\nthree";
+        let quote = resolve_source_span(span(1, 2), input, 8000).expect("span resolves");
+        assert_eq!(quote, "one\ntwo\t  and spaces");
+        assert!(input.contains(&quote));
+    }
+
+    #[test]
+    fn crlf_and_a_trailing_newline_do_not_shift_line_numbers() {
+        let input = "first\r\nsecond\r\nthird\r\n";
+        let quote = resolve_source_span(span(2, 2), input, 8000).expect("span resolves");
+        assert_eq!(quote, "second");
+        assert!(input.contains(&quote));
+
+        // A final newline does not create a fourth, empty line.
+        let error = resolve_source_span(span(4, 4), input, 8000).expect_err("line 4 is absent");
+        assert_eq!(
+            error,
+            SourceSpanError::OutOfRange {
+                start_line: 4,
+                end_line: 4,
+                lines: 3
+            }
+        );
+    }
+
+    #[test]
+    fn combining_marks_and_emoji_are_addressed_by_line_not_character_count() {
+        let input = "e\u{301} combining, 🚀 emoji\n第二行 ✅";
+        let quote = resolve_source_span(span(1, 1), input, 8000).expect("span resolves");
+        assert_eq!(quote, "e\u{301} combining, 🚀 emoji");
+        assert_eq!(
+            quote.chars().count(),
+            "e\u{301} combining, 🚀 emoji".chars().count()
+        );
+    }
+
+    #[test]
+    fn repeated_text_resolves_positionally_instead_of_by_first_match() {
+        let input = "same\ndifferent\nsame";
+        let quote = resolve_source_span(span(3, 3), input, 8000).expect("span resolves");
+        assert_eq!(quote, "same");
+        let earlier = resolve_source_span(span(1, 1), input, 8000).expect("span resolves");
+        assert_eq!(earlier, "same");
+        // Both are the same text, but the span is still an unambiguous position.
+        let middle = resolve_source_span(span(2, 2), input, 8000).expect("span resolves");
+        assert_eq!(middle, "different");
+    }
+
+    #[test]
+    fn blank_reversed_and_out_of_range_spans_are_refused() {
+        let input = "real requirement\n\nlast";
+        assert_eq!(
+            resolve_source_span(span(2, 2), input, 8000).expect_err("blank line"),
+            SourceSpanError::Empty
+        );
+        assert_eq!(
+            resolve_source_span(span(0, 1), input, 8000).expect_err("zero line"),
+            SourceSpanError::ZeroLine
+        );
+        assert_eq!(
+            resolve_source_span(span(3, 2), input, 8000).expect_err("reversed"),
+            SourceSpanError::Reversed {
+                start_line: 3,
+                end_line: 2
+            }
+        );
+        assert_eq!(
+            resolve_source_span(span(1, 4), input, 8000).expect_err("past the end"),
+            SourceSpanError::OutOfRange {
+                start_line: 1,
+                end_line: 4,
+                lines: 3
+            }
+        );
+        assert_eq!(
+            resolve_source_span(span(1, 1), "", 8000).expect_err("empty message"),
+            SourceSpanError::OutOfRange {
+                start_line: 1,
+                end_line: 1,
+                lines: 0
+            }
+        );
+    }
+
+    #[test]
+    fn an_over_long_span_is_refused_instead_of_truncated() {
+        let input = "aaaaaaaaaa\nbbbbbbbbbb";
+        let error = resolve_source_span(span(1, 2), input, 5).expect_err("too long");
+        assert_eq!(
+            error,
+            SourceSpanError::TooLong {
+                chars: 21,
+                max_chars: 5
+            }
+        );
     }
 
     #[test]
@@ -709,6 +958,18 @@ mod tests {
             project_intent(&declaration("go on", too_many), &current, &plan,).unwrap_err(),
             IntentError::TooManyOperations { .. }
         ));
+        let oversized = "x".repeat(INTENT_SOURCE_QUOTE_MAX_CHARS + 1);
+        assert_eq!(
+            project_intent(
+                &declaration(&oversized, vec![UserIntentOperation::AmendCurrentTask]),
+                &current,
+                &plan,
+            )
+            .unwrap_err(),
+            IntentError::QuoteTooLong {
+                chars: INTENT_SOURCE_QUOTE_MAX_CHARS + 1
+            }
+        );
     }
 
     #[test]

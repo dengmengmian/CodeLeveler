@@ -11,7 +11,7 @@ work the same way because no word list is involved.
 | Decision | Owner |
 | --- | --- |
 | What the user asked for (deliverables, constraints, prohibitions) | The model, reading the user's message |
-| That the quoted span really occurs in the newest user input | Runtime (`quote_is_in_input`) |
+| That the source quote or span resolves to real user text | Runtime (`quote_is_in_input` / `resolve_source_span`) |
 | Which goal the requirement belongs to | Runtime (the turn's bound goal) |
 | Requirement identity (`R1`, `R2`, …), state and order | `leveler_lifecycle::apply_scope_declaration` |
 | The durable result | `leveler-storage` (ordered `goal_requirement_events`, migration 0055) |
@@ -34,6 +34,7 @@ Each live requirement carries:
 | `text` | The requirement as the model stated it. |
 | `target` | The path, literal location or exact command, when the kind needs one. |
 | `source_quote` | Verbatim span of the user message the declaration was anchored to. |
+| `source_span` | Declaration-only alternative to `source_quote`: a 1-based inclusive line range. The runtime cuts the exact text from the authoritative message, stores it as `source_quote`, and drops the coordinate. |
 | `check` | Optional acceptance check the model associated with the requirement. |
 | `state` | `active`, `waived` or `superseded`. |
 | `superseded_by` | The replacement id when a `replace` retired this one. |
@@ -52,12 +53,22 @@ amend `text` to the literal rather than rewrite the file.
 
 Two structured entry points, both model-called:
 
-- `commit_task(requirements=[{kind, text, target, source_quote, check}])` seeds
-  the initial set when a Chat turn registers a goal. The seeds are applied in
-  array order and mint `R1..Rn`.
+- `commit_task(requirements=[{kind, text, target, source_quote | source_span, check}])`
+  seeds the initial set when a Chat turn registers a goal. The seeds are applied
+  in array order and mint `R1..Rn`.
 - `declare_scope({operations: [...]})` changes an already bound goal's set. The
   same operation set serves `/goal` turns, resumed goals and supplements to a
   committed task.
+
+Each entry carries exactly one source reference. `source_quote` is the model's
+verbatim copy. `source_span` names lines of the authoritative user message
+(1-based, inclusive; `\n` separates lines and a final trailing newline adds no
+line); the runtime cuts the original bytes itself, so punctuation width, a
+rewrap or a Unicode normalization choice in the model's output cannot turn a
+real user requirement into a refused declaration. Supplying both is refused:
+the runtime will not guess which source the model meant. Neither form accepts a
+paraphrase, and there is no fuzzy equivalence (full-width vs ASCII punctuation,
+edit distance or regex repair).
 
 ```json
 {
@@ -85,10 +96,15 @@ on request, the ordered change history with the turn that authorized each event.
    target and reason have explicit length limits; one declaration carries at
    most `SCOPE_OPERATIONS_MAX` operations and the goal at most
    `SCOPE_REQUIREMENTS_MAX` live requirements.
-2. **Provenance.** Every operation's `source_quote` must occur in the newest
-   user-authored input of the transcript (exact, or with whitespace runs
-   collapsed). An older message cannot authorize a change the newest one may
-   already have reversed.
+2. **Provenance.** Every entry's `source_quote` must occur in the authoritative
+   user text (exact, or with whitespace runs collapsed). A `source_span` is
+   resolved against that same text before this check; the cut result is an exact
+   substring by construction, so the strict check still holds. For
+   `declare_scope`, the authoritative text is the newest user-authored input: an
+   older message cannot authorize a change the newest one may already have
+   reversed. `commit_task` anchors seeds to the task objective it records (the
+   user's message; continuation amendments append to it), because the initial
+   scope describes the committed task rather than a change to it.
 3. **Identity.** The target is the goal bound to this turn. An operation on an
    unknown or non-active requirement id is refused with its current state.
 4. **Transition legality and order.** `amend` and `waive` require an active

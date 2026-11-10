@@ -9,7 +9,7 @@
 | 决策 | Owner |
 | --- | --- |
 | 用户想干什么（继续、暂停、补充、取消、提问、新任务） | 模型，在本轮内声明 |
-| 声明是否引用了用户自己的话 | Runtime（`quote_is_in_input`） |
+| 声明是否引用了用户自己的话 | Runtime（`quote_is_in_input` / `resolve_source_span`） |
 | 它作用于哪个 Goal | Runtime（本轮绑定的 Goal、显式 id、或唯一运行中的 Goal） |
 | 转换是否合法、顺序是否正确 | `leveler_lifecycle::project_intent` |
 | 暂停边界指向哪个计划步骤 | 模型自己声明的计划，用稳定 step id |
@@ -36,6 +36,20 @@
 }
 ```
 
+`source_quote` 可以换成 `source_span`：
+
+```json
+{
+  "source_span": {"start_line": 2, "end_line": 2},
+  "operations": [{"kind": "continue_task"}]
+}
+```
+
+span 是最新用户消息的 1-based 闭区间行号（`\n` 分行，末尾一个换行不额外产生
+一行）。Runtime 从消息里切出原始字节，并存为持久 `source_quote`。模型因此只
+指位置、不必复制标点；因为切的是原文，严格性不变。两种形式必须且只能给一个，
+改写仍然不被接受；同时给出会被拒绝，而不是按偏好取一个。
+
 操作集：`continue_task`、`pause_task`、`set_pause_boundary`、
 `replace_pause_boundary`、`amend_current_task`、`start_independent_task`、
 `cancel_task`、`answer_only`。按数组顺序应用，因此复合指令是一次声明，
@@ -44,8 +58,8 @@
 ## 校验
 
 1. **来源。** `source_quote` 必须非空，且出现在 transcript 中最新的用户输入
-   里（精确匹配，或折叠连续空白后匹配）。引用更早的消息会被拒绝：一条可能
-   已被更新消息反转的授权不能复用。
+   里（精确匹配，或折叠连续空白后匹配）；`source_span` 会先从该输入中切出
+   原文。引用更早的消息会被拒绝：一条可能已被更新消息反转的授权不能复用。
 2. **身份。** 目标依次是：本轮绑定的 Goal、显式 `goal_id`、任务内唯一运行中
    的 Goal。没有运行中的 Goal、或多个 Goal 且未指明，都拒绝并在错误中列出
    候选 id。Runtime 不猜用户指的是哪个 Goal。

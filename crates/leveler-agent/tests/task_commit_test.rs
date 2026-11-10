@@ -1108,6 +1108,247 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
 }
 
+/// The reported first-submission failure: the user wrote a requirement with
+/// full-width punctuation, the model copied it with ASCII punctuation, and the
+/// literal comparison refused a real statement. A span names the line; the
+/// runtime cuts the user's own bytes, so the first declaration succeeds and the
+/// recorded quote carries the punctuation the user actually wrote.
+#[tokio::test]
+async fn a_first_declaration_accepts_a_line_span_and_keeps_the_users_punctuation() {
+    const REQUEST: &str = "请完成两个交付！\n一、把结果写进 report.txt。\n二、页面文案保持中文。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["report.txt 存在", "页面文案为中文"],
+                    "requirements": [
+                        {"kind": "artifact", "text": "report.txt 存在", "target": "report.txt",
+                         "source_span": {"start_line": 2, "end_line": 2}},
+                        {"kind": "named", "text": "页面文案为中文",
+                         "source_span": {"start_line": 3, "end_line": 3}}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "report.txt", "content": "done\n"}),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "两个交付完成",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "report.txt 存在"},
+                        {"id": "R2", "status": "done", "evidence": "页面文案保持中文"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "the first declaration registers one goal");
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(
+        requirements[0].source_quote, "一、把结果写进 report.txt。",
+        "the stored quote is the user's exact line"
+    );
+    assert_eq!(requirements[1].source_quote, "二、页面文案保持中文。");
+}
+
+/// A span outside the message is refused as invalid arguments and creates no
+/// goal. The corrected call is the one that registers the scope; there is no
+/// half-created goal, duplicate identity or requirement from the refused call.
+#[tokio::test]
+async fn a_rejected_span_registers_nothing_and_the_corrected_call_registers_once() {
+    const REQUEST: &str = "请创建 stage-1.txt！\n完成后确认。";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact", "text": "stage-1.txt 存在", "target": "stage-1.txt",
+                        "source_span": {"start_line": 3, "end_line": 3}
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact", "text": "stage-1.txt 存在", "target": "stage-1.txt",
+                        "source_span": {"start_line": 1, "end_line": 1}
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "stage-1.txt 已创建",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "stage-1.txt 存在"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let refusal = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id.as_str() == "call-1")
+            .expect("the first declaration's result reaches the model");
+        assert!(
+            refusal.is_error
+                && refusal
+                    .content
+                    .contains("outside the user's message, which has 2 line(s)"),
+            "the refusal names the span fact: {}",
+            refusal.content
+        );
+    }
+
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the refused call created no goal; the corrected call created exactly one"
+    );
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0].source_quote, "请创建 stage-1.txt！");
+    assert_eq!(requirements[0].id, "R1", "one identity, minted once");
+}
+
+/// The span form also serves a supplementary requirement added after the
+/// commit. `declare_scope` resolves the span against the newest user input
+/// before serde parses the declaration, so the durable event carries the
+/// user's exact bytes rather than the coordinate.
+#[tokio::test]
+async fn a_supplementary_requirement_can_name_a_span_of_the_same_message() {
+    const REQUEST: &str = "创建 a.txt。\n再创建 b.txt！";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["a.txt 存在", "b.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                        "source_span": {"start_line": 1, "end_line": 1}
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [{
+                        "op": "add", "kind": "artifact", "text": "b.txt 存在",
+                        "target": "b.txt",
+                        "source_span": {"start_line": 2, "end_line": 2}
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "a\n"}),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "b.txt", "content": "b\n"}),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "两个文件都已创建",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "created a.txt"},
+                        {"id": "R2", "status": "done", "evidence": "created b.txt"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    let requirements = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].source_quote, "创建 a.txt。");
+    assert_eq!(
+        requirements[1].source_quote, "再创建 b.txt！",
+        "the supplementary requirement keeps the user's punctuation"
+    );
+}
+
 /// A first declaration that omits the conditional `target` is refused as
 /// invalid arguments, not as an execution failure. The refusal names the exact
 /// element and what the field must hold, registers no goal, and the corrected
@@ -4267,6 +4508,102 @@ async fn an_explicit_continuation_resumes_the_paused_goal_and_verifies_it() {
     );
     assert!(fx.dir.path().join("stage-2.txt").exists());
     std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// An intent may name the span instead of copying the continuation. The span is
+/// resolved against the newest user input only — not the older objective — and
+/// the durable intent log stores the exact line the runtime cut.
+#[tokio::test]
+async fn a_span_releases_the_pause_and_the_intent_log_keeps_the_cut_line() {
+    const CONTINUATION: &str = "确认。\n继续阶段 2，把剩余任务完成并验收。";
+    let mut script = pause_stage_one_script();
+    script.extend([
+        Scripted::Tool(
+            "declare_intent",
+            serde_json::json!({
+                "source_span": {"start_line": 2, "end_line": 2},
+                "operations": [{"kind": "continue_task"}]
+            }),
+        ),
+        write_named("stage-2.txt"),
+        Scripted::Tool("run_command", verifier_call()),
+        stage_plan("completed", "completed"),
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "阶段 1 与阶段 2 都已交付并验收",
+                "verification": {"status": "passed", "detail": verifier_label()},
+                "requirements": [
+                    {"requirement": "stage-1.txt", "status": "done",
+                     "evidence": "created stage-1.txt"},
+                    {"requirement": "stage-2.txt", "status": "done",
+                     "evidence": "created stage-2.txt"},
+                    {"requirement": verifier_path(), "status": "done",
+                     "evidence": "ran the verifier"}
+                ]
+            }),
+        ),
+    ]);
+    let fx = fixture(script, false).await;
+    write_verifier(fx.dir.path());
+    let staged = staged_pause_objective();
+    fx.coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, staged),
+            vec![ContentPart::Text {
+                text: staged.into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let goal_id = goal_records(&fx).await[0].id.clone();
+
+    let resumed = fx
+        .coding
+        .resume_with_instruction(
+            &fx.session,
+            &spec_for(&fx, staged),
+            Message::user_input(CONTINUATION),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resumed.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "{resumed:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].id, goal_id);
+    assert!(
+        goals[0].user_paused_at.is_none(),
+        "the span declaration released the pause"
+    );
+    let log = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .intent_log(&goal_id)
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 2, "the boundary and the continuation: {log:?}");
+    let continuation = log.last().expect("the continuation entry");
+    assert_eq!(
+        continuation.source_quote, "继续阶段 2，把剩余任务完成并验收。",
+        "the log carries the user's exact line, not the coordinate"
+    );
+    assert!(
+        matches!(
+            continuation.operations.as_slice(),
+            [leveler_lifecycle::UserIntentOperation::ContinueTask]
+        ),
+        "{continuation:?}"
+    );
 }
 
 /// The same authorization in another language, with no shared keyword: the

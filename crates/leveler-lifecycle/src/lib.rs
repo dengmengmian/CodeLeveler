@@ -76,8 +76,8 @@ pub use requirement::{
 };
 pub use user_intent::{
     INTENT_OPERATIONS_MAX, INTENT_SOURCE_QUOTE_MAX_CHARS, IntentError, IntentProjection,
-    PauseBoundary, StageRef, UserIntentDeclaration, UserIntentOperation, project_intent,
-    quote_is_in_input,
+    PauseBoundary, SourceSpan, SourceSpanError, StageRef, UserIntentDeclaration,
+    UserIntentOperation, project_intent, quote_is_in_input, resolve_source_span,
 };
 pub use verification::{VerificationRecord, VerificationRecordState, VerificationReport};
 // Original top-level paths stay valid: the module split is semantic first,

@@ -967,8 +967,7 @@ impl Executor {
             .filter(|message| message.role == Role::User)
             .find(|message| matches!(message.origin.as_ref(), Some(TranscriptOrigin::UserInput)))
             .map(Message::text_content)
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.trim().is_empty())
             .unwrap_or_else(|| objective.latest_instruction().to_string());
         let mut harness = Drive {
             executor: self,
@@ -2145,7 +2144,8 @@ impl Drive<'_> {
         }
         text.push_str(
             "If the newest user message continues, amends, pauses or cancels one of these \
-             goals, call declare_intent with a verbatim source_quote before acting; the runtime \
+             goals, call declare_intent with a verbatim source_quote or a source_span naming the \
+             message's lines before acting; the runtime \
              will not resume a paused goal from your own reading. If the message asks a \
              question, declare answer_only. If it is unrelated work, declare \
              start_independent_task and call commit_task with task_relation \"new\".",
@@ -2176,12 +2176,21 @@ impl Drive<'_> {
             project_intent, quote_is_in_input,
         };
 
-        let quote = call
-            .arguments
-            .get("source_quote")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
+        let Some(arguments) = call.arguments.as_object() else {
+            return Err(IntentCall::Refused(
+                "declare_intent arguments must be an object with `source_quote` or \
+                 `source_span` and `operations`."
+                    .to_string(),
+            ));
+        };
+        let quote = declared_source_quote(
+            arguments,
+            &self.latest_user_input,
+            leveler_lifecycle::INTENT_SOURCE_QUOTE_MAX_CHARS,
+            "declare_intent",
+        )
+        .map_err(IntentCall::Refused)?;
+        let quote = quote.trim();
         if quote.is_empty() {
             return Err(IntentCall::Refused(IntentError::EmptyQuote.to_string()));
         }
@@ -2383,19 +2392,22 @@ impl Drive<'_> {
                     .to_string(),
             ));
         }
-        let declaration: ScopeDeclaration = serde_json::from_value(call.arguments.clone())
-            .map_err(|error| {
-                IntentCall::Refused(format!(
-                    "declare_scope is not a valid declaration: {error}. Each operation needs \
-                     `op`, `source_quote`, and the fields its op requires."
-                ))
-            })?;
+        let mut arguments = call.arguments.clone();
+        resolve_scope_source_spans(&mut arguments, &self.latest_user_input)
+            .map_err(IntentCall::Refused)?;
+        let declaration: ScopeDeclaration = serde_json::from_value(arguments).map_err(|error| {
+            IntentCall::Refused(format!(
+                "declare_scope is not a valid declaration: {error}. Each operation needs \
+                     `op`, `source_quote` or `source_span`, and the fields its op requires."
+            ))
+        })?;
         for operation in &declaration.operations {
             let quote = operation.source_quote().trim();
             if !quote_is_in_input(quote, &self.latest_user_input) {
                 return Err(IntentCall::Refused(format!(
                     "the scope operation quotes text that is not in the newest user message. \
-                     Newest user message: \"{}\"",
+                     Fix: quote the user's own words exactly, or set `source_span` to the \
+                     1-based line range that contains them. Newest user message: \"{}\"",
                     leveler_core::truncate_head_bytes(&self.latest_user_input, 400, "…")
                 )));
             }
@@ -8385,6 +8397,109 @@ fn structured_scope_text(
     text
 }
 
+/// Resolve the model's source reference to a verbatim quote of the user's text.
+///
+/// Exactly one of two forms is accepted:
+///
+/// - `source_quote`: the model's own copy, checked against the authoritative
+///   text by the caller (`quote_is_in_input`);
+/// - `source_span`: a 1-based inclusive line range; the runtime cuts the exact
+///   bytes out of the authoritative text itself. The model names a position,
+///   so punctuation width, Unicode normalization or a rewrap cannot turn a
+///   real user requirement into a refused declaration.
+///
+/// Supplying both is refused rather than silently preferring one: a model that
+/// copies the text AND names a conflicting span has stated two sources, and the
+/// runtime must not guess which one it meant.
+fn declared_source_quote(
+    object: &serde_json::Map<String, serde_json::Value>,
+    source_text: &str,
+    max_chars: usize,
+    path: &str,
+) -> Result<String, String> {
+    let quote = match object.get("source_quote") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(other) => {
+            return Err(format!(
+                "`{path}.source_quote` must be a string, got {} (`{}`).",
+                json_shape(other),
+                json_preview(other)
+            ));
+        }
+    };
+    let span = match object.get("source_span") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<leveler_lifecycle::SourceSpan>(value.clone()).map_err(
+                |error| {
+                    format!(
+                        "`{path}.source_span` must be an object with integer `start_line` and \
+                         `end_line`: {error}. Lines are 1-based and inclusive."
+                    )
+                },
+            )?,
+        ),
+    };
+    match (quote, span) {
+        (Some(_), Some(_)) => Err(format!(
+            "`{path}` supplies both `source_quote` and `source_span`. Fix: give exactly one — \
+             `source_span` when copying the user's punctuation exactly is risky, or \
+             `source_quote` with a short verbatim fragment."
+        )),
+        (None, None) => Err(format!(
+            "`{path}` needs `source_quote` or `source_span`. Fix: quote the exact user words, or \
+             name the 1-based line range in the user's message that states this requirement."
+        )),
+        (Some(quote), None) => Ok(quote),
+        (None, Some(span)) => leveler_lifecycle::resolve_source_span(span, source_text, max_chars)
+            .map_err(|error| {
+                format!(
+                    "`{path}.source_span` is invalid: {error}. The user's message has {} line(s). \
+                     Line numbers count only the text the user typed, not a host-pinned objective \
+                     block or any other runtime notice. Fix: name lines within that message, or \
+                     pass `source_quote` with a verbatim fragment.",
+                    source_text.lines().count()
+                )
+            }),
+    }
+}
+
+/// Resolve every `declare_scope` operation's `source_span` before serde parses
+/// the declaration.
+///
+/// `ScopeOperation` keeps storing only the resolved `source_quote`, so the
+/// durable history and the replay fold have one representation: the exact user
+/// text. The pre-pass exists because the span needs the authoritative message
+/// text, which a plain `Deserialize` implementation does not receive.
+fn resolve_scope_source_spans(
+    arguments: &mut serde_json::Value,
+    source_text: &str,
+) -> Result<(), String> {
+    let Some(operations) = arguments
+        .get_mut("operations")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        // Serde reports a missing or non-array `operations` with its own
+        // message; there is nothing to resolve here.
+        return Ok(());
+    };
+    for (index, operation) in operations.iter_mut().enumerate() {
+        let Some(object) = operation.as_object_mut() else {
+            // Serde reports the element shape.
+            continue;
+        };
+        let quote = declared_source_quote(
+            object,
+            source_text,
+            leveler_lifecycle::SCOPE_SOURCE_QUOTE_MAX_CHARS,
+            &format!("operations[{index}]"),
+        )?;
+        object.insert("source_quote".to_string(), serde_json::Value::String(quote));
+    }
+    Ok(())
+}
+
 fn parse_commit_declaration(
     arguments: &serde_json::Value,
     user_objective: &str,
@@ -8507,23 +8622,29 @@ fn parse_commit_declaration(
         }
     };
 
-    let requirements = parse_commit_requirements(arguments.get("requirements"))?;
+    let raw_requirements = arguments.get("requirements");
+    if user_objective.is_empty()
+        && raw_requirements
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    {
+        return Err(
+            "`requirements` needs a user message to quote, but this turn carries no user \
+             message text. Fix: commit without requirements, or declare them in a turn that \
+             carries the user's own words."
+                .to_string(),
+        );
+    }
+    let requirements = parse_commit_requirements(raw_requirements, user_objective)?;
     if !requirements.is_empty() {
-        if user_objective.is_empty() {
-            return Err(
-                "`requirements` needs a user message to quote, but this turn carries no user \
-                 message text. Fix: commit without requirements, or declare them in a turn that \
-                 carries the user's own words."
-                    .to_string(),
-            );
-        }
         for (index, seed) in requirements.iter().enumerate() {
             if !leveler_lifecycle::quote_is_in_input(&seed.source_quote, user_objective) {
                 return Err(format!(
                     "`requirements[{index}].source_quote` does not occur in the user's message. \
                      The quote proves the requirement comes from the user; it must be copied \
                      verbatim. Fix: quote the exact user words that state this requirement, or \
-                     remove the requirement."
+                     set `source_quote` to a shorter verbatim fragment, or set `source_span` to \
+                     the 1-based line range that contains them so the runtime extracts the quote."
                 ));
             }
             if let Some(check) = &seed.check
@@ -8568,6 +8689,7 @@ fn requirement_kind_names() -> String {
 /// caller's check: this function only knows the JSON.
 fn parse_commit_requirements(
     value: Option<&serde_json::Value>,
+    source_text: &str,
 ) -> Result<Vec<leveler_lifecycle::RequirementSeed>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -8575,7 +8697,7 @@ fn parse_commit_requirements(
     let Some(items) = value.as_array() else {
         return Err(format!(
             "`requirements` must be an array, got {} (`{}`). Fix: pass the user's explicit \
-             requirements as objects with `kind`, `text` and `source_quote`.",
+             requirements as objects with `kind`, `text` and `source_quote` or `source_span`.",
             json_shape(value),
             json_preview(value)
         ));
@@ -8593,11 +8715,17 @@ fn parse_commit_requirements(
         let Some(object) = item.as_object() else {
             return Err(format!(
                 "`requirements[{index}]` must be an object, got {} (`{}`). Fix: pass `kind`, \
-                 `text` and `source_quote`.",
+                 `text` and `source_quote` or `source_span`.",
                 json_shape(item),
                 json_preview(item)
             ));
         };
+        let source_quote = declared_source_quote(
+            object,
+            source_text,
+            leveler_lifecycle::SCOPE_SOURCE_QUOTE_MAX_CHARS,
+            &format!("requirements[{index}]"),
+        )?;
         let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
             return Err(format!(
                 "`requirements[{index}].kind` is required and must be a string. Fix: use one of \
@@ -8616,15 +8744,6 @@ fn parse_commit_requirements(
             return Err(format!(
                 "`requirements[{index}].text` is required and must be a string. Fix: state the \
                  requirement in the user's terms."
-            ));
-        };
-        let Some(source_quote) = object
-            .get("source_quote")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return Err(format!(
-                "`requirements[{index}].source_quote` is required and must be a string. Fix: copy \
-                 the exact user words that state this requirement."
             ));
         };
         let target = match object.get("target") {
@@ -8665,7 +8784,7 @@ fn parse_commit_requirements(
             kind,
             text: text.to_string(),
             target,
-            source_quote: source_quote.to_string(),
+            source_quote,
             check,
         });
     }
@@ -8680,7 +8799,7 @@ fn goal_refusal_preview(kind: &str, message: &str) -> String {
 
 #[cfg(test)]
 mod commit_declaration_tests {
-    use super::parse_commit_declaration;
+    use super::{parse_commit_declaration, resolve_scope_source_spans};
     use serde_json::json;
 
     fn acceptance() -> serde_json::Value {
@@ -8831,6 +8950,170 @@ mod commit_declaration_tests {
         .expect("a named requirement has no mechanical target");
         assert_eq!(declaration.requirements.len(), 1);
         assert_eq!(declaration.requirements[0].target, None);
+    }
+
+    /// A source span names lines; the runtime cuts the user's own bytes, so
+    /// the model never reproduces punctuation. This is the reported failure:
+    /// a requirement stated with `！` was quoted with `!` and refused.
+    #[test]
+    fn a_source_span_cuts_the_users_text_instead_of_copying_it() {
+        let user = "请创建 stage-1.txt！\n然后运行 `echo hi!` 验证。\n最后确认。";
+        let declaration = parse_commit_declaration(
+            &json!({
+                "acceptance": ["stage-1.txt 存在", "echo hi! 成功"],
+                "requirements": [
+                    {"kind": "artifact", "text": "stage-1.txt 存在", "target": "stage-1.txt",
+                     "source_span": {"start_line": 1, "end_line": 1}},
+                    {"kind": "command", "text": "echo hi! 成功", "target": "echo hi!",
+                     "source_span": {"start_line": 2, "end_line": 2}}
+                ]
+            }),
+            user,
+        )
+        .expect("both spans are inside the user's message");
+        assert_eq!(declaration.objective, user);
+        assert_eq!(
+            declaration.requirements[0].source_quote,
+            "请创建 stage-1.txt！"
+        );
+        assert_eq!(
+            declaration.requirements[1].source_quote,
+            "然后运行 `echo hi!` 验证。"
+        );
+    }
+
+    /// The span is a structural reference with one unambiguous meaning; a
+    /// declaration that supplies both forms has stated two sources, so the
+    /// runtime refuses instead of guessing which one to trust.
+    #[test]
+    fn exactly_one_source_reference_is_accepted() {
+        let user = "创建 a.txt";
+        let both = parse_commit_declaration(
+            &json!({
+                "acceptance": ["a.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                    "source_quote": "创建 a.txt",
+                    "source_span": {"start_line": 1, "end_line": 1}
+                }]
+            }),
+            user,
+        )
+        .expect_err("both source forms are ambiguous");
+        assert!(
+            both.contains("both `source_quote` and `source_span`"),
+            "{both}"
+        );
+        assert!(both.contains("exactly one"), "{both}");
+
+        let neither = parse_commit_declaration(
+            &json!({
+                "acceptance": ["a.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "a.txt 存在", "target": "a.txt"
+                }]
+            }),
+            user,
+        )
+        .expect_err("a requirement needs a source");
+        assert!(
+            neither.contains("needs `source_quote` or `source_span`"),
+            "{neither}"
+        );
+
+        let wrong_type = parse_commit_declaration(
+            &json!({
+                "acceptance": ["a.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                    "source_span": {"start_line": "1", "end_line": 1}
+                }]
+            }),
+            user,
+        )
+        .expect_err("line numbers are integers");
+        assert!(
+            wrong_type.contains("`requirements[0].source_span` must be an object"),
+            "{wrong_type}"
+        );
+
+        let out_of_range = parse_commit_declaration(
+            &json!({
+                "acceptance": ["a.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                    "source_span": {"start_line": 2, "end_line": 2}
+                }]
+            }),
+            user,
+        )
+        .expect_err("line 2 does not exist");
+        assert!(
+            out_of_range.contains("outside the user's message, which has 1 line(s)"),
+            "{out_of_range}"
+        );
+        assert!(
+            out_of_range.contains("not a host-pinned objective block"),
+            "the retry must not count a rendered runtime notice as user text: {out_of_range}"
+        );
+    }
+
+    /// The verbatim path stays strict: a paraphrase is still refused, and the
+    /// refusal points at the span alternative without accepting the mismatch.
+    #[test]
+    fn a_verbatim_quote_still_rejects_a_punctuation_difference() {
+        let error = parse_commit_declaration(
+            &json!({
+                "acceptance": ["stage-1.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "stage-1.txt 存在", "target": "stage-1.txt",
+                    "source_quote": "创建 stage-1.txt!"
+                }]
+            }),
+            "创建 stage-1.txt！",
+        )
+        .expect_err("the ASCII exclamation is not the user's text");
+        assert!(
+            error.contains("does not occur in the user's message"),
+            "{error}"
+        );
+        assert!(error.contains("`source_span`"), "{error}");
+    }
+
+    /// `declare_scope` deserializes directly, so its spans are resolved into
+    /// `source_quote` before serde sees the declaration. The stored operation
+    /// therefore carries the user's exact bytes, and a mixed declaration (one
+    /// span, one quote) resolves each independently.
+    #[test]
+    fn scope_operations_resolve_spans_before_the_declaration_is_applied() {
+        let mut arguments = json!({
+            "operations": [
+                {"op": "add", "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                 "source_span": {"start_line": 2, "end_line": 2}},
+                {"op": "waive", "requirement_id": "R2", "source_quote": "不必了"}
+            ]
+        });
+        resolve_scope_source_spans(&mut arguments, "第一行\n创建 a.txt！\n不必了")
+            .expect("both operations have a source");
+        let declaration: leveler_lifecycle::ScopeDeclaration =
+            serde_json::from_value(arguments).expect("the resolved declaration deserializes");
+        assert_eq!(declaration.operations[0].source_quote(), "创建 a.txt！");
+        assert_eq!(declaration.operations[1].source_quote(), "不必了");
+
+        let mut both = json!({
+            "operations": [{
+                "op": "add", "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                "source_quote": "创建 a.txt",
+                "source_span": {"start_line": 2, "end_line": 2}
+            }]
+        });
+        let error = resolve_scope_source_spans(&mut both, "第一行\n创建 a.txt！")
+            .expect_err("two sources are ambiguous");
+        assert!(
+            error.contains("both `source_quote` and `source_span`"),
+            "{error}"
+        );
+        assert!(error.contains("operations[0]"), "{error}");
     }
 
     #[test]
