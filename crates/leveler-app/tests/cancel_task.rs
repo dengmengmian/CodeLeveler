@@ -357,6 +357,239 @@ async fn continue_after_explicit_cancel_is_refused() {
     );
 }
 
+/// A window that declares its goal blocked: the goal keeps owing the work,
+/// while the session's route returns to Chat for the next message.
+fn blocked_work() -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            "c-block",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "missing credentials"}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
+/// E: `/goal cancel` ends the LOGICAL task even when the running window has
+/// not bound the goal it owes. After a blocked window the user's continuation
+/// runs as an ordinary Chat turn, and the model may not have declared against
+/// the goal before the cancel arrives. Cancelling then must settle that owed
+/// goal in the same terminal transaction; leaving it `running` would expose a
+/// row no continuation can ever re-enter (the task is cancelled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_cancel_of_a_running_unbound_window_settles_the_owed_goal() {
+    let mut responses = blocking_work();
+    responses.insert(0, blocked_work());
+    let f = fixture(responses).await;
+    // The concrete client exposes the live-turn lease. A terminal row can be
+    // committed while the admission is still held, and the next message must
+    // wait for the lease rather than only for the turn row.
+    let client = InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    client
+        .send(ClientCommand::RunGoal {
+            session_id: f.session.clone(),
+            content: "finish the inventory work".to_string(),
+            require_new_turn: false,
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 1).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while client.has_live_turn(&f.session) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the blocked window never released its admission"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals_before = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        goals_before
+            .iter()
+            .filter(|goal| goal.state == GoalState::Running)
+            .count(),
+        1,
+        "the blocked window keeps the goal owed: {goals_before:?}"
+    );
+    let session_row = leveler_storage::SessionRepository::new(&db)
+        .get(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session_row.collaboration, "chat",
+        "a blocked window hands control back: the continuation is an ordinary Chat message"
+    );
+    drop(db);
+
+    // The continuation is an ordinary Chat message; no declaration has bound
+    // it to the goal when the user cancels.
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "继续".to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    wait_for_running_turn(&f.app, &f.session).await;
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(
+        last_outcome(&db, &f.session).await,
+        "cancelled",
+        "a running task cancel must record a cancelled terminal"
+    );
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert!(
+        goals.iter().all(|goal| goal.state == GoalState::Settled),
+        "cancelling the logical task settles the goal it still owed: {goals:?}"
+    );
+}
+
+/// E2 (real client route): the UI's `继续` after a blocked window is a RESUME,
+/// not a plain chat message. Cancelling that resumed window must settle the
+/// owed goal too — and the later resume must then be refused. A resume turn
+/// carries its continuation lineage in its WAL payload; settling must not
+/// depend on the cancelled turn's own declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_cancel_of_a_resumed_window_settles_the_owed_goal() {
+    let mut responses = blocking_work();
+    responses.insert(0, blocked_work());
+    responses.push(sse(vec![finish_frame("stop")]));
+    let f = fixture(responses).await;
+    let client = InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    client
+        .send(ClientCommand::RunGoal {
+            session_id: f.session.clone(),
+            content: "finish the inventory work".to_string(),
+            require_new_turn: false,
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 1).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while client.has_live_turn(&f.session) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the blocked window never released its admission"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let db = f.app.open_database().await.unwrap();
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stores
+            .goals
+            .for_task(&task)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|goal| goal.state == GoalState::Running)
+            .count(),
+        1,
+        "the blocked window keeps its goal owed"
+    );
+    drop(db);
+
+    // Exactly what the TUI sends when the user accepts the blocked goal's
+    // `继续` affordance.
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: f.session.clone(),
+            content: "继续".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for_running_turn(&f.app, &f.session).await;
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(last_outcome(&db, &f.session).await, "cancelled");
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert!(
+        goals.iter().all(|goal| goal.state == GoalState::Settled),
+        "a cancelled resumed window must not leave its goal running: {goals:?}"
+    );
+    let turns_before = TurnRepository::new(&db)
+        .list(&f.session)
+        .await
+        .unwrap()
+        .len();
+    drop(db);
+
+    let refused = client
+        .send(ClientCommand::ResumeTask {
+            session_id: f.session.clone(),
+            content: "继续".to_string(),
+        })
+        .await;
+    refused.expect_err("a cancelled task must refuse a later resume");
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&f.session)
+            .await
+            .unwrap()
+            .len(),
+        turns_before,
+        "a refused resume must not create a turn"
+    );
+}
+
 /// B (running): cancelling the logical task while a turn runs records
 /// `cancelled`, not resumable `interrupted`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

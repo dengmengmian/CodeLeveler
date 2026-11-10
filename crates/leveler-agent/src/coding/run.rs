@@ -1829,7 +1829,7 @@ impl CodingRuntime {
         );
         let resolution_phase =
             begin_finalization_phase(&log, FINALIZATION_RESOLVING_OUTCOME, observer).await;
-        let goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
+        let mut goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
             goal_id: goal_id.clone(),
             windows_delta: result.as_ref().map(|report| report.windows).unwrap_or(1),
             // Decided from the FINAL terminal below. The draft of an outcome is
@@ -1854,6 +1854,32 @@ impl CodingRuntime {
         // user explicitly cancelled the LOGICAL task, the same stop is
         // `cancelled`: terminal, so no later `继续` can reopen the work.
         let explicit_task_cancel = interrupted && self.task_cancel.load(Ordering::SeqCst);
+        // `/goal cancel` ends the LOGICAL task, not merely the window that
+        // happens to be running. A Chat window continuing owed work may not
+        // have bound that goal when the cancel lands, so the terminal would
+        // carry no goal and leave a `running` row behind a cancelled task no
+        // continuation can re-enter. The task's running goal is the work the
+        // user is ending: settle it in this same terminal transaction, exactly
+        // as the idle cancel path does.
+        if explicit_task_cancel && goal_update.is_none() {
+            goal_update = self
+                .engine
+                .stores
+                .goals
+                .for_task(&token.task_id)
+                .await?
+                .into_iter()
+                .find(|goal| goal.state == leveler_storage::GoalState::Running)
+                .map(|goal| leveler_storage::GoalTerminalUpdate {
+                    goal_id: goal.id,
+                    // Cancelling is not a work window.
+                    windows_delta: 0,
+                    settle: true,
+                    // A cancelled task can never continue, so it also ends the
+                    // session's Goal route when that route still belongs to it.
+                    ends_session_goal: true,
+                });
+        }
         // Is this terminal a DECISION about the work (the harness finished with
         // a verdict, or the user ended it), or a fault that decided nothing?
         // Only a decision can close a goal whose work was never delivered.
