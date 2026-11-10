@@ -23,8 +23,9 @@ pub use guard::{ContentFingerprint, FileStateTracker};
 pub use repo_map::RepositoryMap;
 pub use rules::{
     MAX_RULE_BYTES, ProjectInstruction, READ_PROJECT_RULES_TOOL, RuleDeliveryPlan,
-    RuleDeliveryPolicy, RuleDeliveryReport, RuleSection, is_rule_document, load_rules,
-    plan_instructions, plan_rule_delivery, read_rule_source, render_instructions,
-    scoped_rule_sources, split_rule_sections,
+    RuleDeliveryPolicy, RuleDeliveryReport, RuleLoadIssue, RuleSection, is_rule_document,
+    load_rules, load_rules_reported, plan_instructions, plan_rule_delivery, read_rule_source,
+    read_rule_source_reported, render_instructions, scoped_rule_sources,
+    scoped_rule_sources_reported, split_rule_sections,
 };
 pub use symbols::{defines, extract_symbols};

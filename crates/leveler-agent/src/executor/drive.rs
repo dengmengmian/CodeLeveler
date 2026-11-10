@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_context::{
-    FoldRequirement, ProjectInstruction, render_instructions, scoped_rule_sources,
+    FoldRequirement, ProjectInstruction, RuleLoadIssue, render_instructions,
+    scoped_rule_sources_reported,
 };
 use leveler_lifecycle::{
     EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
@@ -2569,7 +2570,14 @@ impl Drive<'_> {
         let Some(root) = self.scoped_rule_root() else {
             return Vec::new();
         };
-        let candidates = scoped_rule_sources(&root, &self.scoped_paths);
+        let (candidates, issues) = scoped_rule_sources_reported(&root, &self.scoped_paths);
+        for issue in &issues {
+            tracing::warn!(
+                event = "scoped_rule_load_failed",
+                source = %issue.source,
+                reason = %issue.reason
+            );
+        }
         let mut dropped = false;
         let mut retained: Vec<leveler_model::PromptSegment> =
             Vec::with_capacity(self.control_context.blocks.len());
@@ -2600,11 +2608,14 @@ impl Drive<'_> {
 
     /// The nested rule documents that scope over `paths` (whether or not they
     /// are already in the context).
-    fn applicable_scoped_rules(&self, paths: &[String]) -> Vec<ProjectInstruction> {
+    fn applicable_scoped_rules(
+        &self,
+        paths: &[String],
+    ) -> (Vec<ProjectInstruction>, Vec<RuleLoadIssue>) {
         let Some(root) = self.scoped_rule_root() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        scoped_rule_sources(&root, paths)
+        scoped_rule_sources_reported(&root, paths)
     }
 
     fn scoped_rule_root(&self) -> Option<std::path::PathBuf> {
@@ -5505,7 +5516,28 @@ impl AgentHarness for Drive<'_> {
             if self.executor.registry.mutates_files(&call.name) {
                 let mut call_paths = Vec::new();
                 collect_scoped_paths_from_call(&call, &mut call_paths);
-                let applicable = self.applicable_scoped_rules(&call_paths);
+                let (applicable, rule_issues) = self.applicable_scoped_rules(&call_paths);
+                // A nested rule that exists but cannot be read is not an
+                // absent rule: the edit would otherwise run without the rule
+                // that governs it.
+                if !rule_issues.is_empty() {
+                    let reasons = rule_issues
+                        .iter()
+                        .map(|issue| format!("{} ({})", issue.source, issue.reason))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    denied_calls_this_round += 1;
+                    results[index] = Some(deny_call(
+                        &mut *self.observer,
+                        call,
+                        format!(
+                            "Edit paused before execution: project rules that apply to this \
+                             path could not be read: {reasons}. Fix the rule document, then retry."
+                        ),
+                        model_steps,
+                    ));
+                    continue;
+                }
                 let unread = applicable
                     .iter()
                     .filter(|rule| !self.has_scoped_rule(&rule.source))
