@@ -581,8 +581,8 @@ pub(crate) async fn load_goal_verification_runs(
     }
     // The live collector keeps the newest 64; a rebuilt record must answer
     // the same questions a live one would.
-    if runs.len() > 64 {
-        runs.drain(..runs.len() - 64);
+    if runs.len() > crate::executor::goal_verification::MAX_VERIFICATION_RUNS {
+        runs.drain(..runs.len() - crate::executor::goal_verification::MAX_VERIFICATION_RUNS);
     }
     Ok(runs)
 }
