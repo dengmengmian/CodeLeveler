@@ -6,10 +6,15 @@ use std::sync::Arc;
 
 use leveler_app::Application;
 use leveler_app::runtime_boot::{RuntimeBootLease, StateDirBootLiveness};
-use leveler_core::SessionId;
+use leveler_client_protocol::{RuntimeEvent, UiUsageScope};
+use leveler_core::{SessionId, TurnId};
+use leveler_engine::{EngineEvent, TurnKind};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{SessionRecord, SessionRepository, TurnRecord, TurnRepository};
+use leveler_storage::{
+    EngineStores, EventRepository, ModelRequestRecord, ModelRequestRepository, ModelRequestStore,
+    SessionRecord, SessionRepository, TurnRecord, TurnRepository,
+};
 
 /// Point `LEVELER_HOME` at an empty dir so `GlobalConfig::load()` yields the
 /// default. Tests must not depend on the developer's `~/.leveler/config.toml`.
@@ -143,4 +148,186 @@ async fn create_session_leaves_a_turn_whose_boot_cannot_be_probed_alone() {
 
     let after = only_turn(&app, &session_id).await;
     assert_eq!(after.status, "running");
+}
+
+/// A crash between a measured provider call and the turn terminal: the reaper
+/// settles the row as interrupted WITHOUT inventing a usage projection, and
+/// reopening the session rebuilds that projection from the persisted ledger.
+/// Replay and reporting are pure reads — no second settlement, no double count.
+#[tokio::test]
+async fn a_reaped_turns_measured_usage_replays_once_from_the_ledger() {
+    let (_tmp, app, session_id) = app_with_session().await;
+    let crashed = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
+    turn_of_boot(&app, &session_id, &crashed).await;
+    let turn = only_turn(&app, &session_id).await;
+    let turn_id = TurnId::new(turn.id.clone());
+    let db = app.open_database().await.unwrap();
+
+    let (kind, payload) = EngineEvent::TurnStarted {
+        turn_id: turn_id.clone(),
+        kind: TurnKind::Chat,
+    }
+    .to_row()
+    .unwrap();
+    EventRepository::new(&db)
+        .append(
+            &session_id,
+            Some(&turn_id),
+            &kind,
+            &payload,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+    // Two billed calls the provider already answered; the process died before
+    // the turn could settle them into its terminal.
+    for (input, output, cached) in [(1_000_u64, 100_u64, 900_u64), (2_000, 200, 1_800)] {
+        ModelRequestRepository::new(&db)
+            .insert(&ModelRequestRecord {
+                budget_scope: None,
+                estimated_tokens: None,
+                id: leveler_core::EventId::generate().into_inner(),
+                provider_request_id: None,
+                session_id: session_id.clone(),
+                provider: "deepseek".into(),
+                model: "m".into(),
+                input_tokens: input,
+                output_tokens: output,
+                cached_input_tokens: Some(cached),
+                reasoning_tokens: None,
+                projected_input_tokens: None,
+                projected_reasoning_tokens: None,
+                cost_usd_micros: None,
+                agent_id: None,
+                finish_reason: Some("stop".into()),
+                error_kind: None,
+                error_detail: None,
+                turn_id: Some(turn_id.as_str().to_string()),
+                latency_ms: None,
+                attempt_ms: None,
+                connect_ms: None,
+                ttft_ms: None,
+                max_event_gap_ms: None,
+                retry_count: 0,
+                kind: leveler_storage::ModelCallKind::Round,
+                created_at: leveler_core::now(),
+                reasoning_effort: None,
+            })
+            .await
+            .unwrap();
+    }
+    drop(crashed);
+
+    // Opening a fresh session is what proves the dead boot and reaps the turn.
+    app.create_session(&ModelRef::new("mock", "m"), "fresh session")
+        .await
+        .expect("create_session must succeed");
+
+    let stores = EngineStores::from_database(&db);
+    let terminal = stores
+        .events
+        .load_last_by_type(&session_id, "turn_finished", None)
+        .await
+        .unwrap()
+        .expect("the reaper must write a turn terminal");
+    assert!(
+        !terminal.payload.contains("\"usage\""),
+        "the reaper has no ledger read of its own and must not fabricate one: {}",
+        terminal.payload
+    );
+
+    // Settlement is booked, not recomputed: replay and usage queries below
+    // may read these rows but must never add a ledger or terminal row.
+    let before_rows = db.load_for_turn(&session_id, &turn_id).await.unwrap().len();
+    assert_eq!(before_rows, 2, "the two provider calls remain two rows");
+    let events_before = EventRepository::new(&db)
+        .headers(&session_id)
+        .await
+        .unwrap()
+        .len();
+
+    let (entries, _) = leveler_app::session_history::load_session_history(&db, &session_id)
+        .await
+        .unwrap();
+    let usage = entries
+        .iter()
+        .find_map(|entry| match &entry.event {
+            RuntimeEvent::TurnUsage { usage } => Some(usage.clone()),
+            _ => None,
+        })
+        .expect("reopening the session must project the settled ledger");
+    assert_eq!(
+        (
+            usage.requests,
+            usage.unmeasured_requests,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens
+        ),
+        (2, 0, 3_000, 300, Some(2_700)),
+        "both booked calls are read exactly once"
+    );
+
+    // Settlement is booked, not recomputed: neither replay nor two usage
+    // queries may add a ledger row or change the total.
+    let first = leveler_app::usage::query_usage(&db, &session_id, UiUsageScope::Session, 0)
+        .await
+        .unwrap();
+    let second = leveler_app::usage::query_usage(&db, &session_id, UiUsageScope::Session, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            first.requests,
+            first.unmeasured_requests,
+            first.input_tokens,
+            first.output_tokens,
+            first.cached_input_tokens,
+            first.cost_usd_micros,
+            first.priced_requests,
+            first.models.as_slice()
+        ),
+        (
+            second.requests,
+            second.unmeasured_requests,
+            second.input_tokens,
+            second.output_tokens,
+            second.cached_input_tokens,
+            second.cost_usd_micros,
+            second.priced_requests,
+            second.models.as_slice()
+        ),
+        "re-asking is the same durable projection; only generated_at moves"
+    );
+    assert_eq!(
+        (
+            second.requests,
+            second.unmeasured_requests,
+            second.total_tokens()
+        ),
+        (2, 0, 3_300)
+    );
+    assert_eq!(
+        db.load_for_turn(&session_id, &turn_id).await.unwrap().len(),
+        2,
+        "replay and reporting never settle usage a second time"
+    );
+    assert_eq!(
+        EventRepository::new(&db)
+            .headers(&session_id)
+            .await
+            .unwrap()
+            .len(),
+        events_before,
+        "replay is a read: it appends no duplicate terminal or settlement row"
+    );
+    let turn_report = leveler_app::usage::query_usage(&db, &session_id, UiUsageScope::Turn, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (turn_report.requests, turn_report.total_tokens()),
+        (2, 3_300),
+        "the Turn scope reads the same rows as the settled receipt"
+    );
 }
