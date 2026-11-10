@@ -2744,7 +2744,7 @@
           }
         },
         {
-          "description": "Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`.",
+          "description": "Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`.\n\nA SNAPSHOT of the request that just reported, not a delta: a provider may emit it several times while one request streams, and the consumer must replace rather than add. Turn-level accounting is settled once by [`RuntimeEvent::TurnUsage`].",
           "type": "object",
           "required": [
             "cached_input_tokens",
@@ -2783,6 +2783,25 @@
               "enum": [
                 "token_usage"
               ]
+            }
+          }
+        },
+        {
+          "description": "The settled provider usage of one finished turn, aggregated from the runtime's durable model-call ledger. Arrives before the turn terminal and is replayable; a client uses it instead of summing the transient [`RuntimeEvent::TokenUsage`] snapshots.",
+          "type": "object",
+          "required": [
+            "type",
+            "usage"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_usage"
+              ]
+            },
+            "usage": {
+              "$ref": "#/definitions/UiTurnUsage"
             }
           }
         },
@@ -2968,6 +2987,25 @@
               "type": "string",
               "enum": [
                 "turn_incomplete"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The goal stopped because the model declared it blocked.\n\nThis is a distinct terminal, not a flavour of [`Self::TurnIncomplete`]: the goal is NOT settled, the work already delivered stays real, and the user can continue it. `reason` is the model's own declared blocking summary; it is display-only and never decides the lifecycle — the durable `TaskFinished.stop` is the authority.",
+          "type": "object",
+          "required": [
+            "reason",
+            "type"
+          ],
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_blocked"
               ]
             }
           }
@@ -8011,6 +8049,49 @@
         "started_ms": {
           "type": "integer",
           "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiTurnUsage": {
+      "description": "One finished turn's provider usage, projected from the runtime's durable `model_requests` rows.\n\nThis is a settled fact, not a running sum of streamed snapshots: re-reading it after a reconnect, a resume or a replay yields the same figures. `unmeasured_requests` keeps a call whose provider reported no usage distinguishable from a measured zero.",
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "requests",
+        "unmeasured_requests"
+      ],
+      "properties": {
+        "cached_input_tokens": {
+          "description": "Subset of `input_tokens`; `None` when no row recorded it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "description": "Provider calls in the turn, retries included — each is a billed call.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "unmeasured_requests": {
+          "description": "Calls whose provider reported no usage at all.",
+          "type": "integer",
+          "format": "uint32",
           "minimum": 0.0
         }
       }

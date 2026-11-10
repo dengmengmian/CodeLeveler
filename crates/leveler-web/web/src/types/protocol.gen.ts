@@ -465,8 +465,10 @@ export type RuntimeEvent =
   | { type: 'user_shell_capture_ready'; directory: string; execution_id: UserShellId }
   /** A user shell execution ended. `status` is `success | failed | cancelled`; `exit_code` is `None` when the process was killed or never spawned. */
   | { type: 'user_shell_exited'; duration_ms: number; execution_id: UserShellId; exit_code?: number | null; status: string }
-  /** Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`. */
+  /** Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`. A SNAPSHOT of the request that just reported, not a delta: a provider may emit it several times while one request streams, and the consumer must replace rather than add. Turn-level accounting is settled once by [`RuntimeEvent::TurnUsage`]. */
   | { type: 'token_usage'; cached_input_tokens: number; input_tokens: number; output_tokens: number; reasoning_tokens?: number | null }
+  /** The settled provider usage of one finished turn, aggregated from the runtime's durable model-call ledger. Arrives before the turn terminal and is replayable; a client uses it instead of summing the transient [`RuntimeEvent::TokenUsage`] snapshots. */
+  | { type: 'turn_usage'; usage: UiTurnUsage }
   /** The accounting of the exact next model request, computed by the kernel before the request is sent. Transient: nothing persists it, and a reconnecting client gets the latest through its live view. */
   | { type: 'context_usage'; accounting: ContextAccounting }
   /** An orchestrated run completed; carries the summary report (spec §23). */
@@ -487,6 +489,8 @@ export type RuntimeEvent =
   | { type: 'turn_truncated'; error: string }
   /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
   | { type: 'turn_incomplete'; reason: string }
+  /** The goal stopped because the model declared it blocked. This is a distinct terminal, not a flavour of [`Self::TurnIncomplete`]: the goal is NOT settled, the work already delivered stays real, and the user can continue it. `reason` is the model's own declared blocking summary; it is display-only and never decides the lifecycle — the durable `TaskFinished.stop` is the authority. */
+  | { type: 'turn_blocked'; reason: string }
   /** The current turn failed. `error` is the legacy display string, kept for compatibility with older clients (CLI, Web). New presentations must prefer `failure` and must never parse `error` to decide a category, a retry, or a delivery truth. */
   | { type: 'turn_failed'; error: string; failure?: UiFailure | null; recovery?: RecoveryStop | null }
   /** The current turn was cancelled (resumable). */
@@ -1621,6 +1625,18 @@ export interface UiToolTiming {
   elapsed_ms: number;
   finished: boolean;
   started_ms: number;
+}
+
+/** One finished turn's provider usage, projected from the runtime's durable `model_requests` rows. This is a settled fact, not a running sum of streamed snapshots: re-reading it after a reconnect, a resume or a replay yields the same figures. `unmeasured_requests` keeps a call whose provider reported no usage distinguishable from a measured zero. */
+export interface UiTurnUsage {
+  /** Subset of `input_tokens`; `None` when no row recorded it. */
+  cached_input_tokens?: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  /** Provider calls in the turn, retries included — each is a billed call. */
+  requests: number;
+  /** Calls whose provider reported no usage at all. */
+  unmeasured_requests: number;
 }
 
 /** One goal that still owes work. */

@@ -92,6 +92,7 @@ fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
         TurnEndStatus::NoFinalAnswer
         | TurnEndStatus::Truncated
         | TurnEndStatus::Incomplete
+        | TurnEndStatus::Blocked
         | TurnEndStatus::AnsweredUnregistered
         | TurnEndStatus::Failed
         | TurnEndStatus::Cancelled => TerminalTaskStatus::Failed,
@@ -169,6 +170,7 @@ fn activity(state: &AppState, status: TerminalTaskStatus) -> Option<String> {
             match last_turn_end(state) {
                 Some(TurnEndStatus::Cancelled) => t.title_cancelled,
                 Some(TurnEndStatus::Failed) => t.title_failed,
+                Some(TurnEndStatus::Blocked) => t.title_blocked,
                 _ => t.title_incomplete,
             }
             .to_string(),
@@ -374,6 +376,18 @@ mod tests {
             assert!(title.starts_with("× "), "{end:?}: {title}");
             assert!(!title.contains('✓'), "{end:?}: {title}");
         }
+    }
+
+    #[test]
+    fn blocked_goal_names_its_state_in_the_title() {
+        let mut state = test_state();
+        state.transcript.push_user("Task".to_string());
+        state.status = RuntimeStatus::Idle;
+        end_turn(&mut state, TurnEndStatus::Blocked);
+        let mut p = TerminalTitleProjection::default();
+        // Not a checkmark: the goal still owes work. Not "incomplete" either:
+        // the model declared a concrete block, so the tab says so.
+        assert_eq!(p.project(&state), "× Task · 目标受阻");
     }
 
     #[test]

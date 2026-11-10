@@ -738,6 +738,21 @@ async fn a_crash_inside_the_turn_terminal_delivers_it_once() {
     assert_eq!(task_terminals(&after), 1);
     assert_eq!(task_terminals(&observed), 1);
     assert_eq!(goals(&fx).await[0].state, GoalState::Settled);
+
+    // The recovered terminal takes its accounting from the durable request
+    // ledger, not from in-memory state the crashed boot lost. The fake model
+    // reports no usage, so the single call is counted as unmeasured rather
+    // than silently folded into a measured zero.
+    let usage = observed
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::TurnFinished { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .expect("the recovery emitted a turn terminal")
+        .expect("the recovered terminal consults the request ledger");
+    assert_eq!(usage.requests, 1);
+    assert_eq!(usage.unmeasured_requests, 1);
 }
 
 /// Recovery is itself crash-safe: if the terminal commit dies again, the next

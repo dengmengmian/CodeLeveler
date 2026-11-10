@@ -743,6 +743,18 @@ async fn continue_after_a_blocked_goal_retries_the_same_record() {
         GoalState::Running,
         "a blocked goal still owes its work; only the window ended"
     );
+    let terminal = stores
+        .events
+        .load_last_by_type(&f.session, "task_finished", None)
+        .await
+        .unwrap()
+        .expect("the blocked window wrote its task terminal");
+    let terminal: serde_json::Value = serde_json::from_str(&terminal.payload).unwrap();
+    assert_eq!(
+        terminal["payload"]["reason"], "missing credentials",
+        "the model's declared blocking summary must survive as the terminal reason: {terminal}"
+    );
+    assert_eq!(terminal["payload"]["stop"], "blocked");
     drop(db);
 
     let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(

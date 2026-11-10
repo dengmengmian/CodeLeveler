@@ -755,7 +755,7 @@ fn next_step_only_recap_keeps_the_real_next_step_and_ghost() {
     ));
     assert_eq!(s.prompt_suggestion.as_deref(), Some(NEXT_STEP));
     let text = frame(&mut s, 100, 24);
-    assert!(text.contains("回顾: 下一步："), "{text}");
+    assert!(text.contains("回顾: 模型建议下一步："), "{text}");
     assert!(text.contains(NEXT_STEP), "{text}");
 }
 

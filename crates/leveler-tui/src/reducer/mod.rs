@@ -185,6 +185,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::TurnPaused { .. }
                     | RuntimeEvent::TurnTruncated { .. }
                     | RuntimeEvent::TurnIncomplete { .. }
+                    | RuntimeEvent::TurnBlocked { .. }
                     | RuntimeEvent::TurnFailed { .. }
                     | RuntimeEvent::TurnCancelled
                     | RuntimeEvent::TaskCancelled
@@ -4281,3 +4282,8 @@ mod final_nav_tests {
 
 #[cfg(test)]
 mod tool_group_elapsed_tests;
+
+#[cfg(test)]
+mod blocked_terminal_tests;
+#[cfg(test)]
+mod turn_usage_tests;

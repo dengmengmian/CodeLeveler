@@ -672,7 +672,7 @@ export class RuntimeBridge {
 
     const end = turnEndFromEvent(ev);
     if (end) {
-      // Turn Truth：7 个 runtime 终态逐一保真（incomplete/unverified 绝不折叠成
+      // Turn Truth：8 个 runtime 终态逐一保真（incomplete/unverified 绝不折叠成
       // completed）。Completed/Answered 但本回合没有 commit 的 FinalAnswer 时，
       // 终态只能是 no_final_answer —— 工具跑完不等于任务做完（Contract v1 §I9）。
       const outcome =

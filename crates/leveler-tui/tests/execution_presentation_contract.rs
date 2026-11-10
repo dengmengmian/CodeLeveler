@@ -180,6 +180,7 @@ fn turn_end_status(status: TurnEndStatus) -> &'static str {
         TurnEndStatus::AnsweredUnregistered => "answered_unregistered",
         TurnEndStatus::Truncated => "truncated",
         TurnEndStatus::Incomplete => "incomplete",
+        TurnEndStatus::Blocked => "blocked",
         TurnEndStatus::NoFinalAnswer => "no_final_answer",
         TurnEndStatus::Failed => "failed",
         TurnEndStatus::Cancelled => "cancelled",

@@ -230,6 +230,10 @@ pub enum TurnEndStatus {
     AnsweredUnregistered,
     Truncated,
     Incomplete,
+    /// The goal was declared blocked by the model: this window stopped, but
+    /// the goal is not settled and `继续` can re-enter it. Distinct from
+    /// [`Self::Incomplete`], which also covers budget and round ceilings.
+    Blocked,
     /// The loop reached a clean end without committing an answer.
     ///
     /// Tool calls finishing is not a task finishing (§12): the turn's claim to
@@ -258,11 +262,12 @@ pub struct TurnEndBlock {
     pub ended_hm: Option<String>,
     /// Model steps in this turn. Zero means the turn recorded none.
     pub rounds: u32,
-    /// This turn's provider usage, summed across its requests. Not the
-    /// session window and not the footer's next-request gauge.
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cached_tokens: u32,
+    /// This turn's provider usage, booked once by the runtime from its durable
+    /// model-call ledger. Not the session window and not the footer's
+    /// next-request gauge.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 /// Facts frozen onto a turn when it ends. Later requests must not rewrite it.
@@ -270,9 +275,9 @@ pub struct TurnEndBlock {
 pub struct TurnReceipt {
     pub ended_hm: Option<String>,
     pub rounds: u32,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cached_tokens: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 /// One terminal failure, presented exactly once.
@@ -2286,6 +2291,35 @@ impl TranscriptState {
             TranscriptItem::TurnEnd(block) => Some(block),
             _ => None,
         })
+    }
+
+    /// Apply the runtime's booked usage to the terminal that just closed.
+    ///
+    /// The normal order is booked usage first, then the display terminal (the
+    /// terminal then freezes the receipt from it). This patch exists for a
+    /// replay or out-of-order delivery where the terminal came first. Only a
+    /// terminal still at the tail of the transcript is eligible — a newer user
+    /// turn owns a new receipt and must never inherit the previous turn's
+    /// numbers. Returns whether a receipt was updated.
+    pub fn settle_last_turn_receipt(
+        &mut self,
+        usage: &leveler_client_protocol::UiTurnUsage,
+    ) -> bool {
+        let Some(index) = self.items.iter().rposition(|item| {
+            !matches!(
+                item,
+                TranscriptItem::Recap(_) | TranscriptItem::GoalRecap(_)
+            )
+        }) else {
+            return false;
+        };
+        let TranscriptItem::TurnEnd(block) = &mut self.items[index] else {
+            return false;
+        };
+        block.input_tokens = usage.input_tokens;
+        block.output_tokens = usage.output_tokens;
+        block.cached_tokens = usage.cached_input_tokens.unwrap_or(0);
+        true
     }
 
     /// The most recent terminal-failure block. Read by the Issue read model,

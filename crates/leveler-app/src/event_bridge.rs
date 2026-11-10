@@ -343,7 +343,7 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
         StopReason::TurnLimitReached => RuntimeEvent::TurnIncomplete {
             reason: "达到执行回合上限 · 已停止,请检查是否陷入循环".into(),
         },
-        StopReason::Blocked => RuntimeEvent::TurnIncomplete {
+        StopReason::Blocked => RuntimeEvent::TurnBlocked {
             reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
         },
         StopReason::Stalled => RuntimeEvent::TurnIncomplete {
@@ -458,7 +458,7 @@ fn task_finished_event(
         leveler_lifecycle::TaskOutcome::BudgetLimited => RuntimeEvent::TurnIncomplete {
             reason: reason.unwrap_or_else(|| "执行预算已用尽".to_string()),
         },
-        leveler_lifecycle::TaskOutcome::Blocked => RuntimeEvent::TurnIncomplete {
+        leveler_lifecycle::TaskOutcome::Blocked => RuntimeEvent::TurnBlocked {
             reason: reason.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
         },
         leveler_lifecycle::TaskOutcome::Completed => RuntimeEvent::TurnAnswered,
@@ -1474,10 +1474,28 @@ impl EventBridge {
                 // not append a second copy of the text.
                 let _ = self.events.send(RuntimeEvent::DeliveryCommitted { text });
             }
+            EngineEvent::TurnFinished {
+                usage: Some(usage), ..
+            } => {
+                // The settled projection of this turn's durable model-call
+                // ledger. Sent before the task terminal so a client freezes
+                // the receipt from booked usage instead of summing transient
+                // per-request snapshots. It is replayable, so a reopened
+                // session reaches the same receipt.
+                let _ = self.events.send(RuntimeEvent::TurnUsage {
+                    usage: leveler_client_protocol::UiTurnUsage {
+                        requests: usage.requests,
+                        unmeasured_requests: usage.unmeasured_requests,
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cached_input_tokens: usage.cached_input_tokens,
+                    },
+                });
+            }
+            EngineEvent::TurnFinished { usage: None, .. } => {}
             EngineEvent::SessionMetadataChanged { .. }
             | EngineEvent::TaskCancelRequested { .. }
             | EngineEvent::TaskStarted { .. }
-            | EngineEvent::TurnFinished { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
@@ -2820,6 +2838,49 @@ mod bridge_tests {
         assert!(matches!(plain, RuntimeEvent::TurnAnswered));
     }
 
+    /// A blocked goal is its own client terminal, not a generic incomplete
+    /// turn: the goal is unsettled and the same work can be re-entered. Replay
+    /// rebuilds it from the durable `TaskFinished` row through the same
+    /// mapping, so both paths must agree.
+    #[test]
+    fn a_blocked_goal_projects_as_blocked_with_its_declared_reason() {
+        let event = turn_end_event(StopReason::Blocked, Some("dead-letter data missing".into()));
+        assert!(
+            matches!(
+                &event,
+                RuntimeEvent::TurnBlocked { reason } if reason == "dead-letter data missing"
+            ),
+            "{event:?}"
+        );
+
+        let replayed = task_finished_event(
+            leveler_lifecycle::TaskOutcome::Blocked,
+            Some("dead-letter data missing".into()),
+            None,
+            Some(StopReason::Blocked),
+            Vec::new(),
+            false,
+        );
+        assert!(
+            matches!(replayed, RuntimeEvent::TurnBlocked { .. }),
+            "the replay path must reach the same terminal: {replayed:?}"
+        );
+
+        // Legacy rows carry no reason. The typed terminal still stands, and
+        // the client can tell the goal is resumable without the model's words.
+        let bare = turn_end_event(StopReason::Blocked, None);
+        assert!(matches!(bare, RuntimeEvent::TurnBlocked { .. }));
+        let legacy = task_finished_event(
+            leveler_lifecycle::TaskOutcome::Blocked,
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+        );
+        assert!(matches!(legacy, RuntimeEvent::TurnBlocked { .. }));
+    }
+
     #[test]
     fn a_budget_cutoff_tells_the_user_how_to_carry_on() {
         // Short product copy: next action (continue / /goal), not a long essay.
@@ -3311,6 +3372,45 @@ mod projection_equivalence {
         // Phase-5 structured-event migration: the compaction fact is typed;
         // clients localize ("上下文已压缩 100 → 40 条" moves to the TUI).
         assert_eq!(shapes[1], "compacted:100->40");
+    }
+
+    /// The settled projection rides on the durable turn terminal, so a live
+    /// client and a replay reach the same receipt.
+    #[test]
+    fn a_settled_turn_usage_projects_once() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::TurnFinished {
+            turn_id: leveler_core::TurnId::new("t-usage"),
+            outcome: leveler_lifecycle::TurnOutcome::Completed,
+            stop_reason: "Completed".into(),
+            stop: Some(leveler_agent::StopReason::Completed),
+            model_steps: 2,
+            modified_files: Vec::new(),
+            usage: Some(leveler_engine::TurnUsage {
+                requests: 2,
+                unmeasured_requests: 0,
+                input_tokens: 45_491_035,
+                output_tokens: 141_675,
+                cached_input_tokens: Some(44_829_952),
+            }),
+        });
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![RuntimeEvent::TurnUsage {
+                usage: leveler_client_protocol::UiTurnUsage {
+                    requests: 2,
+                    unmeasured_requests: 0,
+                    input_tokens: 45_491_035,
+                    output_tokens: 141_675,
+                    cached_input_tokens: Some(44_829_952),
+                },
+            }]
+        );
     }
 
     #[test]

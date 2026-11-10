@@ -1551,7 +1551,10 @@ fn compact_goal_recap_renders_in_history() {
         text.contains("✽ 阶段回顾 · 架构与数据层审查已完成"),
         "{text}"
     );
-    assert!(text.contains("下一步：检查 API 与验证路径"), "{text}");
+    assert!(
+        text.contains("模型建议下一步：检查 API 与验证路径"),
+        "{text}"
+    );
     // Collapsed: the structured sections stay folded away.
     assert!(!text.contains("已知限制"), "{text}");
 }

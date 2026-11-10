@@ -518,10 +518,12 @@ pub fn item_render(
         TranscriptItem::Recap(block) => {
             let text = match (&block.summary, &block.next_step) {
                 (Some(summary), Some(next_step)) => {
-                    format!("{summary} · {}{next_step}", t.recap_next_step)
+                    format!("{summary} · {}{next_step}", t.recap_model_next_step)
                 }
                 (Some(summary), None) => summary.clone(),
-                (None, Some(next_step)) => format!("{}{next_step}", t.recap_next_step),
+                (None, Some(next_step)) => {
+                    format!("{}{next_step}", t.recap_model_next_step)
+                }
                 (None, None) => return out,
             };
             push_prefixed(
@@ -634,7 +636,7 @@ fn goal_recap_lines(
             push_prefixed(
                 out,
                 "  ",
-                &format!("{}{next}", t.recap_next_step),
+                &format!("{}{next}", t.recap_model_next_step),
                 muted,
                 wrap_width,
             );
@@ -690,7 +692,7 @@ fn goal_recap_lines(
     }
     if let Some(next) = &recap.next_action {
         section(
-            t.recap_next_step.trim_end_matches([':', '：', ' ']),
+            t.recap_model_next_step.trim_end_matches([':', '：', ' ']),
             next,
             out,
         );
@@ -783,6 +785,9 @@ pub(crate) fn turn_end_marker(
             theme.status.warning,
         ),
         TurnEndStatus::Incomplete => (format!("⚠ {}", t.final_blocked), theme.status.warning),
+        // A blocked goal is not a generic incomplete run: the window stopped,
+        // the goal is still owed and `继续` can re-enter it.
+        TurnEndStatus::Blocked => (format!("⚠ {}", t.final_goal_blocked), theme.status.warning),
         // Not a failure — the run may have done real work — but not a
         // completion either. The wording names exactly what is missing.
         TurnEndStatus::NoFinalAnswer => (
@@ -835,7 +840,7 @@ fn turn_receipt_stats(block: &TurnEndBlock, t: &crate::i18n::UiText) -> String {
         ));
     }
     if block.input_tokens > 0 && block.cached_tokens > 0 {
-        let pct = (u64::from(block.cached_tokens) * 100 / u64::from(block.input_tokens)).min(100);
+        let pct = (block.cached_tokens * 100 / block.input_tokens).min(100);
         parts.push(t.turn_cache.replacen("{}", &pct.to_string(), 1));
     }
     if matches!(
@@ -869,8 +874,13 @@ fn turn_end_lines(
     let star = "* ";
     let mut detail_below = false;
     let unregistered = block.status == TurnEndStatus::AnsweredUnregistered;
+    let blocked = block.status == TurnEndStatus::Blocked;
     let detail = if unregistered {
         Some(t.turn_unregistered_detail)
+    } else if blocked {
+        // The blocked reason is model text with its own provenance line; the
+        // runtime-diagnostic localizer below must not rewrite it.
+        None
     } else {
         block.detail.as_deref()
     };
@@ -944,6 +954,35 @@ fn turn_end_lines(
             localized_turn_detail(actual, t),
             width.saturating_sub(4).max(8),
         ) {
+            out.push(Line::from(Span::styled(
+                format!("   {line}"),
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
+    }
+    // A blocked terminal carries three separate facts: why the model stopped
+    // (its own words, labelled as such), that the goal is still owed, and the
+    // two actions the user actually has. The reason is never fed through the
+    // runtime-diagnostic localizer — that would rewrite model prose.
+    if blocked {
+        if let Some(reason) = block
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        {
+            let text = t.blocked_reason.replacen("{}", reason, 1);
+            for line in wrap(&text, width.saturating_sub(4).max(8)) {
+                out.push(Line::from(Span::styled(
+                    format!("   {line}"),
+                    Style::default().fg(theme.text.secondary),
+                )));
+            }
+        }
+        let actions = t
+            .blocked_next_actions
+            .replacen("{}", t.suggestion_continue, 1);
+        for line in wrap(&actions, width.saturating_sub(4).max(8)) {
             out.push(Line::from(Span::styled(
                 format!("   {line}"),
                 Style::default().fg(theme.text.secondary),
@@ -3151,10 +3190,41 @@ mod tests {
         // Budget/loop/stall incompletes read as "未完成", not the old "被阻塞".
         let incomplete = turn_end_text(TurnEndStatus::Incomplete, Some("预算已耗尽"));
         assert!(incomplete.contains("⚠ 未完成"), "{incomplete}");
+        let blocked = turn_end_text(TurnEndStatus::Blocked, Some("数据未就绪"));
+        assert!(
+            blocked.contains("⚠ 目标受阻"),
+            "a blocked goal names its own state, not the generic incomplete word: {blocked}"
+        );
         let failed = turn_end_text(TurnEndStatus::Failed, Some("boom"));
         assert!(failed.contains("✗ 失败"), "{failed}");
         let cancelled = turn_end_text(TurnEndStatus::Cancelled, None);
         assert!(cancelled.contains("⊘ 已取消"), "{cancelled}");
+    }
+
+    /// The blocked terminal tells the reader three separate facts: the model's
+    /// declared reason, that the goal is still open, and what they can do now.
+    /// The reason is model text — it must not be rewritten by the machine-token
+    /// localizer, which owns runtime diagnostics.
+    #[test]
+    fn a_blocked_terminal_names_the_reason_the_open_goal_and_the_next_actions() {
+        let reason = "update_goal 已声明：缺少对账数据，无法继续旅程验证";
+        let text = turn_end_text(TurnEndStatus::Blocked, Some(reason));
+        assert!(text.contains("模型说明"), "{text:?}");
+        assert!(
+            text.contains(reason),
+            "the model's own blocking summary must survive verbatim: {text:?}"
+        );
+        assert!(text.contains("目标未结束"), "{text:?}");
+        assert!(
+            text.contains("继续") && text.contains("/goal cancel"),
+            "the user must be told how to resume or end the goal: {text:?}"
+        );
+
+        let incomplete = turn_end_text(TurnEndStatus::Incomplete, Some("预算已耗尽"));
+        assert!(
+            !incomplete.contains("/goal cancel"),
+            "an ordinary incomplete turn must not borrow the blocked panel: {incomplete:?}"
+        );
     }
 
     #[test]

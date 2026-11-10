@@ -460,16 +460,15 @@ pub struct AppState {
     pub context_tokens: u32,
     /// Latest model-reported input/output tokens for the current conversation.
     /// The status line and the footer read this last request. The turn receipt
-    /// does not: that one sums [`Self::turn_input_tokens`].
+    /// does not: its authority is [`Self::settled_turn_usage`].
     pub token_input: u32,
     pub token_output: u32,
     /// Prefix-cache hits within `token_input`, from the last round.
     pub token_cached: u32,
-    /// Provider usage summed across the turn in progress. Copied onto the
-    /// turn receipt when the turn ends, then cleared. Not the window gauge.
-    pub turn_input_tokens: u32,
-    pub turn_output_tokens: u32,
-    pub turn_cached_tokens: u32,
+    /// The finished turn's booked usage, projected from the runtime's durable
+    /// `model_requests` rows. This is the receipt's only token authority: the
+    /// client keeps no second per-turn sum of the transient request snapshots.
+    pub settled_turn_usage: Option<leveler_client_protocol::UiTurnUsage>,
     /// Conversation checkpoints (restore points, spec §68).
     pub checkpoints: Vec<UiCheckpoint>,
 
@@ -829,9 +828,7 @@ impl AppState {
             token_input: 0,
             token_output: 0,
             token_cached: 0,
-            turn_input_tokens: 0,
-            turn_output_tokens: 0,
-            turn_cached_tokens: 0,
+            settled_turn_usage: None,
             checkpoints: Vec::new(),
             overlay: None,
             pending_interactions: VecDeque::new(),

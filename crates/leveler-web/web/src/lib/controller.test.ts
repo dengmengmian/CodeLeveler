@@ -625,6 +625,17 @@ describe('event closure', () => {
     expect(state.current?.lastTurn?.detail).toBe('budget');
   });
 
+  it('turn_blocked ends the window as a resumable blocked goal, not completed', () => {
+    const { apply, state } = harness();
+    reducer(state, { type: 'turn_active', value: true });
+    apply({ type: 'turn_blocked', reason: '缺少死信数据' });
+    expect(state.current?.turnActive).toBe(false);
+    expect(state.current?.lastTurn).toMatchObject({
+      outcome: 'blocked',
+      detail: '缺少死信数据',
+    });
+  });
+
   it('completed-with-warnings is terminal, preserves its reason, and clears active state', () => {
     const { apply, state } = harness();
     reducer(state, { type: 'turn_active', value: true });

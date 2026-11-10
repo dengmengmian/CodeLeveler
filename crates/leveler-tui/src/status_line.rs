@@ -216,7 +216,7 @@ pub(crate) fn status_control_fields_fit(state: &AppState, max_width: usize) -> b
 }
 
 /// Compact magnitude for footer context: `41181 → 41k`, `1048576 → 1M`.
-pub(crate) fn fmt_tokens_compact(n: u32) -> String {
+pub(crate) fn fmt_tokens_compact(n: u64) -> String {
     if n >= 1_000_000 {
         let whole = n / 1_000_000;
         let frac = (n % 1_000_000) / 100_000;
@@ -276,7 +276,7 @@ fn footer_context_usage(state: &AppState) -> Option<(u64, u64, u64)> {
 /// Compact context chip. Hidden until usage and a denominator are known.
 pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
     let (_, total, percent) = footer_context_usage(state)?;
-    Some(format!("{}%/{}", percent, fmt_tokens_compact(total as u32)))
+    Some(format!("{}%/{}", percent, fmt_tokens_compact(total)))
 }
 
 /// Prefix-cache hit rate when the provider reported cached tokens.

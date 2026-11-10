@@ -10831,6 +10831,7 @@ mod recovered_continuation_tests {
                 stop_reason: "unclean process exit".into(),
                 model_steps: 0,
                 modified_files: Vec::new(),
+                usage: None,
             };
             let (kind, payload) = late.to_row().unwrap();
             leveler_storage::EventRepository::new(&db)

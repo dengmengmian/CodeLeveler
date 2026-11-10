@@ -10,6 +10,7 @@ describe('turn truth', () => {
       [{ type: 'turn_answered' }, 'answered'],
       [{ type: 'turn_truncated', error: 'limit' }, 'truncated'],
       [{ type: 'turn_incomplete', reason: 'budget' }, 'incomplete'],
+      [{ type: 'turn_blocked', reason: '缺少死信数据' }, 'blocked'],
       [{ type: 'turn_failed', error: 'boom' }, 'failed'],
       [{ type: 'turn_cancelled' }, 'cancelled'],
       [{ type: 'task_cancelled' }, 'cancelled'],
@@ -50,6 +51,14 @@ describe('turn truth', () => {
     const incomplete = presentTurnEnd({ outcome: 'incomplete', detail: 'budget exhausted' });
     expect(incomplete.label).toBe('未完成');
     expect(incomplete.tone).toBe('warn');
+    const blocked = presentTurnEnd({
+      outcome: 'blocked',
+      detail: '缺少死信/对账数据，无法完成旅程验证',
+    });
+    expect(blocked.label).toBe('目标受阻');
+    expect(blocked.tone).toBe('warn');
+    // The model's declared blocking summary is shown verbatim.
+    expect(blocked.detail).toBe('缺少死信/对账数据，无法完成旅程验证');
   });
 
   it('keeps ordinary command and review progress labels', () => {

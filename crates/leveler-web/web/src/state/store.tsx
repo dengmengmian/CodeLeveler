@@ -127,7 +127,7 @@ export interface QueuedMessage {
   text: string;
 }
 
-/** 上一回合终态：7 个 runtime 终态逐一保真（Turn Truth），detail 永不丢。 */
+/** 上一回合终态：8 个 runtime 终态逐一保真（Turn Truth），detail 永不丢。 */
 export interface LastTurn {
   outcome: TurnOutcome;
   ms: number;
