@@ -339,22 +339,11 @@ fn scope_label(u: &crate::i18n::UsageText, scope: UiUsageScope) -> &'static str 
     }
 }
 
-/// Token magnitudes, formatted the same way the Context section formats them:
-/// `999`, `1.2k`, `51.8k`, `1.2M`.
+/// Exact token counts with thousands separators: `999`, `6,100`, `45,632,710`.
+/// The usage page is where accounting is read; a compact magnitude would hide
+/// digits the ledger actually holds.
 fn fmt_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        trim_zero(n as f64 / 1_000_000.0, "M")
-    } else if n >= 1_000 {
-        trim_zero(n as f64 / 1_000.0, "k")
-    } else {
-        n.to_string()
-    }
-}
-
-fn trim_zero(v: f64, suffix: &str) -> String {
-    let s = format!("{v:.1}");
-    let s = s.strip_suffix(".0").unwrap_or(&s);
-    format!("{s}{suffix}")
+    crate::status_line::fmt_tokens_u64(n)
 }
 
 #[cfg(test)]
@@ -389,6 +378,17 @@ mod tests {
                 priced_requests: 0,
             }],
         }
+    }
+
+    #[test]
+    fn token_figures_keep_every_digit_the_ledger_has() {
+        // The usage page is where accounting is read. A compact magnitude
+        // would turn a measured 45,632,710 into 45.6M and hide the digits the
+        // receipt claims to report.
+        assert_eq!(fmt_count(45_632_710), "45,632,710");
+        assert_eq!(fmt_count(6_100), "6,100");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(0), "0");
     }
 
     #[test]
