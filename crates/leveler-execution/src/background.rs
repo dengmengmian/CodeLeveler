@@ -5106,8 +5106,10 @@ mod tests {
     }
 
     /// Answers from a fixed table so a test controls what the engine can prove.
+    #[cfg(unix)]
     struct LivenessByBoot(HashMap<&'static str, BootLiveness>);
 
+    #[cfg(unix)]
     impl BootLivenessProbe for LivenessByBoot {
         fn liveness(&self, boot: &BootId) -> BootLiveness {
             self.0

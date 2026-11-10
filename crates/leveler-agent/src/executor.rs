@@ -2588,7 +2588,7 @@ impl Executor {
                 detail = %error.detail
             );
             diagnostics.push(format!(
-                "The project rule source `{}` could not be loaded ({}: {}). Its rules are NOT \
+                "The project rule source `{}` could not be read ({}: {}). Its rules are NOT \
                  in your context; do not treat this as an empty rule set.",
                 error.source,
                 error.kind.as_key(),

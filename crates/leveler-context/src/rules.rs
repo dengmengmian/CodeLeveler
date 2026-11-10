@@ -874,16 +874,28 @@ fn read_rule_source_in(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleRea
             "not a project rule document",
         ));
     }
-    let canonical = match root.join(rel).canonicalize() {
-        Ok(path) => path,
+    let path = root.join(rel);
+    // `symlink_metadata` sees the entry itself, so a dangling symlink is
+    // present-but-broken, while a genuinely missing candidate stays absent.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RuleSourceRead::Absent);
         }
         Err(error) => return Err(RuleReadError::from_io(rel, &error)),
+    }
+    let canonical = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RuleReadError::new(
+                rel,
+                RuleReadErrorKind::Io,
+                "dangling symlink",
+            ));
+        }
+        Err(error) => return Err(RuleReadError::from_io(rel, &error)),
     };
-    // `Path::starts_with` compares whole components, so `/ws-evil` does not
-    // pass for `/ws`.
-    if !canonical.starts_with(root) {
+    if !workspace_contains(root, &canonical) {
         return Err(RuleReadError::new(
             rel,
             RuleReadErrorKind::OutsideWorkspace,
@@ -920,6 +932,27 @@ fn read_rule_source_in(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleRea
         source: rel.to_string(),
         content: trimmed.to_string(),
     }))
+}
+
+/// Whether `target` is `root` or below it. Both paths must already be
+/// canonical, so a symlink cannot vouch for its own containment.
+fn workspace_contains(root: &Path, target: &Path) -> bool {
+    if target.starts_with(root) {
+        return true;
+    }
+    // Windows paths compare case-insensitively; canonicalize does not
+    // normalize the casing of every component (and the drive letter may
+    // differ). `starts_with` above is therefore not sufficient there.
+    #[cfg(windows)]
+    {
+        let root = root.to_string_lossy().to_lowercase();
+        let target = target.to_string_lossy().to_lowercase();
+        return target.strip_prefix(&root).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/')
+        });
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// Whether `rel` is a rule document this product loads: an `AGENTS.md` in any
