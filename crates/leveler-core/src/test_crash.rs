@@ -57,9 +57,21 @@ fn crash(name: &str) {
         let pid = std::process::id().to_string();
         // SIGKILL, not abort/exit: the whole point is an unclean death with no
         // destructor, no flush and no recovery path running in this process.
-        let _ = std::process::Command::new("kill")
+        let sent = std::process::Command::new("kill")
             .args(["-9", &pid])
-            .status();
+            .status()
+            .is_ok_and(|status| status.success());
+        if sent {
+            // `kill` is a separate process: its successful exit proves the
+            // signal was SENT, not that this process already received it.
+            // SIGKILL is delivered on the next kernel boundary, so returning
+            // straight to the `abort()` fallback races that delivery and
+            // turns a valid cut into SIGABRT under load (observed in the
+            // concurrent crash matrix). A sleep is that kernel boundary; the
+            // pending SIGKILL terminates the process inside it. Reaching the
+            // fallback after this means the signal was never sent.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
     // A platform without `kill`, or a failed signal, must not let the run
     // continue as if the cut happened; fail loudly and uncleanly.
