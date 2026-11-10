@@ -2712,8 +2712,9 @@ impl Executor {
                  is the same false completion. An objective that conflicts with a constraint \
                  that must not be changed is blocked.\n\
                  Record the user's stated deliverables and constraints with declare_scope, each \
-                 anchored to a verbatim source_quote from the user's message; the completion \
-                 gate enforces exactly that recorded set.\n\
+                 anchored to the user's message by a verbatim source_quote or a source_span \
+                 naming its 1-based line range; the completion gate enforces exactly that \
+                 recorded set.\n\
                  A delegated sub-task that returns is input to the goal, not a resolution of \
                  the goal.\n",
             );

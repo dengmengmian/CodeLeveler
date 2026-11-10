@@ -9,7 +9,7 @@
 | 决策 | Owner |
 | --- | --- |
 | 用户要求了什么（交付物、约束、禁止项） | 模型，阅读用户消息后声明 |
-| 引用的片段是否真的出现在最新用户输入里 | Runtime（`quote_is_in_input`） |
+| 引用的 quote 或 span 是否解析出真实用户原文 | Runtime（`quote_is_in_input` / `resolve_source_span`） |
 | 需求属于哪个 Goal | Runtime（本轮绑定的 Goal） |
 | 需求身份（`R1`、`R2`…)、状态与顺序 | `leveler_lifecycle::apply_scope_declaration` |
 | 持久结果 | `leveler-storage`（有序 `goal_requirement_events`，迁移 0055） |
@@ -31,6 +31,7 @@ quote 只证明来源存在，不证明模型的解释正确；原始用户消�
 | `text` | 模型陈述的需求本身。 |
 | `target` | 路径、文本位置或精确命令；需要目标的种类必填。 |
 | `source_quote` | 声明所锚定的用户消息原文片段。 |
+| `source_span` | 仅声明时可用的 `source_quote` 替代：1-based 闭区间行号。Runtime 从权威消息中切出原文并存为 `source_quote`，不保留坐标。 |
 | `check` | 模型为该项关联的可选验收检查。 |
 | `state` | `active`、`waived` 或 `superseded`。 |
 | `superseded_by` | replace 退休旧项后，指向替代它的新 id。 |
@@ -47,10 +48,17 @@ quote 只证明来源存在，不证明模型的解释正确；原始用户消�
 
 两个结构化入口，都由模型调用：
 
-- `commit_task(requirements=[{kind, text, target, source_quote, check}])`：Chat
-  轮注册任务时声明初始集合，按数组顺序应用，生成 `R1..Rn`。
+- `commit_task(requirements=[{kind, text, target, source_quote | source_span, check}])`：
+  Chat 轮注册任务时声明初始集合，按数组顺序应用，生成 `R1..Rn`。
 - `declare_scope({operations: [...]})`：修改已绑定 Goal 的集合。`/goal` 轮、
   恢复的 Goal、已提交任务的补充需求都使用同一套操作。
+
+每个条目必须且只能提供一种来源引用。`source_quote` 是模型逐字复制的文本；
+`source_span` 指向权威用户消息的行范围（1-based、闭区间；`\n` 分行，末尾一个
+换行不额外产生一行），由 Runtime 自己切出原始字节。因此模型输出里的标点宽度、
+重新换行或 Unicode 归一化选择，不会把真实的用户需求变成被拒声明。两者同时提供
+会被拒绝：Runtime 不猜模型想用哪一个。两种形式都不接受改写，也不做模糊等价
+（全角/半角、编辑距离或正则修复）。
 
 ```json
 {
@@ -76,9 +84,12 @@ id，`restore` 恢复已 waived 的需求。声明按数组顺序应用，复合
 1. **Schema 与边界。** 未知种类 / 操作拒绝；text、quote、target、reason 都有
    明确长度上限；单次声明最多 `SCOPE_OPERATIONS_MAX` 个操作，单个 Goal 最多
    `SCOPE_REQUIREMENTS_MAX` 项有效需求。
-2. **来源。** 每个操作的 `source_quote` 必须出现在 transcript 中最新的用户输入
-   里（精确匹配，或折叠连续空白后匹配）。旧消息不能授权一个可能已被新消息反转
-   的变更。
+2. **来源。** 每个条目的 `source_quote` 必须出现在权威用户文本里（精确匹配，或
+   折叠连续空白后匹配）。`source_span` 会先在同一文本上解析；切出的结果按构造
+   就是精确子串，因此严格校验仍然成立。`declare_scope` 的权威文本是 transcript
+   中最新的用户输入：旧消息不能授权一个可能已被新消息反转的变更。`commit_task`
+   的种子锚定它所记录的 task objective（用户消息；后续 amendment 会追加到
+   其上），因为初始范围描述的是被提交的任务，而不是对它的变更。
 3. **身份。** 目标只能是本轮绑定的 Goal。操作未知 id 或非 active 的需求会被
    拒绝，并给出当前状态。
 4. **转换合法性与顺序。** `amend`、`waive` 要求 active；`restore` 要求 waived；

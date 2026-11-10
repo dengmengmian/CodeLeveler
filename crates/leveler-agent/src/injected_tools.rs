@@ -390,9 +390,11 @@ fn requirement_target_contract() -> String {
 pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Change this goal's recorded requirements when the user's newest message adds, \
-            amends, replaces, waives or restores something. `source_quote` must copy the part \
-            of the user's newest message that carries the change — the runtime checks that it \
-            really occurs there, so never paraphrase or invent one. Use requirement ids from \
+            amends, replaces, waives or restores something. Every operation needs \
+            `source_quote` or `source_span` naming the part of the user's newest message that \
+            carries the change — the runtime checks the quote really occurs there (a span is \
+            extracted from the message itself), so never paraphrase or invent one. Use \
+            requirement ids from \
             commit_task or get_goal_scope. `add` mints a new id and needs `kind` and `text`; \
             `amend` changes fields of an active requirement; `replace` retires an active \
             requirement and mints a new id carrying the replacement; `waive` marks an active \
@@ -443,7 +445,17 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             },
                             "source_quote": {
                                 "type": "string",
-                                "description": "Verbatim span of the user's newest message that states this change. Whitespace differences are tolerated; paraphrases are not."
+                                "description": "Verbatim span of the user's newest message that states this change. Whitespace differences are tolerated; paraphrases are not. Give either `source_quote` or `source_span`, not both."
+                            },
+                            "source_span": {
+                                "type": "object",
+                                "description": "1-based inclusive line range of the user's newest message that states this change. Count only the text the user typed: a host-pinned objective block or any other runtime notice is a separate message, not part of it. The runtime extracts the original text itself, so punctuation width and line wrapping cannot refuse a real user statement. Lines are separated by newlines; a final trailing newline adds no line. Give either `source_span` or `source_quote`, not both. Prefer this when exact punctuation is easy to mistype.",
+                                "properties": {
+                                    "start_line": {"type": "integer", "minimum": 1},
+                                    "end_line": {"type": "integer", "minimum": 1}
+                                },
+                                "required": ["start_line", "end_line"],
+                                "additionalProperties": false
                             },
                             "check": {
                                 "type": "string",
@@ -454,7 +466,11 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                                 "description": "Optional short note, especially for waive or replace: why the requirement changed."
                             }
                         },
-                        "required": ["op", "source_quote"],
+                        "required": ["op"],
+                        "oneOf": [
+                            {"required": ["source_quote"]},
+                            {"required": ["source_span"]}
+                        ],
                         "additionalProperties": false
                     }
                 }
@@ -481,9 +497,10 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
     let description = String::from(
         "State what the user's newest message means for the task lifecycle. Call this \
             BEFORE continuing, pausing, changing or cancelling an existing goal, from any \
-            language or phrasing. `source_quote` must copy the part of the user's newest \
-            message that carries the instruction — the runtime checks that it really occurs \
-            there, so never paraphrase or invent one. Put the operations in the order the \
+            language or phrasing. `source_quote` or `source_span` must name the part of the \
+            user's newest message that carries the instruction — the runtime checks the quote \
+            really occurs there (a span is extracted from the message itself), so never \
+            paraphrase or invent one. Put the operations in the order the \
             user meant them: `continue_task` releases a pause, `pause_task` stops at a \
             boundary, `set_pause_boundary` / `replace_pause_boundary` move a future boundary \
             without releasing a current pause, `amend_current_task` records a refinement of \
@@ -504,7 +521,17 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
             "properties": {
                 "source_quote": {
                     "type": "string",
-                    "description": "Verbatim span of the user's newest message that this declaration interprets. Whitespace differences are tolerated; paraphrases are not."
+                    "description": "Verbatim span of the user's newest message that this declaration interprets. Whitespace differences are tolerated; paraphrases are not. Give either `source_quote` or `source_span`, not both."
+                },
+                "source_span": {
+                    "type": "object",
+                    "description": "1-based inclusive line range of the user's newest message that this declaration interprets. Count only the text the user typed: a host-pinned objective block or any other runtime notice is a separate message, not part of it. The runtime extracts the original text itself, so punctuation width and line wrapping cannot refuse a real instruction. Lines are separated by newlines; a final trailing newline adds no line. Give either `source_span` or `source_quote`, not both. Prefer this when exact punctuation is easy to mistype.",
+                    "properties": {
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "end_line": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["start_line", "end_line"],
+                    "additionalProperties": false
                 },
                 "goal_id": {
                     "type": "string",
@@ -559,7 +586,11 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
                     "description": "Ordered operations. Applied in this order."
                 }
             },
-            "required": ["source_quote", "operations"],
+            "required": ["operations"],
+            "oneOf": [
+                {"required": ["source_quote"]},
+                {"required": ["source_span"]}
+            ],
             "additionalProperties": false
         }),
     }
@@ -583,9 +614,9 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             objective, so `objective` is unused. \
             `acceptance` lists the concrete checks that will prove it. If the user stated \
             explicit deliverables or constraints, declare them in `requirements`, one entry \
-            each, with a verbatim `source_quote` from the user's message: that structured set \
-            is what the completion gate reads, and the runtime never re-derives it from prose. \
-            After the commit, the \
+            each, with `source_quote` or `source_span` pointing at the user's message: that \
+            structured set is what the completion gate reads, and the runtime never re-derives \
+            it from prose. After the commit, the \
             runtime keeps this turn running: a stage summary or a quiet end does NOT finish the \
             task. Continue the work and resolve it with update_goal(complete|blocked). Do not \
             substitute update_plan for the acceptance contract: a plan records intended steps, \
@@ -615,7 +646,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                 "requirements": {
                     "type": "array",
                     "maxItems": 40,
-                    "description": "The user's stated deliverables and constraints, one entry each with a verbatim quote. Omit if none beyond the objective.",
+                    "description": "The user's stated deliverables and constraints, one entry each with a `source_quote` or `source_span`. Omit if none beyond the objective.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -639,14 +670,28 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                             },
                             "source_quote": {
                                 "type": "string",
-                                "description": "Verbatim span of the user's message that states it; the runtime checks it occurs there."
+                                "description": "Verbatim span of the user's message that states it; the runtime checks it occurs there. Alternative: `source_span`."
+                            },
+                            "source_span": {
+                                "type": "object",
+                                "description": "1-based inclusive line range in the user's message; the runtime cuts that text itself. Count only the text the user typed: a host-pinned objective block or any other runtime notice is a separate message, not part of it. Use instead of `source_quote`, not both.",
+                                "properties": {
+                                    "start_line": {"type": "integer", "minimum": 1},
+                                    "end_line": {"type": "integer", "minimum": 1}
+                                },
+                                "required": ["start_line", "end_line"],
+                                "additionalProperties": false
                             },
                             "check": {
                                 "type": "string",
                                 "description": "One `acceptance` entry covering it, copied exactly."
                             }
                         },
-                        "required": ["kind", "text", "source_quote"],
+                        "required": ["kind", "text"],
+                        "oneOf": [
+                            {"required": ["source_quote"]},
+                            {"required": ["source_span"]}
+                        ],
                         "additionalProperties": false
                     }
                 },
@@ -1589,6 +1634,96 @@ mod tests {
         }
     }
 
+    /// Every declaration entry that needs provenance advertises both forms:
+    /// a verbatim quote, or a line span the runtime cuts itself. The runtime
+    /// enforces exactly one; the schema must not imply that copying is the
+    /// only accepted form, because that is what made punctuation width decide
+    /// whether a real requirement could be recorded.
+    #[test]
+    fn source_references_offer_quote_or_span_in_every_declaration_schema() {
+        for (tool_name, entry) in [
+            (
+                COMMIT_TASK_TOOL,
+                commit_task_tool_definition().input_schema["properties"]["requirements"]["items"]
+                    .clone(),
+            ),
+            (
+                DECLARE_SCOPE_TOOL,
+                declare_scope_tool_definition().input_schema["properties"]["operations"]["items"]
+                    .clone(),
+            ),
+            (
+                DECLARE_INTENT_TOOL,
+                declare_intent_tool_definition().input_schema.clone(),
+            ),
+        ] {
+            let span = &entry["properties"]["source_span"];
+            assert_eq!(
+                span["type"], "object",
+                "{tool_name} must advertise `source_span`"
+            );
+            for field in ["start_line", "end_line"] {
+                assert_eq!(
+                    span["properties"][field]["type"], "integer",
+                    "{tool_name}.source_span.{field} must be an integer"
+                );
+                assert_eq!(
+                    span["properties"][field]["minimum"], 1,
+                    "{tool_name}.source_span.{field} is 1-based"
+                );
+            }
+            assert_eq!(
+                span["required"],
+                serde_json::json!(["start_line", "end_line"]),
+                "{tool_name}: a span needs both ends"
+            );
+            let quote_description = entry["properties"]["source_quote"]["description"]
+                .as_str()
+                .expect("quote description");
+            let span_description = span["description"].as_str().expect("span description");
+            assert!(
+                quote_description.contains("source_span") && span_description.contains("not both"),
+                "{tool_name} must advertise both source forms and state the exactly-one rule: \
+                 quote={quote_description} span={span_description}"
+            );
+            assert!(
+                span_description.contains("host-pinned"),
+                "{tool_name}: a rendered objective pin is not part of the user's message, and the \
+                 model counts lines from what it sees: {span_description}"
+            );
+            let required = entry["required"]
+                .as_array()
+                .expect("required list")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(
+                !required.contains(&"source_quote"),
+                "{tool_name}: requiring the copy contradicts the span alternative: {required:?}"
+            );
+            let exactly_one = entry["oneOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool_name} must express the exactly-one dependency"));
+            let required_sets = exactly_one
+                .iter()
+                .map(|branch| {
+                    branch["required"]
+                        .as_array()
+                        .expect("each branch names a required field")
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                required_sets,
+                vec![vec!["source_quote"], vec!["source_span"]],
+                "{tool_name}: exactly one source form must be expressed in the schema, \
+                 otherwise the model can omit both and pay a full retry"
+            );
+        }
+    }
+
     /// The Chat delegation surface is a fixed cost on every ordinary turn.
     /// Keep it small and make the number visible to the performance record.
     ///
@@ -1596,6 +1731,13 @@ mod tests {
     /// alternative is a second `declare_scope` round after the commit, which
     /// costs one full model request (thousands of cached tokens and a round
     /// trip) instead of ~300 definition tokens.
+    ///
+    /// It also includes the `source_span` alternative to a verbatim quote.
+    /// That alternative prevents a refused first declaration when the model
+    /// copies punctuation in a different width or normalization; the retry is
+    /// another full model request, while the field itself is a bounded fixed
+    /// cost. The ceiling leaves room for that one declared field, not for a
+    /// second schema-sized surface.
     #[test]
     fn commit_task_surface_stays_small() {
         let tool = commit_task_tool_definition();
@@ -1603,7 +1745,7 @@ mod tests {
             + leveler_model::estimate_text(&tool.input_schema.to_string());
         let guidance = leveler_model::estimate_text(TASK_COMMIT_GUIDANCE);
         println!("commit_task schema tokens: {tokens}; guidance tokens: {guidance}");
-        assert!(tokens < 1000, "commit_task surface grew to {tokens} tokens");
+        assert!(tokens < 1150, "commit_task surface grew to {tokens} tokens");
         assert!(guidance < 300, "task guidance grew to {guidance} tokens");
     }
 
