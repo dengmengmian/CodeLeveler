@@ -77,6 +77,65 @@ mod execution_kind_tests {
     }
 }
 
+/// One turn's provider usage, aggregated from its durable `model_requests`
+/// rows.
+///
+/// This is a projection of the runtime's own ledger, never an accumulation of
+/// transient stream events: re-reading it after a reconnect, a resume or a
+/// replay yields the same figures. `unmeasured_requests` keeps an absence of
+/// provider measurement visible instead of folding it into zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TurnUsage {
+    /// Provider calls in this turn, retries included — each is a billed call.
+    #[serde(default)]
+    pub requests: u32,
+    /// Calls whose provider reported no usage at all. They are counted as
+    /// requests but contribute no tokens.
+    #[serde(default)]
+    pub unmeasured_requests: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Subset of `input_tokens`; `None` when no row recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+}
+
+impl TurnUsage {
+    /// Aggregate the rows the engine persisted for one turn.
+    pub fn from_records(rows: &[leveler_storage::ModelRequestRecord]) -> Self {
+        let mut usage = Self::default();
+        for row in rows {
+            // A provider health probe is runtime diagnostics, never a turn's
+            // spend. The turn-scoped query should exclude it already; keeping
+            // the rule here makes the projection total.
+            if row.kind == leveler_storage::ModelCallKind::ProviderProbe {
+                continue;
+            }
+            usage.requests = usage.requests.saturating_add(1);
+            if row.input_tokens == 0 && row.output_tokens == 0 {
+                usage.unmeasured_requests = usage.unmeasured_requests.saturating_add(1);
+            }
+            usage.input_tokens = usage.input_tokens.saturating_add(row.input_tokens);
+            usage.output_tokens = usage.output_tokens.saturating_add(row.output_tokens);
+            if let Some(cached) = row.cached_input_tokens {
+                usage.cached_input_tokens = Some(
+                    usage
+                        .cached_input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(cached),
+                );
+            }
+        }
+        usage
+    }
+
+    /// `input + output`. Cached input is a slice of `input_tokens`, never an
+    /// addition.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// Legacy plan-node status (kept as a plain enum for event replay only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +312,12 @@ pub enum EngineEvent {
         #[serde(rename = "rounds")]
         model_steps: u32,
         modified_files: Vec<String>,
+        /// The turn's provider usage, aggregated from the `model_requests`
+        /// rows committed before this terminal. `None` on legacy rows and when
+        /// the ledger could not be read; a missing projection is not a
+        /// measured zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TurnUsage>,
     },
     TaskFinished {
         outcome: TaskOutcome,
@@ -1524,6 +1589,7 @@ mod contract_tests {
                 model_steps: 2,
                 modified_files: vec![secret.into()],
                 stop: None,
+                usage: None,
             },
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
@@ -1773,5 +1839,72 @@ mod retired_memory_compatibility_tests {
             );
             assert!(event.public_projection().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_usage_tests {
+    use super::TurnUsage;
+    use leveler_storage::{ModelCallKind, ModelRequestRecord};
+
+    fn row(
+        kind: ModelCallKind,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: Option<u64>,
+    ) -> ModelRequestRecord {
+        ModelRequestRecord {
+            budget_scope: None,
+            estimated_tokens: None,
+            id: leveler_core::EventId::generate().into_inner(),
+            provider_request_id: None,
+            session_id: leveler_core::SessionId::new("s-usage"),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            reasoning_tokens: None,
+            projected_input_tokens: None,
+            projected_reasoning_tokens: None,
+            cost_usd_micros: None,
+            agent_id: None,
+            finish_reason: Some("stop".into()),
+            error_kind: None,
+            error_detail: None,
+            turn_id: Some("t-usage".into()),
+            latency_ms: None,
+            attempt_ms: None,
+            connect_ms: None,
+            ttft_ms: None,
+            max_event_gap_ms: None,
+            retry_count: 0,
+            kind,
+            created_at: leveler_core::now(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn booked_usage_sums_each_durable_request_once() {
+        let rows = vec![
+            row(ModelCallKind::Round, 1_000, 100, Some(900)),
+            row(ModelCallKind::Round, 2_000, 200, Some(1_800)),
+            row(ModelCallKind::ProviderProbe, 9_999, 9_999, Some(9_999)),
+            row(ModelCallKind::Compaction, 0, 0, None),
+        ];
+        let usage = TurnUsage::from_records(&rows);
+        assert_eq!(usage.requests, 3, "a health probe is not session work");
+        assert_eq!(usage.unmeasured_requests, 1);
+        assert_eq!(usage.input_tokens, 3_000);
+        assert_eq!(usage.output_tokens, 300);
+        assert_eq!(usage.cached_input_tokens, Some(2_700));
+        assert_eq!(usage.total_tokens(), 3_300);
+    }
+
+    #[test]
+    fn an_absent_cache_measurement_stays_absent() {
+        let usage = TurnUsage::from_records(&[row(ModelCallKind::Round, 10, 1, None)]);
+        assert_eq!(usage.cached_input_tokens, None);
     }
 }

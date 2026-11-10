@@ -497,13 +497,17 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
     let session = engine.create_task(&spec).await.unwrap();
     let mut turn_stops: Vec<Option<leveler_agent::StopReason>> = Vec::new();
     let mut task_stop: Option<Option<leveler_agent::StopReason>> = None;
+    let mut task_reason: Option<Option<String>> = None;
     let report = engine
         .run(
             &session,
             &spec,
             &mut |e| match &e {
                 EngineEvent::TurnFinished { stop, .. } => turn_stops.push(*stop),
-                EngineEvent::TaskFinished { stop, .. } => task_stop = Some(*stop),
+                EngineEvent::TaskFinished { stop, reason, .. } => {
+                    task_stop = Some(*stop);
+                    task_reason = Some(reason.clone());
+                }
                 _ => {}
             },
             CancellationToken::new(),
@@ -513,6 +517,19 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
 
     // Typed in the report, in both terminal events, and in the session row.
     assert_eq!(report.stop_reason, leveler_agent::StopReason::Blocked);
+    // The model's own declared blocking summary is the user-facing reason.
+    // Without it the terminal carries only the machine word "blocked", and the
+    // person reading the turn cannot tell why the goal stopped.
+    assert_eq!(
+        report.stop_detail.as_deref(),
+        Some("cannot proceed"),
+        "the declared blocking summary must survive as the terminal detail"
+    );
+    assert_eq!(
+        task_reason,
+        Some(Some("cannot proceed".to_string())),
+        "TaskFinished.reason must carry the same declared summary"
+    );
     assert_eq!(
         report.outcome,
         TaskOutcome::Blocked,

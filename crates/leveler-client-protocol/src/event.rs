@@ -26,6 +26,35 @@ pub enum NotificationLevel {
     Warning,
     Error,
 }
+
+/// One finished turn's provider usage, projected from the runtime's durable
+/// `model_requests` rows.
+///
+/// This is a settled fact, not a running sum of streamed snapshots: re-reading
+/// it after a reconnect, a resume or a replay yields the same figures.
+/// `unmeasured_requests` keeps a call whose provider reported no usage
+/// distinguishable from a measured zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiTurnUsage {
+    /// Provider calls in the turn, retries included — each is a billed call.
+    pub requests: u32,
+    /// Calls whose provider reported no usage at all.
+    pub unmeasured_requests: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Subset of `input_tokens`; `None` when no row recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+}
+
+impl UiTurnUsage {
+    /// `input + output`. Cached input is a slice of the prompt, never an
+    /// addition to the total.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
 /// The four-way reading of a settled child's result. "Finished with nothing
 /// to flag" and "stopped with nothing to show" are opposite facts; a client
 /// renders them from this field, never from the summary text.
@@ -586,6 +615,11 @@ pub enum RuntimeEvent {
     /// context gauge tracks how full the window is; `input_tokens` already
     /// includes the whole prompt (system + history + tools), so the window in
     /// use is `input_tokens + output_tokens`.
+    ///
+    /// A SNAPSHOT of the request that just reported, not a delta: a provider
+    /// may emit it several times while one request streams, and the consumer
+    /// must replace rather than add. Turn-level accounting is settled once by
+    /// [`RuntimeEvent::TurnUsage`].
     TokenUsage {
         input_tokens: u32,
         output_tokens: u32,
@@ -598,6 +632,11 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_tokens: Option<u32>,
     },
+    /// The settled provider usage of one finished turn, aggregated from the
+    /// runtime's durable model-call ledger. Arrives before the turn terminal
+    /// and is replayable; a client uses it instead of summing the transient
+    /// [`RuntimeEvent::TokenUsage`] snapshots.
+    TurnUsage { usage: UiTurnUsage },
     /// The accounting of the exact next model request, computed by the kernel
     /// before the request is sent. Transient: nothing persists it, and a
     /// reconnecting client gets the latest through its live view.
@@ -639,6 +678,14 @@ pub enum RuntimeEvent {
     /// The executor stopped cleanly but did not reach a successful terminal
     /// state (for example, budget exhaustion or an unresolved goal).
     TurnIncomplete { reason: String },
+    /// The goal stopped because the model declared it blocked.
+    ///
+    /// This is a distinct terminal, not a flavour of [`Self::TurnIncomplete`]:
+    /// the goal is NOT settled, the work already delivered stays real, and the
+    /// user can continue it. `reason` is the model's own declared blocking
+    /// summary; it is display-only and never decides the lifecycle — the
+    /// durable `TaskFinished.stop` is the authority.
+    TurnBlocked { reason: String },
     /// The current turn failed.
     ///
     /// `error` is the legacy display string, kept for compatibility with older

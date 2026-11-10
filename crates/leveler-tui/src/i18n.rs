@@ -209,6 +209,7 @@ pub struct UiText {
     pub title_cancelled: &'static str,
     pub title_failed: &'static str,
     pub title_incomplete: &'static str,
+    pub title_blocked: &'static str,
     pub turn_answered: &'static str,
     pub turn_truncated: &'static str,
     pub turn_incomplete: &'static str,
@@ -239,7 +240,11 @@ pub struct UiText {
     /// This turn's cache hit rate, on the turn receipt only.
     pub turn_cache: &'static str,
     pub recap_label: &'static str,
-    pub recap_next_step: &'static str,
+    /// Every recap's next step is model-authored: the immediate post-turn
+    /// recap comes from `update_goal`, a checkpoint recap from `update_plan`
+    /// or the recap model call. It is advice about a past boundary, never the
+    /// runtime's confirmed resume action, so the provenance stays visible.
+    pub recap_model_next_step: &'static str,
     /// Assistant progress disclosure: "{} 行" carries the hidden visual-line
     /// count, so a folded block never hides content silently.
     pub goal_recap_label: &'static str,
@@ -977,6 +982,14 @@ pub struct UiText {
     pub final_completed_warnings: &'static str,
     pub final_waiting_confirmation: &'static str,
     pub final_blocked: &'static str,
+    /// Terminal marker for a goal the model declared blocked. The goal is not
+    /// settled, so this says "goal blocked", never the generic "incomplete".
+    pub final_goal_blocked: &'static str,
+    /// Provenance line for a blocked terminal's reason. `{}` is the model's
+    /// own declared summary, not a runtime verdict.
+    pub blocked_reason: &'static str,
+    /// What the user can do now. `{}` is the localized continuation word.
+    pub blocked_next_actions: &'static str,
     /// Terminal marker when the run stopped on a failed verification gate
     /// (e.g. cargo test failed) — a verification failure, not a system block.
     pub final_verification_failed: &'static str,
@@ -1683,6 +1696,7 @@ static ZH: UiText = UiText {
     title_cancelled: "已取消",
     title_failed: "失败",
     title_incomplete: "未完成",
+    title_blocked: "目标受阻",
     turn_answered: "✓ 回答结束",
     turn_truncated: "⚠ 输出被截断 · 可继续提问",
     turn_incomplete: "⚠ 任务未完成",
@@ -1704,7 +1718,7 @@ static ZH: UiText = UiText {
     turn_tokens: "{} tokens",
     turn_cache: "本轮缓存 {}%",
     recap_label: "回顾",
-    recap_next_step: "下一步：",
+    recap_model_next_step: "模型建议下一步：",
     goal_recap_label: "阶段回顾",
     goal_recap_phase: "当前阶段",
     goal_recap_completed: "已完成",
@@ -2490,6 +2504,9 @@ static ZH: UiText = UiText {
     final_completed_warnings: "已完成，但有警告",
     final_waiting_confirmation: "等待确认",
     final_blocked: "未完成",
+    final_goal_blocked: "目标受阻",
+    blocked_reason: "模型说明：{}",
+    blocked_next_actions: "目标未结束 · 继续：发送「{}」接着做 · 结束目标：/goal cancel",
     final_verification_failed: "验证未通过",
     final_failed: "失败",
     final_cancelled: "已取消",
@@ -2759,6 +2776,7 @@ static EN: UiText = UiText {
     title_cancelled: "cancelled",
     title_failed: "failed",
     title_incomplete: "incomplete",
+    title_blocked: "goal blocked",
     turn_answered: "✓ answer finished",
     turn_truncated: "⚠ output truncated · continue if needed",
     turn_incomplete: "⚠ task incomplete",
@@ -2780,7 +2798,7 @@ static EN: UiText = UiText {
     turn_tokens: "{} tokens",
     turn_cache: "this turn cache {}%",
     recap_label: "recap",
-    recap_next_step: "Next step: ",
+    recap_model_next_step: "Model-suggested next step: ",
     goal_recap_label: "Recap",
     goal_recap_phase: "Phase",
     goal_recap_completed: "Completed",
@@ -3566,6 +3584,9 @@ static EN: UiText = UiText {
     final_completed_warnings: "Completed with warnings",
     final_waiting_confirmation: "Waiting for confirmation",
     final_blocked: "Incomplete",
+    final_goal_blocked: "Goal blocked",
+    blocked_reason: "Model-declared reason: {}",
+    blocked_next_actions: "Goal still open · Continue: send \"{}\" to resume · /goal cancel ends it",
     final_verification_failed: "Verification failed",
     final_failed: "Failed",
     final_cancelled: "Cancelled",

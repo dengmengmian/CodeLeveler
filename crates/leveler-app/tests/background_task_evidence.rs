@@ -641,6 +641,7 @@ impl Fixture {
             stop_reason: "completed".into(),
             model_steps: 1,
             modified_files: Vec::new(),
+            usage: None,
         };
         let (event_type, payload) = event.to_row().unwrap();
         engine

@@ -167,6 +167,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         | RuntimeEvent::TurnPaused { .. }
         | RuntimeEvent::TurnTruncated { .. }
         | RuntimeEvent::TurnIncomplete { .. }
+        | RuntimeEvent::TurnBlocked { .. }
         | RuntimeEvent::TurnFailed { .. }
         | RuntimeEvent::TurnCancelled
         | RuntimeEvent::TaskCancelled => {
@@ -428,6 +429,9 @@ mod tests {
             },
             RuntimeEvent::TurnIncomplete {
                 reason: "incomplete".to_string(),
+            },
+            RuntimeEvent::TurnBlocked {
+                reason: "blocked".to_string(),
             },
             RuntimeEvent::TurnFailed {
                 error: "failed".to_string(),

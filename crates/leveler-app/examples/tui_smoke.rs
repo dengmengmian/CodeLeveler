@@ -465,6 +465,24 @@ async fn drive_turn(
                     notes,
                 );
             }
+            RuntimeEvent::TurnBlocked { reason } => {
+                // The goal is unsettled and resumable; the smoke run still
+                // ends its window and reports the model's declared reason.
+                notes.push(format!("blocked:{reason}"));
+                println!("[turn] blocked: {reason}");
+                return finish(
+                    "blocked",
+                    started,
+                    model_rounds,
+                    tool_starts,
+                    tool_ends,
+                    edit_tools,
+                    sub_agent_activity,
+                    sub_agent_updated,
+                    assistant_deltas,
+                    notes,
+                );
+            }
             RuntimeEvent::TurnFailed { error, .. } => {
                 notes.push(format!("failed:{error}"));
                 println!("[turn] FAILED: {error}");

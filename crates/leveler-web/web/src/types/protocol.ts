@@ -25,6 +25,7 @@ export const TURN_TERMINAL_TYPES: ReadonlySet<RuntimeEvent['type']> = new Set([
   'turn_answered',
   'turn_truncated',
   'turn_incomplete',
+  'turn_blocked',
   'turn_failed',
   'turn_cancelled',
 ] satisfies ReadonlyArray<RuntimeEvent['type']>);

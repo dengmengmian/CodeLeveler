@@ -119,7 +119,7 @@ fn overview(
         dim,
     )));
     lines.push(Line::from(""));
-    let compact = |n: u64| fmt_tokens_compact(n.min(u32::MAX as u64) as u32);
+    let compact = fmt_tokens_compact;
     // A figure nobody recorded shows as an em dash, never as a zero.
     let unknown = "—".to_string();
     let t = state.t();

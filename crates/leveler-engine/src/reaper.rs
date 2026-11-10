@@ -69,6 +69,7 @@ async fn interrupt_turns_owned(
             stop_reason: "unclean process exit".to_string(),
             model_steps: 0,
             modified_files: Vec::new(),
+            usage: None,
         };
         let (event_type, payload) = event.to_row()?;
         terminal

@@ -675,16 +675,21 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.token_input = input_tokens;
             state.token_output = output_tokens;
             state.token_cached = cached_input_tokens;
-            // The fields above stay the last request (status line, footer).
-            // The receipt sums the whole turn, so a later request cannot
-            // replace an earlier one and a new turn cannot inherit this one.
-            state.turn_input_tokens = state.turn_input_tokens.saturating_add(input_tokens);
-            state.turn_output_tokens = state.turn_output_tokens.saturating_add(output_tokens);
-            state.turn_cached_tokens = state.turn_cached_tokens.saturating_add(cached_input_tokens);
             // These describe the request that JUST finished (`↑` prompt, `↓`
             // output). They are deliberately not copied into the window gauge:
             // a finished request is not the next request's projection, and the
-            // gauge's own number comes from the runtime's snapshot.
+            // gauge's own number comes from the runtime's snapshot. The turn
+            // receipt is not built from them either — the runtime settles that
+            // once from its durable model-call ledger (`RuntimeEvent::TurnUsage`).
+        }
+        RuntimeEvent::TurnUsage { usage } => {
+            // The settled projection of this turn's durable `model_requests`
+            // rows. The bridge sends it just before the display terminal, so
+            // the receipt normally picks it up from `settled_turn_usage` when
+            // that terminal is frozen. The transcript patch below covers a
+            // replay or an out-of-order delivery where the terminal came first.
+            state.settled_turn_usage = Some(usage.clone());
+            state.transcript.settle_last_turn_receipt(&usage);
         }
         RuntimeEvent::TurnProgress {
             phase,
@@ -742,6 +747,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // The durable turn-end marker is the single source of truth. A
             // second transient notification repeats the same reason onscreen.
             finish_turn(state, TurnEndStatus::Incomplete, Some(reason));
+            state.notification = None;
+        }
+        RuntimeEvent::TurnBlocked { reason } => {
+            // A blocked goal is not an ordinary incomplete turn: the runtime
+            // left the goal unsettled, so the work already done stands and the
+            // same goal can be re-entered. `reason` is the model's declared
+            // blocking summary, carried for display only.
+            finish_turn(state, TurnEndStatus::Blocked, Some(reason));
             state.notification = None;
         }
         RuntimeEvent::TurnFailed {
@@ -1584,20 +1597,35 @@ fn dismiss_resolved_interaction(
 }
 
 /// Snapshot of the turn that is about to close. Every number is this turn's
-/// own: the clock on screen, the steps and tools it ran, and the provider
-/// usage summed since the turn started. The footer window gauge is a
-/// different measurement and is not copied here.
+/// own: the clock on screen, the steps and tools it ran, and the usage the
+/// runtime booked for its requests. The footer window gauge is a different
+/// measurement and is not copied here.
+///
+/// Token figures come only from the runtime's settled projection. A turn with
+/// no settled projection reports none rather than a client-side sum of
+/// transient per-request snapshots.
 fn turn_receipt(state: &AppState) -> crate::transcript::TurnReceipt {
     let ended_hm = {
         let label = state.clock_label.trim();
         (!label.is_empty()).then(|| label.to_string())
     };
+    let (input_tokens, output_tokens, cached_tokens) = state
+        .settled_turn_usage
+        .as_ref()
+        .map(|usage| {
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens.unwrap_or(0),
+            )
+        })
+        .unwrap_or_default();
     crate::transcript::TurnReceipt {
         ended_hm,
         rounds: state.transcript.current_turn_rounds(),
-        input_tokens: state.turn_input_tokens,
-        output_tokens: state.turn_output_tokens,
-        cached_tokens: state.turn_cached_tokens,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
     }
 }
 
@@ -1627,6 +1655,13 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // An unregistered answer is not a Goal terminal. Keep the pause
     // resumable so the user can still continue the work the goal owes.
     if matches!(status, TurnEndStatus::AnsweredUnregistered) && paused_owed {
+        state.resumable_task = true;
+    }
+    // A blocked goal is unsettled by the runtime's own rule: the work already
+    // delivered stands and the same objective stays re-enterable. Withdrawing
+    // continuation here would also turn `/goal cancel` into a local-only
+    // clear, leaving the durable goal running.
+    if matches!(status, TurnEndStatus::Blocked) {
         state.resumable_task = true;
     }
     clear_activity(state);
@@ -1679,6 +1714,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
                 TurnEndStatus::Truncated | TurnEndStatus::Incomplete | TurnEndStatus::Cancelled => {
                     goal.pause(now)
                 }
+                // The goal is still owed; the blocked window stops the clock
+                // but does not fail the goal.
+                TurnEndStatus::Blocked => goal.pause(now),
                 TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
                 TurnEndStatus::AnsweredUnregistered => {}
                 TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings => {
@@ -1696,13 +1734,21 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // real compaction pressure while looking authoritative.
     // Read BEFORE `push_turn_end`: a TurnEnd marker is the scan boundary, so
     // the handoff has to be taken while this turn is still the latest one.
+    // The handoff is captured before the terminal so it owns only this turn.
     let handoff = state.transcript.latest_turn_handoff();
-    let suggestion = handoff
-        .as_ref()
-        .and_then(|handoff| handoff.next_step.clone())
-        .or_else(|| {
-            (status == TurnEndStatus::Incomplete).then(|| state.t().suggestion_continue.to_string())
-        });
+    // A blocked goal's next action is the runtime's continuation. The model's
+    // own `next_step` is advice recorded in the recap; it is not the confirmed
+    // resume action, so it must not become the offered input.
+    let suggestion = match status {
+        TurnEndStatus::Blocked => Some(state.t().suggestion_continue.to_string()),
+        _ => handoff
+            .as_ref()
+            .and_then(|handoff| handoff.next_step.clone())
+            .or_else(|| {
+                (status == TurnEndStatus::Incomplete)
+                    .then(|| state.t().suggestion_continue.to_string())
+            }),
+    };
     let summary = turn_end_summary(state, status);
     archive_active_plan(state);
     state.turn_diff_files = None;
@@ -2161,9 +2207,9 @@ pub(super) fn start_turn(state: &mut AppState) {
     // "recently finished" window; the footer never shows them. A still-running
     // one (a dev server) stays reachable too.
     state.turn_tool_calls = 0;
-    state.turn_input_tokens = 0;
-    state.turn_output_tokens = 0;
-    state.turn_cached_tokens = 0;
+    // The previous turn's booked usage belongs to its own receipt. A new turn
+    // starts with no settlement until the runtime reports one.
+    state.settled_turn_usage = None;
     state.status = RuntimeStatus::Busy;
     state.resumable_task = false;
     state.finalization_stage = None;
@@ -2401,6 +2447,10 @@ fn adopt_execution_task(
         return;
     };
     state.execution_task_active = true;
+    // An owed goal with no live window is a continuation point: the runtime
+    // still accepts a new turn against it. A live window already owns the
+    // turn, so there is no finished terminal to resume while it runs.
+    state.resumable_task = !task.running;
     // Only a live window executes the goal contract; owed work with no window,
     // or work the user paused, is not running.
     state.goal_mode_active = task.running && state.status == RuntimeStatus::Busy;
@@ -2601,9 +2651,7 @@ fn apply_session_with(
         state.token_input = 0;
         state.token_output = 0;
         state.token_cached = 0;
-        state.turn_input_tokens = 0;
-        state.turn_output_tokens = 0;
-        state.turn_cached_tokens = 0;
+        state.settled_turn_usage = None;
         state.project_rule_sources.clear();
         state.background_task_labels.clear();
         seal_analysis_segment(state);

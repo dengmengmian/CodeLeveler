@@ -1933,3 +1933,148 @@ fn a_legacy_plan_event_does_not_invent_an_operation() {
     assert_eq!(call.plan_created, None);
     assert_eq!(call.plan_steps, None);
 }
+
+#[test]
+fn a_replayed_turn_reaches_the_same_booked_token_receipt() {
+    let mut s = state();
+    let effects = open(&mut s, vec![message(UiRole::User, "审计")]);
+    let entries = vec![
+        entry(
+            10,
+            true,
+            RuntimeEvent::UserMessageAdded {
+                message: message(UiRole::User, "审计"),
+            },
+        ),
+        entry(
+            1_000,
+            false,
+            RuntimeEvent::TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                cached_input_tokens: 900,
+                reasoning_tokens: None,
+            },
+        ),
+        entry(
+            2_000,
+            false,
+            RuntimeEvent::TokenUsage {
+                input_tokens: 2_000,
+                output_tokens: 200,
+                cached_input_tokens: 1_800,
+                reasoning_tokens: None,
+            },
+        ),
+        entry(3_000, false, RuntimeEvent::TurnCompleted),
+        // The durable ledger projection follows the display terminal in the
+        // recorded log, exactly as it does live.
+        entry(
+            3_000,
+            false,
+            RuntimeEvent::TurnUsage {
+                usage: leveler_client_protocol::UiTurnUsage {
+                    requests: 2,
+                    unmeasured_requests: 0,
+                    input_tokens: 45_491_035,
+                    output_tokens: 141_675,
+                    cached_input_tokens: Some(44_829_952),
+                },
+            },
+        ),
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let end = s
+        .transcript
+        .last_turn_end()
+        .expect("the replayed terminal is on the transcript");
+    assert_eq!(end.input_tokens, 45_491_035);
+    assert_eq!(end.output_tokens, 141_675);
+    assert_eq!(end.cached_tokens, 44_829_952);
+    assert_eq!(end.input_tokens + end.output_tokens, 45_632_710);
+}
+
+#[test]
+fn a_replayed_blocked_turn_keeps_its_typed_panel_and_continuation() {
+    let mut s = state();
+    let effects = open(&mut s, vec![message(UiRole::User, "审计")]);
+    let goal = ToolCallId::new("goal-1");
+    let entries = vec![
+        entry(
+            10,
+            true,
+            RuntimeEvent::UserMessageAdded {
+                message: message(UiRole::User, "审计"),
+            },
+        ),
+        entry(
+            20,
+            false,
+            RuntimeEvent::ToolCallStarted {
+                id: goal.clone(),
+                name: "update_goal".into(),
+                arguments: serde_json::json!({
+                    "status": "blocked",
+                    "summary": "环境数据缺失",
+                })
+                .to_string(),
+                parallel: false,
+                model_step: None,
+                answer_effect: Some(AnswerEffect::Bookkeeping),
+            },
+        ),
+        entry(
+            30,
+            false,
+            RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
+                id: goal,
+                ok: true,
+                preview: "目标已更新".into(),
+                duration_ms: 10,
+                applied_diff: None,
+            },
+        ),
+        entry(
+            40,
+            false,
+            RuntimeEvent::TurnBlocked {
+                reason: "环境数据缺失".into(),
+            },
+        ),
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let end = s
+        .transcript
+        .last_turn_end()
+        .expect("the replayed blocked terminal is on the transcript");
+    assert_eq!(
+        end.status,
+        TurnEndStatus::Blocked,
+        "a replay reaches the same typed terminal the live client showed"
+    );
+    assert_eq!(
+        end.detail.as_deref(),
+        Some("环境数据缺失"),
+        "the model-declared reason survives replay"
+    );
+}

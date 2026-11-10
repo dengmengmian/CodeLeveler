@@ -310,6 +310,10 @@ fn a_reconnect_restores_an_owed_paused_task_from_the_snapshot() {
         state.execution_task_active,
         "the work is still owed after a crash"
     );
+    assert!(
+        state.resumable_task,
+        "owed work with no live window is a continuation point, so `/goal cancel` must reach the runtime"
+    );
     assert!(!state.goal_mode_active, "no window is executing it");
     let header = header_text(&state);
     assert!(

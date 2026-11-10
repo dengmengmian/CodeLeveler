@@ -24,7 +24,7 @@ use leveler_storage::{EngineStores, EventStore, MessageStore, ModelRequestStore}
 use crate::log::EventLog;
 use crate::ports::{EventBarrier, ExecutionFence, ModelRequestRecord, PortError, TranscriptSink};
 use crate::recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
-use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome};
+use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome, TurnUsage};
 
 /// How many times one child may be continued after its activation died. A
 /// child whose activations keep dying with their window is settled as lost
@@ -933,6 +933,30 @@ impl TurnRunner<'_> {
         })
     }
 
+    /// Aggregate this turn's persisted model requests for its terminal.
+    ///
+    /// The rows are the runtime's own accounting authority. A failed read
+    /// leaves the projection absent rather than fabricating a zero or blocking
+    /// the terminal commit; clients then fall back to their live snapshot.
+    async fn turn_usage_for_terminal(&self, turn_id: &TurnId) -> Option<TurnUsage> {
+        match self
+            .stores
+            .model_requests
+            .load_for_turn(&self.session_id, turn_id)
+            .await
+        {
+            Ok(rows) => Some(TurnUsage::from_records(&rows)),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    turn_id = %turn_id,
+                    "could not load persisted turn usage; terminal carries no usage projection"
+                );
+                None
+            }
+        }
+    }
+
     /// Run one fully-persisted turn.
     ///
     /// The engine opens the turn, hands the harness its [`TurnPorts`], pumps
@@ -1402,6 +1426,7 @@ impl TurnRunner<'_> {
             stop,
             model_steps,
             modified_files,
+            usage: self.turn_usage_for_terminal(&turn_id).await,
         };
         let (event_type, payload) = event.to_row().map_err(|error| {
             EngineError::UnclosedTerminalBoundary(format!(

@@ -135,6 +135,24 @@ pub trait ModelRequestStore: Send + Sync {
         session_id: &SessionId,
     ) -> Result<Vec<ModelRequestRecord>, StorageError>;
 
+    /// Attempts recorded under exactly one turn, oldest first.
+    ///
+    /// The default is a filter over the session load so every store honors the
+    /// same identity rule. A turn id is the admission fact the sink stamped on
+    /// the row; it is never inferred from timestamps.
+    async fn load_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        Ok(self
+            .load_for_session(session_id)
+            .await?
+            .into_iter()
+            .filter(|record| record.turn_id.as_deref() == Some(turn_id.as_str()))
+            .collect())
+    }
+
     /// Attempts belonging to exactly one goal/root-turn budget; excludes
     /// unrelated auxiliary calls and legacy records without scope attribution.
     async fn load_for_budget_scope(

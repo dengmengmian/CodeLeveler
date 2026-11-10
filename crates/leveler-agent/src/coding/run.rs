@@ -2877,6 +2877,17 @@ impl CodingRuntime {
         runner
             .reconcile_terminal_children(leveler_lifecycle::ChildStop::Lost, observer)
             .await?;
+        // The crashed window already persisted its model calls. A recovered
+        // terminal carries the same booked projection a normal one does; a
+        // failed read leaves it absent rather than fabricating a zero.
+        let usage = self
+            .engine
+            .stores
+            .model_requests
+            .load_for_turn(session_id, &delivery.turn_id)
+            .await
+            .ok()
+            .map(|rows| leveler_engine::TurnUsage::from_records(&rows));
         let event = EngineEvent::TurnFinished {
             turn_id: delivery.turn_id.clone(),
             outcome: leveler_lifecycle::TurnOutcome::Completed,
@@ -2884,6 +2895,7 @@ impl CodingRuntime {
             stop: Some(delivery.stop),
             model_steps: delivery.model_steps,
             modified_files: delivery.modified_files.clone(),
+            usage,
         };
         let (event_type, payload) = event.to_row().map_err(|error| {
             EngineError::UnclosedTerminalBoundary(format!(

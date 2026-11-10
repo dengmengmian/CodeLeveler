@@ -1973,6 +1973,13 @@ impl<'a> Drive<'a> {
             .terminal_answer
             .as_ref()
             .is_some_and(|text| !text.trim().is_empty());
+        // A blocked goal is a decision the model made about its own work: the
+        // declared summary is the only account of WHY it stopped, and the
+        // person reading the terminal needs it. It is display-only — the stop
+        // reason already carries the lifecycle — so it must not be confused
+        // with a runtime judgement. Completion has its own verification
+        // report; only Blocked borrows the model's words here.
+        let stop_detail = matches!(reason, StopReason::Blocked).then(|| summary.clone());
         let final_text = if delivered {
             self.terminal_answer.clone().unwrap_or_default()
         } else {
@@ -2011,7 +2018,7 @@ impl<'a> Drive<'a> {
             model_steps,
             self.modified_files.clone(),
             reason,
-            None,
+            stop_detail,
             &self.progress,
             &self.objective,
         );

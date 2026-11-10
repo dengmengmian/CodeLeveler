@@ -90,7 +90,8 @@ pub use skills::{
 
 pub use event::{
     ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RecoveryStop,
-    RuntimeEvent, UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, parse_runtime_event,
+    RuntimeEvent, UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiTurnUsage,
+    parse_runtime_event,
 };
 pub use global_tasks::{
     UiGlobalTaskIndex, UiGlobalTaskSourceError, UiGlobalTaskSourceErrorKind, UiGlobalTaskSummary,

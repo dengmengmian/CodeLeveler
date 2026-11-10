@@ -12,6 +12,7 @@ export type TurnOutcome =
   | 'answered_unregistered'
   | 'no_final_answer'
   | 'incomplete'
+  | 'blocked'
   | 'truncated'
   | 'failed'
   | 'cancelled';
@@ -40,6 +41,11 @@ export function turnEndFromEvent(ev: RuntimeEvent): TurnEnd | null {
       return { outcome: 'truncated', detail: ev.error };
     case 'turn_incomplete':
       return { outcome: 'incomplete', detail: ev.reason };
+    case 'turn_blocked':
+      // The model declared the goal blocked. The goal is unsettled and the
+      // delivered work stands; the reason is the model's own summary, kept
+      // verbatim rather than folded into a runtime diagnostic label.
+      return { outcome: 'blocked', detail: ev.reason };
     case 'turn_failed':
       return { outcome: 'failed', detail: ev.error };
     case 'turn_cancelled':
@@ -117,6 +123,16 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
         detail: token ? localizeDetail(token) : null,
       };
     }
+    case 'blocked':
+      // The work window stopped, but the goal is still owed and the runtime
+      // keeps it resumable. The model's declared reason is model prose, so it
+      // is shown as-is (the TUI does the same and never localizes it).
+      return {
+        glyph: '⚠',
+        label: '目标受阻',
+        tone: 'warn',
+        detail: token,
+      };
     case 'failed':
       return { glyph: '✕', label: '执行失败', tone: 'error', detail: token };
     case 'cancelled':

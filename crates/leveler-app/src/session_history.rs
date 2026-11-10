@@ -10,11 +10,11 @@ use std::collections::HashMap;
 
 use leveler_client_protocol::{MessageId, RuntimeEvent, UiHistoryEntry, UiMessage, UiRole};
 use leveler_core::{SessionId, Timestamp, TurnId};
-use leveler_engine::EngineEvent;
+use leveler_engine::{EngineEvent, TurnUsage};
 use leveler_model::{ContentPart, Message, TranscriptOrigin};
 use leveler_storage::{
-    Database, EventRepository, MessageRepository, SessionRecapRepository, TurnRecord,
-    TurnRepository,
+    Database, EventRepository, MessageRepository, ModelRequestRepository, SessionRecapRepository,
+    TurnRecord, TurnRepository,
 };
 use tokio::sync::broadcast;
 
@@ -78,13 +78,39 @@ pub async fn load_session_history(
     let since = (omitted_before_load > 0 && parse_time(&first.created_at).is_some())
         .then_some(first.created_at.as_str());
     let mut events = Vec::with_capacity(records.len());
+    // A `turn_finished` row written before the usage projection existed has no
+    // `usage` field. The model-request ledger is still the accounting
+    // authority, so rebuild the projection from its rows instead of replaying
+    // the turn as an unmeasured zero. New rows carry their own projection and
+    // are left untouched.
+    let mut request_rows: HashMap<String, Vec<leveler_storage::ModelRequestRecord>> =
+        HashMap::new();
+    for record in ModelRequestRepository::new(db)
+        .load_for_session(session_id)
+        .await
+        .map_err(AppError::from)?
+    {
+        if let Some(turn_id) = &record.turn_id {
+            request_rows
+                .entry(turn_id.clone())
+                .or_default()
+                .push(record);
+        }
+    }
     for record in &records {
-        let event = EngineEvent::from_payload(&record.payload).map_err(|e| {
+        let mut event = EngineEvent::from_payload(&record.payload).map_err(|e| {
             AppError::Engine(format!(
                 "corrupt authoritative event: session {} sequence {} type '{}': {e}",
                 record.session_id, record.sequence, record.event_type
             ))
         })?;
+        if let EngineEvent::TurnFinished { turn_id, usage, .. } = &mut event
+            && usage.is_none()
+            && let Some(rows) = request_rows.get(turn_id.as_str())
+            && !rows.is_empty()
+        {
+            *usage = Some(TurnUsage::from_records(rows));
+        }
         events.push((parse_time(&record.created_at), event));
     }
     if !events
@@ -554,6 +580,101 @@ mod tests {
         EventRepository, EventStore, MessageRepository, SessionRecord, SessionRepository,
         TurnRepository,
     };
+
+    #[tokio::test]
+    async fn a_legacy_turn_terminal_rebuilds_usage_from_the_request_ledger() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        // `model_requests.turn_id` is a foreign key into the durable turn row.
+        let turn = TurnRepository::new(&db)
+            .start(&sid, "chat", None, t0)
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(turn.id);
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        // A terminal persisted before the event carried its usage projection.
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::TurnFinished {
+                turn_id: turn_id.clone(),
+                outcome: leveler_lifecycle::TurnOutcome::Completed,
+                stop_reason: "Completed".into(),
+                stop: Some(StopReason::Completed),
+                model_steps: 2,
+                modified_files: Vec::new(),
+                usage: None,
+            },
+        )
+        .await;
+        for (input, output, cached) in [
+            (1_000_u64, 100_u64, Some(900_u64)),
+            (2_000, 200, Some(1_800)),
+        ] {
+            ModelRequestRepository::new(&db)
+                .insert(&leveler_storage::ModelRequestRecord {
+                    budget_scope: None,
+                    estimated_tokens: None,
+                    id: leveler_core::EventId::generate().into_inner(),
+                    provider_request_id: None,
+                    session_id: sid.clone(),
+                    provider: "deepseek".into(),
+                    model: "m".into(),
+                    input_tokens: input,
+                    output_tokens: output,
+                    cached_input_tokens: cached,
+                    reasoning_tokens: None,
+                    projected_input_tokens: None,
+                    projected_reasoning_tokens: None,
+                    cost_usd_micros: None,
+                    agent_id: None,
+                    finish_reason: Some("stop".into()),
+                    error_kind: None,
+                    error_detail: None,
+                    turn_id: Some(turn_id.as_str().to_string()),
+                    latency_ms: None,
+                    attempt_ms: None,
+                    connect_ms: None,
+                    ttft_ms: None,
+                    max_event_gap_ms: None,
+                    retry_count: 0,
+                    kind: leveler_storage::ModelCallKind::Round,
+                    created_at: t0,
+                    reasoning_effort: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let usage = entries
+            .iter()
+            .find_map(|entry| match &entry.event {
+                RuntimeEvent::TurnUsage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("the legacy terminal replays the ledger projection");
+        assert_eq!(
+            (
+                usage.requests,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens
+            ),
+            (2, 3_000, 300, Some(2_700)),
+            "the replay reads each durable request once, not a client-side sum"
+        );
+    }
 
     #[tokio::test]
     async fn execution_timing_replays_from_durable_facts_without_a_wall_clock() {
