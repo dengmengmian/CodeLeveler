@@ -444,8 +444,8 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                                 )
                             },
                             "source_quote": {
-                                "type": "string",
-                                "description": "Verbatim span of the user's newest message that states this change. Whitespace differences are tolerated; paraphrases are not. Give either `source_quote` or `source_span`, not both."
+                                "type": ["string", "null"],
+                                "description": "Verbatim span of the user's newest message that states this change. Whitespace differences are tolerated; paraphrases are not. Required: write the quote, or `null` only when you use `source_span`."
                             },
                             "source_span": {
                                 "type": "object",
@@ -466,9 +466,9 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                                 "description": "Optional short note, especially for waive or replace: why the requirement changed."
                             }
                         },
-                        "required": ["op"],
+                        "required": ["op", "source_quote"],
                         "oneOf": [
-                            {"required": ["source_quote"]},
+                            {"required": ["source_quote"], "properties": {"source_quote": {"type": "string"}}},
                             {"required": ["source_span"]}
                         ],
                         "additionalProperties": false
@@ -520,8 +520,8 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
             "type": "object",
             "properties": {
                 "source_quote": {
-                    "type": "string",
-                    "description": "Verbatim span of the user's newest message that this declaration interprets. Whitespace differences are tolerated; paraphrases are not. Give either `source_quote` or `source_span`, not both."
+                    "type": ["string", "null"],
+                    "description": "Verbatim span of the user's newest message that this declaration interprets. Whitespace differences are tolerated; paraphrases are not. Required: write the quote, or `null` only when you use `source_span`."
                 },
                 "source_span": {
                     "type": "object",
@@ -586,9 +586,9 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
                     "description": "Ordered operations. Applied in this order."
                 }
             },
-            "required": ["operations"],
+            "required": ["operations", "source_quote"],
             "oneOf": [
-                {"required": ["source_quote"]},
+                {"required": ["source_quote"], "properties": {"source_quote": {"type": "string"}}},
                 {"required": ["source_span"]}
             ],
             "additionalProperties": false
@@ -669,8 +669,8 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                                 "description": "The path, file or exact command named by `kind`."
                             },
                             "source_quote": {
-                                "type": "string",
-                                "description": "Verbatim span of the user's message that states it; the runtime checks it occurs there. Alternative: `source_span`."
+                                "type": ["string", "null"],
+                                "description": "Verbatim span of the user's message that states it; the runtime checks it occurs there. Required: write the quote, or `null` only when you use `source_span`."
                             },
                             "source_span": {
                                 "type": "object",
@@ -687,9 +687,9 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                                 "description": "One `acceptance` entry covering it, copied exactly."
                             }
                         },
-                        "required": ["kind", "text"],
+                        "required": ["kind", "text", "source_quote"],
                         "oneOf": [
-                            {"required": ["source_quote"]},
+                            {"required": ["source_quote"], "properties": {"source_quote": {"type": "string"}}},
                             {"required": ["source_span"]}
                         ],
                         "additionalProperties": false
@@ -1639,6 +1639,11 @@ mod tests {
     /// enforces exactly one; the schema must not imply that copying is the
     /// only accepted form, because that is what made punctuation width decide
     /// whether a real requirement could be recorded.
+    ///
+    /// The source key is in `required` and nullable. The observed first calls
+    /// followed the required list (`kind`/`text` present) while omitting the
+    /// item-level `oneOf` source entirely; the nullable type keeps a span-only
+    /// declaration schema-valid without asking the model to reproduce text.
     #[test]
     fn source_references_offer_quote_or_span_in_every_declaration_schema() {
         for (tool_name, entry) in [
@@ -1698,8 +1703,17 @@ mod tests {
                 .filter_map(serde_json::Value::as_str)
                 .collect::<Vec<_>>();
             assert!(
-                !required.contains(&"source_quote"),
-                "{tool_name}: requiring the copy contradicts the span alternative: {required:?}"
+                required.contains(&"source_quote"),
+                "{tool_name}: providers that honor `required` but not `oneOf` only see the \
+                 required list. A DeepSeek first declaration omitted the source from every \
+                 requirement while the item-level `oneOf` already required it. The key must be \
+                 present so the provider can see the obligation: {required:?}"
+            );
+            assert_eq!(
+                entry["properties"]["source_quote"]["type"],
+                serde_json::json!(["string", "null"]),
+                "{tool_name}: requiring the key must not require copying; `null` is the \
+                 schema-valid marker for a span-only declaration"
             );
             let exactly_one = entry["oneOf"]
                 .as_array()
@@ -1721,6 +1735,11 @@ mod tests {
                 "{tool_name}: exactly one source form must be expressed in the schema, \
                  otherwise the model can omit both and pay a full retry"
             );
+            assert_eq!(
+                exactly_one[0]["properties"]["source_quote"]["type"], "string",
+                "{tool_name}: a null `source_quote` must fail the quote branch, so a \
+                 span-only declaration matches exactly one branch"
+            );
         }
     }
 
@@ -1738,6 +1757,12 @@ mod tests {
     /// another full model request, while the field itself is a bounded fixed
     /// cost. The ceiling leaves room for that one declared field, not for a
     /// second schema-sized surface.
+    ///
+    /// The source key is also a nullable `required` member: providers that
+    /// follow only a required list used to omit the source entirely, and the
+    /// marker plus its oneOf type restriction costs ~25 tokens. The ceiling
+    /// grew by that bounded amount; it still rejects a new field-sized
+    /// addition (the next smallest surface is hundreds of tokens).
     #[test]
     fn commit_task_surface_stays_small() {
         let tool = commit_task_tool_definition();
@@ -1745,7 +1770,7 @@ mod tests {
             + leveler_model::estimate_text(&tool.input_schema.to_string());
         let guidance = leveler_model::estimate_text(TASK_COMMIT_GUIDANCE);
         println!("commit_task schema tokens: {tokens}; guidance tokens: {guidance}");
-        assert!(tokens < 1150, "commit_task surface grew to {tokens} tokens");
+        assert!(tokens < 1200, "commit_task surface grew to {tokens} tokens");
         assert!(guidance < 300, "task guidance grew to {guidance} tokens");
     }
 

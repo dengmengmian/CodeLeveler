@@ -53,7 +53,10 @@ the exact bytes out of the message and stores them as the durable
 `source_quote`. The model therefore names a position instead of reproducing
 punctuation; exactness is preserved because the cut is from the original text.
 Exactly one of the two forms is accepted, and a paraphrase never is. Supplying
-both is refused rather than resolved by preference.
+both is refused rather than resolved by preference. The tool schema lists
+`source_quote` in `required` (nullable) because some providers honor only a
+required list; a span-only declaration passes `source_quote: null`, which is
+treated as absent, not as a second source.
 
 Operations: `continue_task`, `pause_task`, `set_pause_boundary`,
 `replace_pause_boundary`, `amend_current_task`, `start_independent_task`,

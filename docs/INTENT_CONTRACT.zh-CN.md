@@ -48,7 +48,10 @@
 span 是最新用户消息的 1-based 闭区间行号（`\n` 分行，末尾一个换行不额外产生
 一行）。Runtime 从消息里切出原始字节，并存为持久 `source_quote`。模型因此只
 指位置、不必复制标点；因为切的是原文，严格性不变。两种形式必须且只能给一个，
-改写仍然不被接受；同时给出会被拒绝，而不是按偏好取一个。
+改写仍然不被接受；同时给出会被拒绝，而不是按偏好取一个。工具 schema 把
+`source_quote` 列在 `required`（可为 null），因为部分 provider 只遵循 required
+列表；仅用 span 的声明传 `source_quote: null`，Runtime 将其视为缺失，而不是第二
+种来源。
 
 操作集：`continue_task`、`pause_task`、`set_pause_boundary`、
 `replace_pause_boundary`、`amend_current_task`、`start_independent_task`、
