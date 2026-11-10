@@ -226,6 +226,20 @@ pub async fn load_session_history(
     Ok((entries, omitted_before_load.saturating_add(omitted) as u32))
 }
 
+/// The reason a model declared when it called `update_goal(status=blocked)`.
+///
+/// This is the same structured `summary` the forward path records as the
+/// blocked stop detail. A call that is not a blocked declaration clears the
+/// candidate, so an older summary cannot leak past a later goal update.
+fn blocked_goal_summary(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    if value.get("status")?.as_str()? != "blocked" {
+        return None;
+    }
+    let summary = value.get("summary")?.as_str()?.trim();
+    (!summary.is_empty()).then(|| summary.to_string())
+}
+
 /// Project one turn through a fresh bridge — each turn has its own terminal,
 /// and a bridge publishes exactly one.
 fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistoryEntry>) {
@@ -233,6 +247,10 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
     let mut bridge = EventBridge::new(sender);
     let started = turn.iter().find_map(|(at, _)| *at);
     let mut tool_starts: HashMap<String, Timestamp> = HashMap::new();
+    // A blocked terminal written before the forward path carried the reason
+    // still has the model's structured `update_goal` call in this turn. Keep
+    // the latest one; the terminal only uses it when it has no reason itself.
+    let mut blocked_summary: Option<String> = None;
     let mut first = true;
     for (at, fact) in turn {
         let elapsed_ms = match (started, at) {
@@ -280,7 +298,23 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
                 // complete the turn or convert incomplete output into an answer.
                 RuntimeEvent::AssistantMessageCompleted { message_id: id },
             ],
-            Fact::Event(event) => {
+            Fact::Event(mut event) => {
+                if let EngineEvent::ToolCallStarted {
+                    name, arguments, ..
+                } = &*event
+                    && name == "update_goal"
+                {
+                    blocked_summary = blocked_goal_summary(arguments);
+                }
+                if let EngineEvent::TaskFinished {
+                    outcome, reason, ..
+                } = &mut *event
+                    && *outcome == leveler_lifecycle::TaskOutcome::Blocked
+                    && reason.is_none()
+                    && let Some(summary) = blocked_summary.take()
+                {
+                    *reason = Some(summary);
+                }
                 if let (
                     EngineEvent::ToolCallStarted {
                         call_id,
@@ -674,6 +708,153 @@ mod tests {
             (2, 3_000, 300, Some(2_700)),
             "the replay reads each durable request once, not a client-side sum"
         );
+    }
+
+    /// A blocked terminal written before the reason was projected into the
+    /// durable terminal still has its structured cause: the `update_goal` call
+    /// that declared the block. Replay joins the two authoritative records
+    /// instead of showing a generic fallback for a reason the runtime has.
+    #[tokio::test]
+    async fn a_legacy_blocked_terminal_recovers_the_declared_reason() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        let turn_id = TurnId::generate();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(10),
+            EngineEvent::ToolCallStarted {
+                call_id: "c-goal".into(),
+                name: "update_goal".into(),
+                arguments: serde_json::json!({
+                    "status": "blocked",
+                    "summary": "dead-letter and seat journeys lack environment data",
+                    "next_step": "retry after seeding",
+                    "deliver_answer": true,
+                })
+                .to_string(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+                model_step: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(20),
+            EngineEvent::ToolCallFinished {
+                call_id: "c-goal".into(),
+                name: "update_goal".into(),
+                is_error: false,
+                preview: "Goal blocked.".into(),
+                agent_id: None,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            },
+        )
+        .await;
+        // The audited historical row: typed stop present, reason null.
+        event(
+            &db,
+            &sid,
+            t0 + ms(30),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Blocked,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Blocked),
+                warnings: Vec::new(),
+                verification: None,
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let reason = entries
+            .iter()
+            .find_map(|entry| match &entry.event {
+                RuntimeEvent::TurnBlocked { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the blocked terminal replays");
+        assert_eq!(
+            reason, "dead-letter and seat journeys lack environment data",
+            "the model's structured block summary is the reason the forward path records"
+        );
+    }
+
+    /// A terminal that already carries the runtime's own reason is complete;
+    /// the model's call summary must not override it.
+    #[tokio::test]
+    async fn an_explicit_blocked_reason_is_not_replaced_by_the_call_summary() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(10),
+            EngineEvent::ToolCallStarted {
+                call_id: "c-goal".into(),
+                name: "update_goal".into(),
+                arguments: serde_json::json!({
+                    "status": "blocked",
+                    "summary": "model summary",
+                })
+                .to_string(),
+                parallel: false,
+                risk: None,
+                agent_id: None,
+                model_step: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(30),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Blocked,
+                reason: Some("runtime recorded reason".into()),
+                failure: None,
+                stop: Some(StopReason::Blocked),
+                warnings: Vec::new(),
+                verification: None,
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let reason = entries
+            .iter()
+            .find_map(|entry| match &entry.event {
+                RuntimeEvent::TurnBlocked { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the blocked terminal replays");
+        assert_eq!(reason, "runtime recorded reason");
     }
 
     #[tokio::test]
