@@ -7910,6 +7910,15 @@
             "null"
           ]
         },
+        "duration_ms": {
+          "description": "How long the task's execution was observed, when a fact establishes it.\n\nA lost task's duration ends at the proven loss, not at the moment a client happens to read the record: work whose owner is gone must not appear to keep growing. Absent when no observed start or end exists.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "exit_code": {
           "type": [
             "integer",

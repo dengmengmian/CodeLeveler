@@ -946,6 +946,8 @@ export interface UiBackgroundTaskRecord {
   args?: string[];
   /** The tool call that started the task, when the start was recorded. */
   call_id?: string | null;
+  /** How long the task's execution was observed, when a fact establishes it. A lost task's duration ends at the proven loss, not at the moment a client happens to read the record: work whose owner is gone must not appear to keep growing. Absent when no observed start or end exists. */
+  duration_ms?: number | null;
   exit_code?: number | null;
   /** The lifetime the spawn promised (`goal`, `runtime`, `session`, `persistent`). Absent on a terminal-only record written before starts were recorded. */
   lifetime?: string | null;
@@ -1720,7 +1722,7 @@ export type ClientCommand =
   | { type: 'steer_current_turn'; content: string; message_id?: MessageId | null; session_id: SessionId }
   /** Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop. */
   | { type: 'run_goal'; content: string; require_new_turn?: boolean; session_id: SessionId }
-  /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. The client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it. */
+  /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. This is an EXPLICIT client command: the user chose to resume, so the client does not need to classify their words. The runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text, preserved alongside the original objective and added to it, never replacing it. */
   | { type: 'resume_task'; content: string; session_id: SessionId }
   /** Import a file as an attachment; the runtime processes and stores it. `name` overrides the display name that would otherwise come from the file name. A terminal that answers Cmd+V on an image by writing a scratch file and pasting its path knows the file name is its own bookkeeping (`clipboard-2026-09-16-215212-CE7C9522.png`) and not something the user chose — only the client that made the gesture knows that, so only it can say so. */
   | { type: 'add_attachment'; name?: string | null; path: string; session_id: SessionId }

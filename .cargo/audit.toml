@@ -18,4 +18,13 @@ ignore = [
     # See the matching entry in deny.toml. Expires 2026-10-01: remove when sqlx
     # drops the edge or a fix ships.
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys 0.30.1 bundles SQLite 3.46.0, before the 3.54.0 fix for
+    # RUSTSEC-2026-0459. Expires 2027-01-01. Linked at runtime through
+    # sqlx-sqlite, but only CodeLeveler's own user-owned state databases are
+    # opened; exploitation needs a crafted database plus `-wal` written by a
+    # less trusted local party. No sqlx 0.8 release carries the fixed
+    # libsqlite3-sys (0.9 is the first); that major upgrade is tracked
+    # separately. See deny.toml for the same adjudication.
+    #   $ cargo tree --target all -i libsqlite3-sys
+    "RUSTSEC-2026-0459",
 ]

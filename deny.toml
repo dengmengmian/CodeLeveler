@@ -40,6 +40,19 @@ ignore = [
     #   $ cargo tree --target all -i unsafe-libyaml
     #   unsafe-libyaml v0.2.11 └── serde_yaml_ng v0.10.0 └── leveler-agent └── leveler-app └── leveler-cli
     "RUSTSEC-2024-0449",
+    # libsqlite3-sys 0.30.1 bundles SQLite 3.46.0, which is before the 3.54.0
+    # fix for RUSTSEC-2026-0459 (uninitialized page-cache memory when a database
+    # is opened together with a sibling `-wal` whose page size differs).
+    # Expires 2027-01-01. Reached at runtime: the bundled SQLite backs the
+    # user-owned state databases opened through sqlx. Exploiting it requires a
+    # crafted database plus WAL pair written by a less trusted local party;
+    # CodeLeveler opens only its own `~/.leveler/state/*.db` files, so this is
+    # a local-privilege exposure rather than a remote one. No sqlx 0.8 release
+    # carries the fixed libsqlite3-sys; 0.9 is the first, and the sqlx major
+    # upgrade is tracked separately rather than forced into this release.
+    #   $ cargo tree --target all -i libsqlite3-sys
+    #   libsqlite3-sys v0.30.1 └── sqlx-sqlite v0.8.6 └── sqlx v0.8.6 └── leveler-schedule └── leveler-app └── leveler-cli
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]

@@ -14,7 +14,7 @@ import {
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
   workspaceDraftText, attachmentSubmissionError, permissionCommand, permissionConfirmed,
   beginDiffQuery, expireDiffQuery, retainInterruptedThoughts, mergeRestoredConversation,
-  reconcileBackgroundJobs,
+  reconcileBackgroundJobs, settledJobState,
 } from './state.mjs';
 import { brandMark, fileIcon } from './icons.mjs';
 import {
@@ -1050,19 +1050,6 @@ function jobDuration(job, live) {
   return formatJobDuration(job.duration_ms ?? ((job.finished_at ?? 0) - (job.started_at ?? 0)));
 }
 
-function jobSettledState(job) {
-  // A stopped task is not a failure however its exit code reads (the exit
-  // event's own rule); check the stop fact before the ok flag.
-  if (job.stopped) return { label: '已停止', dot: 'warning' };
-  // A task whose owning runtime is gone has no provable outcome: the process
-  // may have died with it, and nothing here may claim completion or failure.
-  if (job.status === 'lost') return { label: '状态未知', dot: 'failed' };
-  if (job.status === 'conflict') return { label: '标识冲突', dot: 'failed' };
-  if (job.status === 'unknown') return { label: '结果未知', dot: 'failed' };
-  if (job.status === 'failed') return { label: '已失败', dot: 'failed' };
-  return { label: '已完成', dot: 'done' };
-}
-
 function disarmJob() {
   if (jobsArmTimer) { clearTimeout(jobsArmTimer); jobsArmTimer = null; }
   jobsArmed = null;
@@ -1197,7 +1184,7 @@ function renderJobsInto(node) {
     node.append(header);
     if (settledOpen) {
       for (const job of [...settled].reverse()) {
-        const state = jobSettledState(job);
+        const state = settledJobState(job);
         const expanded = expandedJobs.has(job.task_id);
         // A settled row with retained output is a disclosure; one without is
         // read-only, like the reference settled tail.

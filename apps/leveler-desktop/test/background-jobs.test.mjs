@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { reconcileBackgroundJobs } from '../src/state.mjs';
+import { reconcileBackgroundJobs, settledJobState } from '../src/state.mjs';
 
 const priorJob = (taskId, extra = {}) => ({
   task_id: taskId,
@@ -99,4 +99,79 @@ test('a row already settled by an event is not duplicated', () => {
   });
   assert.equal(settledBackgroundTasks.length, 1);
   assert.equal(settledBackgroundTasks[0].status, 'unknown');
+});
+
+test('a cold start restores historical lost and unknown records', () => {
+  const { backgroundTasks, settledBackgroundTasks } = reconcileBackgroundJobs({
+    active: [],
+    prior: [],
+    records: [
+      {
+        task_id: 't-lost',
+        program: 'sh',
+        args: ['-c', 'sleep 600'],
+        state: 'lost',
+        duration_ms: 42_000,
+        output: 'host recorded tail\n',
+      },
+      { task_id: 't-unknown', program: 'curl', args: ['example.test'], state: 'unknown' },
+      { task_id: 't-done', program: 'echo', args: ['ok'], state: 'completed', exit_code: 0 },
+    ],
+    settled: [],
+  });
+  assert.deepEqual(backgroundTasks, []);
+  assert.deepEqual(
+    settledBackgroundTasks.map(job => job.task_id),
+    ['t-lost', 't-unknown'],
+    'only outcomes that cannot be proven are restored; completed history stays out',
+  );
+  const lost = settledBackgroundTasks[0];
+  assert.equal(lost.status, 'lost');
+  assert.equal(lost.duration_ms, 42_000);
+  assert.equal(lost.output, 'host recorded tail\n');
+  assert.equal(lost.finished_at, Number(lost.finished_at));
+  assert.equal(settledBackgroundTasks[1].status, 'unknown');
+});
+
+test('a live row whose durable record already settled is not kept running', () => {
+  const { backgroundTasks, settledBackgroundTasks } = reconcileBackgroundJobs({
+    active: [priorJob('t-lost')],
+    prior: [],
+    records: [{
+      task_id: 't-lost',
+      program: 'sh',
+      args: ['-c', 'sleep 600'],
+      state: 'lost',
+      duration_ms: 7_000,
+      output: 'held output\n',
+    }],
+    settled: [],
+  });
+  assert.deepEqual(backgroundTasks, [], 'a lost owner has no live work to show');
+  assert.equal(settledBackgroundTasks[0].status, 'lost');
+  assert.equal(settledBackgroundTasks[0].duration_ms, 7_000);
+});
+
+test('a cold-start record already settled is not duplicated', () => {
+  const settled = [{ task_id: 't-lost', status: 'unknown', finished_at: 1 }];
+  const { settledBackgroundTasks } = reconcileBackgroundJobs({
+    active: [],
+    prior: [],
+    records: [{ task_id: 't-lost', state: 'lost' }],
+    settled,
+  });
+  assert.equal(settledBackgroundTasks.length, 1);
+  assert.equal(settledBackgroundTasks[0].status, 'unknown');
+});
+
+test('a lost or unknown outcome is never labelled as a failure', () => {
+  assert.deepEqual(settledJobState({ status: 'failed' }), { label: '已失败', dot: 'failed' });
+  for (const status of ['lost', 'unknown']) {
+    const state = settledJobState({ status });
+    assert.notEqual(state.label, '已失败', status);
+    assert.equal(state.dot, 'warning', `${status} is uncertain, not failed`);
+  }
+  assert.deepEqual(settledJobState({ status: 'lost' }), { label: '状态未知', dot: 'warning' });
+  assert.deepEqual(settledJobState({ status: 'unknown' }), { label: '结果未知', dot: 'warning' });
+  assert.deepEqual(settledJobState({ status: 'failed', exit_code: 7 }), { label: '已失败', dot: 'failed' });
 });

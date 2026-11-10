@@ -1041,7 +1041,7 @@ mod tests {
         .expect_err("amend of a waived requirement is refused");
         assert!(matches!(
             error,
-            ScopeError::RequirementNotActive { ref state, .. } if *state == "waived"
+            ScopeError::RequirementNotActive { state, .. } if state == "waived"
         ));
     }
 

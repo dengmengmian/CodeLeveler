@@ -760,39 +760,41 @@ async fn the_scope_tool_is_readable_before_commit() {
 
     let _report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
 
-    let requests = fx.runtime.requests.lock().unwrap();
-    let tools = tool_names(&requests[0]);
-    assert!(
-        tools.contains(&"get_goal_scope"),
-        "the scope reader must be on the pre-commit surface: {tools:?}"
-    );
-    let result = requests[1]
-        .messages
-        .iter()
-        .flat_map(|message| message.content.iter())
-        .filter_map(|part| match part {
-            ContentPart::ToolResult { result } => Some(result),
-            _ => None,
-        })
-        .find(|result| result.call_id.as_str() == "call-1")
-        .expect("the scope result reaches the model");
-    assert!(!result.is_error, "{}", result.content);
-    assert!(
-        result
-            .content
-            .contains("No committed goal exists for this turn"),
-        "{}",
-        result.content
-    );
-    assert!(
-        result
-            .content
-            .contains("does not extract requirements from prose")
-            && result.content.contains("commit_task")
-            && result.content.contains("source_quote"),
-        "the reader names the declaration path instead of inventing scope: {}",
-        result.content
-    );
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let tools = tool_names(&requests[0]);
+        assert!(
+            tools.contains(&"get_goal_scope"),
+            "the scope reader must be on the pre-commit surface: {tools:?}"
+        );
+        let result = requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.call_id.as_str() == "call-1")
+            .expect("the scope result reaches the model");
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("No committed goal exists for this turn"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("does not extract requirements from prose")
+                && result.content.contains("commit_task")
+                && result.content.contains("source_quote"),
+            "the reader names the declaration path instead of inventing scope: {}",
+            result.content
+        );
+    }
     assert!(
         goal_records(&fx).await.is_empty(),
         "reading the scope before a declaration must not register anything"
@@ -877,32 +879,34 @@ async fn adopting_an_owed_goal_adds_the_scope_writer_to_the_next_request() {
 
     let _ = say(&fx, "这一项先记下，暂时不继续。").await;
 
-    let requests = fx.runtime.requests.lock().unwrap();
-    let after = requests.last().expect("the turn reached the model");
-    let receipt = after
-        .messages
-        .iter()
-        .flat_map(|message| message.content.iter())
-        .filter_map(|part| match part {
-            ContentPart::ToolResult { result } => Some(result),
-            _ => None,
-        })
-        .find(|result| result.content.starts_with("Recorded 1 operation(s)"))
-        .expect("the declaration receipt reaches the model");
-    assert!(
-        receipt.content.contains("declare_scope"),
-        "the receipt names the writer that adoption just made available: {}",
-        receipt.content
-    );
-    let tools = tool_names(after);
-    assert!(
-        tools.contains(&"declare_scope"),
-        "the adopting turn must be able to write the scope it adopted: {tools:?}"
-    );
-    assert!(
-        tools.contains(&"get_goal_scope"),
-        "the adopting turn must be able to read the scope it adopted: {tools:?}"
-    );
+    {
+        let requests = fx.runtime.requests.lock().unwrap();
+        let after = requests.last().expect("the turn reached the model");
+        let receipt = after
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result),
+                _ => None,
+            })
+            .find(|result| result.content.starts_with("Recorded 1 operation(s)"))
+            .expect("the declaration receipt reaches the model");
+        assert!(
+            receipt.content.contains("declare_scope"),
+            "the receipt names the writer that adoption just made available: {}",
+            receipt.content
+        );
+        let tools = tool_names(after);
+        assert!(
+            tools.contains(&"declare_scope"),
+            "the adopting turn must be able to write the scope it adopted: {tools:?}"
+        );
+        assert!(
+            tools.contains(&"get_goal_scope"),
+            "the adopting turn must be able to read the scope it adopted: {tools:?}"
+        );
+    }
     let paused = goal_records(&fx).await;
     assert!(
         paused[0].user_paused_at.is_some(),
@@ -3723,24 +3727,25 @@ async fn a_declaration_with_two_running_goals_must_name_one() {
 
     let _ = say(&fx, "继续").await;
 
-    let requests = fx.runtime.requests.lock().unwrap();
-    let refusal = requests
-        .iter()
-        .flat_map(|request| request.messages.iter())
-        .flat_map(|message| message.content.iter())
-        .filter_map(|part| match part {
-            ContentPart::ToolResult { result } => Some(result.content.clone()),
-            _ => None,
-        })
-        .find(|content| content.contains("running goals") && content.contains("will not guess"))
-        .expect("the ambiguity refusal names the choice");
+    let refusal = {
+        let requests = fx.runtime.requests.lock().unwrap();
+        requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("running goals") && content.contains("will not guess"))
+            .expect("the ambiguity refusal names the choice")
+    };
     for id in &ids {
         assert!(
             refusal.contains(id),
             "the refusal lists goal {id}: {refusal}"
         );
     }
-    drop(requests);
     let goals = goal_records(&fx).await;
     assert_eq!(
         goals.len(),
