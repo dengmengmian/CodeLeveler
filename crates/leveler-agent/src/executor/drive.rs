@@ -8417,7 +8417,10 @@ fn structured_scope_text(
 ///
 /// Supplying both is refused rather than silently preferring one: a model that
 /// copies the text AND names a conflicting span has stated two sources, and the
-/// runtime must not guess which one it meant.
+/// runtime must not guess which one it meant. An explicit `null` quote is
+/// absent, not a second source: the tool schema requires the key so a provider
+/// that honors `required` but ignores `oneOf` still sees the obligation, and a
+/// span-only declaration marks that with `null`.
 fn declared_source_quote(
     object: &serde_json::Map<String, serde_json::Value>,
     source_text: &str,
@@ -8986,6 +8989,42 @@ mod commit_declaration_tests {
         assert_eq!(
             declaration.requirements[1].source_quote,
             "然后运行 `echo hi!` 验证。"
+        );
+    }
+
+    /// The schema lists `source_quote` in `required` so a provider that honors
+    /// `required` but ignores `oneOf` cannot omit the source. `null` is the
+    /// presence marker for a span-only declaration, not a second source.
+    #[test]
+    fn a_null_quote_marks_a_span_only_declaration() {
+        let declaration = parse_commit_declaration(
+            &json!({
+                "acceptance": ["a.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                    "source_quote": null,
+                    "source_span": {"start_line": 1, "end_line": 1}
+                }]
+            }),
+            "创建 a.txt",
+        )
+        .expect("a null quote with a span is one source, not two");
+        assert_eq!(declaration.requirements[0].source_quote, "创建 a.txt");
+
+        let neither = parse_commit_declaration(
+            &json!({
+                "acceptance": ["a.txt 存在"],
+                "requirements": [{
+                    "kind": "artifact", "text": "a.txt 存在", "target": "a.txt",
+                    "source_quote": null
+                }]
+            }),
+            "创建 a.txt",
+        )
+        .expect_err("the key is present but carries no source");
+        assert!(
+            neither.contains("needs `source_quote` or `source_span`"),
+            "{neither}"
         );
     }
 

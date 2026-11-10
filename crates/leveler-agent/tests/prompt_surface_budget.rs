@@ -1028,8 +1028,15 @@ async fn progressive_initial_surface_inventory() {
     // requirement set the gate enforces — plus the op/field contract it must
     // describe. The definition is ~700 tokens; the alternative is a scope the
     // model can read but never declare, which is no scope at all.
+    // 8750 (was 8600): the source key is now a nullable `required` member of
+    // every declaration schema. DeepSeek honored `required` but ignored the
+    // item-level `oneOf`, so first declarations omitted the source entirely;
+    // requiring the key (with `null` as the span-only marker) costs ~117
+    // tokens and cut missing-source declarations from 6/58 to 1/49 in the
+    // paired A/B. A new field-sized surface is hundreds of tokens, so this
+    // ceiling still rejects one.
     assert!(
-        schema_tokens <= 8600,
+        schema_tokens <= 8750,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());

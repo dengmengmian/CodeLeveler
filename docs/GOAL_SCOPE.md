@@ -66,7 +66,10 @@ verbatim copy. `source_span` names lines of the authoritative user message
 line); the runtime cuts the original bytes itself, so punctuation width, a
 rewrap or a Unicode normalization choice in the model's output cannot turn a
 real user requirement into a refused declaration. Supplying both is refused:
-the runtime will not guess which source the model meant. Neither form accepts a
+the runtime will not guess which source the model meant. The tool schema lists
+`source_quote` in `required` (it is nullable) because some providers honor only
+a required list; a span-only declaration passes `source_quote: null`, which the
+runtime treats as absent, not as a second source. Neither form accepts a
 paraphrase, and there is no fuzzy equivalence (full-width vs ASCII punctuation,
 edit distance or regex repair).
 
