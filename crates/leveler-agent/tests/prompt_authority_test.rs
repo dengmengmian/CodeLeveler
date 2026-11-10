@@ -893,3 +893,65 @@ async fn an_edit_pause_blocks_only_the_path_that_needs_the_rule() {
     assert_eq!(pause_messages(&requests[2]), 1, "no second pause");
     assert!(dir.path().join("src/fresh.rs").is_file());
 }
+
+/// DF-15: a nested rule that exists but cannot be read is not an absent rule.
+/// The edit whose own path needs it is refused with the reason, while an
+/// unrelated path in the same batch still runs.
+#[tokio::test]
+async fn an_unreadable_scoped_rule_pauses_only_the_edit_that_needs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::create_dir(dir.path().join("answers")).unwrap();
+    // Present but unreadable: a directory at the document's own path.
+    std::fs::create_dir(dir.path().join("src/AGENTS.md")).unwrap();
+
+    let script = Script::new(vec![
+        tool_calls(vec![
+            (
+                "w1",
+                "write_file",
+                serde_json::json!({"path": "src/fresh.rs", "content": "pub fn fresh() -> i32 { 7 }\n"}),
+            ),
+            (
+                "w2",
+                "write_file",
+                serde_json::json!({"path": "answers/answer.txt", "content": "done\n"}),
+            ),
+        ]),
+        answer("stopped"),
+    ]);
+    executor(dir.path(), script.clone())
+        .run(
+            "write a source file governed by a broken rule",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = script.requests.lock().unwrap();
+    assert_eq!(
+        pause_messages(&requests[1]),
+        1,
+        "one pause for the path that needs the rule: {:?}",
+        requests[1].messages
+    );
+    let refusal = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|part| match part {
+            ContentPart::ToolResult { result } if result.content.contains("src/AGENTS.md") => {
+                Some(result.content.as_str())
+            }
+            _ => None,
+        })
+        .expect("the refusal names the unreadable rule");
+    assert!(
+        refusal.contains("could not be read"),
+        "the refusal states why: {refusal}"
+    );
+    assert!(!dir.path().join("src/fresh.rs").exists());
+    assert!(dir.path().join("answers/answer.txt").is_file());
+}
