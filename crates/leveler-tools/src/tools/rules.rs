@@ -18,7 +18,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_context::{READ_PROJECT_RULES_TOOL, load_rules, read_rule_source, split_rule_sections};
+use leveler_context::{
+    READ_PROJECT_RULES_TOOL, load_rules_reported, read_rule_source_reported, split_rule_sections,
+};
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -36,6 +38,14 @@ struct ReadRulesInput {
 }
 
 pub struct ReadProjectRulesTool;
+
+fn render_load_issues(issues: &[leveler_context::RuleLoadIssue]) -> String {
+    issues
+        .iter()
+        .map(|issue| format!("  {} ({})", issue.source, issue.reason))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[async_trait]
 impl Tool for ReadProjectRulesTool {
@@ -72,7 +82,7 @@ impl Tool for ReadProjectRulesTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: ReadRulesInput = super::parse_input(self.name(), input)?;
         let root: &Path = context.require_workspace()?.root();
-        let rules = load_rules(root);
+        let (rules, load_issues) = load_rules_reported(root);
 
         let Some(source) = input.source.as_deref() else {
             if input.section.is_some() {
@@ -80,7 +90,13 @@ impl Tool for ReadProjectRulesTool {
                     "`section` needs a `source`; call with no arguments to list sources.",
                 ));
             }
+            let failures = render_load_issues(&load_issues);
             if rules.is_empty() {
+                if !load_issues.is_empty() {
+                    return Ok(ToolOutput::error(format!(
+                        "Project rule documents exist but could not be read:\n{failures}"
+                    )));
+                }
                 return Ok(ToolOutput::ok("No project rules are configured."));
             }
             let mut listing = String::from("Project rules available:\n");
@@ -93,18 +109,32 @@ impl Tool for ReadProjectRulesTool {
                     ));
                 }
             }
+            if !load_issues.is_empty() {
+                listing.push_str(&format!(
+                    "\nWARNING: some rule documents exist but could not be read:\n{failures}"
+                ));
+            }
             return Ok(ToolOutput::ok(listing));
         };
 
-        // One loader: a root source comes from the same `load_rules` the prompt
-        // uses, and a nested one (`src/AGENTS.md`) is read through the same
-        // `read_rule_source` the scoped loader uses. The two can never return
-        // different bytes for the same file.
-        let instruction = rules
-            .iter()
-            .find(|rule| rule.source == source)
-            .cloned()
-            .or_else(|| read_rule_source(root, source));
+        // One loader: a root source comes from the same `load_rules_reported`
+        // the prompt uses, and a nested one (`src/AGENTS.md`) is read through
+        // the same reported reader the scoped loader uses. The two can never
+        // return different bytes for the same file, and an unreadable file is
+        // never reported as a missing one.
+        let instruction = match rules.iter().find(|rule| rule.source == source).cloned() {
+            Some(rule) => Some(rule),
+            None if !leveler_context::is_rule_document(source) => None,
+            None => match read_rule_source_reported(root, source) {
+                Ok(rule) => rule,
+                Err(issue) => {
+                    return Ok(ToolOutput::error(format!(
+                        "`{}` exists but could not be read: {}",
+                        issue.source, issue.reason
+                    )));
+                }
+            },
+        };
         let Some(instruction) = instruction else {
             return Ok(ToolOutput::error(format!(
                 "`{source}` is not a project-rule document. Rule documents are \

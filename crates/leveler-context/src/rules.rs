@@ -176,6 +176,21 @@ impl RuleDeliveryPolicy {
     }
 }
 
+/// A rule document that exists but could not be delivered.
+///
+/// Absence is not a failure: a workspace without `AGENTS.md` simply has no
+/// rules. A file that is present but unreadable, not valid UTF-8, or that
+/// escapes the workspace through a symlink is a real failure and must be
+/// visible to the operator and the model instead of being reported as absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleLoadIssue {
+    /// Workspace-relative source path, or the directory that could not be
+    /// listed.
+    pub source: String,
+    /// Why the document was not delivered.
+    pub reason: String,
+}
+
 /// One request's rule delivery: prompt-ready documents plus what it cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleDeliveryPlan {
@@ -202,6 +217,8 @@ pub struct RuleDeliveryReport {
     pub clipped_mandatory: Vec<String>,
     /// `always_delivered` entries that matched no section at all.
     pub unmatched_mandatory: Vec<String>,
+    /// Rule documents that exist but could not be delivered.
+    pub load_issues: Vec<RuleLoadIssue>,
 }
 
 /// What one document contributes, by class.
@@ -216,7 +233,10 @@ struct DocumentSelection {
 
 /// Plan the delivery of every rule document under `root`.
 pub fn plan_rule_delivery(root: &Path, policy: &RuleDeliveryPolicy) -> RuleDeliveryPlan {
-    plan_instructions(load_rules(root), policy)
+    let (documents, load_issues) = load_rules_reported(root);
+    let mut plan = plan_instructions(documents, policy);
+    plan.report.load_issues = load_issues;
+    plan
 }
 
 /// Plan delivery across already-loaded documents.
@@ -450,30 +470,67 @@ pub struct ProjectInstruction {
 
 /// Every root rule document under `root`, in priority order.
 pub fn load_rules(root: &Path) -> Vec<ProjectInstruction> {
+    load_rules_reported(root).0
+}
+
+/// Every root rule document, plus the ones that could not be read.
+///
+/// Absence and failure are different states: a missing `AGENTS.md` is normal,
+/// while an unreadable or out-of-workspace document is reported in the second
+/// value and never silently treated as if it did not exist.
+pub fn load_rules_reported(root: &Path) -> (Vec<ProjectInstruction>, Vec<RuleLoadIssue>) {
     let mut out = Vec::new();
+    let mut issues = Vec::new();
     for candidate in ["AGENTS.md", ".leveler/instructions.md"] {
-        if let Some(rule) = read_rule_source(root, candidate) {
-            out.push(rule);
+        match read_rule_source_reported(root, candidate) {
+            Ok(Some(rule)) => out.push(rule),
+            Ok(None) => {}
+            Err(issue) => issues.push(issue),
         }
     }
     // .leveler/rules/*.md, sorted for determinism.
     let rules_dir = root.join(".leveler/rules");
-    if let Ok(entries) = std::fs::read_dir(&rules_dir) {
-        let mut paths: Vec<_> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            if let Some(rel) = path.strip_prefix(root).ok().and_then(|p| p.to_str())
-                && let Some(rule) = read_rule_source(root, rel)
-            {
-                out.push(rule);
+    match std::fs::read_dir(&rules_dir) {
+        Ok(entries) => {
+            let mut files: Vec<String> = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                            continue;
+                        }
+                        match path.strip_prefix(root).ok().and_then(|rel| rel.to_str()) {
+                            Some(rel) => files.push(rel.to_string()),
+                            None => issues.push(RuleLoadIssue {
+                                source: path.display().to_string(),
+                                reason: "rule filename is not valid UTF-8".to_string(),
+                            }),
+                        }
+                    }
+                    Err(err) => issues.push(RuleLoadIssue {
+                        source: ".leveler/rules".to_string(),
+                        reason: err.to_string(),
+                    }),
+                }
+            }
+            files.sort();
+            for rel in files {
+                match read_rule_source_reported(root, &rel) {
+                    Ok(Some(rule)) => out.push(rule),
+                    Ok(None) => {}
+                    Err(issue) => issues.push(issue),
+                }
             }
         }
+        // No rules directory is a normal empty state.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => issues.push(RuleLoadIssue {
+            source: ".leveler/rules".to_string(),
+            reason: err.to_string(),
+        }),
     }
-    out
+    (out, issues)
 }
 
 /// The ONE reader for a rule document, used by the prompt loader, the scoped
@@ -485,20 +542,81 @@ pub fn load_rules(root: &Path) -> Vec<ProjectInstruction> {
 /// retrieval tool from laundering arbitrary file content into project
 /// authority.
 pub fn read_rule_source(root: &Path, rel: &str) -> Option<ProjectInstruction> {
+    read_rule_source_reported(root, rel).ok().flatten()
+}
+
+/// The reported form of [`read_rule_source`].
+///
+/// `Ok(None)` means the document is legitimately absent or empty. `Err` means
+/// it exists but this runtime refused or failed to read it — a state the
+/// caller must surface, not fold into "no rules".
+pub fn read_rule_source_reported(
+    root: &Path,
+    rel: &str,
+) -> Result<Option<ProjectInstruction>, RuleLoadIssue> {
     if !is_rule_document(rel) {
-        return None;
+        return Err(RuleLoadIssue {
+            source: rel.to_string(),
+            reason: "not a project-rule document".to_string(),
+        });
     }
-    let content = std::fs::read_to_string(root.join(rel)).ok()?;
+    let path = root.join(rel);
+    let issue = |reason: String| RuleLoadIssue {
+        source: rel.to_string(),
+        reason,
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        // Absence is the normal state: a workspace does not have to have rules.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(issue(format!("cannot inspect: {err}"))),
+    }
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|err| issue(format!("workspace root: {err}")))?;
+    let canonical = std::fs::canonicalize(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            issue("dangling symlink".to_string())
+        } else {
+            issue(format!("cannot resolve: {err}"))
+        }
+    })?;
+    if !workspace_contains(&canonical_root, &canonical) {
+        return Err(issue(format!(
+            "resolves outside the workspace: {}",
+            canonical.display()
+        )));
+    }
+    let content = std::fs::read_to_string(&canonical).map_err(|err| issue(err.to_string()))?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Stored in full. Selection happens at render time, by whole section, so
     // nothing is lost before the delivery decision is made.
-    Some(ProjectInstruction {
+    Ok(Some(ProjectInstruction {
         source: rel.to_string(),
         content: trimmed.to_string(),
-    })
+    }))
+}
+
+/// Whether `target` is `root` or below it. Both paths must already be
+/// canonical, so a symlink cannot vouch for its own containment.
+fn workspace_contains(root: &Path, target: &Path) -> bool {
+    if target.starts_with(root) {
+        return true;
+    }
+    // Windows paths compare case-insensitively; canonicalize does not
+    // normalize the drive/casing of every component.
+    #[cfg(windows)]
+    {
+        let root = root.to_string_lossy().to_lowercase();
+        let target = target.to_string_lossy().to_lowercase();
+        return target.strip_prefix(&root).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/')
+        });
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// Whether `rel` is a rule document this product loads: an `AGENTS.md` in any
@@ -541,18 +659,34 @@ pub fn is_rule_document(rel: &str) -> bool {
 /// dropped. Root `AGENTS.md` is never returned — it belongs to the request
 /// prefix, not to a path.
 pub fn scoped_rule_sources(root: &Path, paths: &[String]) -> Vec<ProjectInstruction> {
+    scoped_rule_sources_reported(root, paths).0
+}
+
+/// The reported form of [`scoped_rule_sources`]. A nested document that exists
+/// but cannot be read is returned as an issue, never as an absent rule.
+pub fn scoped_rule_sources_reported(
+    root: &Path,
+    paths: &[String],
+) -> (Vec<ProjectInstruction>, Vec<RuleLoadIssue>) {
     let mut out: Vec<ProjectInstruction> = Vec::new();
+    let mut issues: Vec<RuleLoadIssue> = Vec::new();
     for path in paths {
         for rel in scoped_document_paths(path) {
             if rel == "AGENTS.md" || out.iter().any(|rule| rule.source == rel) {
                 continue;
             }
-            if let Some(rule) = read_rule_source(root, &rel) {
-                out.push(rule);
+            match read_rule_source_reported(root, &rel) {
+                Ok(Some(rule)) => out.push(rule),
+                Ok(None) => {}
+                Err(issue) => {
+                    if !issues.iter().any(|seen| seen.source == issue.source) {
+                        issues.push(issue);
+                    }
+                }
             }
         }
     }
-    out
+    (out, issues)
 }
 
 fn scoped_document_paths(path: &str) -> Vec<String> {

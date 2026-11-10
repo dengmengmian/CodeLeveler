@@ -2493,11 +2493,27 @@ impl Executor {
                     sections_omitted = report.sections_omitted,
                     mandatory_undelivered = report.undelivered_mandatory.len(),
                     mandatory_unmatched = report.unmatched_mandatory.len(),
+                    load_issues = report.load_issues.len(),
                     sources = ?plan.documents.iter().map(|rule| rule.source.as_str()).collect::<Vec<_>>(),
                     "project rule delivery"
                 );
                 for entry in &report.unmatched_mandatory {
                     tracing::warn!(event = "mandatory_rule_unmatched", entry = %entry);
+                }
+                for issue in &report.load_issues {
+                    tracing::warn!(
+                        event = "rule_load_failed",
+                        source = %issue.source,
+                        reason = %issue.reason
+                    );
+                    // A rule document that exists but cannot be read is not a
+                    // workspace without rules. Say so instead of letting the
+                    // model infer that no rule constrains the task.
+                    rule_diagnostics.push(format!(
+                        "A project rule document could not be read and is NOT in this \
+                         prompt: {} ({}). Do not assume its contents.",
+                        issue.source, issue.reason
+                    ));
                 }
                 plan.documents
             }
