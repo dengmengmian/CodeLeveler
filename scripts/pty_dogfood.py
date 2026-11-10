@@ -428,6 +428,11 @@ class MockProvider:
         # for every existing scenario.
         self.assist_text: str | None = None
         self.assist_requests: list[str] = []
+        # Opt-in: rewrite a turn from the request that is about to be answered.
+        # A scripted model that must cite a runtime-issued id (a background
+        # task id, for example) reads it from the same request body a real
+        # model reads. Left None, every turn is served verbatim.
+        self.transform = None
         self.lock = threading.Lock()
         provider = self
 
@@ -450,6 +455,8 @@ class MockProvider:
                         index = min(provider.calls, len(provider.turns) - 1)
                         provider.calls += 1
                         frames = provider.turns[index] if provider.turns else []
+                        if provider.transform is not None:
+                            frames = provider.transform(body, frames)
                         assist_text = None
                 if assist:
                     data = json.dumps(
