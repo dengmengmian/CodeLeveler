@@ -198,6 +198,27 @@ pub struct CheckpointExecution {
 /// How many runtime-observed outcomes a checkpoint carries (the most recent).
 pub const MAX_EXECUTION_EVIDENCE: usize = 12;
 
+/// The window a checkpoint closes, projected from the goal's durable window
+/// count and the model's own accepted `update_goal` declaration.
+///
+/// This exists because a Plan alone cannot tell the next window that a window
+/// already ended: a step the model left `in_progress` while yielding made the
+/// next window believe it was still the first one and repeat finished work.
+/// The outcome is a runtime-recorded boundary fact; the summary is the model's
+/// recorded prose and stays labelled unverified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointWindow {
+    /// 1-based index of the window within the goal's execution history.
+    pub index: u32,
+    /// The turn whose boundary closed the window.
+    pub turn_id: String,
+    /// The accepted declaration: `yielded`, `completed`, or `blocked`.
+    pub outcome: String,
+    /// The model's recorded resolution summary, verbatim but bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 /// Plan progress projected from the authoritative [`PlanState`] — counts and
 /// bounded step texts, not a mirror of the whole plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +319,11 @@ pub struct GoalCheckpoint {
     /// Runtime-observed execution outcomes; `None` = none observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<CheckpointExecution>,
+    /// The window this checkpoint closes, when it was cut at a window
+    /// boundary. `None` = mid-window checkpoint or a pre-continuity row —
+    /// never "no window ran".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_window: Option<CheckpointWindow>,
 
     // ---- semantic layer (optional, grounded in the facts above) ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +403,11 @@ impl GoalCheckpoint {
                 evidence.detail = bounded_text(&evidence.detail);
             }
             execution.total = execution.total.max(execution.recent.len() as u32);
+        }
+        if let Some(window) = &mut self.last_window
+            && let Some(summary) = &mut window.summary
+        {
+            *summary = bounded_text(summary);
         }
         self
     }
@@ -471,6 +502,18 @@ impl GoalCheckpoint {
         }
         if !self.completed_milestones.is_empty() {
             push_list(&mut out, "Completed", &self.completed_milestones);
+        }
+        if let Some(window) = &self.last_window {
+            let mut body = format!(
+                "window {} (turn {}) closed with `{}`",
+                window.index, window.turn_id, window.outcome
+            );
+            if let Some(summary) = &window.summary {
+                body.push_str(&format!(
+                    "; model-reported outcome UNVERIFIED (a claim, not evidence): {summary}"
+                ));
+            }
+            push_section(&mut out, "Previous window", &body);
         }
         if let Some(plan) = &self.plan {
             let mut body = format!("{}/{} steps completed", plan.completed, plan.total);
@@ -624,6 +667,40 @@ mod tests {
             "unknown git state is not clean"
         );
         assert!(decoded.plan.is_none(), "no plan is absent, not 0/0");
+        assert!(
+            decoded.last_window.is_none(),
+            "a pre-continuity row did not record a window boundary"
+        );
+    }
+
+    /// The window boundary reaches the next window as a labelled model report,
+    /// never as verified evidence of finished work.
+    #[test]
+    fn previous_window_is_rendered_as_a_model_report() {
+        let cp = GoalCheckpoint {
+            objective: "x".into(),
+            last_window: Some(CheckpointWindow {
+                index: 2,
+                turn_id: "turn-2".into(),
+                outcome: "yielded".into(),
+                summary: Some("implemented; window 3 verifies".into()),
+            }),
+            ..Default::default()
+        };
+        let block = cp.context_block();
+        assert!(block.contains("Previous window"), "got: {block}");
+        assert!(
+            block.contains("window 2 (turn turn-2) closed with `yielded`"),
+            "got: {block}"
+        );
+        assert!(
+            block.contains("UNVERIFIED (a claim, not evidence)"),
+            "got: {block}"
+        );
+        assert!(
+            block.contains("implemented; window 3 verifies"),
+            "got: {block}"
+        );
     }
 
     #[test]

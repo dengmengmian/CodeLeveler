@@ -18,8 +18,8 @@
 use leveler_core::{GoalId, SessionId, TurnId};
 use leveler_lifecycle::{
     CheckpointChild, CheckpointDecision, CheckpointEvidence, CheckpointExecution,
-    CheckpointFindings, CheckpointPlan, CheckpointQuestion, CheckpointReason, CheckpointWorkspace,
-    EvidenceLedger, GoalCheckpoint, MAX_EXECUTION_EVIDENCE,
+    CheckpointFindings, CheckpointPlan, CheckpointQuestion, CheckpointReason, CheckpointWindow,
+    CheckpointWorkspace, EvidenceLedger, GoalCheckpoint, MAX_EXECUTION_EVIDENCE,
 };
 use leveler_storage::{
     EventRecord, EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore,
@@ -376,6 +376,7 @@ pub async fn project_goal_checkpoint(
         user_messages: user_messages(messages, session_id, scope, goal).await?,
         decisions: user_decisions(events, session_id, scope).await?,
         execution: execution_evidence(events, session_id, scope).await?,
+        last_window: previous_window(events, session_id, scope, goal).await?,
         ..Default::default()
     }
     .bounded();
@@ -809,6 +810,98 @@ async fn user_decisions(
         }
     }
     Ok(decisions)
+}
+
+/// The window this checkpoint closes, projected from the model's accepted
+/// `update_goal` declaration in the CURRENT turn.
+///
+/// The plan cannot carry the boundary by itself: a window that ended while its
+/// plan step was still `in_progress` looked, to the next window, exactly like
+/// a window that had not started yet, and the real dogfood re-ran a finished
+/// read-only investigation. The declaration's status is a typed tool argument
+/// and the index comes from the durable window count; the summary is model
+/// prose, rendered as unverified. A refused declaration (outstanding children,
+/// invalid status, …) never becomes a window outcome.
+async fn previous_window(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    scope: &GoalCheckpointScope,
+    goal: &GoalRecord,
+) -> Result<Option<CheckpointWindow>, EngineError> {
+    // `scope.turn_ids` is built in durable turn order; the last turn is the
+    // window this checkpoint closes. A declaration from an earlier turn
+    // belongs to an earlier window and must not take today's index.
+    let Some(current_turn) = scope.turn_ids.last() else {
+        return Ok(None);
+    };
+    let rows = events
+        .load_by_types(session_id, &["tool_call_started", "tool_call_finished"])
+        .await?;
+    let mut accepted = std::collections::HashSet::new();
+    for row in rows.iter().filter(|row| scope.contains_event(row)) {
+        let EngineEvent::ToolCallFinished {
+            call_id,
+            name,
+            is_error: false,
+            agent_id,
+            ..
+        } = EngineEvent::from_payload(&row.payload)?
+        else {
+            continue;
+        };
+        if agent_id.is_none() && name == crate::injected_tools::UPDATE_GOAL_TOOL {
+            accepted.insert(call_id);
+        }
+    }
+    for row in rows
+        .into_iter()
+        .rev()
+        .filter(|row| scope.contains_event(row))
+    {
+        if row.turn_id.as_deref() != Some(current_turn.as_str()) {
+            continue;
+        }
+        let EngineEvent::ToolCallStarted {
+            call_id,
+            name,
+            arguments,
+            agent_id,
+            ..
+        } = EngineEvent::from_payload(&row.payload)?
+        else {
+            continue;
+        };
+        if agent_id.is_some()
+            || name != crate::injected_tools::UPDATE_GOAL_TOOL
+            || !accepted.contains(&call_id)
+        {
+            continue;
+        }
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&arguments) else {
+            continue;
+        };
+        // Only the declared resolution vocabulary is a window outcome. Any
+        // other value would have been refused by the tool gate and is not one.
+        let outcome = match arguments.get("status").and_then(|value| value.as_str()) {
+            Some("yield") => "yielded",
+            Some("complete") => "completed",
+            Some("blocked") => "blocked",
+            _ => continue,
+        };
+        let summary = arguments
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string);
+        return Ok(Some(CheckpointWindow {
+            index: goal.windows_run.saturating_add(1),
+            turn_id: current_turn.as_str().to_string(),
+            outcome: outcome.to_string(),
+            summary,
+        }));
+    }
+    Ok(None)
 }
 
 /// Runtime-observed execution outcomes for this lineage: process exits and

@@ -610,6 +610,148 @@ async fn resume_after_yield_carries_the_answered_user_decision() {
     );
 }
 
+/// The window boundary itself must reach the next window. A model that
+/// yielded while its plan step was still `in_progress` left the plan unable to
+/// tell window 2 that window 1 had already run — in the real dogfood, window 2
+/// re-ran window 1's read-only investigation. The accepted `update_goal`
+/// declaration and the goal's window count are durable, so the checkpoint
+/// carries the closed window explicitly, marked as model-reported and
+/// unverified rather than as evidence of finished work.
+#[tokio::test]
+async fn a_yielded_windows_own_outcome_crosses_the_boundary() {
+    let fx = fixture().await;
+    let summary = "窗口1完成：跨来源权益下放缺口定位；待窗口2实现";
+    append_event(
+        &fx,
+        EngineEvent::ToolCallStarted {
+            call_id: "call-yield".into(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({"status": "yield", "summary": summary}).to_string(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(9),
+        },
+    )
+    .await;
+    append_event(
+        &fx,
+        EngineEvent::ToolCallFinished {
+            call_id: "call-yield".into(),
+            name: "update_goal".into(),
+            is_error: false,
+            preview: "Goal yielded.".into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+    )
+    .await;
+    append_messages(&fx, &["window-1 evidence"]).await;
+
+    let record = create_goal_checkpoint(
+        &fx.engine,
+        &fx.session,
+        &fx.scope,
+        CheckpointReason::Milestone,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("running goal checkpoint");
+    let window = record
+        .payload
+        .last_window
+        .as_ref()
+        .expect("the closed window must be recorded");
+    assert_eq!(window.index, 1, "the goal had run no earlier windows");
+    assert_eq!(window.turn_id, fx.scope.root_turn_id.as_str());
+    assert_eq!(window.outcome, "yielded");
+    assert_eq!(window.summary.as_deref(), Some(summary));
+
+    // The next window starts after the watermark: the block is the only place
+    // the boundary fact can come from.
+    append_messages(&fx, &["window-2 first message"]).await;
+    let transcript = leveler_engine::RawTranscript::load_strict(
+        fx.stores.messages.as_ref(),
+        &fx.session,
+        "test transcript",
+    )
+    .await
+    .unwrap();
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &fx.scope, &transcript)
+        .await
+        .unwrap()
+        .expect("checkpoint resume");
+    let block = &message_texts(&prior)[0];
+
+    assert!(
+        block.contains("Previous window"),
+        "the next window must be told a window already ended:\n{block}"
+    );
+    assert!(
+        block.contains(summary),
+        "the model's recorded outcome of that window must survive:\n{block}"
+    );
+    assert!(
+        block.contains("UNVERIFIED"),
+        "a model report is not evidence; the block must say so:\n{block}"
+    );
+}
+
+/// Only an accepted resolution closes a window. A refused `update_goal(yield)`
+/// (for example while delegated children still run) did not end the window and
+/// must not be presented as its outcome.
+#[tokio::test]
+async fn a_refused_yield_is_not_a_window_outcome() {
+    let fx = fixture().await;
+    append_event(
+        &fx,
+        EngineEvent::ToolCallStarted {
+            call_id: "call-refused-yield".into(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({"status": "yield", "summary": "too early"}).to_string(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(3),
+        },
+    )
+    .await;
+    append_event(
+        &fx,
+        EngineEvent::ToolCallFinished {
+            call_id: "call-refused-yield".into(),
+            name: "update_goal".into(),
+            is_error: true,
+            preview: "update_goal(yield) was not accepted".into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+    )
+    .await;
+
+    let record = create_goal_checkpoint(
+        &fx.engine,
+        &fx.session,
+        &fx.scope,
+        CheckpointReason::Milestone,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("running goal checkpoint");
+    assert!(
+        record.payload.last_window.is_none(),
+        "a refused declaration is not a window outcome"
+    );
+}
+
 /// Three windows: the newest checkpoint must carry the decisions and
 /// runtime-observed execution facts of EVERY earlier window, not just the one
 /// immediately before it.
