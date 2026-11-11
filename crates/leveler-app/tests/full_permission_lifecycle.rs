@@ -545,6 +545,7 @@ async fn switching_to_full_leaves_a_clarification_intact() {
         .send(ClientCommand::AnswerClarification {
             request_id: question.id,
             answer: "简洁".to_string(),
+            session_id: None,
         })
         .await
         .unwrap();

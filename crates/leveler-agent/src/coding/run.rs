@@ -403,7 +403,7 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
     use StopReason as S;
     match report.stop_reason {
         S::Completed | S::Answered => (SessionStatus::Completed, AgentState::Complete),
-        S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled => {
+        S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled | S::Yielded => {
             (SessionStatus::Incomplete, AgentState::Execute)
         }
         S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
@@ -1193,10 +1193,18 @@ impl CodingRuntime {
     /// running when the turn was interrupted. Matching by objective text (or
     /// merely taking the newest running goal) is not identity and can attach a
     /// continuation to unrelated work.
+    ///
+    /// `allow_reopen` distinguishes the two callers. A user's continuation may
+    /// reopen a settled goal: they asked for that work again. A runtime-opened
+    /// continuation may not — it runs because the last window yielded with the
+    /// goal still owed, and a goal that settled since (the user cancelled it,
+    /// or another window completed it) is no longer owed. Reopening it there
+    /// would resurrect work the user ended.
     async fn resume_goal(
         &self,
         token: &leveler_core::OwnershipToken,
         goal_id: &leveler_core::GoalId,
+        allow_reopen: bool,
     ) -> Result<leveler_core::GoalId, EngineError> {
         let goal = self
             .engine
@@ -1212,6 +1220,12 @@ impl CodingRuntime {
             )));
         }
         if goal.state == leveler_storage::GoalState::Settled {
+            if !allow_reopen {
+                return Err(EngineError::GoalNotOwed(format!(
+                    "goal {goal_id} settled while this automatic continuation was starting; \
+                     it is no longer owed and is not reopened"
+                )));
+            }
             self.engine.stores.goals.reopen(token, goal_id).await?;
         }
         Ok(goal.id)
@@ -2616,7 +2630,28 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        self.resume_inner(session_id, spec, None, observer, cancellation)
+        self.resume_inner(session_id, spec, None, true, observer, cancellation)
+            .await
+    }
+
+    /// Continue a goal the runtime itself still owes, without a user message.
+    ///
+    /// This is the automatic continuation of a yielded work window: the model
+    /// ended its window through `update_goal(yield)` and the goal is still
+    /// running. The turn therefore has no initiating message — the runtime is
+    /// not pretending the person typed anything — and the same objective, plan,
+    /// ledger and history continue under one new window.
+    ///
+    /// Unlike a user's continuation this NEVER reopens a settled goal: the goal
+    /// is only continued while it is still owed.
+    pub async fn resume_continuation(
+        &self,
+        session_id: &SessionId,
+        spec: &TaskSpec,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<TaskReport, EngineError> {
+        self.resume_inner(session_id, spec, None, false, observer, cancellation)
             .await
     }
 
@@ -2637,8 +2672,15 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        self.resume_inner(session_id, spec, Some(instruction), observer, cancellation)
-            .await
+        self.resume_inner(
+            session_id,
+            spec,
+            Some(instruction),
+            true,
+            observer,
+            cancellation,
+        )
+        .await
     }
 
     /// Whether the session's latest durable terminal is a declaration that the
@@ -3023,6 +3065,7 @@ impl CodingRuntime {
         session_id: &SessionId,
         spec: &TaskSpec,
         instruction: Option<Message>,
+        allow_reopen: bool,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -3080,6 +3123,29 @@ impl CodingRuntime {
         // yet.
         if lineage_was_chat && (lineage.goal_id.is_some() || (goal_axis && pending.is_some())) {
             lineage.kind = ResumeTurnKind::Goal;
+        }
+        // An automatic continuation runs only because the previous window
+        // yielded with its goal still owed. If the goal settled since — the
+        // user ended the logical task while no window was running — nothing is
+        // owed, and this invocation must not touch the session at all: no
+        // ownership, no status, no terminal. Reading before admission keeps
+        // cancellation's durable truth intact; `resume_goal` re-checks after
+        // admission for the narrow race, and that path writes nothing either.
+        if !allow_reopen
+            && matches!(lineage.kind, ResumeTurnKind::Goal)
+            && let Some(goal_id) = lineage.goal_id.as_ref()
+            && self
+                .engine
+                .stores
+                .goals
+                .get(goal_id)
+                .await?
+                .is_some_and(|goal| goal.state == leveler_storage::GoalState::Settled)
+        {
+            return Err(EngineError::GoalNotOwed(format!(
+                "goal {goal_id} settled before this automatic continuation started; \
+                 it is no longer owed"
+            )));
         }
         // Any user message asks the running model to read what the person said;
         // whether the words continue the task, amend its scope or ask a
@@ -3427,8 +3493,15 @@ impl CodingRuntime {
             let lineage_goal = lineage.goal_id.as_ref().ok_or_else(|| {
                 EngineError::Corrupt("goal continuation has no durable goal id".into())
             })?;
-            match self.resume_goal(&token, lineage_goal).await {
+            match self.resume_goal(&token, lineage_goal, allow_reopen).await {
                 Ok(goal) => Some(goal),
+                Err(error) if matches!(error, EngineError::GoalNotOwed(_)) => {
+                    // Nothing is owed and nothing ran: releasing the admission
+                    // is the only write this invocation makes. A terminal here
+                    // would overwrite the user's cancellation with a failure.
+                    self.engine.release_ownership(&token).await?;
+                    return Err(error);
+                }
                 Err(error) => {
                     let result = Err(error);
                     self.finish_from_result(
@@ -3887,7 +3960,16 @@ impl CodingRuntime {
                     .iter()
                     .map(|(index, call)| {
                         let has_output = !call.preview.trim().is_empty();
-                        let content = if has_output {
+                        let is_question =
+                            crate::injected_tools::is_user_input_tool(&started[*index].name);
+                        // A question's result IS the user's decision, and that
+                        // decision is already durable in the answered event.
+                        // Wrapping it as a lost side effect would tell the
+                        // model the answer may not have taken effect — the one
+                        // thing a durable answer proves.
+                        let content = if is_question && has_output {
+                            call.preview.clone()
+                        } else if has_output {
                             format!(
                                 "[recovery] this tool finished but its transcript result was lost \
                                  in an unclean exit. The effect may already have happened; do not \
@@ -4983,6 +5065,9 @@ pub fn task_outcome_is_resumable(
         // It no longer holds the session's route: the window ended, and the
         // next ordinary message is a conversation.
         TaskOutcome::Blocked => true,
+        // A yielded window ends inside the goal: the objective, plan and
+        // ledger continue, so a continuation re-enters this same goal.
+        TaskOutcome::Yielded => true,
         TaskOutcome::Cancelled => false,
     }
 }
@@ -5004,7 +5089,9 @@ pub fn task_outcome_is_resumable(
 /// A PAUSED window is different: an interruption or a round boundary left the
 /// work mid-flight with nothing for the user to answer, so the session keeps its
 /// route and the supplement they type next continues the same goal (one of the
-/// reasons a goal survives its work window at all).
+/// reasons a goal survives its work window at all). A YIELD is the same kind of
+/// boundary — the model ended its window deliberately, with the objective still
+/// owed and the runtime about to continue it — so the route stays.
 ///
 /// Either way the goal keeps its identity, objective and recovery path: a
 /// continuation re-enters this exact goal by id (see `resume_goal`), and work
@@ -5016,7 +5103,7 @@ fn end_session_goal_route(terminal: &mut leveler_engine::TaskTerminal, goal_sess
     };
     let paused = matches!(
         terminal.outcome,
-        TaskOutcome::Interrupted | TaskOutcome::BudgetLimited
+        TaskOutcome::Interrupted | TaskOutcome::BudgetLimited | TaskOutcome::Yielded
     ) || terminal
         .reason
         .as_deref()
@@ -5037,6 +5124,9 @@ pub(crate) fn direct_non_success_outcome(stop: crate::StopReason) -> Option<Task
         S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
         // The model said the goal cannot be reached as stated.
         S::Blocked => Some(TaskOutcome::Blocked),
+        // The model ended its work window with the objective still owed. Not a
+        // verdict on the task: the runtime continues the same goal.
+        S::Yielded => Some(TaskOutcome::Yielded),
         // A stalled work window leaves its goal owed and explicitly resumable.
         S::Stalled => Some(TaskOutcome::Interrupted),
         S::Incomplete => Some(TaskOutcome::Failed),
@@ -5516,6 +5606,9 @@ mod continuation_rule_tests {
             TaskOutcome::Interrupted,
             TaskOutcome::BudgetLimited,
             TaskOutcome::Blocked,
+            // A yielded window closed the window, not the goal: the runtime
+            // opens the next one without a user message.
+            TaskOutcome::Yielded,
         ] {
             assert!(
                 task_outcome_is_resumable(outcome, None, None),

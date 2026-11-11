@@ -385,6 +385,34 @@ impl<'a> EventRepository<'a> {
         .await?)
     }
 
+    /// The first event after `after_sequence` whose type is not in
+    /// `except_types`.
+    ///
+    /// Recovery asks a bounded tail question — "did anything other than the
+    /// reaper's own bookkeeping follow this row?" — without materialising the
+    /// rest of the session log.
+    pub async fn first_after_except_types(
+        &self,
+        session_id: &SessionId,
+        after_sequence: i64,
+        except_types: &[&str],
+    ) -> Result<Option<EventRecord>, StorageError> {
+        let types_json = serde_json::to_string(except_types)
+            .map_err(|e| StorageError::InvalidData(format!("first_after_except_types: {e}")))?;
+        Ok(sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND sequence > ?2 \
+               AND type NOT IN (SELECT value FROM json_each(?3)) \
+             ORDER BY sequence LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .bind(after_sequence)
+        .bind(&types_json)
+        .fetch_optional(self.db.pool())
+        .await?)
+    }
+
     /// The newest event of `event_type`, optionally scoped to one turn — an
     /// indexed single-row lookup so "latest plan/ledger/snapshot" seeding never
     /// scans the whole session log.

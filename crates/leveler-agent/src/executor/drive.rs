@@ -388,14 +388,24 @@ fn settled_delivery_notice(reason: StopReason, running: &[String]) -> String {
         StopReason::Blocked => "blocked",
         _ => "complete",
     };
+    let guidance = match reason {
+        StopReason::Blocked => {
+            "Write the blocked report for them now, from what actually happened: the concrete \
+             obstruction and its evidence, the progress that is really done, the work that \
+             remains, and what would let it continue. Do not describe a step as verified unless \
+             its result is in this conversation. Do not call update_goal again.\n"
+        }
+        _ => {
+            "Write the answer for them now, from what actually happened: what you did, which \
+             checks really ran and what they returned, what is still true afterwards, and \
+             anything that did not work. Do not describe a step as verified unless its result is \
+             in this conversation. Do not call update_goal again.\n"
+        }
+    };
     let mut notice = format!(
         "update_goal(status=\"{resolution}\") was accepted and is recorded for this goal. \
          No final answer has been delivered for this goal yet: this round is the delivery, not \
-         more goal work.\n\n\
-         Write the answer for them now, from what actually happened: what you did, which checks \
-         really ran and what they returned, what is still true afterwards, and anything that did \
-         not work. Do not describe a step as verified unless its result is in this \
-         conversation. Do not call update_goal again.\n"
+         more goal work.\n\n{guidance}"
     );
     if !running.is_empty() {
         notice.push_str(&format!(
@@ -427,6 +437,51 @@ fn delivery_followup_notice() -> String {
 /// erase an answer.
 fn is_goal_bookkeeping(name: &str) -> bool {
     name == UPDATE_GOAL_TOOL || name == "update_plan"
+}
+
+/// What the numbers in `execution_state` mean, as facts owned by the runtime.
+///
+/// The model decides when its task is done; the runtime only ensures a
+/// cumulative counter is not read as a spending allowance, a missing cap is
+/// not read as an invented quota, and a mechanical breaker is not read as a
+/// task budget. Nothing here asks the model to hurry, stop, or continue.
+fn execution_budget_facts(limits: &ModelStepLimits) -> String {
+    let mut facts = String::from(
+        "model_tokens.spent and model_tokens.estimated are cumulative usage for the whole task, \
+         not a budget or an allowance. ",
+    );
+    match limits.max_model_tokens {
+        Some(cap) => facts.push_str(&format!(
+            "A model-token cap of {cap} tokens is configured (model_tokens.limit). "
+        )),
+        None => facts.push_str(
+            "No model-token cap is configured; model_tokens.limit is null, which means unlimited. ",
+        ),
+    }
+    match limits.max_cost_usd_micros {
+        Some(cap) => facts.push_str(&format!(
+            "A model-cost cap of {cap} micro-USD is configured (cost_usd_micros.limit). "
+        )),
+        None => facts.push_str(
+            "No model-cost cap is configured; cost_usd_micros.limit is null, which means \
+             unlimited. ",
+        ),
+    }
+    match limits.max_duration {
+        Some(limit) => facts.push_str(&format!(
+            "A wall-clock limit of {} ms is configured (duration_limit_ms). ",
+            limit.as_millis().min(u64::MAX as u128)
+        )),
+        None => facts.push_str(
+            "No wall-clock limit is configured; duration_limit_ms is null, which means unlimited. ",
+        ),
+    }
+    facts.push_str(
+        "model_step_ceiling is the harness loop's mechanical safety breaker. \
+         model_step_window_limit, when set, is the hard edge of a bounded unit of work the host \
+         owns. Neither is a task budget, and neither measures how much of the task is left.",
+    );
+    facts
 }
 
 fn background_task_result_message(
@@ -1941,6 +1996,23 @@ impl<'a> Drive<'a> {
         }
     }
 
+    /// Background tasks still running in this session's scope. A running task
+    /// is a lifetime fact, not unfinished goal work.
+    async fn running_background_task_lines(
+        tasks: Option<&std::sync::Arc<leveler_execution::BackgroundTaskRegistry>>,
+        scope: &str,
+    ) -> Vec<String> {
+        match tasks {
+            Some(tasks) => tasks
+                .active_snapshots_for_scope(scope)
+                .await
+                .into_iter()
+                .map(|task| task_line(&task))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Record a delivery repair and give the model another request.
     async fn inject_settled_delivery(
         &mut self,
@@ -1989,19 +2061,24 @@ impl<'a> Drive<'a> {
             .terminal_answer
             .as_ref()
             .is_some_and(|text| !text.trim().is_empty());
-        // A blocked goal is a decision the model made about its own work: the
-        // declared summary is the only account of WHY it stopped, and the
-        // person reading the terminal needs it. It is display-only — the stop
-        // reason already carries the lifecycle — so it must not be confused
-        // with a runtime judgement. Completion has its own verification
-        // report; only Blocked borrows the model's words here.
-        let stop_detail = matches!(reason, StopReason::Blocked).then(|| summary.clone());
+        // A yielded window resolves nothing, so the model owes no final answer
+        // for it and its summary is a window note for the display, not a
+        // delivery. Blocked IS a decision about the work: the declared summary
+        // is the only account of WHY it stopped, and the person reading the
+        // terminal needs it. It is display-only — the stop reason already
+        // carries the lifecycle — so it must not be confused with a runtime
+        // judgement. Completion has its own verification report.
+        let resolved = !matches!(reason, StopReason::Yielded);
+        let stop_detail =
+            matches!(reason, StopReason::Blocked | StopReason::Yielded).then(|| summary.clone());
         let final_text = if delivered {
             self.terminal_answer.clone().unwrap_or_default()
         } else {
             summary
         };
-        // Epoch terminal: next Content turn must not inherit Closing state.
+        // Epoch terminal: next Content turn must not inherit Closing state. A
+        // yield is not an epoch terminal: the goal — and its ledger — continue
+        // in the next window.
         if matches!(reason, StopReason::Completed | StopReason::Blocked) {
             self.progress.enter_closed();
             self.emit_progress();
@@ -2038,7 +2115,7 @@ impl<'a> Drive<'a> {
             &self.progress,
             &self.objective,
         );
-        if !delivered {
+        if resolved && !delivered {
             outcome.completion_warnings.push(
                 "the goal was resolved but the model wrote no final answer for the user; the \
                  goal summary is all that was delivered"
@@ -3183,6 +3260,7 @@ impl AgentHarness for Drive<'_> {
             .map(|s| leveler_core::truncate_head_bytes(&s.step, 128, "…"))
             .collect();
         let limits = rt.limits();
+        let context_policy = self.executor.policy.context_policy;
         let state = serde_json::json!({
             // Mechanical counts of the agent's own request cadence. Neither is
             // a measure of task progress, and the runtime never reads them as
@@ -3191,17 +3269,42 @@ impl AgentHarness for Drive<'_> {
             "model_steps_completed": rt.model_steps().saturating_sub(1),
             "task_model_steps_completed": self.epoch_model_steps_at_start
                 .saturating_add(rt.model_steps().saturating_sub(1)),
-            "model_step_ceiling": limits.model_step_ceiling,
+            "model_step_ceiling": {
+                "value": limits.model_step_ceiling,
+                "limit_set": limits.model_step_ceiling.is_some(),
+                "kind": "mechanical_safety_breaker",
+            },
+            "model_step_window_limit": {
+                "value": limits.model_step_window_limit,
+                "limit_set": limits.model_step_window_limit.is_some(),
+                "kind": "host_owned_work_unit",
+            },
             "elapsed_ms": rt.elapsed().as_millis().min(u64::MAX as u128) as u64,
             "duration_limit_ms": limits.max_duration.map(|v| v.as_millis().min(u64::MAX as u128) as u64),
+            "duration_limit_set": limits.max_duration.is_some(),
             "model_tokens": {
-                "spent":rt.model_tokens_spent(), "limit":limits.max_model_tokens,
-                "estimated": self.epoch_estimated_at_start.saturating_add(rt.usage().estimated_model_tokens)
+                "spent": rt.model_tokens_spent(),
+                "estimated": self.epoch_estimated_at_start.saturating_add(rt.usage().estimated_model_tokens),
+                "kind": "cumulative_usage",
+                "limit": limits.max_model_tokens,
+                "limit_set": limits.max_model_tokens.is_some(),
             },
             "cost_usd_micros": {
                 "spent": limits.max_cost_usd_micros.map(|_| rt.cost_spent_micros()),
-                "limit": limits.max_cost_usd_micros
+                "limit": limits.max_cost_usd_micros,
+                "limit_set": limits.max_cost_usd_micros.is_some(),
             },
+            // Model capacity and the last request's own size. These are not
+            // budgets: none of them says how much work is left.
+            "context": {
+                "context_window": context_policy.context_window,
+                "context_window_set": context_policy.context_window > 0,
+                "quality_boundary": context_policy.quality_boundary,
+                "quality_boundary_set": context_policy.quality_boundary > 0,
+                "last_request_input_tokens": self.last_actual_input_tokens,
+                "last_request_projected_input_tokens": self.last_projected_input_tokens,
+            },
+            "budget_facts": execution_budget_facts(limits),
             "commands_executed": self.commands_run,
             "command_limit": self.executor.step_limits.max_commands,
             "modified_paths_observed": projected_epoch_file_count(&self.progress, &self.modified_files),
@@ -4865,9 +4968,13 @@ impl AgentHarness for Drive<'_> {
                 // children are still running — their results have not been
                 // received, let alone integrated. Drain them (they hold
                 // wall caps), inject the settlements, and refuse this
-                // resolution once so the model integrates first.
-                if call.arguments.get("status").and_then(|v| v.as_str()) == Some("complete")
-                    && !self.background_children.children.is_empty()
+                // resolution once so the model integrates first. Yield is the
+                // same boundary: the window must not end before the delegated
+                // work it owns has been integrated.
+                if matches!(
+                    call.arguments.get("status").and_then(|v| v.as_str()),
+                    Some("complete" | "yield")
+                ) && !self.background_children.children.is_empty()
                 {
                     let waiting: Vec<String> = self
                         .background_children
@@ -4887,10 +4994,15 @@ impl AgentHarness for Drive<'_> {
                     );
                     drain_before_next_round = true;
                     let feedback = format!(
-                        "update_goal(complete) was not accepted: delegated sub-agent(s) {} \
+                        "update_goal({}) was not accepted: delegated sub-agent(s) {} \
                              were still running. The runtime settles them before your next \
                              step, so their notices follow this result. A Goal is still \
-                             resolved only through update_goal(complete|blocked).",
+                             resolved only through update_goal(complete|blocked), and a \
+                             window is ended only through update_goal(yield).",
+                        call.arguments
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("complete"),
                         waiting.join(", ")
                     );
                     (self.observer)(AgentEvent::GoalIntercepted {
@@ -4925,11 +5037,15 @@ impl AgentHarness for Drive<'_> {
                 let reason = match call.arguments.get("status").and_then(|v| v.as_str()) {
                     Some("complete") => StopReason::Completed,
                     Some("blocked") => StopReason::Blocked,
+                    // The window is over; the goal is not. A structured third
+                    // terminal: the model is not deadlocked and not done, so
+                    // neither resolution is true of this window.
+                    Some("yield") => StopReason::Yielded,
                     other => {
                         let feedback = format!(
-                            "update_goal requires `status` set to \"complete\" or \
-                                 \"blocked\" (got {}). Call update_goal again with an \
-                                 explicit status.",
+                            "update_goal requires `status` set to \"complete\", \
+                                 \"blocked\", or \"yield\" (got {}). Call update_goal \
+                                 again with an explicit status.",
                             other
                                 .map(|s| format!("\"{s}\""))
                                 .unwrap_or_else(|| "no status".to_string())
@@ -5437,6 +5553,8 @@ impl AgentHarness for Drive<'_> {
                     } else {
                         crate::injected_tools::completion_receipt("Goal blocked", &[])
                     }
+                } else if reason == StopReason::Yielded {
+                    crate::injected_tools::completion_receipt("Goal yielded", &[])
                 } else {
                     crate::injected_tools::completion_receipt(
                         "Goal completed",
@@ -7306,6 +7424,13 @@ impl AgentHarness for Drive<'_> {
         if let Some((reason, summary)) = goal_resolution {
             let already_settled = self.settled_goal.is_some();
             self.settled_goal = Some((reason, summary));
+            // A yielded window is a boundary inside the goal, not a report on
+            // it: nothing was delivered to the person, and this round's text is
+            // progress narration. The next window continues the same objective.
+            if reason == StopReason::Yielded {
+                self.terminal_answer = None;
+                return self.finish_settled_goal(rt, messages, model_steps).await;
+            }
             // A blocked goal still owes the work itself, and its resolution is
             // a report, so its round ends exactly as before — but the report
             // is THIS round's prose. Reaching back for text from before the
@@ -7316,6 +7441,30 @@ impl AgentHarness for Drive<'_> {
                 } else {
                     None
                 };
+                // A blocked report is the person's delivery exactly like an
+                // accepted completion. The model declared that this round's
+                // text is the answer but wrote none, so the runtime owes it one
+                // delivery request. Without that declaration the summary is the
+                // honest account and no request is fabricated.
+                if self.terminal_answer.is_none()
+                    && goal_delivery_declared
+                    && !already_settled
+                    && !self.delivery_followup_issued
+                {
+                    let running = Self::running_background_task_lines(
+                        self.executor.background_tasks.as_ref(),
+                        self.executor.tool_context.session_scope(),
+                    )
+                    .await;
+                    self.delivery_followup_issued = true;
+                    self.inject_settled_delivery(
+                        messages,
+                        model_steps,
+                        settled_delivery_notice(reason, &running),
+                    )
+                    .await?;
+                    return Ok(Flow::NextRound);
+                }
                 return self.finish_settled_goal(rt, messages, model_steps).await;
             }
             // Delivery is an explicit commit. A refusal did not settle the
@@ -7363,15 +7512,11 @@ impl AgentHarness for Drive<'_> {
                 }
             }
             if !already_settled && self.terminal_answer.is_none() {
-                let running: Vec<String> = match self.executor.background_tasks.as_ref() {
-                    Some(tasks) => tasks
-                        .active_snapshots_for_scope(self.executor.tool_context.session_scope())
-                        .await
-                        .into_iter()
-                        .map(|task| task_line(&task))
-                        .collect(),
-                    None => Vec::new(),
-                };
+                let running = Self::running_background_task_lines(
+                    self.executor.background_tasks.as_ref(),
+                    self.executor.tool_context.session_scope(),
+                )
+                .await;
                 self.inject_settled_delivery(
                     messages,
                     model_steps,

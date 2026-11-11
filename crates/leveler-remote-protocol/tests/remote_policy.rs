@@ -158,6 +158,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             ClientCommand::AnswerClarification {
                 request_id: ClarificationId::new("c1"),
                 answer: "yes".to_string(),
+                session_id: None,
             },
             true,
         ),

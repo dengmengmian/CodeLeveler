@@ -62,7 +62,7 @@ pub use background::{
 pub use checkpoint::Checkpoint;
 pub use clarify::{
     AutoClarify, ClarificationQuestion, ClarificationQuestionKind, ClarificationRequest, Clarifier,
-    ClarifyOutcome,
+    ClarifyOutcome, SKIPPED_NOTE, decision_result_text,
 };
 pub use command::{
     CommandRunner, CommandStop, ManagedProcess, OutputChunk, OutputStream, OutputTee, ProcessError,

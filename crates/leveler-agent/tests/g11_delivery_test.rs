@@ -876,8 +876,82 @@ async fn a_textless_block_does_not_reuse_an_earlier_refused_claim() {
     assert!(run.final_text().contains("Module cache is read-only."));
 }
 
-/// `not_done` requirements refuse completion; the earlier claim of success is
-/// again not a settlement and must not be delivered by the honest block.
+const BLOCKED_REPORT: &str = "Blocked: the migration ledger needs database credentials that are \
+not present. Progress: the schema diff and the rollback plan are written and reviewed. Remaining: \
+applying the migration and re-running the isolation suite. Continue when the ledger credentials \
+are available; nothing else is missing.";
+
+/// A blocked resolution that declares a delivered answer but wrote no prose is
+/// the same broken delivery contract as an accepted completion with no text:
+/// the person only gets the short summary. The runtime owes the model one
+/// controlled delivery request; the report itself is still the model's to
+/// write.
+#[tokio::test]
+async fn a_declared_blocked_answer_without_prose_gets_one_delivery_request() {
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "summary": "Migration ledger credentials are missing.",
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_text(BLOCKED_REPORT),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Blocked);
+    assert_eq!(
+        run.outcome.model_steps, 2,
+        "the declared answer buys one delivery request"
+    );
+    assert_eq!(run.final_text(), BLOCKED_REPORT);
+    assert_eq!(
+        deliveries_of(&run),
+        vec![BLOCKED_REPORT],
+        "the blocked report is the person-facing delivery"
+    );
+}
+
+/// The repair is bounded and only serves a declared answer. A model that stays
+/// textless through the delivery request ends with the summary and the honest
+/// warning, never with a fabricated answer or another request.
+#[tokio::test]
+async fn a_block_that_stays_textless_after_the_delivery_request_keeps_the_warning() {
+    let run = run_goal(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "summary": "Migration ledger credentials are missing.",
+                "deliver_answer": true,
+            }),
+        ),
+        assistant_tool_call("r1", "list_files", serde_json::json!({"path": "."})),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Blocked);
+    assert_eq!(run.outcome.model_steps, 2, "exactly one delivery request");
+    assert!(
+        run.final_text()
+            .contains("Migration ledger credentials are missing.")
+    );
+    assert!(
+        run.outcome
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("no final answer")),
+        "the terminal keeps the fact that no answer was delivered: {:?}",
+        run.outcome.completion_warnings
+    );
+}
+
+/// A `not_done` requirements refusal followed by a block: the earlier claim of
+/// success is not a settlement and must not be delivered by the honest block.
 #[tokio::test]
 async fn an_incomplete_goal_cannot_publish_its_success_claim() {
     let run = run_goal_for(

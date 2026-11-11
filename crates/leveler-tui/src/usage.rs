@@ -86,6 +86,7 @@ pub fn should_refresh(event: &RuntimeEvent) -> bool {
             | TurnAnswered
             | TurnFailed { .. }
             | TurnIncomplete { .. }
+            | TurnYielded { .. }
             | TurnBlocked { .. }
             | TurnCancelled
             | TaskCancelled

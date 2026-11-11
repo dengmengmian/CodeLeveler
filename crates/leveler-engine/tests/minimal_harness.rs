@@ -388,6 +388,102 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
     );
 }
 
+/// A task terminal decides whether an open question can still be answered.
+///
+/// Cancellation is the user ending the task: the asking turn's waiter is
+/// gone, so the question must not stay answerable. An interruption is the
+/// process gap recovery exists for: the question must survive it, or a
+/// client restart would silently discard the user's pending decision.
+#[tokio::test]
+async fn a_cancelled_task_closes_its_question_but_an_interrupted_one_keeps_it() {
+    for (outcome, status, state) in [
+        (
+            TaskOutcome::Cancelled,
+            SessionStatus::Cancelled,
+            AgentState::Cancelled,
+        ),
+        (
+            TaskOutcome::Interrupted,
+            SessionStatus::Interrupted,
+            AgentState::Execute,
+        ),
+    ] {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = open_session(&db).await;
+        let engine = engine(&db);
+        let token = engine.acquire_ownership(&session).await.unwrap();
+        let turn = engine
+            .stores
+            .turns
+            .start_owned(&token, &session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn = leveler_core::TurnId::new(turn.id);
+        EventLog::new_owned(
+            engine.stores.events.as_ref(),
+            session.clone(),
+            token.clone(),
+        )
+        .append(
+            Some(&turn),
+            EngineEvent::ClarificationRequested {
+                id: leveler_core::ClarificationId::new("c1"),
+                question: "Which ledger?".into(),
+                options: vec!["A".into()],
+                call_id: "call-1".into(),
+                tool: "request_user_input".into(),
+                questions: Vec::new(),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        engine
+            .finish_task(
+                &token,
+                &session,
+                leveler_engine::TaskTerminal {
+                    outcome,
+                    reason: None,
+                    failure: None,
+                    stop: None,
+                    status,
+                    state,
+                    goal: None,
+                    warnings: Vec::new(),
+                    verification: None,
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        let pending = EventLog::new(engine.stores.events.as_ref(), session.clone())
+            .pending_clarifications()
+            .await
+            .unwrap();
+        if outcome == TaskOutcome::Cancelled {
+            assert!(
+                pending.is_empty(),
+                "a cancelled task cannot keep a question open"
+            );
+            let settlement = EventLog::new(engine.stores.events.as_ref(), session.clone())
+                .clarification_settlement(&leveler_core::ClarificationId::new("c1"))
+                .await
+                .unwrap()
+                .expect("the cancelled question has a durable terminal");
+            assert_eq!(settlement.outcome, "cancelled");
+        } else {
+            assert_eq!(
+                pending.len(),
+                1,
+                "an interrupted task's question must survive recovery"
+            );
+        }
+    }
+}
+
 /// H6: this proof is worthless if it quietly leans on the coding harness.
 /// Read the file back and check.
 #[test]

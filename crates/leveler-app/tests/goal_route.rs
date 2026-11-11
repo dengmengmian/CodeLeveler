@@ -19,11 +19,13 @@ use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
-use leveler_execution::{AutoApprove, PermissionProfile};
+use leveler_execution::{AutoApprove, BackgroundTaskStatus, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{EngineStores, GoalRecord, GoalState, SessionRepository, TurnRepository};
-use leveler_test_support::{MockResponse, MockServer};
+use leveler_storage::{
+    EngineStores, GoalRecord, GoalState, MessageRepository, SessionRepository, TurnRepository,
+};
+use leveler_test_support::{MockResponse, MockServer, sleep_command};
 use tokio_util::sync::CancellationToken;
 
 const OBJECTIVE: &str = "finish the inventory work";
@@ -194,6 +196,74 @@ fn completed_turn(id: &str, summary: &str) -> MockResponse {
 
 fn plain_answer(text: &str) -> MockResponse {
     sse(vec![answer_frame(text), finish_frame("stop")])
+}
+
+/// The structured third terminal: the model closed this work window while the
+/// goal still owes work. The next window is the runtime's, not the user's.
+fn yielded_turn(note: &str) -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            "c-yield",
+            "update_goal",
+            serde_json::json!({"status": "yield", "summary": note}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
+/// Durable user submissions in this session's transcript. The runtime's
+/// continuation runs with no message, so this must not grow between windows.
+async fn user_input_count(f: &Fixture) -> usize {
+    let db = f.app.open_database().await.unwrap();
+    MessageRepository::new(&db)
+        .load(&f.session)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|payload| {
+            serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| value.pointer("/origin/kind").cloned())
+                .as_ref()
+                .and_then(|kind| kind.as_str())
+                == Some("user_input")
+        })
+        .count()
+}
+
+/// Tool results the model was actually handed in this session, in order.
+async fn tool_result_texts(f: &Fixture) -> Vec<String> {
+    let db = f.app.open_database().await.unwrap();
+    let payloads = MessageRepository::new(&db).load(&f.session).await.unwrap();
+    let mut texts = Vec::new();
+    for payload in payloads {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if let Some(parts) = value.get("content").and_then(|content| content.as_array()) {
+            for part in parts {
+                if let Some(text) = part.pointer("/result/content").and_then(|v| v.as_str()) {
+                    texts.push(text.to_string());
+                }
+            }
+        }
+    }
+    texts
+}
+
+fn user_decision_blocked_turn() -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            "c-user-decision",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "the accounting policy is undecided"
+            }),
+        ),
+        finish_frame("tool_calls"),
+    ])
 }
 
 async fn goals(f: &Fixture) -> Vec<GoalRecord> {
@@ -462,6 +532,228 @@ async fn a_blocked_goal_resumes_the_same_identity_after_an_ordinary_question() {
         "chat",
         "the goal delivered its work, so the route ended with it"
     );
+}
+
+/// A window the model ended through `update_goal(yield)` is continued by the
+/// runtime itself: same goal, same objective, a fresh work window, and NO user
+/// message. Two model requests and two turn rows prove the second window ran;
+/// the transcript holding exactly the user's own message proves nobody typed
+/// the continuation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_yielded_window_is_continued_by_the_runtime_without_a_user_message() {
+    let f = fixture(
+        vec![
+            yielded_turn("阶段 1 已落地；阶段 2 未开始，下一窗口继续。"),
+            completed_turn("c-continue", "两个阶段都已完成"),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+
+    client(&f)
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    settled(&f, 2).await;
+    wait_for_goals(&f, |goals| {
+        goals.iter().any(|goal| goal.state == GoalState::Settled)
+    })
+    .await;
+
+    let goals = goals(&f).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the continuation is the same goal, not a sibling: {goals:?}"
+    );
+    assert_eq!(goals[0].objective, OBJECTIVE);
+    assert_eq!(
+        goals[0].windows_run, 2,
+        "each work window commits its own count: {goals:?}"
+    );
+
+    let db = f.app.open_database().await.unwrap();
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(
+        turns.len(),
+        2,
+        "one durable turn row per work window: {turns:?}"
+    );
+    let bodies = f.server.request_bodies().await;
+    assert!(
+        bodies.len() >= 2,
+        "the second window was really driven by the model: {} request(s)",
+        bodies.len()
+    );
+    assert_eq!(
+        user_input_count(&f).await,
+        1,
+        "the runtime, not the user, started the second window"
+    );
+}
+
+#[cfg(unix)]
+fn os_process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("query isolated test process liveness")
+        .success()
+}
+
+/// A goal-level service the model started does not belong to one work window:
+/// the yielded window must not reap it, the next window sees it running, and
+/// the goal's own terminal is what cleans it up. The second window holds on a
+/// foreground command, so the cross-window observation is a fact, not a race.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_goal_service_survives_a_yielded_window_and_is_reaped_when_the_goal_ends() {
+    let (program, args) = sleep_command(120);
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "c-service",
+                    "run_command",
+                    serde_json::json!({"program": program, "args": args, "background": true}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            yielded_turn("服务已启动，窗口到此为止；下一窗口继续。"),
+            sse(vec![
+                tool_call_frame(
+                    "c-hold",
+                    "run_command",
+                    serde_json::json!({"program": "sleep", "args": ["1"]}),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            completed_turn("c-done", "两个窗口的工作都已完成"),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+
+    let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+        true,
+    ));
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (service_id, pid) = loop {
+        let ids = f
+            .app
+            .background_tasks()
+            .active_ids_for_scope(f.session.as_str())
+            .await;
+        if let Some(id) = ids.into_iter().next() {
+            let snapshot = f
+                .app
+                .background_tasks()
+                .get(&id)
+                .await
+                .expect("the background service record exists");
+            if let Some(pid) = snapshot.pid {
+                break (id, pid);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the goal service never started"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        os_process_exists(pid),
+        "the service exists before the yield"
+    );
+
+    // The second window is now the one running. The service must still be the
+    // SAME live process: the yielded window's terminal did not settle the goal,
+    // so it did not own the service's lifetime.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let db = f.app.open_database().await.unwrap();
+        let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+        if turns.len() >= 2 && turns.iter().any(|turn| turn.status == "running") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second window was never admitted: {turns:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let during = f
+        .app
+        .background_tasks()
+        .get(&service_id)
+        .await
+        .expect("the registry retains the service");
+    assert_eq!(during.status, BackgroundTaskStatus::Running);
+    assert_eq!(
+        during.pid,
+        Some(pid),
+        "same process identity across windows"
+    );
+    assert!(
+        os_process_exists(pid),
+        "the service outlived the yielded window"
+    );
+    let live = goals(&f).await;
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(
+        live[0].state,
+        GoalState::Running,
+        "the yield ended the window, not the goal: {live:?}"
+    );
+    assert_eq!(
+        live[0].windows_run, 1,
+        "only the yielded window has committed so far: {live:?}"
+    );
+
+    settled(&f, 2).await;
+    wait_for_goals(&f, |goals| {
+        goals.iter().any(|goal| goal.state == GoalState::Settled)
+    })
+    .await;
+
+    // The goal's terminal is the service's lifetime boundary.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = f
+            .app
+            .background_tasks()
+            .get(&service_id)
+            .await
+            .expect("the registry retains the settled service");
+        if snapshot.status == BackgroundTaskStatus::Killed && !os_process_exists(pid) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the goal terminal did not reap its service: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// A Goal that still owes work inside an open window (its round budget ran out)
@@ -1085,5 +1377,77 @@ async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
     assert!(
         !f._tmp.path().join("stage-2.txt").exists(),
         "B never executed A's withheld stage"
+    );
+}
+
+/// The reported P2-C failure, at the tool surface: an interactive Goal whose
+/// model needed a user decision had no `request_user_input` in its first
+/// request, so the only structured way to ask was invisible. A human-attached
+/// turn must advertise it without a capability-enable round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interactive_goal_advertises_request_user_input_on_the_first_request() {
+    let f = fixture(vec![blocked_turn()], leveler_agent::CollaborationMode::Goal).await;
+    client(&f)
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    settled(&f, 1).await;
+
+    let bodies = f.server.request_bodies().await;
+    assert!(!bodies.is_empty(), "the model was never asked");
+    let names = tool_names(&bodies[0]);
+    assert!(
+        names.iter().any(|name| name == "request_user_input"),
+        "a human-attached Goal must expose the structured question tool on its first request; \
+         got {names:?}"
+    );
+}
+
+/// The unattended side of the boundary: no human is attached, so no tool may
+/// pretend one is. The tool is absent from the first request rather than
+/// present and guaranteed to return "unattended".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unattended_goal_does_not_advertise_request_user_input() {
+    let f = fixture(vec![blocked_turn()], leveler_agent::CollaborationMode::Goal).await;
+    run_goal_turn(&f, OBJECTIVE).await;
+
+    let bodies = f.server.request_bodies().await;
+    assert!(!bodies.is_empty(), "the model was never asked");
+    let names = tool_names(&bodies[0]);
+    assert!(
+        !names.iter().any(|name| name == "request_user_input"),
+        "an unattended Goal must not advertise a user channel; got {names:?}"
+    );
+}
+
+/// Without a channel there is nothing to repair to. A structured
+/// `user_decision` block is accepted, and the receipt states the degradation:
+/// the decision was never put to the user, so the runtime does not pretend an
+/// interaction happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unattended_user_decision_block_is_an_explicit_degradation() {
+    let f = fixture(
+        vec![user_decision_blocked_turn()],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    run_goal_turn(&f, OBJECTIVE).await;
+
+    let bodies = f.server.request_bodies().await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "no question channel exists, so there is no repair round: {bodies:?}"
+    );
+    let texts = tool_result_texts(&f).await;
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("never put to the user as a question")),
+        "the accepted block must state that no interaction happened: {texts:?}"
     );
 }

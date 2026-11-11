@@ -100,6 +100,7 @@ fn stop_reason_wording(reason: StopReason, exhaustion: Option<&BudgetExhaustion>
         },
         StopReason::TurnLimitReached => "it hit the round ceiling",
         StopReason::Blocked => "it declared the task blocked",
+        StopReason::Yielded => "it ended its work window with work still owed",
         StopReason::Stalled => "it went quiet without resolving the task",
         StopReason::Incomplete => "it stopped without finishing",
         StopReason::Completed | StopReason::Answered => "",
@@ -113,7 +114,10 @@ fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
     match reason {
         StopReason::Completed | StopReason::Answered => ChildStop::Completed,
         StopReason::BudgetExhausted | StopReason::TurnLimitReached => ChildStop::Budget,
-        StopReason::Blocked | StopReason::Stalled | StopReason::Incomplete => ChildStop::Incomplete,
+        StopReason::Blocked
+        | StopReason::Stalled
+        | StopReason::Incomplete
+        | StopReason::Yielded => ChildStop::Incomplete,
     }
 }
 
@@ -231,8 +235,9 @@ impl Executor {
         Ok(match outcome {
             crate::executor::ClarifyOutcome::Answered(text) if !text.trim().is_empty() => text,
             crate::executor::ClarifyOutcome::Answered(_) | crate::executor::ClarifyOutcome::Skipped => {
-                "The user saw this question and chose to skip it; proceed using your best judgment."
-                    .to_string()
+                // One spelling of the skip note, shared with the durable
+                // recovery path that replays it.
+                leveler_execution::SKIPPED_NOTE.to_string()
             }
             crate::executor::ClarifyOutcome::Unattended => {
                 "No user is available to answer in this unattended run — this is NOT a user reply. \

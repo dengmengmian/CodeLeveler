@@ -785,6 +785,10 @@ pub(crate) fn turn_end_marker(
             theme.status.warning,
         ),
         TurnEndStatus::Incomplete => (format!("⚠ {}", t.final_blocked), theme.status.warning),
+        // A yielded window is not a verdict: the model closed this window and
+        // the runtime continues the same goal. Neutral glyph and muted colour,
+        // so it cannot read as either success or failure.
+        TurnEndStatus::Yielded => (format!("↻ {}", t.turn_end_yielded), theme.text.secondary),
         // A blocked goal is not a generic incomplete run: the window stopped,
         // the goal is still owed and `继续` can re-enter it.
         TurnEndStatus::Blocked => (format!("⚠ {}", t.final_goal_blocked), theme.status.warning),

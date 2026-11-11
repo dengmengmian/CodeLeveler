@@ -80,6 +80,12 @@ fn user_input_description() -> String {
         "Ask the user a question and wait for the answer (`{REQUEST_USER_INPUT_TOOL}`). \
          The turn pauses until the user responds or the request is cancelled. \
          Assistant prose does not pause the turn.\n\n\
+         Use it when progress needs a decision, a policy, an approval, or \
+         information only the user can provide — including decisions you must \
+         not make on the user's behalf (financial, accounting, billing, \
+         funding, destructive or irreversible choices). Ask instead of \
+         assuming or inventing an answer, and do not end the goal as blocked \
+         for a question you never asked.\n\n\
          Single question: `question`, plus optional `options` (2–4 mutually \
          exclusive choices, one short line each). Omit `options` for a free-text \
          answer such as a credential, a name, or a path.\n\n\
@@ -124,10 +130,20 @@ pub(crate) const UPDATE_GOAL_TOOL: &str = "update_goal";
 pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Resolve the current objective. Call this ONLY to end the \
-            task: `complete` when every requirement is done, against the \
+            task or this work window: `complete` when every requirement is \
+            done, against the \
             current workspace state; \
             `blocked` when you are genuinely and \
-            repeatedly stuck and cannot make progress. Going silent does NOT end \
+            repeatedly stuck and cannot make progress (if the obstruction is a \
+            decision or information only the user can provide, ask through \
+            `request_user_input` when it is advertised and wait instead of \
+            ending the goal); `yield` when the \
+            objective is NOT done and nothing obstructs it, but this window \
+            has reached its own end (context, time, or a deliberate split). \
+            `yield` ends the window, not the goal: the runtime opens the next \
+            window on the same objective with the same plan and history, so \
+            never use it to abandon work you could finish now, and never use \
+            `blocked` for a window you simply ended. Going silent does NOT end \
             the task — you must call this. Do not mark complete on unproven or \
             indirect evidence, and do not redefine success down to what already \
             exists. `complete` means the objective AS THE USER STATED IT. If the \
@@ -170,8 +186,8 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["complete", "blocked"],
-                    "description": "complete = done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what)."
+                    "enum": ["complete", "blocked", "yield"],
+                    "description": "complete = done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what); yield = the objective still owes work and nothing obstructs it, but this work window ends here (the runtime continues the same goal in a new window)."
                 },
                 "blocked_kind": {
                     "type": "string",
@@ -180,7 +196,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. Do not restate the user question or list files you read."
+                    "description": "Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. For yield: what this window accomplished and what remains. Do not restate the user question or list files you read."
                 },
                 "deliver_answer": {
                     "type": "boolean",

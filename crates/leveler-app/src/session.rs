@@ -324,6 +324,10 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         }
         EngineError::OwnedByLiveBoot { .. } => AppError::SessionRunningElsewhere,
         EngineError::OwnershipUnknown { .. } => AppError::SessionOwnershipUnknown,
+        // Not a fault: the automatic continuation was spawned for a goal the
+        // user has since ended. Keep it typed so the continuation loop stops
+        // silently instead of presenting a failure.
+        EngineError::GoalNotOwed(m) => AppError::GoalSettled(m),
     }
 }
 
@@ -1091,6 +1095,9 @@ impl Application {
             .background_tasks()
             .detach_cleanup(session_id.as_str(), goal.as_ref().map(|goal| &goal.goal_id))
             .await;
+        // The cancelled terminal itself closes any pending question before it
+        // is observable (`TaskEngine::finish_task`); no caller settles these
+        // separately.
         let mut events = Vec::new();
         engine
             .finish_task(
@@ -1176,6 +1183,41 @@ impl Application {
         let result = engine
             .resume_with_instruction(session_id, &spec, instruction, observer, cancellation)
             .await;
+
+        match result {
+            Ok(report) => report_to_result(report),
+            Err(error) => Err(app_error_from_engine(error)),
+        }
+    }
+
+    /// Continue a goal the runtime itself still owes, in a fresh work window.
+    ///
+    /// Same persisted execution config and product axes as
+    /// [`Self::resume_in_session_with_instruction`]; the difference is the
+    /// engine entry point. There is no user message — the previous window
+    /// yielded with the goal still owed — and a goal that settled since is
+    /// NOT reopened: the caller receives [`AppError::GoalSettled`] and must
+    /// stop without publishing a terminal.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume_in_session_continuation(
+        &self,
+        session_id: &leveler_core::SessionId,
+        approver: Arc<dyn Approver>,
+        clarifier: Arc<dyn Clarifier>,
+        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+        task_cancel: Arc<AtomicBool>,
+        observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<AgentOutcome, AppError> {
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
+        let (engine, spec) = self
+            .resume_prepare(session_id, approver, clarifier, task_cancel)
+            .await?;
+        let engine = engine.with_steering(steering);
+        let result = engine
+            .resume_continuation(session_id, &spec, observer, cancellation)
+            .await;
+        crate::interactive::reconcile_background_evidence(self, session_id).await;
 
         match result {
             Ok(report) => report_to_result(report),

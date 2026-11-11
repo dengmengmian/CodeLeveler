@@ -165,6 +165,11 @@ pub enum AppError {
     /// established, so nothing was taken over.
     #[error("无法确认这个会话是否仍在另一个 CodeLeveler 进程中运行，未做任何更改。")]
     SessionOwnershipUnknown,
+    /// A runtime-owned continuation found the goal it exists for already
+    /// settled (the user ended the logical task). No work ran and no terminal
+    /// was written; the caller stops without presenting a failure.
+    #[error("目标已结束，无需继续：{0}")]
+    GoalSettled(String),
 }
 
 /// The loaded configuration bundle (kept around for `config show` / `doctor`).
@@ -1619,6 +1624,11 @@ impl Application {
             .compose_tool_surface(&snapshot, model, mode, sandbox, read_only, session_scope)
             .await?;
         let unrestricted = tool_context.policy.unrestricted_execution();
+        // Whether a person can answer a question in THIS turn. The interactive
+        // runtime attaches a UI clarifier; `AutoClarify` (headless run, eval)
+        // does not. This is a host fact read at turn construction, not an
+        // inference from the task or the model's words.
+        let host_input = clarifier.has_human();
         // Register available controls; exposure is owned by CapabilityDisclosure.
         leveler_agent::register_harness_controls_with(
             &mut registry,
@@ -1697,7 +1707,18 @@ impl Application {
                 permitted,
                 self.capability_activation_for(session_scope),
             )
-            .with_default_active(Vec::new())
+            .with_default_active(if host_input {
+                // A human-attached turn gets the structured question tool on
+                // its FIRST request. `host_interaction` exposes exactly that
+                // tool (`request_user_input`; `ask_user` is only a parser
+                // alias), so this is the narrow tool exposure the product
+                // needs, not a broader pack. Headless runs keep it hidden:
+                // advertising a channel that can only answer "unattended"
+                // would be a fake capability.
+                vec![CapabilityId::HostInteraction]
+            } else {
+                Vec::new()
+            })
             .map_err(AppError::Engine)?
             .with_unavailable(unavailable),
         );
@@ -1757,7 +1778,11 @@ impl Application {
                 allow_delegation: unrestricted
                     || (self.project_config().agents.delegation
                         && snapshot.loaded.agents_delegation),
-                allow_host_input: true,
+                // The same host fact the capability disclosure reads: only a
+                // turn with a real answerer may offer the question tool. The
+                // two must agree, or the candidate surface and the advertised
+                // surface would disagree about whether a human exists.
+                allow_host_input: host_input,
                 independent_review: combine_independent_review(
                     snapshot.loaded.agents_independent_review,
                     self.project_config().agents.independent_review,

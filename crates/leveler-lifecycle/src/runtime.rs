@@ -99,6 +99,11 @@ pub enum TaskOutcome {
     Completed,
     /// The model declared the goal unreachable as stated.
     Blocked,
+    /// The model ended this WORK WINDOW while the goal still owes work. The
+    /// window is not a verdict on the objective: nothing was declared complete
+    /// or unreachable, and the runtime continues the same goal in a fresh
+    /// window. Incomplete and resumable.
+    Yielded,
     /// Execution stopped at an explicit resource boundary. The task is
     /// incomplete and resumable; this is not evidence of model failure.
     BudgetLimited,
@@ -120,6 +125,7 @@ impl TaskOutcome {
         match self {
             TaskOutcome::Completed => "completed",
             TaskOutcome::Blocked => "blocked",
+            TaskOutcome::Yielded => "yielded",
             TaskOutcome::BudgetLimited => "budget_limited",
             TaskOutcome::Failed => "failed",
             TaskOutcome::Interrupted => "interrupted",
@@ -140,6 +146,7 @@ impl FromStr for TaskOutcome {
         Ok(match s {
             "completed" => TaskOutcome::Completed,
             "blocked" => TaskOutcome::Blocked,
+            "yielded" => TaskOutcome::Yielded,
             "budget_limited" => TaskOutcome::BudgetLimited,
             "failed" => TaskOutcome::Failed,
             "interrupted" => TaskOutcome::Interrupted,
@@ -380,6 +387,11 @@ pub enum StopReason {
     /// Goal mode: the model went quiet without ever resolving the goal via
     /// `update_goal`, even after the quiet-nudge cap. Not a success.
     Stalled,
+    /// Goal mode: the model ended this work window through `update_goal(yield)`
+    /// while the goal still owes work. The window is over; the goal is not.
+    /// Unlike [`StopReason::Blocked`] nothing is obstructed, so the runtime
+    /// continues the same objective in a fresh window.
+    Yielded,
 }
 
 #[cfg(test)]
@@ -390,6 +402,7 @@ mod tests {
     fn only_completed_is_a_declared_end() {
         assert!(TaskOutcome::Completed.is_completed());
         assert!(!TaskOutcome::Blocked.is_completed());
+        assert!(!TaskOutcome::Yielded.is_completed());
         assert!(!TaskOutcome::BudgetLimited.is_completed());
         assert!(!TaskOutcome::Failed.is_completed());
         assert!(!TaskOutcome::Interrupted.is_completed());
@@ -420,6 +433,7 @@ mod tests {
         for o in [
             TaskOutcome::Completed,
             TaskOutcome::Blocked,
+            TaskOutcome::Yielded,
             TaskOutcome::BudgetLimited,
             TaskOutcome::Failed,
             TaskOutcome::Interrupted,

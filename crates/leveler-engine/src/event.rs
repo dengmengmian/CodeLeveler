@@ -884,6 +884,18 @@ pub enum EngineEvent {
         id: ClarificationId,
         question: String,
         options: Vec<String>,
+        /// The tool call waiting for this answer. Durable recovery closes
+        /// exactly this call; empty on rows written before the request carried
+        /// its call identity.
+        #[serde(default)]
+        call_id: String,
+        /// The tool that asked (`request_user_input` / legacy `ask_user`).
+        #[serde(default)]
+        tool: String,
+        /// Structured multi-question payload. Empty means the legacy
+        /// single-question `question`/`options` shape.
+        #[serde(default)]
+        questions: Vec<leveler_execution::ClarificationQuestion>,
     },
     ClarificationAnswered {
         id: ClarificationId,
@@ -1613,6 +1625,9 @@ mod contract_tests {
                 id: ClarificationId::new("clarification-safe"),
                 question: secret.into(),
                 options: vec![secret.into()],
+                call_id: secret.into(),
+                tool: secret.into(),
+                questions: Vec::new(),
             },
             EngineEvent::CandidateStarted {
                 branch: secret.into(),

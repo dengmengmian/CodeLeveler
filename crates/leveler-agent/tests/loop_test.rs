@@ -7619,7 +7619,12 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
     );
     // No ceiling was pinned on this executor, so the projection must say so
     // rather than invent a budget: `null` is "the host pinned none".
-    assert!(states[0]["model_step_ceiling"].is_null());
+    assert!(states[0]["model_step_ceiling"]["value"].is_null());
+    assert_eq!(states[0]["model_step_ceiling"]["limit_set"], false);
+    assert_eq!(
+        states[0]["model_step_ceiling"]["kind"],
+        "mechanical_safety_breaker"
+    );
     // The projection states mechanical facts only: it never hands the model a
     // "remaining budget" it did not compute, which would read as an
     // instruction to converge.
@@ -7644,6 +7649,94 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
     );
     drop(executor);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Cumulative spend, the model's context capacity, configured resource caps
+/// and mechanical safety breakers are four different facts. The projection
+/// must name each one so cumulative usage cannot read as an exhausted budget,
+/// and a missing cap cannot read as an invented quota.
+#[tokio::test]
+async fn execution_state_separates_cumulative_usage_caps_and_mechanical_breakers() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_text("done")]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_seeded_progress(leveler_lifecycle::ProgressLedger {
+        cumulative_model_steps: 7,
+        cumulative_model_tokens: 4000,
+        cumulative_duration_ms: 90_000,
+        cumulative_commands: 2,
+        ..Default::default()
+    })
+    .with_context_window(131_072);
+    executor
+        .run(
+            "inspect only",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = runtime.recorded_requests();
+    let block = requests[0]
+        .control_context
+        .blocks
+        .iter()
+        .find(|block| block.name == "execution_state")
+        .expect("every request carries the execution state")
+        .text
+        .clone();
+    let state: serde_json::Value = serde_json::from_str(block.split_once('\n').unwrap().1).unwrap();
+
+    // Cumulative usage across the task epoch, explicitly not an allowance.
+    assert_eq!(state["model_tokens"]["spent"], 4000);
+    assert_eq!(state["model_tokens"]["kind"], "cumulative_usage");
+    assert_eq!(state["model_tokens"]["limit"], serde_json::Value::Null);
+    assert_eq!(state["model_tokens"]["limit_set"], false);
+
+    // The context capacity is a model fact, separate from any budget.
+    assert_eq!(state["context"]["context_window"], 131_072);
+    assert_eq!(state["context"]["context_window_set"], true);
+
+    // The step bound is a mechanical breaker, not a task budget; no cap was
+    // pinned for this run, and the projection says so instead of implying one.
+    assert_eq!(
+        state["model_step_ceiling"]["value"],
+        serde_json::Value::Null
+    );
+    assert_eq!(state["model_step_ceiling"]["limit_set"], false);
+    assert_eq!(
+        state["model_step_ceiling"]["kind"],
+        "mechanical_safety_breaker"
+    );
+
+    // Real configured limits are labeled as such, and absent ones as absent.
+    assert_eq!(state["duration_limit_set"], false);
+    assert_eq!(state["cost_usd_micros"]["limit_set"], false);
+    let facts = state["budget_facts"]
+        .as_str()
+        .expect("the projection states the budget facts");
+    assert!(facts.contains("cumulative"), "{facts}");
+    assert!(facts.contains("unlimited"), "{facts}");
+    assert!(facts.contains("mechanical safety breaker"), "{facts}");
+    assert!(
+        !facts.contains("remaining"),
+        "the projection never invents a remaining budget: {facts}"
+    );
+    assert!(
+        state.get("model_steps_remaining").is_none(),
+        "no fabricated remaining-budget field: {state:?}"
+    );
 }
 
 #[async_trait]

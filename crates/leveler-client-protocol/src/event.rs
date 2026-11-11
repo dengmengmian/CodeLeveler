@@ -673,6 +673,13 @@ pub enum RuntimeEvent {
     /// the work the user withheld authorization to continue; nothing failed
     /// and nothing is complete. Only the user's own continuation releases it.
     TurnPaused { reason: String },
+    /// The model ended this work window through `update_goal(yield)` while the
+    /// goal still owes work. Unlike [`Self::TurnPaused`] nothing waits for the
+    /// user: the runtime continues the same goal in a fresh window. Unlike
+    /// [`Self::TurnIncomplete`] nothing went wrong — the window closed at a
+    /// boundary the model chose. `reason` is the model's window note, display
+    /// only; the durable `TaskFinished.stop` is the authority.
+    TurnYielded { reason: String },
     /// The turn stopped at an output limit even after bounded continuation.
     TurnTruncated { error: String },
     /// The executor stopped cleanly but did not reach a successful terminal

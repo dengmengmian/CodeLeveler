@@ -3213,6 +3213,7 @@ fn clarification_queues_behind_open_approval_and_both_get_answered() {
         ClientCommand::AnswerClarification {
             request_id: ClarificationId::new("c1"),
             answer: String::new(),
+            session_id: Some(SessionId::new("s1")),
         },
         PendingInteraction::Clarification(UiClarificationRequest::single(
             ClarificationId::new("c1"),
@@ -4463,6 +4464,7 @@ fn clarification_arrows_choose_the_option_enter_submits() {
         ClientCommand::AnswerClarification {
             request_id: leveler_client_protocol::ClarificationId::new("c1"),
             answer: "替换".to_string(),
+            session_id: Some(SessionId::new("s1")),
         },
         PendingInteraction::Clarification(clarify_req()),
     );
@@ -4484,6 +4486,7 @@ fn clarification_esc_skips_with_empty_answer() {
         ClientCommand::AnswerClarification {
             request_id: leveler_client_protocol::ClarificationId::new("c1"),
             answer: String::new(),
+            session_id: Some(SessionId::new("s1")),
         },
         PendingInteraction::Clarification(clarify_req()),
     );

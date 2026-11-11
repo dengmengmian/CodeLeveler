@@ -22,8 +22,8 @@ use leveler_client_protocol::{
 /// A deadline was the wrong shape: it denied commands and skipped questions
 /// after five minutes, punishing the person who went to read the code the
 /// prompt is about. What actually ends the wait is nobody being left to
-/// answer — an approval only has the safe refusal to fall back to, while a
-/// question tolerates a client restart for [`clarify_absence_grace`].
+/// answer — an approval only has the safe refusal to fall back to. A question
+/// has a durable pending state, so a missing client never ends it.
 #[cfg(not(test))]
 fn control_liveness_tick() -> std::time::Duration {
     std::time::Duration::from_secs(10)
@@ -32,23 +32,6 @@ fn control_liveness_tick() -> std::time::Duration {
 #[cfg(test)]
 fn control_liveness_tick() -> std::time::Duration {
     std::time::Duration::from_millis(10)
-}
-
-/// How long a clarification may wait with no client attached before the run is
-/// told nobody is available.
-///
-/// A UI restart briefly drops the event subscription. The question stays in
-/// the pending map and the snapshot restores it on reconnect, so one empty
-/// liveness sample must not settle it. The grace is long enough for a restart
-/// and short enough that an abandoned interactive turn does not wait forever.
-#[cfg(not(test))]
-fn clarify_absence_grace() -> std::time::Duration {
-    std::time::Duration::from_secs(60)
-}
-
-#[cfg(test)]
-fn clarify_absence_grace() -> std::time::Duration {
-    std::time::Duration::from_millis(60)
 }
 
 /// Pending approvals keyed by id: the approver parks a oneshot sender here and
@@ -245,37 +228,64 @@ pub(crate) struct ChannelClarifier {
     pub(crate) session_id: SessionId,
 }
 
+/// Build the UI shape of a clarification from its durable fields.
+///
+/// One conversion for the live ask and for the snapshot restored from the
+/// event log, so a question re-read after a restart is identical to the one
+/// first shown — same id, wording, options and multi-question kinds.
+pub(crate) fn ui_clarification_request(
+    id: ClarificationId,
+    question: String,
+    options: Vec<String>,
+    questions: &[leveler_execution::ClarificationQuestion],
+) -> UiClarificationRequest {
+    UiClarificationRequest {
+        id,
+        question,
+        options,
+        questions: questions
+            .iter()
+            .map(|q| UiClarificationQuestion {
+                header: q.header.clone(),
+                question: q.question.clone(),
+                kind: match q.kind {
+                    ClarificationQuestionKind::Single => {
+                        leveler_client_protocol::ClarificationQuestionKind::Single
+                    }
+                    ClarificationQuestionKind::Multi => {
+                        leveler_client_protocol::ClarificationQuestionKind::Multi
+                    }
+                    ClarificationQuestionKind::Text => {
+                        leveler_client_protocol::ClarificationQuestionKind::Text
+                    }
+                },
+                options: q.options.clone(),
+                allow_other: q.allow_other,
+                min_choices: q.min_choices,
+                max_choices: q.max_choices,
+            })
+            .collect(),
+    }
+}
+
 #[async_trait]
 impl Clarifier for ChannelClarifier {
+    fn has_human(&self) -> bool {
+        // The interactive runtime attaches this clarifier because a UI client
+        // is the intended answerer. A client that is only restarting does not
+        // turn the run into a headless one: the request is durable, the
+        // snapshot restores it on reconnect, and it stays pending until a
+        // person answers or the turn is cancelled.
+        true
+    }
+
     async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome {
-        let ui = UiClarificationRequest {
-            id: request.id.clone(),
-            question: request.question.clone(),
-            options: request.options.clone(),
-            questions: request
-                .questions
-                .iter()
-                .map(|q| UiClarificationQuestion {
-                    header: q.header.clone(),
-                    question: q.question.clone(),
-                    kind: match q.kind {
-                        ClarificationQuestionKind::Single => {
-                            leveler_client_protocol::ClarificationQuestionKind::Single
-                        }
-                        ClarificationQuestionKind::Multi => {
-                            leveler_client_protocol::ClarificationQuestionKind::Multi
-                        }
-                        ClarificationQuestionKind::Text => {
-                            leveler_client_protocol::ClarificationQuestionKind::Text
-                        }
-                    },
-                    options: q.options.clone(),
-                    allow_other: q.allow_other,
-                    min_choices: q.min_choices,
-                    max_choices: q.max_choices,
-                })
-                .collect(),
-        };
+        let ui = ui_clarification_request(
+            request.id.clone(),
+            request.question.clone(),
+            request.options.clone(),
+            &request.questions,
+        );
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
             request.id.clone(),
@@ -290,45 +300,28 @@ impl Clarifier for ChannelClarifier {
             events: self.events.clone(),
             id: request.id.clone(),
         };
-        if self
+        // A delivery failure means no client is attached right now — not that
+        // the user declined to answer. The request is already durable, the
+        // waiter stays parked, and a client that attaches later restores the
+        // question from the snapshot and answers this same waiter.
+        let _ = self
             .events
-            .send(RuntimeEvent::ClarificationRequested { request: ui })
-            .is_err()
-        {
-            self.pending.lock().unwrap().remove(&request.id);
-            // Nobody is subscribed: the question was never delivered. This is
-            // an unattended run, not a user reply (R004 F2).
-            return ClarifyOutcome::Unattended;
-        }
-        // The wait ends when the question is answered, the turn is cancelled,
-        // or nobody has been left to answer for a full grace window — each
-        // keeping its own meaning instead of collapsing to a fake empty
-        // "answer". A client that is only restarting comes back inside that
-        // window and finds the pending question in its snapshot.
+            .send(RuntimeEvent::ClarificationRequested { request: ui });
+        // A question ends only on a real decision or a cancelled turn. Client
+        // disconnects, daemon restarts and long silences are gaps in the
+        // realtime channel; they never settle the request.
         let mut rx = rx;
-        let mut absent_since: Option<tokio::time::Instant> = None;
-        loop {
-            tokio::select! {
-                answer = &mut rx => break match answer {
-                    // The wire keeps `answer: String` with "" meaning the user
-                    // explicitly skipped (Esc / empty submit).
-                    Ok(text) if text.trim().is_empty() => ClarifyOutcome::Skipped,
-                    Ok(text) => ClarifyOutcome::Answered(text),
-                    Err(_) => ClarifyOutcome::Unattended,
-                },
-                _ = self.cancel.cancelled() => break ClarifyOutcome::Cancelled,
-                _ = tokio::time::sleep(control_liveness_tick()) => {
-                    if self.events.receiver_count() == 0 {
-                        let absent = *absent_since
-                            .get_or_insert_with(tokio::time::Instant::now);
-                        if absent.elapsed() >= clarify_absence_grace() {
-                            break ClarifyOutcome::Unattended;
-                        }
-                    } else {
-                        absent_since = None;
-                    }
-                }
-            }
+        tokio::select! {
+            answer = &mut rx => match answer {
+                // The wire keeps `answer: String` with "" meaning the user
+                // explicitly skipped (Esc / empty submit).
+                Ok(text) if text.trim().is_empty() => ClarifyOutcome::Skipped,
+                Ok(text) => ClarifyOutcome::Answered(text),
+                // The waiter was removed without an answer; nobody can answer
+                // it any more. Never a fabricated empty reply.
+                Err(_) => ClarifyOutcome::Unattended,
+            },
+            _ = self.cancel.cancelled() => ClarifyOutcome::Cancelled,
         }
     }
 }
@@ -905,8 +898,11 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty());
     }
 
+    /// No client is attached when the question is raised. That is a gap in the
+    /// realtime channel, not a user decision: the waiter stays parked on its
+    /// durable request and the answer that arrives later still reaches it.
     #[tokio::test]
-    async fn disconnected_client_skips_clarification_without_hanging() {
+    async fn a_disconnected_client_leaves_the_question_durable() {
         let (events, receiver) = broadcast::channel(1);
         drop(receiver);
         let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
@@ -926,15 +922,26 @@ mod tests {
             options: vec![],
             questions: Vec::new(),
         };
+        let id = request.id.clone();
+        let ask = tokio::spawn(async move { clarifier.clarify(&request).await });
 
-        let answer = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            clarifier.clarify(&request),
-        )
-        .await
-        .expect("disconnected clarification must resolve");
-        // Never delivered ⇒ unattended, NOT an (empty) user answer (R004 F2).
-        assert_eq!(answer, ClarifyOutcome::Unattended);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !ask.is_finished(),
+            "an undelivered question must not settle as a user decision"
+        );
+        assert_eq!(
+            pending.lock().unwrap().len(),
+            1,
+            "the request stays answerable"
+        );
+
+        resolve_clarification(&pending, &id, "green".to_string()).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), ask)
+            .await
+            .expect("the question resolves once a client answers")
+            .unwrap();
+        assert_eq!(outcome, ClarifyOutcome::Answered("green".into()));
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -1031,11 +1038,13 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty());
     }
 
-    /// Nobody is left to answer: the question stops waiting, and says that is
-    /// what happened — not that the user skipped it.
+    /// Long after the watching client vanished, the question is still pending
+    /// — and still answerable by the client that comes back. Absence of a
+    /// reader is never reported as the user skipping or refusing.
     #[tokio::test]
-    async fn a_question_nobody_watches_any_more_is_unattended() {
+    async fn a_question_outlives_the_client_that_was_watching() {
         let (events, mut receiver) = broadcast::channel(4);
+        let sender = events.clone();
         let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
         let clarifier = ChannelClarifier {
             events: events.into(),
@@ -1053,15 +1062,26 @@ mod tests {
             options: vec![],
             questions: Vec::new(),
         };
+        let id = request.id.clone();
         let ask = tokio::spawn(async move { clarifier.clarify(&request).await });
         let _ = receiver.recv().await;
         drop(receiver);
 
+        // Several liveness ticks with nobody attached: still pending.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !ask.is_finished(),
+            "a question without a reader is not a question the user skipped"
+        );
+        assert_eq!(pending.lock().unwrap().len(), 1);
+
+        let _reconnected = sender.subscribe();
+        resolve_clarification(&pending, &id, "late but real".to_string()).unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), ask)
             .await
-            .expect("an unwatched question resolves")
+            .expect("the recovered client can still answer")
             .unwrap();
-        assert_eq!(outcome, ClarifyOutcome::Unattended);
+        assert_eq!(outcome, ClarifyOutcome::Answered("late but real".into()));
         assert!(pending.lock().unwrap().is_empty());
     }
 

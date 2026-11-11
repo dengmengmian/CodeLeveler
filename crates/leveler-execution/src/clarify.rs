@@ -7,11 +7,13 @@
 //! share one vocabulary without either depending on the other.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use leveler_core::{ClarificationId, TurnId};
 
 /// How one question of a clarification is answered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClarificationQuestionKind {
     /// Exactly one option, or a free-text answer when `allow_other` is set.
     #[default]
@@ -27,7 +29,7 @@ pub enum ClarificationQuestionKind {
 /// A clarification can carry several questions the user answers in one
 /// sitting. The kind is explicit so the UI never has to guess a text prompt
 /// out of an empty option list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClarificationQuestion {
     /// Short label for the question's tab (empty = derive from `question`).
     pub header: String,
@@ -58,6 +60,25 @@ pub struct ClarificationRequest {
     /// single-question shape (`question`/`options`).
     pub questions: Vec<ClarificationQuestion>,
 }
+
+/// The model-facing result of an explicit user decision.
+///
+/// Only `Answered` and `Skipped` are decisions a person made. `Unattended`,
+/// `TimedOut` and `Cancelled` are the absence of one and return `None`: they
+/// must never be turned into a tool result through this path, or a missing
+/// client would read as the user speaking.
+pub fn decision_result_text(outcome: &ClarifyOutcome) -> Option<String> {
+    match outcome {
+        ClarifyOutcome::Answered(text) if !text.trim().is_empty() => Some(text.clone()),
+        ClarifyOutcome::Answered(_) | ClarifyOutcome::Skipped => Some(SKIPPED_NOTE.to_string()),
+        ClarifyOutcome::Unattended | ClarifyOutcome::TimedOut | ClarifyOutcome::Cancelled => None,
+    }
+}
+
+/// What a skipped question says to the model, in one place: the live tool
+/// handler and the durable recovery path must spell it the same way.
+pub const SKIPPED_NOTE: &str =
+    "The user saw this question and chose to skip it; proceed using your best judgment.";
 
 /// How a clarification request ended. `Answered` is the ONLY variant that may
 /// be presented to the model as the user speaking; every other variant must
@@ -96,6 +117,17 @@ impl ClarifyOutcome {
 #[async_trait]
 pub trait Clarifier: Send + Sync {
     async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome;
+
+    /// Whether a person can answer this run's questions.
+    ///
+    /// This is a host fact, not a task-text inference: the interactive runtime
+    /// attaches a UI clarifier, while headless runs use [`AutoClarify`]. The
+    /// tool surface reads it so an unattended run never advertises a channel
+    /// that can only answer "unattended". The default is the truthful one for
+    /// the non-interactive case; a UI-backed clarifier overrides it.
+    fn has_human(&self) -> bool {
+        false
+    }
 }
 
 /// Non-interactive default: no human is attached, and the model must be told

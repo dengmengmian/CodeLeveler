@@ -232,6 +232,13 @@ pub enum ClientCommand {
     AnswerClarification {
         request_id: ClarificationId,
         answer: String,
+        /// The session that owns the request. A live waiter is found by
+        /// request id alone; the session is what lets a runtime with no
+        /// in-memory waiter — a restarted daemon — settle the durable request
+        /// and continue the goal. Older clients omit it and can answer only a
+        /// live waiter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
     },
     /// Switch the model used for subsequent turns .
     SelectModel {
@@ -903,6 +910,7 @@ mod tests {
             ClientCommand::AnswerClarification {
                 request_id: ClarificationId::new("c1"),
                 answer: "yes".to_string(),
+                session_id: None,
             },
             "answer_clarification",
         );

@@ -125,6 +125,17 @@ pub async fn prepare_daemon(
             "reaped zombie turns before daemon startup"
         );
     }
+    // A crash between committing a durable answer and admitting its next
+    // window leaves an answered goal with nobody driving it. Restart is the
+    // point where the runtime finishes that work; the answer is durable, so
+    // losing its continuation would silently strand the user's decision.
+    let resumed = runtime.reconcile_owed_clarification_continuations().await?;
+    if resumed > 0 {
+        tracing::warn!(
+            resumed,
+            "resumed goal windows whose durable answer had no continuation"
+        );
+    }
     if let Some(path) = ready_path {
         let ready = ready_json(socket_path, bound.tcp.as_ref(), runtime_id.as_str())?;
         std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;
