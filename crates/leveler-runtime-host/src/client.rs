@@ -145,7 +145,9 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
 
 /// Whether a transport error means no runtime owns this endpoint. Linux can
 /// report a closed listener as ECONNRESET during the subscribe handshake, the
-/// same fact as ECONNREFUSED; neither says the endpoint is recoverable.
+/// same fact as ECONNREFUSED; macOS can report EPIPE when the closed listener
+/// leaves no peer to receive that handshake. None says the endpoint is
+/// recoverable.
 #[cfg(any(unix, windows))]
 fn endpoint_unavailable(error: &std::io::Error) -> bool {
     matches!(
@@ -153,6 +155,7 @@ fn endpoint_unavailable(error: &std::io::Error) -> bool {
         std::io::ErrorKind::NotFound
             | std::io::ErrorKind::ConnectionRefused
             | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
     )
 }
 
@@ -1503,16 +1506,19 @@ mod probe_tests {
         );
     }
 
-    /// A stale endpoint can fail the subscribe handshake with ECONNRESET:
-    /// Linux reports this when the listener behind the socket file is gone.
-    /// That is the same fact as ECONNREFUSED — no runtime owns the endpoint —
-    /// and must not turn startup into a transport error.
+    /// A stale endpoint can fail the subscribe handshake with ECONNRESET or
+    /// EPIPE: Linux reports the former when the listener behind the socket file
+    /// is gone, and macOS can report the latter when the closed listener leaves
+    /// no peer to receive the handshake. Both are the same fact as
+    /// ECONNREFUSED — no runtime owns the endpoint — and must not turn startup
+    /// into a transport error.
     #[test]
     fn an_unusable_endpoint_is_no_runtime() {
         for kind in [
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::ConnectionRefused,
             std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
         ] {
             assert!(
                 endpoint_unavailable(&std::io::Error::from(kind)),
