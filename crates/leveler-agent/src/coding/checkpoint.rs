@@ -347,12 +347,17 @@ pub async fn project_goal_checkpoint(
         // unknown — never zero.
         None => CheckpointFindings::Unknown,
     };
-    let plan = match &ledger {
-        Some(ledger) => CheckpointPlan::from_state(&ledger.plan),
-        None => last_plan(events, session_id, scope)
-            .await?
+    // The plan the model last declared is authoritative. The evidence ledger's
+    // `plan` is a mirror refreshed on side-effect evidence, not on every
+    // `update_plan`, so reading the mirror first can resurrect a stale plan
+    // (window 2 declared step 4 complete; the checkpoint still said 3/5).
+    // Fall back to the mirror only when this lineage has no declaration — it
+    // may carry a plan seeded from an earlier turn.
+    let plan = match last_plan(events, session_id, scope).await? {
+        Some(declared) => CheckpointPlan::from_state(&declared),
+        None => ledger
             .as_ref()
-            .and_then(CheckpointPlan::from_state),
+            .and_then(|ledger| CheckpointPlan::from_state(&ledger.plan)),
     };
 
     let payload = GoalCheckpoint {
@@ -1084,6 +1089,61 @@ mod tests {
         let plan = projected.payload.plan.expect("plan projected");
         assert_eq!((plan.completed, plan.total), (1, 2));
         assert_eq!(plan.next_step.as_deref(), Some("implement"));
+    }
+
+    /// A newer explicit plan declaration wins over the ledger's plan mirror.
+    /// The mirror is refreshed on side-effect evidence, not on `update_plan`;
+    /// projecting it over a later `PlanUpdated` made window 3 read the plan
+    /// as 3/5 when window 2 had already declared 4/5.
+    #[tokio::test]
+    async fn newer_declared_plan_wins_over_stale_ledger_mirror() {
+        let events = MemoryEventStore::new();
+        let messages = MemoryMessageStore::new();
+        let session = SessionId::new("s1");
+        let step = |name: &str, status: &str| leveler_lifecycle::PlanStep {
+            step: name.into(),
+            status: status.into(),
+            id: Some(name.to_string()),
+            origin: Default::default(),
+        };
+        let ledger = EvidenceLedger {
+            plan: leveler_lifecycle::PlanState {
+                steps: vec![
+                    step("audit", "completed"),
+                    step("implement", "in_progress"),
+                    step("verify", "pending"),
+                ],
+            },
+            ..Default::default()
+        };
+        append(
+            &events,
+            &session,
+            EngineEvent::EvidenceLedgerUpdated { ledger },
+        )
+        .await;
+        append(
+            &events,
+            &session,
+            EngineEvent::PlanUpdated {
+                steps: vec![
+                    step("audit", "completed"),
+                    step("implement", "completed"),
+                    step("verify", "pending"),
+                ],
+                created: false,
+                call_id: None,
+            },
+        )
+        .await;
+
+        let projected =
+            project_goal_checkpoint(&events, &messages, &goal(), &session, &scope(), None)
+                .await
+                .unwrap();
+        let plan = projected.payload.plan.expect("plan projected");
+        assert_eq!((plan.completed, plan.total), (2, 3));
+        assert_eq!(plan.next_step.as_deref(), Some("verify"));
     }
 
     /// A checkpoint projects only the turns in its continuation lineage. An
