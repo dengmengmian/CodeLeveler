@@ -22,7 +22,8 @@ use leveler_client_protocol::{
 /// A deadline was the wrong shape: it denied commands and skipped questions
 /// after five minutes, punishing the person who went to read the code the
 /// prompt is about. What actually ends the wait is nobody being left to
-/// answer — a client that disconnected, a runtime with no UI attached.
+/// answer — an approval only has the safe refusal to fall back to, while a
+/// question tolerates a client restart for [`clarify_absence_grace`].
 #[cfg(not(test))]
 fn control_liveness_tick() -> std::time::Duration {
     std::time::Duration::from_secs(10)
@@ -31,6 +32,23 @@ fn control_liveness_tick() -> std::time::Duration {
 #[cfg(test)]
 fn control_liveness_tick() -> std::time::Duration {
     std::time::Duration::from_millis(10)
+}
+
+/// How long a clarification may wait with no client attached before the run is
+/// told nobody is available.
+///
+/// A UI restart briefly drops the event subscription. The question stays in
+/// the pending map and the snapshot restores it on reconnect, so one empty
+/// liveness sample must not settle it. The grace is long enough for a restart
+/// and short enough that an abandoned interactive turn does not wait forever.
+#[cfg(not(test))]
+fn clarify_absence_grace() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
+}
+
+#[cfg(test)]
+fn clarify_absence_grace() -> std::time::Duration {
+    std::time::Duration::from_millis(60)
 }
 
 /// Pending approvals keyed by id: the approver parks a oneshot sender here and
@@ -283,9 +301,12 @@ impl Clarifier for ChannelClarifier {
             return ClarifyOutcome::Unattended;
         }
         // The wait ends when the question is answered, the turn is cancelled,
-        // or nobody is left to answer — each keeping its own meaning instead
-        // of collapsing to a fake empty "answer".
+        // or nobody has been left to answer for a full grace window — each
+        // keeping its own meaning instead of collapsing to a fake empty
+        // "answer". A client that is only restarting comes back inside that
+        // window and finds the pending question in its snapshot.
         let mut rx = rx;
+        let mut absent_since: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 answer = &mut rx => break match answer {
@@ -298,7 +319,13 @@ impl Clarifier for ChannelClarifier {
                 _ = self.cancel.cancelled() => break ClarifyOutcome::Cancelled,
                 _ = tokio::time::sleep(control_liveness_tick()) => {
                     if self.events.receiver_count() == 0 {
-                        break ClarifyOutcome::Unattended;
+                        let absent = *absent_since
+                            .get_or_insert_with(tokio::time::Instant::now);
+                        if absent.elapsed() >= clarify_absence_grace() {
+                            break ClarifyOutcome::Unattended;
+                        }
+                    } else {
+                        absent_since = None;
                     }
                 }
             }
@@ -1036,6 +1063,57 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, ClarifyOutcome::Unattended);
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    /// A UI restart is a gap in subscribers, not an answer and not an
+    /// abandonment: the pending question is restored from the snapshot once
+    /// the client reconnects, so a brief absence must not settle it.
+    #[tokio::test]
+    async fn a_question_survives_a_client_that_reconnects() {
+        let (events, mut receiver) = broadcast::channel(4);
+        let sender = events.clone();
+        let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
+        let clarifier = ChannelClarifier {
+            events: events.into(),
+            pending: pending.clone(),
+            cancel: CancellationToken::new(),
+            session_id: SessionId::new("session-a"),
+        };
+        let request = ClarificationRequest {
+            id: ClarificationId::new("clarification-restart"),
+            turn_id: Some(leveler_core::TurnId::new("turn-a")),
+            tool: "ask_user".to_string(),
+            call_id: "call-a".to_string(),
+            action_fingerprint: "fingerprint-a".to_string(),
+            question: "which?".to_string(),
+            options: vec![],
+            questions: Vec::new(),
+        };
+        let id = request.id.clone();
+        let ask = tokio::spawn(async move { clarifier.clarify(&request).await });
+        let _ = receiver.recv().await;
+
+        // The UI process goes away; at least one liveness tick sees no client.
+        drop(receiver);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(!ask.is_finished(), "a restart gap is not an abandonment");
+
+        // It comes back before the absence grace expires.
+        let mut reconnected = sender.subscribe();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !ask.is_finished(),
+            "the reconnected client resets the absence"
+        );
+
+        resolve_clarification(&pending, &id, "restored".to_string()).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), ask)
+            .await
+            .expect("the restored question is answerable")
+            .unwrap();
+        assert_eq!(outcome, ClarifyOutcome::Answered("restored".into()));
+        assert!(pending.lock().unwrap().is_empty());
+        let _ = reconnected.try_recv();
     }
 
     #[tokio::test]
