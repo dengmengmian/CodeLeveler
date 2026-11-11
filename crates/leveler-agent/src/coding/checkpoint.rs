@@ -17,8 +17,9 @@
 
 use leveler_core::{GoalId, SessionId, TurnId};
 use leveler_lifecycle::{
-    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointWorkspace,
-    EvidenceLedger, GoalCheckpoint,
+    CheckpointChild, CheckpointDecision, CheckpointEvidence, CheckpointExecution,
+    CheckpointFindings, CheckpointPlan, CheckpointQuestion, CheckpointReason, CheckpointWorkspace,
+    EvidenceLedger, GoalCheckpoint, MAX_EXECUTION_EVIDENCE,
 };
 use leveler_storage::{
     EventRecord, EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore,
@@ -366,6 +367,10 @@ pub async fn project_goal_checkpoint(
             Some(facts) => facts.capture().await,
             None => CheckpointWorkspace::default(),
         },
+        user_amendments: goal.amendments.clone(),
+        user_messages: user_messages(messages, session_id, scope, goal).await?,
+        decisions: user_decisions(events, session_id, scope).await?,
+        execution: execution_evidence(events, session_id, scope).await?,
         ..Default::default()
     }
     .bounded();
@@ -659,6 +664,199 @@ async fn settled_children(
         out.drain(..out.len() - MAX_REFS);
     }
     Ok(out)
+}
+
+/// Verbatim person-submitted messages from this lineage, oldest first.
+///
+/// The transcript origin is the authority: only `UserInput` rows are a person
+/// speaking. Harness notices and legacy origin-less rows are not presented as
+/// user intent, and a text the structured amendment record already carries is
+/// rendered once.
+async fn user_messages(
+    messages: &dyn MessageStore,
+    session_id: &SessionId,
+    scope: &GoalCheckpointScope,
+    goal: &GoalRecord,
+) -> Result<Vec<String>, EngineError> {
+    let mut out: Vec<String> = Vec::new();
+    for turn_id in &scope.turn_ids {
+        for payload in messages.load_for_turn(session_id, turn_id).await? {
+            let message: leveler_model::Message =
+                serde_json::from_str(&payload).map_err(|error| {
+                    EngineError::Corrupt(format!(
+                        "unreplayable transcript row in turn {turn_id}: {error}"
+                    ))
+                })?;
+            if message.origin != Some(leveler_model::TranscriptOrigin::UserInput) {
+                continue;
+            }
+            let text = message.text_content();
+            let text = text.trim();
+            if text.is_empty() || text == goal.objective.trim() {
+                continue;
+            }
+            if out.iter().any(|seen| seen == text)
+                || goal.amendments.iter().any(|a| a.trim() == text)
+            {
+                continue;
+            }
+            out.push(text.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Decisions a person actually produced, projected from the durable
+/// clarification log in event order.
+///
+/// A pending request and every machine-ended outcome (`unattended`,
+/// `timed_out`, `cancelled`) are the ABSENCE of a decision and never appear.
+/// The first terminal per request wins, exactly like the durable writer, so a
+/// retried client cannot rewrite history.
+async fn user_decisions(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    scope: &GoalCheckpointScope,
+) -> Result<Vec<CheckpointDecision>, EngineError> {
+    struct Requested {
+        question: String,
+        options: Vec<String>,
+        questions: Vec<CheckpointQuestion>,
+        turn_id: String,
+    }
+
+    let mut requested: std::collections::HashMap<String, Requested> =
+        std::collections::HashMap::new();
+    let mut decisions: Vec<CheckpointDecision> = Vec::new();
+    let rows = events
+        .load_by_types(
+            session_id,
+            &["clarification_requested", "clarification_answered"],
+        )
+        .await?;
+    for row in rows {
+        match EngineEvent::from_payload(&row.payload)? {
+            EngineEvent::ClarificationRequested {
+                id,
+                question,
+                options,
+                questions,
+                ..
+            } => {
+                // The request event is what places a decision in this
+                // lineage; an answer alone is not enough.
+                if !scope.contains_event(&row) {
+                    continue;
+                }
+                requested
+                    .entry(id.as_str().to_string())
+                    .or_insert(Requested {
+                        question,
+                        options,
+                        questions: questions
+                            .into_iter()
+                            .map(|question| CheckpointQuestion {
+                                header: question.header,
+                                question: question.question,
+                                options: question.options,
+                            })
+                            .collect(),
+                        turn_id: row.turn_id.clone().unwrap_or_default(),
+                    });
+            }
+            EngineEvent::ClarificationAnswered {
+                id,
+                answer,
+                outcome,
+            } => {
+                let Some(request) = requested.get(id.as_str()) else {
+                    continue;
+                };
+                if decisions
+                    .iter()
+                    .any(|decision| decision.request_id == id.as_str())
+                {
+                    continue;
+                }
+                let outcome = match outcome.as_str() {
+                    "answered" => "answered",
+                    "skipped" => "skipped",
+                    // Legacy rows predate the outcome field: a non-empty
+                    // reply is an answer, an empty one is the explicit skip
+                    // the writer records today.
+                    "" if !answer.trim().is_empty() => "answered",
+                    "" => "skipped",
+                    // The user never spoke: not a decision.
+                    _ => continue,
+                };
+                decisions.push(CheckpointDecision {
+                    request_id: id.as_str().to_string(),
+                    question: request.question.clone(),
+                    options: request.options.clone(),
+                    questions: request.questions.clone(),
+                    outcome: outcome.to_string(),
+                    answer,
+                    turn_id: request.turn_id.clone(),
+                    settled_at: row.created_at.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(decisions)
+}
+
+/// Runtime-observed execution outcomes for this lineage: process exits and
+/// failures, never model prose and never a successful read.
+///
+/// Child calls settle through the child projection, and a question's own
+/// result is represented by the decision it carries.
+async fn execution_evidence(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    scope: &GoalCheckpointScope,
+) -> Result<Option<CheckpointExecution>, EngineError> {
+    let rows = events
+        .load_by_types(session_id, &["tool_call_finished"])
+        .await?;
+    let mut outcomes: Vec<CheckpointEvidence> = Vec::new();
+    for row in rows.into_iter().filter(|row| scope.contains_event(row)) {
+        let EngineEvent::ToolCallFinished {
+            name,
+            is_error,
+            preview,
+            agent_id,
+            exit_code,
+            ..
+        } = EngineEvent::from_payload(&row.payload)?
+        else {
+            continue;
+        };
+        if agent_id.is_some() || crate::injected_tools::is_user_input_tool(&name) {
+            continue;
+        }
+        if !is_error && exit_code.is_none() {
+            continue;
+        }
+        outcomes.push(CheckpointEvidence {
+            tool: name,
+            exit_code,
+            failed: is_error,
+            detail: preview,
+            turn_id: row.turn_id.clone().unwrap_or_default(),
+        });
+    }
+    if outcomes.is_empty() {
+        return Ok(None);
+    }
+    let total = outcomes.len() as u32;
+    if outcomes.len() > MAX_EXECUTION_EVIDENCE {
+        outcomes.drain(..outcomes.len() - MAX_EXECUTION_EVIDENCE);
+    }
+    Ok(Some(CheckpointExecution {
+        total,
+        recent: outcomes,
+    }))
 }
 
 #[cfg(test)]
