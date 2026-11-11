@@ -2101,6 +2101,7 @@ fn outcome_exit_code(
         }
         StopReason::Answered
         | StopReason::Incomplete
+        | StopReason::Yielded
         | StopReason::BudgetExhausted
         | StopReason::TurnLimitReached
         | StopReason::Blocked
@@ -2154,6 +2155,14 @@ fn finish(
                             )
                         }
                     }
+                    StopReason::Yielded => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "The model yielded this work window after {} model step(s); \
+                             the goal is still open. Resume with: leveler resume {session_id}",
+                            outcome.model_steps
+                        ))
+                    ),
                     StopReason::Incomplete => println!(
                         "{}",
                         Line::warn(&incomplete_line(

@@ -1021,6 +1021,9 @@ pub struct UiText {
     /// declared complete. Both are clean ends; only the second is a completion
     /// claim, so the two never share wording.
     pub turn_end_answered: &'static str,
+    /// The model closed this work window with the goal still owed. The runtime
+    /// continues the same goal; nothing failed and nothing waits for the user.
+    pub turn_end_yielded: &'static str,
     /// The turn answered, but its task declaration was refused. The task was
     /// never registered, so this is not a completion and not a Goal terminal.
     pub turn_end_answered_unregistered: &'static str,
@@ -2523,6 +2526,7 @@ static ZH: UiText = UiText {
     failure_retries_label: "重试",
     turn_end_completed: "任务已完成",
     turn_end_answered: "回答结束",
+    turn_end_yielded: "本窗口结束 · 目标继续",
     turn_end_answered_unregistered: "回答结束 · 任务未登记",
     turn_unregistered_detail: "本轮只回答了问题，未登记执行任务；不构成验收完成。",
     turn_no_final_answer: "执行已结束，但未提交最终回答",
@@ -3603,6 +3607,7 @@ static EN: UiText = UiText {
     failure_retries_label: "Retries",
     turn_end_completed: "Task completed",
     turn_end_answered: "Answer finished",
+    turn_end_yielded: "Window ended · goal continues",
     turn_end_answered_unregistered: "Answer finished · task not registered",
     turn_unregistered_detail: "This turn answered without registering an execution task; it is not a verified completion.",
     turn_no_final_answer: "run ended without a final answer",

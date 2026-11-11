@@ -73,6 +73,36 @@ fn a_failed_turn_keeps_the_goal_failed() {
     );
 }
 
+/// A yielded window is a boundary inside the goal, not its ending: the model
+/// closed the window, the runtime continues the same goal. The header must not
+/// turn amber or red, the owed task stays visible, and the user is not asked to
+/// resume a continuation the runtime already owns.
+#[test]
+fn a_yielded_window_leaves_the_goal_running() {
+    let mut state = state();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TurnYielded {
+            reason: "本窗口结束 · 目标继续".into(),
+        }),
+    );
+
+    let goal = state.active_goal.as_ref().expect("the goal stays visible");
+    assert_eq!(
+        goal.phase(),
+        GoalPhase::Running,
+        "the same goal continues in the next window"
+    );
+    assert!(
+        state.execution_task_active,
+        "the goal still owes work while the runtime continues it"
+    );
+    assert!(
+        !state.resumable_task,
+        "the runtime owns the next window; no user continuation is required"
+    );
+}
+
 /// A refused `commit_task` turn ends with an answer and a warning, not with a
 /// registered task. It must not settle a goal the user paused: the paused
 /// stage is still owed, and the warning belongs to this answer, not to the

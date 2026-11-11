@@ -136,6 +136,11 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                             _ => unreachable!(),
                         },
                         answer,
+                        // The answer targets this session's request. A runtime
+                        // that restarted has no live waiter to resolve, and
+                        // this is what lets it settle the durable request and
+                        // continue the goal.
+                        session_id: Some(state.session_id.clone()),
                     },
                     restore,
                     command_id,

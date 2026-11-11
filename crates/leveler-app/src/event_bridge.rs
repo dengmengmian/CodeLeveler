@@ -346,6 +346,12 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
         StopReason::Blocked => RuntimeEvent::TurnBlocked {
             reason: detail.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
         },
+        // The model closed this work window; the goal still owes work and the
+        // runtime continues it. Product wording never says "incomplete": the
+        // window is a boundary the model chose, not a failure.
+        StopReason::Yielded => RuntimeEvent::TurnYielded {
+            reason: detail.unwrap_or_else(|| "本窗口结束 · 继续同一目标".to_string()),
+        },
         StopReason::Stalled => RuntimeEvent::TurnIncomplete {
             reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
         },
@@ -460,6 +466,9 @@ fn task_finished_event(
         },
         leveler_lifecycle::TaskOutcome::Blocked => RuntimeEvent::TurnBlocked {
             reason: reason.unwrap_or_else(|| "目标被标记为阻塞".to_string()),
+        },
+        leveler_lifecycle::TaskOutcome::Yielded => RuntimeEvent::TurnYielded {
+            reason: reason.unwrap_or_else(|| "本窗口结束 · 继续同一目标".to_string()),
         },
         leveler_lifecycle::TaskOutcome::Completed => RuntimeEvent::TurnAnswered,
     }

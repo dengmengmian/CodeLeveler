@@ -290,6 +290,13 @@ pub struct RecordingClarifier {
 
 #[async_trait]
 impl Clarifier for RecordingClarifier {
+    fn has_human(&self) -> bool {
+        // Recording is an event-layer decoration, never an answerer. The host
+        // fact belongs to the wrapped clarifier and must survive the wrap, or
+        // the tool surface would treat a UI-backed turn as headless.
+        self.inner.has_human()
+    }
+
     async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome {
         let mut request = request.clone();
         request.turn_id = Some(self.turn_id.clone());
@@ -297,6 +304,9 @@ impl Clarifier for RecordingClarifier {
             id: request.id.clone(),
             question: request.question.clone(),
             options: request.options.clone(),
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            questions: request.questions.clone(),
         });
         let outcome = self.inner.clarify(&request).await;
         self.events.emit(EngineEvent::ClarificationAnswered {

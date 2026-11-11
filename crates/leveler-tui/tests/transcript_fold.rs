@@ -1632,6 +1632,7 @@ fn turn_end_status(status: TurnEndStatus) -> &'static str {
         TurnEndStatus::NoFinalAnswer => "no_final_answer",
         TurnEndStatus::Failed => "failed",
         TurnEndStatus::Cancelled => "cancelled",
+        TurnEndStatus::Yielded => "yielded",
     }
 }
 

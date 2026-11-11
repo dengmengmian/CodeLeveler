@@ -749,6 +749,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             finish_turn(state, TurnEndStatus::Incomplete, Some(reason));
             state.notification = None;
         }
+        RuntimeEvent::TurnYielded { reason } => {
+            // The model closed this window with the goal still owed; the
+            // runtime continues it. Nothing failed, nothing waits for the
+            // user, and the goal's running phase is left untouched.
+            finish_turn(state, TurnEndStatus::Yielded, Some(reason));
+            state.notification = None;
+        }
         RuntimeEvent::TurnBlocked { reason } => {
             // A blocked goal is not an ordinary incomplete turn: the runtime
             // left the goal unsettled, so the work already done stands and the
@@ -1717,6 +1724,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
                 // The goal is still owed; the blocked window stops the clock
                 // but does not fail the goal.
                 TurnEndStatus::Blocked => goal.pause(now),
+                // A yielded window changes nothing about the goal: it is still
+                // running and the runtime owns the next window.
+                TurnEndStatus::Yielded => {}
                 TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
                 TurnEndStatus::AnsweredUnregistered => {}
                 TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings => {

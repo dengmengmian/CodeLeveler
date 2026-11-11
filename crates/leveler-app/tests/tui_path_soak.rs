@@ -341,6 +341,7 @@ async fn drive_turn_to_terminal(
                     .send(ClientCommand::AnswerClarification {
                         request_id: request.id,
                         answer,
+                        session_id: None,
                     })
                     .await;
             }

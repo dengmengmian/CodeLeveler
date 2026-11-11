@@ -31,8 +31,9 @@ pub use event::{
 // lifecycle vocabulary so storage and clients speak it without a back-edge.
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{
-    AcknowledgedCall, BackgroundTaskFact, BackgroundTaskTerminal, DanglingCall, EventLog,
-    FinishedChildFact, SnapshotView,
+    AcknowledgedCall, BackgroundTaskFact, BackgroundTaskTerminal, ClarificationSettlement,
+    DanglingCall, EventLog, FinishedChildFact, PendingClarification, SettledClarification,
+    SnapshotView,
 };
 pub use ports::{
     ChildToolEvent, EventBarrier, ExecutionFence, GoalBinder, LostChild, LostChildNote,
@@ -96,6 +97,12 @@ pub enum EngineError {
     /// A durable cancellation won; the Harness must revise its terminal proposal.
     #[error("durable task cancellation requires a cancelled terminal proposal")]
     TaskCancellationRequested,
+    /// An automatic continuation was starting, but the goal it exists for has
+    /// already settled — the user ended the logical task while no window was
+    /// running. Nothing is owed, so the run writes nothing: no terminal, no
+    /// session status. The last durable terminal stays the authority.
+    #[error("goal is no longer owed: {0}")]
+    GoalNotOwed(String),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("configuration error: {0}")]

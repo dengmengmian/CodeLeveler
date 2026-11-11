@@ -91,7 +91,7 @@ struct Fixture {
     app: Arc<Application>,
     session: leveler_core::SessionId,
     _tmp: tempfile::TempDir,
-    _server: MockServer,
+    server: MockServer,
 }
 
 async fn fixture(responses: Vec<MockResponse>) -> Fixture {
@@ -115,7 +115,7 @@ async fn fixture(responses: Vec<MockResponse>) -> Fixture {
         app,
         session,
         _tmp: tmp,
-        _server: server,
+        server,
     }
 }
 
@@ -590,6 +590,19 @@ async fn explicit_cancel_of_a_resumed_window_settles_the_owed_goal() {
     );
 }
 
+/// A window that ends with the goal still owed, so the runtime owns the next
+/// window instead of the user.
+fn yielded_work() -> MockResponse {
+    sse(vec![
+        tool_call_frame(
+            "c-yield",
+            "update_goal",
+            serde_json::json!({"status": "yield", "summary": "本窗口到此为止，下一窗口继续"}),
+        ),
+        finish_frame("tool_calls"),
+    ])
+}
+
 /// B (running): cancelling the logical task while a turn runs records
 /// `cancelled`, not resumable `interrupted`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -637,4 +650,107 @@ async fn explicit_cancel_of_a_running_task_records_cancelled() {
         }
     }
     assert!(saw, "the runtime must publish a TaskCancelled terminal");
+}
+
+/// A window the runtime continued is still the user's to end. The cancel
+/// reaches the continued window (the runtime, not a message, started it),
+/// settles the logical goal as `cancelled`, and refuses a later automatic
+/// continuation without writing anything: the user's cancellation stays the
+/// last durable terminal instead of being overwritten by a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_the_continued_window_ends_the_logical_goal() {
+    let mut responses = blocking_work();
+    responses.insert(0, yielded_work());
+    let f = fixture(responses).await;
+    let client = client(&f);
+    client
+        .send(ClientCommand::RunGoal {
+            session_id: f.session.clone(),
+            content: "finish the inventory work".to_string(),
+            require_new_turn: false,
+        })
+        .await
+        .unwrap();
+
+    // Window 1 yields; the runtime starts window 2 with no user input. The
+    // second turn row and second model request are the runtime's continuation.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let db = f.app.open_database().await.unwrap();
+        let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+        if turns.len() >= 2
+            && turns.iter().any(|turn| turn.status == "running")
+            && f.server.request_bodies().await.len() >= 2
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the yielded window was never continued: {turns:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 2).await;
+
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(
+        last_outcome(&db, &f.session).await,
+        "cancelled",
+        "cancelling a continued window ends the LOGICAL task"
+    );
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert!(
+        goals.iter().all(|goal| goal.state == GoalState::Settled),
+        "the cancelled logical task leaves no owed goal: {goals:?}"
+    );
+    drop(db);
+    assert_eq!(
+        f.server.request_bodies().await.len(),
+        2,
+        "a cancelled logical task starts no further window"
+    );
+
+    // The continuation that would have followed finds nothing owed and writes
+    // nothing: no request, no terminal.
+    let refused = f
+        .app
+        .resume_in_session_continuation(
+            &f.session,
+            Arc::new(AutoApprove),
+            Arc::new(leveler_agent::AutoClarify),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(leveler_app::AppError::GoalSettled(_))),
+        "a settled goal is not owed: {refused:?}"
+    );
+    assert_eq!(
+        f.server.request_bodies().await.len(),
+        2,
+        "a refused continuation sends no model request"
+    );
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(
+        last_outcome(&db, &f.session).await,
+        "cancelled",
+        "a refused continuation must not overwrite the user's cancellation"
+    );
 }

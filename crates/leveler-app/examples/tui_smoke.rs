@@ -397,6 +397,7 @@ async fn drive_turn(
                     .send(ClientCommand::AnswerClarification {
                         request_id: request.id,
                         answer,
+                        session_id: None,
                     })
                     .await;
             }

@@ -234,6 +234,11 @@ pub enum TurnEndStatus {
     /// the goal is not settled and `继续` can re-enter it. Distinct from
     /// [`Self::Incomplete`], which also covers budget and round ceilings.
     Blocked,
+    /// The model ended this work window through `update_goal(yield)` while the
+    /// goal still owes work. Nothing failed and nothing needs the user: the
+    /// runtime continues the same goal in a fresh window. The marker is a
+    /// neutral boundary, never the amber "incomplete" verdict.
+    Yielded,
     /// The loop reached a clean end without committing an answer.
     ///
     /// Tool calls finishing is not a task finishing (§12): the turn's claim to

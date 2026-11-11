@@ -28,7 +28,9 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use leveler_core::{BootId, BootLiveness, BootLivenessProbe, CheckpointId, CommandId, SessionId};
+use leveler_core::{
+    BootId, BootLiveness, BootLivenessProbe, CheckpointId, ClarificationId, CommandId, SessionId,
+};
 use leveler_execution::{
     AdoptedTaskSpec, Approver, AutoApprove, BackgroundTaskLifetime, OutputStream,
     PermissionProfile, StreamOutcome,
@@ -616,6 +618,14 @@ pub struct InProcessRuntimeClient {
     session_events: Arc<SessionStreams>,
     pending: PendingApprovals,
     pending_clarify: PendingClarifications,
+    /// Serializes durable clarification settlement with turn admission.
+    ///
+    /// A client answer settles the request and then starts the continuation.
+    /// A new turn must not slip between those steps and steal the session, and
+    /// an answer must not race a new turn's admission check. One lock makes
+    /// "the question is gone" and "the continuation owns the session" one
+    /// ordered decision.
+    durable_clarify: Arc<tokio::sync::Mutex<()>>,
     /// User shell executions (`!command`): active + bounded history.
     /// Arc so detached shell workers update it directly.
     user_shells: Arc<crate::user_shell::UserShellStore>,
@@ -1348,6 +1358,183 @@ fn require_model(
         .ok_or_else(|| ClientError::Runtime(no_model_message(session_id)))
 }
 
+/// Whether `answer` is the decision this request already recorded.
+///
+/// An empty wire answer is an explicit skip. Only the identical decision may
+/// be treated as a retried submission whose acknowledgement was lost; a
+/// different choice belongs to a request that is over.
+fn clarification_answer_matches(
+    terminal: &leveler_engine::SettledClarification,
+    answer: &str,
+) -> bool {
+    if answer.trim().is_empty() {
+        terminal.outcome == "skipped"
+    } else {
+        terminal.outcome == "answered" && terminal.result_text == answer
+    }
+}
+
+/// The honest answer to a submission the request can no longer accept.
+fn stale_clarification_answer(terminal: &leveler_engine::SettledClarification) -> ClientError {
+    let state = match terminal.outcome.as_str() {
+        "cancelled" => "该问题已随任务取消而关闭",
+        "answered" | "skipped" => "该问题已由其他客户端处理",
+        "unattended" | "timed_out" => "该问题已按无人应答结束",
+        _ => "该问题已结束",
+    };
+    ClientError::Runtime(format!("{state}，本次回答未生效"))
+}
+
+/// Whether a durable user answer still has no continuation.
+///
+/// `settle_clarification` commits the decision and the tool result that
+/// carries it as one batch; the runtime then admits the next window. A process
+/// that dies between those writes leaves a goal that still owes work with
+/// nobody driving it — the answer is durable, so it must not be lost.
+///
+/// Only that exact tail qualifies. Once any event other than the reaper's own
+/// bookkeeping follows the tool result, the answered window moved on: the
+/// interrupted turn is ordinary work the user resumes explicitly, not an
+/// answer waiting for the runtime.
+async fn clarification_continuation_is_owed(
+    db: &leveler_storage::Database,
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+) -> Result<bool, ClientError> {
+    let storage_error = |error: leveler_storage::StorageError| {
+        ClientError::Runtime(format!("owed clarification: {error}"))
+    };
+    let turns = stores
+        .turns
+        .list_for_session(session_id)
+        .await
+        .map_err(storage_error)?;
+    let Some(latest) = turns.last() else {
+        return Ok(false);
+    };
+    if latest.status != "interrupted" {
+        return Ok(false);
+    }
+    // A goal paused by the user waits for the user's explicit authorization;
+    // a decision recorded before the pause does not lift that boundary.
+    if let Some(task) = stores
+        .tasks
+        .task_for_session(session_id)
+        .await
+        .map_err(storage_error)?
+    {
+        let goals = stores.goals.for_task(&task).await.map_err(storage_error)?;
+        if goals.iter().any(|goal| {
+            goal.state == leveler_storage::GoalState::Running && goal.user_paused_at.is_some()
+        }) {
+            return Ok(false);
+        }
+    }
+    let log = leveler_engine::EventLog::new(stores.events.as_ref(), session_id.clone());
+    // An unanswered question is already waiting for the user; it is not an
+    // answer whose continuation is owed.
+    if !log
+        .pending_clarifications()
+        .await
+        .map_err(|error| ClientError::Runtime(format!("owed clarification: {error}")))?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    let rows = stores
+        .events
+        .load_by_types(
+            session_id,
+            &[
+                "clarification_requested",
+                "clarification_answered",
+                "tool_call_finished",
+            ],
+        )
+        .await
+        .map_err(storage_error)?;
+    let decode = |row: &leveler_storage::EventRecord| {
+        if row.schema_version > leveler_storage::EVENT_SCHEMA_VERSION {
+            return Err(ClientError::Runtime(format!(
+                "owed clarification: event {} has schema_version {} > supported {}",
+                row.id,
+                row.schema_version,
+                leveler_storage::EVENT_SCHEMA_VERSION
+            )));
+        }
+        leveler_engine::EngineEvent::from_payload(&row.payload)
+            .map_err(|error| ClientError::Runtime(format!("owed clarification: {error}")))
+    };
+    let mut asked: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut answered: Option<(i64, ClarificationId, String, Option<String>)> = None;
+    for row in &rows {
+        match decode(row)? {
+            leveler_engine::EngineEvent::ClarificationRequested {
+                id, call_id, tool, ..
+            } => {
+                asked.insert(id.as_str().to_string(), (call_id, tool));
+            }
+            leveler_engine::EngineEvent::ClarificationAnswered { id, outcome, .. } => {
+                answered = Some((row.sequence, id, outcome, row.turn_id.clone()));
+            }
+            _ => {}
+        }
+    }
+    let Some((answer_sequence, id, outcome, answer_turn)) = answered else {
+        return Ok(false);
+    };
+    // The question must belong to the turn whose interruption is being
+    // recovered. An answered question in an older turn is history.
+    if answer_turn.as_deref() != Some(latest.id.as_str()) {
+        return Ok(false);
+    }
+    // Cancellation and non-user outcomes never continue a window.
+    if outcome != "answered" && outcome != "skipped" {
+        return Ok(false);
+    }
+    let Some((call_id, tool)) = asked.get(id.as_str()) else {
+        return Ok(false);
+    };
+    // A request from before the tool identity was persisted cannot be routed
+    // back to a model; it stays readable history.
+    if call_id.is_empty() || tool.is_empty() {
+        return Ok(false);
+    }
+    let mut closure = None;
+    for row in &rows {
+        if row.sequence <= answer_sequence || row.turn_id.as_deref() != answer_turn.as_deref() {
+            continue;
+        }
+        if let leveler_engine::EngineEvent::ToolCallFinished {
+            call_id: closed, ..
+        } = decode(row)?
+            && &closed == call_id
+        {
+            closure = Some(row.sequence);
+        }
+    }
+    // The terminal and its tool result are one atomic batch. A missing result
+    // means this is not the shape the durable path wrote; never drive from it.
+    let Some(closure_sequence) = closure else {
+        return Ok(false);
+    };
+    let after = leveler_storage::EventRepository::new(db)
+        .first_after_except_types(
+            session_id,
+            closure_sequence,
+            &[
+                "turn_finished",
+                "goal_checkpoint_created",
+                "sub_agent_interrupted",
+                "sub_agent_finished",
+            ],
+        )
+        .await
+        .map_err(storage_error)?;
+    Ok(after.is_none())
+}
+
 impl InProcessRuntimeClient {
     /// Build a client that runs turns with the given model, mode, and sandbox
     /// setting.
@@ -1440,6 +1627,71 @@ impl InProcessRuntimeClient {
         self.active.is_running(session_id)
     }
 
+    /// Start the continuation a durable user answer is still owed, if this
+    /// session is in exactly that state.
+    ///
+    /// Idempotent with the answer and admission paths through the same gate:
+    /// whichever caller arrives first admits the window, and every later caller
+    /// sees a live turn and stops.
+    async fn resume_owed_clarification(&self, session_id: &SessionId) -> Result<bool, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let _gate = self.durable_clarify.lock().await;
+        if self.active.is_running(session_id) {
+            return Ok(false);
+        }
+        if !clarification_continuation_is_owed(&db, &stores, session_id).await? {
+            return Ok(false);
+        }
+        self.continue_after_durable_answer(session_id).await?;
+        Ok(true)
+    }
+
+    /// Start every continuation a crash between a durable answer and its next
+    /// window left owed.
+    ///
+    /// The scan is bounded by goals that still owe work, not by session
+    /// history. One session that cannot continue (for example its model was
+    /// removed) is reported and does not stop the recovery of the others.
+    pub async fn reconcile_owed_clarification_continuations(&self) -> Result<usize, ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let goals = stores
+            .goals
+            .unfinished()
+            .await
+            .map_err(|error| ClientError::Runtime(format!("owed clarification: {error}")))?;
+        let mut started = 0;
+        for goal in goals {
+            let Some(session_id) = stores
+                .tasks
+                .session_for_task(&goal.task_id)
+                .await
+                .map_err(|error| ClientError::Runtime(format!("owed clarification: {error}")))?
+            else {
+                continue;
+            };
+            match self.resume_owed_clarification(&session_id).await {
+                Ok(true) => started += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    session = %session_id,
+                    "an owed clarification continuation could not start"
+                ),
+            }
+        }
+        Ok(started)
+    }
+
     /// Like [`Self::new`], with an explicit auto-approve switch for unattended
     /// interactive TUI sessions.
     pub fn new_with_options(
@@ -1505,6 +1757,7 @@ impl InProcessRuntimeClient {
             session_events,
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
+            durable_clarify: Arc::new(tokio::sync::Mutex::new(())),
             steering: Arc::new(Mutex::new(HashMap::new())),
             goal_steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -3471,6 +3724,145 @@ impl InProcessRuntimeClient {
         Ok(())
     }
 
+    /// Answer a clarification from a client.
+    ///
+    /// A live waiter is the fast path: the parked turn continues by itself and
+    /// records its own terminal through the recorder. With no live waiter —
+    /// the runtime restarted, or the turn that asked was already reaped — the
+    /// durable request is the authority: one client answer settles it exactly
+    /// once and the goal continues in a fresh window without the user typing
+    /// anything.
+    async fn handle_answer_clarification(
+        &self,
+        request_id: ClarificationId,
+        answer: String,
+        session_id: Option<SessionId>,
+    ) -> Result<(), ClientError> {
+        if resolve_clarification(&self.pending_clarify, &request_id, answer.clone()).is_ok() {
+            return Ok(());
+        }
+        let Some(session_id) = session_id else {
+            return Err(ClientError::Runtime(
+                "pending clarification not found or already resolved".to_string(),
+            ));
+        };
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let log = leveler_engine::EventLog::new(stores.events.as_ref(), session_id.clone());
+        let missing = || {
+            ClientError::Runtime("pending clarification not found or already resolved".to_string())
+        };
+        // Serialize with turn admission: the question's terminal and the
+        // continuation's admission are one ordered decision.
+        let _gate = self.durable_clarify.lock().await;
+        // A live turn owns the session; its waiter was consumed (another
+        // client answered first) or is about to be. A durable terminal here
+        // would race the recorder's own. A retry of the answer that landed is
+        // a success even while its continuation runs — but a decision this
+        // request never recorded is not this client's answer.
+        if self.active.is_running(&session_id) {
+            let Some(terminal) = log
+                .clarification_settlement(&request_id)
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+            else {
+                return Err(missing());
+            };
+            return if clarification_answer_matches(&terminal, &answer) {
+                Ok(())
+            } else {
+                Err(stale_clarification_answer(&terminal))
+            };
+        }
+        match log
+            .settle_clarification(&request_id, &answer)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+        {
+            leveler_engine::ClarificationSettlement::Settled(_) => {
+                self.continue_after_durable_answer(&session_id).await
+            }
+            // Another answer already settled it. A retry of that same decision
+            // may be the moment the goal gets the window a crash left owed;
+            // any other answer changed nothing and must not read as success,
+            // and no answer may start a second continuation.
+            leveler_engine::ClarificationSettlement::AlreadySettled(terminal) => {
+                if !clarification_answer_matches(&terminal, &answer) {
+                    return Err(stale_clarification_answer(&terminal));
+                }
+                if clarification_continuation_is_owed(&db, &stores, &session_id).await? {
+                    self.continue_after_durable_answer(&session_id).await
+                } else {
+                    Ok(())
+                }
+            }
+            leveler_engine::ClarificationSettlement::Unknown => Err(missing()),
+        }
+    }
+
+    /// Admit and start the goal window that the answered question was holding.
+    ///
+    /// Called with the durable settlement already written and the answer gate
+    /// held. The command returns before the turn is accepted; the acceptance
+    /// error is surfaced as a notification because the answer itself is
+    /// durable and must not be reported as failed.
+    async fn continue_after_durable_answer(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), ClientError> {
+        let config = self.runtime_config(session_id).await?;
+        let model = require_model(&config, session_id)?;
+        let admission = self
+            .active
+            .admit(session_id)
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let accepted = self.spawn_goal_continuation(session_id.clone(), admission, config, model);
+        let events = self.events_for(session_id);
+        tokio::spawn(async move {
+            if let Err(error) = await_turn_acceptance(accepted).await {
+                let _ = events.send(RuntimeEvent::Notification {
+                    level: NotificationLevel::Error,
+                    message: format!("回答后无法继续目标：{error}"),
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// Refuse to start a new turn while an answerable question is pending.
+    ///
+    /// The question is the decision the task is waiting on; a new turn would
+    /// overlap the work the answer belongs to. Rows from before the request
+    /// carried its turn/tool identity are history, not a card: they must not
+    /// block a session forever.
+    async fn refuse_if_clarification_pending(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), ClientError> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let log = leveler_engine::EventLog::new(stores.events.as_ref(), session_id.clone());
+        let pending = log
+            .pending_clarifications()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let Some(request) = pending.into_iter().find(|request| request.is_actionable()) else {
+            return Ok(());
+        };
+        Err(ClientError::Runtime(format!(
+            "该会话仍在等待用户回答一个问题：{}；请先回答或跳过，或取消任务。",
+            request.question
+        )))
+    }
+
     /// The shared turn-launch preamble: admit the session (one active main
     /// turn), optionally name a placeholder session after its first message,
     /// capture the pre-turn checkpoint, and emit the optimistic user-message
@@ -3486,11 +3878,19 @@ impl InProcessRuntimeClient {
         message_id: Option<MessageId>,
         seed_input_id: Option<String>,
     ) -> Result<crate::active_turns::TurnLease, ClientError> {
+        // Admission and durable clarification settlement are one ordered
+        // decision: a new turn must not start while a question is answerable,
+        // and an answer's continuation must not race a turn that is starting.
+        let admission = {
+            let _gate = self.durable_clarify.lock().await;
+            if !self.active.is_running(session_id) {
+                self.refuse_if_clarification_pending(session_id).await?;
+            }
+            self.active
+                .admit(session_id)
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+        };
         self.auxiliary_assists.cancel(session_id);
-        let admission = self
-            .active
-            .admit(session_id)
-            .map_err(|error| ClientError::Runtime(error.to_string()))?;
         if retitle {
             self.retitle_placeholder_session(session_id, text).await;
         }
@@ -4305,6 +4705,43 @@ impl InProcessRuntimeClient {
         config: SessionRuntimeConfig,
         model: ModelRef,
     ) -> oneshot::Receiver<Result<(), ClientError>> {
+        self.spawn_goal_windows(session_id, Some(content), admission, config, model)
+    }
+
+    /// Continue an owed goal after a durable user decision, with no new user
+    /// message and a fresh admission: the answered question is the instruction.
+    fn spawn_goal_continuation(
+        &self,
+        session_id: SessionId,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+        model: ModelRef,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        self.spawn_goal_windows(session_id, None, admission, config, model)
+    }
+
+    /// Drive a Goal turn as one LOGICAL turn made of one or more work windows.
+    ///
+    /// A window ends through `update_goal(yield)`: the objective still owes
+    /// work, nothing obstructs it, and the model chose to close the window.
+    /// The runtime continues the SAME goal in a fresh window with no user
+    /// message and no new admission — the cancellation token, task-cancel
+    /// flag, approver, clarifier and steering all belong to the logical turn,
+    /// not to a window. Every other terminal (completed, blocked, cancelled,
+    /// failed, budget-limited) ends the logical turn here.
+    ///
+    /// `content = None` starts directly in continuation mode: the first window
+    /// is the runtime re-entering an owed goal after a durable user answer.
+    /// The continuation decision is made from the structured `StopReason` the
+    /// engine returned, never from model text or a projected event.
+    fn spawn_goal_windows(
+        &self,
+        session_id: SessionId,
+        content: Option<String>,
+        admission: crate::active_turns::TurnLease,
+        config: SessionRuntimeConfig,
+        model: ModelRef,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
         let app = self.app.clone();
         let client = self.clone();
         let events = self.events_for(&session_id);
@@ -4326,77 +4763,182 @@ impl InProcessRuntimeClient {
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 emit_project_rules(&events, repo.as_deref());
-                let terminal_active = active.clone();
-                let terminal_admission = admission.clone();
-                let terminal_events = events.clone();
-                let mut bridge = EventBridge::new(events.clone())
-                    .with_progress(active.clone(), session_id.clone())
-                    .with_terminal_publisher(move |event| {
-                        terminal_active.finish_with(&terminal_admission, || {
-                            let _ = terminal_events.send(event);
-                        });
-                    });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
-                let observer_acceptance = accepted_tx.clone();
-                let result = {
-                    let mut observer = |event: leveler_engine::EngineEvent| {
-                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
-                            && let Some(tx) = observer_acceptance
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take()
-                        {
-                            let _ = tx.send(Ok(()));
-                            hit_after_turn_started_test_barrier();
+                // The user's own message opens the first window only; every
+                // later window is the runtime continuing an owed goal. A
+                // `None` content means the answer that resumed the goal IS the
+                // opening of its continuation window.
+                let mut content = content;
+                let mut first_window = true;
+                let mut started = false;
+                let mut user_cancelled = false;
+                loop {
+                    // Each window owns its bridge: the terminal publisher is
+                    // single-use. The terminal event is held in the slot so
+                    // this loop, not the engine callback, decides whether it
+                    // ends the logical turn (publish inside the admission
+                    // boundary) or only closes a window (publish now; the
+                    // logical turn stays admitted for its next window).
+                    let terminal: Arc<Mutex<Option<RuntimeEvent>>> = Arc::new(Mutex::new(None));
+                    let mut bridge = EventBridge::new(events.clone())
+                        .with_progress(active.clone(), session_id.clone())
+                        .with_terminal_publisher({
+                            let terminal = terminal.clone();
+                            move |event| {
+                                *terminal
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(event);
+                            }
+                        });
+                    let observer_acceptance = accepted_tx.clone();
+                    let result = {
+                        let mut observer = |event: leveler_engine::EngineEvent| {
+                            if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                                && let Some(tx) = observer_acceptance
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take()
+                            {
+                                let _ = tx.send(Ok(()));
+                                hit_after_turn_started_test_barrier();
+                            }
+                            bridge.forward(event);
+                        };
+                        if let Some(text) = content.take() {
+                            app.run_in_session_with_clarifier(
+                                &session_id,
+                                &model,
+                                mode,
+                                &text,
+                                approver.clone(),
+                                clarifier.clone(),
+                                sandbox,
+                                Some(steering.clone() as Arc<dyn leveler_agent::SteeringSource>),
+                                admission.task_cancel(),
+                                &mut observer,
+                                cancel.clone(),
+                            )
+                            .await
+                        } else {
+                            // No instruction: continue the goal the previous
+                            // window yielded. A goal that settled since (the
+                            // user cancelled the logical task) is not reopened
+                            // and writes nothing — see `AppError::GoalSettled`.
+                            app.resume_in_session_continuation(
+                                &session_id,
+                                approver.clone(),
+                                clarifier.clone(),
+                                Some(steering.clone() as Arc<dyn leveler_agent::SteeringSource>),
+                                admission.task_cancel(),
+                                &mut observer,
+                                cancel.clone(),
+                            )
+                            .await
                         }
-                        bridge.forward(event);
                     };
-                    app.run_in_session_with_clarifier(
-                        &session_id,
-                        &model,
-                        mode,
-                        &content,
-                        approver,
-                        clarifier,
-                        sandbox,
-                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
-                        admission.task_cancel(),
-                        &mut observer,
-                        cancel,
-                    )
-                    .await
-                };
-                // `TurnStarted` is the only consumer of the acceptance
-                // sender. Still holding it after the turn returned means the
-                // turn never reached durable admission.
-                let started = {
-                    let mut slot = accepted_tx
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match slot.take() {
-                        Some(tx) => {
-                            let _ = tx.send(Err(turn_rejection(&result)));
-                            false
-                        }
-                        None => true,
+                    if first_window {
+                        first_window = false;
+                        // `TurnStarted` is the only consumer of the acceptance
+                        // sender. Still holding it after the turn returned
+                        // means the turn never reached durable admission.
+                        let mut slot = accepted_tx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        started = match slot.take() {
+                            Some(tx) => {
+                                let _ = tx.send(Err(turn_rejection(&result)));
+                                false
+                            }
+                            None => true,
+                        };
                     }
-                };
-                // A cancel is the user saying stop: pending text is not
-                // delivered as a new turn. Every other ending owes the person
-                // an answer to what they typed.
-                let user_cancelled = matches!(
-                    &result,
-                    Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
-                );
-                // TaskFinished is the normal path's one terminal authority and
-                // EventBridge projects it immediately. Only failures that never
-                // reached that commit need the wrapper fallback.
-                if !bridge.terminal_published() {
-                    active.finish_with(&admission, || {
-                        let _ = events.send(turn_runtime_event(result));
+                    let terminal = terminal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let yielded = matches!(
+                        &result,
+                        Ok(outcome) if outcome.stop_reason == leveler_agent::StopReason::Yielded
+                    );
+                    if yielded && started {
+                        // The window ended inside the goal: its terminal is a
+                        // durable fact and is published now, while the logical
+                        // turn keeps its admission for the next window.
+                        if let Some(event) = terminal {
+                            let _ = events.send(event);
+                        }
+                        if admission
+                            .task_cancel()
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            // The user ended the LOGICAL task between windows.
+                            // No window is running, so this commits the
+                            // cancelled terminal exactly like the idle path
+                            // the command handler uses when nothing is active.
+                            match app.cancel_task(&session_id).await {
+                                Ok(Some(event)) => {
+                                    // The idle cancel path returns the durable
+                                    // terminal fact; project it through a fresh
+                                    // bridge, inside the admission boundary.
+                                    let projection_events = events.clone();
+                                    active.finish_with(&admission, || {
+                                        let mut cancel_bridge = EventBridge::new(projection_events);
+                                        cancel_bridge.forward(event);
+                                    });
+                                }
+                                Ok(None) => {
+                                    active.finish(&admission);
+                                }
+                                Err(error) => {
+                                    active.finish_with(&admission, || {
+                                        let _ = events.send(RuntimeEvent::Notification {
+                                            level: NotificationLevel::Error,
+                                            message: format!("任务取消失败：{error}"),
+                                        });
+                                    });
+                                }
+                            }
+                            user_cancelled = true;
+                            break;
+                        }
+                        if cancel.is_cancelled() {
+                            // Esc ended the turn after its window had already
+                            // yielded. Nothing more is owed to publish: the
+                            // goal keeps its resumable truth.
+                            user_cancelled = true;
+                            active.finish(&admission);
+                            break;
+                        }
+                        continue;
+                    }
+                    // A cancel is the user saying stop: pending text is not
+                    // delivered as a new turn. Every other ending owes the
+                    // person an answer to what they typed.
+                    user_cancelled = user_cancelled
+                        || matches!(
+                            &result,
+                            Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
+                        );
+                    if matches!(&result, Err(crate::AppError::GoalSettled(_))) {
+                        // The goal settled before this continuation could
+                        // start. The last durable terminal is the authority and
+                        // this window wrote nothing: stop silently.
+                        active.finish(&admission);
+                        break;
+                    }
+                    // TaskFinished is the normal path's one terminal authority.
+                    // Publish it inside the admission boundary; only failures
+                    // that never reached that commit need the wrapper fallback.
+                    active.finish_with(&admission, || match terminal {
+                        Some(event) => {
+                            let _ = events.send(event);
+                        }
+                        None => {
+                            let _ = events.send(turn_runtime_event(result));
+                        }
                     });
-                } else {
-                    active.finish(&admission);
+                    break;
                 }
                 // The goal's terminal may have ended this session's Goal route;
                 // publish the row so the UI stops claiming a Goal that is over.
@@ -6179,6 +6721,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         let probe = crate::runtime_boot::StateDirBootLiveness::new(
                             &self.app.layout.state_dir,
                         );
+                        let stores = leveler_storage::EngineStores::from_database(&db);
                         for task in index
                             .tasks
                             .iter_mut()
@@ -6197,7 +6740,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                                     )
                                 })?;
                             let live = self.active.is_running(&task.id);
-                            let waiting = self
+                            let live_waiter = self
                                 .pending
                                 .lock()
                                 .unwrap()
@@ -6209,6 +6752,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                                     .unwrap()
                                     .values()
                                     .any(|waiter| waiter.binding.session_id == task.id);
+                            // A question outlives the process that asked it.
+                            // The list must agree with the session snapshot
+                            // this client would open: a durable, answerable
+                            // clarification is still WaitingUser.
+                            let waiting = if live_waiter {
+                                true
+                            } else {
+                                leveler_engine::EventLog::new(
+                                    stores.events.as_ref(),
+                                    task.id.clone(),
+                                )
+                                .pending_clarifications()
+                                .await
+                                .map_err(|error| {
+                                    (UiGlobalTaskSourceErrorKind::Storage, error.to_string())
+                                })?
+                                .into_iter()
+                                .any(|request| request.is_actionable())
+                            };
                             task.status = crate::session_projection::project_task(
                                 &facts, &probe, live, waiting,
                             )
@@ -6375,8 +6937,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 request_id,
                 decision,
             } => resolve_approval(&self.pending, &request_id, execution_decision(decision)),
-            ClientCommand::AnswerClarification { request_id, answer } => {
-                resolve_clarification(&self.pending_clarify, &request_id, answer)
+            ClientCommand::AnswerClarification {
+                request_id,
+                answer,
+                session_id,
+            } => {
+                self.handle_answer_clarification(request_id, answer, session_id)
+                    .await
             }
             ClientCommand::SelectModel { .. }
             | ClientCommand::SetDefaultModel { .. }
@@ -6900,7 +7467,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .request_active_task_cancel(&session_id)
                     .await
                     .map_err(|error| ClientError::Runtime(error.to_string()))?;
-                if delivered {
+                // A running LOGICAL turn owns the cancellation even in the
+                // moment between its work windows, when no durable ownership
+                // exists to carry a request row. The turn's own loop settles
+                // the task through the same `cancel_task` transaction; taking
+                // the idle path here instead would race the next window.
+                let held = self.active.is_running(&session_id);
+                if held || delivered {
                     self.active.cancel_task(&session_id);
                 } else {
                     match self.app.cancel_task(&session_id).await {
@@ -7599,6 +8172,18 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
     }
 
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+        // A crash between the durable answer and its continuation leaves the
+        // goal owed with nobody driving it. Opening the session is the moment
+        // to finish that work — the user does not retype anything, and the
+        // snapshot then reports the window as running. The check is narrow and
+        // idempotent; a failure is logged and does not hide the session.
+        if let Err(error) = self.resume_owed_clarification(session_id).await {
+            tracing::warn!(
+                %error,
+                session = %session_id,
+                "could not resume a clarification continuation left owed by a crash"
+            );
+        }
         // Phase times include pool checkout and SQLite busy-wait. They are not
         // a separate pool-acquire measurement: the pool handle stays inside
         // the storage crate.
@@ -7717,6 +8302,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .unwrap_or(false);
         let thinking = ui_thinking_state(profile.as_ref(), config.thinking);
 
+        let stores = leveler_storage::EngineStores::from_database(&db);
         let mut pending_interactions = Vec::new();
         pending_interactions.extend(
             self.pending
@@ -7740,6 +8326,46 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     )
                 }),
         );
+        // A question outlives the turn that asked it. When no live turn owns
+        // the session, the durable pending rows are the authority: a client
+        // that reconnects after a restart restores a card it can still answer,
+        // and the answer re-enters the goal. Live entries win by id.
+        if !self.active.is_running(session_id) {
+            let live: std::collections::HashSet<String> = pending_interactions
+                .iter()
+                .map(|item| match item {
+                    leveler_client_protocol::UiPendingInteraction::Approval(request) => {
+                        request.id.as_str().to_string()
+                    }
+                    leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
+                        request.id.as_str().to_string()
+                    }
+                })
+                .collect();
+            let log = leveler_engine::EventLog::new(stores.events.as_ref(), session_id.clone());
+            let pending = log
+                .pending_clarifications()
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?;
+            for request in pending
+                .into_iter()
+                .filter(|request| request.is_actionable())
+            {
+                if live.contains(request.id.as_str()) {
+                    continue;
+                }
+                pending_interactions.push(
+                    leveler_client_protocol::UiPendingInteraction::Clarification(
+                        crate::prompt_bridge::ui_clarification_request(
+                            request.id,
+                            request.question,
+                            request.options,
+                            &request.questions,
+                        ),
+                    ),
+                );
+            }
+        }
         pending_interactions.sort_by_key(|item| match item {
             leveler_client_protocol::UiPendingInteraction::Approval(request) => {
                 request.id.as_str().to_string()
@@ -7771,7 +8397,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // reopened client re-renders them from the persisted rows — same
         // projection as the live event, oldest boundary first.
         let mut recaps = Vec::new();
-        let stores = leveler_storage::EngineStores::from_database(&db);
 
         let runtime_active = self.active.is_running(session_id);
         let plan = projected_plan(&stores, session_id, live.plan).await?;

@@ -420,6 +420,221 @@ impl<'a> EventLog<'a> {
         Ok(open)
     }
 
+    /// Durable clarification requests with no terminal event.
+    ///
+    /// The first terminal event for an id is authoritative: a later duplicate
+    /// `clarification_answered` or a malformed duplicate `requested` row never
+    /// moves a request back to pending, and never changes what the user
+    /// decided. Returned oldest request first.
+    pub async fn pending_clarifications(&self) -> Result<Vec<PendingClarification>, EngineError> {
+        let rows = self
+            .store
+            .load_by_types(
+                &self.session_id,
+                &["clarification_requested", "clarification_answered"],
+            )
+            .await?;
+        let mut pending: Vec<PendingClarification> = Vec::new();
+        let mut settled: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &rows {
+            match decode_row(row)? {
+                EngineEvent::ClarificationRequested {
+                    id,
+                    question,
+                    options,
+                    call_id,
+                    tool,
+                    questions,
+                } => {
+                    // A terminal is authoritative and immutable. A duplicate
+                    // or out-of-order request row must not reopen it.
+                    if settled.contains(id.as_str()) {
+                        continue;
+                    }
+                    pending.push(PendingClarification {
+                        id,
+                        turn_id: row.turn_id.clone(),
+                        call_id,
+                        tool,
+                        question,
+                        options,
+                        questions,
+                        requested_sequence: row.sequence,
+                    });
+                }
+                EngineEvent::ClarificationAnswered { id, .. } => {
+                    settled.insert(id.as_str().to_string());
+                    pending.retain(|request| request.id != id);
+                }
+                _ => {}
+            }
+        }
+        // Rows are already in sequence order; the explicit sort keeps the
+        // contract even if a backend returns them differently.
+        pending.sort_by_key(|request| request.requested_sequence);
+        Ok(pending)
+    }
+
+    /// The first terminal row for one request, if it has one.
+    ///
+    /// The first terminal is authoritative and immutable. A caller that lost
+    /// its answer acknowledgement reads it to tell "my answer landed" from
+    /// "someone else already decided", and a cancelled request from a live
+    /// one, instead of treating every settled id as its own success.
+    pub async fn clarification_settlement(
+        &self,
+        id: &leveler_core::ClarificationId,
+    ) -> Result<Option<SettledClarification>, EngineError> {
+        let rows = self
+            .store
+            .load_by_types(&self.session_id, &["clarification_answered"])
+            .await?;
+        for row in &rows {
+            match decode_row(row)? {
+                EngineEvent::ClarificationAnswered {
+                    id: settled,
+                    answer,
+                    outcome,
+                } if &settled == id => {
+                    return Ok(Some(SettledClarification {
+                        id: settled,
+                        turn_id: row.turn_id.clone(),
+                        // The result text is what the model sees. An answered
+                        // row's result IS the answer; a skip has one canonical
+                        // note; no other outcome may present a user reply.
+                        result_text: match outcome.as_str() {
+                            "answered" => answer.clone(),
+                            "skipped" => leveler_execution::decision_result_text(
+                                &leveler_execution::ClarifyOutcome::Skipped,
+                            )
+                            .unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                        outcome,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Settle one durable clarification request from a client answer.
+    ///
+    /// The terminal `clarification_answered` and the `tool_call_finished` that
+    /// closes the original question call are appended as ONE batch: either the
+    /// user's decision and the tool result that carries it are both durable, or
+    /// neither is. A crash between them would otherwise leave an answered
+    /// request whose tool call still looks dangling — an unknown side effect
+    /// the model never caused.
+    ///
+    /// First terminal wins. A request that already has a terminal is reported
+    /// as settled and nothing is written; settling is therefore idempotent for
+    /// a retried client, and a second client cannot overwrite the first
+    /// decision. `call_id` empty (a request recorded before the identity was
+    /// persisted) settles the request but has no tool call to close.
+    pub async fn settle_clarification(
+        &self,
+        id: &leveler_core::ClarificationId,
+        answer: &str,
+    ) -> Result<ClarificationSettlement, EngineError> {
+        let decision = if answer.trim().is_empty() {
+            leveler_execution::ClarifyOutcome::Skipped
+        } else {
+            leveler_execution::ClarifyOutcome::Answered(answer.to_string())
+        };
+        // One authority for what the model sees; the live handler spells the
+        // same note, so a durable replay is indistinguishable from the live
+        // tool result.
+        let result_text = leveler_execution::decision_result_text(&decision)
+            .expect("answered and skipped both carry a result");
+        let recorded_answer = match &decision {
+            leveler_execution::ClarifyOutcome::Answered(text) => text.clone(),
+            _ => String::new(),
+        };
+        let terminal = ClarificationTerminal {
+            recorded_answer,
+            outcome: decision.label(),
+            result_text,
+            close_tool_call: true,
+        };
+        self.write_clarification_terminal(id, terminal).await
+    }
+
+    /// Invalidate a pending request because its logical task was cancelled.
+    ///
+    /// Cancellation is a real terminal, not silence: the request stops being
+    /// pending, no client can answer it into a continuation, and the log says
+    /// who ended it. No tool result is invented — the turn that asked is not
+    /// going to consume one.
+    pub async fn cancel_clarification(
+        &self,
+        id: &leveler_core::ClarificationId,
+    ) -> Result<ClarificationSettlement, EngineError> {
+        self.write_clarification_terminal(
+            id,
+            ClarificationTerminal {
+                recorded_answer: String::new(),
+                outcome: "cancelled",
+                result_text: String::new(),
+                close_tool_call: false,
+            },
+        )
+        .await
+    }
+
+    async fn write_clarification_terminal(
+        &self,
+        id: &leveler_core::ClarificationId,
+        terminal: ClarificationTerminal,
+    ) -> Result<ClarificationSettlement, EngineError> {
+        let pending = self
+            .pending_clarifications()
+            .await?
+            .into_iter()
+            .find(|request| &request.id == id);
+        let Some(request) = pending else {
+            return Ok(match self.clarification_settlement(id).await? {
+                Some(terminal) => ClarificationSettlement::AlreadySettled(terminal),
+                None => ClarificationSettlement::Unknown,
+            });
+        };
+
+        let settled = SettledClarification {
+            id: request.id.clone(),
+            turn_id: request.turn_id.clone(),
+            outcome: terminal.outcome.to_string(),
+            result_text: terminal.result_text.clone(),
+        };
+        let mut events = vec![EngineEvent::ClarificationAnswered {
+            id: request.id.clone(),
+            answer: terminal.recorded_answer,
+            outcome: settled.outcome.clone(),
+        }];
+        if terminal.close_tool_call && !request.call_id.is_empty() && !request.tool.is_empty() {
+            events.push(EngineEvent::ToolCallFinished {
+                call_id: request.call_id.clone(),
+                name: request.tool.clone(),
+                is_error: false,
+                // The user's decision IS the result; the recovery path replays
+                // it verbatim instead of treating the question as a side effect
+                // whose output was lost.
+                preview: settled.result_text.clone(),
+                agent_id: None,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            });
+        }
+        let turn = request
+            .turn_id
+            .as_ref()
+            .map(|turn| TurnId::new(turn.clone()));
+        self.append_batch(turn.as_ref(), events, &mut |_| {})
+            .await?;
+        Ok(ClarificationSettlement::Settled(settled))
+    }
+
     /// The session's unresolved crash window as the user acknowledged it: every
     /// user-acknowledged marker with no completed turn after it, paired with
     /// the arguments of the call it closed.
@@ -718,6 +933,73 @@ pub struct AcknowledgedCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
+}
+
+/// A user-decision request that is durable and still unresolved.
+///
+/// This is the authoritative pending state: it survives a client disconnect
+/// and a daemon restart, and only an explicit terminal event removes it. The
+/// turn that asked is the row's `turn_id`; `call_id` is the tool call an
+/// answer must close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingClarification {
+    pub id: leveler_core::ClarificationId,
+    pub turn_id: Option<String>,
+    pub call_id: String,
+    pub tool: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub questions: Vec<leveler_execution::ClarificationQuestion>,
+    /// Sequence of the request row, so callers can order several pending
+    /// requests deterministically.
+    pub requested_sequence: i64,
+}
+
+impl PendingClarification {
+    /// Whether a client can act on this request.
+    ///
+    /// An answer must close a known tool call of a known turn. Rows recorded
+    /// before that identity was persisted stay readable as history, but
+    /// surfacing them would show a card whose answer has nowhere to go.
+    pub fn is_actionable(&self) -> bool {
+        self.turn_id.is_some() && !self.call_id.is_empty() && !self.tool.is_empty()
+    }
+}
+
+/// A durable clarification that reached a terminal.
+///
+/// `result_text` is exactly what the original tool call returns: the user's
+/// answer verbatim, the explicit skip note, or nothing when no user reply may
+/// be presented. `outcome` is the machine label persisted on the answered row
+/// (`answered` / `skipped` / `cancelled` / …); a string because it is read
+/// back from durable rows as well as written from a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledClarification {
+    pub id: leveler_core::ClarificationId,
+    pub turn_id: Option<String>,
+    pub outcome: String,
+    pub result_text: String,
+}
+
+/// What settling a durable clarification did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClarificationSettlement {
+    Settled(SettledClarification),
+    /// This request already had a terminal; the caller's answer changed
+    /// nothing and no second continuation may be started from it. The
+    /// terminal is reported so the caller can tell a retry of its own answer
+    /// from a decision it never made.
+    AlreadySettled(SettledClarification),
+    /// No request with this id was ever persisted for the session.
+    Unknown,
+}
+
+/// The one durable terminal a pending request can receive.
+struct ClarificationTerminal {
+    recorded_answer: String,
+    outcome: &'static str,
+    result_text: String,
+    close_tool_call: bool,
 }
 
 #[cfg(test)]
@@ -1966,6 +2248,413 @@ mod tests {
         assert!(
             error.to_string().contains("task_finished"),
             "the error must name the row type: {error}"
+        );
+    }
+
+    fn requested_clarification(id: &str) -> EngineEvent {
+        EngineEvent::ClarificationRequested {
+            id: leveler_core::ClarificationId::new(id),
+            question: "Which ledger?".into(),
+            options: vec!["A".into(), "B".into()],
+            call_id: "call-1".into(),
+            tool: "request_user_input".into(),
+            questions: vec![leveler_execution::ClarificationQuestion {
+                header: "Ledger".into(),
+                question: "Which ledger should I post to?".into(),
+                kind: leveler_execution::ClarificationQuestionKind::Single,
+                options: vec!["A".into(), "B".into()],
+                allow_other: false,
+                min_choices: 1,
+                max_choices: Some(1),
+            }],
+        }
+    }
+
+    fn answered_clarification(id: &str, answer: &str, outcome: &str) -> EngineEvent {
+        EngineEvent::ClarificationAnswered {
+            id: leveler_core::ClarificationId::new(id),
+            answer: answer.into(),
+            outcome: outcome.into(),
+        }
+    }
+
+    /// The durable request is the pending state: it exists before any answer
+    /// and disappears only on an explicit terminal event.
+    #[tokio::test]
+    async fn a_clarification_is_pending_until_its_terminal_event() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+
+        let pending = log.pending_clarifications().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_str(), "c1");
+        assert_eq!(pending[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(pending[0].call_id, "call-1");
+        assert_eq!(pending[0].tool, "request_user_input");
+        assert_eq!(pending[0].questions.len(), 1);
+        assert_eq!(pending[0].questions[0].header, "Ledger");
+
+        log.append(
+            Some(&turn),
+            answered_clarification("c1", "B", "answered"),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(log.pending_clarifications().await.unwrap().is_empty());
+    }
+
+    /// A delayed duplicate answer never re-opens a settled request, and a
+    /// request row replayed after its terminal never resurrects it.
+    #[tokio::test]
+    async fn a_settled_clarification_never_returns_to_pending() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+        log.append(
+            Some(&turn),
+            answered_clarification("c1", "A", "answered"),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        log.append(
+            Some(&turn),
+            answered_clarification("c1", "B", "answered"),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+
+        assert!(
+            log.pending_clarifications().await.unwrap().is_empty(),
+            "a settled request must not regain pending state"
+        );
+    }
+
+    /// Pending requests are ordered by the request row, so a client restores
+    /// the same queue after a restart.
+    #[tokio::test]
+    async fn pending_clarifications_keep_their_ask_order() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        for id in ["first", "second"] {
+            log.append(Some(&turn), requested_clarification(id), &mut sink)
+                .await
+                .unwrap();
+        }
+        let pending = log.pending_clarifications().await.unwrap();
+        assert_eq!(
+            pending.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    /// Rows written before the request carried tool-call identity still
+    /// decode. They are pending, but a recovery path must see the empty
+    /// call id and not pretend it can close a call.
+    #[tokio::test]
+    async fn a_legacy_request_row_remains_readable() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: Some("turn-legacy".to_string()),
+            sequence: 1,
+            event_type: "clarification_requested".to_string(),
+            payload: r#"{"payload":{"id":"legacy","options":["yes","no"],"question":"Proceed?"},"type":"clarification_requested"}"#.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
+        let log = EventLog::new(&store, session.clone());
+
+        let pending = log.pending_clarifications().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_str(), "legacy");
+        assert_eq!(pending[0].call_id, "");
+        assert_eq!(pending[0].tool, "");
+        assert!(pending[0].questions.is_empty());
+        assert_eq!(pending[0].question, "Proceed?");
+    }
+
+    /// An answer persisted through the engine is the whole terminal: the
+    /// decision and the tool result that carries it become durable together,
+    /// on the asking turn, and the request leaves pending state.
+    #[tokio::test]
+    async fn a_durable_answer_settles_the_question_and_closes_its_tool_call() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+
+        let settlement = log
+            .settle_clarification(&leveler_core::ClarificationId::new("c1"), "B")
+            .await
+            .unwrap();
+        let ClarificationSettlement::Settled(settled) = settlement else {
+            panic!("expected a settlement, got {settlement:?}");
+        };
+        assert_eq!(settled.outcome, "answered");
+        assert_eq!(settled.result_text, "B");
+        assert_eq!(settled.turn_id.as_deref(), Some("turn-1"));
+        assert!(log.pending_clarifications().await.unwrap().is_empty());
+
+        let events: Vec<EngineEvent> = store
+            .load(&session)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| decode_row(row).unwrap())
+            .collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::ClarificationAnswered { id, answer, outcome }
+                    if id.as_str() == "c1" && answer == "B" && outcome == "answered"
+            )),
+            "the user's decision must be recorded: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::ToolCallFinished { call_id, name, preview, is_error, .. }
+                    if call_id == "call-1"
+                        && name == "request_user_input"
+                        && preview == "B"
+                        && !is_error
+            )),
+            "the original tool call must be closed with the answer: {events:?}"
+        );
+        let finished = store
+            .load(&session)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event_type == "tool_call_finished")
+            .unwrap();
+        assert_eq!(
+            finished.turn_id.as_deref(),
+            Some("turn-1"),
+            "the closed call belongs to the turn that asked"
+        );
+    }
+
+    /// An explicit skip is a decision too: the model receives the agreed
+    /// skip note as the tool result, never an empty string that reads like
+    /// the user spoke.
+    #[tokio::test]
+    async fn a_durable_skip_says_so_in_the_tool_result() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+
+        let settlement = log
+            .settle_clarification(&leveler_core::ClarificationId::new("c1"), "   ")
+            .await
+            .unwrap();
+        let ClarificationSettlement::Settled(settled) = settlement else {
+            panic!("expected a settlement, got {settlement:?}");
+        };
+        assert_eq!(settled.outcome, "skipped");
+        assert_eq!(settled.result_text, leveler_execution::SKIPPED_NOTE);
+
+        let events: Vec<EngineEvent> = store
+            .load(&session)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| decode_row(row).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ClarificationAnswered { answer, outcome, .. }
+                if answer.is_empty() && outcome == "skipped"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolCallFinished { preview, is_error: false, .. }
+                if preview == leveler_execution::SKIPPED_NOTE
+        )));
+    }
+
+    /// A retried or racing answer never rewrites the first decision and never
+    /// closes a second tool call.
+    #[tokio::test]
+    async fn a_second_durable_answer_changes_nothing() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+        let id = leveler_core::ClarificationId::new("c1");
+        assert!(matches!(
+            log.settle_clarification(&id, "A").await.unwrap(),
+            ClarificationSettlement::Settled(_)
+        ));
+        let retried = log.settle_clarification(&id, "B").await.unwrap();
+        let ClarificationSettlement::AlreadySettled(terminal) = retried else {
+            panic!("expected the first terminal, got {retried:?}");
+        };
+        assert_eq!(terminal.outcome, "answered");
+        assert_eq!(
+            terminal.result_text, "A",
+            "the retry is told what was actually decided"
+        );
+
+        let rows = store.load(&session).await.unwrap();
+        let answered: Vec<_> = rows
+            .iter()
+            .filter(|row| row.event_type == "clarification_answered")
+            .collect();
+        assert_eq!(answered.len(), 1, "one terminal per request");
+        let EngineEvent::ClarificationAnswered { answer, .. } = decode_row(answered[0]).unwrap()
+        else {
+            panic!("expected an answered row");
+        };
+        assert_eq!(answer, "A", "the first decision is authoritative");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.event_type == "tool_call_finished")
+                .count(),
+            1
+        );
+    }
+
+    /// Cancelling the task invalidates its question: a terminal is written so
+    /// no late answer can reopen a continuation, and no tool result is
+    /// invented for a turn that will never consume one.
+    #[tokio::test]
+    async fn a_cancelled_task_invalidates_its_pending_question() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let turn = TurnId::new("turn-1");
+        let log = EventLog::new(&store, session.clone());
+        let mut sink = |_: EngineEvent| {};
+        log.append(Some(&turn), requested_clarification("c1"), &mut sink)
+            .await
+            .unwrap();
+
+        let settlement = log
+            .cancel_clarification(&leveler_core::ClarificationId::new("c1"))
+            .await
+            .unwrap();
+        let ClarificationSettlement::Settled(settled) = settlement else {
+            panic!("expected a settlement, got {settlement:?}");
+        };
+        assert_eq!(settled.outcome, "cancelled");
+        assert!(log.pending_clarifications().await.unwrap().is_empty());
+
+        // A late answer is not a settlement and cannot start work; it reads
+        // back the cancellation, so the client can report it truthfully.
+        let late = log
+            .settle_clarification(&leveler_core::ClarificationId::new("c1"), "late")
+            .await
+            .unwrap();
+        let ClarificationSettlement::AlreadySettled(terminal) = late else {
+            panic!("expected the cancelled terminal, got {late:?}");
+        };
+        assert_eq!(terminal.outcome, "cancelled");
+        let events: Vec<EngineEvent> = store
+            .load(&session)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| decode_row(row).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ClarificationAnswered { outcome, answer, .. }
+                if outcome == "cancelled" && answer.is_empty()
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::ToolCallFinished { .. })),
+            "a cancelled question has no tool result: {events:?}"
+        );
+    }
+
+    /// A request that was never persisted is reported as unknown; nothing is
+    /// written on its behalf.
+    #[tokio::test]
+    async fn settling_an_unknown_request_is_reported_truthfully() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        let log = EventLog::new(&store, session.clone());
+        assert_eq!(
+            log.settle_clarification(&leveler_core::ClarificationId::new("nope"), "A")
+                .await
+                .unwrap(),
+            ClarificationSettlement::Unknown
+        );
+        assert!(store.load(&session).await.unwrap().is_empty());
+    }
+
+    /// A row recorded before request identity was persisted still settles,
+    /// but no tool call is invented to close.
+    #[tokio::test]
+    async fn a_legacy_request_settles_without_inventing_a_tool_call() {
+        let store = MemoryEventStore::new();
+        let session = SessionId::generate();
+        store.inject_legacy_row_for_tests(leveler_storage::EventRecord {
+            id: leveler_core::EventId::generate().into_inner(),
+            session_id: session.as_str().to_string(),
+            turn_id: Some("turn-legacy".to_string()),
+            sequence: 1,
+            event_type: "clarification_requested".to_string(),
+            payload: r#"{"payload":{"id":"legacy","options":["yes","no"],"question":"Proceed?"},"type":"clarification_requested"}"#.to_string(),
+            created_at: leveler_core::now().to_rfc3339(),
+            schema_version: 1,
+        });
+        let log = EventLog::new(&store, session.clone());
+        let settlement = log
+            .settle_clarification(&leveler_core::ClarificationId::new("legacy"), "yes")
+            .await
+            .unwrap();
+        assert!(matches!(
+            settlement,
+            ClarificationSettlement::Settled(SettledClarification { turn_id: Some(turn), .. })
+                if turn == "turn-legacy"
+        ));
+        assert_eq!(
+            store
+                .load(&session)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row.event_type == "tool_call_finished")
+                .count(),
+            0
         );
     }
 }

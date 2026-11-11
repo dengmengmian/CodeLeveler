@@ -87,6 +87,9 @@ fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
         TurnEndStatus::Completed
         | TurnEndStatus::CompletedWithWarnings
         | TurnEndStatus::Answered => TerminalTaskStatus::Completed,
+        // A yielded window is a boundary inside the task, not its end: the
+        // runtime opens the next window. The tab keeps reading as working.
+        TurnEndStatus::Yielded => TerminalTaskStatus::Running,
         // A run with no answer committed is not a completion, so the title
         // must not carry the ✓ either.
         TurnEndStatus::NoFinalAnswer

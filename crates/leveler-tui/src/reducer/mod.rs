@@ -170,6 +170,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
+                    | RuntimeEvent::TurnYielded { .. }
             );
             // Only semantic boundaries can auto-fold a Thought or regroup
             // exploration receipts. Deltas must not rebuild the projection.
@@ -183,6 +184,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
+                    | RuntimeEvent::TurnYielded { .. }
                     | RuntimeEvent::TurnTruncated { .. }
                     | RuntimeEvent::TurnIncomplete { .. }
                     | RuntimeEvent::TurnBlocked { .. }

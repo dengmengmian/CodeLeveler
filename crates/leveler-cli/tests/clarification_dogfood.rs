@@ -90,8 +90,9 @@ fn clarify_call() -> MockResponse {
     ])
 }
 
-/// The harness exposes `request_user_input` only after the model asks for the
-/// host-interaction capability; a fresh goal starts with no pack loaded.
+/// An interactive turn starts with the host-interaction pack active, but the
+/// model may still ask for it explicitly. Enabling an already-active pack must
+/// be a harmless no-op, so this round also locks that path.
 fn capability_enable_call(id: &str) -> MockResponse {
     let arguments = serde_json::json!({ "action": "enable", "id": id });
     sse(vec![
@@ -200,6 +201,8 @@ async fn a_multi_question_clarification_runs_end_to_end_from_the_agent_to_the_sc
     isolate_global_config();
     let server = MockServer::start(vec![
         // 0: the model asks for the capability the clarification tool needs.
+        // On an interactive turn it is already active; this round proves the
+        // redundant enable is accepted rather than needed.
         capability_enable_call("host_interaction"),
         // 1: the model asks the three questions.
         clarify_call(),
@@ -286,9 +289,9 @@ compatibility:
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut drove = false;
     let mut sent_answers = false;
-    // Requests made by the time the clarification reached the screen. The
-    // disclosure round the model needs before `request_user_input` is exposed
-    // is legitimate; a request AFTER the question is on screen is not.
+    // Requests made by the time the clarification reached the screen. A
+    // capability enable round is legitimate; a request AFTER the question is
+    // on screen is not.
     let mut requests_at_drive = 0usize;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -372,7 +375,10 @@ compatibility:
                 .iter()
                 .find_map(|e| match e {
                     Effect::SendInteraction {
-                        command: ClientCommand::AnswerClarification { request_id, answer },
+                        command:
+                            ClientCommand::AnswerClarification {
+                                request_id, answer, ..
+                            },
                         ..
                     } => Some((request_id.clone(), answer.clone())),
                     _ => None,
@@ -388,7 +394,11 @@ compatibility:
             client
                 .issue(
                     session.clone(),
-                    ClientCommand::AnswerClarification { request_id, answer },
+                    ClientCommand::AnswerClarification {
+                        request_id,
+                        answer,
+                        session_id: Some(session.clone()),
+                    },
                 )
                 .await
                 .unwrap();

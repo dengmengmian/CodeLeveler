@@ -241,6 +241,16 @@ impl TaskEngine {
         terminal: TaskTerminal,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
+        // A cancelled task can never consume an answer. A question still
+        // pending here was asked by the turn the user just ended — its waiter
+        // is gone, so nothing in this process will ever read a reply. Settle
+        // it before the terminal becomes observable, or a client could answer
+        // a question into a task that no longer exists and start work the
+        // user cancelled. The write is idempotent, so a caller that already
+        // settled the session's questions writes nothing.
+        if terminal.outcome == TaskOutcome::Cancelled {
+            self.close_pending_questions(session_id, token).await?;
+        }
         let event = EngineEvent::TaskFinished {
             outcome: terminal.outcome,
             reason: terminal.reason,
@@ -273,6 +283,32 @@ impl TaskEngine {
             })?;
         if commit.inserted {
             observer(event);
+        }
+        Ok(())
+    }
+
+    /// Close every answerable question of a task that is being cancelled.
+    ///
+    /// Cancellation is a decision on the whole task, so an open request can
+    /// never receive the reply its turn was waiting for. The durable terminal
+    /// is what makes a late answer a refusal instead of a second start.
+    async fn close_pending_questions(
+        &self,
+        session_id: &SessionId,
+        token: &leveler_core::OwnershipToken,
+    ) -> Result<(), EngineError> {
+        let log = EventLog::new_owned(
+            self.stores.events.as_ref(),
+            session_id.clone(),
+            token.clone(),
+        );
+        for request in log
+            .pending_clarifications()
+            .await?
+            .into_iter()
+            .filter(|request| request.is_actionable())
+        {
+            log.cancel_clarification(&request.id).await?;
         }
         Ok(())
     }

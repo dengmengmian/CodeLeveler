@@ -117,11 +117,17 @@ pub fn project_task(
                 TaskOutcome::Interrupted => UiTaskStatus::Interrupted,
                 TaskOutcome::Failed => UiTaskStatus::Failed,
                 TaskOutcome::Blocked => UiTaskStatus::Blocked,
+                // A yielded window is not a verdict on the objective: the goal
+                // is still owed and the runtime continues it. Until that next
+                // window starts, the durable reading is "not finished"; the
+                // terminal row carries `stop: "yielded"` for machine readers.
+                TaskOutcome::Yielded => UiTaskStatus::Incomplete,
                 TaskOutcome::BudgetLimited => UiTaskStatus::Incomplete,
                 TaskOutcome::Completed => match stop {
                     Some(StopReason::Completed) => UiTaskStatus::Completed,
                     Some(StopReason::Answered) => UiTaskStatus::Answered,
                     Some(StopReason::Blocked) => UiTaskStatus::Blocked,
+                    Some(StopReason::Yielded) => UiTaskStatus::Incomplete,
                     Some(
                         StopReason::Incomplete
                         | StopReason::BudgetExhausted
@@ -144,6 +150,7 @@ pub fn project_task(
                         StopReason::BudgetExhausted => "budget_exhausted",
                         StopReason::TurnLimitReached => "turn_limit_reached",
                         StopReason::Blocked => "blocked",
+                        StopReason::Yielded => "yielded",
                         StopReason::Stalled => "stalled",
                     }
                     .into()
@@ -154,15 +161,16 @@ pub fn project_task(
             return Ok((status, Some(terminal)));
         }
     }
+    // An answerable question is the task's current state, not an artifact of
+    // which boot happens to be alive: a durable clarification survives a
+    // restart and its answer re-enters the goal. The caller only reports
+    // interactions a client can actually answer — an approval whose turn died
+    // is not rebuilt — so this outranks the interrupted-turn recovery reading.
+    if waiting {
+        return Ok((UiTaskStatus::WaitingUser, None));
+    }
     if live {
-        return Ok((
-            if waiting {
-                UiTaskStatus::WaitingUser
-            } else {
-                UiTaskStatus::Running
-            },
-            None,
-        ));
+        return Ok((UiTaskStatus::Running, None));
     }
     let running: Vec<_> = facts
         .turns
@@ -434,12 +442,43 @@ mod tests {
             (BootLiveness::Unknown, UiTaskStatus::Unknown),
         ] {
             assert_eq!(
-                project_task(&facts, &Probe(boot), false, true).unwrap().0,
+                project_task(&facts, &Probe(boot), false, false).unwrap().0,
                 status
             );
         }
         assert_eq!(
             project_task(&facts, &Probe(BootLiveness::Unknown), true, true)
+                .unwrap()
+                .0,
+            UiTaskStatus::WaitingUser
+        );
+    }
+
+    /// A question a client can answer is not cancelled by the boot that asked
+    /// it dying. The runtime is not executing, but it is also not waiting for
+    /// recovery: it is waiting for the user, and the answer continues the goal.
+    #[test]
+    fn a_durable_question_outlives_the_boot_that_asked_it() {
+        let mut facts = facts();
+        facts.turns.push(leveler_storage::TurnRecord {
+            id: "asked".into(),
+            session_id: facts.session.id.clone(),
+            ordinal: 1,
+            kind: "chat".into(),
+            payload: None,
+            status: "interrupted".into(),
+            created_at: "t".into(),
+            finished_at: Some("t".into()),
+            owner_boot_id: Some("dead".into()),
+        });
+        assert_eq!(
+            project_task(&facts, &Probe(BootLiveness::Dead), false, false)
+                .unwrap()
+                .0,
+            UiTaskStatus::Interrupted
+        );
+        assert_eq!(
+            project_task(&facts, &Probe(BootLiveness::Dead), false, true)
                 .unwrap()
                 .0,
             UiTaskStatus::WaitingUser
