@@ -58,8 +58,9 @@ pub mod workflow;
 
 pub use axes::CollaborationMode;
 pub use checkpoint::{
-    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointWorkspace,
-    GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
+    CheckpointChild, CheckpointDecision, CheckpointEvidence, CheckpointExecution,
+    CheckpointFindings, CheckpointPlan, CheckpointQuestion, CheckpointReason, CheckpointWorkspace,
+    GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint, MAX_EXECUTION_EVIDENCE,
 };
 pub use findings::{ChildResultProjection, ChildStatus, FindingKind, FindingRecord};
 pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord};

@@ -129,6 +129,75 @@ pub struct CheckpointWorkspace {
     pub changed_paths: Vec<String>,
 }
 
+/// One structured question inside a multi-question clarification, projected
+/// from the request event so a later window sees what was actually asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CheckpointQuestion {
+    /// Short tab label; empty when the request had none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+/// One decision a person actually produced, projected from the durable
+/// clarification log.
+///
+/// Only `answered` and `skipped` outcomes ever appear here: a pending request,
+/// a timed-out one, an unattended one, and a cancelled one are the ABSENCE of
+/// a decision and must never be carried as if the user had spoken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointDecision {
+    /// The durable clarification id (`ClarificationId`), the traceability key.
+    pub request_id: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<CheckpointQuestion>,
+    /// `answered` or `skipped`.
+    pub outcome: String,
+    /// The user's verbatim reply. Empty for a skip — which is not a choice.
+    #[serde(default)]
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn_id: String,
+    /// When the terminal event was recorded (RFC 3339).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub settled_at: String,
+}
+
+/// One runtime-observed command or failure outcome, projected from a
+/// `tool_call_finished` event — never from model prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointEvidence {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The tool reported an error (failed verification, denied command, …).
+    pub failed: bool,
+    /// Bounded preview of the recorded result.
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn_id: String,
+}
+
+/// Execution facts the next window needs to avoid repeating finished or
+/// failed work. `total` stays authoritative when `recent` is truncated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CheckpointExecution {
+    /// How many actionable outcomes the lineage recorded.
+    pub total: u32,
+    /// The most recent outcomes, bounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<CheckpointEvidence>,
+}
+
+/// How many runtime-observed outcomes a checkpoint carries (the most recent).
+pub const MAX_EXECUTION_EVIDENCE: usize = 12;
+
 /// Plan progress projected from the authoritative [`PlanState`] — counts and
 /// bounded step texts, not a mirror of the whole plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +281,23 @@ pub struct GoalCheckpoint {
     pub artifact_refs: Vec<String>,
     #[serde(default)]
     pub workspace: CheckpointWorkspace,
+    /// Verbatim user instructions appended after the objective, oldest first.
+    /// The structured amendment record is the authority; this is its durable
+    /// projection, so a later instruction is visible together with the text it
+    /// supersedes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_amendments: Vec<String>,
+    /// Verbatim person-submitted messages from earlier windows, oldest first.
+    /// Only `TranscriptOrigin::UserInput` rows qualify — harness notices are
+    /// never presented as the user speaking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_messages: Vec<String>,
+    /// Decisions a person actually made (answered / skipped), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<CheckpointDecision>,
+    /// Runtime-observed execution outcomes; `None` = none observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<CheckpointExecution>,
 
     // ---- semantic layer (optional, grounded in the facts above) ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +346,38 @@ impl GoalCheckpoint {
             let items = std::mem::take(list);
             *list = bounded_list(items.iter().map(|s| bounded_text(s)));
         }
+        // User text is bounded per item but never count-truncated: an
+        // instruction or decision is exactly what the next window must not
+        // lose, and the count is bounded by real user turns, not by generation.
+        self.user_amendments = std::mem::take(&mut self.user_amendments)
+            .into_iter()
+            .map(|text| bounded_text(&text))
+            .collect();
+        self.user_messages = std::mem::take(&mut self.user_messages)
+            .into_iter()
+            .map(|text| bounded_text(&text))
+            .collect();
+        for decision in &mut self.decisions {
+            decision.question = bounded_text(&decision.question);
+            decision.answer = bounded_text(&decision.answer);
+            decision.options = bounded_list(decision.options.iter().map(|s| bounded_text(s)));
+            for question in &mut decision.questions {
+                question.question = bounded_text(&question.question);
+                question.options = bounded_list(question.options.iter().map(|s| bounded_text(s)));
+            }
+        }
+        if let Some(execution) = &mut self.execution {
+            if execution.recent.len() > MAX_EXECUTION_EVIDENCE {
+                execution
+                    .recent
+                    .drain(..execution.recent.len() - MAX_EXECUTION_EVIDENCE);
+            }
+            for evidence in &mut execution.recent {
+                evidence.tool = bounded_text(&evidence.tool);
+                evidence.detail = bounded_text(&evidence.detail);
+            }
+            execution.total = execution.total.max(execution.recent.len() as u32);
+        }
         self
     }
 
@@ -288,6 +406,63 @@ impl GoalCheckpoint {
     pub fn context_block(&self) -> String {
         let mut out = String::from("[GOAL CHECKPOINT]\n");
         push_section(&mut out, "Goal", &self.objective);
+        if !self.user_amendments.is_empty() {
+            push_list(
+                &mut out,
+                "User instructions after the objective (oldest first; later instructions are newer)",
+                &self.user_amendments,
+            );
+        }
+        if !self.user_messages.is_empty() {
+            push_list(
+                &mut out,
+                "User messages from earlier windows (verbatim, oldest first)",
+                &self.user_messages,
+            );
+        }
+        if !self.decisions.is_empty() {
+            out.push_str("\nUser decisions (durable clarification log; oldest first):\n");
+            for decision in &self.decisions {
+                let mut line = format!("- request {} ({})", decision.request_id, decision.outcome);
+                if !decision.turn_id.is_empty() {
+                    line.push_str(&format!(", turn {}", decision.turn_id));
+                }
+                if !decision.settled_at.is_empty() {
+                    line.push_str(&format!(", at {}", decision.settled_at));
+                }
+                line.push_str(&format!(": {}", decision.question));
+                out.push_str(&line);
+                out.push('\n');
+                if !decision.options.is_empty() {
+                    out.push_str(&format!("  options: {}\n", decision.options.join(" | ")));
+                }
+                for question in &decision.questions {
+                    let header = if question.header.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{}] ", question.header)
+                    };
+                    let options = if question.options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (options: {})", question.options.join(" | "))
+                    };
+                    out.push_str(&format!("  - {header}{}{options}\n", question.question));
+                }
+                match decision.outcome.as_str() {
+                    "skipped" => out.push_str(
+                        "  Answer: none — the user skipped this. A skip is NOT an approval and \
+                         carries no choice; proceed with your best judgment.\n",
+                    ),
+                    "answered" => {
+                        out.push_str(&format!("  Answer: {}\n", decision.answer));
+                    }
+                    other => out.push_str(&format!(
+                        "  Answer: none — outcome `{other}` is not a decision; no user reply is implied.\n"
+                    )),
+                }
+            }
+        }
         if let Some(summary) = &self.goal_summary {
             push_section(&mut out, "Summary", summary);
         }
@@ -324,6 +499,33 @@ impl GoalCheckpoint {
                 (false, _) => "INCOMPLETE — produced no result".to_string(),
             };
             push_section(&mut out, &format!("Child {}", child.nickname), &status);
+        }
+        if let Some(execution) = &self.execution
+            && !execution.recent.is_empty()
+        {
+            out.push_str(
+                "\nRuntime-observed execution (durable tool outcomes, most recent last):\n",
+            );
+            for evidence in &execution.recent {
+                let status = match (evidence.exit_code, evidence.failed) {
+                    (Some(code), true) => format!("exit {code}, FAILED"),
+                    (Some(code), false) => format!("exit {code}"),
+                    (None, true) => "FAILED".to_string(),
+                    (None, false) => "observed".to_string(),
+                };
+                let detail = evidence.detail.trim();
+                if detail.is_empty() {
+                    out.push_str(&format!("- {} ({status})\n", evidence.tool));
+                } else {
+                    out.push_str(&format!("- {} ({status}): {detail}\n", evidence.tool));
+                }
+            }
+            let omitted = (execution.total as usize).saturating_sub(execution.recent.len());
+            if omitted > 0 {
+                out.push_str(&format!(
+                    "- … {omitted} earlier outcomes not carried to bound the checkpoint\n"
+                ));
+            }
         }
         if !self.known_limitations.is_empty() {
             push_list(&mut out, "Known limitations", &self.known_limitations);
@@ -640,5 +842,146 @@ mod tests {
             serde_json::from_str(r#"{"objective":"x","some_future_field":{"a":1}}"#).unwrap();
         assert_eq!(decoded.objective, "x");
         assert_eq!(GOAL_CHECKPOINT_SCHEMA_VERSION, 1);
+    }
+
+    /// A row written before continuity existed decodes with no decisions, no
+    /// amendments, and no execution facts — absence, never invented content.
+    #[test]
+    fn pre_continuity_rows_decode_as_empty_continuity() {
+        let decoded: GoalCheckpoint =
+            serde_json::from_str(r#"{"objective":"x","transcript_ordinal":36}"#).unwrap();
+        assert!(decoded.decisions.is_empty());
+        assert!(decoded.user_amendments.is_empty());
+        assert!(decoded.user_messages.is_empty());
+        assert!(decoded.execution.is_none());
+    }
+
+    /// Decisions and execution facts travel through persistence and render
+    /// truthfully: the request id is traceable, a skip is not an approval, and
+    /// an exit code is a runtime fact rather than a model claim.
+    #[test]
+    fn decisions_and_execution_round_trip_into_the_block() {
+        let cp = GoalCheckpoint {
+            objective: "settle the refund policy".into(),
+            user_amendments: vec!["use plan A".into(), "use plan B instead; A is void".into()],
+            decisions: vec![
+                CheckpointDecision {
+                    request_id: "req-1".into(),
+                    question: "which policy?".into(),
+                    options: vec!["accrual".into(), "cash".into()],
+                    questions: vec![CheckpointQuestion {
+                        header: "policy".into(),
+                        question: "which policy?".into(),
+                        options: vec!["accrual".into(), "cash".into()],
+                    }],
+                    outcome: "answered".into(),
+                    answer: "accrual, with an audit log".into(),
+                    turn_id: "turn-1".into(),
+                    settled_at: "2026-11-11T10:00:00Z".into(),
+                },
+                CheckpointDecision {
+                    request_id: "req-2".into(),
+                    question: "currency?".into(),
+                    options: Vec::new(),
+                    questions: Vec::new(),
+                    outcome: "skipped".into(),
+                    answer: String::new(),
+                    turn_id: "turn-1".into(),
+                    settled_at: "2026-11-11T10:01:00Z".into(),
+                },
+            ],
+            execution: Some(CheckpointExecution {
+                total: 2,
+                recent: vec![
+                    CheckpointEvidence {
+                        tool: "run_command".into(),
+                        exit_code: Some(1),
+                        failed: true,
+                        detail: "cargo test failed: 1 failing".into(),
+                        turn_id: "turn-1".into(),
+                    },
+                    CheckpointEvidence {
+                        tool: "run_command".into(),
+                        exit_code: Some(0),
+                        failed: false,
+                        detail: "cargo test: 42 passed".into(),
+                        turn_id: "turn-1".into(),
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: GoalCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cp);
+
+        let block = back.context_block();
+        assert!(
+            block.contains("req-1"),
+            "request id is the traceability key"
+        );
+        assert!(block.contains("accrual, with an audit log"));
+        assert!(block.contains("req-2") && block.contains("NOT an approval"));
+        assert!(block.contains("run_command (exit 1, FAILED): cargo test failed"));
+        assert!(block.contains("run_command (exit 0): cargo test: 42 passed"));
+        assert!(
+            block.find("use plan A").unwrap() < block.find("use plan B instead").unwrap(),
+            "instructions keep their durable order"
+        );
+    }
+
+    /// Bounds clamp text, never silently drop decisions; evidence keeps the
+    /// most recent outcomes and states how many were not carried.
+    #[test]
+    fn bounds_clamp_decisions_and_cap_evidence_honestly() {
+        let long = "长".repeat(5_000);
+        let mut decisions: Vec<CheckpointDecision> = (0..40)
+            .map(|i| CheckpointDecision {
+                request_id: format!("req-{i}"),
+                question: long.clone(),
+                options: Vec::new(),
+                questions: Vec::new(),
+                outcome: "answered".into(),
+                answer: long.clone(),
+                turn_id: "turn-1".into(),
+                settled_at: String::new(),
+            })
+            .collect();
+        decisions[0].answer = "first decision".into();
+        let cp = GoalCheckpoint {
+            decisions,
+            execution: Some(CheckpointExecution {
+                total: 40,
+                recent: (0..40)
+                    .map(|i| CheckpointEvidence {
+                        tool: "run_command".into(),
+                        exit_code: Some(i),
+                        failed: false,
+                        detail: format!("outcome {i}"),
+                        turn_id: "turn-1".into(),
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }
+        .bounded();
+
+        assert_eq!(
+            cp.decisions.len(),
+            40,
+            "every decision is decision-critical and must not be count-truncated"
+        );
+        assert!(cp.decisions[0].answer.len() <= MAX_TEXT_LEN);
+        assert_eq!(cp.decisions[0].answer, "first decision");
+        let execution = cp.execution.clone().unwrap();
+        assert_eq!(execution.total, 40, "the total stays authoritative");
+        assert_eq!(execution.recent.len(), MAX_EXECUTION_EVIDENCE);
+        assert_eq!(
+            execution.recent.last().unwrap().exit_code,
+            Some(39),
+            "the most recent outcomes are the ones kept"
+        );
+        let block = cp.context_block();
+        assert!(block.contains("28 earlier outcomes not carried"));
     }
 }
