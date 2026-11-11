@@ -168,22 +168,32 @@ fn blocking_work() -> Vec<MockResponse> {
 async fn last_outcome(db: &leveler_storage::Database, session: &leveler_core::SessionId) -> String {
     use leveler_engine::EngineEvent;
     let stores = EngineStores::from_database(db);
-    // The terminal event is written as the task settles, which trails the turn
-    // row's status change — markedly so on Windows, where stopping the child
-    // process is not instantaneous. Wait for it rather than reading once.
+    // The task terminal is committed after the turn terminal, and markedly so
+    // on Windows, where stopping the child process is not instantaneous. Wait
+    // for the terminal that belongs to the newest turn: an earlier turn's
+    // task_finished is already durable, so its mere presence is not evidence
+    // that this turn has settled.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let row = loop {
+        let turn = stores
+            .events
+            .load_last_by_type(session, "turn_finished", None)
+            .await
+            .unwrap();
         if let Some(row) = stores
             .events
             .load_last_by_type(session, "task_finished", None)
             .await
             .unwrap()
+            && turn
+                .as_ref()
+                .is_none_or(|turn| row.sequence > turn.sequence)
         {
             break row;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no terminal task_finished event was recorded"
+            "no task_finished event for the newest turn was recorded"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
