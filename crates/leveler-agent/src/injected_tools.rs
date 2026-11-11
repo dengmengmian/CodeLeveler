@@ -173,6 +173,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                     "enum": ["complete", "blocked"],
                     "description": "complete = done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what)."
                 },
+                "blocked_kind": {
+                    "type": "string",
+                    "enum": ["external", "user_decision"],
+                    "description": "Only meaningful with status=blocked. `user_decision` when progress needs a decision or information only the user can provide; `external` (default) when the obstruction is outside the user's answer. If request_user_input is advertised, ask and wait instead of declaring user_decision without asking. A user_decision block without a request in this turn is repaired once; a second identical declaration is accepted as an explicit degradation."
+                },
                 "summary": {
                     "type": "string",
                     "description": "Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. Do not restate the user question or list files you read."
