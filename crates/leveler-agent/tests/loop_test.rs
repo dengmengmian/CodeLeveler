@@ -3810,6 +3810,466 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A structured `user_decision` block is not an external obstruction. While
+/// the question tool is advertised, resolving the goal that way without asking
+/// is refused once, with a stable interception kind, and the refusal is fed
+/// back to the model in the same turn.
+#[tokio::test]
+async fn a_user_decision_block_without_asking_is_repaired_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-userdecision-{}",
+        std::process::id() as u64 * 73 + 5
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "the accounting policy is undecided"
+            }),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the ledger service is unavailable"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "settle the accounting policy",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, .. } if id == "g1" && *is_error
+        )),
+        "the user_decision block must surface as an errored tool result"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_without_request"
+        )),
+        "the repair reason is a persisted fact: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_degraded"
+        )),
+        "a repaired block is not a degradation"
+    );
+    // The refusal round plus the corrected resolution. A blocked goal takes no
+    // delivery round.
+    assert_eq!(runtime.recorded_requests().len(), 2);
+    let repaired_request = &runtime.recorded_requests()[1];
+    assert!(
+        repaired_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| matches!(part, ContentPart::ToolResult { result }
+                if result.content.contains("request_user_input"))),
+        "the model must see the repair instruction, not just a dropped call"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The repair is issued once. A model that declares the same user-decision
+/// block again settles as an explicit degradation: the block stands, the
+/// receipt says no interaction happened, and the turn is not looped forever.
+#[tokio::test]
+async fn a_repeated_user_decision_block_settles_as_an_explicit_degradation() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-userdecision2-{}",
+        std::process::id() as u64 * 79 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "the accounting policy is undecided"
+            }),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "the accounting policy is still undecided"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "settle the accounting policy",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert_eq!(runtime.recorded_requests().len(), 2);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_without_request"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_degraded"
+        )),
+        "the second identical declaration is the explicit degradation: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, preview, .. }
+                if id == "g2" && !*is_error && preview.contains("never put to the user")
+        )),
+        "the accepted block's receipt states the missing interaction: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Asking is the exemption: once the question tool was actually called in this
+/// turn, a user-decision block is the legitimate resolution of that interaction
+/// and no repair or degradation applies.
+#[tokio::test]
+async fn a_user_decision_block_after_asking_is_not_repaired() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-userdecision3-{}",
+        std::process::id() as u64 * 83 + 11
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "q1",
+            "request_user_input",
+            serde_json::json!({
+                "question": "Which accounting policy should the refund use?",
+                "options": ["payment_reversal", "voluntary_refund", "sales_return"]
+            }),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "no human answered the accounting question"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "settle the accounting policy",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. }
+                if kind == "user_decision_without_request"
+        )),
+        "the question was asked: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_degraded"
+        )),
+        "an asked question is not a degradation: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An earlier answer covers only the question it answered. Work after that
+/// answer means a later `user_decision` block needs its own question; the old
+/// interaction must not exempt it.
+#[tokio::test]
+async fn a_user_decision_block_after_work_following_the_answer_is_repaired() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-userdecision4-{}",
+        std::process::id() as u64 * 89 + 13
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn unchanged() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "q1",
+            "request_user_input",
+            serde_json::json!({
+                "question": "Which accounting policy should the refund use?",
+                "options": ["payment_reversal", "voluntary_refund", "sales_return"]
+            }),
+        ),
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "a later accounting decision is undecided"
+            }),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the ledger service is unavailable"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "settle the accounting policy",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, .. } if id == "g1" && *is_error
+        )),
+        "a question answered before further work must not exempt this block"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_without_request"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_degraded"
+        )),
+        "the first block is repaired, not degraded: {events:?}"
+    );
+    assert_eq!(runtime.recorded_requests().len(), 4);
+    let repaired_request = &runtime.recorded_requests()[3];
+    assert!(
+        repaired_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| matches!(part, ContentPart::ToolResult { result }
+                if result.content.contains("work continued after that answer")
+                    && result.content.contains("request_user_input"))),
+        "the repair must say why the earlier answer does not cover this block"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A repair is feedback owed one round, not a repeated refusal. When the
+/// previous round was already a quiet goal continuation (one no-progress
+/// tick), the repaired block used to push the streak over its cap and stop
+/// the turn before the message could reach the model.
+#[tokio::test]
+async fn a_repaired_user_decision_block_gets_the_round_it_was_told_to_take() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-userdecision5-{}",
+        std::process::id() as u64 * 97 + 17
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text("Checking the remaining closeout work."),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "user_decision",
+                "summary": "the accounting policy is undecided"
+            }),
+        ),
+        assistant_tool_call(
+            "q1",
+            "request_user_input",
+            serde_json::json!({
+                "question": "Which accounting policy should the refund use?",
+                "options": ["payment_reversal", "voluntary_refund", "sales_return"]
+            }),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the ledger service is unavailable"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "settle the accounting policy",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Blocked,
+        "the repaired round must be delivered, not short-circuited as no progress"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_without_request"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "user_decision_degraded"
+        )),
+        "the repaired block is not a degradation: {events:?}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        4,
+        "the quiet continuation, the repaired block, the question, and the resolution"
+    );
+    let repaired_request = &runtime.recorded_requests()[2];
+    assert!(
+        repaired_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|part| matches!(part, ContentPart::ToolResult { result }
+                if result.content.contains("request_user_input"))),
+        "the model must actually receive the repair after a quiet round"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, .. } if id == "q1" && !*is_error
+        )),
+        "the question tool must run in the repaired round: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn cargo_command_is_completion_evidence() {
     let dir = std::env::temp_dir().join(format!(

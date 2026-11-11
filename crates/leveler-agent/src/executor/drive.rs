@@ -297,6 +297,19 @@ pub(crate) struct Drive<'a> {
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
     completion_warnings: Vec<String>,
+    /// Whether a clarification tool was actually invoked in this turn. It
+    /// decides whether a structured `blocked_kind: "user_decision"` arrived
+    /// without the interaction it claims to need. Never inferred from text.
+    asked_user_this_turn: bool,
+    /// Whether a regular tool call ran after the last question was answered.
+    /// An answer only speaks for the decision it answered: once the model has
+    /// done more work, a new `user_decision` block needs a new question. This
+    /// is a structured fact (a tool executed), not a reading of the summary.
+    work_since_user_ask: bool,
+    /// The one repair for a `user_decision` block that never asked. A second
+    /// identical declaration is accepted as an explicit degradation instead of
+    /// looping a model that will not call the question tool.
+    user_decision_repair_issued: bool,
     /// How far the runtime could verify the completion it accepted. Set by the
     /// completion gate and the requirement gate of every accepted attempt, and
     /// cleared at the start of each attempt so a refused one leaves no verdict.
@@ -1020,6 +1033,9 @@ impl Executor {
             registration_refused: false,
             registration_nudged: false,
             completion_warnings: Vec::new(),
+            asked_user_this_turn: false,
+            work_since_user_ask: false,
+            user_decision_repair_issued: false,
             completion_verification: None,
             settled_goal: None,
             settled_rounds: 0,
@@ -4147,6 +4163,12 @@ impl AgentHarness for Drive<'_> {
         // feedback is recoverable, and it has its own bound.
         let mut denied_calls_this_round: usize = 0;
         let mut verification_refusals_this_round: usize = 0;
+        // A `user_decision` block repaired by naming the question tool is
+        // actionable feedback, not a repeated refusal: the model has not yet
+        // had the round it was just told to take. Clearing the no-progress
+        // streak for it cannot spin — the repair is issued once and a second
+        // identical block settles as an explicit degradation.
+        let mut user_decision_repaired_this_round = false;
         // A requirements refusal whose verdict is DIFFERENT from the previous
         // one is the model acting on the feedback, not repeating itself. It is
         // bounded by the same recovery budget as a citation correction, so an
@@ -4946,6 +4968,144 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
+                // A structured "only the user can decide" block is not an
+                // external obstruction. While the question tool is actually
+                // advertised, redirect the model to ask instead of letting a
+                // user decision settle as Blocked without an interaction. Only
+                // this structured field is read; the summary is never
+                // classified. One repair, then explicit degradation: a model
+                // that will not ask must not loop the turn forever.
+                let mut user_decision_degraded = false;
+                if reason == StopReason::Blocked {
+                    // The field is typed: absent means `external`, a present
+                    // value must be one of the two kinds. A malformed value is
+                    // refused like any other invalid resolution, never guessed.
+                    let blocked_kind = match call.arguments.get("blocked_kind") {
+                        None => None,
+                        Some(value) => match value.as_str() {
+                            Some(kind) if matches!(kind, "external" | "user_decision") => {
+                                Some(kind)
+                            }
+                            _ => {
+                                let observed = compact_json(value);
+                                denied_calls_this_round += 1;
+                                let message = format!(
+                                    "update_goal requires `blocked_kind` to be \
+                                     \"external\" or \"user_decision\" when it is present \
+                                     (got {observed}). Call update_goal again with a valid \
+                                     value."
+                                );
+                                (self.observer)(AgentEvent::GoalIntercepted {
+                                    kind: "invalid_blocked_kind".to_string(),
+                                    detail: observed,
+                                });
+                                self.note_refused_completion(
+                                    &round_prose,
+                                    declares_answer,
+                                    revises_answer,
+                                    round_has_work,
+                                );
+                                (self.observer)(AgentEvent::ToolResult {
+                                    exit_code: None,
+                                    stop: None,
+                                    execution_status: None,
+                                    id: call.id.as_str().to_string(),
+                                    name: UPDATE_GOAL_TOOL.to_string(),
+                                    is_error: true,
+                                    preview: goal_refusal_preview("invalid_blocked_kind", &message),
+                                    applied_diff: None,
+                                });
+                                results[index] = Some(ContentPart::ToolResult {
+                                    result: ToolResultContent {
+                                        call_id: call.id.clone(),
+                                        content: message,
+                                        is_error: true,
+                                    },
+                                });
+                                continue;
+                            }
+                        },
+                    };
+                    if blocked_kind == Some("user_decision") {
+                        let can_ask = self.tools.iter().any(|tool| {
+                            tool.name == crate::injected_tools::REQUEST_USER_INPUT_TOOL
+                        });
+                        // An answer covers only the question it answered. Work
+                        // after that answer means this block is about a later
+                        // decision, so the old question is not its interaction.
+                        let asked_for_this_block =
+                            self.asked_user_this_turn && !self.work_since_user_ask;
+                        if can_ask && !asked_for_this_block && !self.user_decision_repair_issued {
+                            self.user_decision_repair_issued = true;
+                            user_decision_repaired_this_round = true;
+                            denied_calls_this_round += 1;
+                            let message = if self.asked_user_this_turn {
+                                "update_goal(blocked) with \
+                                 blocked_kind=\"user_decision\" was not accepted: the turn \
+                                 asked earlier, but work continued after that answer, so \
+                                 this block declares a user decision that was never put to \
+                                 the user. Ask the user through request_user_input and wait \
+                                 for the answer before resolving the goal. If the \
+                                 obstruction is not a user decision, call \
+                                 update_goal(blocked) with blocked_kind=\"external\"."
+                            } else {
+                                "update_goal(blocked) with \
+                                 blocked_kind=\"user_decision\" was not accepted: no \
+                                 request_user_input call was made in this turn, and the \
+                                 question tool is advertised. Ask the user through \
+                                 request_user_input and wait for the answer before resolving \
+                                 the goal. If the obstruction is not a user decision, call \
+                                 update_goal(blocked) with blocked_kind=\"external\"."
+                            };
+                            (self.observer)(AgentEvent::GoalIntercepted {
+                                kind: "user_decision_without_request".to_string(),
+                                detail: message.to_string(),
+                            });
+                            self.note_refused_completion(
+                                &round_prose,
+                                declares_answer,
+                                revises_answer,
+                                round_has_work,
+                            );
+                            (self.observer)(AgentEvent::ToolResult {
+                                exit_code: None,
+                                stop: None,
+                                execution_status: None,
+                                id: call.id.as_str().to_string(),
+                                name: UPDATE_GOAL_TOOL.to_string(),
+                                is_error: true,
+                                preview: goal_refusal_preview(
+                                    "user_decision_without_request",
+                                    message,
+                                ),
+                                applied_diff: None,
+                            });
+                            results[index] = Some(ContentPart::ToolResult {
+                                result: ToolResultContent {
+                                    call_id: call.id.clone(),
+                                    content: message.to_string(),
+                                    is_error: true,
+                                },
+                            });
+                            continue;
+                        }
+                        if !asked_for_this_block {
+                            // Either no channel exists, or the model declared
+                            // the same user-decision block again after the one
+                            // repair. Both settle as an explicit degradation:
+                            // the block stands, but no interaction happened.
+                            user_decision_degraded = true;
+                            (self.observer)(AgentEvent::GoalIntercepted {
+                                kind: "user_decision_degraded".to_string(),
+                                detail: if can_ask {
+                                    "declared again after repair without asking".to_string()
+                                } else {
+                                    "no interactive question channel was advertised".to_string()
+                                },
+                            });
+                        }
+                    }
+                }
                 // The user's pause is not the model's obstruction. A model
                 // that reaches the authorized boundary truthfully reports
                 // "waiting for the user", and `blocked` is the only terminal
@@ -5263,7 +5423,20 @@ impl AgentHarness for Drive<'_> {
                 // completion, and the model writing the delivery is the one
                 // party that must not present it as verified.
                 let receipt = if reason == StopReason::Blocked {
-                    crate::injected_tools::completion_receipt("Goal blocked", &[])
+                    if user_decision_degraded {
+                        // No channel existed, so this block is the explicit
+                        // degradation the model was told about. Say so in the
+                        // receipt; a user decision was never taken.
+                        crate::injected_tools::completion_receipt(
+                            "Goal blocked",
+                            &["The user decision behind this block was never put to \
+                              the user as a question, so it was not resolved with the \
+                              user."
+                                .to_string()],
+                        )
+                    } else {
+                        crate::injected_tools::completion_receipt("Goal blocked", &[])
+                    }
                 } else {
                     crate::injected_tools::completion_receipt(
                         "Goal completed",
@@ -5309,6 +5482,8 @@ impl AgentHarness for Drive<'_> {
             // disappeared the moment the user pressed Enter — absent from the
             // screen, the session log, and every later replay.
             if is_user_input_tool(&call.name) {
+                self.asked_user_this_turn = true;
+                self.work_since_user_ask = false;
                 (self.observer)(AgentEvent::ToolCall {
                     id: call.id.as_str().to_string(),
                     name: call.name.clone(),
@@ -6037,6 +6212,10 @@ impl AgentHarness for Drive<'_> {
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
+                    // A tool that is admitted and will run is work after the
+                    // last answer; the question it answered no longer covers
+                    // a later user-decision block.
+                    self.work_since_user_ask = true;
                     parallel_jobs.push(ParallelJob { index, admitted });
                     continue;
                 }
@@ -6044,6 +6223,7 @@ impl AgentHarness for Drive<'_> {
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
+                    self.work_since_user_ask = true;
                     let files_before = self.modified_files.clone();
                     // Heartbeat: while a long command runs, emit a
                     // CommandProgress every few seconds so the UI shows
@@ -7019,7 +7199,15 @@ impl AgentHarness for Drive<'_> {
             // one). Both are bounded here; neither is "no progress" while the
             // verdict keeps moving. An unchanged requirements verdict is a
             // repeat and stays on the denial streak.
-            if citation_refused || gate_verdict_advanced_this_round {
+            // A repaired `user_decision` block is feedback that names the
+            // interaction the model skipped; the model has not yet had the
+            // round it was told to take. Clearing the streak here cannot
+            // spin: the repair is issued once and a second identical block
+            // settles as an explicit degradation.
+            if user_decision_repaired_this_round {
+                self.progress.note_progress(model_steps);
+                self.emit_progress();
+            } else if citation_refused || gate_verdict_advanced_this_round {
                 if gate_verdict_advanced_this_round {
                     // The gate's verdict moved because the model changed its
                     // answer: that clears the no-progress streak, exactly like
