@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.0.26] - 2026-11-11
+
 - Continuation, pause, amendment, cancellation and questions are decided by the model in the running turn, not by a wording pattern. The model declares the meaning with `declare_intent`, quoting the newest user message verbatim; the runtime checks that the quote really came from that message, which goal it targets (and refuses to guess when several are running and none is named), the legal ordered operations, and the plan step a boundary names by stable id. Any language, phrasing or compound instruction ("继续执行，但第三阶段完成后暂停") uses the same path, and no extra classification call is made.
 - A pause is released only by a validated `continue_task`. Clients submit the user's text unchanged and project the runtime's goal state; "继续" no longer turns into a special client-side resume intent. A supplement or a status question neither releases a pause nor starts work, and a declaration cannot create authority the user did not state.
 - Accepted declarations are stored in order with the turn that carried the quoted user message (migrations 0053, 0054), so a restart can still answer who authorized what, with which words. A turn that continues the same goal reuses its plan instead of re-planning the completed stages from nothing.
