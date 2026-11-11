@@ -16923,34 +16923,33 @@
       }
     ],
     "soak": {
-      "status": "FAILED — RETRYING",
-      "headline": "24-hour Soak: FAILED — Re-run in progress",
-      "run_id": "soak-20261109T032108Z-db4bc9",
+      "status": "FAILED",
+      "headline": "24-hour Soak: FAIL — Reliability Certification Failed",
+      "run_id": "soak-20261110T033104Z-418a12",
       "code_sha": "3a3fa8fb7702808da8bb33928f8c27c082d35655",
-      "started_at": "2026-11-09T03:21:08Z",
-      "elapsed": "21h 30m (stopped before the 24h deadline)",
-      "target": "24h; re-run soak-20261110T033104Z-418a12 started 2026-11-10T03:31:04Z",
-      "verdict": "FAILED — did not complete; finalize hit a disk I/O error",
-      "short_note": "run soak-20261109T032108Z-db4bc9 failed at finalize; re-run soak-20261110T033104Z-418a12 in progress",
-      "note": "10,869 runs, 0 failed; RSS 149 MB -> 327 MB last / 443 MB max (under the 512 MiB growth threshold). The runner attempted finalize at 2026-11-10T00:52:40Z, 2h30m before the deadline, and failed reading the overlap lane's schedules.db with a disk I/O error (the host reported about 1.1 GB free at that moment and the machine appears to have slept). This is an environment/finalization failure, not a product run failure. A fresh 24h run (soak-9) is in progress on the same released SHA; the certification stays unproven until a run completes."
+      "started_at": "2026-11-10T03:31:04Z",
+      "elapsed": "24h 00m (86,480.6 s)",
+      "target": "24h (completed)",
+      "verdict": "FAIL — S_shell_outcomes, S4_2, S4_allow_execution_2",
+      "short_note": "soak-20261110T033104Z-418a12 completed 24h with verdict FAIL",
+      "note": "12,118 runs: 11,367 succeeded, 3 failed, 746 skipped (policy), 2 unknown (injected fault). The 3 failures were scheduled shell runs on 2026-11-11T00:45:20Z (os-tick, os-pause, misfire-runonce) that could not get a session snapshot within 30 s while the host showed a CPU spike (sample 67.9%); the runtime logs from that window are gone, so the cause (runtime stall vs host starvation) is not proven. S4_2 / S4_allow_execution_2 failed on a 180 s observation window, but the overlap store shows queue-one occurrences running back-to-back throughout the run, so that check is a probe-timing gap, not a policy failure. RSS max 494 MB, under the 512 MiB growth threshold. The 24-hour reliability certification is FAILED and is not rewritten as PASS."
     },
     "conditional_release": {
-      "status": "ACTIVE — CONDITIONAL RELEASE",
-      "reason": "Every mandatory non-soak gate passed for 3a3fa8fb: L0 build/static, L1 workspace + 29 release contracts, L2 TUI acceptance, L3 real-provider eval and RC1–RC4, CI on Ubuntu/macOS/Windows, and the release workflow's 4 artifacts (checksums verified, install check). The only unfinished certification item is the 24-hour soak, so the release proceeds under the conditional-soak waiver; the waiver covers soak duration only and no failed gate.",
-      "risk": "A long-run, low-frequency defect could still surface. The first soak attempt failed at finalization (environment/disk I/O) after 21h30m with 0 run failures, so it proves 21.5 hours of healthy execution but not the full 24 hours; a fresh 24h run is in progress on the released SHA. Functional paths are separately covered by the three-platform CI and the RC suites; the downgrade and Linux glibc limits are recorded separately.",
-      "rollback": "Forward-only for state: publish a v1.0.25.x hotfix from a fixed SHA. A v1.0.24 binary cannot open a schema-52 store (it fails closed with 'migration 52 was previously applied but is missing'); restoring a pre-upgrade backup is the only downgrade path. The release itself can be deleted or marked pre-release if a soak failure proves a product defect."
+      "status": "CONDITIONAL RELEASE — SOAK FAILED",
+      "reason": "The release was published under a waiver limited to the soak's remaining duration. That soak has now completed 24 hours and returned FAIL (3/12,118 runs hit a 30 s runtime-snapshot timeout under a load spike; a further probe-timing check failed). The waiver therefore no longer applies to a pending run: the final reliability certification is FAILED, while every functional gate (L0-L4, RC, three-platform CI) passed and the artifacts are verified.",
+      "risk": "A transient 30 s runtime unresponsiveness under heavy local load affected 3 scheduled shell runs (0.025%), with no duplicate side effects, stranded occurrences or unsettled runs. The runtime recovered and the run completed. It is a reliability signal for long-running, loaded hosts; the exact cause is unproven because the runtime logs from the 00:45Z window were not preserved.",
+      "rollback": "No data-integrity failure was observed, so an emergency rollback is not indicated by this evidence. The honest options are: (a) assess and fix the runtime-unresponsive path and ship a forward hotfix (v1.0.26) with its own gates, (b) keep v1.0.25 published with this failed certification clearly labeled, or (c) withdraw the release. A v1.0.24 downgrade cannot open a schema-52 store; restore a pre-upgrade backup instead. The choice needs the user's decision."
     },
     "known_issues": [
       "Downgrading a schema-52 store to v1.0.24 is refused by design; rollback is a forward patch or a pre-upgrade backup.",
       "Feature coverage ends at CONDITIONAL PASS: 2 features unverified (session replay corpus without a corpus; TUI slash fork), 51 declared gaps, performance collected but not compared against a hard threshold (perf hard-fail disabled in this phase).",
       "The Linux x86_64 archive is built on Ubuntu 24.04 and requires glibc >= 2.39 (v1.0.24 has the same floor). It runs on Ubuntu 24.04+, Fedora 40+ and Debian 13+, but not on Ubuntu 22.04 or Debian 12. The CI matrix still tests the source on ubuntu-22.04; the archive's glibc floor is a build-image choice in release.yml, not a code regression in this release.",
-      "The first 24-hour soak attempt (soak-20261109T032108Z-db4bc9) stopped at 21h30m during finalization with a disk I/O error on the overlap lane's schedules.db; it had 10,869 runs and 0 failures. It is recorded as FAILED (not PASS); a fresh 24h run is in progress."
+      "The first 24-hour soak attempt (soak-20261109T032108Z-db4bc9) stopped at 21h30m during finalization with a disk I/O error on the overlap lane's schedules.db; it had 10,869 runs and 0 failures. It is recorded as FAILED (not PASS); a fresh 24h run is in progress.",
+      "24-hour soak completed with verdict FAIL: 3/12,118 scheduled runs failed with a 30 s runtime-snapshot timeout at 2026-11-11T00:45:20Z under a CPU spike (cause unproven); the S4 overlap probe also failed on a 180 s observation window although queue-one occurrences ran back-to-back. Certification is FAILED."
     ],
     "not_verified": [
-      "24-hour soak: IN PROGRESS — final verdict pending 2026-11-10T03:21:08Z.",
-      "Physical flicker of the wait spinner is not verified by the PTY contract (reported as NOT VERIFIED there).",
-      "Windows x86_64 artifact was checksum-verified and built by the release workflow but was not executed here (no Windows host); macOS x86_64 was executed under Rosetta 2 and reports 1.0.25 (3a3fa8fb7702).",
-      "24-hour soak: first attempt FAILED at finalization (21h30m); re-run soak-20261110T033104Z-418a12 in progress until 2026-11-11T03:31:04Z."
+      "The cause of the 3 runtime-snapshot timeouts is not proven: the runtime logs from the 00:45Z window are gone, and no reproduction was run.",
+      "Windows x86_64 artifact was checksum-verified but not executed (no Windows host)."
     ]
   },
   "dashboard": {
