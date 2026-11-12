@@ -2954,6 +2954,25 @@
           }
         },
         {
+          "description": "The model ended this work window through `update_goal(yield)` while the goal still owes work. Unlike [`Self::TurnPaused`] nothing waits for the user: the runtime continues the same goal in a fresh window. Unlike [`Self::TurnIncomplete`] nothing went wrong — the window closed at a boundary the model chose. `reason` is the model's window note, display only; the durable `TaskFinished.stop` is the authority.",
+          "type": "object",
+          "required": [
+            "reason",
+            "type"
+          ],
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_yielded"
+              ]
+            }
+          }
+        },
+        {
           "description": "The turn stopped at an output limit even after bounded continuation.",
           "type": "object",
           "required": [
