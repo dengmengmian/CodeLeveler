@@ -17,6 +17,49 @@ use crate::response::ModelResponse;
 /// A pinned, boxed stream of normalized model events.
 pub type ModelEventStream = Pin<Box<dyn Stream<Item = Result<ModelEvent, ModelError>> + Send>>;
 
+/// Automatic retries one logical model request may spend after its first
+/// attempt fails transiently. The retry lifecycle is sized for this count.
+pub const DEFAULT_MAX_RETRIES: u32 = 12;
+
+/// Wall-clock ceiling for one logical request's recovery, measured from its
+/// first attempt. It bounds the whole retry lifecycle, so a provider that is
+/// slow *and* failing cannot multiply attempts into an unbounded wait.
+pub const DEFAULT_RECOVERY_SECONDS: u64 = 600;
+
+/// The bounded recovery budget a route advertises for one logical model
+/// request.
+///
+/// This is the overall bound, not a per-attempt one: a single physical attempt
+/// is bounded by the provider's own request/stream timeouts. A retry is only
+/// spent on failures the delivery truth classifies as recoverable; a permanent
+/// error (`Auth`, `InvalidRequest`, `Decode`, …) ends the request immediately
+/// whatever this budget says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryBudget {
+    /// Automatic retries after the first attempt of one logical request fails
+    /// transiently. `0` disables automatic recovery.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Wall-clock ceiling for the whole recovery, measured from the logical
+    /// request's first attempt. `None` = the retry count alone bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_seconds: Option<u64>,
+}
+
+fn default_max_retries() -> u32 {
+    DEFAULT_MAX_RETRIES
+}
+
+impl Default for RetryBudget {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_MAX_RETRIES,
+            recovery_seconds: Some(DEFAULT_RECOVERY_SECONDS),
+        }
+    }
+}
+
 /// Everything the agent needs from a model, expressed model-agnostically.
 #[async_trait]
 pub trait ModelRuntime: Send + Sync {
@@ -36,6 +79,15 @@ pub trait ModelRuntime: Send + Sync {
 
     /// The capability profile for a model.
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError>;
+
+    /// The recovery budget this route advertises for one logical request.
+    ///
+    /// The route owns its outage tolerance: the default is the product budget,
+    /// and a configured provider may raise or lower it. Scripted and in-process
+    /// runtimes keep the default rather than inventing a route fact.
+    fn retry_budget(&self, _model: &ModelRef) -> RetryBudget {
+        RetryBudget::default()
+    }
 
     /// The identity of the route `model` addresses, when this runtime knows it.
     ///

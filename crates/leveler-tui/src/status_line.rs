@@ -1898,7 +1898,7 @@ mod tests {
         assert_eq!(crate::activity::running_background_count(&state), 1);
     }
 
-    /// A live reconnect is the one fact that must survive the busy status line:
+    /// A live retry is the one fact that must survive the busy status line:
     /// the generic "waiting for model" would hide it. The trailing number is
     /// the runtime's OWN announced delay, counted down from it.
     #[test]
@@ -1912,12 +1912,12 @@ mod tests {
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(4),
         });
         let text = status_text(&state);
-        assert!(text.contains("正在重连 · 2/10 · "), "{text}");
+        assert!(text.contains("模型服务暂时不可用 · 重试 2/10 · "), "{text}");
         assert!(text.contains('s'), "the countdown is shown: {text}");
         assert!(!text.contains("等待模型"), "{text}");
     }
 
-    /// The brief "Reconnected" confirmation owns the line after a retry
+    /// The brief "Recovered" confirmation owns the line after a retry
     /// attempt starts again, then yields to the normal streaming status.
     #[test]
     fn a_brief_reconnected_confirmation_yields_to_streaming() {
@@ -1925,12 +1925,12 @@ mod tests {
         state.status = RuntimeStatus::Busy;
         state.reconnected_until =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
-        assert!(status_text(&state).contains("已重连"));
+        assert!(status_text(&state).contains("已恢复"));
 
         // Once the confirmation window passes, the line is the normal pending
-        // model status — a stale "Reconnected" must not linger.
+        // model status — a stale "Recovered" must not linger.
         state.reconnected_until =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-        assert!(!status_text(&state).contains("已重连"));
+        assert!(!status_text(&state).contains("已恢复"));
     }
 }

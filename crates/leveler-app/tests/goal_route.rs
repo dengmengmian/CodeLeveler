@@ -867,10 +867,11 @@ async fn a_cancelled_goal_leaves_the_next_message_ordinary() {
 /// afterwards re-enters the SAME goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_recoverably_failed_goal_answers_a_question_then_resumes_the_same_goal() {
-    // One failed logical request = the first attempt plus the retry budget. The
-    // provider advertises `Retry-After: 0`, so the retries are immediate and
-    // this stays a fast, deterministic test.
-    let mut responses = vec![unavailable_with_immediate_retry(); 11];
+    // One failed logical request = the first attempt plus the route's default
+    // retry budget. The provider advertises `Retry-After: 0`, so the retries
+    // are immediate and this stays a fast, deterministic test.
+    let mut responses =
+        vec![unavailable_with_immediate_retry(); 1 + leveler_model::DEFAULT_MAX_RETRIES as usize];
     responses.push(plain_answer("上一步失败于 provider 5xx；权限无关。"));
     responses.push(completed_turn("c-resume", "the failed work is finished"));
     let f = fixture(responses, leveler_agent::CollaborationMode::Goal).await;

@@ -205,6 +205,8 @@ pub struct LoadedConfig {
     /// `[web.search]`, resolved. `None` means web search is unavailable; there
     /// is no legacy environment-only fallback.
     pub web_search: Option<WebSearchSettings>,
+    /// `[retry]`: the bounded recovery budget for one logical model request.
+    pub retry: leveler_model::RetryBudget,
 }
 
 impl LoadedConfig {
@@ -368,6 +370,7 @@ pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
         context_soft_percent: global.context_soft_percent,
         model_context_soft_percent: global.model_soft_percent,
         web_search: global.web_search,
+        retry: global.retry,
     })
 }
 
@@ -388,6 +391,7 @@ impl Default for LoadedConfig {
             context_soft_percent: None,
             model_context_soft_percent: Vec::new(),
             web_search: None,
+            retry: leveler_model::RetryBudget::default(),
         }
     }
 }

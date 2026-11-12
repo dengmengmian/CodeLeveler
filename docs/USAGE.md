@@ -10,6 +10,16 @@ Configuration is read again while the app runs: editing `~/.leveler/config.toml`
 
 Use `/thinking high` to change reasoning intensity for the session, or `/thinking reset` to return to the configured default. Choices are `auto`, `off`, `minimal`, `low`, `medium`, `high`, and `max`; run `leveler doctor` to check model support. The default is `high`; `max` uses the model's strongest supported level, and `auto` leaves the choice to the provider.
 
+A transient provider failure (connection refused or reset, a retryable timeout, 429, a retryable 5xx) is retried automatically with exponential backoff and jitter, without resending the original task. The default budget is 12 retries within 10 minutes; `Ctrl+C` cancels the wait. Change it in `~/.leveler/config.toml`:
+
+```toml
+[retry]
+max_retries = 12        # retries after the first attempt; 0 disables automatic recovery
+recovery_seconds = 600  # wall-clock ceiling for the whole recovery, from the first attempt
+```
+
+A permanent error (authentication, an invalid request, a rejected conversation) is never retried. When the budget runs out the failure is reported as resumable: the task and its completed tool work are kept, and sending a new message continues from there.
+
 ## Input and results
 
 - `Ctrl+R` searches input history. Enter restores an entry to the draft without sending it.

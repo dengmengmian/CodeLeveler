@@ -227,7 +227,9 @@ pub struct UiText {
     pub summary_plan: &'static str,
     /// Long-command heartbeat: the command's own name and elapsed.
     pub running_command: &'static str,
-    /// Live reconnect status: "正在重连 · {attempt}/{max} · {secs}s".
+    /// Live retry status: "模型服务暂时不可用 · 重试 {attempt}/{max} · {secs}s".
+    /// Not "重连": a 429 or a 5xx that answered and failed is not a lost
+    /// connection, and the countdown is the runtime's own announced delay.
     pub reconnecting: &'static str,
     /// Brief confirmation once a retry attempt starts again: "已重连".
     pub reconnected: &'static str,
@@ -1714,8 +1716,8 @@ static ZH: UiText = UiText {
     summary_files_many: "{} 个文件",
     summary_plan: "计划 {}/{}",
     running_command: "运行 {}",
-    reconnecting: "正在重连 · {attempt}/{max} · {secs}s",
-    reconnected: "已重连",
+    reconnecting: "模型服务暂时不可用 · 重试 {attempt}/{max} · {secs}s",
+    reconnected: "已恢复",
     footer_cache: "缓存 {}%",
     turn_rounds: "{} 轮",
     turn_tokens: "{} tokens",
@@ -2795,8 +2797,8 @@ static EN: UiText = UiText {
     summary_files_many: "{} files",
     summary_plan: "plan {}/{}",
     running_command: "Running {}",
-    reconnecting: "Reconnecting · {attempt}/{max} · {secs}s",
-    reconnected: "Reconnected",
+    reconnecting: "Model service unavailable · retry {attempt}/{max} · {secs}s",
+    reconnected: "Recovered",
     footer_cache: "cache {}%",
     turn_rounds: "{} rounds",
     turn_tokens: "{} tokens",

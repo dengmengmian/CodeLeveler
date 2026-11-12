@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 use leveler_model::{
     ContentPart, DeliveryState, FinishReason, Message, ModelError, ModelErrorKind, ModelEvent,
     ModelRequest, ModelRuntime, ReasoningSegment, Role, StreamProgress, TokenUsage, ToolCall,
-    TransportFault,
 };
 
 use crate::error::AgentCoreError;
@@ -77,32 +76,20 @@ impl ModelRound {
 /// This is the sole owner of a model request's retry lifecycle. Provider
 /// transport performs one physical attempt, so every chargeable invocation
 /// passes through the same admission and settlement hooks.
-pub const MAX_RETRIES: u32 = 10;
-
-/// A connection the OS refused is not an upstream transient: nothing is
-/// listening, and no 30-second wait changes that. It gets a short, fast budget
-/// so a wrong `base_url` fails in about two seconds with a clear error instead
-/// of after ~3 minutes of backoff. Local services that are still starting up
-/// still recover, because the first retries are quick. Every other failure
-/// keeps the full schedule.
-const IMMEDIATE_ENDPOINT_MAX_RETRIES: u32 = 3;
-const IMMEDIATE_ENDPOINT_SCHEDULE_MS: [u64; IMMEDIATE_ENDPOINT_MAX_RETRIES as usize] =
-    [250, 500, 1_000];
-
-/// Whether this failure is a machine-local "nothing accepted the connection"
-/// answer that will not resolve on a long retry cadence. Read from the
-/// structured fault, never from the message.
-fn is_immediate_endpoint_failure(error: &ModelError) -> bool {
-    error.delivery_state == DeliveryState::NotSent
-        && error.transport_fault() == Some(TransportFault::ConnectionRefused)
-}
+///
+/// The schedule below covers outages of roughly seven minutes by default: the
+/// original Session's provider refused connections for about 5.5 minutes, and
+/// a long-task product must be able to wait that out inside one logical
+/// request instead of making the user re-send the task. The budget stays
+/// bounded and exponential with jitter; it is not a fixed per-failure wait.
+pub const MAX_RETRIES: u32 = leveler_model::DEFAULT_MAX_RETRIES;
 
 /// Backoff before retry `retry` (1-based). Quick first recoveries, then a
-/// steady 30s rate so a real outage is not hammered; a provider-advertised
+/// steady 60s rate so a real outage is not hammered; a provider-advertised
 /// `Retry-After` (capped) overrides the schedule entirely.
 fn scheduled_backoff(retry: u32) -> Duration {
     const SCHEDULE_MS: [u64; MAX_RETRIES as usize] = [
-        1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 30_000, 30_000, 30_000, 30_000,
+        1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000, 60_000, 60_000, 60_000, 60_000, 60_000,
     ];
     let idx = (retry as usize)
         .saturating_sub(1)
@@ -132,31 +119,27 @@ fn jittered(base: Duration) -> Duration {
     base + base.mul_f64((nanos % 200) as f64 / 1000.0)
 }
 
-/// How many retries a round may spend, and how long it waits between them.
-/// Production uses the real time schedule; a test injects a zero-delay policy
-/// so a ten-retry exhaustion is exercised without waiting out the backoff.
+/// How many retries a round may spend, how long it waits between them, and the
+/// wall-clock ceiling for the whole recovery. Production uses the real time
+/// schedule; a test injects a zero-delay policy so a full-retry exhaustion is
+/// exercised without waiting out the backoff.
 #[derive(Clone, Copy)]
 pub(crate) struct RetryPolicy {
     pub max_retries: u32,
     /// Multiplies every computed delay. `0.0` makes retries immediate.
     pub delay_scale: f64,
+    /// Wall-clock ceiling for the whole recovery, from the round's first
+    /// attempt. `None` = the retry count alone bounds it.
+    pub recovery_window: Option<Duration>,
 }
 
 impl RetryPolicy {
-    pub(crate) fn production() -> Self {
+    /// The route's configured budget, applied at production delay scale.
+    pub(crate) fn from_budget(budget: leveler_model::RetryBudget) -> Self {
         Self {
-            max_retries: MAX_RETRIES,
+            max_retries: budget.max_retries,
             delay_scale: 1.0,
-        }
-    }
-
-    /// How many retries this failure may spend. A refused connection gets the
-    /// short endpoint budget; everything else gets the configured budget.
-    fn max_retries_for(&self, error: &ModelError) -> u32 {
-        if is_immediate_endpoint_failure(error) {
-            self.max_retries.min(IMMEDIATE_ENDPOINT_MAX_RETRIES)
-        } else {
-            self.max_retries
+            recovery_window: budget.recovery_seconds.map(Duration::from_secs),
         }
     }
 
@@ -164,14 +147,7 @@ impl RetryPolicy {
         if self.delay_scale <= 0.0 {
             return Duration::ZERO;
         }
-        let base = if is_immediate_endpoint_failure(error) {
-            let idx = (retry as usize)
-                .saturating_sub(1)
-                .min(IMMEDIATE_ENDPOINT_SCHEDULE_MS.len() - 1);
-            Duration::from_millis(IMMEDIATE_ENDPOINT_SCHEDULE_MS[idx])
-        } else {
-            retry_backoff_delay(error, retry)
-        };
+        let base = retry_backoff_delay(error, retry);
         // A provider-advertised wait is honored exactly: jitter must never
         // retry BEFORE the window the server named. Only our own schedule is
         // jittered, to spread concurrent recoveries.
@@ -213,19 +189,13 @@ pub async fn run_model_round(
     cancellation: &CancellationToken,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
 ) -> Result<ModelRound, AgentCoreError> {
-    run_model_round_with(
-        runtime,
-        request,
-        cancellation,
-        on_event,
-        RetryPolicy::production(),
-    )
-    .await
+    let policy = RetryPolicy::from_budget(runtime.retry_budget(&request.model));
+    run_model_round_with(runtime, request, cancellation, on_event, policy).await
 }
 
-/// The retry budget is a parameter so a test can exercise the full ten-retry
-/// lifecycle without waiting out the real backoff. Production always passes
-/// [`RetryPolicy::production`].
+/// The retry budget is a parameter so a test can exercise the full retry
+/// lifecycle without waiting out the real backoff. Production always passes the
+/// route's advertised budget ([`RetryPolicy::from_budget`]).
 async fn run_model_round_with(
     runtime: &dyn ModelRuntime,
     request: ModelRequest,
@@ -276,14 +246,8 @@ pub async fn run_model_round_observed<O: ModelRoundObserver>(
     cancellation: &CancellationToken,
     observer: &mut O,
 ) -> Result<ModelRound, O::Error> {
-    run_model_round_observed_with(
-        runtime,
-        request,
-        cancellation,
-        observer,
-        RetryPolicy::production(),
-    )
-    .await
+    let policy = RetryPolicy::from_budget(runtime.retry_budget(&request.model));
+    run_model_round_observed_with(runtime, request, cancellation, observer, policy).await
 }
 
 async fn run_model_round_observed_with<O: ModelRoundObserver>(
@@ -412,7 +376,7 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             );
             return Err(AgentCoreError::Model(error).into());
         }
-        if retries >= policy.max_retries_for(&error) {
+        if retries >= policy.max_retries {
             // The budget is spent. Surface the last failure instead of hiding
             // it behind an unbounded wait: whether to try again is the
             // person's decision, and the count travels with the error.
@@ -430,8 +394,27 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             return Err(AgentCoreError::Model(error).into());
         }
         retries += 1;
-        let max_retries = policy.max_retries_for(&error);
+        let max_retries = policy.max_retries;
         let wait = policy.delay(&error, retries);
+        // The overall recovery budget binds independently of the retry count:
+        // a provider that is slow *and* failing must not multiply attempts
+        // into an unbounded wait. The countdown and the event below state the
+        // same wait the scheduler will actually sleep.
+        if let Some(window) = policy.recovery_window
+            && started.elapsed().saturating_add(wait) >= window
+        {
+            let mut error = error;
+            error.retry_attempts = Some(retries - 1);
+            tracing::warn!(
+                request_id = %request.request_id,
+                retries = retries - 1,
+                recovery_window_ms = window.as_millis() as u64,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %error,
+                "model round recovery budget exhausted"
+            );
+            return Err(AgentCoreError::Model(error).into());
+        }
         // The retry controller emits this; presentation must never drive it.
         observer.on_event(AgentEvent::ModelRetrying {
             attempt: retries,
@@ -865,11 +848,11 @@ mod backoff_tests {
     }
 
     /// The schedule is a fixed, bounded function of the retry number: quick
-    /// first recoveries, then a steady 30s rate. The presented countdown is
+    /// first recoveries, then a steady 60s rate. The presented countdown is
     /// this value, so it must not grow without bound.
     #[test]
-    fn schedule_climbs_then_caps_at_thirty_seconds() {
-        let expected = [1, 2, 4, 8, 15, 30, 30, 30, 30, 30];
+    fn schedule_climbs_then_caps_at_sixty_seconds() {
+        let expected = [1, 2, 4, 8, 15, 30, 60, 60, 60, 60, 60, 60];
         for (i, secs) in expected.iter().enumerate() {
             let retry = (i + 1) as u32;
             assert_eq!(
@@ -881,9 +864,26 @@ mod backoff_tests {
         // Any retry beyond the budget keeps the cap rather than growing.
         assert_eq!(
             retry_backoff_delay(&err(ModelErrorKind::Transport), 50),
-            Duration::from_secs(30)
+            Duration::from_secs(60)
         );
-        assert_eq!(MAX_RETRIES, 10, "the budget the schedule is sized for");
+        assert_eq!(MAX_RETRIES, 12, "the budget the schedule is sized for");
+    }
+
+    /// The real Session's outage lasted 5.5 minutes. A machine-local refused
+    /// socket is the same external-transient shape as any other outage: the
+    /// whole logical request must be able to wait it out inside its default
+    /// budget, without the user re-sending the task. The bound is a sum of the
+    /// counted, jittered schedule — not a fixed wait.
+    #[test]
+    fn the_default_budget_outlasts_a_five_and_a_half_minute_outage() {
+        let base: Duration = (1..=MAX_RETRIES)
+            .map(|retry| retry_backoff_delay(&err(ModelErrorKind::Transport), retry))
+            .sum();
+        assert!(
+            base >= Duration::from_secs(330),
+            "the default retry schedule must cover the observed 5.5-minute \
+             outage, waited {base:?}"
+        );
     }
 
     #[test]
@@ -906,7 +906,7 @@ mod retry_decision_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use leveler_model::{FinishReason, ModelRef, Retryability, Role};
+    use leveler_model::{FinishReason, ModelRef, Retryability, Role, TransportFault};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1117,6 +1117,7 @@ mod retry_decision_tests {
         RetryPolicy {
             max_retries: MAX_RETRIES,
             delay_scale: 0.0,
+            recovery_window: None,
         }
     }
 
@@ -1189,10 +1190,13 @@ mod retry_decision_tests {
         .with_transport_fault(TransportFault::ConnectionRefused)
     }
 
-    /// A wrong `base_url` fails in seconds, not after the full ~3-minute
-    /// schedule: a refused socket gets a short, fast budget.
+    /// A refused socket is a transient external outage like any other: the
+    /// original Session's provider refused connections for about 5.5 minutes
+    /// and every turn gave up after four requests. The logical request owns one
+    /// bounded budget, so a refusal must spend the same budget as a reset or a
+    /// 5xx instead of a special short one.
     #[tokio::test]
-    async fn a_refused_connection_exhausts_a_short_fast_budget() {
+    async fn a_refused_connection_uses_the_full_recovery_budget() {
         let mut out = Vec::new();
         let cancel = CancellationToken::new();
         let (result, calls) = run(connection_refused(), u32::MAX, &cancel, &mut out).await;
@@ -1202,10 +1206,10 @@ mod retry_decision_tests {
         };
         assert_eq!(
             calls,
-            1 + IMMEDIATE_ENDPOINT_MAX_RETRIES,
-            "one attempt plus the endpoint budget"
+            1 + MAX_RETRIES,
+            "one attempt plus the full recovery budget"
         );
-        assert_eq!(error.retry_attempts, Some(IMMEDIATE_ENDPOINT_MAX_RETRIES));
+        assert_eq!(error.retry_attempts, Some(MAX_RETRIES));
         let max_attempts: Vec<u32> = out
             .iter()
             .filter_map(|event| match event {
@@ -1213,10 +1217,63 @@ mod retry_decision_tests {
                 _ => None,
             })
             .collect();
+        assert_eq!(max_attempts.len() as u32, MAX_RETRIES);
+        assert!(max_attempts.iter().all(|n| *n == MAX_RETRIES));
+    }
+
+    /// The overall recovery window binds independently of the retry count: a
+    /// provider that is slow *and* failing cannot turn a count budget into an
+    /// unbounded wait. The failure still carries how many retries were spent.
+    #[tokio::test]
+    async fn the_overall_recovery_window_bounds_the_retry_loop() {
+        let calls = Arc::new(Mutex::new(0));
+        let runtime = FlakyRuntime {
+            error: connection_refused(),
+            fail_times: u32::MAX,
+            calls: calls.clone(),
+            seen: Arc::default(),
+        };
+        let result = run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |_| {},
+            RetryPolicy {
+                max_retries: MAX_RETRIES,
+                // No real wait: the window, not the clock, is what is under
+                // test here.
+                delay_scale: 0.0,
+                // A zero window is "no recovery": the loop must stop before
+                // announcing or sleeping a wait the budget cannot cover.
+                recovery_window: Some(Duration::ZERO),
+            },
+        )
+        .await;
+        let error = match result {
+            Err(AgentCoreError::Model(error)) => error,
+            other => panic!("expected a model error, got {other:?}"),
+        };
+        assert_eq!(*calls.lock().unwrap(), 1, "no retry fits the window");
+        assert_eq!(error.retry_attempts, Some(0));
+    }
+
+    /// The original outage outlasted what one turn was willing to wait, so the
+    /// user re-sent seven times. A logical round must instead wait through the
+    /// whole transient window and continue by itself once the provider is back.
+    #[tokio::test]
+    async fn a_round_recovers_after_seven_refusals_without_a_new_turn() {
+        let mut out = Vec::new();
+        let cancel = CancellationToken::new();
+        let (result, calls) = run(connection_refused(), 7, &cancel, &mut out).await;
+        let round = result.expect("the round must recover inside its own budget");
+        assert_eq!(calls, 8, "seven refusals and one successful attempt");
+        assert_eq!(round.retry_count, 7);
         assert_eq!(
-            max_attempts,
-            vec![3, 3, 3],
-            "the event states the same budget"
+            out.iter()
+                .filter(|event| matches!(event, AgentEvent::ModelRetrying { .. }))
+                .count(),
+            7,
+            "every wait is announced"
         );
     }
 
@@ -1235,28 +1292,21 @@ mod retry_decision_tests {
         );
     }
 
+    /// The structured fault changes neither the count budget nor the schedule:
+    /// a refused socket is recovered by the same bounded lifecycle as every
+    /// other transient failure.
     #[test]
-    fn the_endpoint_budget_and_schedule_apply_only_to_a_refused_socket() {
-        let policy = RetryPolicy::production();
-        assert_eq!(
-            policy.max_retries_for(&connection_refused()),
-            IMMEDIATE_ENDPOINT_MAX_RETRIES
-        );
-        assert_eq!(policy.max_retries_for(&not_sent()), MAX_RETRIES);
+    fn a_refused_socket_keeps_the_same_budget_and_schedule() {
+        let policy = RetryPolicy::from_budget(leveler_model::RetryBudget::default());
+        assert_eq!(policy.max_retries, MAX_RETRIES);
 
-        // Fast schedule (250/500/1000 ms plus <=20% jitter), never 30 s.
-        let first = policy.delay(&connection_refused(), 1);
-        assert!(
-            first >= Duration::from_millis(250) && first <= Duration::from_millis(320),
-            "{first:?}"
-        );
-        let third = policy.delay(&connection_refused(), 3);
-        assert!(
-            third >= Duration::from_millis(1_000) && third <= Duration::from_millis(1_250),
-            "{third:?}"
-        );
-        // An unrelated NotSent failure still gets the long first backoff.
-        assert!(policy.delay(&not_sent(), 1) >= Duration::from_millis(1_000));
+        for error in [connection_refused(), not_sent()] {
+            let first = policy.delay(&error, 1);
+            assert!(
+                first >= Duration::from_millis(1_000) && first <= Duration::from_millis(1_200),
+                "the first backoff is the ordinary schedule, not a fast path: {first:?}"
+            );
+        }
     }
 
     /// A retry re-sends the round's request as built — the tool exchange in
@@ -1864,6 +1914,7 @@ mod retry_decision_tests {
         let policy = RetryPolicy {
             max_retries: MAX_RETRIES,
             delay_scale: 1.0,
+            recovery_window: None,
         };
         let result = run_model_round_with(
             &runtime,
@@ -1908,6 +1959,7 @@ mod retry_decision_tests {
             RetryPolicy {
                 max_retries: MAX_RETRIES,
                 delay_scale: 1.0,
+                recovery_window: None,
             },
         )
         .await;
@@ -2246,6 +2298,7 @@ mod reasoning_assembly_tests {
             RetryPolicy {
                 max_retries: 0,
                 delay_scale: 0.0,
+                recovery_window: None,
             },
         )
         .await;
@@ -2379,6 +2432,7 @@ mod reasoning_assembly_tests {
             RetryPolicy {
                 max_retries: 0,
                 delay_scale: 0.0,
+                recovery_window: None,
             },
         )
         .await;
@@ -2642,6 +2696,7 @@ mod attempt_contract_tests {
             RetryPolicy {
                 max_retries: 1,
                 delay_scale: 0.0,
+                recovery_window: None,
             },
         )
         .await;
@@ -2775,6 +2830,7 @@ mod attempt_contract_tests {
             RetryPolicy {
                 max_retries: 1,
                 delay_scale: 0.0,
+                recovery_window: None,
             },
         )
         .await
@@ -2843,7 +2899,8 @@ mod attempt_contract_tests {
                 &mut observer,
                 RetryPolicy {
                     max_retries: 1,
-                    delay_scale: 0.0
+                    delay_scale: 0.0,
+                    recovery_window: None,
                 }
             )
             .await
@@ -2918,6 +2975,7 @@ mod attempt_contract_tests {
             RetryPolicy {
                 max_retries: 1,
                 delay_scale: 0.0,
+                recovery_window: None,
             },
         )
         .await

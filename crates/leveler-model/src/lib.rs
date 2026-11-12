@@ -81,6 +81,9 @@ pub use request::{
 };
 pub use response::ModelResponse;
 pub use retention::ReasoningRetention;
-pub use runtime::{ModelEventStream, ModelRuntime, stream_from_response};
+pub use runtime::{
+    DEFAULT_MAX_RETRIES, DEFAULT_RECOVERY_SECONDS, ModelEventStream, ModelRuntime, RetryBudget,
+    stream_from_response,
+};
 pub use thinking::{ThinkingAccess, ThinkingCapabilities, ThinkingLevel, ThinkingProjection};
 pub use tool_exchange::{ToolExchangeViolation, validate_tool_exchange};
