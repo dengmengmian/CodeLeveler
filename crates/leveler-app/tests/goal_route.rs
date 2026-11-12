@@ -19,13 +19,17 @@ use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
-use leveler_execution::{AutoApprove, BackgroundTaskStatus, PermissionProfile};
+#[cfg(unix)]
+use leveler_execution::BackgroundTaskStatus;
+use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::{
     EngineStores, GoalRecord, GoalState, MessageRepository, SessionRepository, TurnRepository,
 };
-use leveler_test_support::{MockResponse, MockServer, sleep_command};
+#[cfg(unix)]
+use leveler_test_support::sleep_command;
+use leveler_test_support::{MockResponse, MockServer};
 use tokio_util::sync::CancellationToken;
 
 const OBJECTIVE: &str = "finish the inventory work";
