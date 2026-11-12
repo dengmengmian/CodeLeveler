@@ -1035,8 +1035,13 @@ async fn progressive_initial_surface_inventory() {
     // tokens and cut missing-source declarations from 6/58 to 1/49 in the
     // paired A/B. A new field-sized surface is hundreds of tokens, so this
     // ceiling still rejects one.
+    // 9200 (was 8750): `update_goal` now spells out yield, a user_decision
+    // block, and the rule that a decision is asked before it is declared.
+    // Those sentences are the cross-window and durable-question contract.
+    // The initial tool count stays 20. Measured schema is 9045 tokens.
+    // 155 tokens of headroom still rejects one new field-sized surface.
     assert!(
-        schema_tokens <= 8750,
+        schema_tokens <= 9200,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());

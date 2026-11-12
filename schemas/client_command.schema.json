@@ -490,6 +490,17 @@
         "request_id": {
           "$ref": "#/definitions/ClarificationId"
         },
+        "session_id": {
+          "description": "The session that owns the request. A live waiter is found by request id alone; the session is what lets a runtime with no in-memory waiter — a restarted daemon — settle the durable request and continue the goal. Older clients omit it and can answer only a live waiter.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "type": {
           "type": "string",
           "enum": [
