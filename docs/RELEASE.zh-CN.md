@@ -2,18 +2,19 @@
 
 [English](RELEASE.md) · [历史版本](../CHANGELOG.zh-CN.md)
 
-本版加入可持久化的定时自动化、确定性的原生动作、桌面操作，以及接续本机 Claude Code 与 Codex 会话。提交的输入在重连和重启后也不再丢失。
+本版把 Goal 的继续、范围变更与完成证据改为模型显式声明、运行时校验；用户提问可以跨断线与重启存活；Provider 短时中断在同一个逻辑请求内恢复；项目规则的投递可审计；旧版移动客户端正式退役。
 
-- **定时自动化**：`leveler schedule` 与 TUI 的 `/schedules` 页面创建持久定义，可以执行 shell 命令、类型化原生动作，或一个普通的 Agent 目标。触发器支持一次性的 RFC 3339 时刻、固定间隔、每日时刻、指定星期和五段 cron 表达式，并按 IANA 时区求值。定义会记录工作区、权限模式、会话策略、重叠策略（`skip-if-running`、`queue-one`、`allow-concurrent`）、错过策略（`skip`、`run-once`）、超时和授权。运行通过租约认领；租约过期只会把该次运行记为 `unknown`，不会重试。`add`、`list`、`show`、`update`、`grant`、`revoke-grant`、`runs`、`pause`、`resume`、`run-now`、`cancel`、`remove` 管理定义；`dispatch` 执行一轮，`serve` 是常驻调度器。`schedule_inspect` 与 `schedule_manage` 工具向模型提供同一套事实，Web 与桌面端的自动化页面读取同一份运行时状态。
-- **无人值守授权**：无人值守运行需要一份已持久化的授权，覆盖它的动作、工作区、触发器、权限模式和外部副作用选择。修改任一被覆盖的字段会使授权失效。Full 权限不能替代授权；缺少授权时动作会在开始前被拒绝，而不是在无人可答时弹出审批。
-- **操作系统唤醒**：`schedule enable` 在 macOS 注册 launchd agent，在 Windows 注册当前用户的 Task Scheduler 任务；`disable` 和 `uninstall` 移除注册；`status`、`wakeups` 和 `doctor` 报告注册状态、唤醒历史与诊断。Linux 会把唤醒后端报告为不支持；定时仍可通过 `schedule serve` 或 `schedule dispatch` 运行。
-- **原生动作**：`leveler native capabilities` 在不启动应用、不请求权限、不发送内容的前提下探测 macOS 的 Mail 或 Windows 的 Outlook。`leveler native action` 不经过模型、守护进程或会话，确定性地执行 `mail.draft.create`、`mail.send.open_ui`、`mail.send.submit` 或 `mail.sent.check`。输入在规划前校验，用户文本通过权限为 `0600` 的私有文件而不是 argv 或脚本源码传给应用，成功必须看到可识别结果标记。超时或无法识别的结果记为 `unknown`，不会重试。模型工具是 `native_capabilities`、`native_action` 和 `native_verify`。
-- **桌面操作**：`computer_observe` 与 `computer_act` 通过 macOS 的 Accessibility 与 CoreGraphics，或 Windows 的 UI Automation 与 Win32 观察和操作桌面。观察引用只属于当前会话，并在每次动作前对实时界面重新校验。工具沿用既有审批策略、能力包和图片通道，不新增第二条执行路径。macOS 需要辅助功能与屏幕录制权限，权限状态作为调用时事实报告。
-- **外部会话接续**：`/resume-claude` 与 `/resume-codex` 列出本机 Claude Code 或 Codex 会话（也可直接给出会话 ID），并把其中一个导入为 CodeLeveler 原生会话，附带一份有界简报。源存储只读，原始历史仍以源文件为准。简报引用任务和源会话结束时的状态，不复制整份对话；工具调用不会重放，工作区不一致会在导入前报告，`foreign_session_history` 按需读取源记录。
-- **持久输入**：回合运行中提交的输入会先带着自己的身份写入日志，再被接纳。重连和恢复依据这条记录只投递一次，不会丢失或重复发送。最终答案绑定到模型显式的 `deliver_answer` 声明，并在回合结束前持久化；答案写出后进程崩溃不会再次调用模型。
-- **TUI**：代码块和 diff 共用一套语法高亮，已应用的 diff 是一份可整体复制的文档，而不是拼接起来的分开着色行。`/schedules` 就地管理定义；`/resume-claude` 与 `/resume-codex` 打开外部会话选择器。
-- **修复**：客户端输掉运行时启动竞争时会接管已存活的运行时，而不是永久失败；自然周期规则在 shell 仍运行时保留自己的时间网格；`allow-concurrent` 的 shell 运行各自获得独立执行上下文；一次性定义在触发器重排时保留待执行时刻；`schedule show` 不再把已完成、已取消或已错过的运行当作下一次运行；无头 CLI 输出已提交的最终答案，而不是记账回合的文本。
+- **声明式意图，不猜措辞。** 继续、暂停、补充、取消与提问由执行中的模型在本轮决定。`declare_intent` 逐字引用最新用户消息；运行时校验引用确实来自该消息、目标是哪个 Goal、操作集合与顺序是否合法，以及暂停边界按稳定 id 指向哪个计划步骤。多个 Goal 同时运行且未指明时拒绝猜测。任意语言、任意措辞和复合指令都走同一条路径，不额外发起分类模型调用。暂停只由校验通过的 `continue_task` 解除。
+- **可审计的 Goal 范围。** `commit_task.requirements` 与 `declare_scope` 让验收集合结构化并由模型声明。每次变更都锚定原文引用，作为有序持久事件保存（迁移 0055），并由 `get_goal_scope` 投射。关键词、否定词、章节标题、量词与测试名启发式全部移除；用户文本只由模型解释。
+- **证据而不是成功声明。** `update_goal(verification)` 仍是模型的声明；完成 Gate 按 call id、精确命令行或命令行加备注，用运行时自己的执行记录解析引用。失败、过期或被推翻的运行会按真实原因拒绝；组合运行中某个组成部分后来单独失败时，也不会被当作整体通过。被接受的完成会持久化结构化 `VerificationReport`；没有需求级记录就不存在 `Verified`。命令通过只证明执行发生过，不证明某个已声明需求已交付。
+- **持久提问。** 澄清请求有 id、结构化问题与 answered/skipped/cancelled 终态，写入事件日志。实时 waiter 只是投递通道，因此客户端断线、守护进程重启或任务取消都不会丢失问题，也不会让迟到的回答启动已取消的工作。第一个终态生效，重复或过期的回答被拒绝，待答卡片从持久状态恢复。
+- **跨窗口连续性。** checkpoint 携带已答澄清、用户补充、逐字消息、运行时观测到的命令结果，以及当前窗口自己的已接受结论。计划以最新一次声明为准，yield 后的下一个窗口不再重复上一个窗口已完成的工作。
+- **Provider 中断恢复。** 一个逻辑请求可以跨过短时 Provider 故障：`[retry]` 默认在首次尝试之后的 600 秒窗口内重试 12 次，退避最高到 60 秒稳定速率，`Retry-After` 优先。工具执行后的重试不会重复副作用，TUI 用「模型服务不可用 · 重试」区分于连接丢失。
+- **项目规则。** 规则每回合读取一次并带类型化审计投递。不可读、非法 UTF-8、非文件与符号链接逃逸的来源会被报告而不是静默丢弃；空、缺失、已加载三种状态可区分；适用的 scoped 规则无法读取时，会修改状态的调用暂停；子目录自己的 `AGENTS.md` 只作用于该目录。
+- **TUI 真实单元格。** 制表符与控制字节在输入框与 Markdown 边界、宽度计算之前被规范化，粘贴内容或模型 Markdown 不再导致后续单元格错位；启动图在离开备用屏幕前按 id 删除 Kitty 图像数据。
+- **退役。** 独立的 Flutter 移动客户端、其 relay，以及只为它存在的宿主端 remote protocol/agent crate 已移除。CLI 与 TUI 不再有配对设备命令与页面；本地传输、runtime host 与客户端 command/event/snapshot 协议保留给其他客户端。
+- **依赖。** `rmcp` 3.9.0 关闭 RUSTSEC-2026-0462；`cap-primitives` 4.0.3 关闭沙箱逃逸 RUSTSEC-2026-0482；`rustix` 1.1.6 关闭 RUSTSEC-2026-0486。RUSTSEC-2026-0459（`libsqlite3-sys` 的内置 SQLite）因 `sqlx` 0.8 没有修复版本，按本地文件可达性边界与到期时间登记，而不是静默忽略。
 
-安装包是命令行程序，包含 macOS（Apple Silicon 与 Intel）、64 位 Linux 和 64 位 Windows。没有 Linux ARM 安装包。桌面客户端可从源码构建，不在本安装包内。安装包不含 Apple 公证或 Microsoft 签名。已有配置可以继续使用。
+安装包是命令行程序，包含 macOS（Apple Silicon 与 Intel）、64 位 Linux 和 64 位 Windows。没有 Linux ARM 安装包。桌面客户端可从源码构建，不在本安装包内。安装包不含 Apple 公证或 Microsoft 签名。
 
 安装和更新见[首页](../README.zh-CN.md)。版本历史见[更新日志](../CHANGELOG.zh-CN.md)。
