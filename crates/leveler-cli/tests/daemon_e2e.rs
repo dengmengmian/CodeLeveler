@@ -60,6 +60,10 @@ fn test_env(base_url: &str) -> TestEnv {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(config_dir.join("providers")).unwrap();
     std::fs::create_dir_all(config_dir.join("models")).unwrap();
+    // Unavailable-provider scenarios must observe the terminal failure, not
+    // spend the production retry budget waiting for a server that will never
+    // answer.
+    std::fs::write(home.join("config.toml"), "[retry]\nmax_retries = 0\n").unwrap();
     std::fs::write(
         config_dir.join("providers/mock.yaml"),
         format!("id: mock\nprotocol: openai_chat\nbase_url: {base_url}\n"),
