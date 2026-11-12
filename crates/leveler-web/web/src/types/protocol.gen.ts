@@ -485,6 +485,8 @@ export type RuntimeEvent =
   | { type: 'turn_answered' }
   /** The turn ended at the user's own pause boundary. The goal still owes the work the user withheld authorization to continue; nothing failed and nothing is complete. Only the user's own continuation releases it. */
   | { type: 'turn_paused'; reason: string }
+  /** The model ended this work window through `update_goal(yield)` while the goal still owes work. Unlike [`Self::TurnPaused`] nothing waits for the user: the runtime continues the same goal in a fresh window. Unlike [`Self::TurnIncomplete`] nothing went wrong — the window closed at a boundary the model chose. `reason` is the model's window note, display only; the durable `TaskFinished.stop` is the authority. */
+  | { type: 'turn_yielded'; reason: string }
   /** The turn stopped at an output limit even after bounded continuation. */
   | { type: 'turn_truncated'; error: string }
   /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
@@ -1765,7 +1767,7 @@ export type ClientCommand =
   /** Resolve a pending permission request . */
   | { type: 'approval_decision'; decision: ApprovalDecision; request_id: ApprovalId }
   /** Answer a pending clarification (spec §35). An empty answer means "skip". */
-  | { type: 'answer_clarification'; answer: string; request_id: ClarificationId }
+  | { type: 'answer_clarification'; answer: string; request_id: ClarificationId; session_id?: SessionId | null }
   /** Switch the model used for subsequent turns . */
   | { type: 'select_model'; model: ModelRef; session_id: SessionId }
   /** The user's explicit "use this model from now on": switch the active session's model AND persist it as the user's default model for future sessions. Distinct from [`Self::SelectModel`] on purpose. Only this command carries the authority to rewrite the user's persisted configuration, because only an explicit user action does. Runtime fallbacks, provider failover, retries, temporary CLI/session overrides and internal routing MUST use [`Self::SelectModel`] (session-scoped) and never touch the default. */
