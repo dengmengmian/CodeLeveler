@@ -75,6 +75,9 @@ pub struct ConfigChange {
     pub mcp_servers: bool,
     pub context: bool,
     pub web_search: bool,
+    /// `[retry]`: the registry generation carries the recovery budget, so a
+    /// policy change rebuilds it like any other route fact.
+    pub retry: bool,
     pub ui: bool,
     /// `[browser].default`: the browser capability's product is chosen when
     /// the browser handle is built, so a change is reported as restart-scoped
@@ -95,7 +98,7 @@ impl ConfigChange {
 
     /// Whether provider clients and model profiles must be rebuilt.
     pub fn requires_registry_rebuild(&self) -> bool {
-        self.models || self.providers || self.thinking
+        self.models || self.providers || self.thinking || self.retry
     }
 
     /// Stable labels for logs and user-facing summaries. Never includes values,
@@ -110,6 +113,7 @@ impl ConfigChange {
             (self.mcp_servers, "mcp_servers"),
             (self.context, "context"),
             (self.web_search, "web_search"),
+            (self.retry, "retry"),
             (self.ui, "ui"),
             (self.browser, "browser"),
             (self.assists, "assists"),
@@ -202,7 +206,8 @@ impl ConfigManager {
         let registry = ProviderRegistry::build(RegistryInputs {
             providers,
             models: loaded.models.clone(),
-        })?;
+        })?
+        .with_retry_budget(loaded.retry);
         let project_digest = project_policy_digest(&layout);
         let (applied, _) = broadcast::channel(16);
         let (failed, _) = broadcast::channel(16);
@@ -346,7 +351,7 @@ impl ConfigManager {
                 providers,
                 models: loaded.models.clone(),
             }) {
-                Ok(registry) => Arc::new(registry),
+                Ok(registry) => Arc::new(registry.with_retry_budget(loaded.retry)),
                 Err(error) => return self.fail(error.to_string(), &previous, origin),
             }
         } else {
@@ -582,6 +587,10 @@ fn registry_inputs(loaded: &LoadedConfig) -> (Vec<(ProviderConfig, Option<String
     for model in &loaded.models {
         hasher.update(serde_json::to_vec(model).unwrap_or_default());
     }
+    // The registry generation owns the recovery budget, so a budget-only edit
+    // must still produce a new generation instead of silently keeping the old
+    // policy in force.
+    hasher.update(serde_json::to_vec(&loaded.retry).unwrap_or_default());
     (providers, format!("sha256:{:x}", hasher.finalize()))
 }
 
@@ -618,6 +627,7 @@ pub fn diff(previous: &LoadedConfig, next: &LoadedConfig) -> ConfigChange {
         context: previous.context_soft_percent != next.context_soft_percent
             || previous.model_context_soft_percent != next.model_context_soft_percent,
         web_search: previous.web_search != next.web_search,
+        retry: previous.retry != next.retry,
         ui: previous.lang != next.lang,
         browser: previous.browser_default != next.browser_default,
         assists: previous.assist_prompt_suggestions != next.assist_prompt_suggestions
@@ -764,6 +774,29 @@ mod tests {
         assert!(change.default_model);
         assert!(!change.models);
         assert!(!change.requires_registry_rebuild());
+    }
+
+    /// The recovery budget lives on the registry generation. A budget-only
+    /// edit is therefore a real change, not a comment, and must rebuild the
+    /// generation that carries it.
+    #[test]
+    fn a_retry_budget_change_is_its_own_registry_dimension() {
+        let mut a = config("p/m", ("p", "m"));
+        let mut b = config("p/m", ("p", "m"));
+        b.retry = leveler_model::RetryBudget {
+            max_retries: 3,
+            recovery_seconds: Some(60),
+        };
+        assert!(diff(&a, &b).retry);
+        assert!(diff(&a, &b).requires_registry_rebuild());
+        assert_eq!(diff(&a, &b).labels(), vec!["retry"]);
+        assert!(!diff(&a, &b).models);
+        // The digest the manager uses to decide on a rebuild follows it too.
+        let (_, before) = registry_inputs(&a);
+        let (_, after) = registry_inputs(&b);
+        assert_ne!(before, after);
+        a.retry = b.retry;
+        assert!(diff(&a, &b).is_empty());
     }
 
     #[test]

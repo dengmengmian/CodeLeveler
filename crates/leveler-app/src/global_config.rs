@@ -125,6 +125,9 @@ pub struct GlobalConfig {
     /// model provider: changing the conversation model never changes it.
     #[serde(default)]
     web: GlobalWeb,
+    /// Bounded automatic recovery for transient model-provider failures.
+    #[serde(default)]
+    retry: leveler_model::RetryBudget,
 }
 
 /// `[storage]`. Bounds on what CodeLeveler may reclaim from its own home.
@@ -544,6 +547,8 @@ pub struct GlobalBundle {
     pub model_soft_percent: Vec<(String, u8)>,
     /// `[web.search]`, resolved. `None` means web search is unavailable.
     pub web_search: Option<WebSearchSettings>,
+    /// `[retry]`: the bounded recovery budget for one logical model request.
+    pub retry: leveler_model::RetryBudget,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -1383,6 +1388,7 @@ impl GlobalConfig {
             context_soft_percent,
             model_soft_percent,
             web_search,
+            retry: self.retry,
         }
     }
 }
@@ -1601,6 +1607,31 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// `[retry]` is the one configurable recovery budget. Absent means the
+    /// product budget; present fields are read as declared, and a typo must not
+    /// silently leave the default policy in force.
+    #[test]
+    fn the_retry_budget_defaults_and_parses() {
+        let cfg: GlobalConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.into_bundle().retry,
+            leveler_model::RetryBudget::default()
+        );
+
+        let cfg: GlobalConfig =
+            toml::from_str("[retry]\nmax_retries = 2\nrecovery_seconds = 30\n").unwrap();
+        assert_eq!(
+            cfg.into_bundle().retry,
+            leveler_model::RetryBudget {
+                max_retries: 2,
+                recovery_seconds: Some(30),
+            }
+        );
+
+        assert!(toml::from_str::<GlobalConfig>("[retry]\nmax_retry = 2\n").is_err());
+        assert!(toml::from_str::<GlobalConfig>("[retry]\nmax_retries = -1\n").is_err());
+    }
 
     // ── Thinking Level: one vocabulary, three places it can be set ──────────
 

@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_core::RequestId;
 use leveler_model::{
     ModelError, ModelErrorKind, ModelEvent, ModelEventStream, ModelProfile, ModelRef, ModelRequest,
-    ModelResponse, ModelRuntime, ProtocolAdapter, ProtocolContext, ProtocolKind,
+    ModelResponse, ModelRuntime, ProtocolAdapter, ProtocolContext, ProtocolKind, RetryBudget,
 };
 use leveler_protocol::{AnthropicMessagesAdapter, OpenAiChatAdapter};
 
@@ -96,6 +96,10 @@ pub struct RegistryInputs {
 pub struct ProviderRegistry {
     providers: HashMap<String, Provider>,
     models: HashMap<(String, String), ModelEntry>,
+    /// The configured recovery budget for one logical model request. It
+    /// belongs to the route collection, not to a single request: every model
+    /// this registry serves recovers under the same configured policy.
+    retry_budget: RetryBudget,
 }
 
 impl ProviderRegistry {
@@ -146,7 +150,22 @@ impl ProviderRegistry {
             );
         }
 
-        Ok(Self { providers, models })
+        Ok(Self {
+            providers,
+            models,
+            retry_budget: RetryBudget::default(),
+        })
+    }
+
+    /// Adopt the configured recovery budget.
+    ///
+    /// Called by the composition root when it builds a registry generation, so
+    /// every request served by this generation recovers under one policy. The
+    /// budget is not a provider or model fact, which is why it is not part of
+    /// [`RegistryInputs`].
+    pub fn with_retry_budget(mut self, budget: RetryBudget) -> Self {
+        self.retry_budget = budget;
+        self
     }
 
     /// List all configured model references.
@@ -369,6 +388,10 @@ impl ModelRuntime for ProviderRegistry {
 
     async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
         Ok(self.entry(model)?.profile.clone())
+    }
+
+    fn retry_budget(&self, _model: &ModelRef) -> RetryBudget {
+        self.retry_budget
     }
 
     /// The provider entry is this configuration's identity for one deployment:
@@ -667,6 +690,7 @@ mod resolution_tests {
         ProviderRegistry {
             providers: HashMap::new(),
             models: HashMap::new(),
+            retry_budget: RetryBudget::default(),
         }
     }
 
@@ -691,6 +715,28 @@ mod resolution_tests {
         };
         assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
         assert_eq!(error.delivery_state, leveler_model::DeliveryState::NotSent);
+    }
+
+    /// The route collection is the budget's owner: a registry built without a
+    /// configured policy advertises the product budget, and a configured one
+    /// advertises exactly what the composition root adopted.
+    #[test]
+    fn the_registry_advertises_its_configured_recovery_budget() {
+        let model = ModelRef::new("deepseek", "deepseek-flash");
+        assert_eq!(
+            empty_registry().retry_budget(&model),
+            RetryBudget::default()
+        );
+        let configured = RetryBudget {
+            max_retries: 20,
+            recovery_seconds: Some(900),
+        };
+        assert_eq!(
+            empty_registry()
+                .with_retry_budget(configured)
+                .retry_budget(&model),
+            configured
+        );
     }
 }
 
