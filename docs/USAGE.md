@@ -129,5 +129,3 @@ Or `leveler mcp add devorder --url http://127.0.0.1:8081/mcp --header X-API-Key=
 ## Troubleshooting
 
 Run `leveler doctor` to check models, terminal support, and system capabilities. Use `leveler trace` to inspect session records. Check for private content before sharing them.
-
-The mobile client remains a frozen source preview without an official install package. Remote session traffic passes through a relay without end-to-end encryption; self-host the relay when evaluating it.

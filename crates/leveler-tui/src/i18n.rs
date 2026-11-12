@@ -569,8 +569,6 @@ pub struct UiText {
     pub screen_tools: &'static str,
     pub screen_diff: &'static str,
     pub screen_verify: &'static str,
-    /// Full-screen `/remote` invite title.
-    pub screen_remote: &'static str,
     /// `/trace` — the runtime observatory. Its CHROME is language; the ids,
     /// model names, event types and protocol field names it wraps are not,
     /// and stay byte-identical in every locale.
@@ -733,30 +731,6 @@ pub struct UiText {
     pub tool_filter_write: &'static str,
     pub tool_filter_shell: &'static str,
     pub tool_filter_failed: &'static str,
-    /// Lead line above the QR.
-    pub remote_scan_heading: &'static str,
-    /// One-line subtitle under the heading.
-    pub remote_scan_sub: &'static str,
-    /// Label before the relay URL.
-    pub remote_label_address: &'static str,
-    /// Label before this machine's fingerprint.
-    pub remote_label_host_fp: &'static str,
-    /// Idle state: no phone has claimed the invite yet.
-    pub remote_waiting: &'static str,
-    /// Hint above the pasteable payload.
-    pub remote_paste_hint: &'static str,
-    /// "「{name}」（{platform}）想要连接" / "“{name}” ({platform}) wants to connect".
-    pub remote_wants_connect: &'static str,
-    /// Label before the phone's fingerprint.
-    pub remote_label_phone_fp: &'static str,
-    /// Security copy: compare fingerprints, not device names.
-    pub remote_compare_hint: &'static str,
-    /// y/n actions while a device is pending.
-    pub remote_yn: &'static str,
-    /// Footer: scroll + Esc back to conversation.
-    pub remote_footer: &'static str,
-    /// Placeholder while the invite is still loading.
-    pub remote_preparing: &'static str,
     pub no_sessions: &'static str,
     pub no_context: &'static str,
     /// Label fragment for "step k of n" in sticky plan header (e.g. "步").
@@ -1420,10 +1394,6 @@ pub struct SlashText {
     pub update: &'static str,
     /// /reload: re-read the configuration files into the running runtime.
     pub reload: &'static str,
-    /// `/remote`
-    pub remote: &'static str,
-    /// `/remote-loc`
-    pub remote_loc: &'static str,
 }
 
 /// `/clean` page copy. Kept in its own struct so the page's words live beside
@@ -1942,7 +1912,6 @@ static ZH: UiText = UiText {
     screen_tools: "工具",
     screen_diff: "改动",
     screen_verify: "验证结果",
-    screen_remote: "配对手机",
     trace_title: "运行时观测台",
     trace_loading: "查询中… 或尚无 durable 记录。",
     trace_hint: "1-6 切换标签  Tab 换页  ↑↓ 移动  Enter 查看  f 筛选  Esc 返回",
@@ -2093,18 +2062,6 @@ static ZH: UiText = UiText {
     tool_filter_write: "写入",
     tool_filter_shell: "Shell",
     tool_filter_failed: "需调整",
-    remote_scan_heading: "用手机扫这个码",
-    remote_scan_sub: "扫码后在本机核对指纹，确认后手机即可连接",
-    remote_label_address: "地址",
-    remote_label_host_fp: "本机指纹",
-    remote_waiting: "等待扫码… 手机出现后会在这里显示指纹供你确认",
-    remote_paste_hint: "扫不了码时，把下面这一行粘贴到手机：",
-    remote_wants_connect: "「{}」（{}）想要连接",
-    remote_label_phone_fp: "手机指纹",
-    remote_compare_hint: "请与手机上的那一行逐字比对——你确认的是这把密钥，不是设备名字。",
-    remote_yn: "y 接受      n 拒绝",
-    remote_footer: "↑↓/PgUp/PgDn 滚动 · Esc 返回对话（可继续等扫码，不会取消配对）",
-    remote_preparing: "正在准备配对…",
     no_sessions: "暂无会话",
     no_context: "暂无上下文信息",
     plan_step_of: "当前",
@@ -2154,8 +2111,6 @@ static ZH: UiText = UiText {
         output: "用分页器查看最近一次本地命令的完整输出（/output）",
         export: "导出对话为 markdown（默认存当前目录，可 /export <路径>）",
         web: "在浏览器打开 Web UI（loopback + token，同一会话）",
-        remote: "让手机扫码连接这台机器",
-        remote_loc: "同一 Wi-Fi 下连手机（本机测试用，不需要公网 relay）",
         attach: "添加附件（图片或文件；别名 /image）",
         theme: "选择配色主题（auto / dark / light / high-contrast）",
         new: "开始新对话（当前这段保留在 /sessions）",
@@ -2190,8 +2145,6 @@ static ZH: UiText = UiText {
         output: "完整查看",
         export: "导出对话",
         web: "打开网页",
-        remote: "手机配对",
-        remote_loc: "局域网配对",
         attach: "添加附件",
         theme: "切换主题",
         new: "新对话",
@@ -3023,7 +2976,6 @@ static EN: UiText = UiText {
     screen_tools: "Tools",
     screen_diff: "Diff",
     screen_verify: "Verification",
-    screen_remote: "Pair a phone",
     trace_title: "Runtime Observatory",
     trace_loading: "Querying… or no durable record yet.",
     trace_hint: "1-6 tabs  Tab pane  ↑↓ move  Enter inspect  f filter  Esc back",
@@ -3174,18 +3126,6 @@ static EN: UiText = UiText {
     tool_filter_write: "Write",
     tool_filter_shell: "Shell",
     tool_filter_failed: "Needs attention",
-    remote_scan_heading: "Scan this code with your phone",
-    remote_scan_sub: "Then confirm the fingerprint here so the phone can connect",
-    remote_label_address: "Address",
-    remote_label_host_fp: "This machine",
-    remote_waiting: "Waiting for a scan… the phone's fingerprint will show here to confirm",
-    remote_paste_hint: "Can't scan? Paste this line into the phone app:",
-    remote_wants_connect: "“{}” ({}) wants to connect",
-    remote_label_phone_fp: "Phone fingerprint",
-    remote_compare_hint: "Compare character-by-character with the phone — you are confirming the key, not the device name.",
-    remote_yn: "y accept      n decline",
-    remote_footer: "↑↓/PgUp/PgDn scroll · Esc back to chat (pairing keeps waiting)",
-    remote_preparing: "Preparing invite…",
     no_sessions: "No sessions",
     no_context: "No context yet",
     plan_step_of: "step",
@@ -3235,8 +3175,6 @@ static EN: UiText = UiText {
         output: "page the complete output of the latest local command (/output)",
         export: "export conversation to markdown (cwd by default; /export <path>)",
         web: "open the browser Web UI (loopback + token, same session)",
-        remote: "Pair a phone with this machine by QR",
-        remote_loc: "Pair over the same Wi-Fi (local testing; no public relay)",
         attach: "add attachment (image or file; alias /image)",
         theme: "choose theme (auto / dark / light / high-contrast)",
         new: "start a new conversation (this one stays in /sessions)",
@@ -3271,8 +3209,6 @@ static EN: UiText = UiText {
         output: "view full output",
         export: "export chat",
         web: "open web UI",
-        remote: "phone pair",
-        remote_loc: "local pair",
         attach: "attach file",
         theme: "switch theme",
         new: "new chat",

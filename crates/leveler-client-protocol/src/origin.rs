@@ -1,6 +1,6 @@
 //! Where a command came from.
 //!
-//! The runtime treats a local terminal and a paired phone identically once a
+//! The runtime treats a local terminal and a paired remote client identically once a
 //! command is admitted — the same `deliver_protocol` path, the same idempotency
 //! receipts. Origin is what lets the layers *around* that path tell them apart:
 //! the audit log records who issued a command, and the approval timeout only
@@ -25,7 +25,7 @@ pub enum ClientOrigin {
     /// person chose — today, a remote-only approval that timed out.
     ///
     /// Distinct from `Remote` on purpose: the audit trail should not read as
-    /// though the phone denied something its user never saw.
+    /// though the remote client denied something its user never saw.
     RemoteTimeout { device_id: String },
 }
 
@@ -92,7 +92,7 @@ mod tests {
         );
     }
 
-    /// A timeout-issued denial must not be attributable to the phone's user as
+    /// A timeout-issued denial must not be attributable to the remote client's user as
     /// though they made the call.
     #[test]
     fn a_timeout_is_distinguishable_from_a_human_remote_decision() {

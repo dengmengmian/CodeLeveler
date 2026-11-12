@@ -90,10 +90,7 @@ mod workbench;
 
 mod run;
 
-pub use action::{
-    CleanHost, PairingRequest, RemoteInvite, RemoteLauncher, RemoteOutcome, RemoteRequest,
-    UrlOpener, WebLauncher,
-};
+pub use action::{CleanHost, UrlOpener, WebLauncher};
 pub use i18n::Locale;
 pub use observability::LIVE_REFRESH_INTERVAL;
 pub use run::{TuiError, TuiExit, run};

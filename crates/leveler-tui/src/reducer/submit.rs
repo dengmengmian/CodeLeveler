@@ -573,30 +573,6 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
     vec![Effect::StartWeb]
 }
 
-/// `/remote` — make this machine reachable from a phone.
-///
-/// `/remote-loc` is the same thing with the relay bound to this machine's own
-/// network address instead of one on the internet, so a phone on the same
-/// Wi-Fi can reach it — the difference between "works once you rent a server"
-/// and "works now".
-///
-/// A separate name rather than an argument to `/remote`: as `/remote loc` the
-/// local path was one typo away from being taken for the real command, on a
-/// command whose whole job is to open this machine to a network. It stays out
-/// of the command list — it is a testing and same-network path, not the shape
-/// the product is aiming at.
-fn start_remote(state: &mut AppState, local: bool) -> Vec<Effect> {
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: if local {
-            "正在把这台机器开放给同一 Wi-Fi 下的手机…".to_string()
-        } else {
-            "正在生成配对二维码…".to_string()
-        },
-    });
-    vec![Effect::StartRemote { local }]
-}
-
 /// Handle a `/command` typed in the composer.
 pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let name = command.split_whitespace().next().unwrap_or("");
@@ -645,8 +621,6 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "agents" => agents_slash(state, command),
         "skills" => skills_slash(state, command),
         "web" => start_web(state),
-        "remote" => start_remote(state, false),
-        "remote-loc" => start_remote(state, true),
         "copy" => copy_slash(state, command),
         "output" => output_slash(state),
         "diff" => open_diff_screen(state),
@@ -1603,64 +1577,6 @@ mod export_tests {
             matches!(&s.notification, Some(n) if n.message.contains("没有可导出的内容")),
             "empty transcript should report nothing to export"
         );
-    }
-
-    #[test]
-    fn the_local_relay_needs_its_own_command_not_an_argument() {
-        let mut s = state_with_dialogue();
-
-        // The real command never binds a local relay, whatever follows it. As
-        // an argument this was one typo from being taken for `/remote` itself,
-        // on a command whose whole job is to open this machine to a network.
-        assert_eq!(
-            handle_slash(&mut s, "remote"),
-            vec![Effect::StartRemote { local: false }]
-        );
-        assert_eq!(
-            handle_slash(&mut s, "remote loc"),
-            vec![Effect::StartRemote { local: false }],
-            "a trailing word must not change what /remote does"
-        );
-
-        assert_eq!(
-            handle_slash(&mut s, "remote-loc"),
-            vec![Effect::StartRemote { local: true }]
-        );
-    }
-
-    #[test]
-    fn the_local_command_can_be_found_by_typing_it() {
-        // It used to be hidden — a testing path that shows up while browsing is
-        // a testing path users will try. That was the wrong trade: the person
-        // who needs this command is told to type it, types it, sees no
-        // completion and nothing in the list, and concludes it does not exist.
-        // A command nobody can confirm is real is worse than one a stranger
-        // might try; the description says plainly what it is for.
-        assert!(crate::screen::is_known_slash_token("remote-loc"));
-
-        for locale in [crate::i18n::Locale::Zh, crate::i18n::Locale::En] {
-            let text = locale.text();
-            let listed = crate::screen::slash_commands(text);
-            assert!(
-                listed.iter().any(|(name, _)| *name == "/remote-loc"),
-                "typing /remote- must offer it"
-            );
-
-            // Enter submits a fully typed command instead of completing to the
-            // highlighted suggestion, and that turns on this list. Without the
-            // entry, `/remote-loc` + Enter would run `/remote` — the one
-            // command it must never be mistaken for.
-            assert!(crate::screen::is_exact_slash_token("/remote-loc"));
-
-            // And it says which one is which, rather than leaving two
-            // near-identical names to be told apart by guessing.
-            let (_, description) = listed
-                .iter()
-                .find(|(name, _)| *name == "/remote-loc")
-                .expect("just asserted it is there");
-            assert!(!description.is_empty());
-            assert_ne!(*description, text.slash.remote);
-        }
     }
 
     #[test]

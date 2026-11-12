@@ -1,8 +1,8 @@
 //! A real conversation, serialised from the real types, for other languages to
 //! replay.
 //!
-//! The mobile app turns `RuntimeEvent`s into a transcript, and it was written
-//! against field names I guessed at rather than read: `content` where the type
+//! Clients turn `RuntimeEvent`s into a transcript. One such client was written
+//! against field names guessed at rather than read: `content` where the type
 //! says `text`, a flattened pending interaction where the type nests it under
 //! `request`. Both compiled, both passed their own tests, and both rendered
 //! empty bubbles on a device.
@@ -99,9 +99,9 @@ fn snapshot() -> UiSessionSnapshot {
 }
 
 /// One turn, in the order a runtime emits it — including the kinds a chat UI
-/// has no use for. Those are the ones that broke the app: it treated every
+/// has no use for. Those are the ones that broke a client: it treated every
 /// unrecognised kind as a reason to resynchronise, so an ordinary turn put the
-/// phone in a permanent "reconnecting" state.
+/// client in a permanent "reconnecting" state.
 fn turn() -> Vec<RuntimeEvent> {
     vec![
         RuntimeEvent::UserMessageAdded {
@@ -152,7 +152,7 @@ fn turn() -> Vec<RuntimeEvent> {
 fn the_transcript_golden_matches_the_types() {
     let document = serde_json::json!({
         "note": "One session as the runtime really emits it. Replayed by \
-                 apps/leveler-mobile/test/transcript_golden_test.dart; a client that \
+                 crates/leveler-client-protocol/tests/event_transcript_golden.rs; a client that \
                  mis-reads a field fails there instead of showing a user an empty bubble.",
         "snapshot": snapshot(),
         "turn": turn(),
@@ -169,8 +169,8 @@ fn the_transcript_golden_matches_the_types() {
                 {"role": "assistant", "text": "等于 2"},
                 // A notification is the host speaking, not the assistant. It
                 // belongs in the transcript as an aside — dropping it, which is
-                // what the mobile client used to do, loses the one channel the
-                // host has for telling a user something outside an answer.
+                // what a client used to do, loses the one channel the host has
+                // for telling a user something outside an answer.
                 {"role": "notice", "text": "顺带一提"},
             ],
             // The point of the whole file: an ordinary turn must not leave a
@@ -198,7 +198,7 @@ fn the_transcript_golden_matches_the_types() {
     });
     assert_eq!(
         current, rendered,
-        "the event shapes changed; regenerate and update the mobile client:\n  \
+        "the event shapes changed; regenerate and update every client replaying it:\n  \
          UPDATE_GOLDEN=1 cargo test -p leveler-client-protocol --test event_transcript_golden"
     );
 }

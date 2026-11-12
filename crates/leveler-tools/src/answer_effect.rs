@@ -4,7 +4,7 @@
 //! message the turn ends on is the answer, and a *work* call after a message
 //! proves that message was interim narration instead. Deciding that inside each
 //! renderer made the classification a second truth source — the TUI owned it
-//! and Web, Desktop and the mobile App each copied it.
+//! and Web, Desktop and other clients each copied it.
 //!
 //! This module is the single owner. The runtime stamps the outcome onto every
 //! `ToolCallStarted` it projects to a client (`leveler_tools::acts_on_answer`

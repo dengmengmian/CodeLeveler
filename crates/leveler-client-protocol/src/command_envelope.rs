@@ -1,6 +1,6 @@
 //! Command delivery, idempotency, and crash-window recovery (M5).
 //!
-//! A future remote client (mobile → cloud → local daemon) delivers commands
+//! A future remote client (remote client → local daemon) delivers commands
 //! over an unreliable link, so delivery is **at-least-once**: the same command
 //! may arrive more than once. That is safe for *records* (dedup by
 //! `command_id`) but does **not** make arbitrary *side effects* exactly-once —

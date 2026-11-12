@@ -1238,23 +1238,7 @@ pub(crate) async fn cmd_tui(
             // screen is not the one the user last chose.
             model_notice,
         };
-        // A phone can be served over this connection.
-        //
-        // `/remote` used to refuse here on the grounds that the TUI does not own
-        // a runtime. It does not need to own one: the daemon on the other end of
-        // this socket *is* a `LocalRuntimeService`, and it is on this machine —
-        // the socket is a file in this repository's state directory. Refusing
-        // meant that opening a TUI in a repository where `leveler serve` was
-        // already running made the whole feature unreachable, with a message
-        // about a "remote daemon" that named the one case this is not.
         let runtime_service: Arc<dyn leveler_local_transport::LocalRuntimeService> = client.clone();
-        let remote_launcher = crate::remote_invite::launcher(
-            runtime_service.clone(),
-            layout.require_workspace()?.to_path_buf(),
-            leveler_remote_agent::RemoteHome::new(
-                leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
-            ),
-        );
         let web_shutdown = CancellationToken::new();
         let web_launcher = make_web_launcher(
             runtime_service,
@@ -1266,7 +1250,6 @@ pub(crate) async fn cmd_tui(
             client,
             Some(web_launcher),
             Some(make_url_opener()),
-            Some(remote_launcher),
             Some(crate::clean_cmd::clean_host()),
             boot,
         )
@@ -1364,10 +1347,7 @@ pub(crate) async fn cmd_tui(
     // current repository.
     let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
-    let remote_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
-        in_process_client.clone();
     let quit_client = in_process_client.clone();
-    let remote_repo_root = app.layout.require_workspace()?.to_path_buf();
     let web_shutdown = CancellationToken::new();
     let web_launcher = make_web_launcher(
         web_service,
@@ -1409,21 +1389,10 @@ pub(crate) async fn cmd_tui(
         model_notice,
     };
 
-    // `/remote`: the agent serves paired phones over this same in-process
-    // runtime, so remote access lives exactly as long as this session.
-    let remote_launcher = crate::remote_invite::launcher(
-        remote_service,
-        remote_repo_root,
-        leveler_remote_agent::RemoteHome::new(
-            leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
-        ),
-    );
-
     let exit = leveler_tui::run(
         client,
         Some(web_launcher),
         Some(make_url_opener()),
-        Some(remote_launcher),
         Some(crate::clean_cmd::clean_host()),
         boot,
     )

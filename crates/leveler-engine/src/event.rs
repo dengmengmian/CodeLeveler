@@ -1036,8 +1036,8 @@ impl EngineEvent {
     /// How far this event may travel beyond the local machine. Local execution
     /// keeps everything; a future cloud control-plane projection (M6/M7) may
     /// carry only [`DataClass::Projectable`] events — lifecycle, status, phase,
-    /// verifier verdicts, and the approval/clarification control surface a phone
-    /// needs. [`DataClass::LocalOnly`] events embed source code, model output,
+    /// verifier verdicts, and the approval/clarification control surface a remote
+    /// client needs. [`DataClass::LocalOnly`] events embed source code, model output,
     /// tool output, or full conversation context and must never enter a syncable
     /// projection.
     ///

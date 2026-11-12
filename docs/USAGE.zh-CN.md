@@ -129,5 +129,3 @@ X-API-Key = "DEVORDER_MCP_API_KEY"
 ## 排查问题
 
 先运行 `leveler doctor` 检查模型、终端和系统能力；`leveler trace` 查看会话记录。分享记录前请检查是否含有私密内容。
-
-移动端仍是冻结的源码预览，没有正式安装包。远程会话流量经过 relay，目前没有端到端加密；评估时应自行部署 relay。
