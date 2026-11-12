@@ -227,9 +227,14 @@ try {
   assert.equal(facts(id).messages.length, 1, 'durable replay wrote full history back into model context');
   phase = 'continue'; await sendUI('继续'); await poll('ordinary continuation after compact', () => snapshot(id), value => value.messages.some(message => message.text.includes('CONTINUATION_AFTER_COMPACT')) && value.task_status !== 'running');
   const afterResume = facts(id); const resumePayload = { kind: afterResume.turns.at(-1)?.kind, payload: JSON.parse(afterResume.turns.at(-1)?.payload ?? '{}') };
-  assert.ok(afterResume.turns.length > durableBefore.turns.length, 'continuation turn not persisted');
-  assert.equal(resumePayload.payload.continuation_root_turn_id, durableBefore.turns[0].id);
-  assert.equal(resumePayload.payload.objective.primary, '看下现在最新模型，同步更新配置');
+  assert.equal(afterResume.turns.length, durableBefore.turns.length + 1, 'continuation turn not persisted');
+  // The runtime never reads the user's wording as a control signal. An
+  // ordinary message after compaction starts an ordinary chat turn: it names
+  // its own objective and carries no continuation anchor. Continuing a goal
+  // requires the model's structured declaration inside the turn.
+  assert.equal(resumePayload.kind, 'chat');
+  assert.equal(resumePayload.payload.continuation_root_turn_id, undefined);
+  assert.equal(resumePayload.payload.objective.primary, '继续');
   const continuationRequest = requests.find(request => request.phase === 'continue' && request.body.stream === true && request.body.tools?.length);
   assert.ok(continuationRequest, 'actual continuation model request missing');
   assert.ok(continuationRequest.body.messages.some(message => message.role === 'user' && message.content === compactSnapshot.messages[0].text), 'actual model request did not receive the compacted summary');
