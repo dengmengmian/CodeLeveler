@@ -128,8 +128,10 @@ pub(crate) struct RetryPolicy {
     pub max_retries: u32,
     /// Multiplies every computed delay. `0.0` makes retries immediate.
     pub delay_scale: f64,
-    /// Wall-clock ceiling for the whole recovery, from the round's first
-    /// attempt. `None` = the retry count alone bounds it.
+    /// Wall-clock ceiling for the recovery phase, from the round's first
+    /// attempt. It bounds the backoff waits and each retry attempt; the first
+    /// attempt keeps the provider's request/stream timeout so a normal long
+    /// generation is not cut short. `None` = the retry count alone bounds it.
     pub recovery_window: Option<Duration>,
 }
 
@@ -259,14 +261,25 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
 ) -> Result<ModelRound, O::Error> {
     let mut retries = 0u32;
     let started = std::time::Instant::now();
+    let recovery_deadline = policy.recovery_window.map(|window| started + window);
     loop {
         if cancellation.is_cancelled() {
             return Err(AgentCoreError::Cancelled.into());
         }
-        if request
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
+        // A retry runs on the recovery clock: when the window's remaining time
+        // is shorter than the provider's own request timeout, the attempt is
+        // clipped to what is left instead of hanging past the promised bound.
+        // The first attempt keeps the provider's deadline — clipping a normal
+        // long stream to a recovery wall-clock would be a different contract.
+        let attempt_deadline = match (retries > 0, recovery_deadline) {
+            (true, Some(window_deadline)) => Some(
+                request
+                    .deadline
+                    .map_or(window_deadline, |deadline| deadline.min(window_deadline)),
+            ),
+            _ => request.deadline,
+        };
+        if attempt_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(AgentCoreError::Model(ModelError::new(
                 ModelErrorKind::Timeout,
                 "model request deadline elapsed",
@@ -279,9 +292,11 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
         let mut observed_usage = None;
         let mut output_estimate = leveler_model::TokenEstimate::new();
         let mut diagnostics = AttemptDiagnostics::default();
+        let mut attempt_request = request.clone();
+        attempt_request.deadline = attempt_deadline;
         let outcome = stream_round(
             runtime,
-            request.clone(),
+            attempt_request,
             cancellation,
             &mut |event| observer.on_event(event),
             &mut observed_usage,
@@ -1255,6 +1270,95 @@ mod retry_decision_tests {
         };
         assert_eq!(*calls.lock().unwrap(), 1, "no retry fits the window");
         assert_eq!(error.retry_attempts, Some(0));
+    }
+
+    /// The recovery window also bounds the attempt itself: when only a short
+    /// window is left, a retry that hangs must not run past it waiting for the
+    /// provider's own (longer) timeout. The first attempt keeps the provider
+    /// deadline; every retry is clipped to the recovery deadline.
+    #[tokio::test]
+    async fn a_hanging_retry_is_bounded_by_the_recovery_window() {
+        struct FailsThenHangs {
+            calls: Arc<Mutex<u32>>,
+            retry_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelRuntime for FailsThenHangs {
+            async fn generate(
+                &self,
+                _: ModelRequest,
+                _: CancellationToken,
+            ) -> Result<leveler_model::ModelResponse, ModelError> {
+                unimplemented!()
+            }
+            async fn stream(
+                &self,
+                request: ModelRequest,
+                _: CancellationToken,
+            ) -> Result<leveler_model::ModelEventStream, ModelError> {
+                let n = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                if n == 1 {
+                    return Err(connection_refused());
+                }
+                *self.retry_deadline.lock().unwrap() = request.deadline;
+                std::future::pending().await
+            }
+            async fn profile(
+                &self,
+                _: &ModelRef,
+            ) -> Result<leveler_model::ModelProfile, ModelError> {
+                unimplemented!()
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(0));
+        let retry_deadline = Arc::new(Mutex::new(None));
+        let runtime = FailsThenHangs {
+            calls: calls.clone(),
+            retry_deadline: retry_deadline.clone(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_model_round_with(
+                &runtime,
+                request(),
+                &CancellationToken::new(),
+                &mut |_| {},
+                RetryPolicy {
+                    max_retries: MAX_RETRIES,
+                    delay_scale: 0.0,
+                    recovery_window: Some(Duration::from_millis(300)),
+                },
+            ),
+        )
+        .await
+        .expect("the hanging retry must be cut at the recovery deadline, not hang");
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "one failure and one clipped retry"
+        );
+        let deadline = retry_deadline
+            .lock()
+            .unwrap()
+            .expect("the retry attempt carries the recovery deadline");
+        assert!(
+            deadline <= std::time::Instant::now() + Duration::from_millis(50),
+            "the retry deadline is the remaining recovery window, not a fresh provider timeout"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(AgentCoreError::Model(ModelError { ref kind, .. }))
+                    if *kind == ModelErrorKind::Timeout
+            ),
+            "a clipped attempt reports a timeout: {result:?}"
+        );
     }
 
     /// The original outage outlasted what one turn was willing to wait, so the

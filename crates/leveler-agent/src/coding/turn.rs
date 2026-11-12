@@ -1272,7 +1272,33 @@ mod goal_verification_replay_tests {
         let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
         SessionRepository::new(&db).create(&record).await.unwrap();
         let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
         let goal = leveler_core::GoalId::new("goal-replay");
+        append_command_call(
+            &stores,
+            &session,
+            &goal,
+            "call-1",
+            "cargo test",
+            is_error,
+            exit_code,
+            preview,
+        )
+        .await;
+        (stores, session, goal)
+    }
+
+    /// Append one goal turn whose only command call ended with `finished`.
+    async fn append_command_call(
+        stores: &EngineStores,
+        session: &SessionId,
+        goal: &leveler_core::GoalId,
+        call_id: &str,
+        command: &str,
+        is_error: bool,
+        exit_code: Option<i32>,
+        preview: &str,
+    ) {
         let payload = serde_json::json!({
             "version": 2,
             "initiating_message": null,
@@ -1281,17 +1307,16 @@ mod goal_verification_replay_tests {
             "goal_id": goal,
         })
         .to_string();
-        let stores = EngineStores::from_database(&db);
         let turn = stores
             .turns
-            .start(&session, "goal", Some(&payload), leveler_core::now())
+            .start(session, "goal", Some(&payload), leveler_core::now())
             .await
             .unwrap();
         let turn_id = leveler_core::TurnId::new(turn.id);
         let started = EngineEvent::ToolCallStarted {
-            call_id: "call-1".into(),
+            call_id: call_id.into(),
             name: "shell_command".into(),
-            arguments: serde_json::json!({"cmd": "cargo test"}).to_string(),
+            arguments: serde_json::json!({"cmd": command}).to_string(),
             parallel: false,
             risk: None,
             agent_id: None,
@@ -1300,7 +1325,7 @@ mod goal_verification_replay_tests {
         stores
             .events
             .append(
-                &session,
+                session,
                 Some(&turn_id),
                 "tool_call_started",
                 &serde_json::to_string(&started).unwrap(),
@@ -1309,7 +1334,7 @@ mod goal_verification_replay_tests {
             .await
             .unwrap();
         let finished = EngineEvent::ToolCallFinished {
-            call_id: "call-1".into(),
+            call_id: call_id.into(),
             name: "shell_command".into(),
             is_error,
             preview: preview.into(),
@@ -1321,7 +1346,7 @@ mod goal_verification_replay_tests {
         stores
             .events
             .append(
-                &session,
+                session,
                 Some(&turn_id),
                 "tool_call_finished",
                 &serde_json::to_string(&finished).unwrap(),
@@ -1329,7 +1354,48 @@ mod goal_verification_replay_tests {
             )
             .await
             .unwrap();
-        (stores, session, goal)
+    }
+
+    /// Runs are rebuilt from the events of the requested goal's lineage only.
+    /// The same command under another goal is that goal's evidence; it cannot
+    /// vouch for this one, regardless of the command text being equal.
+    #[tokio::test]
+    async fn another_goals_command_is_not_this_goals_evidence() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
+        let this_goal = leveler_core::GoalId::new("goal-this");
+        let other_goal = leveler_core::GoalId::new("goal-other");
+        append_command_call(
+            &stores,
+            &session,
+            &this_goal,
+            "call-this",
+            "cargo test",
+            false,
+            Some(0),
+            "ok",
+        )
+        .await;
+        append_command_call(
+            &stores,
+            &session,
+            &other_goal,
+            "call-other",
+            "cargo test",
+            false,
+            Some(0),
+            "ok",
+        )
+        .await;
+
+        let runs = load_goal_verification_runs(&stores, &session, &this_goal)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].call_id.as_deref(), Some("call-this"));
     }
 
     /// A crash-window acknowledgement is recovery control, not a tool result:

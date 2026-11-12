@@ -1038,10 +1038,18 @@ async fn progressive_initial_surface_inventory() {
     // 9200 (was 8750): `update_goal` now spells out yield, a user_decision
     // block, and the rule that a decision is asked before it is declared.
     // Those sentences are the cross-window and durable-question contract.
-    // The initial tool count stays 20. Measured schema is 9045 tokens.
-    // 155 tokens of headroom still rejects one new field-sized surface.
+    // The initial tool count stays 20. Measured schema was 9045 tokens.
+    //
+    // The 9200 pin is withdrawn: the growth was not a new capability, it was
+    // the same facts written twice inside one definition. The command tools'
+    // descriptions restated their own `timeout_seconds`, `background`, and
+    // `background_lifetime` docs, and `update_goal`'s status/blocked_kind
+    // enums restated the prose above them. Removing the duplicate copy keeps
+    // every fact (each now has one authoritative field description) and
+    // measures 8542 tokens, so the fixed 8750 ceiling again holds. 208 tokens
+    // of headroom still rejects one new field-sized surface.
     assert!(
-        schema_tokens <= 9200,
+        schema_tokens <= 8750,
         "initial schema grew beyond its fixed budget: {schema_tokens}"
     );
     assert!(initial.tools.len() < full.tools.len());

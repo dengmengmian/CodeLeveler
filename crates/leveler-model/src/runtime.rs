@@ -22,18 +22,20 @@ pub type ModelEventStream = Pin<Box<dyn Stream<Item = Result<ModelEvent, ModelEr
 pub const DEFAULT_MAX_RETRIES: u32 = 12;
 
 /// Wall-clock ceiling for one logical request's recovery, measured from its
-/// first attempt. It bounds the whole retry lifecycle, so a provider that is
-/// slow *and* failing cannot multiply attempts into an unbounded wait.
+/// first attempt. It bounds the backoff waits and each retry attempt, so a
+/// provider that is slow *and* failing cannot multiply attempts into an
+/// unbounded wait. The first attempt itself is bounded only by the provider's
+/// request/stream timeout: recovery never shortens normal long generation.
 pub const DEFAULT_RECOVERY_SECONDS: u64 = 600;
 
 /// The bounded recovery budget a route advertises for one logical model
 /// request.
 ///
-/// This is the overall bound, not a per-attempt one: a single physical attempt
-/// is bounded by the provider's own request/stream timeouts. A retry is only
-/// spent on failures the delivery truth classifies as recoverable; a permanent
-/// error (`Auth`, `InvalidRequest`, `Decode`, …) ends the request immediately
-/// whatever this budget says.
+/// A retry is only spent on failures the delivery truth classifies as
+/// recoverable; a permanent error (`Auth`, `InvalidRequest`, `Decode`, …) ends
+/// the request immediately whatever this budget says. The first physical
+/// attempt is bounded by the provider's own request/stream timeout; every
+/// retry is additionally clipped to the remaining recovery window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryBudget {
@@ -41,8 +43,10 @@ pub struct RetryBudget {
     /// transiently. `0` disables automatic recovery.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
-    /// Wall-clock ceiling for the whole recovery, measured from the logical
-    /// request's first attempt. `None` = the retry count alone bounds it.
+    /// Wall-clock ceiling for retries, measured from the logical request's
+    /// first attempt. It bounds both the backoff waits and each retry
+    /// attempt's execution; the first attempt is bounded by the provider's
+    /// request/stream timeout. `None` = the retry count alone bounds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_seconds: Option<u64>,
 }

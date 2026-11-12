@@ -78,20 +78,8 @@ impl Tool for ShellCommandTool {
          system `/tmp`; other host paths are not writable. Reads of system and toolchain paths \
          are allowed. Writes outside the workspace, other user directories, \
          and readonly roots require approval outside full-access mode. \
-         A foreground command with no `timeout_seconds` still running after 15 \
-         seconds is moved to the background and this tool returns a task id \
-         while the process keeps running. That is not success, and the move \
-         does not kill it. Set `timeout_seconds` to wait for a command: a \
-         deadline up to the 120-second foreground ceiling ends it in this call; \
-         a longer deadline is waited for up to that ceiling, then the \
-         still-running process moves to the background and the deadline \
-         continues to follow it. Set `background` \
-         true to start a long-lived service in the background immediately. \
-         `background_lifetime` decides what stops it — `goal` (the default) stops \
-         it when the goal finishes, so a service the user asked to keep running \
-         needs `session` or `persistent`; a foreground command that is moved to the \
-         background keeps the lifetime you set. `wait_task` reads the eventual \
-         result and does not kill the task when its own bound expires. `&` and nohup require \
+         The `background`, `timeout_seconds`, and `background_lifetime` fields \
+         describe background and deadline behavior. `&` and nohup require \
          approval outside full-access mode. A `#` comment does \
          not hide a following command from the shell."
     }
