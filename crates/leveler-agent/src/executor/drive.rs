@@ -30,7 +30,7 @@ use super::dispatch::{
 use super::host::AdmitError;
 use super::{
     AbortedFacts, AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, DriveAborted,
-    Executor, ModelRequestRecord, StopReason, TranscriptSink,
+    Executor, ModelRequestRecord, StopReason, TranscriptSink, UserAuthority,
 };
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::executor::scope_gate;
@@ -332,6 +332,10 @@ pub(crate) struct Drive<'a> {
     /// The newest user directive this window has delivered to the model.
     /// A structured intent declaration must quote a span of it.
     latest_user_input: String,
+    /// Clarification answers a person gave in this session (seeded from the
+    /// durable request/answer pair, plus the answers this window receives).
+    /// Only these tool results carry user authority for a requirement quote.
+    clarification_answers: Vec<super::ClarificationAnswer>,
     /// The model declared the newest input a question about the goal rather
     /// than an authorization to continue it. This window only answers.
     answer_only: bool,
@@ -1096,6 +1100,7 @@ impl Executor {
             settled_rounds: 0,
             terminal_answer: None,
             latest_user_input,
+            clarification_answers: self.seeded_clarification_answers.clone(),
             answer_only: false,
             cancelled_goal: None,
             delivery_followup_issued: false,
@@ -2477,7 +2482,7 @@ impl Drive<'_> {
     /// over the recorded requirement history. The model supplies the reading;
     /// the runtime supplies identity, order and durability.
     async fn apply_scope_change(&mut self, call: &ToolCall) -> Result<String, IntentCall> {
-        use leveler_lifecycle::{ScopeDeclaration, quote_is_in_input};
+        use leveler_lifecycle::ScopeDeclaration;
 
         let Some(binder) = self.executor.goal_binder().cloned() else {
             return Err(IntentCall::Refused(
@@ -2501,13 +2506,20 @@ impl Drive<'_> {
                      `op`, `source_quote` or `source_span`, and the fields its op requires."
             ))
         })?;
+        let objective = self.objective.text();
+        let authority = super::UserAuthority::new(
+            &objective,
+            &self.latest_user_input,
+            &self.clarification_answers,
+        );
         for operation in &declaration.operations {
             let quote = operation.source_quote().trim();
-            if !quote_is_in_input(quote, &self.latest_user_input) {
+            if !authority.authorizes_scope_change(quote) {
                 return Err(IntentCall::Refused(format!(
-                    "the scope operation quotes text that is not in the newest user message. \
-                     Fix: quote the user's own words exactly, or set `source_span` to the \
-                     1-based line range that contains them. Newest user message: \"{}\"",
+                    "the scope operation quotes text that is in neither the newest user message \
+                     nor an answer you received from the user. Fix: quote the user's own words \
+                     exactly, or set `source_span` to the 1-based line range that contains them. \
+                     Newest user message: \"{}\"",
                     leveler_core::truncate_head_bytes(&self.latest_user_input, 400, "…")
                 )));
             }
@@ -4744,7 +4756,13 @@ impl AgentHarness for Drive<'_> {
                             .to_string(),
                     )
                 } else {
-                    match parse_commit_declaration(&call.arguments, self.objective.text()) {
+                    let objective = self.objective.text();
+                    let authority = super::UserAuthority::new(
+                        &objective,
+                        &self.latest_user_input,
+                        &self.clarification_answers,
+                    );
+                    match parse_commit_declaration(&call.arguments, &authority) {
                         Ok(declaration) => {
                             // The durable objective is the user's own request, not the
                             // model's restatement. Its structured requirements are
@@ -5287,7 +5305,10 @@ impl AgentHarness for Drive<'_> {
                     // every completion attempt, accepted or refused: a refused
                     // attempt's declaration is the answer candidate, and a
                     // revision must be able to replace an earlier candidate.
-                    let claim = match super::goal_verification::parse_claim(&call.arguments) {
+                    let claim = match super::goal_verification::parse_claim(
+                        &call.arguments,
+                        &self.verification_runs,
+                    ) {
                         Ok(claim) => claim,
                         Err(message) => {
                             self.note_refused_completion(
@@ -5609,7 +5630,10 @@ impl AgentHarness for Drive<'_> {
                     parallel: false,
                     model_step: Some(model_steps),
                 });
-                let answer = self.executor.handle_ask_user(&call, &cancellation).await?;
+                let reply = self.executor.handle_ask_user(&call, &cancellation).await?;
+                if let Some(answer) = reply.answer {
+                    self.clarification_answers.push(answer);
+                }
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
@@ -5619,14 +5643,14 @@ impl AgentHarness for Drive<'_> {
                     // The answer IS the result. It is short, user-written, and
                     // the only thing worth reading — never truncated to a
                     // preview budget meant for command output.
-                    preview: answer.clone(),
+                    preview: reply.content.clone(),
                     is_error: false,
                     applied_diff: None,
                 });
                 results[index] = Some(ContentPart::ToolResult {
                     result: ToolResultContent {
                         call_id: call.id,
-                        content: answer,
+                        content: reply.content,
                         is_error: false,
                     },
                 });
@@ -8845,9 +8869,9 @@ fn resolve_scope_source_spans(
 
 fn parse_commit_declaration(
     arguments: &serde_json::Value,
-    user_objective: &str,
+    authority: &UserAuthority<'_>,
 ) -> Result<CommitDeclaration, String> {
-    let user_objective = user_objective.trim();
+    let user_objective = authority.objective().trim();
     let objective = if user_objective.is_empty() {
         match arguments.get("objective") {
             None => {
@@ -8967,27 +8991,29 @@ fn parse_commit_declaration(
 
     let raw_requirements = arguments.get("requirements");
     if user_objective.is_empty()
+        && !authority.has_answers()
         && raw_requirements
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| !items.is_empty())
     {
         return Err(
-            "`requirements` needs a user message to quote, but this turn carries no user \
-             message text. Fix: commit without requirements, or declare them in a turn that \
-             carries the user's own words."
+            "`requirements` needs a user message or an answer to quote, but this turn carries \
+             neither. Fix: commit without requirements, or declare them in a turn that carries \
+             the user's own words."
                 .to_string(),
         );
     }
     let requirements = parse_commit_requirements(raw_requirements, user_objective)?;
     if !requirements.is_empty() {
         for (index, seed) in requirements.iter().enumerate() {
-            if !leveler_lifecycle::quote_is_in_input(&seed.source_quote, user_objective) {
+            if !authority.authorizes_requirement(&seed.source_quote) {
                 return Err(format!(
-                    "`requirements[{index}].source_quote` does not occur in the user's message. \
-                     The quote proves the requirement comes from the user; it must be copied \
-                     verbatim. Fix: quote the exact user words that state this requirement, or \
-                     set `source_quote` to a shorter verbatim fragment, or set `source_span` to \
-                     the 1-based line range that contains them so the runtime extracts the quote."
+                    "`requirements[{index}].source_quote` does not occur in the user's message \
+                     or in an answer you received from the user. The quote proves the requirement \
+                     comes from the user; it must be copied verbatim. Fix: quote the exact user \
+                     words that state this requirement, or set `source_quote` to a shorter \
+                     verbatim fragment, or set `source_span` to the 1-based line range that \
+                     contains them so the runtime extracts the quote."
                 ));
             }
             if let Some(check) = &seed.check
@@ -9142,8 +9168,20 @@ fn goal_refusal_preview(kind: &str, message: &str) -> String {
 
 #[cfg(test)]
 mod commit_declaration_tests {
-    use super::{parse_commit_declaration, resolve_scope_source_spans};
+    use super::{CommitDeclaration, UserAuthority, resolve_scope_source_spans};
     use serde_json::json;
+
+    /// The message-only authority these unit cases exercise; clarification
+    /// answers are covered by the integration tests.
+    fn parse_commit_declaration(
+        arguments: &serde_json::Value,
+        user_message: &str,
+    ) -> Result<CommitDeclaration, String> {
+        super::parse_commit_declaration(
+            arguments,
+            &UserAuthority::new(user_message, user_message, &[]),
+        )
+    }
 
     fn acceptance() -> serde_json::Value {
         json!(["go test ./... 通过"])

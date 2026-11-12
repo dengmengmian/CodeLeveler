@@ -412,7 +412,8 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
     let description = String::from(
         "Change this goal's recorded requirements when the user's newest message adds, \
             amends, replaces, waives or restores something. Every operation needs \
-            `source_quote` or `source_span` naming the part of the user's newest message that \
+            `source_quote` or `source_span` naming the part of the user's newest message or \
+            of their answer to your question that \
             carries the change — the runtime checks the quote really occurs there (a span is \
             extracted from the message itself), so never paraphrase or invent one. Use \
             requirement ids from \
@@ -466,7 +467,7 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             },
                             "source_quote": {
                                 "type": ["string", "null"],
-                                "description": "Verbatim span of the user's newest message that states this change. Whitespace differences are tolerated; paraphrases are not. Required: write the quote, or `null` only when you use `source_span`."
+                                "description": "Verbatim span of the user's newest message or of their answer to your question that states this change. Whitespace differences are tolerated; paraphrases are not. Required: write the quote, or `null` only when you use `source_span`."
                             },
                             "source_span": {
                                 "type": "object",
@@ -635,9 +636,9 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             objective, so `objective` is unused. \
             `acceptance` lists the concrete checks that will prove it. If the user stated \
             explicit deliverables or constraints, declare them in `requirements`, one entry \
-            each, with `source_quote` or `source_span` pointing at the user's message: that \
-            structured set is what the completion gate reads, and the runtime never re-derives \
-            it from prose. After the commit, the \
+            each, with `source_quote` or `source_span` pointing at the user's message or at \
+            their answer to your question: that structured set is what the \
+            completion gate reads, and the runtime never re-derives it from prose. After the commit, the \
             runtime keeps this turn running: a stage summary or a quiet end does NOT finish the \
             task. Continue the work and resolve it with update_goal(complete|blocked). Do not \
             substitute update_plan for the acceptance contract: a plan records intended steps, \
@@ -691,7 +692,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                             },
                             "source_quote": {
                                 "type": ["string", "null"],
-                                "description": "Verbatim span of the user's message that states it; the runtime checks it occurs there. Required: write the quote, or `null` only when you use `source_span`."
+                                "description": "Verbatim span of the user's message or of their answer to your question that states it; the runtime checks it occurs there. Required: write the quote, or `null` only when you use `source_span`."
                             },
                             "source_span": {
                                 "type": "object",

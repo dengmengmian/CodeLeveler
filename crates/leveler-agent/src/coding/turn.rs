@@ -189,6 +189,14 @@ pub async fn drive_turn(
         None
     };
     let is_goal_profile = matches!(profile, TurnProfile::Goal { .. });
+    // The user's answers to this session's questions survive a resume, a
+    // replay or a compaction. The transcript cannot stand in for them: an
+    // answer reaches the model as a tool result, and a tool result is not
+    // user authority. The durable request/answered pair is where the person's
+    // own words are recorded once.
+    let clarification_answers = load_clarification_answers(events.as_ref(), &session_id)
+        .await
+        .map_err(seed_failure)?;
     // The raw request text, when the caller has one. Resume turns carry no
     // new request, so they stay unclassified.
     let task_text: Option<String> = match &input {
@@ -234,7 +242,8 @@ pub async fn drive_turn(
                 verification_runs, ..
             } => verification_runs.clone(),
             TurnInput::Content { .. } => Vec::new(),
-        });
+        })
+        .with_clarification_answers(clarification_answers);
 
     // A resumed execution has no in-process file observations. Existing files
     // it wants to overwrite are unknown versions: require a fresh read first.
@@ -673,6 +682,63 @@ async fn load_coding_seeds(
         ledger: persisted_ledger(events, session_id, turn_ids).await?,
         progress: persisted_progress(events, session_id, turn_ids).await?,
     })
+}
+
+/// Every clarification answer the user actually gave in this session, in the
+/// order they gave it.
+///
+/// Only an `answered` terminal with non-empty text qualifies. A skipped,
+/// unattended, timed-out or cancelled request is the absence of a user reply,
+/// not an empty one, and becomes no authority at all. Rows written before the
+/// request carried its call identity stay usable — the person's text is still
+/// theirs — with the provenance left unbound.
+async fn load_clarification_answers(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+) -> Result<Vec<crate::executor::ClarificationAnswer>, EngineError> {
+    use std::collections::{HashMap, HashSet};
+
+    let rows = events
+        .load_by_types(
+            session_id,
+            &["clarification_requested", "clarification_answered"],
+        )
+        .await?;
+    let mut requests: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut terminals: HashSet<String> = HashSet::new();
+    let mut answers = Vec::new();
+    for row in rows {
+        match EngineEvent::from_payload(&row.payload)? {
+            EngineEvent::ClarificationRequested { id, call_id, .. } => {
+                requests.insert(id.into_inner(), (call_id, row.turn_id.clone()));
+            }
+            EngineEvent::ClarificationAnswered {
+                id,
+                answer,
+                outcome,
+            } => {
+                let id = id.into_inner();
+                // First terminal wins, matching the durable settle path: a
+                // second terminal for one request is a retry, not a second
+                // answer.
+                if !terminals.insert(id.clone()) {
+                    continue;
+                }
+                if outcome != "answered" || answer.trim().is_empty() {
+                    continue;
+                }
+                let (call_id, request_turn) = requests.get(&id).cloned().unwrap_or_default();
+                answers.push(crate::executor::ClarificationAnswer {
+                    id: leveler_core::ClarificationId::new(id),
+                    call_id,
+                    turn_id: row.turn_id.clone().or(request_turn),
+                    text: answer,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(answers)
 }
 
 pub(crate) fn seed_failure(error: EngineError) -> TurnFailure {
@@ -1507,5 +1573,139 @@ mod cross_scope_budget_tests {
         assert_eq!(reconciled.cumulative_commands, 4);
         assert_eq!(reconciled.cumulative_duration_ms, 9_000);
         assert_eq!(reconciled.cumulative_modified_files, 2);
+    }
+}
+
+#[cfg(test)]
+mod clarification_answer_tests {
+    use super::*;
+    use leveler_core::ClarificationId;
+    use leveler_storage::MemoryEventStore;
+
+    async fn append(
+        events: &MemoryEventStore,
+        session: &SessionId,
+        turn: &str,
+        event: EngineEvent,
+    ) {
+        let (event_type, payload) = event.to_row().unwrap();
+        events
+            .append(
+                session,
+                Some(&leveler_core::TurnId::new(turn)),
+                &event_type,
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn requested(id: &str, call_id: &str) -> EngineEvent {
+        EngineEvent::ClarificationRequested {
+            id: ClarificationId::new(id),
+            question: "媒体来源怎么存？".into(),
+            options: Vec::new(),
+            call_id: call_id.into(),
+            tool: "request_user_input".into(),
+            questions: Vec::new(),
+        }
+    }
+
+    fn answered(id: &str, answer: &str, outcome: &str) -> EngineEvent {
+        EngineEvent::ClarificationAnswered {
+            id: ClarificationId::new(id),
+            answer: answer.into(),
+            outcome: outcome.into(),
+        }
+    }
+
+    /// The person's answer is authority with the call that asked as its
+    /// provenance; a skip and an unattended request are the absence of an
+    /// answer, not an empty one.
+    #[tokio::test]
+    async fn only_an_answered_terminal_with_text_becomes_authority() {
+        let events = MemoryEventStore::new();
+        let session = SessionId::new("s1");
+        append(&events, &session, "t1", requested("c1", "call-7")).await;
+        append(
+            &events,
+            &session,
+            "t1",
+            answered("c1", "外链 URL 字段", "answered"),
+        )
+        .await;
+        append(&events, &session, "t1", requested("c2", "call-8")).await;
+        append(&events, &session, "t1", answered("c2", "", "skipped")).await;
+        append(&events, &session, "t1", requested("c3", "call-9")).await;
+        append(&events, &session, "t1", answered("c3", "", "unattended")).await;
+
+        let answers = load_clarification_answers(&events, &session).await.unwrap();
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0].text, "外链 URL 字段");
+        assert_eq!(answers[0].call_id, "call-7");
+        assert_eq!(answers[0].turn_id.as_deref(), Some("t1"));
+    }
+
+    /// An answer recorded before requests carried their call identity is still
+    /// the user's own text; only the provenance link is absent, never the
+    /// authority.
+    #[tokio::test]
+    async fn a_legacy_answer_without_a_request_row_stays_the_users_words() {
+        let events = MemoryEventStore::new();
+        let session = SessionId::new("s1");
+        append(
+            &events,
+            &session,
+            "t2",
+            answered("c1", "用外链", "answered"),
+        )
+        .await;
+
+        let answers = load_clarification_answers(&events, &session).await.unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].text, "用外链");
+        assert_eq!(answers[0].call_id, "");
+        assert_eq!(answers[0].turn_id.as_deref(), Some("t2"));
+    }
+
+    /// A second terminal for one request is a retry of that answer, not a
+    /// second thing the user said.
+    #[tokio::test]
+    async fn a_second_terminal_is_ignored() {
+        let events = MemoryEventStore::new();
+        let session = SessionId::new("s1");
+        append(&events, &session, "t1", requested("c1", "call-7")).await;
+        append(&events, &session, "t1", answered("c1", "外链", "answered")).await;
+        append(&events, &session, "t1", answered("c1", "内网", "answered")).await;
+
+        let answers = load_clarification_answers(&events, &session).await.unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].text, "外链");
+    }
+
+    /// Answers are scoped to the session that asked. Another session's user
+    /// text is not authority here even though it is user-authored there.
+    #[tokio::test]
+    async fn another_sessions_answer_is_not_authority() {
+        let events = MemoryEventStore::new();
+        let asked = SessionId::new("s1");
+        let other = SessionId::new("s2");
+        append(&events, &asked, "t1", requested("c1", "call-7")).await;
+        append(&events, &asked, "t1", answered("c1", "外链", "answered")).await;
+
+        assert!(
+            load_clarification_answers(&events, &other)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_clarification_answers(&events, &asked)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

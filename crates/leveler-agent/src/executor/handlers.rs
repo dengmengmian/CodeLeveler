@@ -141,6 +141,17 @@ fn child_limit(
     }
 }
 
+/// What one clarification call produced: the model-facing result and, when a
+/// person actually answered, the user-authored text with its provenance.
+///
+/// The two travel together because only this layer sees the outcome. Reading
+/// the result text back later cannot tell an answer from a skip note or from
+/// any other tool output.
+pub(crate) struct AskUserReply {
+    pub content: String,
+    pub answer: Option<super::ClarificationAnswer>,
+}
+
 impl Executor {
     /// Why a child pinned to `model` cannot run, if it cannot: the runtime
     /// does not resolve the model, or a cost cap is in force and the model
@@ -172,7 +183,7 @@ impl Executor {
         &self,
         call: &ToolCall,
         cancellation: &CancellationToken,
-    ) -> Result<String, AgentError> {
+    ) -> Result<AskUserReply, AgentError> {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
@@ -232,26 +243,40 @@ impl Executor {
         // unattended run or a timeout for "the user said nothing is needed".
         // The TUI recognizes these notes by their opening words to show the
         // user what happened (`unanswered_question_note`); keep them.
-        Ok(match outcome {
-            crate::executor::ClarifyOutcome::Answered(text) if !text.trim().is_empty() => text,
+        let (content, answer) = match outcome {
+            crate::executor::ClarifyOutcome::Answered(text) if !text.trim().is_empty() => {
+                let answer = super::ClarificationAnswer {
+                    id: request.id,
+                    call_id: request.call_id,
+                    turn_id: self.turn_id.as_ref().map(ToString::to_string),
+                    text: text.clone(),
+                };
+                (text, Some(answer))
+            }
             crate::executor::ClarifyOutcome::Answered(_) | crate::executor::ClarifyOutcome::Skipped => {
                 // One spelling of the skip note, shared with the durable
                 // recovery path that replays it.
-                leveler_execution::SKIPPED_NOTE.to_string()
+                (
+                    leveler_execution::SKIPPED_NOTE.to_string(),
+                    None,
+                )
             }
-            crate::executor::ClarifyOutcome::Unattended => {
+            crate::executor::ClarifyOutcome::Unattended => (
                 "No user is available to answer in this unattended run — this is NOT a user reply. \
                  Continue only if the task can be completed without this information; otherwise \
                  finish what is safely possible and state explicitly what is missing instead of guessing."
-                    .to_string()
-            }
-            crate::executor::ClarifyOutcome::TimedOut => {
+                    .to_string(),
+                None,
+            ),
+            crate::executor::ClarifyOutcome::TimedOut => (
                 "The user did not respond in time — this is NOT a user reply. Continue only if the \
                  task can proceed without the answer; otherwise state explicitly what is missing."
-                    .to_string()
-            }
+                    .to_string(),
+                None,
+            ),
             crate::executor::ClarifyOutcome::Cancelled => return Err(AgentError::Cancelled),
-        })
+        };
+        Ok(AskUserReply { content, answer })
     }
 
     /// Handle a `request_permissions` call: ask the user to approve elevated

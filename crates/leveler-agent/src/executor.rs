@@ -10,6 +10,8 @@ pub use handlers::DelegatedChildResult;
 pub(crate) mod host;
 /// Mechanical completion accounting for the structured requirement set.
 pub(crate) mod scope_gate;
+mod user_authority;
+pub(crate) use user_authority::{ClarificationAnswer, UserAuthority};
 
 use std::sync::Arc;
 
@@ -1530,6 +1532,10 @@ pub struct Executor {
     /// (resume / retry). The completion gate reads one task-wide record, not
     /// only the commands that happened to run after this window opened.
     seeded_verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+    /// Clarification answers the user actually gave in this session. The
+    /// requirement gate may quote them; every other tool result stays
+    /// untrusted agent-visible output.
+    seeded_clarification_answers: Vec<crate::executor::ClarificationAnswer>,
     /// Seeded progress (engine continue / resume).
     seeded_progress: ProgressLedger,
     /// Settlements from a previous window the host proved durable but the
@@ -1673,6 +1679,7 @@ impl Executor {
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_verification_runs: Vec::new(),
+            seeded_clarification_answers: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
@@ -1767,6 +1774,17 @@ impl Executor {
         runs: Vec<crate::executor::goal_verification::VerificationRun>,
     ) -> Self {
         self.seeded_verification_runs = runs;
+        self
+    }
+
+    /// Seed the clarification answers the user gave in this session. They are
+    /// user authority for requirement quotes across resume, replay and
+    /// compaction; the model-facing tool result is not.
+    pub(crate) fn with_clarification_answers(
+        mut self,
+        answers: Vec<crate::executor::ClarificationAnswer>,
+    ) -> Self {
+        self.seeded_clarification_answers = answers;
         self
     }
 
@@ -2294,6 +2312,7 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             // A child's commands are its own; they never prove the parent's goal.
             seeded_verification_runs: Vec::new(),
+            seeded_clarification_answers: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
             resumed_children: Vec::new(),
