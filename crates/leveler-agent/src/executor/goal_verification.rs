@@ -532,9 +532,15 @@ fn citable_commands(
 
 /// Parse the optional `verification` object from `update_goal` arguments.
 ///
+/// `runs` is the task's real execution record. It is the authority for what
+/// one execution was, so a multi-line command (a quoted `sh -c` script, a
+/// heredoc body) stays one citation instead of being cut at its newlines.
 /// A malformed declaration is an error the model can correct, never an
 /// implicit `not_applicable`.
-pub(crate) fn parse_claim(arguments: &serde_json::Value) -> Result<VerificationClaim, String> {
+pub(crate) fn parse_claim(
+    arguments: &serde_json::Value,
+    runs: &[VerificationRun],
+) -> Result<VerificationClaim, String> {
     let Some(verification) = arguments.get("verification") else {
         return Ok(VerificationClaim::Missing);
     };
@@ -548,20 +554,64 @@ pub(crate) fn parse_claim(arguments: &serde_json::Value) -> Result<VerificationC
         .and_then(|value| value.as_str())
         .unwrap_or("");
     match status {
-        "passed" => {
-            let commands = detail
-                .lines()
-                .map(str::trim)
-                .filter(|command| !command.is_empty() && !is_observation(command))
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            Ok(VerificationClaim::Passed(commands))
-        }
+        "passed" => Ok(VerificationClaim::Passed(claim_citations(detail, runs))),
         "not_applicable" => Ok(VerificationClaim::NotApplicable(detail.to_string())),
         other => Err(format!(
             "`verification.status` must be \"passed\" or \"not_applicable\" (got \"{other}\")"
         )),
     }
+}
+
+/// Split a `passed` detail into citations, using the recorded executions as
+/// the grouping authority.
+///
+/// The model declares one citation per line, but a command may itself span
+/// lines. Reading such a command line by line invents citations out of its
+/// middle: turn 19 of the recorded session cited the command it ran and was
+/// refused on `import re,sys`, a line inside a quoted `python3 -c` argument.
+/// Consecutive lines are therefore joined exactly when the joined text names
+/// a recorded run. No shell syntax is parsed and no command is classified: a
+/// line that is not part of a recorded execution remains its own citation
+/// and is checked — and refused — as one.
+fn claim_citations(detail: &str, runs: &[VerificationRun]) -> Vec<String> {
+    let lines: Vec<&str> = detail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut citations = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        // Prefer the longest span that names a recorded execution. The first
+        // line of a multi-line command can match as a window of its label,
+        // and stopping there would leave the rest of that command as invented
+        // citations.
+        let mut end = None;
+        for candidate in start..lines.len() {
+            if names_recorded_run(&lines[start..=candidate].join("\n"), runs) {
+                end = Some(candidate);
+            }
+        }
+        match end {
+            Some(end) => {
+                citations.push(lines[start..=end].join("\n"));
+                start = end + 1;
+            }
+            None => {
+                // An observation on its own line records what a command
+                // produced; it is not a citation.
+                if !is_observation(lines[start]) {
+                    citations.push(lines[start].to_string());
+                }
+                start += 1;
+            }
+        }
+    }
+    citations
+}
+
+fn names_recorded_run(cited: &str, runs: &[VerificationRun]) -> bool {
+    matches!(cited_run(cited, runs), CitedRun::Found(_))
 }
 
 /// Whether a line is an observation rather than a command.
@@ -1541,12 +1591,15 @@ mod tests {
     #[test]
     fn an_observation_line_is_not_a_cited_command() {
         let runs = vec![run("go test -count=1 ./...", true, 4, 2)];
-        let claim = parse_claim(&serde_json::json!({
-            "verification": {
-                "status": "passed",
-                "detail": "go test -count=1 ./...\n(exit 0; every package ok, no FAIL)"
-            }
-        }))
+        let claim = parse_claim(
+            &serde_json::json!({
+                "verification": {
+                    "status": "passed",
+                    "detail": "go test -count=1 ./...\n(exit 0; every package ok, no FAIL)"
+                }
+            }),
+            &runs,
+        )
         .expect("valid claim");
         assert_eq!(
             decide(&claim, &runs, &[], 2, true),
@@ -1757,31 +1810,196 @@ mod tests {
     #[test]
     fn claims_parse_only_their_two_explicit_shapes() {
         assert_eq!(
-            parse_claim(&serde_json::json!({})),
+            parse_claim(&serde_json::json!({}), &[]),
             Ok(VerificationClaim::Missing)
         );
         assert_eq!(
-            parse_claim(&serde_json::json!({
-                "verification": {"status": "passed", "detail": "go test ./...\ngo vet ./..."}
-            })),
+            parse_claim(
+                &serde_json::json!({
+                    "verification": {"status": "passed", "detail": "go test ./...\ngo vet ./..."}
+                }),
+                &[]
+            ),
             Ok(VerificationClaim::Passed(vec![
                 "go test ./...".into(),
                 "go vet ./...".into()
             ]))
         );
         assert_eq!(
-            parse_claim(&serde_json::json!({
-                "verification": {"status": "not_applicable", "detail": "docs"}
-            })),
+            parse_claim(
+                &serde_json::json!({
+                    "verification": {"status": "not_applicable", "detail": "docs"}
+                }),
+                &[]
+            ),
             Ok(VerificationClaim::NotApplicable("docs".into()))
         );
         assert!(
-            parse_claim(&serde_json::json!({
-                "verification": {"status": "maybe"}
-            }))
+            parse_claim(
+                &serde_json::json!({
+                    "verification": {"status": "maybe"}
+                }),
+                &[]
+            )
             .is_err()
         );
-        assert!(parse_claim(&serde_json::json!({"verification": {}})).is_err());
+        assert!(parse_claim(&serde_json::json!({"verification": {}}), &[]).is_err());
+    }
+
+    /// The command turn 19 of the recorded session ran and then cited. It is
+    /// one shell command whose text spans lines inside a double-quoted
+    /// `python3 -c` argument.
+    const TURN_19_COMMAND: &str = r#"rm -f frontend/scripts/__audit.mjs && echo "temp removed"; cd frontend && npm run typecheck 2>&1 | tail -3; for p in "/" "/announcements" "/opportunities" "/mission/first-site/0" "/auth/login" "/cocreate"; do printf "%-28s -> " "$p"; curl -sS -m 20 -o /tmp/pg.html -w "%{http_code}" "http://127.0.0.1:3000$p"; python3 -c "
+import re,sys
+h=open('/tmp/pg.html',encoding='utf-8',errors='ignore').read()
+t=re.sub(r'<[^>]+>',' ',h); t=re.sub(r'\s+',' ',t).strip()
+print(f'  text={len(t)}')
+"; done"#;
+
+    #[test]
+    fn a_recorded_multiline_command_is_one_citation_and_resolves() {
+        // Splitting `detail` by lines invented citations out of the middle of
+        // the quoted argument (`import re,sys`) and refused a completion whose
+        // check had really run under exactly this command.
+        let runs = vec![run(TURN_19_COMMAND, true, 21, 5)];
+        let claim = parse_claim(
+            &serde_json::json!({
+                "verification": {"status": "passed", "detail": TURN_19_COMMAND}
+            }),
+            &runs,
+        )
+        .expect("a well-formed claim");
+        assert_eq!(
+            claim,
+            VerificationClaim::Passed(vec![TURN_19_COMMAND.to_string()])
+        );
+        assert_eq!(
+            decide(&claim, &runs, &[], 5, true),
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
+        );
+        // Without that execution record the same text is not evidence: the
+        // grouping reads the record, never the shape of the shell text.
+        let unrecorded = parse_claim(
+            &serde_json::json!({
+                "verification": {"status": "passed", "detail": TURN_19_COMMAND}
+            }),
+            &[],
+        )
+        .expect("a well-formed claim");
+        assert!(matches!(
+            decide(&unrecorded, &[], &[], 5, true),
+            VerificationDecision::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn a_recorded_multiline_command_keeps_its_failure_and_freshness() {
+        // Grouping changes how the detail is read, never whether the cited
+        // execution passed or is current.
+        let failed = vec![run(TURN_19_COMMAND, false, 21, 5)];
+        let claim = parse_claim(
+            &serde_json::json!({
+                "verification": {"status": "passed", "detail": TURN_19_COMMAND}
+            }),
+            &failed,
+        )
+        .expect("a well-formed claim");
+        assert!(matches!(
+            decide(&claim, &failed, &[], 5, true),
+            VerificationDecision::Refuse(message) if message.contains("failed")
+        ));
+        let stale = vec![run(TURN_19_COMMAND, true, 21, 4)];
+        assert!(matches!(
+            decide(&claim, &stale, &[], 5, true),
+            VerificationDecision::Refuse(message) if message.contains("before the most recent")
+        ));
+    }
+
+    #[test]
+    fn a_heredoc_command_is_one_citation_but_separate_lines_stay_separate() {
+        let heredoc = "cat > /tmp/check.py <<'PY'\nimport sys\nprint('ok')\nPY";
+        let script = format!("{heredoc}\npython3 /tmp/check.py");
+        // One recorded execution for the whole script: the heredoc body and
+        // the command after it belong to that execution.
+        let whole = vec![run(&script, true, 4, 0)];
+        assert_eq!(
+            parse_claim(
+                &serde_json::json!({
+                    "verification": {"status": "passed", "detail": script}
+                }),
+                &whole
+            ),
+            Ok(VerificationClaim::Passed(vec![script.clone()]))
+        );
+        // Two recorded executions: the same text is two citations.
+        let separate = vec![
+            run(heredoc, true, 3, 0),
+            run("python3 /tmp/check.py", true, 4, 0),
+        ];
+        assert_eq!(
+            parse_claim(
+                &serde_json::json!({
+                    "verification": {"status": "passed", "detail": script}
+                }),
+                &separate
+            ),
+            Ok(VerificationClaim::Passed(vec![
+                heredoc.to_string(),
+                "python3 /tmp/check.py".to_string()
+            ]))
+        );
+        // Only the heredoc ran: the second line stays its own citation and is
+        // not silently absorbed into the recorded command.
+        let only_heredoc = vec![run(heredoc, true, 3, 0)];
+        let claim = parse_claim(
+            &serde_json::json!({
+                "verification": {"status": "passed", "detail": script}
+            }),
+            &only_heredoc,
+        )
+        .expect("a well-formed claim");
+        assert_eq!(
+            claim,
+            VerificationClaim::Passed(vec![
+                heredoc.to_string(),
+                "python3 /tmp/check.py".to_string()
+            ])
+        );
+        assert!(matches!(
+            decide(&claim, &only_heredoc, &[], 0, true),
+            VerificationDecision::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn an_unrecorded_line_is_its_own_citation_not_absorbed_into_the_previous_one() {
+        // A line that names no recorded execution is not a continuation of a
+        // recorded command just because it follows one.
+        let runs = vec![run("make lint", true, 4, 0)];
+        let claim = parse_claim(
+            &serde_json::json!({
+                "verification": {
+                    "status": "passed",
+                    "detail": "echo start # don't retry\nmake lint"
+                }
+            }),
+            &runs,
+        )
+        .expect("a well-formed claim");
+        assert_eq!(
+            claim,
+            VerificationClaim::Passed(vec![
+                "echo start # don't retry".to_string(),
+                "make lint".to_string()
+            ])
+        );
+        assert!(matches!(
+            decide(&claim, &runs, &[], 0, true),
+            VerificationDecision::Refuse(message) if message.contains("never ran")
+        ));
     }
 
     #[test]
