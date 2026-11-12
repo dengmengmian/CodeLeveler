@@ -44,7 +44,7 @@ fn test_env(base_url: &str) -> TestEnv {
     // guide. Auto-update is off so no test reaches the network.
     std::fs::write(
         home.join("config.toml"),
-        "default_model = \"mock/m\"\n\n[update]\nauto_update = false\n",
+        "default_model = \"mock/m\"\n\n[update]\nauto_update = false\n\n[retry]\nmax_retries = 0\n",
     )
     .unwrap();
     std::fs::write(

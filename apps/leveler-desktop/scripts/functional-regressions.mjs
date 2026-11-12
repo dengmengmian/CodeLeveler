@@ -52,11 +52,17 @@ const provider = createServer(async (request, response) => {
     response.write(`data: ${chunk({}, 'tool_calls')}\n\n`); response.end('data: [DONE]\n\n'); return;
   }
   if (userText.includes('ASK')) {
-    if (names.includes('request_user_input') && toolCount < 2) {
-      response.write(`data: ${chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'ask-1', type: 'function', function: { name: 'request_user_input', arguments: JSON.stringify({ question: '午餐吃什么？', options: ['面条', '米饭'] }) } }] }, null)}\n\n`);
-      response.write(`data: ${chunk({}, 'tool_calls')}\n\n`);
-    } else if (!names.includes('request_user_input')) {
+    // A human-attached turn now offers request_user_input on its first
+    // request; only a surface that hides it needs the capability step. Ask
+    // once either way, so the case proves one question is answered and the
+    // turn completes instead of scripting a second question.
+    const asked = body.messages.some(message => message.role === 'assistant'
+      && (message.tool_calls ?? []).some(call => call.function?.name === 'request_user_input'));
+    if (!names.includes('request_user_input')) {
       response.write(`data: ${chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'cap-1', type: 'function', function: { name: 'capability', arguments: JSON.stringify({ action: 'enable', id: 'host_interaction' }) } }] }, null)}\n\n`);
+      response.write(`data: ${chunk({}, 'tool_calls')}\n\n`);
+    } else if (!asked) {
+      response.write(`data: ${chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'ask-1', type: 'function', function: { name: 'request_user_input', arguments: JSON.stringify({ question: '午餐吃什么？', options: ['面条', '米饭'] }) } }] }, null)}\n\n`);
       response.write(`data: ${chunk({}, 'tool_calls')}\n\n`);
     } else {
       response.write(`data: ${chunk({ role: 'assistant', content: 'ASK-DONE' }, null)}\n\n`);
