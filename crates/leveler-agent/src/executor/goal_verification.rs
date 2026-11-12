@@ -233,6 +233,19 @@ pub(crate) fn decide(
                         run.model_step, later.model_step
                     ));
                 }
+                // A combined script is one recorded execution, but a command
+                // inside it can also run on its own later. Citing the older
+                // combined pass must not speak for the component's newer
+                // failure: the component's current state is the later run.
+                if let Some((component, later)) = later_failed_component(runs, run) {
+                    return VerificationDecision::Refuse(format!(
+                        "`{cited}` cites a combined execution from step {} that contains \
+                         `{component}`, but `{component}` ran again on its own at step {} and \
+                         failed. The combined pass is not current evidence for that command; \
+                         fix the failure or cite a check that still passes.",
+                        run.model_step, later.model_step
+                    ));
+                }
                 // A pass must judge the current tree. This applies to any cited
                 // command: the runtime does not know which commands are
                 // "verification", so it treats the model's own citation as the
@@ -305,6 +318,34 @@ fn later_failed_execution<'a>(
         .iter()
         .rev()
         .find(|run| run.label == cited.label && !run.ok)
+}
+
+/// The latest later failure of a command that the cited run contains.
+///
+/// A multi-line run is one execution whose labels are the script's lines. When
+/// one of those lines is later run on its own and fails, the newer record is
+/// that command's current state, and the older combined pass cannot stand in
+/// for it. Single-line runs have exactly one component and are covered by
+/// [`later_failed_execution`]; this only reports a line of a multi-line run.
+fn later_failed_component<'a>(
+    runs: &'a [VerificationRun],
+    cited: &VerificationRun,
+) -> Option<(&'a str, &'a VerificationRun)> {
+    let position = runs.iter().position(|run| std::ptr::eq(run, cited))?;
+    let components: Vec<&str> = cited
+        .label
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if components.len() < 2 {
+        return None;
+    }
+    runs[position + 1..]
+        .iter()
+        .rev()
+        .find(|run| !run.ok && components.contains(&run.label.trim()))
+        .map(|run| (run.label.trim(), run))
 }
 
 /// Why a citation is not an execution record, and what the model can do.
@@ -1972,6 +2013,52 @@ print(f'  text={len(t)}')
             decide(&claim, &only_heredoc, &[], 0, true),
             VerificationDecision::Refuse(_)
         ));
+    }
+
+    /// An earlier combined script that passed cannot hide a later failure of
+    /// one command inside it. Grouping reads the longest recorded window; when
+    /// that window is an older pass, the component's newer failed execution is
+    /// still the command's current state.
+    #[test]
+    fn a_later_failure_of_a_component_is_not_hidden_by_the_older_combined_pass() {
+        let combined = "make lint\nmake test";
+        let runs = vec![run(combined, true, 3, 1), run("make test", false, 7, 1)];
+        let claim = parse_claim(
+            &serde_json::json!({
+                "verification": {"status": "passed", "detail": combined}
+            }),
+            &runs,
+        )
+        .expect("a well-formed claim");
+        assert_eq!(
+            claim,
+            VerificationClaim::Passed(vec![combined.to_string()]),
+            "the two lines are one recorded execution"
+        );
+        let decision = decide(&claim, &runs, &[], 1, true);
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a later component failure must refuse the stale combined pass: {decision:?}");
+        };
+        assert!(message.contains("make test"), "{message}");
+        assert!(message.contains("step 7"), "{message}");
+    }
+
+    /// The same record cited by identity: `call_id` names the older combined
+    /// execution, so the component check must read that execution's own text.
+    #[test]
+    fn a_call_id_of_a_combined_pass_cannot_hide_a_later_component_failure() {
+        let combined = "make lint\nmake test";
+        let runs = vec![
+            run_id(combined, true, 3, 1, "combined"),
+            run_id("make test", false, 7, 1, "component"),
+        ];
+        let claim = VerificationClaim::Passed(vec!["call_id:combined".into()]);
+        let decision = decide(&claim, &runs, &[], 1, true);
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("the older combined id is not current evidence: {decision:?}");
+        };
+        assert!(message.contains("make test"), "{message}");
+        assert!(message.contains("step 7"), "{message}");
     }
 
     #[test]

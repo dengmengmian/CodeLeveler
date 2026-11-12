@@ -126,24 +126,8 @@ impl Tool for RunCommandTool {
          could not reach its service (check the endpoint or service named in stderr). \
          Temporary files are writable in the workspace, in `$TMPDIR`, \
          and under the system `/tmp`; other host paths are not writable. \
-         `background` true \
-         starts a long-running process and returns a task id for \
-         `get_task`, `wait_task`, and `kill_task`. Background processes stop \
-         when the goal finishes unless `background_lifetime` is `runtime`, \
-         which keeps the process owned by this runtime until it exits or is \
-         killed. Use `session` across runtime updates until its session is deleted; \
-         use `persistent` only when the user explicitly wants a service to \
-         survive runtime updates under the independent execution host. \
-         A foreground command with no `timeout_seconds` still running after 15 \
-         seconds is moved to the background with the lifetime you set (`goal` by \
-         default) and this tool returns a task id while the process keeps \
-         running. That is not success, and the move does not kill it. Set \
-         `timeout_seconds` to wait for a command: a deadline up to the \
-         120-second foreground ceiling ends it in this call; a longer deadline \
-         is waited for up to that ceiling, then the still-running process moves \
-         to the background and the deadline continues to follow it. `wait_task` \
-         reads the eventual result and does not kill the task when its own bound \
-         expires."
+         The `background`, `timeout_seconds`, and `background_lifetime` fields \
+         describe background and deadline behavior."
     }
 
     fn input_schema(&self) -> serde_json::Value {

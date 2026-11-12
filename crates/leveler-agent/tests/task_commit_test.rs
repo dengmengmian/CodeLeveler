@@ -2293,9 +2293,132 @@ async fn a_durable_clarification_answer_survives_into_a_later_window() {
     assert_eq!(items[0].text, "媒体来源使用外链 URL 字段");
 }
 
-/// A scope amendment may also quote the user's answer. The newest message
-/// still governs the window, but the answer the person just gave is part of
-/// the same conversation and states the changed requirement.
+/// An answer from an earlier window is not current scope authority once the
+/// user has spoken again. The user chose "外链 URL" through a question, then
+/// replaced that choice in a normal message: quoting the old answer must not
+/// amend the revoked requirement back into the recorded scope.
+#[tokio::test]
+async fn a_durable_answer_cannot_restore_a_requirement_after_the_user_changed_it() {
+    const REQUEST: &str = "改为创建 b.txt，不再使用之前的来源方案。";
+    const ANSWER: &str = "媒体来源：外链 URL 字段";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["b.txt 存在"],
+                    "requirements": [{
+                        "kind": "artifact",
+                        "text": "b.txt 存在",
+                        "target": "b.txt",
+                        "source_quote": "创建 b.txt"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [{
+                        "op": "add",
+                        "kind": "named",
+                        "text": "媒体来源使用外链 URL 字段",
+                        "source_quote": ANSWER
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "b.txt", "content": "b\n"}),
+            ),
+            Scripted::run_tests(),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "b.txt 已创建",
+                    "verification": {"status": "passed", "detail": test_runner_label()},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "created b.txt"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    // The answer was given before this window's newest message.
+    let stores = leveler_storage::EngineStores::from_database(&fx.db);
+    let request_id = leveler_core::ClarificationId::new("clarify-earlier");
+    for event in [
+        leveler_engine::EngineEvent::ClarificationRequested {
+            id: request_id.clone(),
+            question: "媒体来源怎么存？".into(),
+            options: Vec::new(),
+            call_id: "call-earlier".into(),
+            tool: "request_user_input".into(),
+            questions: Vec::new(),
+        },
+        leveler_engine::EngineEvent::ClarificationAnswered {
+            id: request_id,
+            answer: ANSWER.into(),
+            outcome: "answered".into(),
+        },
+    ] {
+        let (event_type, payload) = event.to_row().unwrap();
+        stores
+            .events
+            .append(
+                &fx.session,
+                None,
+                &event_type,
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "{report:?}");
+    let items = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the old answer restored a revoked requirement: {items:?}"
+    );
+    assert_eq!(items[0].text, "b.txt 存在");
+
+    let refusal = {
+        let requests = fx.runtime.requests.lock().unwrap();
+        requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("answer received after it"))
+            .expect("the refusal tells the model why the old answer is stale")
+    };
+    assert!(refusal.contains("newest user message"), "{refusal}");
+}
+
+/// A live answer still authorizes a scope amendment in the same window: it was
+/// given after the input it changes.
 #[tokio::test]
 async fn a_clarification_answer_authorizes_a_scope_amendment() {
     const REQUEST: &str = "把运营后台的媒体库接入到新系统。";

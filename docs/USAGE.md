@@ -15,7 +15,7 @@ A transient provider failure (connection refused or reset, a retryable timeout, 
 ```toml
 [retry]
 max_retries = 12        # retries after the first attempt; 0 disables automatic recovery
-recovery_seconds = 600  # wall-clock ceiling for the whole recovery, from the first attempt
+recovery_seconds = 600  # ceiling for retries (waits and attempts), from the first attempt
 ```
 
 A permanent error (authentication, an invalid request, a rejected conversation) is never retried. When the budget runs out the failure is reported as resumable: the task and its completed tool work are kept, and sending a new message continues from there.

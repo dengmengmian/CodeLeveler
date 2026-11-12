@@ -187,12 +187,12 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 "status": {
                     "type": "string",
                     "enum": ["complete", "blocked", "yield"],
-                    "description": "complete = done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what); yield = the objective still owes work and nothing obstructs it, but this work window ends here (the runtime continues the same goal in a new window)."
+                    "description": "complete = done, for the objective as stated; blocked = truly stuck, or the objective cannot be satisfied as written; yield = end this window, not the goal (see above)."
                 },
                 "blocked_kind": {
                     "type": "string",
                     "enum": ["external", "user_decision"],
-                    "description": "Only meaningful with status=blocked. `user_decision` when progress needs a decision or information only the user can provide; `external` (default) when the obstruction is outside the user's answer. If request_user_input is advertised, ask and wait instead of declaring user_decision without asking. A user_decision block without a request in this turn is repaired once; a second identical declaration is accepted as an explicit degradation."
+                    "description": "Only meaningful with status=blocked. `user_decision` when progress needs a decision or information only the user can provide; `external` (default) otherwise. A user_decision block without a request in this turn is repaired once; a second identical declaration is accepted as an explicit degradation."
                 },
                 "summary": {
                     "type": "string",

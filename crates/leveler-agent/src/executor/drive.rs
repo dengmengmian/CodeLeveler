@@ -336,6 +336,11 @@ pub(crate) struct Drive<'a> {
     /// durable request/answer pair, plus the answers this window receives).
     /// Only these tool results carry user authority for a requirement quote.
     clarification_answers: Vec<super::ClarificationAnswer>,
+    /// Index into `clarification_answers` of the first answer received after
+    /// the newest user input. Seeded answers start before it; a steer or a
+    /// mid-turn `/goal` moves it to the end, because the newest message may
+    /// have reversed an answer given before it.
+    scope_answers_from: usize,
     /// The model declared the newest input a question about the goal rather
     /// than an authorization to continue it. This window only answers.
     answer_only: bool,
@@ -1100,6 +1105,7 @@ impl Executor {
             settled_rounds: 0,
             terminal_answer: None,
             latest_user_input,
+            scope_answers_from: self.seeded_clarification_answers.len(),
             clarification_answers: self.seeded_clarification_answers.clone(),
             answer_only: false,
             cancelled_goal: None,
@@ -2511,15 +2517,17 @@ impl Drive<'_> {
             &objective,
             &self.latest_user_input,
             &self.clarification_answers,
+            &self.clarification_answers[self.scope_answers_from..],
         );
         for operation in &declaration.operations {
             let quote = operation.source_quote().trim();
             if !authority.authorizes_scope_change(quote) {
                 return Err(IntentCall::Refused(format!(
                     "the scope operation quotes text that is in neither the newest user message \
-                     nor an answer you received from the user. Fix: quote the user's own words \
-                     exactly, or set `source_span` to the 1-based line range that contains them. \
-                     Newest user message: \"{}\"",
+                     nor an answer received after it. An answer given before the newest message \
+                     may already have been reversed, so it cannot authorize this change. Fix: \
+                     quote the user's own words exactly, or set `source_span` to the 1-based line \
+                     range that contains them. Newest user message: \"{}\"",
                     leveler_core::truncate_head_bytes(&self.latest_user_input, 400, "…")
                 )));
             }
@@ -3419,6 +3427,10 @@ impl AgentHarness for Drive<'_> {
         {
             // A `/goal` declaration is itself the newest user input.
             self.latest_user_input = declaration.clone();
+            // An answer given before this declaration is no longer current:
+            // a scope change now needs words from the declaration or from a
+            // later answer.
+            self.scope_answers_from = self.clarification_answers.len();
             // A Chat turn that becomes a Goal here has no durable goal yet.
             // Open it and bind this running turn to it BEFORE the contract is
             // advertised: a goal that exists only in memory would be lost on
@@ -3471,8 +3483,11 @@ impl AgentHarness for Drive<'_> {
                 }
                 // The user just spoke; a declaration about the newest input
                 // must quote this one, not an earlier message the runtime has
-                // already acted on.
+                // already acted on. An answer given before this input may
+                // already have been reversed, so it is no longer current
+                // scope authority either.
                 self.latest_user_input = text.to_string();
+                self.scope_answers_from = self.clarification_answers.len();
                 let message = Message::user_input(text);
                 // A journalled input is appended and settled in one durable
                 // transaction. `false` means the user cancelled it while this
@@ -4761,6 +4776,7 @@ impl AgentHarness for Drive<'_> {
                         &objective,
                         &self.latest_user_input,
                         &self.clarification_answers,
+                        &self.clarification_answers[self.scope_answers_from..],
                     );
                     match parse_commit_declaration(&call.arguments, &authority) {
                         Ok(declaration) => {
@@ -9179,7 +9195,7 @@ mod commit_declaration_tests {
     ) -> Result<CommitDeclaration, String> {
         super::parse_commit_declaration(
             arguments,
-            &UserAuthority::new(user_message, user_message, &[]),
+            &UserAuthority::new(user_message, user_message, &[], &[]),
         )
     }
 
