@@ -14,7 +14,9 @@ use leveler_agent::coding::{CodingRuntime, ExecutorFactory, TaskSpec};
 use leveler_agent::{AutoClarify, StepLimits};
 use leveler_core::{RequestId, SessionId};
 use leveler_engine::{EngineBoot, ExecutionKind, TaskEngine};
-use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
+use leveler_execution::{
+    AutoApprove, ClarificationRequest, Clarifier, ClarifyOutcome, PermissionProfile, Workspace,
+};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEventStream, ModelProfile, ModelRef,
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
@@ -254,6 +256,34 @@ fn with_delivery(mut script: Vec<Scripted>) -> Vec<Scripted> {
     script
 }
 
+/// A UI-backed clarifier for the turn-16 shape: a person answers the model's
+/// question, and the answer is the only text that states the requirement.
+struct ScriptedClarifier {
+    answer: String,
+    requests: Mutex<Vec<ClarificationRequest>>,
+}
+
+impl ScriptedClarifier {
+    fn new(answer: impl Into<String>) -> Self {
+        Self {
+            answer: answer.into(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Clarifier for ScriptedClarifier {
+    async fn clarify(&self, request: &ClarificationRequest) -> ClarifyOutcome {
+        self.requests.lock().unwrap().push(request.clone());
+        ClarifyOutcome::Answered(self.answer.clone())
+    }
+
+    fn has_human(&self) -> bool {
+        true
+    }
+}
+
 async fn fixture(script: Vec<Scripted>, read_only: bool) -> Fixture {
     fixture_with_mode(script, read_only, PermissionProfile::Assisted).await
 }
@@ -262,6 +292,15 @@ async fn fixture_with_mode(
     script: Vec<Scripted>,
     read_only: bool,
     mode: PermissionProfile,
+) -> Fixture {
+    fixture_with_clarifier(script, read_only, mode, Arc::new(AutoClarify)).await
+}
+
+async fn fixture_with_clarifier(
+    script: Vec<Scripted>,
+    read_only: bool,
+    mode: PermissionProfile,
+    clarifier: Arc<dyn Clarifier>,
 ) -> Fixture {
     let script = with_delivery(script);
     let dir = tempfile::tempdir().unwrap();
@@ -342,7 +381,7 @@ async fn fixture_with_mode(
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         },
         approver: Arc::new(AutoApprove),
-        clarifier: Arc::new(AutoClarify),
+        clarifier,
         task_cancel: task_cancel.clone(),
     };
     Fixture {
@@ -1844,6 +1883,73 @@ async fn an_accepted_completion_carries_the_structured_verification_records() {
     assert!(record.model_step > 0);
 }
 
+/// Turn 19 of the recorded session cited, as its verification, the exact
+/// multi-line shell command it had run. Reading the detail line by line
+/// invented a citation out of the middle of a quoted argument (`import
+/// re,sys`) and refused a completion whose check had really run. The command
+/// keeps its identity across embedded newlines; a newline between two
+/// commands still separates them.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_multiline_shell_command_is_cited_as_the_execution_that_ran() {
+    const SCRIPT: &str = "printf '%s' \"alpha
+beta
+gamma\"";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["验证命令通过"],
+                    "requirements": [{
+                        "kind": "command",
+                        "text": "验证命令通过",
+                        "target": SCRIPT,
+                        "source_quote": "完成后通过测试"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "shell_command",
+                serde_json::json!({"cmd": SCRIPT, "reason": "run the recorded check"}),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "验证通过",
+                    "verification": {"status": "passed", "detail": SCRIPT},
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "call_id:call-2"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{:?}",
+        report.completion_warnings
+    );
+    let verification = report
+        .verification
+        .expect("an accepted completion carries its verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified,
+        "the multi-line command ran and passed: {verification:?}"
+    );
+    assert_eq!(verification.records.len(), 1);
+    assert_eq!(verification.records[0].command.as_deref(), Some(SCRIPT));
+    assert_eq!(verification.records[0].call_id.as_deref(), Some("call-2"));
+}
+
 /// `content` compares the requirement's `text` to a line of the target file.
 /// A model that records the requirement as prose cannot satisfy it by
 /// rewriting the file; the refusal must name the declaration fix, and an
@@ -1950,6 +2056,314 @@ async fn a_content_requirement_refusal_names_the_declaration_fix() {
         "the declaration now holds the literal the gate compares"
     );
     std::fs::remove_dir_all(fx.dir.path()).ok();
+}
+
+/// Turn 16 shape: the user requested the work but stated its concrete terms
+/// only in the answer to the model's own question. That answer is user-authored
+/// authority, so a `commit_task` requirement may quote it — even though the
+/// same text reaches the model as a tool result.
+#[tokio::test]
+async fn a_clarification_answer_is_a_user_requirement_source() {
+    const REQUEST: &str = "把运营后台的媒体库接入到新系统，具体资料和实现范围你来问我。";
+    const ANSWER: &str =
+        "媒体来源：外链 URL 字段，支持多值；\n实现范围：全链路做完：迁移、后端、后台、前端、验证";
+    let clarifier = Arc::new(ScriptedClarifier::new(ANSWER));
+    let fx = fixture_with_clarifier(
+        vec![
+            Scripted::Tool(
+                "request_user_input",
+                serde_json::json!({
+                    "question": "媒体库接入的两个问题",
+                    "questions": [
+                        {"header": "来源", "question": "媒体来源怎么存？", "kind": "text"},
+                        {"header": "范围", "question": "实现范围到哪里？", "kind": "text"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": [
+                        "媒体来源使用外链 URL 字段",
+                        "全链路做完：迁移、后端、后台、前端、验证"
+                    ],
+                    "requirements": [
+                        {
+                            "kind": "named",
+                            "text": "媒体来源使用外链 URL 字段",
+                            "source_quote": "媒体来源：外链 URL 字段"
+                        },
+                        {
+                            "kind": "named",
+                            "text": "全链路做完：迁移、后端、后台、前端、验证",
+                            "source_quote": "实现范围：全链路做完：迁移、后端、后台、前端、验证"
+                        }
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "媒体库接入完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "外链 URL 字段已接入"},
+                        {"id": "R2", "status": "done", "evidence": "全链路已完成"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+        PermissionProfile::Assisted,
+        clarifier.clone(),
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    {
+        let requests = clarifier.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the model's question reached the human");
+        assert_eq!(
+            requests[0].call_id, "call-1",
+            "the answer stays bound to the call that asked"
+        );
+        assert_eq!(requests[0].questions.len(), 2);
+    }
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the declaration quoting the user's answer commits instead of being refused: {report:?}"
+    );
+    let items = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(items[0].text, "媒体来源使用外链 URL 字段");
+    assert_eq!(items[1].text, "全链路做完：迁移、后端、后台、前端、验证");
+}
+
+/// The answer's authority comes from the person, not from the tool result that
+/// carries it. Text the model itself wrote into a file is agent output; a
+/// requirement may not quote it as the user's words.
+#[tokio::test]
+async fn an_ordinary_tool_result_cannot_authorize_a_requirement() {
+    const REQUEST: &str = "把运营后台的媒体库接入到新系统。";
+    const FABRICATED: &str = "媒体来源使用外链 URL 字段";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "notes.txt", "content": FABRICATED}),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": [FABRICATED],
+                    "requirements": [{
+                        "kind": "named",
+                        "text": FABRICATED,
+                        "source_quote": FABRICATED
+                    }]
+                }),
+            ),
+            Scripted::Text("我先记录了一下打算怎么做。"),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    let refusal = {
+        let requests = fx.runtime.requests.lock().unwrap();
+        requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.clone()),
+                _ => None,
+            })
+            .find(|content| content.contains("source_quote"))
+            .expect("the model sees the refusal")
+    };
+    assert!(
+        refusal.contains("does not occur in the user's message"),
+        "{refusal}"
+    );
+    assert!(
+        goal_records(&fx).await.is_empty(),
+        "a file the model wrote is not user authority: {report:?}"
+    );
+}
+
+/// An answer given in an earlier window is replayed from the durable
+/// request/answered pair, so a later window can quote it without the original
+/// in-memory receipt. This exercises the seed path, not the live capture.
+#[tokio::test]
+async fn a_durable_clarification_answer_survives_into_a_later_window() {
+    const REQUEST: &str = "把运营后台的媒体库接入到新系统。";
+    const ANSWER: &str = "媒体来源：外链 URL 字段";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["媒体来源使用外链 URL 字段"],
+                    "requirements": [{
+                        "kind": "named",
+                        "text": "媒体来源使用外链 URL 字段",
+                        "source_quote": ANSWER
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "媒体库接入完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "外链 URL 字段已接入"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+
+    let stores = leveler_storage::EngineStores::from_database(&fx.db);
+    let request_id = leveler_core::ClarificationId::new("clarify-1");
+    for event in [
+        leveler_engine::EngineEvent::ClarificationRequested {
+            id: request_id.clone(),
+            question: "媒体来源怎么存？".into(),
+            options: Vec::new(),
+            call_id: "call-earlier".into(),
+            tool: "request_user_input".into(),
+            questions: Vec::new(),
+        },
+        leveler_engine::EngineEvent::ClarificationAnswered {
+            id: request_id,
+            answer: ANSWER.into(),
+            outcome: "answered".into(),
+        },
+    ] {
+        let (event_type, payload) = event.to_row().unwrap();
+        stores
+            .events
+            .append(
+                &fx.session,
+                None,
+                &event_type,
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1, "{report:?}");
+    let items = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text, "媒体来源使用外链 URL 字段");
+}
+
+/// A scope amendment may also quote the user's answer. The newest message
+/// still governs the window, but the answer the person just gave is part of
+/// the same conversation and states the changed requirement.
+#[tokio::test]
+async fn a_clarification_answer_authorizes_a_scope_amendment() {
+    const REQUEST: &str = "把运营后台的媒体库接入到新系统。";
+    const ANSWER: &str = "标题字段使用英文";
+    let clarifier = Arc::new(ScriptedClarifier::new(ANSWER));
+    let fx = fixture_with_clarifier(
+        vec![
+            Scripted::Tool(
+                "request_user_input",
+                serde_json::json!({"question": "标题用什么语言？"}),
+            ),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["媒体库已接入", "标题使用英文"],
+                    "requirements": [{
+                        "kind": "named",
+                        "text": "媒体库接入",
+                        "source_quote": "接入到新系统"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [{
+                        "op": "amend",
+                        "requirement_id": "R1",
+                        "text": "标题字段使用英文",
+                        "source_quote": ANSWER
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "媒体库接入完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "标题已使用英文"}
+                    ]
+                }),
+            ),
+        ],
+        false,
+        PermissionProfile::Assisted,
+        clarifier,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "{report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    let items = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        items[0].text, "标题字段使用英文",
+        "the amendment quoting the answer was applied: {report:?}"
+    );
 }
 
 /// A completion the runtime cannot mechanically check still completes: it is
