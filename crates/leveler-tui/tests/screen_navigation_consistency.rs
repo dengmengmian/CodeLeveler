@@ -524,7 +524,7 @@ fn the_issue_page_keeps_its_cursor_on_screen() {
 
 /// Every page that paints the shell's `← <title>` header — which is now every
 /// independent page: the last four to keep the pre-shell app frame (Tools,
-/// Diff, Remote, Trace) draw the same header as the rest.
+/// Diff, Trace) draw the same header as the rest.
 fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
     vec![
         (Screen::Plan, "Plan"),
@@ -539,7 +539,6 @@ fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
         (Screen::Clean, "Clean"),
         (Screen::Tools, "Tools"),
         (Screen::Diff, "Diff"),
-        (Screen::Remote, "Remote"),
         (Screen::Trace, "Trace"),
     ]
 }

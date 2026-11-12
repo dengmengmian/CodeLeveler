@@ -2076,7 +2076,6 @@ version = "1.0.26"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -2085,7 +2084,6 @@ dependencies = [
  "console",
  "crossterm",
  "futures",
- "getrandom 0.2.17",
  "iana-time-zone",
  "leveler-agent",
  "leveler-app",
@@ -2101,9 +2099,6 @@ dependencies = [
  "leveler-native",
  "leveler-project",
  "leveler-provider",
- "leveler-relay",
- "leveler-remote-agent",
- "leveler-remote-protocol",
  "leveler-runtime-host",
  "leveler-schedule",
  "leveler-storage",
@@ -2112,7 +2107,6 @@ dependencies = [
  "leveler-tui",
  "leveler-update",
  "leveler-web",
- "qrcode",
  "ratatui",
  "reqwest 0.12.28",
  "serde",
@@ -2378,64 +2372,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "leveler-relay"
-version = "1.0.26"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "leveler-remote-protocol",
- "reqwest 0.12.28",
- "ring",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "leveler-remote-agent"
-version = "1.0.26"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "leveler-client-protocol",
- "leveler-local-transport",
- "leveler-relay",
- "leveler-remote-protocol",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tokio-util",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "leveler-remote-protocol"
-version = "1.0.26"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "leveler-client-protocol",
- "ring",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3265,12 +3201,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

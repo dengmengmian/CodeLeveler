@@ -32,10 +32,6 @@ leveler-lsp = { workspace = true }
 leveler-app = { workspace = true }
 leveler-client-protocol = { workspace = true }
 leveler-native = { workspace = true }
-leveler-remote-agent = { workspace = true }
-leveler-remote-protocol = { workspace = true }
-leveler-relay = { workspace = true }
-axum = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-runtime-host = { workspace = true }
 leveler-tui = { workspace = true }
@@ -57,10 +53,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 tempfile = "3"
-# OS CSPRNG for the `serve --tcp` daemon bearer token (256-bit, unpredictable).
-getrandom = "0.2"
 base64 = { workspace = true }
-qrcode = { version = "0.14.1", default-features = false }
 iana-time-zone = "0.1"
 chrono-tz = "0.10"
 

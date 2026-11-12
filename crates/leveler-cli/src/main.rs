@@ -24,8 +24,6 @@ mod mcp_lsp_cmds;
 mod native_cmd;
 mod output;
 mod permissions_cmds;
-mod remote_cmds;
-mod remote_invite;
 mod render;
 mod run_cmds;
 mod schedule_cmd;
@@ -339,7 +337,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         }
         Command::Permissions(pc) => cmd_permissions(layout, pc),
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
-        Command::Remote(command) => crate::remote_cmds::cmd_remote(command).await,
         Command::Config(ConfigCommand::Show) => cmd_config_show(layout),
         Command::Theme(ThemeCommand::Preview { id }) => cmd_theme_preview(id),
         Command::Agents(AgentsCommand::List { json }) => agents_cmds::list(layout, json).await,

@@ -103,11 +103,6 @@ impl LevelerHome {
         self.projects_dir().join(project_id)
     }
 
-    /// Remote pairing/identity/credential state: `state/remote/`.
-    pub fn remote_state_dir(&self) -> PathBuf {
-        self.state_dir().join("remote")
-    }
-
     /// Web aggregation state: `state/web/`.
     pub fn web_state_dir(&self) -> PathBuf {
         self.state_dir().join("web")
@@ -240,10 +235,6 @@ mod tests {
             PathBuf::from("/home/u/.leveler/state/web/projects.json")
         );
         assert_eq!(
-            h.remote_state_dir(),
-            PathBuf::from("/home/u/.leveler/state/remote")
-        );
-        assert_eq!(
             h.sockets_dir(),
             PathBuf::from("/home/u/.leveler/run/sockets")
         );
@@ -337,7 +328,6 @@ mod tests {
             h.state_dir(),
             h.projects_dir(),
             h.project_state_dir("p"),
-            h.remote_state_dir(),
             h.web_state_dir(),
             h.web_projects_registry(),
             h.web_uploads_dir(),

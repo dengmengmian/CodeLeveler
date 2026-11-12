@@ -40,5 +40,3 @@ verify:
       - leveler-app
       - --exclude
       - leveler-cli
-      - --exclude
-      - leveler-remote-agent

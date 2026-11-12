@@ -17,8 +17,6 @@ pub enum Screen {
     /// other coding agent. Enter continues the selected source's work in a NEW
     /// native session; the page never resumes that agent's runtime.
     ForeignSessions,
-    /// The `/remote` invite: a QR to scan, and the fingerprint to compare.
-    Remote,
     /// First-class Activity Detail (background task or child agent).
     /// Observational: Esc closes the viewer without cancelling the work.
     Activity,
@@ -85,7 +83,7 @@ pub enum SlashCategory {
     Session,
     /// Attachments.
     Input,
-    /// Theme, web, remote, help.
+    /// Theme, web, help.
     System,
 }
 
@@ -357,20 +355,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::Always,
     ),
     slash(
-        "/remote",
-        &[],
-        SlashCategory::System,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
-        "/remote-loc",
-        &[],
-        SlashCategory::System,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
         "/help",
         &[],
         SlashCategory::System,
@@ -561,8 +545,6 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/output" => s.output,
         "/export" | "/save" => s.export,
         "/web" => s.web,
-        "/remote" => s.remote,
-        "/remote-loc" => s.remote_loc,
         "/image" | "/attach" => s.attach,
         "/theme" => s.theme,
         "/new" => s.new,
@@ -883,8 +865,6 @@ mod surface_tests {
                 "/attach",
                 "/theme",
                 "/web",
-                "/remote",
-                "/remote-loc",
                 "/help",
                 "/doctor",
                 "/clean",
@@ -1085,8 +1065,6 @@ mod ghost_tests {
             "/attach",
             "/theme",
             "/web",
-            "/remote",
-            "/remote-loc",
         ] {
             assert!(!names.contains(&hidden), "searchable leaked on /: {hidden}");
         }
@@ -1387,7 +1365,6 @@ mod reachability_tests {
             Screen::ForeignSessions => {
                 Some("`/resume-claude` / `/resume-codex` — reducer/submit.rs")
             }
-            Screen::Remote => Some("`/remote` — reducer/mod.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
             Screen::ActivityList => Some(
                 "clicking the strip's background cell or Enter under its focus — reducer/mod.rs",
@@ -1414,7 +1391,6 @@ mod reachability_tests {
             Screen::Diff,
             Screen::Sessions,
             Screen::ForeignSessions,
-            Screen::Remote,
             Screen::Activity,
             Screen::ActivityList,
             Screen::Team,

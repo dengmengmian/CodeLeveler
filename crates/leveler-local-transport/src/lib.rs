@@ -64,7 +64,7 @@ pub enum ClientKind {
     /// prompt a real person was answering.
     #[default]
     LocalInteractive,
-    /// The remote agent, bridging a paired device.
+    /// A remote client bridging a paired device.
     Remote,
 }
 
@@ -244,7 +244,7 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
     /// a person could still be reading it in their own terminal. The default
     /// answers `1` — "assume someone is watching" — because that direction can
     /// only suppress an auto-deny, whereas guessing zero would let a paired
-    /// phone's policy cut off a decision a human was making. The socket client
+    /// remote client's policy cut off a decision a human was making. The socket client
     /// asks the daemon for the real number.
     async fn local_waiter_count(&self) -> Result<usize, ClientError> {
         Ok(1)
@@ -351,7 +351,7 @@ enum WireRequest {
         /// The kind of client that opened this connection, as it declared itself
         /// when connecting (`connect_as`). Load-bearing for approval trust: only
         /// a `LocalInteractive` client on a trusted-local transport may create an
-        /// `AutoApprove` session; a `Remote` kind (the remote-agent bridge) or a
+        /// `AutoApprove` session; a `Remote` kind (a remote client) or a
         /// TCP connection is normalized to `Interactive` at the daemon boundary
         /// (see `handle_connection`). Set by the connecting client, never from a
         /// relayed body, so a remote peer cannot spoof it.
@@ -381,7 +381,7 @@ enum WireRequest {
         #[serde(default)]
         client_kind: ClientKind,
     },
-    /// How many local interactive UIs are attached. Asked by the remote agent,
+    /// How many local interactive UIs are attached. Asked by a remote client,
     /// which cannot see this machine's terminals from its own process.
     LocalWaiters,
     /// The runtime's identity + process diagnostics. Additive: a daemon built
@@ -405,7 +405,7 @@ enum WireRequest {
     },
     Subscribe {
         session_id: Option<SessionId>,
-        /// Absent from clients built before remote control existed; `default`
+        /// Absent from clients built before this field existed; `default`
         /// makes those count as local, which is the safe direction.
         #[serde(default)]
         client_kind: ClientKind,
@@ -1159,7 +1159,7 @@ mod transport {
 
         /// Live count of attached local interactive UIs.
         ///
-        /// The remote agent reads this to decide whether an approval is
+        /// A remote client reads this to decide whether an approval is
         /// remote-only; the handle stays valid after `serve` consumes the
         /// server.
         pub fn local_waiters(&self) -> LocalWaiters {
@@ -1227,9 +1227,9 @@ mod transport {
 
         /// Connect while declaring what kind of client this is.
         ///
-        /// Only the remote agent needs this; local UIs get
-        /// [`ClientKind::LocalInteractive`] from [`Self::connect`], so a phone
-        /// cannot be miscounted as somebody sitting at the machine.
+        /// Only a remote client needs this; local UIs get
+        /// [`ClientKind::LocalInteractive`] from [`Self::connect`], so a remote
+        /// client cannot be miscounted as somebody sitting at the machine.
         pub async fn connect_as(
             path: impl AsRef<Path>,
             client_kind: ClientKind,
@@ -2506,7 +2506,7 @@ mod unsupported {
         /// see this machine's terminals from inside its own. Here there is no
         /// daemon to ask, so this reports unavailable like every other method
         /// on this stub rather than inventing a count. Both callers already
-        /// read the error correctly: remote-agent approvals assume a person is
+        /// read the error correctly: remote approvals assume a person is
         /// watching, and project reattach treats the handle as dead.
         async fn local_waiter_count(&self) -> Result<usize, ClientError> {
             Err(ClientError::Runtime(
@@ -4869,8 +4869,8 @@ mod tests {
 
     // ── Approval-policy trust boundary (Merge Blocker Closeout: B-1 / M-1) ──
     // AutoApprove is a trusted-local privilege: only a LocalInteractive client on
-    // the trusted-local Unix socket may request it. A Remote client (the
-    // remote-agent bridge) or any TCP peer is rejected — never silently elevated.
+    // the trusted-local Unix socket may request it. A Remote client or any TCP
+    // peer is rejected — never silently elevated.
 
     use leveler_client_protocol::ApprovalPolicy;
 
@@ -5202,9 +5202,9 @@ mod tests {
 
     /// The remote approval timeout must not fire while someone is at the
     /// keyboard, so the daemon has to know how many local UIs are attached —
-    /// and must not count a phone's bridge among them.
+    /// and must not count a remote client's bridge among them.
     #[tokio::test]
-    async fn local_waiters_counts_local_uis_and_excludes_the_remote_agent() {
+    async fn local_waiters_counts_local_uis_and_excludes_remote_clients() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.sock");
         let server = LocalSocketServer::bind(&path, Arc::new(TestRuntime::new()))
@@ -5244,7 +5244,7 @@ mod tests {
         let _ = task.await;
     }
 
-    /// The remote agent runs in its own process, so the only way it can know
+    /// A remote client runs in its own process, so the only way it can know
     /// whether a person is at this machine is to ask the daemon.
     #[cfg(unix)]
     #[tokio::test]

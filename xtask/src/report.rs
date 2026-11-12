@@ -294,7 +294,6 @@ fn changes(context: &Context, transaction: &Transaction) -> Json {
     let risky_owners = [
         ("crates/leveler-protocol/", "protocol"),
         ("crates/leveler-client-protocol/", "protocol"),
-        ("crates/leveler-remote-protocol/", "protocol"),
         ("crates/leveler-storage/", "persistence"),
         ("crates/leveler-execution/", "permission/execution"),
         ("crates/leveler-runtime-host/", "runtime lifecycle"),

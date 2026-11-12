@@ -21,8 +21,6 @@ members = [
     "crates/leveler-engine",
     "crates/leveler-app",
     "crates/leveler-client-protocol",
-    "crates/leveler-remote-protocol",
-    "crates/leveler-remote-agent",
     "crates/leveler-local-transport",
     "crates/leveler-win-local-ipc",
     "crates/leveler-runtime-host",
@@ -37,7 +35,6 @@ members = [
     "crates/leveler-web",
     "crates/leveler-cli",
     "crates/leveler-test-support",
-    "services/leveler-relay",
     "xtask",
 ]
 
@@ -72,9 +69,6 @@ leveler-eval = { version = "1.0.26", path = "crates/leveler-eval" }
 leveler-engine = { version = "1.0.26", path = "crates/leveler-engine" }
 leveler-app = { version = "1.0.26", path = "crates/leveler-app" }
 leveler-client-protocol = { version = "1.0.26", path = "crates/leveler-client-protocol" }
-leveler-remote-protocol = { version = "1.0.26", path = "crates/leveler-remote-protocol" }
-leveler-remote-agent = { version = "1.0.26", path = "crates/leveler-remote-agent" }
-leveler-relay = { version = "1.0.26", path = "services/leveler-relay" }
 leveler-local-transport = { version = "1.0.26", path = "crates/leveler-local-transport" }
 leveler-runtime-host = { version = "1.0.26", path = "crates/leveler-runtime-host" }
 leveler-media = { version = "1.0.26", path = "crates/leveler-media" }
@@ -171,10 +165,6 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-fan
 # JSON Schema
 schemars = "0.8"
 jsonschema = "0.26"
-
-# Cryptography (Ed25519 signing, SHA-256). Already linked via rustls; kept
-# central so the remote agent and relay cannot drift to another version.
-ring = "0.17"
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }

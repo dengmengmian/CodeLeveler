@@ -37,7 +37,7 @@
       }
     ]
   },
-  "note": "One session as the runtime really emits it. Replayed by apps/leveler-mobile/test/transcript_golden_test.dart; a client that mis-reads a field fails there instead of showing a user an empty bubble.",
+  "note": "One session as the runtime really emits it. Replayed by crates/leveler-client-protocol/tests/event_transcript_golden.rs; a client that mis-reads a field fails there instead of showing a user an empty bubble.",
   "snapshot": {
     "active_tools": [],
     "available_models": [],

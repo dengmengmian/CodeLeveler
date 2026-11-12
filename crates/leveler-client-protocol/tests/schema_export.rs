@@ -1,6 +1,6 @@
 //! Keeps `schemas/*.json` in step with the Rust protocol types.
 //!
-//! The schemas are the contract non-Rust clients consume — the mobile APP
+//! The schemas are the contract non-Rust clients consume — a client
 //! generates its command and event types from them rather than hand-writing a
 //! second dialect that drifts. Nothing regenerates them automatically, so this
 //! test is what makes drift loud: add a `ClientCommand` variant without

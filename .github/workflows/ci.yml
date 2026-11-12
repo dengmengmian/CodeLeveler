@@ -115,18 +115,6 @@ jobs:
         if: runner.os == 'Linux'
         run: sh packaging/scripts/check_release_payload.sh
 
-      # The remote-control surface as its own required step. It is one chain
-      # across three crates — a phone, a relay nobody trusts, and a host — and a
-      # break in pairing, project isolation, the approval timeout or revocation
-      # should be visible here rather than buried in the workspace run that
-      # follows. Unix only: the MVP host is macOS/Linux.
-      - name: Remote control acceptance
-        if: runner.os != 'Windows'
-        run: |
-          cargo test -p leveler-remote-protocol --all-features --locked
-          cargo test -p leveler-remote-agent --all-features --locked
-          cargo test -p leveler-relay --all-features --locked
-
       # Browser acceptance is opt-in, so the workspace run below cannot imply
       # it passed. Run it here against a browser each runner image already
       # has — Edge on Windows, Chrome elsewhere — so "Windows is a supported
@@ -321,35 +309,6 @@ jobs:
         if: matrix.shard == 3
         timeout-minutes: 6
         run: cargo test -p leveler-app --all-features --locked --no-fail-fast --test zombie_turns
-
-  # The phone client. It is Dart, so it cannot ride the Rust job. Analyze and
-  # test only: CI has no simulator, and building the app needs one platform
-  # toolchain per target. What this does guard is the cross-language envelope
-  # conformance, which is the part a host change can silently break.
-  mobile:
-    name: leveler-mobile · analyze · test
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: apps/leveler-mobile
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-
-      - name: Resolve dependencies
-        run: flutter pub get
-
-      - name: Analyze
-        run: flutter analyze
-
-      # Reads testdata/signed_envelope.golden.json from the repository root, so
-      # the app and the host are checked against one answer key rather than
-      # against each other's assumptions.
-      - name: Test
-        run: flutter test
 
   # Protocol contract closure for the WebUI: Rust is the source of truth
   # (schemas/ is guarded by schema_export.rs in the Rust job); this job makes

@@ -140,16 +140,6 @@ pub struct StoppableCommand {
     pub target: CommandTarget,
 }
 
-/// The `/remote` invite, as the screen shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteState {
-    pub invite: crate::action::RemoteInvite,
-    /// Set once a phone has claimed the invite and is waiting to be accepted.
-    pub pending: Option<crate::action::PairingRequest>,
-    /// What happened after the user decided, so the screen can say so.
-    pub outcome: Option<String>,
-}
-
 /// Background-process chrome derived from `BackgroundTaskStarted`.
 ///
 /// `started_elapsed_secs` is the turn clock when the TUI applied the start
@@ -533,9 +523,6 @@ pub struct AppState {
     pub restart_requested: bool,
     /// True while `/web`'s server is starting (guards against double-launch).
     pub web_starting: bool,
-    /// The invite `/remote` produced, and who is waiting on it. Present only
-    /// while the invite screen is up.
-    pub remote: Option<RemoteState>,
 
     /// Models the user can switch to, and the current execution mode — used to
     /// build the model/mode pickers.
@@ -851,7 +838,6 @@ impl AppState {
             update: None,
             restart_requested: false,
             web_starting: false,
-            remote: None,
             available_models: Vec::new(),
             mode: PermissionProfile::Assisted,
             screen_scroll: 0,
