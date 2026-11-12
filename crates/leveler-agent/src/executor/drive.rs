@@ -2514,7 +2514,7 @@ impl Drive<'_> {
         })?;
         let objective = self.objective.text();
         let authority = super::UserAuthority::new(
-            &objective,
+            objective,
             &self.latest_user_input,
             &self.clarification_answers,
             &self.clarification_answers[self.scope_answers_from..],
@@ -4773,7 +4773,7 @@ impl AgentHarness for Drive<'_> {
                 } else {
                     let objective = self.objective.text();
                     let authority = super::UserAuthority::new(
-                        &objective,
+                        objective,
                         &self.latest_user_input,
                         &self.clarification_answers,
                         &self.clarification_answers[self.scope_answers_from..],
