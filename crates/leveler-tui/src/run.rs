@@ -7,7 +7,7 @@
 //! scrollback.
 
 use std::collections::VecDeque;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -152,6 +152,11 @@ pub async fn run(
             Err(error) => {
                 tracing::warn!(%error, "welcome PNG could not be decoded; using terminal logo")
             }
+        }
+        if let Some((r, g, b)) = crate::theme::sample_rgb(state.theme.surface.canvas)
+            && let Some(image) = state.welcome_image.as_mut()
+        {
+            image.set_background([r, g, b, 255]);
         }
     }
     let (cols, rows) = size().unwrap_or((80, 24));
@@ -587,8 +592,14 @@ pub async fn run(
         }
     }
 
-    // Leave the alternate screen before restoring terminal state.
+    // Leave the alternate screen before restoring terminal state. Kitty image
+    // data lives outside the character grid, so it is deleted by id while the
+    // alternate screen that owns the splash is still active.
     if alt.is_some() {
+        if let Some(image) = &mut state.welcome_image {
+            image.retire();
+        }
+        let _ = flush_welcome_cleanup(&mut stdout, &mut state);
         let _ = execute!(stdout, LeaveAlternateScreen);
     }
 
@@ -1406,14 +1417,40 @@ fn paint(
         t.clear()?;
         *alt = Some(t);
     }
+    // The splash is permanent for this session once real content exists; its
+    // terminal-side image data must not outlive the card.
+    if !crate::splash::conversation_is_empty(state)
+        && let Some(image) = &mut state.welcome_image
+    {
+        image.retire();
+    }
+    flush_welcome_cleanup(stdout, state)?;
     if let Some(t) = alt {
         t.draw(|f| render(f, state))?;
     }
+    // An encoding failure is discovered during draw and retires the image then.
+    flush_welcome_cleanup(stdout, state)?;
     // Terminal tab title: a best-effort projection of the same structured
     // state this frame just rendered. Deduplicated inside; a terminal that
     // ignores OSC titles degrades silently.
     title.maybe_apply(state, stdout);
     Ok(())
+}
+
+/// Deletes Kitty image data by id. iTerm2 images are cell-anchored and are
+/// torn down with the alternate screen, so they yield no sequences.
+fn flush_welcome_cleanup(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
+    let Some(image) = &mut state.welcome_image else {
+        return Ok(());
+    };
+    let pending = image.take_cleanup();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for sequence in pending {
+        stdout.write_all(sequence.as_bytes())?;
+    }
+    stdout.flush()
 }
 
 fn map_terminal_event(event: CtEvent) -> Option<Action> {

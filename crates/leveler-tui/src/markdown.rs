@@ -141,7 +141,14 @@ impl MdDoc {
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
         opts.insert(Options::ENABLE_TABLES);
-        let parser = Parser::new_ext(text, opts);
+        // The one owner of "model Markdown -> terminal cells": normalise tabs
+        // and control characters BEFORE parsing and width measurement, so no
+        // later stage can put a raw tab or escape sequence into a Cell. A tab
+        // cell is printed verbatim by the backend while the terminal expands
+        // it to its next tab stop, desyncing ratatui's cursor model for the
+        // rest of that row (the reported ghosting).
+        let text = crate::render::text::sanitize_terminal_text(text);
+        let parser = Parser::new_ext(text.as_ref(), opts);
 
         let mut blocks: Vec<MdBlock> = Vec::new();
         let mut spans: Vec<MdSpan> = Vec::new();
@@ -336,7 +343,7 @@ impl MdDoc {
         MdDoc {
             blocks,
             unclosed_strong: !text.match_indices("**").count().is_multiple_of(2),
-            streaming_table_tail: trailing_block_may_be_table(text),
+            streaming_table_tail: trailing_block_may_be_table(text.as_ref()),
         }
     }
 
@@ -3556,5 +3563,65 @@ export function LedgerBadge({ total, currency = \"USD\" }) {
             highlight_cache().lock().unwrap().entries.len() <= HIGHLIGHT_CACHE_MAX_ENTRIES,
             "entry bound must hold"
         );
+    }
+
+    /// The projection contract: a `Line` produced from model text contains
+    /// only printable cell text. A raw `\t` reaches a ratatui cell; the
+    /// backend prints it verbatim and the terminal expands it to its next tab
+    /// stop while ratatui's cursor model advanced one column — every later
+    /// cell on that row lands somewhere the buffer model does not expect, and
+    /// the diff cannot repair cells it thinks are already correct. That is the
+    /// reported ghosting. Other C0 controls are worse: `\r` rewinds the
+    /// cursor and ESC starts an escape sequence.
+    #[test]
+    fn projected_markdown_never_contains_control_cells() {
+        let cases = [
+            (
+                "tab-indented code",
+                "```go\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n```",
+            ),
+            ("tab in prose", "a\tb"),
+            ("tab in inline code", "run `a\tb` now"),
+            ("carriage return", "a\rb"),
+            ("escape sequence", "a\u{1b}[31mred\u{1b}[0m"),
+            ("tab in table cell", "| a | b |\n|---|---|\n| x\ty | z |"),
+            ("tab in quote", "> a\tb"),
+        ];
+        for (name, src) in cases {
+            let lines = MdDoc::parse(src).to_lines(40, &Theme::no_color());
+            for line in &lines {
+                for span in &line.spans {
+                    let bad: Vec<char> = span
+                        .content
+                        .chars()
+                        .filter(|c| c.is_control() || *c == '\t')
+                        .collect();
+                    assert!(
+                        bad.is_empty(),
+                        "{name}: span {:?} carries control cells {bad:?}",
+                        span.content
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same contract over the report's real mid-stream answer, including
+    /// its tab-indented Go heredoc.
+    #[test]
+    fn the_reported_streaming_answer_has_no_control_cells() {
+        let src = include_str!("../../../testdata/tui_render_truth/streaming_answer.md");
+        for width in [40usize, 80, 116, 120] {
+            let lines = MdDoc::parse(src).to_lines(width, &Theme::no_color());
+            for line in &lines {
+                for span in &line.spans {
+                    assert!(
+                        !span.content.chars().any(|c| c.is_control()),
+                        "width {width}: {:?} carries a control cell",
+                        span.content
+                    );
+                }
+            }
+        }
     }
 }

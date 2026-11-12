@@ -1252,7 +1252,7 @@ impl Theme {
     }
 }
 
-fn sample_rgb(color: Color) -> Option<(u8, u8, u8)> {
+pub(crate) fn sample_rgb(color: Color) -> Option<(u8, u8, u8)> {
     match color {
         Color::Rgb(r, g, b) => Some((r, g, b)),
         Color::Indexed(index @ 16..=255) => Some(xterm_256_rgb(index)),

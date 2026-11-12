@@ -165,18 +165,15 @@ fn layout(
     };
     // Terminal cells are about twice as tall as they are wide: a cell slot that
     // preserves the illustration's aspect needs 2 * src_w / src_h columns per row.
-    let (src_w, src_h) = state
-        .welcome_image
-        .as_ref()
-        .map(NativeMascot::aspect)
-        .unwrap_or((2, 1));
+    let live_image = state.welcome_image.as_ref().filter(|image| image.usable());
+    let (src_w, src_h) = live_image.map(NativeMascot::aspect).unwrap_or((2, 1));
     let src_w = usize::try_from(src_w).unwrap_or(2).max(1);
     let src_h = usize::try_from(src_h).unwrap_or(1).max(1);
     let mascot_w = (hero_h * 2 * src_w / src_h)
         .min(22)
         .min(inner.saturating_sub(34));
     let mascot_h = (mascot_w * src_h / (2 * src_w)).min(hero_h);
-    let use_mascot = state.welcome_image.is_some()
+    let mut use_mascot = live_image.is_some()
         && !theme.monochrome
         && state.surface == crate::btw::SurfaceFocus::Main
         && state.history_search.is_none()
@@ -196,7 +193,7 @@ fn layout(
     let mark_w = level_mark_width(mark_size);
 
     let mut show_mark = !use_mascot && bordered && inner >= mark_w + 28;
-    let hero_for = |show_mark: bool| {
+    let hero_for = |use_mascot: bool, show_mark: bool| {
         if use_mascot {
             mascot_h
         } else if show_mark {
@@ -229,11 +226,20 @@ fn layout(
             + usize::from(blank)
             + usize::from(bordered) * 2
     };
-    while planned_rows(hero_for(show_mark), spacer_after_hero, untrusted_blank) > height {
+    while planned_rows(
+        hero_for(use_mascot, show_mark),
+        spacer_after_hero,
+        untrusted_blank,
+    ) > height
+    {
         if spacer_after_hero {
             spacer_after_hero = false;
         } else if untrusted_blank {
             untrusted_blank = false;
+        } else if use_mascot {
+            // The illustration is decoration; a slot that cannot be drawn
+            // must not leave an empty column beside the text.
+            use_mascot = false;
         } else if show_mark {
             // The illustration is decoration; the notice is not.
             show_mark = false;
@@ -252,7 +258,7 @@ fn layout(
     };
     let gap = if art_w > 0 { 4 } else { 0 };
     let text_w = inner.saturating_sub(art_w + gap);
-    let hero_rows = hero_for(show_mark);
+    let hero_rows = hero_for(use_mascot, show_mark);
     let text_top = hero_rows.saturating_sub(5) / 2;
     for row in 0..hero_rows {
         let mut spans = if show_mark {
@@ -477,7 +483,7 @@ pub(crate) fn render_native_image(
     );
     if let Some(Err(error)) = image.protocol.last_encoding_result() {
         tracing::warn!(%error,"welcome PNG encoding failed; using terminal logo");
-        state.welcome_image = None;
+        image.mark_failed();
         // Clear skipped protocol cells as well as symbols, then immediately
         // render the logo fallback in the same frame.
         frame.render_widget(ratatui::widgets::Clear, content);
@@ -503,6 +509,8 @@ pub(crate) fn render_native_image(
             ),
             content,
         );
+    } else {
+        image.mark_uploaded();
     }
 }
 
@@ -902,6 +910,57 @@ mod tests {
         s.untrusted_config = vec![".leveler/hooks.yaml".into()];
         let pos = crate::conversation::geometry::screen_to_content(&s, 0, 0).unwrap();
         assert_eq!(pos.row, 0);
+    }
+
+    #[test]
+    fn a_failed_protocol_stops_reserving_the_image_slot() {
+        use ratatui_image::picker::ProtocolType;
+        let mut s = state(Locale::Zh);
+        s.theme = Theme::dark();
+        let mut image = NativeMascot::new(ProtocolType::Kitty, (10, 20)).unwrap();
+        image.mark_failed();
+        s.welcome_image = Some(image);
+        let layout = layout(&s, 100, 30, &s.theme, s.t());
+        assert!(layout.image.is_none());
+        let text = joined(&layout.lines);
+        assert!(text.contains("CodeLeveler"));
+        for index in 0..3 {
+            let label = action_label(Locale::Zh, index);
+            assert!(text.contains(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn overflowing_card_drops_the_image_instead_of_reserving_a_blank_column() {
+        use ratatui_image::picker::ProtocolType;
+        for (height, paths) in [(30, 14usize), (24, 8), (20, 6)] {
+            let mut s = state(Locale::Zh);
+            s.theme = Theme::dark();
+            s.welcome_image = Some(NativeMascot::new(ProtocolType::Iterm2, (10, 20)).unwrap());
+            s.untrusted_config = (0..paths)
+                .map(|index| format!(".leveler/config-{index}.yaml"))
+                .collect();
+            let layout = layout(&s, 100, height, &s.theme, s.t());
+            assert!(
+                layout.image.is_none(),
+                "{height}x100 with {paths} untrusted paths kept an off-screen image slot"
+            );
+            assert!(
+                layout.lines.len() <= height,
+                "{height}x100 overflowed: {}",
+                layout.lines.len()
+            );
+            let first_body = line_plain(&layout.lines[1]);
+            let expected_prefix = format!("{}│  CodeLeveler", " ".repeat(7));
+            assert!(
+                first_body.starts_with(&expected_prefix),
+                "image column was still reserved: {first_body:?}"
+            );
+            assert!(
+                joined(&layout.lines).contains("hooks.yaml")
+                    || joined(&layout.lines).contains("config-")
+            );
+        }
     }
 
     #[test]
