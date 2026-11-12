@@ -29,6 +29,19 @@ fn byte_of_grapheme(s: &str, g: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Text pasted, recalled from history or inserted from a file becomes terminal
+/// cells verbatim. A tab is printed as a tab (the terminal jumps to its next
+/// stop while the renderer counted one column) and an escape byte starts a
+/// terminal sequence, so both corrupt every cell painted after them on the
+/// row. Normalise at the composer's input boundary — before the buffer, the
+/// caret measurement and the wrapped rows ever see the text — exactly as the
+/// transcript projection does. CR is a line break for pasted text; other
+/// controls flatten to a space; tabs expand to the same 8-column stops.
+fn normalize_input_text(s: &str) -> String {
+    let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+    crate::render::text::sanitize_terminal_text(&normalized).into_owned()
+}
+
 /// The grapheme index of `byte`: how many graphemes begin before it.
 ///
 /// This is where a cursor may come from after a mutation, because it is a count
@@ -287,14 +300,15 @@ impl Composer {
 
     // ---- editing ------------------------------------------------------------
 
-    /// Insert text at the cursor. Normalizes `\r\n` / `\r` to `\n` so pasted
-    /// content keeps a single line convention .
+    /// Insert text at the cursor. Painted rows have to agree with what the
+    /// terminal prints, so CR becomes a line break and tabs/controls are
+    /// normalised (see [`normalize_input_text`]).
     pub fn insert_str(&mut self, s: &str) {
         if s.is_empty() {
             return;
         }
         self.begin_edit();
-        self.insert_unrecorded(s);
+        self.insert_unrecorded(&normalize_input_text(s));
     }
 
     fn insert_unrecorded(&mut self, s: &str) {
@@ -307,7 +321,7 @@ impl Composer {
     /// Insert pasted text. Large pastes are represented by a short placeholder
     /// in the editor and expanded back to the original text on submission.
     pub fn insert_paste(&mut self, s: &str) {
-        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = normalize_input_text(s);
         let chars = normalized.chars().count();
         let lines = normalized.lines().count().max(1);
         if chars < PASTE_PLACEHOLDER_MIN_CHARS && lines < PASTE_PLACEHOLDER_MIN_LINES {
@@ -984,6 +998,7 @@ impl Composer {
 
     fn set_buffer(&mut self, s: String) {
         self.clear_edit_history();
+        let s = normalize_input_text(&s);
         self.cursor = grapheme_count(&s);
         self.buffer = s;
     }
@@ -1525,6 +1540,54 @@ mod history_tests {
             assert_cursor_on_boundary(&c);
         }
         assert_eq!(c.text(), "", "every grapheme and every token can come out");
+    }
+
+    /// The composer buffer is painted as terminal cells verbatim, so it must
+    /// never hold a tab or a control character: the terminal would expand or
+    /// interpret it while the renderer counted one column, and everything
+    /// painted after it on the row lands in the wrong cell.
+    #[test]
+    fn paste_and_history_are_cell_safe_before_they_are_painted() {
+        let mut c = Composer::new();
+        c.insert_str("a\tb");
+        assert_eq!(
+            c.text(),
+            "a       b",
+            "a tab expands to the next 8-col stop"
+        );
+        c.insert_str("x\u{1b}[31my");
+        assert_eq!(c.text(), "a       bx [31my");
+        assert!(!c.text().chars().any(|ch| ch != '\n' && ch.is_control()));
+
+        let mut c = Composer::new();
+        c.insert_paste("l1\n\tl2");
+        assert_eq!(c.text(), "l1\n        l2");
+
+        // A large paste collapses to a chip but keeps its content for
+        // submission; the stored copy is painted again by yank or history, so
+        // it goes through the same gate.
+        let big = "\tline\n".repeat(600) + "\u{1b}";
+        let mut c = Composer::new();
+        c.insert_paste(&big);
+        assert_eq!(c.pending_pastes.len(), 1);
+        assert!(
+            !c.pending_pastes[0]
+                .content
+                .chars()
+                .any(|ch| ch != '\n' && ch.is_control()),
+            "{:?}",
+            &c.pending_pastes[0].content[..40.min(c.pending_pastes[0].content.len())]
+        );
+
+        // History seeded from a persisted store can predate this gate.
+        let mut c = Composer::new();
+        c.set_history(vec!["old\tcommand\u{1b}".to_string()]);
+        c.history_prev();
+        assert!(
+            !c.text().chars().any(|ch| ch != '\n' && ch.is_control()),
+            "{:?}",
+            c.text()
+        );
     }
 
     #[test]

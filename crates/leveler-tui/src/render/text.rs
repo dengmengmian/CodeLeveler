@@ -54,6 +54,35 @@ pub(crate) fn sanitize_terminal_line(s: &str) -> String {
     out
 }
 
+/// [`sanitize_terminal_line`] for multi-line text, preserving the `\n`
+/// structure.
+///
+/// This is the input contract of the layout primitives that turn arbitrary
+/// text into terminal cells. A `\t` kept in a `Line` becomes a real tab in a
+/// `Cell`; the backend prints it verbatim and the terminal jumps to its next
+/// tab stop while ratatui's cursor model advanced one column, so every cell
+/// after it in the same diff run is painted where the buffer model does not
+/// expect — later frames trust the buffer and cannot clean those cells up.
+/// Other C0 controls are worse: `\r` rewinds the cursor, ESC starts an escape
+/// sequence. Normalising here, before widths are measured and wrapping
+/// happens, keeps measured width equal to printed width.
+pub(crate) fn sanitize_terminal_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s
+        .chars()
+        .any(|c| c != '\n' && (c == '\t' || c.is_control()))
+    {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for (index, line) in s.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&sanitize_terminal_line(line));
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Width-aware wrap that preserves explicit newlines.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     wrap_with_joiners(text, width)
@@ -73,8 +102,9 @@ pub(crate) fn wrap_with_joiners(text: &str, width: usize) -> Vec<(String, Option
     if text.is_empty() {
         return vec![(String::new(), None)];
     }
+    let text = sanitize_terminal_text(text);
     let mut out = Vec::new();
-    for logical in text.split('\n') {
+    for logical in text.as_ref().split('\n') {
         if logical.is_empty() {
             out.push((String::new(), None));
             continue;
@@ -267,6 +297,21 @@ mod wrap_joiner_tests {
     #[test]
     fn explicit_newlines_survive_with_blank_lines() {
         assert_eq!(joined("a\n\nb", 10), "a\n\nb");
+    }
+
+    /// Same contract as the markdown projection: rows handed to a Paragraph
+    /// are terminal cells. A tab would be printed verbatim and desync the
+    /// backend's cursor model; `\r` would rewind it.
+    #[test]
+    fn wrapped_rows_never_contain_control_cells() {
+        for src in ["a\tb", "a\rb", "a\u{1b}[31mred", "x\n\tindent", "\tz"] {
+            for (row, _) in wrap_with_joiners(src, 8) {
+                assert!(
+                    !row.chars().any(|c| c.is_control()),
+                    "{src:?} wrapped to {row:?}, which carries a control cell"
+                );
+            }
+        }
     }
 }
 

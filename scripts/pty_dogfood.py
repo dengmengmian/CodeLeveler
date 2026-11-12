@@ -433,6 +433,18 @@ class MockProvider:
         # task id, for example) reads it from the same request body a real
         # model reads. Left None, every turn is served verbatim.
         self.transform = None
+        # Opt-in: seconds to wait after each SSE frame, written and flushed one
+        # at a time. 0 keeps the historical one-shot body. A positive value is
+        # how a deterministic script reproduces real token-by-token streaming:
+        # the runtime's SSE decoder receives the same incremental deltas a
+        # provider sends, instead of one fully-buffered response.
+        self.stream_delay = 0.0
+        # Opt-in: called with the cumulative number of *content* characters
+        # after a frame has been written and flushed. Runs on the HTTP handler
+        # thread, so a callback that sleeps pauses this stream only. This is
+        # how a deterministic script lets the harness snapshot a real mid-stream
+        # screen at an exact character offset.
+        self.stream_hook = None
         self.lock = threading.Lock()
         provider = self
 
@@ -497,8 +509,28 @@ class MockProvider:
                 self.send_header("content-length", str(len(data)))
                 self.send_header("connection", "close")
                 self.end_headers()
+                delay = provider.stream_delay
                 try:
-                    self.wfile.write(data)
+                    if delay > 0 or provider.stream_hook is not None:
+                        cum = 0
+                        for frame in frames:
+                            line = ("data: %s\n\n" % frame).encode()
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                            try:
+                                payload = json.loads(frame)
+                                content = payload["choices"][0]["delta"].get("content") or ""
+                            except Exception:
+                                content = ""
+                            cum += len(content)
+                            if provider.stream_hook is not None:
+                                provider.stream_hook(cum)
+                            if delay > 0:
+                                time.sleep(delay)
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    else:
+                        self.wfile.write(data)
                 except Exception:
                     pass
 

@@ -670,6 +670,11 @@ pub(super) fn apply_theme_id(state: &mut AppState, raw: &str) {
     };
     state.theme = Theme::resolve(next, no_color);
     state.dark = state.theme.is_dark();
+    if let Some((r, g, b)) = crate::theme::sample_rgb(state.theme.surface.canvas)
+        && let Some(image) = state.welcome_image.as_mut()
+    {
+        image.set_background([r, g, b, 255]);
+    }
     if let Err(err) = crate::theme_config::save_theme_id(next) {
         tracing::warn!(%err, "failed to persist theme id");
     }

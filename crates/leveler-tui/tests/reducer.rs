@@ -3384,9 +3384,12 @@ fn uncertain_interaction_completion_restores_overlay_and_sticky_id() {
 #[test]
 fn whitespace_only_paste_is_inserted_as_text() {
     let mut s = opened();
+    // The paste is still inserted (not treated as a submit), but control
+    // characters never enter composer state: the tab expands to spaces at the
+    // next 8-column stop, exactly what the terminal would paint.
     let effects = reduce(&mut s, Action::Paste(" \n\t".into()));
     assert!(effects.is_empty());
-    assert_eq!(s.composer.take(), " \n\t");
+    assert_eq!(s.composer.take(), " \n        ");
 }
 
 #[test]
