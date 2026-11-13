@@ -161,11 +161,42 @@ pub(crate) async fn after_capture(
     session_id: &SessionId,
     model: &ModelRef,
 ) {
-    if !runtime
-        .config_for(Some(session_id.as_str()))
-        .can_run_automatic_dream()
-    {
+    let memory_config = runtime.config_for(Some(session_id.as_str()));
+    if !memory_config.can_run_automatic_dream() {
         return;
+    }
+    if runtime.is_workspace_ephemeral() {
+        return;
+    }
+    // Decide eligibility before taking the shared worker slot. The probe opens
+    // the store and reads the pending set; it is not a consolidation, and while
+    // it held the slot an explicit `/dream` or batch Dream arriving in that
+    // window was refused as "another Dream is already running".
+    let shadow = memory_config.rollout == MemoryRollout::Shadow;
+    let storage = runtime.storage();
+    let store = match open_store(
+        storage.workspace_dir().to_path_buf(),
+        storage.global_dir().to_path_buf(),
+        storage.workspace_dir().to_path_buf(),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(%error, "memory automatic Dream store unavailable");
+            return;
+        }
+    };
+    match automatic_disposition(&store, shadow).await {
+        Ok(DreamTriggerDisposition::Ready) => {}
+        Ok(disposition) => {
+            tracing::debug!(?disposition, "memory automatic Dream not started");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "memory automatic Dream eligibility failed");
+            return;
+        }
     }
     let Some(cancel) = runtime.acquire_dream_worker().await else {
         // The running Dream observes the pending trigger on its next pass.
@@ -185,6 +216,7 @@ pub(crate) async fn after_capture(
             &model,
             DreamInvocation::Automatic,
             &cancel,
+            Some(store),
         )
         .await;
         tracing::info!(outcome = %outcome.message(), "memory automatic Dream finished");
@@ -217,10 +249,56 @@ pub(crate) async fn run_manual(
         model,
         DreamInvocation::Manual,
         &cancel,
+        None,
     )
     .await;
     runtime.release_dream_worker().await;
     outcome
+}
+
+/// Open the workspace consolidation store off the async threads.
+async fn open_store(
+    scope_dir: PathBuf,
+    global_dir: PathBuf,
+    workspace_dir: PathBuf,
+) -> Result<Arc<ConsolidationStore>, String> {
+    tokio::task::spawn_blocking(move || {
+        ConsolidationStore::open(
+            scope_dir,
+            MemoryScope::Workspace,
+            &global_dir,
+            &workspace_dir,
+        )
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Dream store task failed: {error}"))?
+}
+
+/// Ask the durable trigger rule whether an automatic Dream is due.
+async fn automatic_disposition(
+    store: &Arc<ConsolidationStore>,
+    shadow: bool,
+) -> Result<DreamTriggerDisposition, String> {
+    let eligibility = DreamEligibilityConfig {
+        min_pending_count: DREAM_MIN_PENDING_COUNT,
+        max_pending_age: DREAM_MAX_PENDING_AGE,
+    };
+    let evaluate_store = store.clone();
+    tokio::task::spawn_blocking(move || {
+        let now = leveler_core::now().timestamp();
+        let result = if shadow {
+            evaluate_store.on_capture_completed_shadow(now, eligibility)
+        } else {
+            evaluate_store.on_capture_completed(now, eligibility)
+        };
+        result
+            .map(|eligibility| eligibility.disposition)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Dream eligibility task failed: {error}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,6 +310,7 @@ async fn execute(
     model: &ModelRef,
     invocation: DreamInvocation,
     cancel: &CancellationToken,
+    prepared_store: Option<Arc<ConsolidationStore>>,
 ) -> DreamOutcome {
     let memory_config = runtime.config_for(Some(session_id.as_str()));
     let allowed = match invocation {
@@ -255,53 +334,23 @@ async fn execute(
     let route = runtime.model_override().unwrap_or_else(|| model.clone());
     let registry = config.snapshot().registry.clone();
 
-    let store = match tokio::task::spawn_blocking({
-        let global_dir = global_dir.clone();
-        let workspace_dir = workspace_dir.clone();
-        move || {
-            ConsolidationStore::open(
-                scope_dir,
-                MemoryScope::Workspace,
-                &global_dir,
-                &workspace_dir,
-            )
-            .map(Arc::new)
-            .map_err(|error| error.to_string())
-        }
-    })
-    .await
-    {
-        Ok(Ok(store)) => store,
-        Ok(Err(error)) => return DreamOutcome::Failed(error),
-        Err(error) => return DreamOutcome::Failed(format!("Dream store task failed: {error}")),
+    // An automatic caller already evaluated eligibility before it took the
+    // worker slot and hands its open store over.
+    let eligibility_checked = prepared_store.is_some();
+    let store = match prepared_store {
+        Some(store) => store,
+        None => match open_store(scope_dir, global_dir, workspace_dir).await {
+            Ok(store) => store,
+            Err(error) => return DreamOutcome::Failed(error),
+        },
     };
 
-    if invocation == DreamInvocation::Automatic {
-        let eligibility = DreamEligibilityConfig {
-            min_pending_count: DREAM_MIN_PENDING_COUNT,
-            max_pending_age: DREAM_MAX_PENDING_AGE,
-        };
-        let evaluate_store = store.clone();
-        let disposition = tokio::task::spawn_blocking(move || {
-            let now = leveler_core::now().timestamp();
-            let result = if shadow {
-                evaluate_store.on_capture_completed_shadow(now, eligibility)
-            } else {
-                evaluate_store.on_capture_completed(now, eligibility)
-            };
-            result
-                .map(|eligibility| eligibility.disposition)
-                .map_err(|error| error.to_string())
-        })
-        .await;
-        match disposition {
-            Ok(Ok(DreamTriggerDisposition::Ready)) => {}
-            Ok(Ok(DreamTriggerDisposition::Coalesced)) => return DreamOutcome::Busy,
-            Ok(Ok(DreamTriggerDisposition::Ineligible)) => return DreamOutcome::Ineligible,
-            Ok(Err(error)) => return DreamOutcome::Failed(error),
-            Err(error) => {
-                return DreamOutcome::Failed(format!("Dream eligibility task failed: {error}"));
-            }
+    if invocation == DreamInvocation::Automatic && !eligibility_checked {
+        match automatic_disposition(&store, shadow).await {
+            Ok(DreamTriggerDisposition::Ready) => {}
+            Ok(DreamTriggerDisposition::Coalesced) => return DreamOutcome::Busy,
+            Ok(DreamTriggerDisposition::Ineligible) => return DreamOutcome::Ineligible,
+            Err(error) => return DreamOutcome::Failed(error),
         }
     }
 
