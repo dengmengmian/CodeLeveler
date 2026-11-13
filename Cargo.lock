@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-agent"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "futures",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-agent-core"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "futures",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-app"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-browser"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-cli"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-client-protocol"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "leveler-core",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-context"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-core",
  "leveler-model",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-core"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "chrono",
  "schemars",
@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-cua"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "core-foundation-sys",
  "image",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-engine"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "futures",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-eval"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "serde",
  "serde_json",
@@ -2273,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-execution"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "cap-std",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-foreign-session"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-core",
  "serde",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-lifecycle"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "serde",
  "serde_json",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-local-transport"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-lsp"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-core",
  "leveler-project",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-media"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-memory"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "blake3",
  "chrono",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-model"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-native"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-execution",
  "schemars",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-project"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "fs2",
  "leveler-core",
@@ -2430,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-protocol"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-stream",
  "futures",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-provider"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "futures",
@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-runtime-host"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-schedule"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-skills"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-core",
  "serde",
@@ -2524,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-storage"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-test-support"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-core",
  "nix 0.29.0",
@@ -2551,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-tools"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "axum",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-tui"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "arboard",
  "async-trait",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-update"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-vcs"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "leveler-core",
  "leveler-execution",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "leveler-web"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "async-trait",
  "axum",
@@ -2690,14 +2690,14 @@ dependencies = [
 
 [[package]]
 name = "leveler-win-confine"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "leveler-win-local-ipc"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "tokio",
  "windows-sys 0.59.0",
@@ -5803,7 +5803,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xtask"
-version = "1.0.26"
+version = "1.0.27"
 
 [[package]]
 name = "yoke"
