@@ -2031,3 +2031,68 @@ async fn quitting_releases_the_capture_lease_this_process_owns() {
         "the release records the cancel, not a stolen lease: {state:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_process_resumes_the_cancelled_capture_without_a_new_turn() {
+    let harness = harness(vec![
+        text_response("first"),
+        MockResponse::NeverResponds,
+        capture_response(observation(
+            "The restarted runtime recovered the cancelled capture.",
+        )),
+    ])
+    .await;
+    harness.submit("first turn").await;
+    // Wait until the extraction actually owns the job, then quit the way the
+    // normal exit path does.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+        if store
+            .work_state(harness.session.as_str(), 1)
+            .is_ok_and(|state| state.running == 1)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "capture never claimed a lease"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    harness.client.send(ClientCommand::Quit).await.unwrap();
+    let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+    let state = store.work_state(harness.session.as_str(), 1).unwrap();
+    assert_eq!(
+        state.failed, 1,
+        "the cancelled job stays retryable: {state:?}"
+    );
+    assert_eq!(
+        store.cursors(harness.session.as_str()).unwrap().captured,
+        0,
+        "nothing was captured before the cancel"
+    );
+    assert!(harness.inbox_notes().is_empty());
+
+    // The pass a fresh process performs at startup. No turn runs first, and
+    // no manual flush is issued.
+    harness
+        .app
+        .recover_memory_captures(&harness.models[0])
+        .await;
+    harness.wait_for_capture().await;
+
+    assert_eq!(
+        store.cursors(harness.session.as_str()).unwrap().captured,
+        1,
+        "the recovered job advanced the captured cursor"
+    );
+    let notes = harness.inbox_notes();
+    assert_eq!(notes.len(), 1, "exactly one observation, not a duplicate");
+    assert!(
+        std::fs::read_to_string(&notes[0])
+            .unwrap()
+            .contains("restarted runtime recovered the cancelled capture"),
+        "the recovered extraction committed its observation"
+    );
+}

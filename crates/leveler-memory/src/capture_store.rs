@@ -526,6 +526,44 @@ impl CaptureStore {
         self.claim_matching(request, Some(session_id))
     }
 
+    /// Sessions whose durable queue has work a claim would take right now.
+    ///
+    /// A claim is per session because the worker owns that session's
+    /// transcript. A process that starts later therefore cannot see another
+    /// session's cancelled job unless it asks the store which sessions still
+    /// have claimable work. This is that question: pending jobs, retryable
+    /// failures and running jobs whose lease expired. Terminal failures stay
+    /// closed, and a live lease belongs to another worker.
+    ///
+    /// Ordered by the oldest claimable job so a bounded recovery pass serves
+    /// the work that has waited longest first.
+    pub fn sessions_with_claimable_jobs(&self, now: i64, limit: usize) -> Result<Vec<String>> {
+        validate_runtime_timestamp(now)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = self.open_state()?;
+        let mut statement = connection.prepare(
+            "SELECT session_id FROM capture_jobs
+             WHERE status = 'pending'
+                OR (status = 'failed' AND NOT EXISTS (
+                    SELECT 1 FROM memory_v2_terminal_capture_failures t
+                    WHERE t.job_id = capture_jobs.job_id
+                ))
+                OR (status = 'running' AND lease_expires_at <= ?1)
+             GROUP BY session_id
+             ORDER BY MIN(rowid)
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![now, limit], |row| row.get::<_, String>(0))?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row?);
+        }
+        Ok(sessions)
+    }
+
     fn claim_matching(
         &self,
         request: &ClaimRequest,

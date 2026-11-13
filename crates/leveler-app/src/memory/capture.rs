@@ -47,6 +47,11 @@ const EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 16 * 1024;
 /// unlucky range cannot block every later turn forever.
 const MAX_CAPTURE_ATTEMPTS: u32 = 3;
 
+/// Sessions one restart pass resumes. A workspace normally has a handful of
+/// sessions with claimable work; a pathological queue resumes the rest on the
+/// next process start rather than opening an unbounded number of workers.
+const RECOVERY_SESSION_LIMIT: usize = 16;
+
 /// The tool schema the extractor must answer with.
 fn capture_tool() -> ToolDefinition {
     ToolDefinition {
@@ -116,6 +121,76 @@ impl crate::Application {
     /// The memory runtime this application owns.
     pub fn memory(&self) -> &MemoryRuntime {
         &self.memory
+    }
+
+    /// Resume durable capture jobs a previous process left claimable.
+    ///
+    /// A normal quit cancels the extraction already in flight. The job stays
+    /// durable and retryable, but only its own session's worker claims it, so
+    /// without this pass a cancelled range would wait for that exact session
+    /// to run another turn (or `/flush`) and could stay unclaimed forever.
+    /// Entry points that serve a workspace and hold a model call this once on
+    /// startup.
+    ///
+    /// The pass never enqueues historical turns and never creates a store: a
+    /// workspace that was never captured has no state database, and opening
+    /// one would be an opt-in the user did not make. Failures are logged; a
+    /// memory problem must not block startup.
+    pub async fn recover_memory_captures(&self, model: &ModelRef) {
+        let runtime = &self.memory;
+        if !runtime.config().can_capture() || runtime.is_workspace_ephemeral() {
+            return;
+        }
+        let state_path = runtime
+            .storage()
+            .workspace_dir()
+            .join("memory_state.sqlite");
+        if !state_path.is_file() {
+            return;
+        }
+        let scope_dir = runtime.storage().workspace_dir().to_path_buf();
+        let now = leveler_core::now().timestamp();
+        let scanned = tokio::task::spawn_blocking(move || {
+            CaptureStore::open(&scope_dir, MemoryScope::Workspace)
+                .and_then(|store| store.sessions_with_claimable_jobs(now, RECOVERY_SESSION_LIMIT))
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        let sessions = match scanned {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "memory capture recovery scan failed");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "memory capture recovery scan task failed");
+                return;
+            }
+        };
+        if sessions.is_empty() {
+            return;
+        }
+        if sessions.len() >= RECOVERY_SESSION_LIMIT {
+            tracing::warn!(
+                limit = RECOVERY_SESSION_LIMIT,
+                "memory capture recovery reached its session limit; the rest wait for the next process start"
+            );
+        }
+        let db = match self.open_database().await {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::warn!(%error, "memory capture recovery could not open the session database");
+                return;
+            }
+        };
+        for session in sessions {
+            runtime.kick_capture_worker(
+                db.clone(),
+                SessionId::new(session),
+                model.clone(),
+                self.config.clone(),
+            );
+        }
     }
 }
 
