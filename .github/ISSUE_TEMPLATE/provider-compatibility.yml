@@ -1,0 +1,111 @@
+name: Provider Compatibility
+description: Report compatibility with a model provider or API protocol
+title: "[Provider]: "
+labels:
+  - compatibility
+  - "area: provider"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never submit an API key, token, credential, or unredacted configuration. Replace secrets with placeholders such as `REDACTED`.
+
+  - type: input
+    id: version
+    attributes:
+      label: CodeLeveler version
+      description: Run `leveler --version` or provide the commit SHA.
+      placeholder: "vX.Y.Z or commit SHA"
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Provider or API service
+      placeholder: "Provider name"
+    validations:
+      required: true
+
+  - type: input
+    id: provider-version
+    attributes:
+      label: Provider or gateway version
+      description: Include the self-hosted gateway version when applicable.
+      placeholder: "Version or not applicable"
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: API protocol
+      options:
+        - OpenAI-compatible
+        - Anthropic-compatible
+        - Other or custom
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Provide the exact model identifier used in the request.
+      placeholder: "Model identifier"
+    validations:
+      required: true
+
+  - type: textarea
+    id: sanitized-configuration
+    attributes:
+      label: Sanitized configuration
+      description: Replace every API key, token, credential, private host, and other secret with `REDACTED`.
+      placeholder: |
+        provider: example
+        base_url: https://example.invalid/v1
+        api_key: REDACTED
+        model: example-model
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest reliable sequence that demonstrates the compatibility problem.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed-behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Explain what you expected and what happened instead. Include sanitized response details or logs when useful.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Sensitive data check
+      options:
+        - label: I removed API keys, tokens, credentials, private hosts, personal data, and other sensitive information.
+          required: true
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
