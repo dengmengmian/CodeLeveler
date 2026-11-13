@@ -531,7 +531,7 @@ impl Executor {
     /// only its start/finish bubbles to the parent observer (see the batch in
     /// `drive`).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_one_sub_agent_on(
+    pub(crate) fn run_one_sub_agent_on(
         &self,
         id: String,
         role: AgentRole,
@@ -543,20 +543,26 @@ impl Executor {
         residual_limits: StepLimits,
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
-    ) -> SubAgentRunResult {
-        self.sub_agent_run_future(
-            id,
-            role,
-            spec,
-            brief,
-            task,
-            permit,
-            progress,
-            residual_limits,
-            cancellation,
-            parent_wall,
-        )
-        .await
+    ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + '_ {
+        // A child's state machine is as large as the parent's. Polling it
+        // inline makes nesting consume another full stack frame, which
+        // overflows a 2 MiB test or worker thread at depth two. Box it so the
+        // nesting costs a pointer instead.
+        Box::pin(async move {
+            self.sub_agent_run_future(
+                id,
+                role,
+                spec,
+                brief,
+                task,
+                permit,
+                progress,
+                residual_limits,
+                cancellation,
+                parent_wall,
+            )
+            .await
+        })
     }
 
     /// Build the child's run as an OWNED `'static` future, so a background

@@ -4,6 +4,8 @@
 //! choice belongs to the caller and is never made for it by what happens to be
 //! installed on the machine: one invocation, one meaning, every platform.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -100,6 +102,9 @@ impl Tool for GrepTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.clone().unwrap_or_else(|| ".".to_string());
         let search_root = context.execution_workspace()?.resolve_for_read(&rel)?;
+        if let Err(reason) = crate::memory_access::validate_read(&context, &search_root) {
+            return Ok(ToolOutput::error(reason));
+        }
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
 
         let query = GrepQuery {
@@ -134,14 +139,27 @@ impl Tool for GrepTool {
         };
 
         let mut body = String::new();
+        let workspace_root = context.require_workspace()?.root().to_path_buf();
         for found in &result.matches {
+            let matched = Path::new(&found.path);
+            let absolute = if matched.is_absolute() {
+                matched.to_path_buf()
+            } else {
+                workspace_root.join(matched)
+            };
+            // A search rooted above the memory scopes must not surface bytes
+            // the memory policy refuses to read (retained archives, tombstones
+            // awaiting unlink). Silently omitting them is the forget contract.
+            if crate::memory_access::validate_read(&context, &absolute).is_err() {
+                continue;
+            }
             body.push_str(&clip_line(&format!(
                 "{}:{}:{}",
                 found.path, found.line, found.text
             )));
             body.push('\n');
         }
-        if result.matches.is_empty() {
+        if body.is_empty() {
             body.push_str("(no matches)\n");
         }
         if result.limited {
@@ -218,6 +236,69 @@ mod tests {
         )
         .await;
         assert_eq!(out.content, "notes.md:1:main\n");
+    }
+
+    #[tokio::test]
+    async fn archived_memory_does_not_leak_through_grep() {
+        let (_dir, ctx) = workspace();
+        let memory_temp = tempfile::tempdir().unwrap();
+        let root = memory_temp.path().join("memory");
+        let global = root.join("global");
+        let workspace_memory = root.join("workspaces/project");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(workspace_memory.join("archive/dream")).unwrap();
+        std::fs::create_dir_all(workspace_memory.join("topics")).unwrap();
+        std::fs::write(
+            workspace_memory.join("archive/dream/note.md"),
+            "the forgotten fact\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_memory.join("topics/current.md"),
+            "current topic\n",
+        )
+        .unwrap();
+        let policy = std::sync::Arc::new(
+            leveler_memory::MemoryAccessPolicy::new(&global, &workspace_memory).unwrap(),
+        );
+        let ctx = ctx.with_memory(leveler_memory::MemoryAccessResource(policy));
+
+        // A broad search of the memory scope must not surface retained archive
+        // bytes, while the same traversal still finds ordinary topic content.
+        let out = grep(
+            &ctx,
+            serde_json::json!({
+                "pattern": "forgotten",
+                "path": workspace_memory.display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(out.content, "(no matches)\n", "{}", out.content);
+        let topic = grep(
+            &ctx,
+            serde_json::json!({
+                "pattern": "current",
+                "path": workspace_memory.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            topic.content.contains("topics/current.md"),
+            "{}",
+            topic.content
+        );
+
+        // Pointing the search directly at retention data is refused outright.
+        let direct = grep(
+            &ctx,
+            serde_json::json!({
+                "pattern": "fact",
+                "path": workspace_memory.join("archive").display().to_string(),
+            }),
+        )
+        .await;
+        assert!(direct.is_error, "{}", direct.content);
+        assert!(direct.content.contains("archive"), "{}", direct.content);
     }
 
     #[tokio::test]

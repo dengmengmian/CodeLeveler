@@ -908,6 +908,9 @@ impl Application {
         // And once more at the turn boundary, so a task that exited during this
         // turn is in the log before the next window reads it.
         crate::interactive::reconcile_background_evidence(self, session_id).await;
+        // Memory is a post-turn side effect: it enqueues the settled range and
+        // starts this session's worker, and never alters the turn's result.
+        self.memory_after_turn(session_id, model).await;
 
         match result {
             Ok(report) => report_to_result(report),
@@ -974,6 +977,8 @@ impl Application {
             cancellation,
         )
         .await;
+        // Capture runs after the turn settles, outside the user's result path.
+        self.memory_after_turn(session_id, model).await;
 
         match result {
             Ok(report) => report_to_result(report),
@@ -1134,7 +1139,7 @@ impl Application {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         crate::interactive::reconcile_background_evidence(self, session_id).await;
-        let (engine, spec) = self
+        let (engine, spec, model) = self
             .resume_prepare(
                 session_id,
                 approver,
@@ -1150,6 +1155,10 @@ impl Application {
                 cancellation,
             )
             .await;
+        // A resume produces a settled turn like any other entry point; its
+        // transcript must reach Capture or the session's memory cursor would
+        // silently skip it.
+        self.memory_after_turn(session_id, &model).await;
 
         match result {
             Ok(report) => report_to_result(report),
@@ -1176,13 +1185,14 @@ impl Application {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         crate::interactive::reconcile_background_evidence(self, session_id).await;
-        let (engine, spec) = self
+        let (engine, spec, model) = self
             .resume_prepare(session_id, approver, clarifier, task_cancel)
             .await?;
         let engine = engine.with_steering(steering);
         let result = engine
             .resume_with_instruction(session_id, &spec, instruction, observer, cancellation)
             .await;
+        self.memory_after_turn(session_id, &model).await;
 
         match result {
             Ok(report) => report_to_result(report),
@@ -1210,7 +1220,7 @@ impl Application {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         crate::interactive::reconcile_background_evidence(self, session_id).await;
-        let (engine, spec) = self
+        let (engine, spec, model) = self
             .resume_prepare(session_id, approver, clarifier, task_cancel)
             .await?;
         let engine = engine.with_steering(steering);
@@ -1218,6 +1228,7 @@ impl Application {
             .resume_continuation(session_id, &spec, observer, cancellation)
             .await;
         crate::interactive::reconcile_background_evidence(self, session_id).await;
+        self.memory_after_turn(session_id, &model).await;
 
         match result {
             Ok(report) => report_to_result(report),
@@ -1233,7 +1244,7 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         task_cancel: Arc<AtomicBool>,
-    ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec), AppError> {
+    ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec, ModelRef), AppError> {
         let db = self.open_database().await?;
 
         let repo = SessionRepository::new(&db);
@@ -1274,7 +1285,7 @@ impl Application {
         let mut spec = self.direct_spec(record.goal.clone(), mode, sandbox);
         // Resume with the persisted strategy, not an assumed one.
         spec.runtime.kind = kind;
-        Ok((engine, spec))
+        Ok((engine, spec, model))
     }
 }
 

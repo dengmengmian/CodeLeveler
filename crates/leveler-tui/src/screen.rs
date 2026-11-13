@@ -55,6 +55,10 @@ pub enum Screen {
     /// management API — list, detail, create/edit, pause, run now, history,
     /// grant and OS wakeup. The runtime owns every definition and run.
     Schedules,
+    /// `/memory`: durable cross-session memory. A searchable file list beside
+    /// a bounded, read-only preview; the runtime owns the store, the capture
+    /// queue and every tombstone.
+    Memory,
     /// Complete output of a finished local command. File-backed and windowed:
     /// the page paints only the visible rows, so a 50 MiB result costs the
     /// same per frame as a 1 KiB one.
@@ -386,6 +390,40 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // Cross-session memory: a read-only view plus typed management requests.
+    // Reading is safe while a turn runs; the runtime owns every memory write.
+    slash(
+        "/memory",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    // A local note: it writes one Markdown file and reaches no model, so it
+    // is allowed while a turn runs.
+    slash(
+        "/remember",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    // Both run an auxiliary model pass over the memory store. `IdleOnly`: the
+    // current turn must settle before a second model call competes with it.
+    slash(
+        "/dream",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
+    ),
+    slash(
+        "/flush",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
+    ),
     // Self-update. `IdleOnly`: replacing the running binary under an active
     // task would strand it, so the busy gate refuses first.
     slash(
@@ -536,6 +574,10 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/context" => s.context,
         "/usage" => s.usage,
         "/sessions" => s.sessions,
+        "/memory" => s.memory,
+        "/remember" => s.remember,
+        "/dream" => s.dream,
+        "/flush" => s.flush,
         "/resume-claude" => s.resume_claude,
         "/resume-codex" => s.resume_codex,
         "/restore" | "/checkpoint" | "/rewind" => s.restore,
@@ -793,9 +835,12 @@ mod surface_tests {
         }
     }
 
+    /// The Memory 2.0 command surface is retired. The native memory page
+    /// registers its own `/memory`, `/remember`, `/dream` and `/flush`; the
+    /// old destructive and consolidation names stay unreachable.
     #[test]
-    fn memory_is_absent_from_parse_completion_help_and_aliases() {
-        for token in ["/memory", "/remember", "/forget", "/consolidate_memory"] {
+    fn retired_memory_commands_stay_absent() {
+        for token in ["/forget", "/consolidate_memory"] {
             assert!(!all_slash_tokens().contains(&token));
             assert!(!super::is_known_slash_token(token));
             assert!(super::slash_primary(token).is_none());
@@ -809,11 +854,12 @@ mod surface_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn remember_is_absent_from_all_completion_tokens() {
-        assert!(!all_slash_tokens().contains(&"/remember"));
+        for token in ["/memory", "/remember", "/dream", "/flush"] {
+            assert!(
+                super::slash_def(token).is_some(),
+                "{token} is not registered"
+            );
+        }
     }
 
     /// `/develop` was removed outright. It must not survive as a completion,
@@ -869,6 +915,10 @@ mod surface_tests {
                 "/doctor",
                 "/clean",
                 "/schedules",
+                "/memory",
+                "/remember",
+                "/dream",
+                "/flush",
                 "/update",
                 "/reload",
             ]
@@ -1378,6 +1428,7 @@ mod reachability_tests {
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
+            Screen::Memory => Some("`/memory` — reducer/submit.rs"),
             Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
             Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
         }
@@ -1401,6 +1452,7 @@ mod reachability_tests {
             Screen::Trace,
             Screen::Context,
             Screen::Schedules,
+            Screen::Memory,
             Screen::Output,
         ];
         for screen in all {
