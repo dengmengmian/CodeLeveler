@@ -2043,20 +2043,24 @@ async fn a_restarted_process_resumes_the_cancelled_capture_without_a_new_turn() 
     ])
     .await;
     harness.submit("first turn").await;
-    // Wait until the extraction actually owns the job, then quit the way the
-    // normal exit path does.
+    // Wait until the extraction actually owns the job *and* its request reached
+    // the scripted server. The durable claim is written before the provider
+    // call, so quitting on the claim alone can cancel the request before it is
+    // sent, leaving the `NeverResponds` unclaimed and shifting the script: the
+    // recovered attempt would then hold forever instead of completing.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
         if store
             .work_state(harness.session.as_str(), 1)
             .is_ok_and(|state| state.running == 1)
+            && harness.servers[0].request_count() >= 2
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "capture never claimed a lease"
+            "capture never claimed a lease and sent its extraction request"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -2114,6 +2118,12 @@ async fn normal_quits_do_not_exhaust_the_capture_retry_budget() {
     // Three normal exits, each with the extraction in flight. A shutdown
     // cancellation must not consume the bounded extraction-failure budget.
     for cycle in 1..=3 {
+        // Wait for the durable claim *and* the request reaching the scripted
+        // server. Quitting on the claim alone can cancel the request before it
+        // is sent, leaving this cycle's `NeverResponds` unconsumed; a later
+        // attempt would then block on it instead of running the scripted
+        // success. The turn itself is request 1, so cycle N's extraction is
+        // request N + 1.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let store =
@@ -2121,12 +2131,13 @@ async fn normal_quits_do_not_exhaust_the_capture_retry_budget() {
             if store
                 .work_state(harness.session.as_str(), 1)
                 .is_ok_and(|state| state.running == 1)
+                && harness.servers[0].request_count() > cycle
             {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "cycle {cycle}: capture never claimed a lease"
+                "cycle {cycle}: capture never claimed a lease and sent its extraction request"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
