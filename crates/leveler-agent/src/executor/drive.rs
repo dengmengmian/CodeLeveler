@@ -310,6 +310,12 @@ pub(crate) struct Drive<'a> {
     /// identical declaration is accepted as an explicit degradation instead of
     /// looping a model that will not call the question tool.
     user_decision_repair_issued: bool,
+    /// The one reconciliation for a `blocked` resolution that contradicts the
+    /// model's own latest explicit plan. A second declaration is accepted as
+    /// an explicit degradation: pending steps say the model once declared the
+    /// work necessary, not that it is still possible, so the block is never
+    /// refused forever and the plan is never executed on the model's behalf.
+    plan_block_repair_issued: bool,
     /// How far the runtime could verify the completion it accepted. Set by the
     /// completion gate and the requirement gate of every accepted attempt, and
     /// cleared at the start of each attempt so a refused one leaves no verdict.
@@ -1100,6 +1106,7 @@ impl Executor {
             asked_user_this_turn: false,
             work_since_user_ask: false,
             user_decision_repair_issued: false,
+            plan_block_repair_issued: false,
             completion_verification: None,
             settled_goal: None,
             settled_rounds: 0,
@@ -4299,6 +4306,14 @@ impl AgentHarness for Drive<'_> {
         // streak for it cannot spin — the repair is issued once and a second
         // identical block settles as an explicit degradation.
         let mut user_decision_repaired_this_round = false;
+        // A block reconciled against the model's own still-open plan is the
+        // same kind of actionable feedback: it names a structured conflict the
+        // model has not answered yet. The repair is issued once per drive, so
+        // clearing the no-progress streak for it cannot spin.
+        let mut plan_block_repaired_this_round = false;
+        // Set when the block stands AFTER that reconciliation. The accepted
+        // block then carries the conflict in its receipt instead of hiding it.
+        let mut plan_block_degraded = false;
         // A requirements refusal whose verdict is DIFFERENT from the previous
         // one is the model acting on the feedback, not repeating itself. It is
         // bounded by the same recovery budget as a citation correction, so an
@@ -5307,6 +5322,83 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 }
+                // A blocked resolution is the model's structured terminal, but
+                // it is declared against a plan the same model published. While
+                // that latest explicit plan still lists steps the model never
+                // marked completed, the two declarations describe different
+                // states of the same work. One bounded reconciliation states
+                // the conflict with the real open steps; the model continues,
+                // rewrites the plan, or confirms the block. A confirmed block
+                // is accepted with the conflict recorded: a pending step is the
+                // model's declaration that work was needed, not proof that it
+                // is still possible, so the runtime never forces the plan to
+                // completion or demands proof of the obstruction.
+                if reason == StopReason::Blocked
+                    && self.plan_state.is_model_explicit()
+                    && !self.plan_state.open_steps().is_empty()
+                {
+                    let open_steps: Vec<String> = self
+                        .plan_state
+                        .open_steps()
+                        .into_iter()
+                        .map(|step| step.step.clone())
+                        .collect();
+                    // Bounded like the quiet-round nudge: the model owns the
+                    // full list in its own transcript.
+                    let detail = format!(
+                        "{} open step(s): {}",
+                        open_steps.len(),
+                        open_steps
+                            .iter()
+                            .take(12)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                    if !self.plan_block_repair_issued {
+                        self.plan_block_repair_issued = true;
+                        plan_block_repaired_this_round = true;
+                        denied_calls_this_round += 1;
+                        let message = crate::nudges::plan_block_conflict(&open_steps);
+                        (self.observer)(AgentEvent::GoalIntercepted {
+                            kind: "blocked_with_open_plan".to_string(),
+                            detail,
+                        });
+                        self.note_refused_completion(
+                            &round_prose,
+                            declares_answer,
+                            revises_answer,
+                            round_has_work,
+                        );
+                        (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
+                            execution_status: None,
+                            id: call.id.as_str().to_string(),
+                            name: UPDATE_GOAL_TOOL.to_string(),
+                            is_error: true,
+                            preview: goal_refusal_preview("blocked_with_open_plan", &message),
+                            applied_diff: None,
+                        });
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: message,
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                    // Confirmed after the one reconciliation. The block is
+                    // the model's resolution; the plan conflict is a fact the
+                    // terminal must carry, not a reason to loop or to mark
+                    // work done on its behalf.
+                    plan_block_degraded = true;
+                    (self.observer)(AgentEvent::GoalIntercepted {
+                        kind: "blocked_with_open_plan_degraded".to_string(),
+                        detail,
+                    });
+                }
                 // A completion claim is not sole evidence. The model's own
                 // verification field is checked against this drive's command
                 // record; a failed test/build cannot be closed as complete,
@@ -5576,20 +5668,27 @@ impl AgentHarness for Drive<'_> {
                 // completion, and the model writing the delivery is the one
                 // party that must not present it as verified.
                 let receipt = if reason == StopReason::Blocked {
+                    let mut boundaries = Vec::new();
                     if user_decision_degraded {
                         // No channel existed, so this block is the explicit
                         // degradation the model was told about. Say so in the
                         // receipt; a user decision was never taken.
-                        crate::injected_tools::completion_receipt(
-                            "Goal blocked",
-                            &["The user decision behind this block was never put to \
-                              the user as a question, so it was not resolved with the \
-                              user."
-                                .to_string()],
-                        )
-                    } else {
-                        crate::injected_tools::completion_receipt("Goal blocked", &[])
+                        boundaries.push(
+                            "The user decision behind this block was never put to \
+                             the user as a question, so it was not resolved with the \
+                             user."
+                                .to_string(),
+                        );
                     }
+                    if plan_block_degraded {
+                        boundaries.push(
+                            "The block stands while the model's latest plan still lists \
+                             steps that were never marked completed; they stay open in \
+                             the record."
+                                .to_string(),
+                        );
+                    }
+                    crate::injected_tools::completion_receipt("Goal blocked", &boundaries)
                 } else if reason == StopReason::Yielded {
                     crate::injected_tools::completion_receipt("Goal yielded", &[])
                 } else {
@@ -7357,12 +7456,12 @@ impl AgentHarness for Drive<'_> {
             // one). Both are bounded here; neither is "no progress" while the
             // verdict keeps moving. An unchanged requirements verdict is a
             // repeat and stays on the denial streak.
-            // A repaired `user_decision` block is feedback that names the
-            // interaction the model skipped; the model has not yet had the
-            // round it was told to take. Clearing the streak here cannot
-            // spin: the repair is issued once and a second identical block
-            // settles as an explicit degradation.
-            if user_decision_repaired_this_round {
+            // A repaired `user_decision` block, or a block reconciled against
+            // the model's own open plan, is feedback that names a structured
+            // conflict the model has not answered yet. Clearing the streak here
+            // cannot spin: each repair is issued once per drive and a repeated
+            // declaration settles as an explicit degradation.
+            if user_decision_repaired_this_round || plan_block_repaired_this_round {
                 self.progress.note_progress(model_steps);
                 self.emit_progress();
             } else if citation_refused || gate_verdict_advanced_this_round {

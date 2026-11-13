@@ -44,12 +44,50 @@ pub(crate) fn goal_settled_delivery_nudge() -> String {
 /// plan to reach 100%: a step that is no longer necessary only has to stop
 /// being declared open.
 pub(crate) fn plan_unresolved_nudge(open_steps: &[String]) -> String {
-    // Listing more than this pushes the plan into a prompt budget it does not
-    // deserve; the model owns the full list in its own transcript.
-    const MAX_LISTED: usize = 12;
-
     let mut text =
         String::from("Your declared plan is still open: these steps are not marked completed.\n");
+    text.push_str(&listed_steps(open_steps));
+    text.push_str(
+        "The plan is your own declaration, so nothing else resolves this. Continue the work, \
+         publish an updated plan if a step is no longer needed, or state what blocks the rest. \
+         Ending the turn now leaves these steps open in the record.",
+    );
+    text
+}
+
+/// Goal mode: `update_goal(blocked)` was declared while the model's own latest
+/// explicit plan still lists steps it never marked completed.
+///
+/// Both facts are the model's own declarations, and they describe different
+/// states of the same work. Pending steps do not prove the remaining work is
+/// still possible — that judgement is the model's — so this is one
+/// reconciliation, not a gate: the block is accepted on a second declaration,
+/// with the conflict kept in the record. The runtime does not choose the next
+/// step, order the plan executed, or demand proof of the obstruction.
+pub(crate) fn plan_block_conflict(open_steps: &[String]) -> String {
+    let mut text = String::from(
+        "update_goal(blocked) was not accepted: the latest plan this model published still \
+         lists these steps as not completed.\n",
+    );
+    text.push_str(&listed_steps(open_steps));
+    text.push_str(
+        "The plan is your own declaration, so the block and the plan currently describe \
+         different states of the same work. Continue the work, publish an updated plan with \
+         update_plan when a step is no longer needed or is covered by what obstructs it, or \
+         confirm the block with update_goal(blocked) again. A block confirmed while these \
+         steps remain open is accepted, and the conflict stays recorded.",
+    );
+    text
+}
+
+/// One bounded rendering of a plan's open steps. The model owns the full list
+/// in its own transcript; the feedback only has to name the conflict.
+fn listed_steps(open_steps: &[String]) -> String {
+    // Listing more than this pushes the plan into a prompt budget it does not
+    // deserve.
+    const MAX_LISTED: usize = 12;
+
+    let mut text = String::new();
     for step in open_steps.iter().take(MAX_LISTED) {
         text.push_str("- ");
         text.push_str(step.trim());
@@ -58,11 +96,6 @@ pub(crate) fn plan_unresolved_nudge(open_steps: &[String]) -> String {
     if open_steps.len() > MAX_LISTED {
         text.push_str(&format!("- (and {} more)\n", open_steps.len() - MAX_LISTED));
     }
-    text.push_str(
-        "The plan is your own declaration, so nothing else resolves this. Continue the work, \
-         publish an updated plan if a step is no longer needed, or state what blocks the rest. \
-         Ending the turn now leaves these steps open in the record.",
-    );
     text
 }
 
@@ -163,6 +196,40 @@ mod tests {
     fn the_plan_nudge_caps_a_long_plan() {
         let steps: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
         let n = plan_unresolved_nudge(&steps);
+        assert!(n.contains("- s11"), "{n}");
+        assert!(!n.contains("- s12"), "{n}");
+        assert!(n.contains("(and 8 more)"), "{n}");
+    }
+
+    /// The block reconciliation states both of the model's own declarations,
+    /// every honest exit, and that a confirmed block is accepted. It must not
+    /// choose work, require the plan to complete, or claim pending steps prove
+    /// the remaining work is possible.
+    #[test]
+    fn the_plan_block_conflict_states_the_conflict_and_every_exit() {
+        let n = plan_block_conflict(&["step seven".to_string(), "step nine".to_string()]);
+        assert!(n.contains("- step seven"), "{n}");
+        assert!(n.contains("- step nine"), "{n}");
+        assert!(n.contains("not accepted"), "{n}");
+        assert!(n.contains("update_plan"), "{n}");
+        assert!(n.contains("update_goal(blocked) again"), "{n}");
+        assert!(n.contains("is accepted"), "{n}");
+        for banned in [
+            "read_file",
+            "apply_patch",
+            "run_command",
+            "you must complete",
+            "下一步应该",
+            "cannot be done",
+        ] {
+            assert!(!n.contains(banned), "must not coach (`{banned}`): {n}");
+        }
+    }
+
+    #[test]
+    fn the_plan_block_conflict_caps_a_long_plan() {
+        let steps: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
+        let n = plan_block_conflict(&steps);
         assert!(n.contains("- s11"), "{n}");
         assert!(!n.contains("- s12"), "{n}");
         assert!(n.contains("(and 8 more)"), "{n}");

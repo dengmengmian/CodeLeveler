@@ -49,6 +49,19 @@ impl Scripted {
         )
     }
 
+    /// A plan with nothing open. The budget cases below end on a `blocked`
+    /// resolution that does not contradict the plan, so the Goal-block
+    /// reconciliation adds no round; those cases measure budget attribution,
+    /// not that gate.
+    fn completed_plan() -> Self {
+        Self::Tool(
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "keep working", "status": "completed"}
+            ]}),
+        )
+    }
+
     fn goal(status: &str) -> Self {
         Self::Tool(
             "update_goal",
@@ -343,7 +356,7 @@ async fn pre_upgrade_spend_counts_against_the_resumed_goal_budget() {
     // the goal owed so a continuation re-enters it.
     let fx = fixture(
         vec![None, Some(OBJECTIVE)],
-        vec![Scripted::plan(), Scripted::goal("blocked")],
+        vec![Scripted::completed_plan(), Scripted::goal("blocked")],
         true,
     )
     .await;
@@ -508,8 +521,8 @@ async fn a_second_declaration_never_double_counts_or_replaces_the_objective() {
     let fx = fixture(
         vec![None, Some(OBJECTIVE), Some("另一个目标")],
         vec![
-            Scripted::plan(),
-            Scripted::plan(),
+            Scripted::completed_plan(),
+            Scripted::completed_plan(),
             Scripted::goal("blocked"),
         ],
         true,

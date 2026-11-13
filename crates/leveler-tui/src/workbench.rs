@@ -1,7 +1,7 @@
 //! Workbench layout: fixed Header / Plan / Input / Footer + scrollable Conversation.
 //!
 //! Layout (top → bottom):
-//! Header · Conversation (scroll) · gap · Notice? · Status? · Plan · gap? · Input ·
+//! Header · Conversation (scroll) · gap · Notice? · Plan? · Status? · gap? · Input ·
 //! Hint+usage+clock footer
 //!
 //! `Notice` is the global Notice Surface: user-action feedback (busy refusal,
@@ -15,6 +15,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::{
@@ -23,7 +24,6 @@ use crate::render::{
 };
 use crate::screen::Screen;
 use crate::state::AppState;
-use crate::status_line::status_lines;
 
 /// The conversation never shrinks below this, whatever the plan dock wants.
 const MIN_CONVERSATION_ROWS: u16 = 3;
@@ -121,7 +121,7 @@ pub(crate) fn plan_indicator_should_show(plan: &UiPlan, live: bool) -> bool {
     !plan.steps.is_empty() && (live || plan_panel_should_show(plan))
 }
 
-/// The plan's half of the state strip, before fitting decides what survives.
+/// The plan row's summary, before fitting decides what survives.
 ///
 /// One structured value so the glyph, the progress and the state word cannot
 /// drift apart between the widest and the narrowest terminal.
@@ -130,10 +130,13 @@ struct PlanStrip {
     glyph_color: ratatui::style::Color,
     /// `计划 3/4` — the plan's name and its declared progress.
     core: String,
+    total: usize,
     /// The step declared in progress, or the plan's state word. Never a step
     /// the plan has not declared.
     detail: Option<String>,
     detail_color: ratatui::style::Color,
+    /// Width to preserve for a state label before fitting decorative marks.
+    detail_floor: usize,
 }
 
 /// Build the plan indicator from the live plan.
@@ -160,8 +163,13 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
             glyph: "✕",
             glyph_color: theme.status.error,
             core,
-            detail: Some(t.plan_state_failed.to_string()),
+            total,
+            detail: Some(join_detail(
+                Some(t.plan_state_failed.to_string()),
+                history.as_deref(),
+            )),
             detail_color: theme.status.error,
+            detail_floor: 1 + t.plan_state_failed.width(),
         };
     }
     if live && all_settled {
@@ -169,11 +177,13 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
             glyph: "✓",
             glyph_color: theme.status.success,
             core,
+            total,
             detail: Some(join_detail(
                 Some(t.plan_state_done.to_string()),
                 history.as_deref(),
             )),
             detail_color: theme.status.success,
+            detail_floor: 1 + t.plan_state_done.width(),
         };
     }
     if live {
@@ -205,23 +215,25 @@ fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
             glyph: "●",
             glyph_color,
             core,
+            total,
             detail,
             detail_color: theme.text.secondary,
+            detail_floor: 5,
         };
     }
+    let label = if waiting_for_user {
+        t.plan_waiting_user
+    } else {
+        t.plan_state_last
+    };
     PlanStrip {
         glyph: "○",
         glyph_color: theme.text.muted,
         core,
-        detail: Some(join_detail(
-            Some(if waiting_for_user {
-                t.plan_waiting_user.to_string()
-            } else {
-                t.plan_state_last.to_string()
-            }),
-            history.as_deref(),
-        )),
+        total,
+        detail: Some(join_detail(Some(label.to_string()), history.as_deref())),
         detail_color: theme.text.muted,
+        detail_floor: 1 + label.width(),
     }
 }
 
@@ -284,48 +296,54 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // Conversation's bottom-right; with no notice it costs zero rows and the
     // transcript keeps its full height.
     let notice_rows: u16 = u16::from(state.notification.is_some());
-    // Runtime status (spinner / elapsed / tokens) and the plan indicator share
-    // ONE state strip: the runtime is the turn's state, the plan is its
-    // declared shape, and two rows for one moment of the turn spent a row of
-    // conversation on chrome. The strip is never merged with the transient
-    // notice above it. Every strip of bottom chrome sits on the composer's
-    // grid: the same workspace gutter, applied through `chrome_slot` below.
-    // The text is laid out for that inner width, not the terminal's.
-    let status_block = status_lines(state, workspace_inner.width as usize);
-    let status_has_content = status_block
-        .iter()
-        .any(|line| line.spans.iter().any(|span| !span.content.is_empty()));
-    let plan_visible = state
-        .plan
-        .as_ref()
-        .is_some_and(|plan| plan_indicator_should_show(plan, state.is_busy()));
-    // Any painted cell earns the row: the runtime's own line, a live plan, a
-    // running background task, or an active issue. (Visibility here and the
-    // renderer's own filters must agree, or a cell would be counted for a row
-    // it never gets to paint on.)
-    let background_visible = crate::activity::running_background_count(state) > 0;
-    let issue_visible = !crate::issue::issue_summary(state).is_empty();
-    let strip_rows: u16 =
-        u16::from(status_has_content || plan_visible || background_visible || issue_visible);
+    // Plan and runtime claim rows before the transcript gets its viewport.
+    let strip = state_strip(state, workspace_inner.width as usize);
+    let strip_rows = u16::from(strip.is_some());
+    let chrome_rows = strip_rows + attach_rows + pending_rows + live_rows;
+    // One breathing row separates the roster from the context footer.
+    let team_gap = u16::from(team_rows > 0);
+    let base_rows = header_rows
+        + gap_rows
+        + notice_rows
+        + chrome_rows
+        + composer_rows
+        + footer_rows
+        + footer_bottom
+        + team_rows
+        + team_gap;
+    // If the extra row and its input gap would squeeze existing chrome,
+    // temporarily leave the plan out. Its hit is cleared by the same path.
+    let plan_line = (area.height >= base_rows + MIN_CONVERSATION_ROWS + 2)
+        .then(|| plan_row(state, workspace_inner.width as usize))
+        .flatten();
+    let plan_rows = u16::from(plan_line.is_some());
     // Breathing room around the input box: blank above only when live chrome
     // (the state strip / attachments / 待发送) sits on top of it; blank below
     // always so Context footer is not flush on the composer border.
-    let chrome_above = strip_rows
-        .saturating_add(attach_rows)
-        .saturating_add(pending_rows)
-        .saturating_add(live_rows);
-    let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
-
-    // One breathing row between the Context footer and the roster, so the
-    // process list reads as its own surface rather than a second footer.
-    let team_gap: u16 = if team_rows > 0 { 1 } else { 0 };
-
-    let chunks = Layout::vertical([
+    let pre_composer_gap = u16::from(chrome_rows + plan_rows > 0);
+    let [
+        header,
+        conversation,
+        _,
+        notice,
+        plan,
+        status,
+        attachments,
+        pending,
+        shell,
+        _,
+        composer,
+        footer,
+        _,
+        team,
+        _,
+    ] = Layout::vertical([
         Constraint::Length(header_rows),
         Constraint::Min(MIN_CONVERSATION_ROWS), // conversation viewport
         Constraint::Length(gap_rows),
         Constraint::Length(notice_rows), // Notice Surface (0 rows when idle)
-        Constraint::Length(strip_rows),  // runtime status + plan indicator
+        Constraint::Length(plan_rows),
+        Constraint::Length(strip_rows),
         Constraint::Length(attach_rows),
         Constraint::Length(pending_rows),
         Constraint::Length(live_rows),
@@ -341,7 +359,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Length(team_rows),
         Constraint::Length(footer_bottom),
     ])
-    .split(area);
+    .areas(area);
 
     // The one horizontal rule for the bottom chrome: notice, strip,
     // attachments, pending inputs, composer and footer all start on the
@@ -349,16 +367,10 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // renderer.)
     let chrome_slot =
         |slot: Rect| crate::layout::horizontal_inset(slot, crate::layout::WORKSPACE_GUTTER_X);
-    let notice_slot = chrome_slot(chunks[3]);
-    let strip_slot = chrome_slot(chunks[4]);
-    let attach_slot = chrome_slot(chunks[5]);
-    let pending_slot = chrome_slot(chunks[6]);
-    let live_slot = chrome_slot(chunks[7]);
-    let input_slot = chrome_slot(chunks[9]);
-    let footer_slot = chrome_slot(chunks[10]);
+    let input_slot = chrome_slot(composer);
 
-    render_header(frame, chunks[0], state);
-    crate::conversation::viewport::render(frame, chunks[1], state);
+    render_header(frame, header, state);
+    crate::conversation::viewport::render(frame, conversation, state);
     // The composer's own plane. An overlay takes this slot instead, and the
     // decision sits on the conversation's background — so the input surface
     // must not be painted underneath it.
@@ -366,28 +378,37 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         let input_bg = state.theme.surface.input;
         state.theme.paint_surface(frame, input_slot, input_bg);
     }
-    // chunks[2] = gap (leave blank)
-    render_notice(frame, notice_slot, state);
-    render_state_strip(frame, strip_slot, state);
-    render_attachments(frame, attach_slot, state);
-    crate::pending_inputs::render(frame, pending_slot, state, area.height);
-    render_shell_live_activity(frame, live_slot, state);
-    // chunks[8] = pre_composer_gap (leave blank)
+    render_notice(frame, chrome_slot(notice), state);
+    render_plan_row(frame, chrome_slot(plan), state, plan_line);
+    render_state_strip(frame, chrome_slot(status), state, strip);
+    render_attachments(frame, chrome_slot(attachments), state);
+    crate::pending_inputs::render(frame, chrome_slot(pending), state, area.height);
+    render_shell_live_activity(frame, chrome_slot(shell), state);
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
         }
         None => render_input(frame, input_slot, state),
     }
-    render_footer(frame, footer_slot, state);
-    // chunks[11] = breathing row; the roster docks under the footer.
-    state.activity_hits = render_team_panel(frame, chunks[12], state);
+    render_footer(frame, chrome_slot(footer), state);
+    state.activity_hits = render_team_panel(frame, team, state);
 
     // /btw is its own surface (see `crate::btw`), not an overlay here.
 
     if state.active_screen == Screen::Conversation && state.overlay.is_none() {
-        crate::render::render_shell_completion(frame, chunks[1], input_slot, state);
-        render_slash_popup(frame, chunks[1], input_slot, state);
+        let shell_popup =
+            crate::render::render_shell_completion(frame, conversation, input_slot, state);
+        let slash_popup = render_slash_popup(frame, conversation, input_slot, state);
+        for popup in [shell_popup, slash_popup].into_iter().flatten() {
+            // Both menus start on the composer's gutter, like the plan.
+            // Keep only the visible suffix clickable while a menu covers it.
+            if let Some((y, x0, x1)) = state.plan_hit
+                && popup.intersects(Rect::new(x0, y, x1 - x0, 1))
+            {
+                let start = popup.right();
+                state.plan_hit = (start < x1).then_some((y, start, x1));
+            }
+        }
     }
 }
 
@@ -680,7 +701,7 @@ fn repo_basename(repo: &str) -> String {
         .to_string()
 }
 
-// ── State strip (runtime status + plan indicator, one row) ──────────────────
+// ── Bottom status rows
 
 /// Columns between two painted cells of the strip.
 ///
@@ -690,8 +711,7 @@ fn repo_basename(repo: &str) -> String {
 /// constant width keeps every later cell's x position stable.
 const STRIP_GAP: usize = 3;
 
-/// Between the plan's progress and its current step / state word.
-const STRIP_DETAIL_SEP: &str = " · ";
+const MAX_PLAN_SEGMENTS: usize = 8;
 
 /// The plan's entry to the full Plan page, including its leading space.
 const STRIP_ARROW: &str = " ↗";
@@ -705,7 +725,6 @@ const STRIP_LABEL_FLOOR: usize = 6;
 enum StripTarget {
     Background,
     Issue,
-    Plan,
 }
 
 /// One painted cell of the strip: its spans, its width, and what it opens.
@@ -715,39 +734,21 @@ struct StripItem {
     width: usize,
 }
 
-/// The state strip: `◉ 命令运行中 · 15s · 20 次工具 · 后台 2 ↗ · ⚠ 后台失败 1 ↗ · ● 计划 3/4 ↗`.
-///
-/// One row, one paint, four cells with independent data and interaction:
-/// runtime status (left, keeps its own rendering and animation), then the
-/// background indicator, the issue indicator and the plan indicator — each a
-/// real fact from its own owner, each publishing its painted range as a hit
-/// region. Nothing here merges the underlying state; the strip only decides
-/// who gets columns.
-///
-/// Claims follow the product's priority: a blocking issue, the runtime's live
-/// state, active issues, the plan's progress and entry, the background entry,
-/// then the runtime's secondary numbers. A claim either fits or is skipped
-/// (the issue and plan degrade within their own claim first), so the row never
-/// wraps and a later cell never paints over an earlier one.
-fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    if area.height == 0 || area.width == 0 {
-        state.background_hit = None;
-        state.issue_hit = None;
-        state.plan_hit = None;
-        return;
+struct StateStrip {
+    line: Line<'static>,
+    hits: Vec<(StripTarget, u16, u16)>,
+}
+
+/// Fit the strip before reserving its row. Unpaintable entries take no space.
+fn state_strip(state: &AppState, width: usize) -> Option<StateStrip> {
+    if width == 0 {
+        return None;
     }
-    let width = area.width as usize;
-    let live = state.is_busy();
 
     // Facts, each from its owner.
     let running = crate::activity::running_background_count(state);
     let ready = crate::activity::ready_background_count(state);
     let issues = crate::issue::issue_summary(state);
-    let indicator = state
-        .plan
-        .as_ref()
-        .filter(|plan| plan_indicator_should_show(plan, live))
-        .map(|plan| plan_strip(state, plan, live));
 
     // The runtime label is measured first and forms every later budget:
     // statistics are negotiable, the live state word is not.
@@ -789,7 +790,7 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .and_then(|severe| severe_strip(state, &issues, severe, width.saturating_sub(label_floor)))
         .is_some_and(|item| claim(item, &mut committed, &mut claimed));
     // 2. Active issues (when no blocking one owns the cell): the active issue
-    //    outranks the plan. Labelled when it fits, the count form otherwise. A
+    //    outranks the background entry. Labelled when it fits, the count form otherwise. A
     //    seen issue is exactly as active as an unread one — only its marker
     //    differs, and that lives on the page.
     if !severe_claimed && !issues.is_empty() {
@@ -812,13 +813,7 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
             );
         }
     }
-    // 3. The plan's progress and entry (`● 计划 k/n ↗`) — its floor, claimed
-    //    before the plan's detail and before the background entry.
-    let plan_pos = indicator.as_ref().and_then(|ind| {
-        let item = plan_floor_strip(state, ind);
-        claim(item, &mut committed, &mut claimed).then(|| claimed.len() - 1)
-    });
-    // 4. Background entry (running tasks only): an entry, not a report.
+    // 3. Background entry (running tasks only): an entry, not a report.
     if running > 0 {
         claim(
             background_strip(state, running, ready),
@@ -827,50 +822,18 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
         );
     }
 
-    // The label takes what is left after every claim; the plan's detail then
-    // refills from THAT leftover, and the runtime's statistics from what the
-    // plan leaves. Both are the strip's last two priorities.
     let label_budget = width.saturating_sub(committed);
-    let label_line = crate::status_line::status_strip_line(state, label_budget, false);
-    let label_w = label_line.width();
-    let plan_item = plan_pos.and_then(|pos| {
-        let ind = indicator.as_ref()?;
-        let floor_w = claimed[pos].width;
-        let budget = label_budget.saturating_sub(label_w) + floor_w;
-        let (line, width) = fit_plan_strip(state, ind, budget)?;
-        Some(StripItem {
-            target: StripTarget::Plan,
-            spans: line.spans,
-            width,
-        })
-    });
-    let plan_extra = plan_item
-        .as_ref()
-        .zip(plan_pos)
-        .map(|(item, pos)| item.width.saturating_sub(claimed[pos].width))
-        .unwrap_or(0);
-    // `label_budget` is the label's own pool (width minus the claimed cells):
-    // the plan's detail and the runtime's statistics share only what the label
-    // does not use, and the label is never squeezed below its own budget.
-    let runtime =
-        crate::status_line::status_strip_line(state, label_budget.saturating_sub(plan_extra), true);
+    let label_w = crate::status_line::status_strip_line(state, label_budget, false).width();
+    let runtime = crate::status_line::status_strip_line(state, label_budget, true);
     let runtime_w = runtime.width();
 
-    // Assemble in reading order: runtime, background, issues, plan.
+    // Assemble in reading order: runtime, background, issues.
     let mut spans = runtime.spans;
     let mut hits: Vec<(StripTarget, u16, u16)> = Vec::new();
     let mut cursor = runtime_w;
     let mut first = true;
-    for target in [
-        StripTarget::Background,
-        StripTarget::Issue,
-        StripTarget::Plan,
-    ] {
-        let item = match target {
-            StripTarget::Plan => plan_item.as_ref(),
-            _ => claimed.iter().find(|item| item.target == target),
-        };
-        let Some(item) = item else {
+    for target in [StripTarget::Background, StripTarget::Issue] {
+        let Some(item) = claimed.iter().find(|item| item.target == target) else {
             continue;
         };
         if cursor > 0 || !first {
@@ -882,25 +845,35 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
             spans.push(Span::raw(separator));
             cursor += STRIP_GAP;
         }
-        let x0 = area.x.saturating_add(cursor as u16);
+        let x0 = cursor as u16;
         let x1 = x0.saturating_add(item.width as u16);
         hits.push((item.target, x0, x1));
         spans.extend(item.spans.iter().cloned());
         cursor += item.width;
         first = false;
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let line = Line::from(spans);
+    (line.width() > 0).then_some(StateStrip { line, hits })
+}
 
-    // Hits are the PAINTED ranges, one per cell: a click can never open the
-    // plan from under the runtime's numbers, nor the issues from the plan.
-    let find = |target: StripTarget| {
-        hits.iter()
-            .find(|(kind, _, _)| *kind == target)
-            .map(|(_, x0, x1)| (area.y, *x0, *x1))
-    };
-    state.background_hit = find(StripTarget::Background);
-    state.issue_hit = find(StripTarget::Issue);
-    state.plan_hit = find(StripTarget::Plan);
+fn render_state_strip(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    strip: Option<StateStrip>,
+) {
+    state.background_hit = None;
+    state.issue_hit = None;
+    if let Some(strip) = strip.filter(|_| area.width > 0 && area.height > 0) {
+        for (target, x0, x1) in strip.hits {
+            let hit = Some((area.y, area.x + x0, area.x + x1));
+            match target {
+                StripTarget::Background => state.background_hit = hit,
+                StripTarget::Issue => state.issue_hit = hit,
+            }
+        }
+        frame.render_widget(Paragraph::new(strip.line), area);
+    }
 }
 
 /// `后台 N ↗` — RUNNING background tasks only. A finished task is history (the
@@ -1018,94 +991,123 @@ fn severe_strip(
     })
 }
 
-/// The plan's progress and entry at its floor form: glyph, `计划 k/n`, arrow —
-/// no step name. Claimed as a floor so the plan's own detail never decides
-/// whether the entry exists.
-fn plan_floor_strip(state: &AppState, ind: &PlanStrip) -> StripItem {
-    let budget = plan_core_width(ind) + UnicodeWidthStr::width(STRIP_ARROW);
-    let (line, width) =
-        fit_plan_strip(state, ind, budget).expect("core + arrow always fits its own budget");
-    StripItem {
-        target: StripTarget::Plan,
-        spans: line.spans,
-        width,
+fn render_plan_row(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    plan: Option<Line<'static>>,
+) {
+    state.plan_hit = None;
+    if let Some(line) = plan.filter(|_| area.width > 0 && area.height > 0) {
+        state.plan_hit = Some((area.y, area.x, area.x + line.width() as u16));
+        frame.render_widget(Paragraph::new(line), area);
     }
 }
 
-fn plan_core_width(ind: &PlanStrip) -> usize {
-    UnicodeWidthStr::width(ind.glyph) + 1 + UnicodeWidthStr::width(ind.core.as_str())
-}
-
-/// Fit the plan indicator into `budget` columns, degrading in priority order:
-/// progress → arrow → step detail (which truncates before it drops).
-///
-/// `None` when not even `计划 k/n` fits: a clipped glyph would say nothing the
-/// reader can use, and the runtime's state outranks the plan outright.
-fn fit_plan_strip(
-    state: &AppState,
-    ind: &PlanStrip,
-    budget: usize,
-) -> Option<(Line<'static>, usize)> {
-    let focused = state.workbench_focus == crate::state::WorkbenchFocus::Plan;
-    let paint = |spans: Vec<Span<'static>>| -> Vec<Span<'static>> {
-        if focused {
-            spans
-                .into_iter()
-                .map(|span| {
-                    Span::styled(
-                        span.content.into_owned(),
-                        span.style.add_modifier(Modifier::REVERSED),
-                    )
-                })
-                .collect()
-        } else {
-            spans
-        }
-    };
-    let glyph = format!("{} ", ind.glyph);
-    let core_w = UnicodeWidthStr::width(glyph.as_str()) + UnicodeWidthStr::width(ind.core.as_str());
+fn plan_row(state: &AppState, budget: usize) -> Option<Line<'static>> {
+    let live = state.is_busy();
+    let plan = state
+        .plan
+        .as_ref()
+        .filter(|p| plan_indicator_should_show(p, live))?;
+    let ind = plan_strip(state, plan, live);
+    let marker = crate::status_line::status_marker(ind.glyph);
+    let core_w = marker.width() + ind.core.width();
+    let arrow_w = STRIP_ARROW.width();
     if core_w > budget {
         return None;
     }
-    let core_spans = || {
-        vec![
-            Span::styled(glyph.clone(), Style::default().fg(ind.glyph_color)),
-            Span::styled(
-                ind.core.clone(),
-                Style::default()
-                    .fg(state.theme.plan.primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]
-    };
-    let arrow_span = || Span::styled(STRIP_ARROW, Style::default().fg(state.theme.plan.primary));
-    let arrow_w = UnicodeWidthStr::width(STRIP_ARROW);
-    // Full form: detail + arrow, the detail truncated to what is left after
-    // the parts that outrank it. A sliver under two columns is not a step
-    // name, so the detail drops instead.
-    if let Some(detail) = ind.detail.as_deref() {
-        let fixed = core_w + UnicodeWidthStr::width(STRIP_DETAIL_SEP) + arrow_w;
-        let room = budget.saturating_sub(fixed);
-        if room >= 2 {
-            let text = crate::render::truncate_display(detail, room);
-            let used = fixed + UnicodeWidthStr::width(text.as_str());
-            let mut spans = core_spans();
+    let theme = &state.theme;
+    let mut spans = vec![
+        Span::styled(marker, Style::default().fg(ind.glyph_color)),
+        Span::styled(
+            ind.core,
+            Style::default()
+                .fg(theme.plan.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if core_w + arrow_w <= budget {
+        let mut room = budget - core_w - arrow_w;
+        let detail = ind
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        // Keep each visible mark tied to one current item. Hide the whole
+        // indicator rather than implying that a partial sample is the plan.
+        if (1..=MAX_PLAN_SEGMENTS).contains(&ind.total) {
+            let segment_width = ind.total * (" ".width() + "━".width());
+            let title_floor = if detail.is_some() {
+                ind.detail_floor
+            } else {
+                0
+            };
+            if room >= segment_width + title_floor {
+                for step in &plan.steps {
+                    let (mark, color, modifier) = match step.status {
+                        PlanStepStatus::Done => ("━", theme.plan.primary, Modifier::empty()),
+                        PlanStepStatus::Running => ("━", theme.plan.active, Modifier::BOLD),
+                        PlanStepStatus::Pending => ("─", theme.plan.dim, Modifier::empty()),
+                        PlanStepStatus::Failed => ("×", theme.status.error, Modifier::empty()),
+                        PlanStepStatus::Skipped => ("·", theme.text.muted, Modifier::empty()),
+                        PlanStepStatus::Abandoned => continue,
+                    };
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        mark,
+                        Style::default().fg(color).add_modifier(modifier),
+                    ));
+                }
+                room -= segment_width;
+            }
+        }
+        if let Some(detail) = detail.filter(|_| room >= 3) {
+            let text = plan_title(detail, room - 1);
             spans.push(Span::styled(
-                format!("{STRIP_DETAIL_SEP}{text}"),
+                format!(" {text}"),
                 Style::default().fg(ind.detail_color),
             ));
-            spans.push(arrow_span());
-            return Some((Line::from(paint(spans)), used));
+        }
+        spans.push(Span::styled(
+            STRIP_ARROW,
+            Style::default().fg(theme.plan.primary),
+        ));
+    }
+    if state.workbench_focus == crate::state::WorkbenchFocus::Plan {
+        for span in &mut spans {
+            span.style = span.style.add_modifier(Modifier::REVERSED);
         }
     }
-    // The arrow outranks the detail: the entry to the full plan survives a
-    // step name that does not.
-    if core_w + arrow_w <= budget {
-        let mut spans = core_spans();
-        spans.push(arrow_span());
-        return Some((Line::from(paint(spans)), core_w + arrow_w));
+    Some(Line::from(spans))
+}
+
+/// Fit the same graphemes the terminal buffer paints, reserving the ellipsis.
+fn plan_title(title: &str, width: usize) -> String {
+    let flat: String = title
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat
+        .graphemes(true)
+        .map(UnicodeWidthStr::width)
+        .sum::<usize>()
+        <= width
+    {
+        return flat;
     }
-    Some((Line::from(paint(core_spans())), core_w))
+    let mut room = width - "…".width();
+    let mut out = String::new();
+    for grapheme in flat.graphemes(true) {
+        let w = grapheme.width();
+        if w > room {
+            break;
+        }
+        out.push_str(grapheme);
+        room -= w;
+    }
+    out.push('…');
+    out
 }
 
 /// Rows the Task Team panel needs, or 0 when it should not appear.
@@ -1714,12 +1716,8 @@ mod tests {
             .unwrap_or_else(|| panic!("`{needle}` not on screen:\n{}", lines.join("\n")))
     }
 
-    /// The full workbench paints the runtime status and the plan indicator on
-    /// ONE row, and that row is the same row the runtime alone would use: the
-    /// plan rides the existing strip instead of costing the conversation
-    /// another line.
     #[test]
-    fn the_full_workbench_paints_one_state_strip_row() {
+    fn the_full_workbench_gives_one_viewport_row_to_the_plan() {
         let with = render_workbench(
             100,
             34,
@@ -1744,14 +1742,15 @@ mod tests {
             with.join("\n")
         );
         assert!(
-            with[plan_row].contains("waiting for model"),
-            "runtime status and plan indicator share the row: {:?}",
-            with[plan_row]
+            with[plan_row + 1].contains("waiting for model"),
+            "runtime status follows the plan: {:?}",
+            with[plan_row + 1]
         );
         let runtime_only_row = row_of(&without, "waiting for model");
         assert_eq!(
-            plan_row, runtime_only_row,
-            "the plan must not push the strip to another row"
+            plan_row + 1,
+            runtime_only_row,
+            "the extra row comes from the conversation, not the runtime"
         );
         // Composer and footer keep their rows with and without the plan.
         assert_eq!(
@@ -1762,10 +1761,8 @@ mod tests {
         assert_eq!(without.iter().filter(|l| l.contains("plan 1/3")).count(), 0);
     }
 
-    /// The merged strip survives a narrow terminal inside the FULL workbench:
-    /// both sides stay on one row and the composer keeps its full width.
     #[test]
-    fn a_narrow_workbench_keeps_the_merged_strip_inside_the_row() {
+    fn a_narrow_workbench_keeps_each_status_on_its_own_row() {
         let lines = render_workbench(
             60,
             24,
@@ -1777,8 +1774,8 @@ mod tests {
         let strip_row = row_of(&lines, "plan 1/3");
         let strip = &lines[strip_row];
         assert!(
-            strip.contains("waiting for model") || strip.contains('⠋'),
-            "runtime state survives: {strip:?}"
+            lines[strip_row + 1].contains("waiting for model"),
+            "runtime state survives: {lines:?}"
         );
         assert!(
             UnicodeWidthStr::width(strip.trim_end()) <= 60,
@@ -1852,6 +1849,24 @@ mod tests {
         state.elapsed_secs = 55;
         state.token_input = 59_000;
         state.team = team_with_usage(&[("a1", "explorer", "read_file", 158_000)]);
+        state.plan = Some(sample_plan());
+        state.composer.insert_file_reference("probe", "probe.txt");
+        state.transcript.push_user_shell_started(
+            leveler_core::UserShellId::new("ush-live"),
+            "shell probe".into(),
+            "/repo".into(),
+            0,
+        );
+        state
+            .background_task_labels
+            .insert("bg".into(), bg_running_task("work", 0));
+        state
+            .background_task_labels
+            .insert("err".into(), bg_failed_task("failure", 0, 1));
+        state.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "notice probe".into(),
+        });
         for i in 1..=9 {
             state
                 .pending_inputs
@@ -1877,15 +1892,32 @@ mod tests {
             })
             .collect();
         let pending_row = row_of(&lines, "Not sent · 9");
-        let input_row = row_of(&lines, "Type a message");
+        let input_row = row_of(&lines, "[file #1]");
         let footer_row = row_of(&lines, "29%/200k");
         let roster_row = row_of(&lines, "agents running");
+        let (plan, _, _) = state.plan_hit.unwrap();
+        let (strip, _, _) = state.background_hit.unwrap();
+        let (_, shell, _, _) = state.shell_live_stop_rect.unwrap();
+        assert_eq!(row_of(&lines, "notice probe") + 1, plan as usize);
+        assert_eq!(strip, plan + 1);
+        assert_eq!(state.issue_hit.unwrap().0, strip);
+        assert!(row_of(&lines, "probe.txt") < pending_row);
+        assert!(state.pending_hits.iter().all(|hit| hit.row < shell));
+        assert_eq!(state.shell_live_background_rect.unwrap().1, shell);
+        assert!((shell as usize) < input_row);
         assert!(pending_row < input_row, "{lines:#?}");
         assert!(
             input_row < footer_row && footer_row < roster_row,
             "{lines:#?}"
         );
         assert!(row_of(&lines, "6 more") > pending_row, "{lines:#?}");
+        terminal.backend_mut().resize(54, 18);
+        terminal
+            .draw(|f| crate::render::render(f, &mut state))
+            .unwrap();
+        assert!(state.plan_hit.is_none());
+        assert!(state.input_rect.is_some());
+        assert!(state.conv.rect.is_some());
     }
 
     /// Approval state: the approval body, its keyboard hints and the Context
@@ -1917,6 +1949,7 @@ mod tests {
         state.elapsed_secs = 55;
         state.token_input = 59_000;
         state.team = team_with_usage(&[("a1", "explorer", "read_file", 158_000)]);
+        state.plan = Some(sample_plan());
         state.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
             crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
                 grant: None,
@@ -1947,6 +1980,8 @@ mod tests {
             })
             .collect();
         let body_row = row_of(&lines, "git push");
+        assert!(row_of(&lines, "plan 1/3") < body_row);
+        assert!(!lines.iter().any(|row| row.contains("waiting for model")));
         let footer_row = row_of(&lines, "29%/200k");
         let roster_row = row_of(&lines, "agents running");
         assert!(
@@ -2559,7 +2594,7 @@ mod tests {
         );
     }
 
-    /// Every strip stacked above the composer — the notice, the runtime
+    /// Every strip stacked above the composer — the notice, plan, runtime
     /// status, pending attachments — starts on the same column as the
     /// composer's border: one grid, not chrome hanging off the terminal edge.
     #[test]
@@ -2571,6 +2606,7 @@ mod tests {
             let mut state = test_state();
             state.theme = crate::theme::Theme::dark();
             state.status = leveler_client_protocol::RuntimeStatus::Busy;
+            state.plan = Some(sample_plan());
             state.notification = Some(crate::state::Notification {
                 level: leveler_client_protocol::NotificationLevel::Warning,
                 message: "选择权限模式: 完全访问（免审批）".into(),
@@ -2594,6 +2630,8 @@ mod tests {
             let notice = row("\u{26a0}").expect("notice row");
             assert_eq!(first_col(&notice), gutter, "{width}: notice {notice:?}");
             if width >= 44 {
+                let plan = row("1/3").expect("plan row");
+                assert_eq!(first_col(&plan), gutter, "{width}: plan {plan:?}");
                 // Wide glyphs occupy two cells, so match on the ASCII clock.
                 let status = row(" · 0s").expect("status row");
                 assert_eq!(first_col(&status), gutter, "{width}: status {status:?}");
@@ -3796,52 +3834,114 @@ mod tests {
         assert!(squash(&rows[0]).contains("未完成"), "{rows:?}");
     }
 
-    /// The plan indicator is a sibling of the runtime status on ONE row and
-    /// starts at the same content baseline as every other workbench line.
     #[test]
-    fn the_plan_indicator_shares_the_state_strip_row() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
+    fn the_plan_row_aligns_with_the_runtime_below_it() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.goal_mode_active = true;
         state.plan = Some(sample_plan());
-        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 24)).unwrap();
         terminal
-            .draw(|f| {
-                // The strip slot as the workbench hands it over: the full row,
-                // inset by the workspace gutter.
-                let area = crate::layout::horizontal_inset(
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: 60,
-                        height: 6,
-                    },
-                    crate::layout::WORKSPACE_GUTTER_X,
-                );
-                render_state_strip(f, area, &mut state);
-            })
+            .draw(|f| super::render_workbench(f, &mut state))
             .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let rows: Vec<String> = (0..6)
-            .map(|y| {
-                (0..60)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect::<String>()
-            })
-            .collect();
-        let line = &rows[0];
-        let line_col = line.len() - line.trim_start().len();
+        let (row, x, end) = state.plan_hit.expect("plan is clickable");
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(x, row)].symbol(), "●");
+        assert_eq!(buf[(x + 2, row)].symbol(), "计");
+        assert_eq!(buf[(end - 1, row)].symbol(), "↗");
+        assert_eq!(buf[(x + 2, row + 1)].symbol(), "目");
+        assert_ne!(buf[(x, row + 1)].symbol(), " ");
+        assert!((x..end).any(|col| buf[(col, row)].symbol() == "━"));
+    }
+
+    #[test]
+    fn thought_growth_keeps_the_plan_runtime_and_input_in_place_below_a_notice() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.goal_mode_active = true;
+        state.plan = Some(sample_plan());
+        state.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: "notice probe".into(),
+        });
+        state
+            .background_task_labels
+            .insert("b".into(), bg_running_task("work", 0));
+        state.composer.replace("draft\nsecond line");
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        let mut initial = None;
+        for i in 0..6 {
+            if i == 4 {
+                state.transcript.finish_thought(None);
+                state.activity = Some("command probe".into());
+            } else if i != 0 && i != 5 {
+                state
+                    .transcript
+                    .append_thought(&"思考 thought\n".repeat(i * 30));
+            }
+            terminal
+                .draw(|f| crate::render::render(f, &mut state))
+                .unwrap();
+            let hit = state.plan_hit.unwrap();
+            let input = state.input_rect.unwrap();
+            assert_eq!(*initial.get_or_insert((hit, input)), (hit, input));
+            let (y, x, _) = hit;
+            let buf = terminal.backend().buffer();
+            assert_eq!(buf[(x + 2, y + 1)].symbol(), "目");
+            assert_eq!(state.background_hit.unwrap().0, y + 1);
+            assert!((0..90).any(|col| buf[(col, y - 1)].symbol() == "n"));
+        }
+        terminal.backend_mut().resize(90, 10);
+        terminal
+            .draw(|f| crate::render::render(f, &mut state))
+            .unwrap();
+        assert!(state.plan_hit.is_none());
+        terminal.backend_mut().resize(90, 30);
+        terminal
+            .draw(|f| crate::render::render(f, &mut state))
+            .unwrap();
         assert_eq!(
-            line_col,
-            crate::layout::WORKSPACE_GUTTER_X as usize,
-            "the strip sits on the content baseline: {line:?}"
+            (state.plan_hit.unwrap(), state.input_rect.unwrap()),
+            initial.unwrap()
         );
-        assert!(line.contains('↗'), "{line:?}");
-        assert!(
-            rows.iter().skip(1).all(|row| row.trim().is_empty()),
-            "runtime and plan share ONE row: {rows:?}"
+    }
+
+    #[test]
+    fn segments_show_nonsequential_states_in_plan_order() {
+        use PlanStepStatus::*;
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let mut plan = running_plan(6, 0);
+        for (step, status) in plan
+            .steps
+            .iter_mut()
+            .zip([Pending, Done, Running, Skipped, Failed, Abandoned])
+        {
+            step.status = status;
+        }
+        let buf = strip_buffer(&mut state, Some(plan), 90);
+        let plan_text = painted_text(&buf, 0, buf.area.width as usize);
+        assert!(plan_text.contains("1 项历史步骤已弃用"), "{plan_text}");
+        let marks: Vec<_> = strip_buffer_cells(&buf)
+            .into_iter()
+            .take_while(|(symbol, _)| symbol != "执")
+            .filter(|(symbol, _)| ["─", "━", "·", "×"].contains(&symbol.as_str()))
+            .map(|(symbol, color)| (symbol.chars().next().unwrap(), color))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                ('─', state.theme.plan.dim),
+                ('━', state.theme.plan.primary),
+                ('━', state.theme.plan.active),
+                ('·', state.theme.text.muted),
+                ('×', state.theme.status.error),
+            ]
         );
+        assert_eq!(plan_title("A👩‍💻e\u{301}中文字", 5), "A👩‍💻e\u{301}…");
     }
 
     /// The indicator names the running step because the full list lives on its
@@ -3852,7 +3952,7 @@ mod tests {
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         let rows = strip_rows(&mut state, Some(sample_plan()), 100);
         let line = rows[0].trim_end();
-        assert!(line.contains("● 计划 1/3 · edit module ↗"), "{line}");
+        assert!(line.contains("● 计划 1/3 ━ ━ ─ edit module ↗"), "{line}");
         assert!(
             !line.contains("已完成 1/3"),
             "the fraction already carries the done count: {line}"
@@ -3867,7 +3967,7 @@ mod tests {
         state.status = leveler_client_protocol::RuntimeStatus::Idle;
         let rows = strip_rows(&mut state, Some(sample_plan()), 100);
         let line = rows[0].trim_end();
-        assert!(line.contains("○ 计划 1/3 · 最后记录 ↗"), "{line}");
+        assert!(line.contains("○ 计划 1/3 ━ ━ ─ 最后记录 ↗"), "{line}");
         assert!(!line.contains("进行中"), "{line}");
     }
 
@@ -3904,7 +4004,7 @@ mod tests {
         };
         let rows = strip_rows(&mut state, Some(plan), 100);
         let line = rows[0].trim_end();
-        assert!(line.contains("● 计划 0/4 · 4 项待办"), "{line}");
+        assert!(line.contains("● 计划 0/4 ─ ─ ─ ─ 4 项待办"), "{line}");
         assert!(!line.contains("侦察仓库结构"), "{line}");
         assert!(
             !line.contains("进行中"),
@@ -3923,7 +4023,7 @@ mod tests {
         let buf = strip_buffer(&mut state, Some(completed_plan()), 100);
         let rows = strip_rows(&mut state, Some(completed_plan()), 100);
         let line = rows[0].trim_end();
-        assert!(line.contains("✓ 计划 2/2 · 已完成 ↗"), "{line}");
+        assert!(line.contains("✓ 计划 2/2 ━ ━ 已完成 ↗"), "{line}");
         let glyph = (0..buf.area.width)
             .map(|x| buf[(x, 0)].clone())
             .find(|cell| cell.symbol() == "✓")
@@ -4027,17 +4127,13 @@ mod tests {
         let (row, x0, x1) = state.plan_hit.expect("plan hit published");
         assert_eq!(row, 0);
         let painted = painted_text(&buf, x0 as usize, x1 as usize);
-        assert_eq!(painted, "● 计划 1/3 · edit module ↗", "{line}");
+        assert_eq!(painted, "● 计划 1/3 ━ ━ ─ edit module ↗", "{line}");
         let cells = strip_buffer_cells(&buf);
         assert!(
             cells[x1 as usize..].iter().all(|(c, _)| c == " "),
             "nothing painted past the hit: {cells:?}"
         );
-        let runtime = painted_text(&buf, 0, x0 as usize - STRIP_GAP);
-        assert!(
-            !runtime.contains('●') && !runtime.contains('↗'),
-            "the runtime side is outside the hit: {runtime:?}"
-        );
+        assert!(!strip_rows(&mut state, Some(sample_plan()), 100)[1].contains('↗'));
     }
 
     /// The hit region is the plan's exact painted x-range at any width, so a
@@ -4047,7 +4143,7 @@ mod tests {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         let cases = [
-            (24u16, running_plan(4, 2)),
+            (12u16, running_plan(4, 2)),
             (40, running_plan(4, 2)),
             (60, running_plan(4, 2)),
             (100, running_plan(4, 2)),
@@ -4081,68 +4177,136 @@ mod tests {
         }
     }
 
-    /// At a width where the runtime's secondary numbers no longer fit, the
-    /// plan's progress, current step and arrow survive — statistics yield
-    /// before the plan's step does, and nothing wraps.
     #[test]
-    fn the_plan_outranks_runtime_statistics_when_the_row_is_tight() {
+    fn plan_width_is_independent_of_runtime_statistics() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.activity = Some("正在检查 WorkerConfig 并对齐执行路径".into());
-        state.elapsed_secs = 15;
         state.turn_tool_calls = 20;
-        state.token_input = 64_590;
-        state.token_output = 716;
         let plan = running_plan(4, 2);
-        // A row wide enough for both sides in full.
-        let wide = strip_rows(&mut state, Some(plan.clone()), 120);
-        let wide = wide[0].trim_end();
-        assert!(wide.contains("20 次工具"), "{wide}");
-        assert!(wide.contains("● 计划 2/4 · 步骤 3 ↗"), "{wide}");
-        // A tighter row: the statistics are what yields, in their own order.
-        let tight = strip_rows(&mut state, Some(plan.clone()), 60);
-        let tight = tight[0].trim_end();
-        assert!(tight.contains("计划 2/4"), "{tight}");
-        assert!(tight.contains('↗'), "{tight}");
-        assert!(
-            !tight.contains("次工具"),
-            "tool count yields to the plan: {tight}"
-        );
-        // Every width from cramped to full: one row, never wider than the
-        // terminal, and never a bare animation glyph without a state word.
-        // A long runtime label may own the whole narrow row (priority 1) —
-        // what it may never do is crowd the plan into a meaningless stub.
-        for width in 18..80u16 {
+        for width in 12..80u16 {
             let rows = strip_rows(&mut state, Some(plan.clone()), width);
-            assert_eq!(rows.len(), 1, "w={width}: one row, always");
-            let line = rows[0].trim_end();
-            assert!(
-                UnicodeWidthStr::width(line) <= width as usize,
-                "w={width}: the strip may never overflow: {line:?}"
-            );
-            assert!(
-                line.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
-                "w={width}: the strip always carries a state word: {line:?}"
-            );
-            assert!(
-                !line.contains('●') || line.contains("计划"),
-                "w={width}: a plan glyph without its progress is a stub: {line:?}"
+            let runtime = strip_rows(&mut state, None, width);
+            assert_eq!(rows.len(), 2);
+            assert!(rows[0].trim_end().ends_with('↗'), "{rows:?}");
+            assert_eq!(rows[1], runtime[0]);
+        }
+    }
+
+    #[test]
+    fn failed_and_idle_plan_labels_take_space_before_segments() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let mut failed = running_plan(8, 0);
+        failed.steps[0].status = PlanStepStatus::Failed;
+        let rows = strip_rows(&mut state, Some(failed), 36);
+        assert!(rows[0].contains("执行失败 ↗"), "{rows:?}");
+        assert!(!rows[0].contains('×'), "{rows:?}");
+
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        let rows = strip_rows(&mut state, Some(running_plan(8, 0)), 36);
+        assert!(rows[0].contains("最后记录 ↗"), "{rows:?}");
+        assert!(!rows[0].contains('─'), "{rows:?}");
+    }
+
+    #[test]
+    fn an_unpaintable_background_entry_does_not_claim_a_row() {
+        let mut state = test_state();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(11, 24)).unwrap();
+        let height = |state: &mut AppState, terminal: &mut ratatui::Terminal<_>| {
+            terminal
+                .draw(|f| super::render_workbench(f, state))
+                .unwrap();
+            state.conv.rect.unwrap().3
+        };
+        let before = height(&mut state, &mut terminal);
+        state
+            .background_task_labels
+            .insert("b".into(), bg_running_task("work", 0));
+        assert_eq!(height(&mut state, &mut terminal), before);
+        assert!(state.background_hit.is_none());
+    }
+
+    #[test]
+    fn slash_popup_does_not_leave_a_click_target_under_its_paint() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.plan = Some(sample_plan());
+        let rows = screen_rows(&mut state, 80);
+        assert!(rows.iter().any(|row| row.contains("edit module")));
+        assert!(state.plan_hit.is_some());
+        state.composer.replace("/");
+        let rows = screen_rows(&mut state, 80);
+        assert!(!rows.iter().any(|row| row.contains("edit module")));
+        assert!(state.plan_hit.is_none());
+        state.composer.replace("");
+        screen_rows(&mut state, 80);
+        assert!(state.plan_hit.is_some());
+    }
+
+    #[test]
+    fn waiting_for_background_requires_the_wait_tool_even_with_a_plan() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.goal_mode_active = true;
+        state.transcript.append_thought("foreground reasoning");
+        state
+            .background_task_labels
+            .insert("bg".into(), bg_running_task("work", 0));
+        let plan = sample_plan();
+        let rows = strip_rows(&mut state, Some(plan.clone()), 100);
+        assert!(
+            rows[1].contains("目标模式 · 思考") && rows[1].contains("后台 1 ↗"),
+            "{rows:?}"
+        );
+        state.transcript.push_tool_started(
+            leveler_client_protocol::ToolCallId::new("wait"),
+            "wait_task".into(),
+            r#"{"task_id":"bg"}"#.into(),
+            false,
+            0,
+            None,
+            None,
+        );
+        let waiting = strip_rows(&mut state, Some(plan), 100);
+        assert_eq!(waiting[0], rows[0]);
+        assert!(
+            waiting[1].contains("等待后台任务") && waiting[1].contains("后台 1 ↗"),
+            "{waiting:?}"
+        );
+    }
+
+    #[test]
+    fn plan_and_background_do_not_repeat_the_clarification_wait() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.goal_mode_active = true;
+        state.plan = Some(sample_plan());
+        state.overlay = Some(crate::overlay::Overlay::Clarification(Box::new(
+            crate::overlay::ClarificationOverlay::new(
+                leveler_client_protocol::UiClarificationRequest::single(
+                    leveler_client_protocol::ClarificationId::new("c1"),
+                    "Clarification probe?",
+                    vec![],
+                ),
+            ),
+        )));
+        for background in [false, true] {
+            if background {
+                state
+                    .background_task_labels
+                    .insert("bg".into(), bg_running_task("work", 0));
+            }
+            let rows = screen_rows(&mut state, 80);
+            let (plan, _, _) = state.plan_hit.unwrap();
+            assert!(row_of(&rows, "Clarification probe?") > plan as usize);
+            assert!(rows.iter().filter(|row| row.contains("目标模式 ·")).count() == 0);
+            assert_eq!(
+                state.background_hit.map(|hit| hit.0),
+                background.then_some(plan + 1)
             );
         }
-        // With a short label there is room for both sides even on a narrow
-        // row — the narrow form the product targets. Whatever it keeps of the
-        // step name, the run's state, progress and entry stay on the row.
-        state.activity = Some("运行中".into());
-        let narrow = strip_rows(&mut state, Some(plan), 30);
-        let narrow = narrow[0].trim_end();
-        assert!(narrow.contains("⠋ 运行中"), "{narrow}");
-        assert!(narrow.contains("● 计划 2/4"), "{narrow}");
-        assert!(narrow.ends_with('↗'), "{narrow}");
-        // And with even less room the step name drops before the arrow does.
-        let cramped = strip_rows(&mut state, Some(running_plan(4, 2)), 25);
-        let cramped = cramped[0].trim_end();
-        assert!(cramped.contains("● 计划 2/4 ↗"), "{cramped}");
-        assert!(!cramped.contains('步'), "{cramped}");
     }
 
     fn completed_plan() -> UiPlan {
@@ -4439,9 +4603,7 @@ mod tests {
 
     // ── State strip: runtime status + plan indicator ────────────────────────
 
-    /// Paint the state strip alone into a one-row test terminal with `plan`
-    /// installed, and hand back the painted buffer. One production call site,
-    /// so these tests see exactly what the workbench paints.
+    /// Paint the production status rows without the rest of the workbench.
     fn strip_buffer(
         state: &mut AppState,
         plan: Option<UiPlan>,
@@ -4450,11 +4612,33 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         state.plan = plan;
-        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        let plan = plan_row(state, width as usize);
+        let height = 1 + u16::from(plan.is_some());
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| {
                 let area = f.area();
-                render_state_strip(f, area, state);
+                let plan_height = height - 1;
+                render_plan_row(
+                    f,
+                    Rect {
+                        height: plan_height,
+                        ..area
+                    },
+                    state,
+                    plan,
+                );
+                let strip = state_strip(state, width as usize);
+                render_state_strip(
+                    f,
+                    Rect {
+                        y: plan_height,
+                        height: 1,
+                        ..area
+                    },
+                    state,
+                    strip,
+                );
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -4538,13 +4722,13 @@ mod tests {
     /// The strip is always exactly one row, whatever the plan's shape — the
     /// complete list belongs to the Plan page.
     #[test]
-    fn the_state_strip_is_always_one_row() {
+    fn long_plan_uses_one_row_without_displacing_the_runtime_row() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         let rows = strip_rows(&mut state, Some(running_plan(9, 5)), 70);
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
         let line = rows[0].trim_end();
-        assert!(line.contains("● 计划 5/9 · 步骤 6 ↗"), "{line}");
+        assert!(line.contains("● 计划 5/9 步骤 6 ↗"), "{line}");
         assert!(line.ends_with('↗'), "{line}");
     }
 
@@ -4573,7 +4757,7 @@ mod tests {
         let buf = strip_buffer(&mut state, Some(plan.clone()), 100);
         let rows = strip_rows(&mut state, Some(plan), 100);
         let line = rows[0].trim_end();
-        assert!(line.contains("✕ 计划 2/4 · 执行失败 ↗"), "{line}");
+        assert!(line.contains("✕ 计划 2/4 ━ ━ × ─ 执行失败 ↗"), "{line}");
         let glyph = (0..buf.area.width)
             .map(|x| buf[(x, 0)].clone())
             .find(|cell| cell.symbol() == "✕")
@@ -4601,10 +4785,8 @@ mod tests {
         }
     }
 
-    /// All four cells on ONE row, each with its own painted hit region: the
-    /// runtime's live state, the running count, the active issues and the plan.
     #[test]
-    fn the_strip_paints_all_four_cells_on_one_row() {
+    fn background_and_issue_entries_share_the_runtime_row_below_the_plan() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.activity = Some("运行 cargo test".into());
@@ -4620,35 +4802,27 @@ mod tests {
 
         let buf = strip_buffer(&mut state, Some(sample_plan()), 140);
         let rows = strip_rows(&mut state, Some(sample_plan()), 140);
-        let line = rows[0].trim_end();
+        let line = rows[1].trim_end();
         assert!(line.contains("运行 cargo test"), "{line}");
         assert!(line.contains("后台 2 ↗"), "{line}");
         assert!(line.contains("后台失败 1 ↗"), "{line}");
-        assert!(line.contains("计划 1/3"), "{line}");
+        assert!(rows[0].contains("计划 1/3"), "{rows:?}");
         assert!(
             !line.contains("go test -race"),
             "the failed task's command is not chrome: {line}"
         );
 
-        // Reading order Background → Issue → Plan, hit ranges exactly the
-        // painted run of each cell, and never overlapping.
         let (brow, bx0, bx1) = state.background_hit.expect("background hit");
         let (irow, ix0, ix1) = state.issue_hit.expect("issue hit");
         let (prow, px0, px1) = state.plan_hit.expect("plan hit");
-        assert!(brow == irow && irow == prow && brow == 0, "one row");
+        assert_eq!((prow, brow, irow), (0, 1, 1));
         assert!(
             bx1 <= ix0,
             "cells do not overlap: b={bx0}..{bx1} i={ix0}..{ix1}"
         );
-        assert!(
-            ix1 <= px0,
-            "cells do not overlap: i={ix0}..{ix1} p={px0}..{px1}"
-        );
-        assert_eq!(painted_text(&buf, bx0 as usize, bx1 as usize), "后台 2 ↗");
-        assert_eq!(
-            painted_text(&buf, ix0 as usize, ix1 as usize),
-            "⚠ 后台失败 1 ↗"
-        );
+        assert_eq!(buf[(bx1 - 1, brow)].symbol(), "↗");
+        assert_eq!(buf[(ix1 - 1, irow)].symbol(), "↗");
+        assert_eq!(buf[(ix0, irow)].symbol(), "⚠");
         assert!(
             painted_text(&buf, px0 as usize, px1 as usize).starts_with("● 计划 1/3"),
             "plan hit covers the painted indicator"
@@ -4726,13 +4900,8 @@ mod tests {
         assert!(state.transcript.last_failure_block().is_some());
     }
 
-    /// Width is the only variable this row has, so the rules are exact:
-    /// nothing overflows, the runtime's state word never vanishes, the active
-    /// issue outranks the plan (a plan cell without an issue cell is
-    /// impossible), the issue degrades to its count form before it drops, and
-    /// the same width always paints the same row.
     #[test]
-    fn the_strip_degrades_deterministically_as_it_narrows() {
+    fn plan_does_not_change_background_and_issue_width_priority() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.activity = Some("运行 cargo test".into());
@@ -4742,71 +4911,23 @@ mod tests {
         state
             .background_task_labels
             .insert("f1".into(), bg_failed_task("npm start", 7, 1));
-        let plan = running_plan(4, 2);
-
-        let mut rows_by_width = Vec::new();
-        let mut previous: Option<(bool, bool)> = None;
         for width in 18..140u16 {
-            let rows = strip_rows(&mut state, Some(plan.clone()), width);
-            let line = rows[0].trim_end().to_string();
-            assert!(
-                UnicodeWidthStr::width(line.as_str()) <= width as usize,
-                "w={width}: never overflows: {line:?}"
+            let rows = strip_rows(&mut state, Some(running_plan(4, 2)), width);
+            assert!(rows[0].contains("计划 2/4"), "{rows:?}");
+            assert!(rows[1].contains('⚠'), "{rows:?}");
+            let issue_with_plan = state.issue_hit.unwrap();
+            let background_with_plan = state.background_hit;
+            let runtime = strip_rows(&mut state, None, width);
+            assert_eq!(rows[1], runtime[0]);
+            assert_eq!(
+                state.issue_hit.map(|(y, x, end)| (y + 1, x, end)),
+                Some(issue_with_plan)
             );
-            assert!(
-                line.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
-                "w={width}: the runtime state never vanishes: {line:?}"
+            assert_eq!(
+                state.background_hit.map(|(y, x, end)| (y + 1, x, end)),
+                background_with_plan
             );
-            // Labelled (`⚠ 后台失败 1`) or compact (`⚠ 1`): the ink is the
-            // cell's identity at every width.
-            let has_issue = line.contains('⚠') || line.contains('✕');
-            let has_plan = line.contains("计划 ");
-            assert!(
-                !has_plan || has_issue,
-                "w={width}: the issue outranks the plan: {line:?}"
-            );
-            // Presence curves are monotone in width: once the issue (or the
-            // plan, which yields to it) is shown, a wider row still shows it.
-            // The background cell is claimed LAST, so it may appear in a band
-            // where the plan's floor cannot fit — it can never displace the
-            // plan, but it legitimately fills room the plan cannot use.
-            if let Some((issue_before, plan_before)) = previous {
-                assert!(
-                    !issue_before || has_issue,
-                    "w={width}: the issue must not vanish as the row widens: {line:?}"
-                );
-                assert!(
-                    !plan_before || has_plan,
-                    "w={width}: the plan must not vanish as the row widens: {line:?}"
-                );
-            }
-            previous = Some((has_issue, has_plan));
-            rows_by_width.push(line);
         }
-        // Deterministic: the same width repaints the same row.
-        let again = strip_rows(&mut state, Some(plan.clone()), 77);
-        assert_eq!(again[0].trim_end(), rows_by_width[77 - 18]);
-
-        // Wide: all four cells. Wide-mid: the background yields to the plan.
-        // Narrow: the issue keeps a count while the plan is gone.
-        let wide = strip_rows(&mut state, Some(plan.clone()), 139);
-        let wide = wide[0].trim_end();
-        assert!(
-            wide.contains("后台 1") && wide.contains("后台失败 1") && wide.contains("计划 2/4"),
-            "{wide:?}"
-        );
-        let mid = strip_rows(&mut state, Some(plan.clone()), 40);
-        let mid = mid[0].trim_end();
-        assert!(mid.contains("计划 2/4"), "{mid:?}");
-        assert!(mid.contains("后台失败 1"), "{mid:?}");
-        let narrow = strip_rows(&mut state, Some(plan.clone()), 24);
-        let narrow = narrow[0].trim_end();
-        assert!(narrow.contains("后台失败 1"), "{narrow:?}");
-        assert!(!narrow.contains("后台 1"), "{narrow:?}");
-        let narrowest = strip_rows(&mut state, Some(plan), 19);
-        let narrowest = narrowest[0].trim_end();
-        assert!(narrowest.contains("⚠ 1 ↗"), "{narrowest:?}");
-        assert!(!narrowest.contains("计划"), "{narrowest:?}");
     }
 
     /// Running count only: a settled task leaves the background cell, and a

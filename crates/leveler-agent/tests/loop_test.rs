@@ -677,6 +677,13 @@ async fn renamed_plan_steps_replace_the_declared_list_before_blocked_closeout() 
             "update_goal",
             serde_json::json!({"status": "blocked", "summary": "Portal returns 404."}),
         ),
+        // The first block is refused because the model's own revised plan
+        // still lists open steps; the confirmation is the block it stands on.
+        assistant_tool_call(
+            "blocked2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "Portal returns 404."}),
+        ),
     ]));
     let executor = Executor::new(
         runtime.clone(),
@@ -720,9 +727,10 @@ async fn renamed_plan_steps_replace_the_declared_list_before_blocked_closeout() 
         final_plan, revised,
         "the full list must be exactly the model declaration"
     );
-    // Two work rounds plus the blocked resolution. A blocked goal still owes
-    // the work itself, so it takes no delivery round: its report is its answer.
-    assert_eq!(runtime.recorded_requests().len(), 3);
+    // Two plan rounds, the block reconciled against the still-open plan, and
+    // the confirmed block. A blocked goal still owes the work itself, so it
+    // takes no delivery round: its report is its answer.
+    assert_eq!(runtime.recorded_requests().len(), 4);
     assert!(
         !runtime.recorded_requests()[2]
             .messages
@@ -3982,6 +3990,878 @@ async fn a_repeated_user_decision_block_settles_as_an_explicit_degradation() {
         )),
         "the accepted block's receipt states the missing interaction: {events:?}"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Replays the audit fixture: a model publishes an eight-step plan, marks six
+/// steps completed, and declares the goal blocked with two steps still open.
+/// The block is the model's structured terminal, but its own latest plan still
+/// lists work it declared necessary. The runtime must state that conflict once
+/// and let the model continue, rewrite the plan, or confirm the block — never
+/// accept the first declaration as if the plan were settled, and never refuse
+/// the block forever.
+#[tokio::test]
+async fn a_blocked_goal_with_open_plan_steps_is_reconciled_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-{}",
+        std::process::id() as u64 * 89 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let plan = serde_json::json!({
+        "plan": [
+            {"step": "stage-1", "status": "completed"},
+            {"step": "stage-2", "status": "completed"},
+            {"step": "stage-3", "status": "completed"},
+            {"step": "stage-4", "status": "completed"},
+            {"step": "stage-5", "status": "completed"},
+            {"step": "专项 F：管理 API 与 P3 增量联调（未实现）", "status": "pending"},
+            {"step": "专项 G：真实 E2E（环境阻断）", "status": "pending"},
+            {"step": "stage-8", "status": "completed"}
+        ]
+    });
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("p1", "update_plan", plan),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "P2-C fixed; MySQL 181 PASS. The async export and P3 remain unimplemented.",
+                "next_step": "needs an available Docker daemon"
+            }),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the same two steps are still blocked"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "finish the migration",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, .. } if id == "g1" && *is_error
+        )),
+        "the first block conflicts with the model's own open plan: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "blocked_with_open_plan"
+        )),
+        "the conflict is a persisted fact: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "blocked_with_open_plan_degraded"
+        )),
+        "a confirmed block with open steps settles as an explicit degradation: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, preview, .. }
+                if id == "g2" && !*is_error && preview.contains("stay open")
+        )),
+        "the accepted block's receipt states the remaining conflict: {events:?}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "the plan round, the refused block, and the confirmed block"
+    );
+    let repaired_request = &runtime.recorded_requests()[2];
+    let repair_text: Vec<&str> = repaired_request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } if result.is_error => Some(result.content.as_str()),
+            _ => None,
+        })
+        .collect();
+    let repair = repair_text.join("\n");
+    assert!(
+        repair.contains("专项 F") && repair.contains("专项 G"),
+        "the model must see its own open steps, not a generic refusal: {repair}"
+    );
+    assert!(
+        repair.contains("update_plan") && repair.contains("update_goal"),
+        "the repair names both structured exits: {repair}"
+    );
+    // One terminal, one delivery: the reconciliation round must not duplicate
+    // the settlement, and a block is never rewritten into a completion.
+    let deliveries: Vec<StopReason> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::DeliveryCommitted { stop, .. } => Some(*stop),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        deliveries.len() <= 1,
+        "the reconciliation round must not duplicate the delivery: {events:?}"
+    );
+    assert!(
+        deliveries.iter().all(|stop| *stop == StopReason::Blocked),
+        "a blocked terminal is never rewritten into a completion: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Finished(_)))
+            .count(),
+        1,
+        "exactly one terminal: {events:?}"
+    );
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Blocked,
+        "the confirmed block is not converted into a completion"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A block after the model did real work since the repair still settles, and
+/// the work is not undone. The repair asks about the plan; it does not force
+/// the model to keep working forever.
+#[tokio::test]
+async fn work_after_the_plan_block_repair_counts_and_a_confirmed_block_settles() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-work-{}",
+        std::process::id() as u64 * 97 + 17
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "fix the export", "status": "pending"},
+                {"step": "run the E2E suite", "status": "pending"}
+            ]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "Docker is unavailable"
+            }),
+        ),
+        assistant_tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({"path": "export.rs", "content": "fixed\n"}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the export is fixed; only the E2E environment is unavailable"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "finish the migration",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert!(
+        dir.join("export.rs").exists(),
+        "work done after the repair is real work, not a formality"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { id, is_error, .. } if id == "w1" && !*is_error
+        )),
+        "{events:?}"
+    );
+    assert_eq!(runtime.recorded_requests().len(), 4);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Pending steps do not prove the remaining work is doable, so a plan the model
+/// rewrote to no open steps is consistent with a block. No repair is issued.
+#[tokio::test]
+async fn a_blocked_goal_after_the_plan_is_rewritten_is_accepted() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-rewrite-{}",
+        std::process::id() as u64 * 101 + 19
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "stage-5", "status": "completed"},
+                {"step": "stage-6 (no longer required)", "status": "pending"}
+            ]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the registry is unreachable"
+            }),
+        ),
+        assistant_tool_call(
+            "p2",
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "stage-5", "status": "completed"},
+                {"step": "stage-6 was folded into stage-5", "status": "completed"}
+            ]}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "the registry is unreachable"
+            }),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "finish the migration",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    assert_eq!(runtime.recorded_requests().len(), 4);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "blocked_with_open_plan_degraded"
+        )),
+        "a rewritten plan is a consistent block, not a degradation: {events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The repair budget is per drive, not per plan revision: rewriting or
+/// reordering the plan does not buy a second repair round.
+#[tokio::test]
+async fn a_plan_refresh_does_not_reset_the_block_repair_budget() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-refresh-{}",
+        std::process::id() as u64 * 103 + 23
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "export", "status": "pending"},
+                {"step": "e2e", "status": "pending"}
+            ]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "blocked"}),
+        ),
+        assistant_tool_call(
+            "p2",
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "e2e", "status": "pending"},
+                {"step": "export", "status": "pending"}
+            ]}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "blocked"}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "finish the migration",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    let repairs = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "blocked_with_open_plan"
+            )
+        })
+        .count();
+    assert_eq!(repairs, 1, "one repair per drive: {events:?}");
+    assert_eq!(runtime.recorded_requests().len(), 4);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A completed plan has no open step to reconcile, and a goal with no model
+/// plan never had a declaration to contradict. Both blocks settle immediately.
+#[tokio::test]
+async fn a_blocked_goal_without_open_plan_steps_is_accepted_without_repair() {
+    for (name, script) in [
+        (
+            "completed-plan",
+            vec![
+                assistant_tool_call(
+                    "p1",
+                    "update_plan",
+                    serde_json::json!({"plan": [
+                        {"step": "stage-5", "status": "completed"},
+                        {"step": "stage-6", "status": "completed"}
+                    ]}),
+                ),
+                assistant_tool_call(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "done except the registry"}),
+                ),
+            ],
+        ),
+        (
+            "no-plan",
+            vec![assistant_tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "the registry is unreachable"}),
+            )],
+        ),
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-planblock-clean-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = Workspace::new(&dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let registry = Arc::new(default_registry());
+        let expected_requests = script.len();
+        let runtime = Arc::new(MockRuntime::new(script));
+        let executor = Executor::new(
+            runtime.clone(),
+            registry,
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_goal_mode(true);
+
+        let mut events = Vec::new();
+        let outcome = executor
+            .run(
+                "finish the migration",
+                &mut |event| events.push(event),
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.stop_reason, StopReason::Blocked, "{name}");
+        assert_eq!(
+            runtime.recorded_requests().len(),
+            expected_requests,
+            "{name}: no repair round is spent when there is no open plan"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalIntercepted { kind, .. } if kind == "blocked_with_open_plan"
+            )),
+            "{name}: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// User cancellation is the terminal for this window, whatever the model's
+/// plan says. The reconciliation feedback must not force another model round
+/// after the user asked to stop.
+#[tokio::test]
+async fn a_cancelled_goal_is_not_continued_by_the_plan_reconciliation() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-cancel-{}",
+        std::process::id() as u64 * 107 + 29
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [{"step": "export", "status": "pending"}]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "blocked"}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+    let cancel = CancellationToken::new();
+    let cancel_on_repair = cancel.clone();
+    let result = executor
+        .run(
+            "finish the migration",
+            &mut |event| {
+                if matches!(
+                    event,
+                    AgentEvent::GoalIntercepted { kind, .. } if kind == "blocked_with_open_plan"
+                ) {
+                    cancel_on_repair.cancel();
+                }
+            },
+            &mut NoopSink,
+            cancel,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentError::Cancelled)),
+        "cancel must win over the plan reconciliation: {result:?}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        2,
+        "no further model round after the user cancelled"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Mid-turn user input reaches the model in the same round as the
+/// reconciliation. The harness names a plan conflict; it never overrides or
+/// withholds the user's latest instruction.
+#[tokio::test]
+async fn a_user_steer_reaches_the_model_during_the_plan_reconciliation() {
+    struct SteerOnThirdRound {
+        calls: Mutex<usize>,
+        text: String,
+    }
+    impl leveler_agent::SteeringSource for SteerOnThirdRound {
+        fn take_pending(&self) -> Vec<String> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls >= 3 {
+                vec![self.text.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-steer-{}",
+        std::process::id() as u64 * 109 + 31
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [{"step": "export", "status": "pending"}]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "blocked"}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "blocked"}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_steering(Arc::new(SteerOnThirdRound {
+        calls: Mutex::new(0),
+        text: "stop after the export; the E2E environment is out of scope".to_string(),
+    }));
+
+    let outcome = executor
+        .run(
+            "finish the migration",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+    let repaired = &runtime.recorded_requests()[2];
+    let texts: Vec<String> = repaired
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text_content)
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("out of scope")),
+        "the user's latest instruction is in the reconciliation round: {texts:?}"
+    );
+    let tool_results: Vec<&str> = repaired
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { result } => Some(result.content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        tool_results
+            .iter()
+            .any(|text| text.contains("not accepted")),
+        "the repair is a tool result, not a user instruction: {tool_results:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A blocked window is resumable. The next drive seeds the plan the model
+/// declared before the block, and a completion is still a completion — no
+/// repair, no inherited conflict.
+#[tokio::test]
+async fn a_blocked_window_resumes_with_its_plan_and_can_complete() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-resume-{}",
+        std::process::id() as u64 * 113 + 37
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Window 1: the model blocks while its plan still has an open step, and
+    // confirms the block.
+    let first = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [{"step": "export", "status": "pending"}]}),
+        ),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "docker unavailable"}),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "docker unavailable"}),
+        ),
+    ]));
+    let outcome = Executor::new(
+        first,
+        registry.clone(),
+        tool_context.clone(),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .run(
+        "finish the migration",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Blocked);
+
+    // Window 2: the same plan is seeded; the work now completes.
+    let second = Arc::new(MockRuntime::new(vec![assistant_tool_call(
+        "c1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "export shipped"}),
+    )]));
+    let outcome = Executor::new(
+        second.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    .with_seeded_plan(leveler_agent::PlanState {
+        steps: vec![leveler_agent::PlanStep {
+            step: "export".to_string(),
+            status: "pending".to_string(),
+            id: None,
+            origin: leveler_agent::PlanOrigin::ModelExplicit,
+        }],
+    })
+    .run(
+        "continue the migration",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        second.recorded_requests().len(),
+        2,
+        "the completion and its delivery; a completion never triggers the blocked reconciliation"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Completion is not the block path: an open plan remains the model's own
+/// progress record and never buys a repair round for `update_goal(complete)`.
+#[tokio::test]
+async fn a_completion_with_an_open_plan_is_not_reconciled() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-complete-{}",
+        std::process::id() as u64 * 127 + 41
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call(
+            "p1",
+            "update_plan",
+            serde_json::json!({"plan": [
+                {"step": "export", "status": "pending"},
+                {"step": "e2e", "status": "completed"}
+            ]}),
+        ),
+        assistant_tool_call(
+            "c1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "shipped"}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "finish the migration",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "the plan, the completion, and the delivery round"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind.starts_with("blocked_with_open_plan")
+        )),
+        "{events:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A provider failure during the reconciliation round fails the turn
+/// truthfully. The refused block is not retroactively accepted, and no
+/// terminal is fabricated.
+#[tokio::test]
+async fn a_provider_error_during_the_plan_reconciliation_does_not_settle() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-planblock-provider-{}",
+        std::process::id() as u64 * 131 + 43
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+    let runtime = Arc::new(MockRuntime::with_stream_errors(
+        vec![
+            assistant_tool_call(
+                "p1",
+                "update_plan",
+                serde_json::json!({"plan": [{"step": "export", "status": "pending"}]}),
+            ),
+            assistant_tool_call(
+                "g1",
+                "update_goal",
+                serde_json::json!({"status": "blocked", "blocked_kind": "external", "summary": "blocked"}),
+            ),
+            assistant_text("unused"),
+        ],
+        vec![
+            None,
+            None,
+            Some(ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "provider unavailable",
+            )),
+        ],
+    ));
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut events = Vec::new();
+    let result = executor
+        .run(
+            "finish the migration",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentError::Model(_))),
+        "the provider failure surfaces as itself: {result:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Finished(_))),
+        "no terminal is fabricated after the refused block: {events:?}"
+    );
+    assert_eq!(runtime.recorded_requests().len(), 3);
 
     std::fs::remove_dir_all(&dir).ok();
 }
