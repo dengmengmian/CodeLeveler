@@ -870,12 +870,23 @@ fn a_plan_transition_repaints_on_the_same_frame() {
     );
     reduce(&mut state, plan(P::Running, P::Pending, P::Pending));
     let before = render_at(100, 30, &mut state);
-    assert!(before.contains("● 计划 0/3 · 骨架"), "{before}");
+    let plan_row = before
+        .lines()
+        .position(|line| line.contains("● 计划 0/3 ━ ─ ─ 骨架 ↗"))
+        .unwrap_or_else(|| panic!("initial plan row missing: {before}"));
+    assert!(
+        before.lines().nth(plan_row + 1).unwrap().contains("run"),
+        "{before}"
+    );
 
     reduce(&mut state, plan(P::Done, P::Running, P::Pending));
     let after = render_at(100, 30, &mut state);
     assert!(
-        after.contains("● 计划 1/3 · 首页"),
+        after
+            .lines()
+            .nth(plan_row)
+            .unwrap()
+            .contains("● 计划 1/3 ━ ━ ─ 首页 ↗"),
         "the indicator follows the transition: {after}"
     );
     assert!(
