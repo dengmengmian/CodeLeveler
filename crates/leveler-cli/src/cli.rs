@@ -203,6 +203,13 @@ pub enum Command {
     #[command(subcommand)]
     Sessions(SessionsCommand),
 
+    /// Inspect and manage durable cross-session memory.
+    ///
+    /// These commands read the same store the agent and the TUI use; they do
+    /// not start a model or a session.
+    #[command(subcommand)]
+    Memory(MemoryCommand),
+
     /// Inspect and stop background tasks on this repository's local runtime.
     ///
     /// A background task (a dev server, a watcher) outlives the turn that
@@ -685,6 +692,38 @@ pub enum SessionsCommand {
     },
     /// Delete a session by id.
     Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// Show rollout, both scopes, capture state and stored files.
+    Status {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one memory file. The preview hash is written to stderr.
+    Show {
+        /// Scope: `global` or `workspace`.
+        scope: String,
+        /// Scope-relative path, as listed by `status`.
+        path: String,
+        /// Print machine-readable JSON instead of the raw file.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append a user-authored note to global memory.
+    Remember { text: String },
+    /// Forget one memory file bound to the hash from `show`.
+    Forget {
+        /// Scope: `global` or `workspace`.
+        scope: String,
+        /// Scope-relative path, as listed by `status`.
+        path: String,
+        /// The expected BLAKE3 from `show`.
+        #[arg(long = "hash", value_name = "BLAKE3")]
+        content_hash: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

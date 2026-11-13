@@ -104,6 +104,15 @@ enum Op {
     },
 }
 
+/// A memory-file change resolved and preflighted before any write. The host
+/// memory policy owns these paths, so they never enter the workspace plan or
+/// commit engine.
+struct MemoryPatch {
+    path: String,
+    resolved: PathBuf,
+    content: String,
+}
+
 enum Applied {
     Replaced {
         path: PathBuf,
@@ -443,10 +452,131 @@ impl Tool for ApplyPatchTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
-        let changes = match parse_patch(&input.patch) {
+        let parsed = match parse_patch(&input.patch) {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(e.to_string())),
         };
+
+        // Memory files are outside the workspace and owned by the host memory
+        // policy. Separate them before workspace ownership and planning: the
+        // policy enforces containment, read snapshots and atomic persistence,
+        // and the workspace editor must never see them. Resolving every memory
+        // change here keeps deterministic failures ahead of the first write.
+        let mut workspace_changes = Vec::with_capacity(parsed.len());
+        let mut memory_writes: Vec<MemoryPatch> = Vec::new();
+        let mut memory_summary: Vec<String> = Vec::new();
+        let mut memory_located: Vec<(String, String, Vec<AppliedHunk>)> = Vec::new();
+        let mut memory_modified: Vec<String> = Vec::new();
+        let mut memory_no_change: Vec<String> = Vec::new();
+        for change in parsed {
+            let path = match &change {
+                FileChange::Add { path, .. }
+                | FileChange::Delete { path }
+                | FileChange::Update { path, .. } => path.clone(),
+            };
+            match crate::memory_access::validate_read(&context, std::path::Path::new(&path)) {
+                Ok(false) => {
+                    workspace_changes.push(change);
+                    continue;
+                }
+                Ok(true) => {}
+                Err(reason) => return Ok(ToolOutput::error(reason)),
+            }
+            match change {
+                FileChange::Add { path, content } => {
+                    let resolved = PathBuf::from(&path);
+                    match tokio::fs::symlink_metadata(&resolved).await {
+                        Ok(_) => {
+                            return Ok(ToolOutput::error(format!(
+                                "cannot add existing file: {path}"
+                            )));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(ToolError::Io(format!("stat {path}: {e}"))),
+                    }
+                    if let Err(reason) = crate::memory_access::preflight_write(
+                        &context,
+                        &resolved,
+                        content.as_bytes(),
+                    )
+                    .await
+                    {
+                        return Ok(ToolOutput::error(reason));
+                    }
+                    if let Some(hunk) = applied_diff::whole_file_hunk(&content, true) {
+                        memory_located.push((path.clone(), path.clone(), vec![hunk]));
+                    }
+                    memory_summary.push(format!("A {path}"));
+                    memory_modified.push(path.clone());
+                    memory_writes.push(MemoryPatch {
+                        path,
+                        resolved,
+                        content,
+                    });
+                }
+                FileChange::Delete { path } => {
+                    return Ok(ToolOutput::error(format!(
+                        "{path} is inside a memory directory; apply_patch cannot delete or move \
+                         memory files. Edit a topic file in place, or manage memory through the \
+                         memory workflow."
+                    )));
+                }
+                FileChange::Update {
+                    path,
+                    move_to,
+                    chunks,
+                } => {
+                    if move_to.is_some() {
+                        return Ok(ToolOutput::error(format!(
+                            "{path} is inside a memory directory; apply_patch cannot delete or move \
+                             memory files. Edit a topic file in place, or manage memory through the \
+                             memory workflow."
+                        )));
+                    }
+                    let resolved = PathBuf::from(&path);
+                    let existing = match tokio::fs::read_to_string(&resolved).await {
+                        Ok(s) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(ToolOutput::error(format!(
+                                "cannot update missing file: {path}"
+                            )));
+                        }
+                        Err(e) => return Err(ToolError::Io(format!("read {path}: {e}"))),
+                    };
+                    let (updated, hunks) = match apply_update_located(&existing, &chunks) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            return Ok(ToolOutput::error(format!(
+                                "failed to apply hunk to {path}: {reason}"
+                            )));
+                        }
+                    };
+                    if updated == existing {
+                        memory_summary.push(format!("M {path} (no change)"));
+                        memory_no_change.push(path);
+                        continue;
+                    }
+                    if let Err(reason) = crate::memory_access::preflight_write(
+                        &context,
+                        &resolved,
+                        updated.as_bytes(),
+                    )
+                    .await
+                    {
+                        return Ok(ToolOutput::error(reason));
+                    }
+                    memory_located.push((path.clone(), path.clone(), hunks));
+                    memory_summary.push(format!("M {path}"));
+                    memory_modified.push(path.clone());
+                    memory_writes.push(MemoryPatch {
+                        path,
+                        resolved,
+                        content: updated,
+                    });
+                }
+            }
+        }
+        let changes = workspace_changes;
 
         // Write-site ownership: the drive-loop fence is the first line, but
         // PB_B_ORCH_1 showed a child apply_patch reaching this body with
@@ -479,7 +609,7 @@ impl Tool for ApplyPatchTool {
 
         // Plan phase — resolve and compute all operations in memory.
         let mut ops = Vec::new();
-        let mut summary = Vec::new();
+        let mut summary = memory_summary;
         let mut modified = Vec::new();
         // Update hunks that matched but produced the same bytes. Reported in
         // the result, never counted as a modification.
@@ -488,7 +618,7 @@ impl Tool for ApplyPatchTool {
         // content, so only the applier knows its line numbers — the patch text
         // the model wrote carries none, and a presenter must never re-derive
         // a position from the request.
-        let mut located: Vec<(String, String, Vec<AppliedHunk>)> = Vec::new();
+        let mut located = memory_located;
         let scope = context.write_scope();
 
         for change in changes {
@@ -674,7 +804,12 @@ impl Tool for ApplyPatchTool {
         // added lines were identical. Reporting a plain success here is the
         // "applied, but unchanged" trap — the model reads success, re-reads
         // the same bytes, and concludes the tool lied or the write raced.
-        if ops.is_empty() && !no_change.is_empty() {
+        if ops.is_empty()
+            && memory_writes.is_empty()
+            && (!no_change.is_empty() || !memory_no_change.is_empty())
+        {
+            let mut unchanged = memory_no_change;
+            unchanged.extend(no_change);
             return Ok(ToolOutput::ok(format!(
                 "Patch matched but changed nothing:\n{}\n\
                  No file was modified. The hunk's removed and added lines are identical; \
@@ -684,7 +819,7 @@ impl Tool for ApplyPatchTool {
             ))
             .with_metadata(serde_json::json!({
                 "modified_files": [],
-                "no_change": no_change,
+                "no_change": unchanged,
             })));
         }
 
@@ -730,6 +865,13 @@ impl Tool for ApplyPatchTool {
         // the first file changes, so a multi-file patch cannot apply half of
         // its content and then discover the guard on a later file.
         if !input.allow_redacted_literal {
+            for change in &memory_writes {
+                if let Err(message) =
+                    crate::workspace::ensure_materializable(&change.content, false)
+                {
+                    return Ok(ToolOutput::error(message));
+                }
+            }
             for op in &ops {
                 let content = match op {
                     Op::Replace { content, .. } | Op::Create { content, .. } => Some(content),
@@ -803,6 +945,43 @@ impl Tool for ApplyPatchTool {
             }
         }
 
+        // Commit memory changes through the policy. Their preflight ran before
+        // the first workspace write, so deterministic refusals cannot leave a
+        // half-applied patch; a runtime failure names what was already written.
+        let mut memory_written: Vec<&str> = Vec::new();
+        for change in &memory_writes {
+            match crate::memory_access::write_file(
+                &context,
+                &change.resolved,
+                change.content.as_bytes(),
+            )
+            .await
+            {
+                Ok(leveler_memory::MemoryV2Write::Written { .. }) => {
+                    memory_written.push(&change.path);
+                }
+                Ok(leveler_memory::MemoryV2Write::Outside) => {
+                    return Ok(ToolOutput::error(format!(
+                        "the memory policy accepted {} but did not persist it",
+                        change.path
+                    )));
+                }
+                Err(reason) => {
+                    let already_written = if memory_written.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nMemory files already written: {}",
+                            memory_written.join(", ")
+                        )
+                    };
+                    return Ok(ToolOutput::error(format!("{reason}{already_written}")));
+                }
+            }
+        }
+
+        let mut all_modified = memory_modified;
+        all_modified.extend(modified);
         let body = format!("Applied patch:\n{}\n", summary.join("\n"));
         // The applied diff is presentation truth, not model context: it rides
         // in metadata, never in the tool output the model reads back.
@@ -812,7 +991,7 @@ impl Tool for ApplyPatchTool {
                 applied_diff::unified_diff_with_paths(before, after, hunks)
             })
             .collect();
-        let mut meta = serde_json::json!({ "modified_files": modified });
+        let mut meta = serde_json::json!({ "modified_files": all_modified });
         if !applied.is_empty() {
             meta["applied_diff"] = serde_json::Value::String(applied);
         }
@@ -2082,6 +2261,227 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "TOKEN=[REDACTED]\n"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Test double for the host memory policy. Tool behavior under test is
+    /// routing, preflight ordering and destructive-path refusal; containment,
+    /// snapshots and atomic persistence belong to the memory crate's own suite.
+    #[derive(Debug)]
+    struct FakeMemory {
+        root: PathBuf,
+        writes: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    }
+
+    impl leveler_memory::MemoryV2Access for FakeMemory {
+        fn validate_read(&self, path: &std::path::Path) -> Result<bool, String> {
+            Ok(path.starts_with(&self.root))
+        }
+
+        fn record_read(&self, _path: &std::path::Path, _contents: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn preflight_write(
+            &self,
+            path: &std::path::Path,
+            _contents: &[u8],
+        ) -> Result<bool, String> {
+            if !path.starts_with(&self.root) {
+                return Ok(false);
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                return Err(format!(
+                    "{} is a protected memory file and cannot be edited directly",
+                    path.display()
+                ));
+            }
+            Ok(true)
+        }
+
+        fn write_file(
+            &self,
+            path: &std::path::Path,
+            contents: &[u8],
+        ) -> Result<leveler_memory::MemoryV2Write, String> {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                return Err(format!(
+                    "{} is a protected memory file and cannot be edited directly",
+                    path.display()
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(path, contents).map_err(|error| error.to_string())?;
+            self.writes.lock().unwrap().push((
+                path.to_path_buf(),
+                String::from_utf8_lossy(contents).into_owned(),
+            ));
+            Ok(leveler_memory::MemoryV2Write::Written {
+                previous_content: None,
+            })
+        }
+
+        fn scope_roots(&self) -> [PathBuf; 2] {
+            [self.root.clone(), self.root.clone()]
+        }
+    }
+
+    fn memory_context(
+        memory_root: &std::path::Path,
+    ) -> (ToolContext, PathBuf, std::sync::Arc<FakeMemory>) {
+        let (mut context, dir) = ctx();
+        let memory = std::sync::Arc::new(FakeMemory {
+            root: memory_root.to_path_buf(),
+            writes: std::sync::Mutex::new(Vec::new()),
+        });
+        context.execution.memory = Some(leveler_memory::MemoryV2AccessResource(memory.clone()));
+        (context, dir, memory)
+    }
+
+    #[tokio::test]
+    async fn a_memory_topic_add_is_written_through_the_policy() {
+        let memory_root = tempfile::tempdir().unwrap();
+        let topic = memory_root.path().join("topics/build.md");
+        let (context, dir, memory) = memory_context(memory_root.path());
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+# Build\n+Use cargo.\n*** End Patch",
+            topic.display()
+        );
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&topic).unwrap(),
+            "# Build\nUse cargo.\n"
+        );
+        let writes = memory.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "the workspace editor must not write it");
+        assert_eq!(writes[0].0, topic);
+        assert!(out.content.contains(&format!("A {}", topic.display())));
+        assert_eq!(
+            out.metadata["modified_files"],
+            serde_json::json!([topic.display().to_string()])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_memory_update_applies_its_hunks_through_the_policy() {
+        let memory_root = tempfile::tempdir().unwrap();
+        let topic = memory_root.path().join("topics/build.md");
+        std::fs::create_dir_all(topic.parent().unwrap()).unwrap();
+        std::fs::write(&topic, "# Build\nUse make.\n").unwrap();
+        let (context, dir, memory) = memory_context(memory_root.path());
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n # Build\n-Use make.\n+Use cargo.\n*** End Patch",
+            topic.display()
+        );
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&topic).unwrap(),
+            "# Build\nUse cargo.\n"
+        );
+        assert_eq!(memory.writes.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Destructive memory operations are refused during planning, so an
+    /// earlier ordinary change in the same patch is never written.
+    #[tokio::test]
+    async fn a_memory_delete_or_move_is_rejected_before_any_write() {
+        let memory_root = tempfile::tempdir().unwrap();
+        let topic = memory_root.path().join("topics/build.md");
+        std::fs::create_dir_all(topic.parent().unwrap()).unwrap();
+        std::fs::write(&topic, "# Build\n").unwrap();
+        let (context, dir, memory) = memory_context(memory_root.path());
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: src/new.rs\n+fn new() {{}}\n*** Delete File: {}\n*** End Patch",
+            topic.display()
+        );
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("cannot delete or move memory files"),
+            "{}",
+            out.content
+        );
+        assert!(!dir.join("src/new.rs").exists(), "nothing may be written");
+        assert_eq!(std::fs::read_to_string(&topic).unwrap(), "# Build\n");
+
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n-# Build\n+# Build\n*** End Patch",
+            topic.display(),
+            memory_root.path().join("topics/other.md").display()
+        );
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("cannot delete or move memory files"),
+            "{}",
+            out.content
+        );
+        assert!(memory.writes.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&topic).unwrap(), "# Build\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A protected memory file (state database, manifest) is refused by the
+    /// policy during preflight, before the ordinary workspace change lands.
+    #[tokio::test]
+    async fn a_protected_memory_write_is_rejected_before_any_write() {
+        let memory_root = tempfile::tempdir().unwrap();
+        let protected = memory_root.path().join("memory_state.sqlite");
+        let (context, dir, _memory) = memory_context(memory_root.path());
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: src/new.rs\n+fn new() {{}}\n*** Add File: {}\n+x\n*** End Patch",
+            protected.display()
+        );
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("protected memory file"),
+            "{}",
+            out.content
+        );
+        assert!(!dir.join("src/new.rs").exists(), "nothing may be written");
+        assert!(!protected.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

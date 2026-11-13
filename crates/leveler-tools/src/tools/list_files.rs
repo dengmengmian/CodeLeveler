@@ -76,6 +76,9 @@ impl Tool for ListFilesTool {
         let rel = input.path.unwrap_or_else(|| ".".to_string());
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
         let base = context.execution_workspace()?.resolve_for_read(&rel)?;
+        if let Err(reason) = crate::memory_access::validate_read(&context, &base) {
+            return Ok(ToolOutput::error(reason));
+        }
 
         let listing = match WorkspaceSearch::list_dir(&base, limit) {
             Ok(listing) => listing,

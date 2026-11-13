@@ -87,6 +87,17 @@ pub struct ExecutionResources {
     /// result looks authoritative while being meaningless. `ToolContext` is
     /// cloned into every child, so the `Arc` makes one gate for the whole run.
     pub command_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Host-owned memory access policy, when the user enabled the memory
+    /// pipeline. Ordinary file tools route paths inside the configured memory
+    /// roots through this policy so memory files keep their own containment,
+    /// concurrency and manifest guarantees. `None` = every path behaves as an
+    /// ordinary file.
+    pub memory: Option<leveler_memory::MemoryV2AccessResource>,
+    /// The bounded memory index rendered for this turn, when the memory
+    /// pipeline exposes it. Held here (not recomputed in the executor) so every
+    /// model round of one turn sends the same bytes and the provider's prefix
+    /// cache stays valid across rounds.
+    pub memory_index: Option<Arc<str>>,
 }
 
 /// Gates and budgets — the scope-varying part of the context. Per-engine
@@ -387,6 +398,8 @@ impl ToolContext {
                 checkpoint: Arc::new(Checkpoint::new()),
                 file_state: Arc::new(FileStateTracker::default()),
                 command_gate: Arc::new(tokio::sync::Mutex::new(())),
+                memory: None,
+                memory_index: None,
             },
             policy: ToolPolicy {
                 permission_profile: SharedPermissionProfile::new(mode),
@@ -486,6 +499,23 @@ impl ToolContext {
     pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
         self.session_scope = Some(scope.into());
         self
+    }
+
+    /// Attach the host memory policy for ordinary file-tool routing.
+    pub fn with_memory(mut self, memory: leveler_memory::MemoryV2AccessResource) -> Self {
+        self.execution.memory = Some(memory);
+        self
+    }
+
+    /// Attach the pre-rendered memory index for this turn's prompt.
+    pub fn with_memory_index(mut self, index: Arc<str>) -> Self {
+        self.execution.memory_index = Some(index);
+        self
+    }
+
+    /// The memory index this turn was composed with, if memory is exposed.
+    pub fn memory_index(&self) -> Option<&Arc<str>> {
+        self.execution.memory_index.as_ref()
     }
 
     /// Attach this call's attention signal. The host stamps this from the

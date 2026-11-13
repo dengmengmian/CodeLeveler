@@ -12,6 +12,7 @@ description = "Tool trait, registry, JSON-schema validation, and the built-in to
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }
 leveler-execution = { workspace = true }
+leveler-memory = { workspace = true }
 leveler-context = { workspace = true }
 leveler-foreign-session = { workspace = true }
 leveler-project = { workspace = true }

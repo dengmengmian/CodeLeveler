@@ -3524,7 +3524,9 @@ fn slash_new_starts_a_fresh_session() {
 /// Ctrl+X Ctrl+E, Ctrl+T, Ctrl+C. `/skill` is not listed here: it is now the
 /// prefix of the `/skills` inspector, so Enter completes it rather than
 /// reporting it unknown. `/doctor` is no longer closed either: it opens the
-/// local terminal diagnostics screen.
+/// local terminal diagnostics screen. The Memory 2.0 management verbs are
+/// still closed, but `/memory` and `/remember` are live commands of the native
+/// memory surface, so they are not "unknown".
 #[test]
 fn closed_commands_are_unknown_and_send_nothing() {
     for command in [
@@ -3536,15 +3538,6 @@ fn closed_commands_are_unknown_and_send_nothing() {
         "/tools",
         "/quit",
         "/q",
-        "/remember 终端输出保持紧凑",
-        "/memory",
-        "/memory list",
-        "/memory status",
-        "/memory review",
-        "/memory accept old-id",
-        "/memory reject old-id",
-        "/memory forget old-id",
-        "/memory remember note",
         "/forget old-id",
         "/consolidate_memory",
     ] {

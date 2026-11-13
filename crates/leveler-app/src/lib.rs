@@ -26,6 +26,7 @@ mod goal_recap;
 mod interactive;
 mod live_view;
 pub mod mcp_config;
+pub mod memory;
 pub mod observability;
 mod parallel;
 mod prompt_assist;
@@ -207,6 +208,10 @@ pub struct LoadedConfig {
     pub web_search: Option<WebSearchSettings>,
     /// `[retry]`: the bounded recovery budget for one logical model request.
     pub retry: leveler_model::RetryBudget,
+    /// `[memory]`, resolved. `Off` unless the user opted in.
+    pub memory: leveler_memory::config::MemoryV2Config,
+    /// `[memory].model`: the route for capture and Dream extraction.
+    pub memory_model: Option<String>,
 }
 
 impl LoadedConfig {
@@ -371,6 +376,8 @@ pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
         model_context_soft_percent: global.model_soft_percent,
         web_search: global.web_search,
         retry: global.retry,
+        memory: global.memory,
+        memory_model: global.memory_model,
     })
 }
 
@@ -392,6 +399,8 @@ impl Default for LoadedConfig {
             model_context_soft_percent: Vec::new(),
             web_search: None,
             retry: leveler_model::RetryBudget::default(),
+            memory: leveler_memory::config::MemoryV2Config::default(),
+            memory_model: None,
         }
     }
 }
@@ -709,6 +718,10 @@ pub struct Application {
     /// "a receipt of this boot that is not in flight" is a fact about the
     /// boot, not about one client of it.
     in_flight_commands: interactive::InFlightCommands,
+    /// Cross-session memory: the process-side Capture/Dream workers, the host
+    /// access policy and the turn-stable prompt index. Memory is inert unless
+    /// the loaded `[memory].rollout` opts in.
+    memory: memory::MemoryRuntime,
     /// The live permission profile of each session, keyed by session scope.
     ///
     /// The persisted `sessions.mode` column is the durable record; this is the
@@ -738,6 +751,15 @@ pub struct Application {
     /// stream has no subscriber at creation time; the created session's
     /// bootstrap is the one channel a client is guaranteed to read.
     default_model_notice: std::sync::Mutex<Option<String>>,
+}
+
+impl Drop for Application {
+    fn drop(&mut self) {
+        // A turn may have just handed a range to a capture worker. Their
+        // durable jobs survive the process; the leases expire, so cancelling
+        // here only stops work that this process can no longer own.
+        self.memory.cancel_workers();
+    }
 }
 
 impl Application {
@@ -893,6 +915,7 @@ impl Application {
         let computer = Arc::new(leveler_cua::ComputerUse::new());
         let native = Arc::new(leveler_native::NativeActions::new());
         let has_workspace = layout.primary_workspace().is_some();
+        let memory = memory::MemoryRuntime::new(&layout, config.clone());
         Ok(Self {
             layout,
             config,
@@ -914,6 +937,7 @@ impl Application {
             schedule: tokio::sync::Mutex::new(None),
             boot: std::sync::Mutex::new(None),
             in_flight_commands: Default::default(),
+            memory,
             default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
             capability_activations: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1417,6 +1441,20 @@ impl Application {
             tool_context.with_permission_profile(self.permission_profile_for(session_scope, mode));
         let tool_context = match session_scope {
             Some(scope) => tool_context.with_session_scope(scope),
+            None => tool_context,
+        };
+        // Memory paths are ordinary files to the model. The access policy is
+        // what keeps the store's control files, leases and tombstones out of
+        // reach while allowing topics and observations; it is attached only
+        // when the current rollout enables a memory capability. The index is
+        // byte-stable across turns whose memory did not change, so prompt
+        // prefix caching is unaffected.
+        let tool_context = match self.memory.access_resource(session_scope).await {
+            Some(resource) => tool_context.with_memory(resource),
+            None => tool_context,
+        };
+        let tool_context = match self.memory.prompt_index(session_scope).await {
+            Some(index) => tool_context.with_memory_index(index),
             None => tool_context,
         };
         // Build all mechanically available tools. The executor discloses them

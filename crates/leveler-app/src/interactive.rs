@@ -42,16 +42,17 @@ use leveler_model::{
     resolve_reasoning_effort,
 };
 use leveler_storage::{
-    ForeignSessionOriginRepository, MessageRepository, SessionInputRepository, SessionInputState,
-    SessionRecapRepository, SessionRepository, TurnRepository,
+    Database, ForeignSessionOriginRepository, MessageRepository, SessionInputRepository,
+    SessionInputState, SessionRecapRepository, SessionRepository, TurnRepository,
 };
 
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
     AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
     MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiForeignOrigin, UiForeignTool,
-    UiInputState, UiInterruptedCallState, UiInterruptedToolCall, UiMessage, UiMessageKind, UiPlan,
-    UiPlanState, UiRole, UiSessionSnapshot, UiSessionSummary, UiThinkingAccess, UiThinkingState,
+    UiInputState, UiInterruptedCallState, UiInterruptedToolCall, UiMemoryActionResult, UiMessage,
+    UiMessageKind, UiPlan, UiPlanState, UiRole, UiSessionSnapshot, UiSessionSummary,
+    UiThinkingAccess, UiThinkingState,
 };
 
 /// Whether a turn auto-approves risky actions. True when the session opted in
@@ -1358,6 +1359,11 @@ fn require_model(
         .ok_or_else(|| ClientError::Runtime(no_model_message(session_id)))
 }
 
+/// The action name a Dream result carries; batch Dream is a distinct command.
+fn dream_action_name(batch: bool) -> &'static str {
+    if batch { "batch_dream" } else { "dream" }
+}
+
 /// Whether `answer` is the decision this request already recorded.
 ///
 /// An empty wire answer is an explicit skip. Only the identical decision may
@@ -2051,6 +2057,24 @@ impl InProcessRuntimeClient {
         require_model(&config, session_id)
     }
 
+    /// Everything a memory management action attributes its model call to: the
+    /// real session database and the session's configured route.
+    async fn memory_action_context(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(Database, ModelRef), String> {
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| format!("memory action database unavailable: {error}"))?;
+        let model = self
+            .session_model(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((db, model))
+    }
+
     async fn save_agent(
         &self,
         session_id: SessionId,
@@ -2103,6 +2127,9 @@ impl InProcessRuntimeClient {
         self.user_shells.drop_session(session_id);
         self.steering.lock().unwrap().remove(session_id);
         self.goal_steering.lock().unwrap().remove(session_id);
+        // The session's cached prompt index and activity outlive the turn that
+        // produced them; a deleted session must not keep either in memory.
+        self.app.memory().forget_session(session_id.as_str());
     }
 
     /// Drop session streams nobody is watching once the cache is over its
@@ -7645,6 +7672,213 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     });
                 Ok(())
             }
+            ClientCommand::QueryMemory {
+                session_id,
+                query_id,
+            } => {
+                // Read-only projection. It opens each scope's state database,
+                // so it runs off the async thread and never starts a turn.
+                let status = self.app.memory().ui_status(Some(&session_id)).await;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::MemoryLoaded {
+                        query_id,
+                        status: Box::new(status),
+                    });
+                Ok(())
+            }
+            ClientCommand::ReadMemoryFile {
+                session_id,
+                query_id,
+                scope,
+                path,
+            } => {
+                let file = self.app.memory().read_ui_file(&scope, &path).await;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::MemoryFileLoaded { query_id, file });
+                Ok(())
+            }
+            ClientCommand::RememberMemory {
+                session_id,
+                query_id,
+                content,
+            } => {
+                let result = match self.app.memory().remember(&content).await {
+                    Ok(Some(path)) => UiMemoryActionResult {
+                        action: "remember".to_owned(),
+                        ok: true,
+                        message: format!(
+                            "Saved to global memory: {}",
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        ),
+                    },
+                    Ok(None) => UiMemoryActionResult {
+                        action: "remember".to_owned(),
+                        ok: false,
+                        message: "Nothing to remember: the note was empty.".to_owned(),
+                    },
+                    Err(error) => UiMemoryActionResult {
+                        action: "remember".to_owned(),
+                        ok: false,
+                        message: format!("Could not save the note: {error}"),
+                    },
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::MemoryActionFinished { query_id, result });
+                Ok(())
+            }
+            ClientCommand::RunMemoryDream {
+                session_id,
+                query_id,
+                batch,
+            } => {
+                let (db, model) = match self.memory_action_context(&session_id).await {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::MemoryActionFinished {
+                                    query_id,
+                                    result: UiMemoryActionResult {
+                                        action: dream_action_name(batch).to_owned(),
+                                        ok: false,
+                                        message: error,
+                                    },
+                                });
+                        return Ok(());
+                    }
+                };
+                let memory = self.app.memory().clone();
+                let config = self.app.config_manager().clone();
+                let events = self.events_for(&session_id);
+                // A Dream can run for minutes. It owns the dream worker slot,
+                // so the command returns at once and the settled outcome
+                // arrives as one event.
+                tokio::spawn(async move {
+                    let result = if batch {
+                        let outcome = crate::memory::run_batch_dream(
+                            &memory,
+                            &config,
+                            &db,
+                            &session_id,
+                            &model,
+                        )
+                        .await;
+                        UiMemoryActionResult {
+                            action: dream_action_name(true).to_owned(),
+                            ok: outcome.succeeded(),
+                            message: outcome.message(),
+                        }
+                    } else {
+                        let outcome = crate::memory::run_manual_dream(
+                            &memory,
+                            &config,
+                            &db,
+                            &session_id,
+                            &model,
+                        )
+                        .await;
+                        UiMemoryActionResult {
+                            action: dream_action_name(false).to_owned(),
+                            ok: outcome.succeeded(),
+                            message: outcome.message(),
+                        }
+                    };
+                    let _ = events.send(RuntimeEvent::MemoryActionFinished { query_id, result });
+                });
+                Ok(())
+            }
+            ClientCommand::FlushMemory {
+                session_id,
+                query_id,
+            } => {
+                let (db, model) = match self.memory_action_context(&session_id).await {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let _ =
+                            self.events_for(&session_id)
+                                .send(RuntimeEvent::MemoryActionFinished {
+                                    query_id,
+                                    result: UiMemoryActionResult {
+                                        action: "flush".to_owned(),
+                                        ok: false,
+                                        message: error,
+                                    },
+                                });
+                        return Ok(());
+                    }
+                };
+                let memory = self.app.memory().clone();
+                let config = self.app.config_manager().clone();
+                let events = self.events_for(&session_id);
+                tokio::spawn(async move {
+                    let outcome = memory
+                        .flush_capture(&config, &db, &session_id, &model)
+                        .await;
+                    let _ = events.send(RuntimeEvent::MemoryActionFinished {
+                        query_id,
+                        result: UiMemoryActionResult {
+                            action: "flush".to_owned(),
+                            ok: outcome.succeeded(),
+                            message: outcome.message(),
+                        },
+                    });
+                });
+                Ok(())
+            }
+            ClientCommand::ToggleMemory {
+                session_id,
+                query_id,
+                enabled,
+            } => {
+                // A session-scoped preference, not a config write: the
+                // configured rollout still decides whether memory may run.
+                let result = match self.app.memory().set_session_enabled(&session_id, enabled) {
+                    Ok(config) if enabled => UiMemoryActionResult {
+                        action: "toggle".to_owned(),
+                        ok: true,
+                        message: format!(
+                            "Memory is on for this session (rollout: {}).",
+                            config.rollout.as_str()
+                        ),
+                    },
+                    Ok(_) => UiMemoryActionResult {
+                        action: "toggle".to_owned(),
+                        ok: true,
+                        message: "Memory is paused for this session.".to_owned(),
+                    },
+                    Err(error) => UiMemoryActionResult {
+                        action: "toggle".to_owned(),
+                        ok: false,
+                        message: error,
+                    },
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::MemoryActionFinished { query_id, result });
+                Ok(())
+            }
+            ClientCommand::ForgetMemory {
+                session_id,
+                query_id,
+                scope,
+                path,
+                content_hash,
+            } => {
+                let result = self
+                    .app
+                    .memory()
+                    .forget_ui_file(&scope, &path, &content_hash)
+                    .await;
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::MemoryActionFinished { query_id, result });
+                Ok(())
+            }
             ClientCommand::QueryObservability {
                 session_id,
                 query_id,
@@ -11745,6 +11979,15 @@ mod session_stream_tests {
             leveler_storage::SessionRecord::new("/repo", "delete", "unused/m", leveler_core::now());
         SessionRepository::new(&db).create(&record).await.unwrap();
         let id = SessionId::new(record.id);
+        runtime.app.memory().record_activity(
+            id.as_str(),
+            crate::memory::MemoryActivity {
+                kind: crate::memory::MemoryActivityKind::Capturing,
+                active: true,
+                last_captured_range: Some((1, 2)),
+                ..Default::default()
+            },
+        );
         let cancel = CancellationToken::new();
         runtime.btw.lock().unwrap().insert(
             id.clone(),
@@ -11806,6 +12049,11 @@ mod session_stream_tests {
         assert!(!runtime.btw.lock().unwrap().contains_key(&id));
         assert!(cancel.is_cancelled());
         assert!(shell_cancel.is_cancelled());
+        assert_eq!(
+            runtime.app.memory().activity(id.as_str()),
+            crate::memory::MemoryActivity::default(),
+            "a deleted session must not leave a cached memory index or activity"
+        );
         assert!(
             sender.send(RuntimeEvent::TurnCancelled).is_err(),
             "stale producers must stay closed"
