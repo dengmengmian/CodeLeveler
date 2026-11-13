@@ -559,6 +559,77 @@ fn pending_work_is_claimed_before_failed_work_is_retried() {
 }
 
 #[test]
+fn claimable_sessions_are_the_sessions_a_new_worker_must_resume() {
+    let (_temp, store) = setup();
+    let request = |now: i64, duration: u64| ClaimRequest {
+        owner: format!("worker-{now}"),
+        now,
+        duration: Duration::from_secs(duration),
+    };
+
+    // Pending work, never attempted.
+    store.enqueue("s-pending", range(1, 1)).unwrap();
+
+    // A retryable failure (what a cancelled or failed extraction leaves).
+    store.enqueue("s-failed", range(1, 1)).unwrap();
+    let failed = store
+        .claim_for_session("s-failed", &request(1000, 60))
+        .unwrap()
+        .unwrap();
+    store
+        .fail_retryable(&failed, 1001, "capture worker cancelled")
+        .unwrap();
+
+    // A terminal failure is closed and must never be resumed.
+    store.enqueue("s-terminal", range(1, 1)).unwrap();
+    let terminal = store
+        .claim_for_session("s-terminal", &request(1000, 60))
+        .unwrap()
+        .unwrap();
+    store
+        .fail_terminal(&terminal, 1001, "corrupt stored payload")
+        .unwrap();
+
+    // Another live worker owns this lease.
+    store.enqueue("s-live", range(1, 1)).unwrap();
+    store
+        .claim_for_session("s-live", &request(1000, 60))
+        .unwrap()
+        .unwrap();
+
+    // A crashed worker's lease expired.
+    store.enqueue("s-expired", range(1, 1)).unwrap();
+    store
+        .claim_for_session("s-expired", &request(880, 60))
+        .unwrap()
+        .unwrap();
+
+    // Committed work has no claimable row.
+    store.enqueue("s-done", range(1, 1)).unwrap();
+    let done = store
+        .claim_for_session("s-done", &request(1000, 60))
+        .unwrap()
+        .unwrap();
+    store
+        .commit(&done, &CaptureOutcomeDraft::Noop, 1002)
+        .unwrap();
+
+    assert_eq!(
+        store.sessions_with_claimable_jobs(1000, 16).unwrap(),
+        vec![
+            "s-pending".to_owned(),
+            "s-failed".to_owned(),
+            "s-expired".to_owned()
+        ]
+    );
+    assert_eq!(
+        store.sessions_with_claimable_jobs(1000, 2).unwrap(),
+        vec!["s-pending".to_owned(), "s-failed".to_owned()],
+        "the pass is bounded and keeps the oldest claimable work first"
+    );
+}
+
+#[test]
 fn retryable_failure_text_cannot_strand_a_running_lease() {
     let (_temp, store) = setup();
     store.enqueue("session", range(1, 1)).unwrap();
