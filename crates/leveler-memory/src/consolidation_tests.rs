@@ -938,7 +938,10 @@ fn write_manual_note(fixture: &Fixture, name: &str, content: &str, modified_at: 
     let path = fixture.workspace.join(&relative);
     std::fs::write(&path, content).unwrap();
     let modified = std::time::UNIX_EPOCH + Duration::from_secs(modified_at as u64);
-    std::fs::File::open(&path)
+    // Windows only updates timestamps through a writable handle.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
         .unwrap()
         .set_modified(modified)
         .unwrap();

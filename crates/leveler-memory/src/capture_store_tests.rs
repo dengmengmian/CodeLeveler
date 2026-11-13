@@ -443,7 +443,7 @@ fn observation_commit_converges_file_fts_manifest_and_cursors() {
     assert!(!index.search_fts("quasar durable", 10).unwrap().is_empty());
     let manifest = std::fs::read_to_string(temp.path().join("scope/MEMORY.md")).unwrap();
     assert!(manifest.contains("## Pending observations"));
-    assert!(manifest.contains(result.files.first().expect("first file").to_str().unwrap()));
+    assert!(manifest.contains(&relative_text(result.files.first().expect("first file"))));
     assert_eq!(
         store.cursors("session").unwrap(),
         CaptureCursors {
@@ -900,28 +900,12 @@ fn reconcile_tolerates_dream_archival_after_unarchived_snapshot() {
     assert_eq!(store.cursors("archived").unwrap().indexed, 2);
     assert_eq!(store.cursors("later").unwrap().indexed, 4);
     let manifest = std::fs::read_to_string(scope.join("MEMORY.md")).unwrap();
-    assert!(
-        !manifest.contains(
-            archived
-                .files
-                .first()
-                .expect("first file")
-                .path
-                .to_str()
-                .unwrap()
-        )
-    );
-    assert!(
-        manifest.contains(
-            later
-                .files
-                .first()
-                .expect("first file")
-                .path
-                .to_str()
-                .unwrap()
-        )
-    );
+    assert!(!manifest.contains(&relative_text(
+        &archived.files.first().expect("first file").path
+    )));
+    assert!(manifest.contains(&relative_text(
+        &later.files.first().expect("first file").path
+    )));
 }
 
 #[test]
@@ -1013,27 +997,12 @@ fn stale_reconcile_cannot_replace_newer_cross_handle_manifest() {
         .commit(&second_lease, &observations("Concurrent snapshot fact"), 21)
         .unwrap();
     let newer_manifest = std::fs::read_to_string(scope.join("MEMORY.md")).unwrap();
-    assert!(
-        newer_manifest.contains(
-            first
-                .files
-                .first()
-                .expect("first file")
-                .path
-                .to_str()
-                .unwrap()
-        )
-    );
-    assert!(
-        newer_manifest.contains(
-            second_result
-                .files
-                .first()
-                .expect("first file")
-                .to_str()
-                .unwrap()
-        )
-    );
+    assert!(newer_manifest.contains(&relative_text(
+        &first.files.first().expect("first file").path
+    )));
+    assert!(newer_manifest.contains(&relative_text(
+        second_result.files.first().expect("first file")
+    )));
 
     resume_older_tx.send(()).unwrap();
     older.join().unwrap().unwrap();
@@ -1183,7 +1152,7 @@ fn reconcile_uses_one_injected_timestamp_for_adoption_and_quarantine() {
         .query_row(
             "SELECT quarantined_at FROM memory_v2_quarantined_paths
              WHERE relative_path = ?1",
-            params![committed.to_string_lossy()],
+            params![relative_text(&committed)],
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
@@ -1529,6 +1498,12 @@ fn commit_one(store: &CaptureStore, range: CaptureRange, statement: &str, now: i
         .remove(0)
 }
 
+/// Every stored relative path is `/`-separated, while a `PathBuf` returned by
+/// a commit keeps the host's separators. Compare the stored spelling.
+fn relative_text(path: &Path) -> String {
+    super::path_text(path).unwrap()
+}
+
 fn indexed_chunks_for(scope: &Path, relative: &Path) -> Vec<String> {
     let index_path = scope.join("index.sqlite");
     let connection = JournalMode::for_db_path(&index_path)
@@ -1539,7 +1514,7 @@ fn indexed_chunks_for(scope: &Path, relative: &Path) -> Vec<String> {
         .unwrap();
     statement
         .query_map(
-            params![scope.join(relative).to_string_lossy().to_string()],
+            params![crate::index::path_key(&scope.join(relative))],
             |row| row.get::<_, String>(0),
         )
         .unwrap()
@@ -1635,16 +1610,16 @@ fn missing_inbox_file_does_not_wedge_later_commits() {
     assert!(!indexed_chunks_for(&scope, &second).is_empty());
     assert!(!indexed_chunks_for(&scope, &third).is_empty());
     let manifest = std::fs::read_to_string(scope.join("MEMORY.md")).unwrap();
-    assert!(!manifest.contains(first.to_str().unwrap()));
-    assert!(manifest.contains(second.to_str().unwrap()));
-    assert!(manifest.contains(third.to_str().unwrap()));
+    assert!(!manifest.contains(&relative_text(&first)));
+    assert!(manifest.contains(&relative_text(&second)));
+    assert!(manifest.contains(&relative_text(&third)));
     assert_eq!(
         store
             .open_state()
             .unwrap()
             .query_row(
                 "SELECT reason FROM memory_v2_quarantined_paths WHERE relative_path = ?1",
-                params![first.to_string_lossy()],
+                params![relative_text(&first)],
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),
@@ -1668,7 +1643,7 @@ fn edited_inbox_file_is_durably_quarantined_from_index_and_manifest() {
     assert!(
         !std::fs::read_to_string(scope.join("MEMORY.md"))
             .unwrap()
-            .contains(first.to_str().unwrap()),
+            .contains(&relative_text(&first)),
         "manifest rendering must verify committed inbox bytes before reconciliation"
     );
 
@@ -1679,15 +1654,15 @@ fn edited_inbox_file_is_durably_quarantined_from_index_and_manifest() {
     assert!(indexed_chunks_for(&scope, &first).is_empty());
     assert!(!indexed_chunks_for(&scope, &second).is_empty());
     let manifest = std::fs::read_to_string(scope.join("MEMORY.md")).unwrap();
-    assert!(!manifest.contains(first.to_str().unwrap()));
-    assert!(manifest.contains(second.to_str().unwrap()));
+    assert!(!manifest.contains(&relative_text(&first)));
+    assert!(manifest.contains(&relative_text(&second)));
     assert_eq!(
         store
             .open_state()
             .unwrap()
             .query_row(
                 "SELECT reason FROM memory_v2_quarantined_paths WHERE relative_path = ?1",
-                params![first.to_string_lossy()],
+                params![relative_text(&first)],
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),
@@ -1697,7 +1672,7 @@ fn edited_inbox_file_is_durably_quarantined_from_index_and_manifest() {
     assert!(
         !std::fs::read_to_string(scope.join("MEMORY.md"))
             .unwrap()
-            .contains(first.to_str().unwrap())
+            .contains(&relative_text(&first))
     );
     let storage = MemoryStorage::new_flat(temp.path(), &scope);
     let index = crate::MemoryIndex::open_or_create(
@@ -1812,28 +1787,24 @@ fn independent_handles_for_two_sessions_preserve_files_and_manifest() {
     );
     let manifest = std::fs::read_to_string(scope.join("MEMORY.md")).unwrap();
     assert!(
-        manifest.contains(
+        manifest.contains(&relative_text(
             results
                 .first()
                 .expect("first result")
                 .files
                 .first()
                 .expect("first file")
-                .to_str()
-                .unwrap()
-        )
+        ))
     );
     assert!(
-        manifest.contains(
+        manifest.contains(&relative_text(
             results
                 .get(1)
                 .expect("second result")
                 .files
                 .first()
                 .expect("first file")
-                .to_str()
-                .unwrap()
-        )
+        ))
     );
 }
 
