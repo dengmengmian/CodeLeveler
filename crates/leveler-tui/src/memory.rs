@@ -1026,6 +1026,20 @@ fn summary_line(state: &AppState, width: usize) -> Line<'static> {
     ))
 }
 
+/// `MM-DD HH:MM` in local time.
+const UPDATED_W: usize = 11;
+
+fn updated_label(modified_at: Option<i64>) -> String {
+    modified_at
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn file_row(
     file: &UiMemoryFile,
     selected: bool,
@@ -1036,8 +1050,11 @@ fn file_row(
     let marker = if selected { "› " } else { "  " };
     let kind = kind_label(&file.kind, t);
     let size = human_bytes(file.bytes);
+    let updated = updated_label(file.modified_at);
     let kind_w = display_width(kind).max(4);
-    let fixed = 2 + kind_w + 1 + 1 + size.len();
+    // The size renders in an eight-column field even when the text is shorter.
+    let size_w = size.len().max(8);
+    let fixed = 2 + kind_w + 1 + 1 + UPDATED_W + 1 + size_w;
     let path_w = width.saturating_sub(fixed).max(1);
     let path = crate::render::truncate_display(&file.path, path_w);
     let style = if selected {
@@ -1057,6 +1074,10 @@ fn file_row(
         Span::styled(crate::render::pad_display(kind, kind_w), kind_style),
         Span::styled(" ", Style::default()),
         Span::styled(path, style),
+        Span::styled(
+            format!(" {updated:>UPDATED_W$}"),
+            Style::default().fg(theme.text.muted),
+        ),
         Span::styled(format!(" {size:>8}"), Style::default().fg(theme.text.muted)),
     ])
 }
@@ -1521,6 +1542,55 @@ mod tests {
         assert!(
             state.memory.preview_for.is_none(),
             "the page must ask the store for the file again"
+        );
+    }
+
+    #[test]
+    fn a_file_row_shows_when_the_store_last_wrote_the_file() {
+        let t = state().t();
+        let theme = Theme::no_color();
+        let mut topic = file("workspace", "topics/build.md", true);
+        topic.modified_at = Some(1_700_000_000);
+        let row = file_row(&topic, false, 80, &t.memory, &theme);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        let expected = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string();
+        assert!(
+            text.contains(&expected),
+            "the row must show the updated time {expected:?}: {text}"
+        );
+    }
+
+    #[test]
+    fn a_file_row_fits_the_width_it_is_given() {
+        // The size is rendered in an 8-column field, so a three-character
+        // size must not shrink the path budget by nothing.
+        let t = state().t();
+        let theme = Theme::no_color();
+        let topic = file("workspace", "topics/build.md", true);
+        for width in [30, 40, 60] {
+            let row = file_row(&topic, true, width, &t.memory, &theme);
+            let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+            assert!(
+                unicode_width::UnicodeWidthStr::width(text.as_str()) <= width,
+                "row wider than {width}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_row_without_a_modified_time_shows_a_placeholder() {
+        let t = state().t();
+        let theme = Theme::no_color();
+        let topic = file("workspace", "topics/build.md", true);
+        let row = file_row(&topic, false, 80, &t.memory, &theme);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(
+            text.contains("          - "),
+            "the updated column keeps its width with no time: {text:?}"
         );
     }
 

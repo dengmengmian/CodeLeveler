@@ -83,14 +83,15 @@ fn print_status(status: &UiMemoryStatus) {
         enabled(status.manual_dream_enabled),
         enabled(status.batch_dream_enabled),
     );
-    if status.rollout == "off" {
+    let opened = status.rollout != "off";
+    if !opened {
         println!(
             "memory is off; nothing is captured or injected for this configuration \
              (`memory remember` still records an explicit note)"
         );
     }
-    print_scope("global", &status.global);
-    print_scope("workspace", &status.workspace);
+    print_scope("global", &status.global, opened);
+    print_scope("workspace", &status.workspace, opened);
     if let Some(session) = &status.session {
         println!(
             "session {}: requested {}, captured {}, indexed {}, pending {}, active {}, failed {}",
@@ -120,10 +121,14 @@ fn print_status(status: &UiMemoryStatus) {
     }
 }
 
-fn print_scope(name: &str, scope: &leveler_client_protocol::UiMemoryScope) {
+fn print_scope(name: &str, scope: &leveler_client_protocol::UiMemoryScope, opened: bool) {
     println!("\n{name}: {}", scope.root);
     if let Some(error) = &scope.error {
         println!("  error: {error}");
+        return;
+    }
+    if !opened {
+        println!("  not read: memory is off");
         return;
     }
     println!(
