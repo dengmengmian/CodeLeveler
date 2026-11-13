@@ -31,6 +31,11 @@ pub enum ModelCallKind {
     /// A bounded call the runtime makes on its own account. Never a second
     /// model judging the first — that class of call no longer exists.
     Advisory,
+    /// Automatic memory capture: extracting durable observations from a
+    /// settled turn range. Runs after the user's turn, never inside it.
+    MemoryCapture,
+    /// Memory Dream: consolidating captured observations into topics.
+    MemoryDream,
 }
 
 impl ModelCallKind {
@@ -45,6 +50,8 @@ impl ModelCallKind {
             Self::SideQuestion => "side_question",
             Self::ProviderProbe => "provider_probe",
             Self::Advisory => "advisory",
+            Self::MemoryCapture => "memory_capture",
+            Self::MemoryDream => "memory_dream",
         }
     }
 
@@ -62,6 +69,8 @@ impl ModelCallKind {
             "side_question" => Self::SideQuestion,
             "provider_probe" => Self::ProviderProbe,
             "advisory" => Self::Advisory,
+            "memory_capture" => Self::MemoryCapture,
+            "memory_dream" => Self::MemoryDream,
             _ => Self::Round,
         }
     }

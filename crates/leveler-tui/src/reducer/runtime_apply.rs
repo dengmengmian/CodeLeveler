@@ -1336,6 +1336,18 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.usage.loaded = Some(*report);
         }
+        // Memory answers are matched against the page's own slots: a replay,
+        // another client's answer, or an answer to a selection the user has
+        // already left must not replace what is on screen.
+        RuntimeEvent::MemoryLoaded { query_id, status } => {
+            crate::memory::apply_status(state, query_id.as_ref(), status);
+        }
+        RuntimeEvent::MemoryFileLoaded { query_id, file } => {
+            crate::memory::apply_file(state, query_id.as_ref(), file);
+        }
+        RuntimeEvent::MemoryActionFinished { query_id, result } => {
+            crate::memory::apply_action(state, query_id.as_ref(), result);
+        }
         RuntimeEvent::ObservabilityLoaded {
             observation,
             query_id,

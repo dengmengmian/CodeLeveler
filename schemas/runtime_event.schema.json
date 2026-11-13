@@ -2622,6 +2622,93 @@
       }
     },
     {
+      "description": "Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection of both memory scopes. The file list carries no contents; a page asks for one file at a time with `ReadMemoryFile`.",
+      "type": "object",
+      "required": [
+        "status",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/UiMemoryStatus"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::ReadMemoryFile`]. `content.error` is set when the path was refused or the read failed, so an empty preview can never be mistaken for an empty file.",
+      "type": "object",
+      "required": [
+        "file",
+        "type"
+      ],
+      "properties": {
+        "file": {
+          "$ref": "#/definitions/UiMemoryFileContent"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_file_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of a memory management command (`RememberMemory`, `RunMemoryDream`, `FlushMemory`, `ToggleMemory`, `ForgetMemory`). One settled outcome per command; the UI shows `message` and, for an ok result, refreshes with `QueryMemory`.",
+      "type": "object",
+      "required": [
+        "result",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/UiMemoryActionResult"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_action_finished"
+          ]
+        }
+      }
+    },
+    {
       "description": "Result of [`crate::ClientCommand::ReloadConfig`], and the notification of an automatically applied generation. `outcome` is one of `applied` / `unchanged` / `failed`.\n\n`version` is the generation now in force — the PREVIOUS one on a failure, because a failed reload keeps the last known good configuration. `changed` names the dimensions that moved (never their values, and never a credential). `deferred_to_next_turn` is true when a turn was already running: it keeps the generation it started with, and the next turn uses this one.",
       "type": "object",
       "required": [
@@ -6494,6 +6581,93 @@
           }
         },
         {
+          "description": "Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection of both memory scopes. The file list carries no contents; a page asks for one file at a time with `ReadMemoryFile`.",
+          "type": "object",
+          "required": [
+            "status",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/UiMemoryStatus"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory_loaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::ReadMemoryFile`]. `content.error` is set when the path was refused or the read failed, so an empty preview can never be mistaken for an empty file.",
+          "type": "object",
+          "required": [
+            "file",
+            "type"
+          ],
+          "properties": {
+            "file": {
+              "$ref": "#/definitions/UiMemoryFileContent"
+            },
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory_file_loaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of a memory management command (`RememberMemory`, `RunMemoryDream`, `FlushMemory`, `ToggleMemory`, `ForgetMemory`). One settled outcome per command; the UI shows `message` and, for an ok result, refreshes with `QueryMemory`.",
+          "type": "object",
+          "required": [
+            "result",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "result": {
+              "$ref": "#/definitions/UiMemoryActionResult"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory_action_finished"
+              ]
+            }
+          }
+        },
+        {
           "description": "Result of [`crate::ClientCommand::ReloadConfig`], and the notification of an automatically applied generation. `outcome` is one of `applied` / `unchanged` / `failed`.\n\n`version` is the generation now in force — the PREVIOUS one on a failure, because a failed reload keeps the last known good configuration. `changed` names the dimensions that moved (never their values, and never a credential). `deferred_to_next_turn` is true when a turn was already running: it keeps the generation it started with, and the next turn uses this one.",
           "type": "object",
           "required": [
@@ -9188,6 +9362,373 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        }
+      }
+    },
+    "UiMemoryActionResult": {
+      "description": "A management action's mechanical result. `ok` reflects the runtime's own store outcome, never a model claim.",
+      "type": "object",
+      "required": [
+        "action",
+        "message",
+        "ok"
+      ],
+      "properties": {
+        "action": {
+          "description": "`remember`, `dream`, `batch_dream`, `flush`, or `forget`.",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      }
+    },
+    "UiMemoryActivity": {
+      "description": "What the memory pipeline is doing for this session.",
+      "type": "object",
+      "required": [
+        "active",
+        "kind"
+      ],
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "`idle`, `capturing`, `dreaming`, or `failed`.",
+          "type": "string"
+        },
+        "last_captured_range": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": [
+            {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "last_dream_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiMemoryFile": {
+      "description": "One file a memory page may list and preview.",
+      "type": "object",
+      "required": [
+        "bytes",
+        "deletable",
+        "kind",
+        "path",
+        "scope"
+      ],
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "deletable": {
+          "description": "The runtime would accept a forget for these bytes. Manifests, protected files and files above the store's forget bound are not deletable.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "`manifest`, `topic`, `observation`, `archive`, or `other`.",
+          "type": "string"
+        },
+        "modified_at": {
+          "description": "Unix seconds, when the platform reports it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "path": {
+          "description": "Path relative to the scope root, with `/` separators.",
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        }
+      }
+    },
+    "UiMemoryFileContent": {
+      "description": "One file's contents, bounded by the runtime.",
+      "type": "object",
+      "required": [
+        "content",
+        "content_hash",
+        "path",
+        "scope",
+        "total_bytes",
+        "truncated"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "content_hash": {
+          "description": "BLAKE3 of the bytes that produced `content`. Forget sends this back so the tombstone names exactly the content the user saw.",
+          "type": "string"
+        },
+        "error": {
+          "description": "The read failed. Never rendered as an empty file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "total_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "truncated": {
+          "description": "The file was larger than the projection cap; `content` is its prefix.",
+          "type": "boolean"
+        }
+      }
+    },
+    "UiMemoryScope": {
+      "description": "One scope's health and counters.",
+      "type": "object",
+      "required": [
+        "archive_count",
+        "completed_capture_jobs",
+        "dream_lease",
+        "failed_capture_jobs",
+        "files",
+        "hidden_pending_observations",
+        "pending_capture_jobs",
+        "pending_observations",
+        "retry_capture_jobs",
+        "root",
+        "running_capture_jobs",
+        "scope",
+        "tombstone_count"
+      ],
+      "properties": {
+        "archive_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "completed_capture_jobs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "dream_lease": {
+          "type": "string"
+        },
+        "error": {
+          "description": "The scope could not be opened; the page shows this instead of zeros.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failed_capture_jobs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "files": {
+          "description": "Sorted topic/observation files that may be previewed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiMemoryFile"
+          }
+        },
+        "hidden_pending_observations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "last_failure_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "last_success_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "pending_capture_jobs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "pending_observations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "retry_capture_jobs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "root": {
+          "type": "string"
+        },
+        "running_capture_jobs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "scope": {
+          "description": "`global` or `workspace`.",
+          "type": "string"
+        },
+        "tombstone_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiMemorySession": {
+      "description": "One session's durable capture cursors and queued work.",
+      "type": "object",
+      "required": [
+        "active",
+        "captured",
+        "failed",
+        "indexed",
+        "pending",
+        "requested",
+        "session_id"
+      ],
+      "properties": {
+        "active": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "captured": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "failed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "indexed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "pending": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "requested": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "session_id": {
+          "type": "string"
+        }
+      }
+    },
+    "UiMemoryStatus": {
+      "description": "Everything the memory page lists without opening a file.",
+      "type": "object",
+      "required": [
+        "activity",
+        "automatic_dream_enabled",
+        "batch_dream_enabled",
+        "capture_enabled",
+        "enabled",
+        "global",
+        "manual_dream_enabled",
+        "rollout",
+        "workspace",
+        "workspace_ephemeral"
+      ],
+      "properties": {
+        "activity": {
+          "$ref": "#/definitions/UiMemoryActivity"
+        },
+        "automatic_dream_enabled": {
+          "type": "boolean"
+        },
+        "batch_dream_enabled": {
+          "type": "boolean"
+        },
+        "capture_enabled": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Memory is on for this session. False when the configured rollout is `off`, or when the session toggle paused it; `rollout` distinguishes the two.",
+          "type": "boolean"
+        },
+        "global": {
+          "$ref": "#/definitions/UiMemoryScope"
+        },
+        "manual_dream_enabled": {
+          "type": "boolean"
+        },
+        "rollout": {
+          "description": "The configured rollout: `off`, `record_only`, `shadow`, or `active`.",
+          "type": "string"
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiMemorySession"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workspace": {
+          "$ref": "#/definitions/UiMemoryScope"
+        },
+        "workspace_ephemeral": {
+          "type": "boolean"
         }
       }
     },

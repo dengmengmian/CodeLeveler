@@ -2763,6 +2763,22 @@ impl Executor {
                 commit_prompt,
             ));
         }
+        // Cross-session memory: a bounded index of topic files the model may
+        // read on demand. It is advisory and byte-stable for the whole turn,
+        // so every model round of the turn sends exactly the same prefix.
+        // Sub-agents inherit the same tool context and therefore the same
+        // index; a role that cannot read files never receives a memory tool
+        // surface in the first place.
+        if let Some(index) = self.tool_context.memory_index() {
+            segments.push(PromptSegment::control(
+                "memory_index",
+                PromptSource::MemoryIndex,
+                PromptAuthority::AdvisoryContext,
+                SegmentLifecycle::SessionPrefix,
+                true,
+                format!("\n\n{index}"),
+            ));
+        }
         segments
     }
 

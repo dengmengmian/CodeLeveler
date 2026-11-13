@@ -617,6 +617,10 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "usage" => open_stats(state, crate::screen::StatsSection::Usage),
         "clean" => open_clean(state),
         "schedules" => crate::schedules::open(state),
+        "memory" => crate::memory::open(state),
+        "remember" => remember_memory(state, command),
+        "dream" => run_memory_dream(state, command),
+        "flush" => run_memory_flush(state),
         "collab" => set_collab_cmd(state, command),
         "agents" => agents_slash(state, command),
         "skills" => skills_slash(state, command),
@@ -1134,6 +1138,91 @@ fn run_btw(state: &mut AppState, command: &str) -> Vec<Effect> {
     vec![Effect::Send(ClientCommand::Btw {
         session_id: state.session_id.clone(),
         question,
+    })]
+}
+
+/// `/remember <text>`: a typed write to global memory. No model turn, no
+/// prompt; the runtime stores the note and answers with the settled outcome.
+fn remember_memory(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let content = command
+        .strip_prefix("remember")
+        .unwrap_or(command)
+        .trim()
+        .to_owned();
+    if content.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().memory.remember_usage.to_string(),
+        });
+        return Vec::new();
+    }
+    let query_id = CommandId::generate();
+    state.memory.action_query = Some(query_id.clone());
+    vec![Effect::Send(ClientCommand::RememberMemory {
+        session_id: state.session_id.clone(),
+        query_id: Some(query_id),
+        content,
+    })]
+}
+
+/// `/dream [batch]`: consolidate pending observations now. The runtime decides
+/// eligibility and owns the lease; the client only names the mode.
+fn run_memory_dream(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let argument = command
+        .strip_prefix("dream")
+        .unwrap_or(command)
+        .trim()
+        .to_owned();
+    let batch = if argument.is_empty() {
+        false
+    } else if argument.eq_ignore_ascii_case("batch") {
+        true
+    } else {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().memory.dream_usage.to_string(),
+        });
+        return Vec::new();
+    };
+    if state.memory.action_query.is_some() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().memory.action_busy.to_string(),
+        });
+        return Vec::new();
+    }
+    let query_id = CommandId::generate();
+    state.memory.action_query = Some(query_id.clone());
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: state.t().memory.action_pending.to_string(),
+    });
+    vec![Effect::Send(ClientCommand::RunMemoryDream {
+        session_id: state.session_id.clone(),
+        query_id: Some(query_id),
+        batch,
+    })]
+}
+
+/// `/flush`: run the pending capture and promote what it produced into the
+/// visible index. The runtime's worker owns the model call.
+fn run_memory_flush(state: &mut AppState) -> Vec<Effect> {
+    if state.memory.action_query.is_some() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().memory.action_busy.to_string(),
+        });
+        return Vec::new();
+    }
+    let query_id = CommandId::generate();
+    state.memory.action_query = Some(query_id.clone());
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: state.t().memory.action_pending.to_string(),
+    });
+    vec![Effect::Send(ClientCommand::FlushMemory {
+        session_id: state.session_id.clone(),
+        query_id: Some(query_id),
     })]
 }
 

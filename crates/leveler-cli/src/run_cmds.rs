@@ -1324,6 +1324,10 @@ pub(crate) async fn cmd_tui(
     // generations to the attached client without restarting the runtime.
     app.start_config_watcher();
     in_process_client.spawn_config_bridge();
+    // A previous process may have quit while an extraction was in flight.
+    // The durable job survived that quit; resume it now, before the user has
+    // to touch the original session again.
+    app.recover_memory_captures(&model_ref).await;
     // The created row already carries `mode`; on a resume an explicit flag has
     // to move the persisted row + live cell like any other profile change.
     if let Some(persisted) = persisted_mode
@@ -1483,6 +1487,12 @@ pub(crate) async fn cmd_serve(
     .await?;
     let bound = prepared.bound;
     let runtime_id = prepared.runtime_id;
+    // The daemon is the workspace's runtime for every attached client. Resume
+    // capture work a previous process left claimable; without this the daemon
+    // would only retry it when the original session ran another turn.
+    if let Some(model) = &model_ref {
+        app.recover_memory_captures(model).await;
+    }
 
     println!("{}", Line::heading("Local runtime ready"));
     if let Some(server) = &bound.unix {
