@@ -957,10 +957,10 @@ impl Tool for ApplyPatchTool {
             )
             .await
             {
-                Ok(leveler_memory::MemoryV2Write::Written { .. }) => {
+                Ok(leveler_memory::MemoryWrite::Written { .. }) => {
                     memory_written.push(&change.path);
                 }
-                Ok(leveler_memory::MemoryV2Write::Outside) => {
+                Ok(leveler_memory::MemoryWrite::Outside) => {
                     return Ok(ToolOutput::error(format!(
                         "the memory policy accepted {} but did not persist it",
                         change.path
@@ -2273,7 +2273,7 @@ mod tests {
         writes: std::sync::Mutex<Vec<(PathBuf, String)>>,
     }
 
-    impl leveler_memory::MemoryV2Access for FakeMemory {
+    impl leveler_memory::MemoryAccess for FakeMemory {
         fn validate_read(&self, path: &std::path::Path) -> Result<bool, String> {
             Ok(path.starts_with(&self.root))
         }
@@ -2303,7 +2303,7 @@ mod tests {
             &self,
             path: &std::path::Path,
             contents: &[u8],
-        ) -> Result<leveler_memory::MemoryV2Write, String> {
+        ) -> Result<leveler_memory::MemoryWrite, String> {
             if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
                 return Err(format!(
                     "{} is a protected memory file and cannot be edited directly",
@@ -2318,7 +2318,7 @@ mod tests {
                 path.to_path_buf(),
                 String::from_utf8_lossy(contents).into_owned(),
             ));
-            Ok(leveler_memory::MemoryV2Write::Written {
+            Ok(leveler_memory::MemoryWrite::Written {
                 previous_content: None,
             })
         }
@@ -2336,7 +2336,7 @@ mod tests {
             root: memory_root.to_path_buf(),
             writes: std::sync::Mutex::new(Vec::new()),
         });
-        context.execution.memory = Some(leveler_memory::MemoryV2AccessResource(memory.clone()));
+        context.execution.memory = Some(leveler_memory::MemoryAccessResource(memory.clone()));
         (context, dir, memory)
     }
 

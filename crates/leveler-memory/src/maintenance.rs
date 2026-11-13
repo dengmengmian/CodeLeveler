@@ -1,4 +1,4 @@
-//! Content-free status, durable forgetting, and bounded retention for memory v2.
+//! Content-free status, durable forgetting, and bounded retention for memory.
 //!
 //! `memory_state.sqlite` is the serialization point for every operation in this
 //! module. Tombstones are committed before files are removed, so all readers
@@ -10,16 +10,18 @@ use std::path::{Component, Path, PathBuf};
 use crate::sqlite_journal::JournalMode;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 
+use crate::scope::{ManifestBudget, MemoryScope, content_hash, regenerate_scope_manifest};
 use crate::storage::MemoryStorage;
-use crate::v2::{V2ManifestBudget, V2MemoryScope, content_hash, regenerate_scope_manifest};
-use crate::{MemoryIndex, SharedV2Clock, V2MemoryAccessPolicy, V2PathClass, system_v2_clock};
+use crate::{
+    MemoryAccessPolicy, MemoryIndex, MemoryPathClass, SharedMemoryClock, system_memory_clock,
+};
 
 /// Largest file `forget` will hash and remove; clients should not offer deletion above it.
 pub const MAX_FORGET_FILE_BYTES: u64 = 256 * 1024;
 const MAX_GC_ITEMS_PER_CLASS: i64 = 256;
 const SECONDS_PER_DAY: i64 = 86_400;
 
-pub type Result<T> = std::result::Result<T, V2MaintenanceError>;
+pub type Result<T> = std::result::Result<T, MaintenanceError>;
 
 /// Whether a live Dream lease blocks this maintenance transaction.
 ///
@@ -39,7 +41,7 @@ fn has_active_lease(connection: &rusqlite::Connection, now: i64) -> Result<bool>
         )
         .optional()?
         .unwrap_or((None, None));
-    Ok(crate::v2_consolidation::lease_is_active(
+    Ok(crate::consolidation::lease_is_active(
         owner.as_deref(),
         expires_at,
         now,
@@ -56,25 +58,25 @@ enum TombstoneReconciliation {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum V2MaintenanceError {
-    #[error("invalid memory-v2 maintenance request: {0}")]
+pub enum MaintenanceError {
+    #[error("invalid memory maintenance request: {0}")]
     Invalid(&'static str),
-    #[error("memory-v2 target is unknown or no longer matches its evidence")]
+    #[error("memory target is unknown or no longer matches its evidence")]
     EvidenceMismatch,
-    #[error("memory-v2 target is protected")]
+    #[error("memory target is protected")]
     Protected,
-    #[error("memory-v2 maintenance rejected while an active Dream lease exists")]
+    #[error("memory maintenance rejected while an active Dream lease exists")]
     ActiveLease,
-    #[error("memory-v2 maintenance database failed")]
+    #[error("memory maintenance database failed")]
     Database(#[from] rusqlite::Error),
-    #[error("memory-v2 maintenance filesystem operation failed")]
+    #[error("memory maintenance filesystem operation failed")]
     Io(#[from] std::io::Error),
-    #[error("memory-v2 maintenance access policy rejected the operation")]
+    #[error("memory maintenance access policy rejected the operation")]
     Access(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("memory-v2 maintenance index convergence failed")]
+    #[error("memory maintenance index convergence failed")]
     Index(#[source] rusqlite::Error),
-    #[error("memory-v2 maintenance manifest convergence failed")]
-    Manifest(#[source] crate::V2StorageError),
+    #[error("memory maintenance manifest convergence failed")]
+    Manifest(#[source] crate::MemoryScopeError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +100,7 @@ impl ForgetReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgetRequest {
-    /// Exact path relative to one v2 scope, such as `topics/editor.md`.
+    /// Exact path relative to one memory scope, such as `topics/editor.md`.
     pub relative_path: PathBuf,
     /// BLAKE3 of the bytes the caller deliberately inspected.
     pub expected_content_hash: String,
@@ -133,7 +135,7 @@ pub enum DreamLeaseState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct V2ScopeStatus {
+pub struct MemoryScopeStatus {
     pub pending_capture_jobs: u64,
     pub running_capture_jobs: u64,
     pub retry_capture_jobs: u64,
@@ -154,18 +156,18 @@ pub struct V2ScopeStatus {
 }
 
 #[derive(Debug)]
-pub struct V2MaintenanceStore {
+pub struct MaintenanceStore {
     scope_dir: PathBuf,
-    scope: V2MemoryScope,
+    scope: MemoryScope,
     state_path: PathBuf,
-    access: V2MemoryAccessPolicy,
-    clock: SharedV2Clock,
+    access: MemoryAccessPolicy,
+    clock: SharedMemoryClock,
 }
 
-impl V2MaintenanceStore {
+impl MaintenanceStore {
     pub fn open(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
+        scope: MemoryScope,
         global_root: &Path,
         workspace_root: &Path,
     ) -> Result<Self> {
@@ -174,20 +176,20 @@ impl V2MaintenanceStore {
             scope,
             global_root,
             workspace_root,
-            system_v2_clock(),
+            system_memory_clock(),
         )
     }
 
     pub fn open_with_clock(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
+        scope: MemoryScope,
         global_root: &Path,
         workspace_root: &Path,
-        clock: SharedV2Clock,
+        clock: SharedMemoryClock,
     ) -> Result<Self> {
         let scope_dir = scope_dir.as_ref().to_path_buf();
-        let access = V2MemoryAccessPolicy::new(global_root, workspace_root)
-            .map_err(|source| V2MaintenanceError::Access(Box::new(source)))?;
+        let access = MemoryAccessPolicy::new(global_root, workspace_root)
+            .map_err(|source| MaintenanceError::Access(Box::new(source)))?;
         let store = Self {
             state_path: scope_dir.join("memory_state.sqlite"),
             scope_dir,
@@ -197,16 +199,16 @@ impl V2MaintenanceStore {
         };
         let mut connection = store.open_state()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        migrate_v2_hardening(&transaction)?;
+        migrate_hardening(&transaction)?;
         transaction.commit()?;
         match store.reconcile_tombstones() {
-            Ok(()) | Err(V2MaintenanceError::ActiveLease) => {}
+            Ok(()) | Err(MaintenanceError::ActiveLease) => {}
             Err(error) => return Err(error),
         }
         Ok(store)
     }
 
-    pub fn status(&self, now: i64) -> Result<V2ScopeStatus> {
+    pub fn status(&self, now: i64) -> Result<MemoryScopeStatus> {
         validate_timestamp(now)?;
         let connection = self.open_state()?;
         let (pending, running, retry, failed, completed) = connection
@@ -281,7 +283,7 @@ impl V2MaintenanceStore {
             .unwrap_or((None, None, 0));
         let dream_lease = if lock.0.is_none() {
             DreamLeaseState::None
-        } else if crate::v2_consolidation::lease_is_active(lock.0.as_deref(), lock.1, now) {
+        } else if crate::consolidation::lease_is_active(lock.0.as_deref(), lock.1, now) {
             DreamLeaseState::Active
         } else {
             DreamLeaseState::Expired
@@ -316,7 +318,7 @@ impl V2MaintenanceStore {
                 |row| row.get(0),
             )
             .unwrap_or(None);
-        Ok(V2ScopeStatus {
+        Ok(MemoryScopeStatus {
             pending_capture_jobs: pending,
             running_capture_jobs: running,
             retry_capture_jobs: retry,
@@ -351,7 +353,7 @@ impl V2MaintenanceStore {
         })
     }
 
-    /// Forget one exact, previously inspected v2 topic or observation.
+    /// Forget one exact, previously inspected memory topic or observation.
     pub fn forget(&self, request: &ForgetRequest) -> Result<ForgetResult> {
         validate_timestamp(request.now)?;
         validate_relative_target(&request.relative_path)?;
@@ -362,7 +364,7 @@ impl V2MaintenanceStore {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
         {
-            return Err(V2MaintenanceError::Invalid(
+            return Err(MaintenanceError::Invalid(
                 "expected hash must be 64 hexadecimal bytes",
             ));
         }
@@ -370,17 +372,17 @@ impl V2MaintenanceStore {
         let class = self
             .access
             .classify_path(&absolute)
-            .map_err(|source| V2MaintenanceError::Access(Box::new(source)))?;
+            .map_err(|source| MaintenanceError::Access(Box::new(source)))?;
         if !matches!(
             class,
-            V2PathClass::Topic(scope)
-                | V2PathClass::Observation(scope)
-                | V2PathClass::ArchivedObservation(scope)
+            MemoryPathClass::Topic(scope)
+                | MemoryPathClass::Observation(scope)
+                | MemoryPathClass::ArchivedObservation(scope)
                 if scope == self.scope
         ) {
-            return Err(V2MaintenanceError::Protected);
+            return Err(MaintenanceError::Protected);
         }
-        let target_kind = if matches!(class, V2PathClass::Topic(_)) {
+        let target_kind = if matches!(class, MemoryPathClass::Topic(_)) {
             "topic"
         } else {
             "observation"
@@ -398,14 +400,14 @@ impl V2MaintenanceStore {
             .optional()?
         {
             if existing_hash != request.expected_content_hash {
-                return Err(V2MaintenanceError::EvidenceMismatch);
+                return Err(MaintenanceError::EvidenceMismatch);
             }
             return Ok(ForgetResult {
                 tombstone_id,
                 was_already_forgotten: true,
             });
         }
-        if matches!(class, V2PathClass::ArchivedObservation(_)) {
+        if matches!(class, MemoryPathClass::ArchivedObservation(_)) {
             let is_known = self.open_state()?.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM consolidation_archives
@@ -416,21 +418,21 @@ impl V2MaintenanceStore {
                 |row| row.get::<_, bool>(0),
             )?;
             if !is_known {
-                return Err(V2MaintenanceError::EvidenceMismatch);
+                return Err(MaintenanceError::EvidenceMismatch);
             }
         }
         let bytes = read_regular_bounded(&absolute)?;
         if content_hash(&bytes) != request.expected_content_hash {
-            return Err(V2MaintenanceError::EvidenceMismatch);
+            return Err(MaintenanceError::EvidenceMismatch);
         }
         self.access
             .record_read_typed(&absolute, &bytes)
-            .map_err(|source| V2MaintenanceError::Access(Box::new(source)))?;
+            .map_err(|source| MaintenanceError::Access(Box::new(source)))?;
         let mut connection = self.open_state()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_active_lease = has_active_lease(&transaction, request.now)?;
         if has_active_lease {
-            return Err(V2MaintenanceError::ActiveLease);
+            return Err(MaintenanceError::ActiveLease);
         }
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO memory_v2_tombstones(
@@ -478,7 +480,7 @@ impl V2MaintenanceStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_active_lease = has_active_lease(&transaction, now)?;
         if has_active_lease {
-            return Err(V2MaintenanceError::ActiveLease);
+            return Err(MaintenanceError::ActiveLease);
         }
         let expired_archives = {
             let mut statement = transaction.prepare(
@@ -623,7 +625,7 @@ impl V2MaintenanceStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_active_lease = has_active_lease(&transaction, now)?;
         if has_active_lease {
-            return Err(V2MaintenanceError::ActiveLease);
+            return Err(MaintenanceError::ActiveLease);
         }
         let targets = {
             let mut statement = transaction.prepare(
@@ -643,11 +645,11 @@ impl V2MaintenanceStore {
         let mut removed_any = false;
         for (relative, kind, expected_content_hash) in &targets {
             let class = if kind == "topic" {
-                V2PathClass::Topic(self.scope)
+                MemoryPathClass::Topic(self.scope)
             } else if relative.starts_with("archive/") {
-                V2PathClass::ArchivedObservation(self.scope)
+                MemoryPathClass::ArchivedObservation(self.scope)
             } else {
-                V2PathClass::Observation(self.scope)
+                MemoryPathClass::Observation(self.scope)
             };
             match self.remove_expected_tombstoned_file(
                 Path::new(relative),
@@ -657,9 +659,7 @@ impl V2MaintenanceStore {
             ) {
                 Ok(TombstoneReconciliation::Removed) => removed_any = true,
                 Ok(TombstoneReconciliation::AlreadyGone) => {}
-                Err(
-                    error @ (V2MaintenanceError::EvidenceMismatch | V2MaintenanceError::Protected),
-                ) => {
+                Err(error @ (MaintenanceError::EvidenceMismatch | MaintenanceError::Protected)) => {
                     tracing::warn!(
                         relative_path = relative,
                         error = %error,
@@ -684,8 +684,8 @@ impl V2MaintenanceStore {
         // Rendering the manifest re-runs the exclusion scan over the whole state
         // database, so settled tombstones (the common case on every open) skip it.
         if removed_any {
-            regenerate_scope_manifest(&self.scope_dir, self.scope, V2ManifestBudget::configured())
-                .map_err(V2MaintenanceError::Manifest)?;
+            regenerate_scope_manifest(&self.scope_dir, self.scope, ManifestBudget::configured())
+                .map_err(MaintenanceError::Manifest)?;
         }
         Ok(())
     }
@@ -693,7 +693,7 @@ impl V2MaintenanceStore {
     fn remove_expected_tombstoned_file(
         &self,
         relative: &Path,
-        class: V2PathClass,
+        class: MemoryPathClass,
         expected_content_hash: &str,
         transaction: &rusqlite::Transaction<'_>,
     ) -> Result<TombstoneReconciliation> {
@@ -706,19 +706,19 @@ impl V2MaintenanceStore {
             Err(error) => return Err(error.into()),
         };
         if !metadata.file_type().is_file() {
-            return Err(V2MaintenanceError::EvidenceMismatch);
+            return Err(MaintenanceError::EvidenceMismatch);
         }
         let bytes = read_regular_bounded(&absolute)?;
         if content_hash(&bytes) != expected_content_hash {
-            return Err(V2MaintenanceError::EvidenceMismatch);
+            return Err(MaintenanceError::EvidenceMismatch);
         }
         self.access
             .record_read_typed(&absolute, &bytes)
-            .map_err(|source| V2MaintenanceError::Access(Box::new(source)))?;
-        if matches!(class, V2PathClass::Topic(_)) {
+            .map_err(|source| MaintenanceError::Access(Box::new(source)))?;
+        if matches!(class, MemoryPathClass::Topic(_)) {
             self.access
                 .remove_topic_file_in_transaction(&absolute, transaction)
-                .map_err(|source| V2MaintenanceError::Access(Box::new(source)))?;
+                .map_err(|source| MaintenanceError::Access(Box::new(source)))?;
         } else {
             std::fs::remove_file(&absolute)?;
         }
@@ -733,11 +733,11 @@ impl V2MaintenanceStore {
             crate::config::MemoryIndexConfig::default(),
             1,
         )
-        .map_err(V2MaintenanceError::Index)?;
+        .map_err(MaintenanceError::Index)?;
         for relative in paths {
             index
                 .delete_path(&self.scope_dir.join(relative))
-                .map_err(V2MaintenanceError::Index)?;
+                .map_err(MaintenanceError::Index)?;
         }
         Ok(())
     }
@@ -745,11 +745,11 @@ impl V2MaintenanceStore {
     fn open_state(&self) -> Result<rusqlite::Connection> {
         JournalMode::for_db_path(&self.state_path)
             .open(&self.state_path)
-            .map_err(V2MaintenanceError::Database)
+            .map_err(MaintenanceError::Database)
     }
 }
 
-pub(crate) fn migrate_v2_hardening(connection: &rusqlite::Connection) -> Result<()> {
+pub(crate) fn migrate_hardening(connection: &rusqlite::Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
@@ -883,8 +883,8 @@ fn validate_relative_target(path: &Path) -> Result<()> {
             || path.starts_with(Path::new("observations/_inbox"))
             || path.starts_with(Path::new("archive")))
     {
-        return Err(V2MaintenanceError::Invalid(
-            "target must be one exact v2 Markdown file",
+        return Err(MaintenanceError::Invalid(
+            "target must be one exact memory Markdown file",
         ));
     }
     Ok(())
@@ -892,7 +892,7 @@ fn validate_relative_target(path: &Path) -> Result<()> {
 
 fn validate_timestamp(now: i64) -> Result<()> {
     if now < 0 {
-        Err(V2MaintenanceError::Invalid("timestamp cannot be negative"))
+        Err(MaintenanceError::Invalid("timestamp cannot be negative"))
     } else {
         Ok(())
     }
@@ -902,9 +902,7 @@ fn cutoff(now: i64, days: u64) -> Result<i64> {
     let seconds = i64::try_from(days)
         .ok()
         .and_then(|days| days.checked_mul(SECONDS_PER_DAY))
-        .ok_or(V2MaintenanceError::Invalid(
-            "retention duration is too large",
-        ))?;
+        .ok_or(MaintenanceError::Invalid("retention duration is too large"))?;
     Ok(now.saturating_sub(seconds))
 }
 
@@ -922,14 +920,14 @@ fn deterministic_tombstone_id(kind: &str, path: &str, hash: &str) -> String {
 fn read_regular_bounded(path: &Path) -> Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.len() > MAX_FORGET_FILE_BYTES {
-        return Err(V2MaintenanceError::Protected);
+        return Err(MaintenanceError::Protected);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     std::fs::File::open(path)?
         .take(MAX_FORGET_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FORGET_FILE_BYTES {
-        return Err(V2MaintenanceError::Protected);
+        return Err(MaintenanceError::Protected);
     }
     Ok(bytes)
 }
@@ -942,12 +940,12 @@ fn remove_retained_file(scope_dir: &Path, relative: &str) -> Result<()> {
             .any(|component| !matches!(component, Component::Normal(_)))
         || !(relative.starts_with("archive") || relative.starts_with("observations/_inbox"))
     {
-        return Err(V2MaintenanceError::Protected);
+        return Err(MaintenanceError::Protected);
     }
     let path = scope_dir.join(relative);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(path)?,
-        Ok(_) => return Err(V2MaintenanceError::Protected),
+        Ok(_) => return Err(MaintenanceError::Protected),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -957,9 +955,9 @@ fn remove_retained_file(scope_dir: &Path, relative: &str) -> Result<()> {
 fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(|path| path.replace('\\', "/"))
-        .ok_or(V2MaintenanceError::Invalid("target path must be UTF-8"))
+        .ok_or(MaintenanceError::Invalid("target path must be UTF-8"))
 }
 
 #[cfg(test)]
-#[path = "v2_maintenance_tests.rs"]
+#[path = "maintenance_tests.rs"]
 mod tests;

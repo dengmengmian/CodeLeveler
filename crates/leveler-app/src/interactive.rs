@@ -7849,7 +7849,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     Ok(_) => UiMemoryActionResult {
                         action: "toggle".to_owned(),
                         ok: true,
-                        message: "Memory is paused for this session.".to_owned(),
+                        message: "Memory is paused for this session. Turns during the pause are not captured later.".to_owned(),
                     },
                     Err(error) => UiMemoryActionResult {
                         action: "toggle".to_owned(),
@@ -8171,6 +8171,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     }
                 }
                 self.app.browser().shutdown().await;
+                // `process::exit` skips Drop, so this is the only chance for a
+                // capture or Dream worker to release the lease it still owns.
+                self.app.memory().shutdown_workers().await;
                 Ok(())
             }
         }

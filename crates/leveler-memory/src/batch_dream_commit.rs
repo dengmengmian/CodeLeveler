@@ -17,7 +17,7 @@ use crate::batch_dream_io::{hash_file, publish_copy, read_bounded, sync_director
 
 /// Kept deferral reasons per note; older reasons fall off the front.
 const MAX_REASONS_BYTES: i64 = 4 * MAX_REASON_BYTES as i64;
-use crate::{MemoryIndex, MemoryStorage, V2ManifestBudget};
+use crate::{ManifestBudget, MemoryIndex, MemoryStorage};
 
 struct SettledNote {
     path: String,
@@ -389,7 +389,7 @@ impl BatchDreamStore {
              WHERE singleton = 1 AND owner = ?1 AND generation = ?2",
             params![owner, generation],
         )?;
-        crate::v2::bump_manifest_revision_in_transaction(&self.scope_dir, &transaction)?;
+        crate::scope::bump_manifest_revision_in_transaction(&self.scope_dir, &transaction)?;
         transaction.commit()?;
         self.cleanup_completed(operation_id)?;
         Ok(report)
@@ -473,10 +473,10 @@ impl BatchDreamStore {
         }
         sync_directory(&self.scope_dir.join(TOPICS_DIR))?;
         self.converge_index(&changes, &archived)?;
-        crate::v2::regenerate_scope_manifest(
+        crate::scope::regenerate_scope_manifest(
             &self.scope_dir,
             self.scope,
-            V2ManifestBudget::configured(),
+            ManifestBudget::configured(),
         )?;
         connection.execute(
             "UPDATE batch_dream_batches SET cleanup_pending = 0 WHERE operation_id = ?1",
@@ -500,8 +500,8 @@ impl BatchDreamStore {
         )
         .map_err(index_error)?;
         let source = match self.scope {
-            crate::V2MemoryScope::Global => "global",
-            crate::V2MemoryScope::Workspace => "workspace",
+            crate::MemoryScope::Global => "global",
+            crate::MemoryScope::Workspace => "workspace",
         };
         for change in changes {
             index

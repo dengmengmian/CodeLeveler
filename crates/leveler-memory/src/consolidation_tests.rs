@@ -4,8 +4,8 @@ use std::time::Duration;
 use super::*;
 use crate::sqlite_journal::JournalMode;
 use crate::{
-    CaptureOutcomeDraft, CaptureRange, ClaimRequest, ObservationDraft, ObservationType,
-    V2CaptureStore, ensure_scope_initialized,
+    CaptureOutcomeDraft, CaptureRange, CaptureStore, ClaimRequest, ObservationDraft,
+    ObservationType, ensure_scope_initialized,
 };
 use tempfile::TempDir;
 
@@ -13,22 +13,22 @@ struct Fixture {
     _temp: TempDir,
     global: PathBuf,
     workspace: PathBuf,
-    capture: V2CaptureStore,
-    dream: V2ConsolidationStore,
+    capture: CaptureStore,
+    dream: ConsolidationStore,
 }
 
 impl Fixture {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("memory-v2");
+        let root = temp.path().join("memory");
         let global = root.join("global");
         let workspace = root.join("workspaces/ws");
         std::fs::create_dir_all(root.join("workspaces")).unwrap();
-        ensure_scope_initialized(&root, &global, V2MemoryScope::Global).unwrap();
-        ensure_scope_initialized(&root, &workspace, V2MemoryScope::Workspace).unwrap();
-        let capture = V2CaptureStore::open(&workspace, V2MemoryScope::Workspace).unwrap();
+        ensure_scope_initialized(&root, &global, MemoryScope::Global).unwrap();
+        ensure_scope_initialized(&root, &workspace, MemoryScope::Workspace).unwrap();
+        let capture = CaptureStore::open(&workspace, MemoryScope::Workspace).unwrap();
         let dream =
-            V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
+            ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace)
                 .unwrap();
         Self {
             _temp: temp,
@@ -142,9 +142,9 @@ fn independent_handles_are_exclusive_and_generation_fences_stale_workers() {
     let fixture = Fixture::new();
     let evidence = fixture.add_observation("one", 1, "Lock fact", 10);
     let old = fixture.claim("old", 20, 5);
-    let other = V2ConsolidationStore::open(
+    let other = ConsolidationStore::open(
         &fixture.workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &fixture.global,
         &fixture.workspace,
     )
@@ -155,7 +155,7 @@ fn independent_handles_are_exclusive_and_generation_fences_stale_workers() {
             now: 21,
             duration: Duration::from_secs(5),
         }),
-        Err(V2ConsolidationError::Busy)
+        Err(ConsolidationError::Busy)
     ));
     let replacement = other
         .claim(&DreamClaimRequest {
@@ -176,7 +176,7 @@ fn independent_handles_are_exclusive_and_generation_fences_stale_workers() {
             }],
             25,
         ),
-        Err(V2ConsolidationError::StaleLease)
+        Err(ConsolidationError::StaleLease)
     ));
 }
 
@@ -303,7 +303,7 @@ fn restricted_surface_rejects_protected_arbitrary_and_unclaimed_paths() {
                 }],
                 21,
             ),
-            Err(V2ConsolidationError::Invalid(_)) | Err(V2ConsolidationError::Access(_))
+            Err(ConsolidationError::Invalid(_)) | Err(ConsolidationError::Access(_))
         ));
     }
     assert!(matches!(
@@ -316,7 +316,7 @@ fn restricted_surface_rejects_protected_arbitrary_and_unclaimed_paths() {
             }],
             21,
         ),
-        Err(V2ConsolidationError::Invalid(_))
+        Err(ConsolidationError::Invalid(_))
     ));
 }
 
@@ -418,7 +418,7 @@ fn empty_plan_preserves_claimed_observations() {
 
     assert!(matches!(
         fixture.dream.commit(&lease, &[], 21),
-        Err(V2ConsolidationError::Invalid(_))
+        Err(ConsolidationError::Invalid(_))
     ));
     assert!(
         fixture.dream.resume_planned(&lease, 21).unwrap().is_none(),
@@ -492,7 +492,7 @@ fn failed_durable_plan_is_reclaimed_after_new_captures_arrive() {
             }],
             21,
         ),
-        Err(V2ConsolidationError::Database(_))
+        Err(ConsolidationError::Database(_))
     ));
     fixture
         .dream
@@ -637,7 +637,7 @@ fn archive_database_failure_leaves_capture_source_recoverable() {
 
     assert!(matches!(
         fixture.dream.commit(&lease, &operations, 21),
-        Err(V2ConsolidationError::Database(_))
+        Err(ConsolidationError::Database(_))
     ));
     assert!(fixture.workspace.join(&observation).is_file());
     let connection = JournalMode::for_db_path(&state_path)
@@ -735,7 +735,7 @@ fn topic_prompt_rejects_excess_file_count() {
 
     assert!(matches!(
         fixture.dream.consolidation_input(&lease, 21),
-        Err(V2ConsolidationError::Invalid(_))
+        Err(ConsolidationError::Invalid(_))
     ));
 }
 
@@ -778,7 +778,7 @@ fn topic_prompt_rejects_excess_total_bytes() {
 
     assert!(matches!(
         fixture.dream.consolidation_input(&lease, 21),
-        Err(V2ConsolidationError::Invalid(_))
+        Err(ConsolidationError::Invalid(_))
     ));
 }
 
@@ -1069,7 +1069,7 @@ fn expired_worker_resumes_durable_plan_before_claiming_new_arrivals() {
     );
     assert!(matches!(
         fixture.dream.resume_planned(&old, 26),
-        Err(V2ConsolidationError::StaleLease)
+        Err(ConsolidationError::StaleLease)
     ));
     let result = fixture
         .dream
@@ -1290,7 +1290,7 @@ fn empty_shadow_plan_is_retryable_without_consuming_observations() {
         .unwrap();
 
     let error = fixture.dream.complete_shadow(&lease, &[], 21).unwrap_err();
-    assert!(matches!(error, V2ConsolidationError::Invalid(_)));
+    assert!(matches!(error, ConsolidationError::Invalid(_)));
     let state = JournalMode::for_db_path(&fixture.workspace.join("memory_state.sqlite"))
         .open_readonly(&fixture.workspace.join("memory_state.sqlite"))
         .unwrap();
@@ -1348,7 +1348,7 @@ fn rejected_shadow_plan_is_retryable_and_releases_lease() {
             21,
         )
         .unwrap_err();
-    assert!(matches!(error, V2ConsolidationError::Invalid(_)));
+    assert!(matches!(error, ConsolidationError::Invalid(_)));
 
     let state = JournalMode::for_db_path(&fixture.workspace.join("memory_state.sqlite"))
         .open(&fixture.workspace.join("memory_state.sqlite"))
@@ -1448,7 +1448,7 @@ fn explicitly_forgotten_topic_path_cannot_be_recreated() {
             }],
             21,
         ),
-        Err(V2ConsolidationError::Conflict(_))
+        Err(ConsolidationError::Conflict(_))
     ));
     assert!(!fixture.workspace.join("topics/forgotten.md").exists());
 }
@@ -1525,7 +1525,7 @@ fn post_archive_convergence_failure_remains_recoverable_on_next_claim() {
             21,
         )
         .unwrap_err();
-    assert!(matches!(&error, V2ConsolidationError::Convergence(_)));
+    assert!(matches!(&error, ConsolidationError::Convergence(_)));
     assert!(error.source().unwrap().is::<rusqlite::Error>());
     fixture
         .dream
@@ -1548,9 +1548,9 @@ fn post_archive_convergence_failure_remains_recoverable_on_next_claim() {
     drop(connection);
 
     std::fs::remove_dir(fixture.workspace.join("index.sqlite")).unwrap();
-    let reopened = V2ConsolidationStore::open(
+    let reopened = ConsolidationStore::open(
         &fixture.workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &fixture.global,
         &fixture.workspace,
     )
@@ -1578,11 +1578,10 @@ fn access_errors_retain_the_typed_source() {
     let global = temp.path().join("missing-global");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let error =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap_err();
-    assert!(matches!(&error, V2ConsolidationError::Access(_)));
-    assert!(error.source().unwrap().is::<crate::V2AccessError>());
+    let error = ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace)
+        .unwrap_err();
+    assert!(matches!(&error, ConsolidationError::Access(_)));
+    assert!(error.source().unwrap().is::<crate::MemoryAccessError>());
 }
 
 #[test]
@@ -1622,7 +1621,7 @@ fn structural_operations_do_not_overwrite_unrelated_destinations() {
     ] {
         assert!(matches!(
             fixture.dream.prepare_changes(&lease, &[operation]),
-            Err(V2ConsolidationError::Conflict(_))
+            Err(ConsolidationError::Conflict(_))
         ));
     }
 
@@ -1681,11 +1680,11 @@ fn topic_content_size_limit_is_enforced() {
     );
     assert!(matches!(
         normalize_topic_content(&format!("{at_limit}x")),
-        Err(V2ConsolidationError::Invalid(_))
+        Err(ConsolidationError::Invalid(_))
     ));
     assert!(matches!(
         normalize_topic_content("  \n"),
-        Err(V2ConsolidationError::Invalid(_))
+        Err(ConsolidationError::Invalid(_))
     ));
 }
 

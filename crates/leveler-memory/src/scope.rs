@@ -1,6 +1,6 @@
-//! Isolated on-disk foundation for the v2 memory pipeline.
+//! Isolated on-disk foundation for the memory pipeline.
 //!
-//! V2 never reads from or writes to the legacy `memory/` tree. Each global or
+//! The store never reads from or writes to a legacy tree outside `<LevelerHome>/memory/`. Each global or
 //! workspace scope owns its topics, immutable observation inbox, archive,
 //! generated manifest, durable state database, and lexical index.
 
@@ -12,7 +12,7 @@ use crate::sqlite_journal::JournalMode;
 use crate::text_utils::truncate_str;
 use rusqlite::params;
 
-use crate::v2_topic_reads::{compare_observations_newest_first, compare_topics_by_use};
+use crate::topic_reads::{compare_observations_newest_first, compare_topics_by_use};
 
 const STATE_SCHEMA_VERSION: &str = "1";
 pub(crate) const MAX_DISCOVERED_FILES: usize = 10_000;
@@ -27,10 +27,10 @@ const MAX_SOURCE_BYTES: u64 = 64 * 1024;
 /// Maximum size accepted for a user-authored remember observation.
 ///
 /// This matches the per-source read budget so one manually saved observation
-/// cannot persist more content than v2 will inspect while building a manifest.
+/// cannot persist more content than memory will inspect while building a manifest.
 pub const MAX_MANUAL_OBSERVATION_BYTES: usize = MAX_SOURCE_BYTES as usize;
 
-/// Content hash used by every memory-v2 optimistic write, tombstone, and
+/// Content hash used by every memory optimistic write, tombstone, and
 /// observation outcome: the BLAKE3 hex digest of the exact bytes.
 ///
 /// Exported so ordinary file tools, the TUI, and maintenance requests compute
@@ -51,10 +51,10 @@ pub(crate) const COMMITTED_UNARCHIVED_FILES_SQL: &str = "SELECT f.path, f.conten
      ORDER BY f.path
      LIMIT ?1";
 
-pub type Result<T> = std::result::Result<T, V2StorageError>;
+pub type Result<T> = std::result::Result<T, MemoryScopeError>;
 
 #[derive(Debug, thiserror::Error)]
-pub enum V2StorageError {
+pub enum MemoryScopeError {
     #[error("failed to {operation} at {path}")]
     Io {
         operation: &'static str,
@@ -69,10 +69,10 @@ pub enum V2StorageError {
         #[source]
         source: rusqlite::Error,
     },
-    #[error("v2 memory directory {path} exceeds the {limit}-entry safety limit")]
+    #[error("memory directory {path} exceeds the {limit}-entry safety limit")]
     TooManyEntries { path: PathBuf, limit: usize },
     #[error(
-        "v2 memory scope {path} is on a network filesystem; memory-v2 requires local shared-memory coordination"
+        "memory scope {path} is on a network filesystem; memory requires local shared-memory coordination"
     )]
     UnsupportedNetworkFilesystem { path: PathBuf },
     #[error("memory observation is {actual_bytes} bytes, exceeding the {limit_bytes}-byte limit")]
@@ -83,12 +83,12 @@ pub enum V2StorageError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum V2MemoryScope {
+pub enum MemoryScope {
     Global,
     Workspace,
 }
 
-impl V2MemoryScope {
+impl MemoryScope {
     fn heading(self) -> &'static str {
         match self {
             Self::Global => "Global memory index",
@@ -98,7 +98,7 @@ impl V2MemoryScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct V2ManifestBudget {
+pub struct ManifestBudget {
     pub max_bytes: usize,
     pub max_entries: usize,
     pub max_description_bytes: usize,
@@ -110,7 +110,7 @@ pub struct V2ManifestBudget {
     pub slug_tail: bool,
 }
 
-impl Default for V2ManifestBudget {
+impl Default for ManifestBudget {
     fn default() -> Self {
         Self {
             max_bytes: 8 * 1024,
@@ -122,10 +122,10 @@ impl Default for V2ManifestBudget {
     }
 }
 
-static CONFIGURED_MANIFEST_BUDGET: std::sync::RwLock<Option<V2ManifestBudget>> =
+static CONFIGURED_MANIFEST_BUDGET: std::sync::RwLock<Option<ManifestBudget>> =
     std::sync::RwLock::new(None);
 
-impl V2ManifestBudget {
+impl ManifestBudget {
     /// The budget every `MEMORY.md` writer in this process uses, so the file on
     /// disk always matches the view injected into the prompt. Falls back to
     /// [`Self::default`] until [`set_configured_manifest_budget`] runs.
@@ -149,8 +149,8 @@ impl V2ManifestBudget {
     }
 }
 
-/// Pin the process-wide manifest budget from the resolved memory-v2 config.
-pub fn set_configured_manifest_budget(budget: V2ManifestBudget) {
+/// Pin the process-wide manifest budget from the resolved memory config.
+pub fn set_configured_manifest_budget(budget: ManifestBudget) {
     if let Ok(mut guard) = CONFIGURED_MANIFEST_BUDGET.write() {
         *guard = Some(budget);
     }
@@ -159,31 +159,31 @@ pub fn set_configured_manifest_budget(budget: V2ManifestBudget) {
 /// Manifest entries discovered by one scan of a scope, renderable under
 /// several budgets without re-reading the files.
 #[derive(Debug, Clone)]
-pub struct V2ManifestSource {
+pub struct ManifestSource {
     entries: Vec<ManifestEntry>,
     discovered_topics: usize,
     discovered_observations: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct V2Manifest {
+pub struct MemoryManifest {
     pub content: String,
     pub discovered_entries: usize,
     pub included_entries: usize,
     pub is_truncated: bool,
 }
 
-/// Create one v2 scope without consulting any legacy path.
+/// Create one memory scope without consulting any legacy path.
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::Io`] when directories or the initial manifest
-/// cannot be created, and [`V2StorageError::Database`] when either SQLite
+/// Returns [`MemoryScopeError::Io`] when directories or the initial manifest
+/// cannot be created, and [`MemoryScopeError::Database`] when either SQLite
 /// database cannot be initialized.
 pub fn ensure_scope_initialized(
     storage_root: &Path,
     scope_dir: &Path,
-    scope: V2MemoryScope,
+    scope: MemoryScope,
 ) -> Result<()> {
     ensure_scope_initialized_with_journal_mode(storage_root, scope_dir, scope, None)
 }
@@ -191,60 +191,56 @@ pub fn ensure_scope_initialized(
 pub fn ensure_scope_initialized_with_journal_mode(
     storage_root: &Path,
     scope_dir: &Path,
-    scope: V2MemoryScope,
+    scope: MemoryScope,
     journal_mode: Option<JournalMode>,
 ) -> Result<()> {
     reject_symlink_components(storage_root, scope_dir)?;
     for relative in ["topics", "observations", "observations/_inbox", "archive"] {
         let path = scope_dir.join(relative);
-        reject_symlink(&path, "initialize symlinked v2 memory directory")?;
-        std::fs::create_dir_all(&path).map_err(|source| V2StorageError::Io {
-            operation: "create v2 memory directory",
+        reject_symlink(&path, "initialize symlinked memory directory")?;
+        std::fs::create_dir_all(&path).map_err(|source| MemoryScopeError::Io {
+            operation: "create memory directory",
             path,
             source,
         })?;
     }
-    ensure_canonical_descendant(
-        storage_root,
-        scope_dir,
-        "validate v2 memory scope containment",
-    )?;
+    ensure_canonical_descendant(storage_root, scope_dir, "validate memory scope containment")?;
 
     let state_path = scope_dir.join("memory_state.sqlite");
     let journal_mode = journal_mode.unwrap_or_else(|| JournalMode::for_db_path(&state_path));
     if journal_mode == JournalMode::Truncate || crate::sqlite_journal::is_network_fs(scope_dir) {
-        return Err(V2StorageError::UnsupportedNetworkFilesystem {
+        return Err(MemoryScopeError::UnsupportedNetworkFilesystem {
             path: scope_dir.to_path_buf(),
         });
     }
     reject_symlink_components(storage_root, scope_dir)?;
-    reject_symlink(&state_path, "initialize symlinked v2 state database")?;
+    reject_symlink(&state_path, "initialize symlinked memory state database")?;
     initialize_state_db(&state_path)?;
     let index_path = scope_dir.join("index.sqlite");
     reject_symlink_components(storage_root, scope_dir)?;
-    reject_symlink(&index_path, "initialize symlinked v2 lexical index")?;
+    reject_symlink(&index_path, "initialize symlinked memory lexical index")?;
     initialize_lexical_index(&index_path)?;
 
     let manifest_path = scope_dir.join("MEMORY.md");
     reject_symlink_components(storage_root, scope_dir)?;
-    reject_symlink(&manifest_path, "initialize symlinked v2 manifest")?;
-    regenerate_scope_manifest(scope_dir, scope, V2ManifestBudget::configured())?;
+    reject_symlink(&manifest_path, "initialize symlinked memory manifest")?;
+    regenerate_scope_manifest(scope_dir, scope, ManifestBudget::configured())?;
     Ok(())
 }
 
-/// Atomically publish one immutable observation into a v2 scope inbox.
+/// Atomically publish one immutable observation into a memory scope inbox.
 ///
 /// The caller must initialize the scope first. The next scope initialization
 /// regenerates `MEMORY.md`; direct browse sees the observation immediately.
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::ObservationTooLarge`] when `content` exceeds
-/// [`MAX_MANUAL_OBSERVATION_BYTES`], or [`V2StorageError::Io`] if the inbox is
+/// Returns [`MemoryScopeError::ObservationTooLarge`] when `content` exceeds
+/// [`MAX_MANUAL_OBSERVATION_BYTES`], or [`MemoryScopeError::Io`] if the inbox is
 /// missing or unsafe or the observation cannot be durably published.
 pub fn persist_observation(scope_dir: &Path, content: &str) -> Result<PathBuf> {
     if content.len() > MAX_MANUAL_OBSERVATION_BYTES {
-        return Err(V2StorageError::ObservationTooLarge {
+        return Err(MemoryScopeError::ObservationTooLarge {
             actual_bytes: content.len(),
             limit_bytes: MAX_MANUAL_OBSERVATION_BYTES,
         });
@@ -255,23 +251,23 @@ pub fn persist_observation(scope_dir: &Path, content: &str) -> Result<PathBuf> {
     ensure_canonical_descendant(
         scope_dir,
         &inbox,
-        "validate v2 observation inbox containment",
+        "validate memory observation inbox containment",
     )?;
 
     let mut temporary = tempfile::Builder::new()
         .prefix(".remember-")
         .suffix(".tmp")
         .tempfile_in(&inbox)
-        .map_err(|source| V2StorageError::Io {
-            operation: "create temporary v2 observation",
+        .map_err(|source| MemoryScopeError::Io {
+            operation: "create temporary memory observation",
             path: inbox.clone(),
             source,
         })?;
     temporary
         .write_all(content.as_bytes())
         .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|source| V2StorageError::Io {
-            operation: "write temporary v2 observation",
+        .map_err(|source| MemoryScopeError::Io {
+            operation: "write temporary memory observation",
             path: temporary.path().to_path_buf(),
             source,
         })?;
@@ -280,8 +276,8 @@ pub fn persist_observation(scope_dir: &Path, content: &str) -> Result<PathBuf> {
         .path()
         .file_stem()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| V2StorageError::Io {
-            operation: "derive v2 observation filename",
+        .ok_or_else(|| MemoryScopeError::Io {
+            operation: "derive memory observation filename",
             path: temporary.path().to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -291,8 +287,8 @@ pub fn persist_observation(scope_dir: &Path, content: &str) -> Result<PathBuf> {
     let observation_path = inbox.join(format!("{}.md", temporary_name.trim_start_matches('.')));
     temporary
         .persist_noclobber(&observation_path)
-        .map_err(|error| V2StorageError::Io {
-            operation: "publish v2 observation",
+        .map_err(|error| MemoryScopeError::Io {
+            operation: "publish memory observation",
             path: observation_path.clone(),
             source: error.error,
         })?;
@@ -302,26 +298,26 @@ pub fn persist_observation(scope_dir: &Path, content: &str) -> Result<PathBuf> {
 fn reject_symlink_components(storage_root: &Path, scope_dir: &Path) -> Result<()> {
     let relative = scope_dir
         .strip_prefix(storage_root)
-        .map_err(|_| V2StorageError::Io {
-            operation: "validate v2 memory scope root",
+        .map_err(|_| MemoryScopeError::Io {
+            operation: "validate memory scope root",
             path: scope_dir.to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "scope is outside the configured v2 storage root",
+                "scope is outside the configured memory storage root",
             ),
         })?;
-    reject_symlink(storage_root, "initialize symlinked v2 memory root")?;
+    reject_symlink(storage_root, "initialize symlinked memory root")?;
     let mut current = storage_root.to_path_buf();
     for component in relative.components() {
         current.push(component);
-        reject_symlink(&current, "initialize symlinked v2 memory path")?;
+        reject_symlink(&current, "initialize symlinked memory path")?;
     }
     Ok(())
 }
 
 fn reject_symlink(path: &Path, operation: &'static str) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(V2StorageError::Io {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(MemoryScopeError::Io {
             operation,
             path: path.to_path_buf(),
             source: std::io::Error::new(
@@ -331,8 +327,8 @@ fn reject_symlink(path: &Path, operation: &'static str) -> Result<()> {
         }),
         Ok(_) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(V2StorageError::Io {
-            operation: "inspect v2 memory path",
+        Err(source) => Err(MemoryScopeError::Io {
+            operation: "inspect memory path",
             path: path.to_path_buf(),
             source,
         }),
@@ -340,12 +336,12 @@ fn reject_symlink(path: &Path, operation: &'static str) -> Result<()> {
 }
 
 fn ensure_canonical_descendant(root: &Path, target: &Path, operation: &'static str) -> Result<()> {
-    let canonical_root = dunce::canonicalize(root).map_err(|source| V2StorageError::Io {
+    let canonical_root = dunce::canonicalize(root).map_err(|source| MemoryScopeError::Io {
         operation,
         path: root.to_path_buf(),
         source,
     })?;
-    let canonical_target = dunce::canonicalize(target).map_err(|source| V2StorageError::Io {
+    let canonical_target = dunce::canonicalize(target).map_err(|source| MemoryScopeError::Io {
         operation,
         path: target.to_path_buf(),
         source,
@@ -353,12 +349,12 @@ fn ensure_canonical_descendant(root: &Path, target: &Path, operation: &'static s
     if canonical_target.starts_with(&canonical_root) {
         Ok(())
     } else {
-        Err(V2StorageError::Io {
+        Err(MemoryScopeError::Io {
             operation,
             path: target.to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "path escapes the configured v2 storage root",
+                "path escapes the configured memory storage root",
             ),
         })
     }
@@ -368,13 +364,13 @@ fn ensure_canonical_descendant(root: &Path, target: &Path, operation: &'static s
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::Io`] if source files cannot be enumerated or the
+/// Returns [`MemoryScopeError::Io`] if source files cannot be enumerated or the
 /// replacement cannot be persisted.
 pub fn regenerate_scope_manifest(
     scope_dir: &Path,
-    scope: V2MemoryScope,
-    budget: V2ManifestBudget,
-) -> Result<V2Manifest> {
+    scope: MemoryScope,
+    budget: ManifestBudget,
+) -> Result<MemoryManifest> {
     let manifest = render_scope_manifest(scope_dir, scope, budget)?;
     persist_scope_manifest(scope_dir, &manifest)?;
     Ok(manifest)
@@ -384,14 +380,14 @@ pub(crate) fn bump_manifest_revision(scope_dir: &Path) -> Result<()> {
     let path = scope_dir.join("memory_state.sqlite");
     let mut connection = JournalMode::for_db_path(&path)
         .open(&path)
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: path.clone(),
             source,
         })?;
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: path.clone(),
             source,
@@ -399,7 +395,7 @@ pub(crate) fn bump_manifest_revision(scope_dir: &Path) -> Result<()> {
     bump_manifest_revision_in_transaction(scope_dir, &transaction)?;
     transaction
         .commit()
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path,
             source,
@@ -418,7 +414,7 @@ pub(crate) fn bump_manifest_revision_in_transaction(
             [],
         )
         .map(|_| ())
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: scope_dir.join("memory_state.sqlite"),
             source,
@@ -429,8 +425,8 @@ pub(crate) fn bump_manifest_revision_in_transaction(
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::Io`] if the replacement cannot be persisted.
-pub fn persist_scope_manifest(scope_dir: &Path, manifest: &V2Manifest) -> Result<()> {
+/// Returns [`MemoryScopeError::Io`] if the replacement cannot be persisted.
+pub fn persist_scope_manifest(scope_dir: &Path, manifest: &MemoryManifest) -> Result<()> {
     persist_replacing_file(&scope_dir.join("MEMORY.md"), manifest.content.as_bytes())
 }
 
@@ -438,12 +434,12 @@ pub fn persist_scope_manifest(scope_dir: &Path, manifest: &V2Manifest) -> Result
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::Io`] if a source directory cannot be enumerated.
+/// Returns [`MemoryScopeError::Io`] if a source directory cannot be enumerated.
 pub fn render_scope_manifest(
     scope_dir: &Path,
-    scope: V2MemoryScope,
-    budget: V2ManifestBudget,
-) -> Result<V2Manifest> {
+    scope: MemoryScope,
+    budget: ManifestBudget,
+) -> Result<MemoryManifest> {
     let source = collect_scope_manifest_source(scope_dir)?;
     Ok(render_manifest_from_source(
         &source, scope, scope_dir, budget,
@@ -454,9 +450,9 @@ pub fn render_scope_manifest(
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::Io`] if a source directory cannot be enumerated.
-pub fn collect_scope_manifest_source(scope_dir: &Path) -> Result<V2ManifestSource> {
-    reject_symlink(scope_dir, "render symlinked v2 memory scope")?;
+/// Returns [`MemoryScopeError::Io`] if a source directory cannot be enumerated.
+pub fn collect_scope_manifest_source(scope_dir: &Path) -> Result<ManifestSource> {
+    reject_symlink(scope_dir, "render symlinked memory scope")?;
     let (mut entries, discovered_topics, discovered_observations) =
         collect_entries(scope_dir, MAX_DESCRIPTION_BYTES)?;
     entries.sort_by(|left, right| {
@@ -468,7 +464,7 @@ pub fn collect_scope_manifest_source(scope_dir: &Path) -> Result<V2ManifestSourc
             ),
         })
     });
-    Ok(V2ManifestSource {
+    Ok(ManifestSource {
         entries,
         discovered_topics,
         discovered_observations,
@@ -477,12 +473,12 @@ pub fn collect_scope_manifest_source(scope_dir: &Path) -> Result<V2ManifestSourc
 
 /// Render a deterministic, bounded pointer index from an already scanned scope.
 pub fn render_manifest_from_source(
-    source: &V2ManifestSource,
-    scope: V2MemoryScope,
+    source: &ManifestSource,
+    scope: MemoryScope,
     scope_dir: &Path,
-    budget: V2ManifestBudget,
-) -> V2Manifest {
-    let budget = V2ManifestBudget {
+    budget: ManifestBudget,
+) -> MemoryManifest {
+    let budget = ManifestBudget {
         max_bytes: budget.max_bytes.min(MAX_MANIFEST_BYTES),
         max_entries: budget.max_entries.min(MAX_MANIFEST_ENTRIES),
         max_description_bytes: budget.max_description_bytes.min(MAX_DESCRIPTION_BYTES),
@@ -629,7 +625,7 @@ pub fn render_manifest_from_source(
 
     let was_entry_limited = discovered_entries > included_entries;
 
-    V2Manifest {
+    MemoryManifest {
         content,
         discovered_entries,
         included_entries,
@@ -637,7 +633,7 @@ pub fn render_manifest_from_source(
     }
 }
 
-fn manifest_header(scope: V2MemoryScope, scope_dir: &Path) -> String {
+fn manifest_header(scope: MemoryScope, scope_dir: &Path) -> String {
     format!(
         "# {}\n\n> Generated by CodeLeveler. Do not edit this file directly.\n> Paths are relative to `{}`.\n",
         scope.heading(),
@@ -692,24 +688,24 @@ fn collect_entries_from(
     relative_dir: &Path,
     kind: ManifestEntryKind,
     max_description_bytes: usize,
-    ledgers: &V2StateLedgers,
+    ledgers: &MemoryStateLedgers,
     entries: &mut Vec<ManifestEntry>,
 ) -> Result<usize> {
     let directory = scope_dir.join(relative_dir);
-    reject_symlink(&directory, "read symlinked v2 memory directory")?;
+    reject_symlink(&directory, "read symlinked memory directory")?;
     if directory.exists() {
         ensure_canonical_descendant(
             scope_dir,
             &directory,
-            "validate v2 manifest source containment",
+            "validate memory manifest source containment",
         )?;
     }
     let read_dir = match std::fs::read_dir(&directory) {
         Ok(read_dir) => read_dir,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(source) => {
-            return Err(V2StorageError::Io {
-                operation: "enumerate v2 memory files",
+            return Err(MemoryScopeError::Io {
+                operation: "enumerate memory files",
                 path: directory,
                 source,
             });
@@ -720,7 +716,7 @@ fn collect_entries_from(
     let mut candidates = Vec::new();
     for (entry_index, entry) in read_dir.enumerate() {
         if entry_index >= MAX_DIRECTORY_ENTRIES {
-            return Err(V2StorageError::TooManyEntries {
+            return Err(MemoryScopeError::TooManyEntries {
                 path: directory,
                 limit: MAX_DIRECTORY_ENTRIES,
             });
@@ -728,16 +724,16 @@ fn collect_entries_from(
         let entry = match entry {
             Ok(entry) => entry,
             Err(source) => {
-                return Err(V2StorageError::Io {
-                    operation: "read v2 memory directory entry",
+                return Err(MemoryScopeError::Io {
+                    operation: "read memory directory entry",
                     path: directory.clone(),
                     source,
                 });
             }
         };
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| V2StorageError::Io {
-            operation: "inspect v2 memory entry",
+        let file_type = entry.file_type().map_err(|source| MemoryScopeError::Io {
+            operation: "inspect memory entry",
             path: path.clone(),
             source,
         })?;
@@ -805,7 +801,7 @@ pub(crate) fn excluded_manifest_paths_with_journal_mode(
 
 /// Manifest-relevant state read from one scope's `memory_state.sqlite`.
 #[derive(Debug, Default)]
-pub(crate) struct V2StateLedgers {
+pub(crate) struct MemoryStateLedgers {
     /// Paths hidden from the manifest and browse: tombstones, record-only
     /// observations, quarantined files.
     pub(crate) excluded: BTreeSet<String>,
@@ -815,23 +811,23 @@ pub(crate) struct V2StateLedgers {
     pub(crate) read_counts: BTreeMap<String, u64>,
 }
 
-pub(crate) fn state_ledgers(scope_dir: &Path) -> Result<V2StateLedgers> {
+pub(crate) fn state_ledgers(scope_dir: &Path) -> Result<MemoryStateLedgers> {
     state_ledgers_with_journal_mode(scope_dir, None)
 }
 
 fn state_ledgers_with_journal_mode(
     scope_dir: &Path,
     journal_mode: Option<JournalMode>,
-) -> Result<V2StateLedgers> {
+) -> Result<MemoryStateLedgers> {
     let state_path = scope_dir.join("memory_state.sqlite");
     let journal_mode = journal_mode.unwrap_or_else(|| JournalMode::for_db_path(&state_path));
     match std::fs::symlink_metadata(journal_mode.effective_db_path(&state_path)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(V2StateLedgers::default());
+            return Ok(MemoryStateLedgers::default());
         }
         Err(source) => {
-            return Err(V2StorageError::Io {
-                operation: "inspect v2 state exclusion ledger",
+            return Err(MemoryScopeError::Io {
+                operation: "inspect memory state exclusion ledger",
                 path: state_path,
                 source,
             });
@@ -841,13 +837,13 @@ fn state_ledgers_with_journal_mode(
     let connection =
         journal_mode
             .open_readonly(&state_path)
-            .map_err(|source| V2StorageError::Database {
+            .map_err(|source| MemoryScopeError::Database {
                 database: "state",
                 path: state_path.clone(),
                 source,
             })?;
     let excluded = excluded_paths_from_state(&connection, scope_dir, &state_path)?;
-    let read_counts = match crate::v2_topic_reads::read_counts_from_state(&connection) {
+    let read_counts = match crate::topic_reads::read_counts_from_state(&connection) {
         Ok(counts) => counts,
         Err(error) => {
             tracing::warn!(
@@ -858,7 +854,7 @@ fn state_ledgers_with_journal_mode(
             BTreeMap::new()
         }
     };
-    Ok(V2StateLedgers {
+    Ok(MemoryStateLedgers {
         excluded,
         read_counts,
     })
@@ -884,7 +880,7 @@ fn excluded_paths_from_state(
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<BTreeSet<_>, _>>()
         })
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source,
@@ -895,13 +891,13 @@ fn excluded_paths_from_state(
             [],
             |row| row.get::<_, String>(0),
         )
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source,
         })?;
     if state_schema_version == "4" && exclusion_tables.len() != 3 {
-        return Err(V2StorageError::Database {
+        return Err(MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source: rusqlite::Error::InvalidQuery,
@@ -928,7 +924,7 @@ fn excluded_paths_from_state(
         let mut statement =
             connection
                 .prepare(query)
-                .map_err(|source| V2StorageError::Database {
+                .map_err(|source| MemoryScopeError::Database {
                     database: "state",
                     path: state_path.to_path_buf(),
                     source,
@@ -936,7 +932,7 @@ fn excluded_paths_from_state(
         let paths = statement
             .query_map([], |row| row.get::<_, String>(0))
             .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
-            .map_err(|source| V2StorageError::Database {
+            .map_err(|source| MemoryScopeError::Database {
                 database: "state",
                 path: state_path.to_path_buf(),
                 source,
@@ -959,7 +955,7 @@ fn excluded_paths_from_state(
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<BTreeSet<_>, _>>()
         })
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source,
@@ -972,7 +968,7 @@ fn excluded_paths_from_state(
         return Ok(excluded);
     }
     if capture_tables.len() != 3 {
-        return Err(V2StorageError::Database {
+        return Err(MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source: rusqlite::Error::InvalidQuery,
@@ -981,7 +977,7 @@ fn excluded_paths_from_state(
 
     let mut statement = connection
         .prepare(COMMITTED_UNARCHIVED_FILES_SQL)
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source,
@@ -991,13 +987,13 @@ fn excluded_paths_from_state(
         .query_map(params![-1i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source,
         })?;
     for row in committed {
-        let (relative, expected_hash) = row.map_err(|source| V2StorageError::Database {
+        let (relative, expected_hash) = row.map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: state_path.to_path_buf(),
             source,
@@ -1054,8 +1050,8 @@ pub(crate) fn is_durably_excluded_with_journal_mode(
     match std::fs::symlink_metadata(journal_mode.effective_db_path(&state_path)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
-            return Err(V2StorageError::Io {
-                operation: "inspect v2 state exclusion ledger",
+            return Err(MemoryScopeError::Io {
+                operation: "inspect memory state exclusion ledger",
                 path: state_path,
                 source,
             });
@@ -1065,7 +1061,7 @@ pub(crate) fn is_durably_excluded_with_journal_mode(
     let connection =
         journal_mode
             .open_readonly(&state_path)
-            .map_err(|source| V2StorageError::Database {
+            .map_err(|source| MemoryScopeError::Database {
                 database: "state",
                 path: state_path.clone(),
                 source,
@@ -1102,7 +1098,7 @@ pub(crate) fn is_durably_excluded_with_journal_mode(
                 params![table],
                 |row| row.get::<_, bool>(0),
             )
-            .map_err(|source| V2StorageError::Database {
+            .map_err(|source| MemoryScopeError::Database {
                 database: "state",
                 path: state_path.clone(),
                 source,
@@ -1110,7 +1106,7 @@ pub(crate) fn is_durably_excluded_with_journal_mode(
         if table_exists
             && connection
                 .query_row(query, params![relative_path], |row| row.get::<_, bool>(0))
-                .map_err(|source| V2StorageError::Database {
+                .map_err(|source| MemoryScopeError::Database {
                     database: "state",
                     path: state_path.clone(),
                     source,
@@ -1180,7 +1176,7 @@ fn sanitize_inline(value: &str) -> String {
 fn initialize_state_db(path: &Path) -> Result<()> {
     let connection = JournalMode::for_db_path(path)
         .open(path)
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: path.to_path_buf(),
             source,
@@ -1192,7 +1188,7 @@ fn initialize_state_db(path: &Path) -> Result<()> {
                 value TEXT NOT NULL
             );",
         )
-        .and_then(|()| connection.execute_batch(crate::v2_topic_reads::TOPIC_READS_TABLE_SQL))
+        .and_then(|()| connection.execute_batch(crate::topic_reads::TOPIC_READS_TABLE_SQL))
         .and_then(|()| {
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -1200,7 +1196,7 @@ fn initialize_state_db(path: &Path) -> Result<()> {
             )
         })
         .map(|_| ())
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "state",
             path: path.to_path_buf(),
             source,
@@ -1210,7 +1206,7 @@ fn initialize_state_db(path: &Path) -> Result<()> {
 fn initialize_lexical_index(path: &Path) -> Result<()> {
     let connection = JournalMode::for_db_path(path)
         .open(path)
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "lexical index",
             path: path.to_path_buf(),
             source,
@@ -1224,7 +1220,7 @@ fn initialize_lexical_index(path: &Path) -> Result<()> {
             )
         })
         .map(|_| ())
-        .map_err(|source| V2StorageError::Database {
+        .map_err(|source| MemoryScopeError::Database {
             database: "lexical index",
             path: path.to_path_buf(),
             source,
@@ -1232,40 +1228,40 @@ fn initialize_lexical_index(path: &Path) -> Result<()> {
 }
 
 fn persist_replacing_file(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| V2StorageError::Io {
-        operation: "resolve v2 manifest parent",
+    let parent = path.parent().ok_or_else(|| MemoryScopeError::Io {
+        operation: "resolve memory manifest parent",
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"),
     })?;
-    std::fs::create_dir_all(parent).map_err(|source| V2StorageError::Io {
-        operation: "create v2 manifest parent",
+    std::fs::create_dir_all(parent).map_err(|source| MemoryScopeError::Io {
+        operation: "create memory manifest parent",
         path: parent.to_path_buf(),
         source,
     })?;
     let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| V2StorageError::Io {
-            operation: "create temporary v2 manifest",
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| MemoryScopeError::Io {
+            operation: "create temporary memory manifest",
             path: path.to_path_buf(),
             source,
         })?;
     temporary
         .write_all(contents)
         .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|source| V2StorageError::Io {
-            operation: "write temporary v2 manifest",
+        .map_err(|source| MemoryScopeError::Io {
+            operation: "write temporary memory manifest",
             path: path.to_path_buf(),
             source,
         })?;
     temporary
         .persist(path)
         .map(|_| ())
-        .map_err(|error| V2StorageError::Io {
-            operation: "publish v2 manifest",
+        .map_err(|error| MemoryScopeError::Io {
+            operation: "publish memory manifest",
             path: path.to_path_buf(),
             source: error.error,
         })
 }
 
 #[cfg(test)]
-#[path = "v2_tests.rs"]
+#[path = "scope_tests.rs"]
 mod tests;

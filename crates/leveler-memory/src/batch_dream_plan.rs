@@ -467,12 +467,12 @@ impl BatchDreamSession {
             }
             PlanEdit::UpdateDescription { description, .. } => {
                 if description.trim().is_empty()
-                    || description.len() > crate::v2::MAX_DESCRIPTION_BYTES
+                    || description.len() > crate::scope::MAX_DESCRIPTION_BYTES
                     || description.contains(['\n', '\r'])
                 {
                     return Err(EditFailure::new(format!(
                         "description must be one line of 1..={} bytes",
-                        crate::v2::MAX_DESCRIPTION_BYTES
+                        crate::scope::MAX_DESCRIPTION_BYTES
                     )));
                 }
                 match description_range(&absolute, control)? {

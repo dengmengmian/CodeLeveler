@@ -9,7 +9,7 @@
 //!
 //! The job row, not this worker, is the source of truth. A crash at any point
 //! leaves either a pending job or an orphan file set that
-//! [`V2CaptureStore::reconcile`] repairs on the next claim, so restarting the
+//! [`CaptureStore::reconcile`] repairs on the next claim, so restarting the
 //! process never loses or duplicates a turn. Extraction failures never fail the
 //! user's turn: they are recorded on the job and surfaced as memory activity.
 
@@ -19,17 +19,20 @@ use std::time::Duration;
 use leveler_core::SessionId;
 use leveler_memory::capture_model::{
     CAPTURE_SYSTEM_PROMPT, CAPTURE_TOOL_NAME, extraction_schema, extraction_user_message,
-    missing_range, parse_model_outcome,
+    parse_model_outcome,
 };
 use leveler_memory::capture_transcript::{TranscriptBudget, condense_turn_transcript};
 use leveler_memory::{
-    CaptureOutcomeDraft, CaptureRange, ClaimRequest, V2CaptureStore, V2MemoryScope,
+    CaptureAdmission, CaptureOutcomeDraft, CapturePlanStep, CaptureRange, CaptureStore,
+    ClaimRequest, MemoryScope, plan_capture_admissions,
 };
 use leveler_model::{
     ContentPart, FinishReason, ModelRef, ModelRequest, ModelRuntime, Role, ToolChoice,
     ToolDefinition,
 };
-use leveler_storage::{Database, MessageRepository, TurnRecord, TurnRepository};
+use leveler_storage::{
+    Database, MemoryCaptureDisposition, MessageRepository, TurnRecord, TurnRepository,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{MemoryActivity, MemoryActivityKind, MemoryRuntime};
@@ -69,14 +72,12 @@ impl crate::Application {
     /// activity, because the user's work already succeeded.
     pub(crate) async fn memory_after_turn(&self, session_id: &SessionId, model: &ModelRef) {
         let runtime = self.memory.clone();
-        if !runtime.config_for(Some(session_id.as_str())).can_capture() {
-            return;
-        }
-        // A temporary working directory owns no durable workspace memory, so
-        // there is no scope to capture into.
-        if runtime.is_workspace_ephemeral() {
-            return;
-        }
+        // A temporary workspace and a paused or globally disabled session do
+        // not capture. The session row still records that decision so a later
+        // enable cannot backfill the turn. That write stays on the session
+        // database and does not create a memory store.
+        let capture_allowed = runtime.config_for(Some(session_id.as_str())).can_capture()
+            && !runtime.is_workspace_ephemeral();
         let db = match self.open_database().await {
             Ok(db) => db,
             Err(error) => {
@@ -84,6 +85,16 @@ impl crate::Application {
                 return;
             }
         };
+        if let Err(error) = runtime
+            .freeze_latest_capture_admission(&db, session_id, capture_allowed)
+            .await
+        {
+            tracing::warn!(%error, "memory capture could not record turn eligibility");
+            return;
+        }
+        if !capture_allowed {
+            return;
+        }
         match runtime.enqueue_missing(&db, session_id).await {
             Ok(_) => {}
             Err(error) => {
@@ -109,10 +120,55 @@ impl crate::Application {
 }
 
 impl MemoryRuntime {
-    /// Enqueue every eligible turn the persisted cursor has not requested.    ///
-    /// Idempotent: `requested_cursor` only moves forward, and a duplicate
-    /// range returns the same job row. This is also the crash-recovery entry
-    /// point — the next turn after a restart reconciles the whole gap.
+    /// Record capture eligibility for the latest settled user/chat turn.
+    ///
+    /// The first decision sticks. A turn that settled while this session was
+    /// paused, or while memory was globally off, stays ineligible after memory
+    /// comes back. Turns that finished before this process started are left
+    /// unmarked so they are not backfilled.
+    pub(crate) async fn freeze_latest_capture_admission(
+        &self,
+        db: &Database,
+        session_id: &SessionId,
+        capture_allowed: bool,
+    ) -> Result<(), String> {
+        let turns = TurnRepository::new(db)
+            .list(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(latest) = turns.iter().rev().find(|turn| is_capture_eligible(turn)) else {
+            return Ok(());
+        };
+        if !turn_finished_during_process(latest.finished_at.as_deref(), self.process_started) {
+            return Ok(());
+        }
+        let repo = TurnRepository::new(db);
+        if repo
+            .memory_capture_disposition(&latest.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let disposition = if capture_allowed {
+            MemoryCaptureDisposition::Eligible
+        } else {
+            MemoryCaptureDisposition::Ineligible
+        };
+        repo.admit_memory_capture(session_id, &latest.id, disposition, leveler_core::now())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Enqueue capture jobs for turns that were eligible when they settled.
+    ///
+    /// Paused and globally disabled turns advance the cursor as an explicit
+    /// skip, so they are not captured later and do not stall the turns that
+    /// follow. A settled turn with no persisted decision is not eligible:
+    /// historical sessions are not backfilled, and a lost decision does not
+    /// stall the cursor. Already queued jobs stay recoverable through the
+    /// claim lease.
     pub(crate) async fn enqueue_missing(
         &self,
         db: &Database,
@@ -126,42 +182,27 @@ impl MemoryRuntime {
             .list(session_id)
             .await
             .map_err(|error| error.to_string())?;
-        let settled = turns
-            .iter()
-            .filter(|turn| is_capture_eligible(turn))
-            .count();
-        let settled = u32::try_from(settled)
-            .ok()
-            .filter(|count| *count <= 999_999)
-            .ok_or_else(|| "session exceeds the durable capture turn limit".to_owned())?;
+        let dispositions = TurnRepository::new(db)
+            .memory_capture_dispositions(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut admissions = Vec::new();
+        for turn in turns.iter().filter(|turn| is_capture_eligible(turn)) {
+            // A missing row is not eligible. That covers turns from before
+            // this ledger and any turn whose decision was lost. The latest
+            // turn is admitted just before this plan, so a turn that settled
+            // while memory was on still has an eligible row.
+            let admission = match dispositions.get(&turn.id) {
+                Some(MemoryCaptureDisposition::Eligible) => CaptureAdmission::Eligible,
+                Some(MemoryCaptureDisposition::Ineligible) | None => CaptureAdmission::NotEligible,
+            };
+            admissions.push(admission);
+        }
+        let exposes = config.rollout.exposes_memory();
         let storage = self.storage.clone();
         let session_id = session_id.as_str().to_owned();
         tokio::task::spawn_blocking(move || {
-            storage
-                .ensure_initialized()
-                .map_err(|error| error.to_string())?;
-            let store = V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace)
-                .map_err(|error| error.to_string())?;
-            store
-                .ensure_session(&session_id)
-                .map_err(|error| error.to_string())?;
-            let cursors = store
-                .cursors(&session_id)
-                .map_err(|error| error.to_string())?;
-            let Some(range) =
-                missing_range(cursors.requested, settled).map_err(|error| error.to_string())?
-            else {
-                return Ok(None);
-            };
-            store
-                .enqueue_for_prompt_with_visibility(
-                    &session_id,
-                    range,
-                    range.through_turn().saturating_sub(1),
-                    config.rollout.exposes_memory(),
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(Some(range))
+            apply_capture_plan(&storage, &session_id, &admissions, exposes)
         })
         .await
         .map_err(|error| format!("memory capture enqueue task failed: {error}"))?
@@ -186,7 +227,12 @@ impl MemoryRuntime {
                 run_capture_worker(&runtime, &config, &db, &session_id, &model, cancel.clone())
                     .await;
             runtime.finish_capture_worker(&key);
-            if !cancel.is_cancelled() {
+            // A pause or global disable that landed while this job was in
+            // flight must not start another automatic model call. The job
+            // already claimed is allowed to finish; Dream waits until capture
+            // is allowed again.
+            if !cancel.is_cancelled() && runtime.config_for(Some(session_id.as_str())).can_capture()
+            {
                 runtime
                     .run_capture_followups(&config, &db, &session_id, &model, produced)
                     .await;
@@ -223,7 +269,7 @@ impl MemoryRuntime {
         let produced =
             run_capture_worker(self, config, db, session_id, model, cancel.clone()).await;
         self.finish_capture_worker(&key);
-        if !cancel.is_cancelled() {
+        if !cancel.is_cancelled() && self.config_for(Some(session_id.as_str())).can_capture() {
             self.run_capture_followups(config, db, session_id, model, produced)
                 .await;
         }
@@ -245,9 +291,9 @@ impl MemoryRuntime {
         if memory_config.can_expose_memory() {
             match self.promote_hidden_observations().await {
                 Ok(0) => {}
-                Ok(count) => tracing::info!(count, "memory-v2 promoted hidden observations"),
+                Ok(count) => tracing::info!(count, "memory promoted hidden observations"),
                 Err(error) => {
-                    tracing::warn!(%error, "memory-v2 observation promotion failed")
+                    tracing::warn!(%error, "memory observation promotion failed")
                 }
             }
         }
@@ -261,16 +307,16 @@ impl MemoryRuntime {
 
     /// Delete observations and job metadata past their retention windows.
     /// Failures are logged, never surfaced as a turn failure.
-    async fn run_maintenance(&self, config: leveler_memory::config::MemoryV2Config) {
+    async fn run_maintenance(&self, config: leveler_memory::config::MemoryConfig) {
         let storage = self.storage.clone();
         let retention = leveler_memory::RetentionPolicy {
             archived_observation_days: config.archived_retention_days,
             terminal_job_days: config.job_retention_days,
         };
         let result = tokio::task::spawn_blocking(move || {
-            let store = leveler_memory::V2MaintenanceStore::open(
+            let store = leveler_memory::MaintenanceStore::open(
                 storage.workspace_dir(),
-                V2MemoryScope::Workspace,
+                MemoryScope::Workspace,
                 storage.global_dir(),
                 storage.workspace_dir(),
             )
@@ -284,12 +330,12 @@ impl MemoryRuntime {
                     tracing::info!(
                         archived_observations = removed.archived_observations_removed,
                         terminal_jobs = removed.terminal_jobs_removed,
-                        "memory-v2 retention gc completed"
+                        "memory retention gc completed"
                     );
                 }
             }
-            Ok(Err(error)) => tracing::warn!(%error, "memory-v2 retention gc failed"),
-            Err(error) => tracing::warn!(%error, "memory-v2 retention gc task failed"),
+            Ok(Err(error)) => tracing::warn!(%error, "memory retention gc failed"),
+            Err(error) => tracing::warn!(%error, "memory retention gc task failed"),
         }
     }
 }
@@ -325,6 +371,68 @@ impl FlushOutcome {
     }
 }
 
+/// True when `finished_at` is at or after this process began.
+///
+/// A turn that finished earlier is historical. It keeps whatever eligibility
+/// row it already has, and a missing row is not backfilled.
+pub(crate) fn turn_finished_during_process(
+    finished_at: Option<&str>,
+    process_started: leveler_core::Timestamp,
+) -> bool {
+    let Some(finished_at) = finished_at else {
+        return false;
+    };
+    let Ok(finished) = chrono::DateTime::parse_from_rfc3339(finished_at) else {
+        return false;
+    };
+    finished.with_timezone(&chrono::Utc) >= process_started
+}
+
+fn apply_capture_plan(
+    storage: &leveler_memory::MemoryStorage,
+    session_id: &str,
+    admissions: &[CaptureAdmission],
+    exposes: bool,
+) -> Result<Option<CaptureRange>, String> {
+    storage
+        .ensure_initialized()
+        .map_err(|error| error.to_string())?;
+    let store = CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace)
+        .map_err(|error| error.to_string())?;
+    store
+        .ensure_session(session_id)
+        .map_err(|error| error.to_string())?;
+    let requested = store
+        .cursors(session_id)
+        .map_err(|error| error.to_string())?
+        .requested;
+    let steps =
+        plan_capture_admissions(requested, admissions).map_err(|error| error.to_string())?;
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    let mut enqueued = None;
+    for step in steps {
+        match step {
+            CapturePlanStep::Skip(range) => store
+                .record_skipped_range(session_id, range)
+                .map_err(|error| error.to_string())?,
+            CapturePlanStep::Enqueue(range) => {
+                store
+                    .enqueue_for_prompt_with_visibility(
+                        session_id,
+                        range,
+                        range.through_turn().saturating_sub(1),
+                        exposes,
+                    )
+                    .map_err(|error| error.to_string())?;
+                enqueued = Some(range);
+            }
+        }
+    }
+    Ok(enqueued)
+}
+
 /// Drain this session's claimable capture jobs. Returns whether any committed
 /// outcome contained observations (the only condition that can make Dream
 /// eligible).
@@ -348,14 +456,14 @@ async fn run_capture_worker(
             storage
                 .ensure_initialized()
                 .map_err(|error| error.to_string())?;
-            V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace)
+            CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace)
                 .map_err(|error| error.to_string())
         })
         .await
         {
             Ok(Ok(store)) => store,
             Ok(Err(error)) => {
-                tracing::warn!(%error, "memory-v2 capture store unavailable");
+                tracing::warn!(%error, "memory capture store unavailable");
                 runtime.record_activity(
                     &scope,
                     MemoryActivity {
@@ -367,7 +475,7 @@ async fn run_capture_worker(
                 return false;
             }
             Err(error) => {
-                tracing::warn!(%error, "memory-v2 capture store task failed");
+                tracing::warn!(%error, "memory capture store task failed");
                 return false;
             }
         }
@@ -400,11 +508,11 @@ async fn run_capture_worker(
             Ok(Ok(Some(lease))) => lease,
             Ok(Ok(None)) => break,
             Ok(Err(error)) => {
-                tracing::warn!(%error, "memory-v2 capture claim failed");
+                tracing::warn!(%error, "memory capture claim failed");
                 break;
             }
             Err(error) => {
-                tracing::warn!(%error, "memory-v2 capture claim task failed");
+                tracing::warn!(%error, "memory capture claim task failed");
                 break;
             }
         };
@@ -452,11 +560,11 @@ async fn run_capture_worker(
                             from_turn = range.start_turn(),
                             through_turn = range.through_turn(),
                             observations,
-                            "memory-v2 capture committed"
+                            "memory capture committed"
                         );
                     }
                     Ok(Err(error)) => {
-                        tracing::warn!(%error, "memory-v2 capture commit failed");
+                        tracing::warn!(%error, "memory capture commit failed");
                         fail_lease(&store, &lease, &error.to_string(), false).await;
                         runtime.record_activity(
                             &scope,
@@ -469,7 +577,7 @@ async fn run_capture_worker(
                         );
                     }
                     Err(error) => {
-                        let detail = format!("memory-v2 capture commit task failed: {error}");
+                        let detail = format!("memory capture commit task failed: {error}");
                         tracing::warn!(%detail);
                         fail_lease(&store, &lease, &detail, false).await;
                     }
@@ -481,7 +589,7 @@ async fn run_capture_worker(
                     through_turn = range.through_turn(),
                     attempt = lease.job.attempt,
                     %failure.detail,
-                    "memory-v2 capture extraction failed"
+                    "memory capture extraction failed"
                 );
                 fail_lease(&store, &lease, &failure.detail, failure.terminal).await;
                 runtime.record_activity(
@@ -533,6 +641,13 @@ async fn extract_range(
             detail: format!("could not list durable turns: {error}"),
             terminal: false,
         })?;
+    let dispositions = TurnRepository::new(db)
+        .memory_capture_dispositions(session_id)
+        .await
+        .map_err(|error| ExtractionFailure {
+            detail: format!("could not read capture eligibility: {error}"),
+            terminal: false,
+        })?;
     let eligible: Vec<_> = turns.into_iter().filter(is_capture_eligible).collect();
     let from = usize::try_from(job.range.start_turn().saturating_sub(1)).unwrap_or(usize::MAX);
     let through = usize::try_from(job.range.through_turn()).unwrap_or(usize::MAX);
@@ -542,6 +657,20 @@ async fn extract_range(
             terminal: true,
         });
     };
+    // A job must not hand a paused or disabled turn to the extraction model,
+    // even if an older range index still names it.
+    let selected: Vec<_> = selected
+        .iter()
+        .filter(|turn| {
+            !matches!(
+                dispositions.get(&turn.id),
+                Some(MemoryCaptureDisposition::Ineligible)
+            )
+        })
+        .collect();
+    if selected.is_empty() {
+        return Ok(CaptureOutcomeDraft::Noop);
+    }
     let mut payloads = Vec::new();
     for turn in selected {
         let messages = MessageRepository::new(db)
@@ -666,7 +795,7 @@ async fn extract_range(
 /// Release a claim. The attempt bound is enforced here so no job can retry
 /// forever without an operator.
 async fn fail_lease(
-    store: &V2CaptureStore,
+    store: &CaptureStore,
     lease: &leveler_memory::CaptureLease,
     detail: &str,
     terminal: bool,
@@ -686,7 +815,37 @@ async fn fail_lease(
     .await;
     match released {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "memory-v2 capture lease release failed"),
-        Err(error) => tracing::warn!(%error, "memory-v2 capture lease release task failed"),
+        Ok(Err(error)) => tracing::warn!(%error, "memory capture lease release failed"),
+        Err(error) => tracing::warn!(%error, "memory capture lease release task failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_finished_during_process;
+
+    fn at(rfc3339: &str) -> leveler_core::Timestamp {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn only_a_turn_that_finished_in_this_process_can_be_admitted() {
+        let started = at("2026-11-13T12:00:00Z");
+        assert!(!turn_finished_during_process(None, started));
+        assert!(!turn_finished_during_process(Some("not-a-time"), started));
+        assert!(!turn_finished_during_process(
+            Some("2026-11-13T11:59:59Z"),
+            started
+        ));
+        assert!(turn_finished_during_process(
+            Some("2026-11-13T12:00:00Z"),
+            started
+        ));
+        assert!(turn_finished_during_process(
+            Some("2026-11-13T12:00:01Z"),
+            started
+        ));
     }
 }

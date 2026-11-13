@@ -30,7 +30,7 @@ pub(crate) fn hash_file(path: &Path, control: &BatchDreamControl) -> Result<Stri
 
 /// Hash for content already in memory; matches `hash_file` for the same bytes.
 pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
-    crate::v2::content_hash(bytes)
+    crate::scope::content_hash(bytes)
 }
 
 pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {

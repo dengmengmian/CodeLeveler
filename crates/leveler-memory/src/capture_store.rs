@@ -1,4 +1,4 @@
-//! Durable capture queue and immutable observation persistence for memory v2.
+//! Durable capture queue and immutable observation persistence for memory.
 //!
 //! The state database is the cross-process serialization point. Observation
 //! files are published before their outcome row, so a crash can leave orphan
@@ -15,11 +15,11 @@ use std::time::Duration;
 use crate::sqlite_journal::{JournalMode, is_network_fs};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
-use crate::storage::MemoryStorage;
-use crate::v2::{
-    V2ManifestBudget, V2MemoryScope, content_hash, persist_scope_manifest, render_scope_manifest,
+use crate::scope::{
+    ManifestBudget, MemoryScope, content_hash, persist_scope_manifest, render_scope_manifest,
 };
-use crate::{SharedV2Clock, system_v2_clock};
+use crate::storage::MemoryStorage;
+use crate::{SharedMemoryClock, system_memory_clock};
 
 const STATE_SCHEMA_VERSION: &str = "4";
 const MAX_SESSION_BYTES: usize = 256;
@@ -40,10 +40,10 @@ const MAX_INBOX_ENTRIES: usize = 4_096;
 const MAX_COMMITTED_OBSERVATION_ROWS: usize = 4_096;
 const MAX_REINDEX_ATTEMPTS: usize = 3;
 
-pub type Result<T> = std::result::Result<T, V2CaptureError>;
+pub type Result<T> = std::result::Result<T, CaptureError>;
 
 #[derive(Debug, thiserror::Error)]
-pub enum V2CaptureError {
+pub enum CaptureError {
     #[error("invalid capture input: {0}")]
     Invalid(String),
     #[error("capture conflict: {0}")]
@@ -71,9 +71,9 @@ pub enum V2CaptureError {
         source: rusqlite::Error,
     },
     #[error("capture manifest convergence failed")]
-    Manifest(#[source] crate::v2::V2StorageError),
+    Manifest(#[source] crate::scope::MemoryScopeError),
     #[error("capture hardening schema convergence failed")]
-    Maintenance(#[source] crate::v2_maintenance::V2MaintenanceError),
+    Maintenance(#[source] crate::maintenance::MaintenanceError),
     #[error("capture recovery directory {path} exceeds the {limit}-entry safety limit")]
     RecoveryDirectoryLimit { path: PathBuf, limit: usize },
     #[error("capture recovery query for {rows} exceeds the {limit}-row safety limit")]
@@ -89,12 +89,12 @@ pub struct CaptureRange {
 impl CaptureRange {
     pub fn try_new(from_turn: u32, through_turn: u32) -> Result<Self> {
         if from_turn > through_turn {
-            return Err(V2CaptureError::Invalid(
+            return Err(CaptureError::Invalid(
                 "capture range starts after it ends".to_owned(),
             ));
         }
         if through_turn > 999_999 {
-            return Err(V2CaptureError::Invalid(
+            return Err(CaptureError::Invalid(
                 "capture turn exceeds the six-digit durable path limit".to_owned(),
             ));
         }
@@ -128,7 +128,7 @@ impl ObservationType {
             "feedback" => Ok(Self::Feedback),
             "project" => Ok(Self::Project),
             "reference" => Ok(Self::Reference),
-            _ => Err(V2CaptureError::Invalid(format!(
+            _ => Err(CaptureError::Invalid(format!(
                 "unknown observation type {value:?}"
             ))),
         }
@@ -173,7 +173,7 @@ impl ObservationDraft {
             MAX_PROMPT_VERSION_BYTES,
         )?;
         if !(0..=253_402_300_799).contains(&self.created_at) {
-            return Err(V2CaptureError::Invalid(
+            return Err(CaptureError::Invalid(
                 "created timestamp is outside the supported range".to_owned(),
             ));
         }
@@ -187,7 +187,7 @@ impl ObservationDraft {
                     character.is_control() && !matches!(character, '\n' | '\r' | '\t')
                 }))
         {
-            return Err(V2CaptureError::Invalid(format!(
+            return Err(CaptureError::Invalid(format!(
                 "observation body must contain 1..={MAX_BODY_BYTES} safe bytes"
             )));
         }
@@ -249,23 +249,23 @@ pub struct CommitResult {
 }
 
 #[derive(Clone)]
-pub struct V2CaptureStore {
+pub struct CaptureStore {
     scope_dir: PathBuf,
-    scope: V2MemoryScope,
+    scope: MemoryScope,
     state_path: PathBuf,
-    clock: SharedV2Clock,
+    clock: SharedMemoryClock,
 }
 
-impl V2CaptureStore {
-    /// Open and additively migrate one initialized v2 scope.
-    pub fn open(scope_dir: impl AsRef<Path>, scope: V2MemoryScope) -> Result<Self> {
-        Self::open_with_clock(scope_dir, scope, system_v2_clock())
+impl CaptureStore {
+    /// Open and additively migrate one initialized memory scope.
+    pub fn open(scope_dir: impl AsRef<Path>, scope: MemoryScope) -> Result<Self> {
+        Self::open_with_clock(scope_dir, scope, system_memory_clock())
     }
 
     pub fn open_with_clock(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
-        clock: SharedV2Clock,
+        scope: MemoryScope,
+        clock: SharedMemoryClock,
     ) -> Result<Self> {
         Self::open_with_clock_and_journal_mode(scope_dir, scope, clock, None)
     }
@@ -273,16 +273,21 @@ impl V2CaptureStore {
     #[cfg(test)]
     fn open_with_journal_mode(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
+        scope: MemoryScope,
         journal_mode: Option<JournalMode>,
     ) -> Result<Self> {
-        Self::open_with_clock_and_journal_mode(scope_dir, scope, system_v2_clock(), journal_mode)
+        Self::open_with_clock_and_journal_mode(
+            scope_dir,
+            scope,
+            system_memory_clock(),
+            journal_mode,
+        )
     }
 
     fn open_with_clock_and_journal_mode(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
-        clock: SharedV2Clock,
+        scope: MemoryScope,
+        clock: SharedMemoryClock,
         journal_mode: Option<JournalMode>,
     ) -> Result<Self> {
         let scope_dir = scope_dir.as_ref().to_path_buf();
@@ -352,9 +357,9 @@ impl V2CaptureStore {
             .optional()?
             .unwrap_or((None, None));
         let has_active_lease =
-            crate::v2_consolidation::lease_is_active(lease_owner.as_deref(), lease_expires_at, now);
+            crate::consolidation::lease_is_active(lease_owner.as_deref(), lease_expires_at, now);
         if has_active_lease {
-            return Err(V2CaptureError::Conflict(
+            return Err(CaptureError::Conflict(
                 "cannot promote observations while a Dream lease is active".to_owned(),
             ));
         }
@@ -418,7 +423,7 @@ impl V2CaptureStore {
     ) -> Result<CaptureJob> {
         let safe_session = safe_session_name(session_id)?;
         if source_prompt_index > 999_999 {
-            return Err(V2CaptureError::Invalid(
+            return Err(CaptureError::Invalid(
                 "capture source prompt exceeds the six-digit durable limit".to_owned(),
             ));
         }
@@ -455,12 +460,50 @@ impl V2CaptureStore {
         )?;
         let job = read_job(&transaction, &job_id)?;
         if job.source_prompt_index != source_prompt_index {
-            return Err(V2CaptureError::Conflict(
+            return Err(CaptureError::Conflict(
                 "capture range is already tied to a different source prompt".to_owned(),
             ));
         }
         transaction.commit()?;
         Ok(job)
+    }
+
+    /// Acknowledge a turn range that must not be captured.
+    ///
+    /// The requested cursor moves past the range, and the captured cursor walks
+    /// through it once the preceding jobs are terminal. No capture job and no
+    /// model call are created. A range that overlaps an existing job is
+    /// refused: that job, not this skip, owns those turns.
+    pub fn record_skipped_range(&self, session_id: &str, range: CaptureRange) -> Result<()> {
+        self.ensure_session(session_id)?;
+        let mut connection = self.open_state()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let overlap = transaction.query_row(
+            "SELECT COUNT(*) FROM capture_jobs
+             WHERE session_id = ?1 AND from_turn <= ?3 AND through_turn >= ?2",
+            params![session_id, range.start_turn(), range.through_turn()],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if overlap > 0 {
+            return Err(CaptureError::Conflict(
+                "capture skip overlaps a job that already owns those turns".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO capture_skipped_ranges(session_id, from_turn, through_turn)
+             VALUES (?1, ?2, ?3)",
+            params![session_id, range.start_turn(), range.through_turn()],
+        )?;
+        transaction.execute(
+            "UPDATE capture_sessions
+             SET requested_cursor = MAX(requested_cursor, ?2)
+             WHERE session_id = ?1",
+            params![session_id, range.through_turn()],
+        )?;
+        advance_captured_cursor(&transaction, session_id)?;
+        transaction.commit()?;
+        self.reconcile()?;
+        Ok(())
     }
 
     /// Claim pending/failed work, reclaiming an expired running lease.
@@ -491,16 +534,16 @@ impl V2CaptureStore {
         validate_text("lease owner", &request.owner, 1, MAX_OWNER_BYTES)?;
         validate_runtime_timestamp(request.now)?;
         let lease_seconds = i64::try_from(request.duration.as_secs())
-            .map_err(|_| V2CaptureError::Invalid("lease duration is too large".to_owned()))?;
+            .map_err(|_| CaptureError::Invalid("lease duration is too large".to_owned()))?;
         if lease_seconds == 0 {
-            return Err(V2CaptureError::Invalid(
+            return Err(CaptureError::Invalid(
                 "lease duration must be at least one second".to_owned(),
             ));
         }
         let expires_at = request
             .now
             .checked_add(lease_seconds)
-            .ok_or_else(|| V2CaptureError::Invalid("lease expiry overflows".to_owned()))?;
+            .ok_or_else(|| CaptureError::Invalid("lease expiry overflows".to_owned()))?;
         let mut connection = self.open_state()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job_id = match session_id {
@@ -589,7 +632,7 @@ impl V2CaptureStore {
             .optional()?
         {
             if existing_hash != prepared.hash {
-                return Err(V2CaptureError::Conflict(
+                return Err(CaptureError::Conflict(
                     "job was already committed with a different outcome".to_owned(),
                 ));
             }
@@ -619,7 +662,7 @@ impl V2CaptureStore {
                 |row| row.get::<_, bool>(0),
             )?;
             if excluded {
-                return Err(V2CaptureError::Conflict(format!(
+                return Err(CaptureError::Conflict(format!(
                     "capture destination {} is durably excluded",
                     file.path.display()
                 )));
@@ -712,7 +755,7 @@ impl V2CaptureStore {
             ],
         )?;
         if updated != 1 {
-            return Err(V2CaptureError::StaleLease);
+            return Err(CaptureError::StaleLease);
         }
         transaction.commit()?;
         Ok(())
@@ -779,7 +822,7 @@ impl V2CaptureStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         if rows.len() > MAX_COMMITTED_OBSERVATION_ROWS {
-            return Err(V2CaptureError::RecoveryRowLimit {
+            return Err(CaptureError::RecoveryRowLimit {
                 rows: "committed observation files",
                 limit: MAX_COMMITTED_OBSERVATION_ROWS,
             });
@@ -820,7 +863,7 @@ impl V2CaptureStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         if cursors.len() > MAX_RECOVERY_JOBS {
-            return Err(V2CaptureError::RecoveryRowLimit {
+            return Err(CaptureError::RecoveryRowLimit {
                 rows: "capture sessions pending indexing",
                 limit: MAX_RECOVERY_JOBS,
             });
@@ -831,8 +874,8 @@ impl V2CaptureStore {
         before_index()?;
         self.converge_committed_rows(&rows, now)?;
         let manifest =
-            render_scope_manifest(&self.scope_dir, self.scope, V2ManifestBudget::configured())
-                .map_err(V2CaptureError::Manifest)?;
+            render_scope_manifest(&self.scope_dir, self.scope, ManifestBudget::configured())
+                .map_err(CaptureError::Manifest)?;
         before_manifest_publish()?;
 
         let mut connection = self.open_state()?;
@@ -844,7 +887,7 @@ impl V2CaptureStore {
             transaction.commit()?;
             return Ok(());
         }
-        persist_scope_manifest(&self.scope_dir, &manifest).map_err(V2CaptureError::Manifest)?;
+        persist_scope_manifest(&self.scope_dir, &manifest).map_err(CaptureError::Manifest)?;
         for (session_id, captured_cursor) in cursors {
             transaction.execute(
                 "UPDATE capture_sessions
@@ -875,13 +918,13 @@ impl V2CaptureStore {
                 crate::config::MemoryIndexConfig::default(),
                 1,
             )
-            .map_err(|source| V2CaptureError::Index {
+            .map_err(|source| CaptureError::Index {
                 path: index_path.clone(),
                 source,
             })?;
             let source = match self.scope {
-                V2MemoryScope::Global => "global",
-                V2MemoryScope::Workspace => "workspace",
+                MemoryScope::Global => "global",
+                MemoryScope::Workspace => "workspace",
             };
             for row in rows {
                 let path = self.scope_dir.join(&row.path);
@@ -896,17 +939,17 @@ impl V2CaptureStore {
                                     "committed observation is not UTF-8; \
                                      dropping it from the lexical index"
                                 );
-                                index.delete_path(&path).map_err(|source| {
-                                    V2CaptureError::Index {
+                                index
+                                    .delete_path(&path)
+                                    .map_err(|source| CaptureError::Index {
                                         path: path.clone(),
                                         source,
-                                    }
-                                })?;
+                                    })?;
                                 continue;
                             }
                         };
                         reindex_content_with_retry(&mut index, &path, source, content).map_err(
-                            |source| V2CaptureError::Index {
+                            |source| CaptureError::Index {
                                 path: path.clone(),
                                 source,
                             },
@@ -916,16 +959,16 @@ impl V2CaptureStore {
                         tracing::warn!(
                             path = %path.display(),
                             "committed observation no longer matches its recorded hash; \
-                             quarantining it from memory-v2 reads"
+                             quarantining it from memory reads"
                         );
                         index
                             .delete_path(&path)
-                            .map_err(|source| V2CaptureError::Index {
+                            .map_err(|source| CaptureError::Index {
                                 path: path.clone(),
                                 source,
                             })?;
                     }
-                    Err(V2CaptureError::Io { source, .. })
+                    Err(CaptureError::Io { source, .. })
                         if source.kind() == std::io::ErrorKind::NotFound =>
                     {
                         tracing::warn!(
@@ -935,7 +978,7 @@ impl V2CaptureStore {
                         self.quarantine_unreadable_committed_row(row, now)?;
                         index
                             .delete_path(&path)
-                            .map_err(|source| V2CaptureError::Index {
+                            .map_err(|source| CaptureError::Index {
                                 path: path.clone(),
                                 source,
                             })?;
@@ -950,7 +993,7 @@ impl V2CaptureStore {
                         self.quarantine_unreadable_committed_row(row, now)?;
                         index
                             .delete_path(&path)
-                            .map_err(|source| V2CaptureError::Index {
+                            .map_err(|source| CaptureError::Index {
                                 path: path.clone(),
                                 source,
                             })?;
@@ -1002,7 +1045,7 @@ impl V2CaptureStore {
                 },
             )
             .optional()?
-            .ok_or_else(|| V2CaptureError::Invalid("unknown capture session".to_owned()))
+            .ok_or_else(|| CaptureError::Invalid("unknown capture session".to_owned()))
     }
 
     /// Content-free job state through a frozen target cursor.
@@ -1091,6 +1134,13 @@ impl V2CaptureStore {
             );
             CREATE TABLE IF NOT EXISTS memory_v2_terminal_capture_failures (
                 job_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS capture_skipped_ranges (
+                session_id TEXT NOT NULL REFERENCES capture_sessions(session_id),
+                from_turn INTEGER NOT NULL,
+                through_turn INTEGER NOT NULL,
+                PRIMARY KEY(session_id, from_turn),
+                CHECK(from_turn >= 1 AND through_turn >= from_turn)
             );",
         )?;
         let has_source_prompt_index = {
@@ -1112,8 +1162,7 @@ impl V2CaptureStore {
                 [],
             )?;
         }
-        crate::v2_maintenance::migrate_v2_hardening(&transaction)
-            .map_err(V2CaptureError::Maintenance)?;
+        crate::maintenance::migrate_hardening(&transaction).map_err(CaptureError::Maintenance)?;
         transaction.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('capture_revision', '0')",
             [],
@@ -1133,7 +1182,7 @@ impl V2CaptureStore {
         ensure_shared_coordination(&self.scope_dir, journal_mode)?;
         journal_mode
             .open(&self.state_path)
-            .map_err(V2CaptureError::Database)
+            .map_err(CaptureError::Database)
     }
 
     fn prepare_outcome(
@@ -1146,7 +1195,7 @@ impl V2CaptureStore {
             CaptureOutcomeDraft::Noop => Vec::new(),
             CaptureOutcomeDraft::Observations(observations) => {
                 if observations.is_empty() || observations.len() > MAX_OBSERVATIONS {
-                    return Err(V2CaptureError::Invalid(format!(
+                    return Err(CaptureError::Invalid(format!(
                         "observations must contain 1..={MAX_OBSERVATIONS} entries"
                     )));
                 }
@@ -1177,6 +1226,7 @@ impl V2CaptureStore {
         } else {
             "observations"
         };
+        // `v2:` is the durable outcome-hash domain. Existing commits use it.
         let mut hash_input = format!("v2:{kind}:{}", job.job_id);
         for (ordinal, file) in files.iter().enumerate() {
             hash_input.push_str(&format!(
@@ -1231,7 +1281,7 @@ impl V2CaptureStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(jobs_statement);
         if jobs.len() > MAX_RECOVERY_JOBS {
-            return Err(V2CaptureError::RecoveryRowLimit {
+            return Err(CaptureError::RecoveryRowLimit {
                 rows: "uncommitted capture jobs",
                 limit: MAX_RECOVERY_JOBS,
             });
@@ -1482,7 +1532,7 @@ fn reindex_content_with_retry(
 
 fn ensure_shared_coordination(scope_dir: &Path, journal_mode: JournalMode) -> Result<()> {
     if is_network_fs(scope_dir) || journal_mode == JournalMode::Truncate {
-        return Err(V2CaptureError::UnsupportedNetworkFilesystem {
+        return Err(CaptureError::UnsupportedNetworkFilesystem {
             path: scope_dir.to_path_buf(),
         });
     }
@@ -1502,7 +1552,7 @@ fn pinned_safe_session(connection: &Connection, session_id: &str) -> Result<Stri
         )
         .optional()?
         .ok_or_else(|| {
-            V2CaptureError::Invalid(format!("capture session {session_id} is not registered"))
+            CaptureError::Invalid(format!("capture session {session_id} is not registered"))
         })
 }
 
@@ -1549,6 +1599,7 @@ fn is_canonical_uuid(value: &str) -> bool {
 }
 
 fn deterministic_job_id(session_id: &str, range: CaptureRange) -> String {
+    // `capture-v2` is the durable job-id domain. Existing rows use it.
     let input = format!(
         "capture-v2\0{session_id}\0{}\0{}",
         range.from_turn, range.through_turn
@@ -1558,12 +1609,12 @@ fn deterministic_job_id(session_id: &str, range: CaptureRange) -> String {
 
 fn validate_text(name: &str, value: &str, min: usize, max: usize) -> Result<()> {
     if value.len() < min || value.len() > max {
-        return Err(V2CaptureError::Invalid(format!(
+        return Err(CaptureError::Invalid(format!(
             "{name} must contain {min}..={max} bytes"
         )));
     }
     if value.chars().any(char::is_control) {
-        return Err(V2CaptureError::Invalid(format!(
+        return Err(CaptureError::Invalid(format!(
             "{name} contains control characters"
         )));
     }
@@ -1572,7 +1623,7 @@ fn validate_text(name: &str, value: &str, min: usize, max: usize) -> Result<()> 
 
 fn validate_runtime_timestamp(value: i64) -> Result<()> {
     if value < 0 {
-        Err(V2CaptureError::Invalid(
+        Err(CaptureError::Invalid(
             "capture timestamp cannot be negative".to_owned(),
         ))
     } else {
@@ -1609,7 +1660,7 @@ fn sanitize_failure(error: &str) -> String {
 
 fn validate_terms(name: &str, values: &[String], max_count: usize) -> Result<()> {
     if values.len() > max_count {
-        return Err(V2CaptureError::Invalid(format!(
+        return Err(CaptureError::Invalid(format!(
             "{name} exceeds the {max_count}-entry limit"
         )));
     }
@@ -1627,7 +1678,7 @@ fn render_observation(
 ) -> Result<String> {
     let json = |value: &str| {
         serde_json::to_string(value)
-            .map_err(|error| V2CaptureError::Invalid(format!("cannot encode observation: {error}")))
+            .map_err(|error| CaptureError::Invalid(format!("cannot encode observation: {error}")))
     };
     let topic = observation
         .topic_hint
@@ -1636,9 +1687,9 @@ fn render_observation(
         .transpose()?
         .unwrap_or_else(|| "null".to_owned());
     let keywords = serde_json::to_string(&observation.keywords)
-        .map_err(|error| V2CaptureError::Invalid(error.to_string()))?;
+        .map_err(|error| CaptureError::Invalid(error.to_string()))?;
     let aliases = serde_json::to_string(&observation.aliases)
-        .map_err(|error| V2CaptureError::Invalid(error.to_string()))?;
+        .map_err(|error| CaptureError::Invalid(error.to_string()))?;
     let mut rendered = format!(
         "---\nschema_version: 2\ntype: {}\ntopic_hint: {topic}\nkeywords: {keywords}\n\
          aliases: {aliases}\nsession_id: {}\nfrom_turn: {}\nthrough_turn: {}\n\
@@ -1681,7 +1732,7 @@ fn read_job(connection: &rusqlite::Connection, job_id: &str) -> Result<CaptureJo
                 })
             },
         )
-        .map_err(V2CaptureError::Database)
+        .map_err(CaptureError::Database)
 }
 
 fn validate_lease(
@@ -1708,7 +1759,7 @@ fn validate_lease(
     if matches == 1 {
         Ok(())
     } else {
-        Err(V2CaptureError::StaleLease)
+        Err(CaptureError::StaleLease)
     }
 }
 
@@ -1773,7 +1824,7 @@ fn persist_outcome(
 fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(|path| path.replace('\\', "/"))
-        .ok_or_else(|| V2CaptureError::Invalid("path is not valid UTF-8".to_owned()))
+        .ok_or_else(|| CaptureError::Invalid("path is not valid UTF-8".to_owned()))
 }
 
 fn read_capture_revision(connection: &rusqlite::Connection) -> Result<i64> {
@@ -1783,7 +1834,7 @@ fn read_capture_revision(connection: &rusqlite::Connection) -> Result<i64> {
         |row| row.get::<_, i64>(0),
     )?;
     if revision < 0 {
-        return Err(V2CaptureError::Conflict(
+        return Err(CaptureError::Conflict(
             "capture revision cannot be negative".to_owned(),
         ));
     }
@@ -1802,13 +1853,18 @@ fn advance_captured_cursor(
     loop {
         let next = transaction
             .query_row(
-                "SELECT MAX(through_turn) FROM capture_jobs
-                 WHERE session_id = ?1 AND from_turn <= ?2 AND (
-                    status = 'completed'
-                    OR (status = 'failed' AND EXISTS (
-                        SELECT 1 FROM memory_v2_terminal_capture_failures t
-                        WHERE t.job_id = capture_jobs.job_id
-                    ))
+                "SELECT MAX(through_turn) FROM (
+                    SELECT through_turn FROM capture_jobs
+                    WHERE session_id = ?1 AND from_turn <= ?2 AND (
+                        status = 'completed'
+                        OR (status = 'failed' AND EXISTS (
+                            SELECT 1 FROM memory_v2_terminal_capture_failures t
+                            WHERE t.job_id = capture_jobs.job_id
+                        ))
+                    )
+                    UNION ALL
+                    SELECT through_turn FROM capture_skipped_ranges
+                    WHERE session_id = ?1 AND from_turn <= ?2
                  )",
                 params![session_id, cursor.saturating_add(1)],
                 |row| row.get::<_, Option<u32>>(0),
@@ -1832,7 +1888,7 @@ fn read_dir_bounded(path: &Path, limit: usize) -> Result<Vec<RecoveryDirectoryEn
     let mut bounded = Vec::new();
     for (index, entry) in entries.enumerate() {
         if index == limit {
-            return Err(V2CaptureError::RecoveryDirectoryLimit {
+            return Err(CaptureError::RecoveryDirectoryLimit {
                 path: path.to_path_buf(),
                 limit,
             });
@@ -1857,7 +1913,7 @@ fn recovery_ordinal(name: &str, prefix: &str) -> Result<usize> {
     name[prefix.len()..name.len() - 3]
         .parse::<usize>()
         .map_err(|_| {
-            V2CaptureError::Conflict(format!("malformed deterministic observation path {name}"))
+            CaptureError::Conflict(format!("malformed deterministic observation path {name}"))
         })
 }
 
@@ -1868,14 +1924,14 @@ fn persist_create_only(path: &Path, bytes: &[u8]) -> Result<()> {
         return if existing == bytes {
             Ok(())
         } else {
-            Err(V2CaptureError::Conflict(format!(
+            Err(CaptureError::Conflict(format!(
                 "create-only observation {} already has different bytes",
                 path.display()
             )))
         };
     }
     let parent = path.parent().ok_or_else(|| {
-        V2CaptureError::Invalid("observation path does not have a parent".to_owned())
+        CaptureError::Invalid("observation path does not have a parent".to_owned())
     })?;
     reject_symlink(parent)?;
     let mut temporary =
@@ -1891,7 +1947,7 @@ fn persist_create_only(path: &Path, bytes: &[u8]) -> Result<()> {
             if existing == bytes {
                 Ok(())
             } else {
-                Err(V2CaptureError::Conflict(format!(
+                Err(CaptureError::Conflict(format!(
                     "create-only observation {} raced with different bytes",
                     path.display()
                 )))
@@ -1905,7 +1961,7 @@ fn read_regular_bounded(path: &Path) -> Result<Vec<u8>> {
     reject_symlink(path)?;
     let metadata = std::fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
     if !metadata.file_type().is_file() || metadata.len() > MAX_OBSERVATION_FILE_BYTES {
-        return Err(V2CaptureError::Invalid(format!(
+        return Err(CaptureError::Invalid(format!(
             "{} is not a bounded regular observation file",
             path.display()
         )));
@@ -1919,7 +1975,7 @@ fn read_regular_bounded(path: &Path) -> Result<Vec<u8>> {
         })
         .map_err(|source| io_error(path, source))?;
     if bytes.len() as u64 > MAX_OBSERVATION_FILE_BYTES {
-        return Err(V2CaptureError::Invalid(
+        return Err(CaptureError::Invalid(
             "observation file exceeds its read limit".to_owned(),
         ));
     }
@@ -1928,39 +1984,39 @@ fn read_regular_bounded(path: &Path) -> Result<Vec<u8>> {
 
 fn recovery_metadata(bytes: &[u8]) -> Result<RecoveryMetadata> {
     let content = std::str::from_utf8(bytes)
-        .map_err(|_| V2CaptureError::Conflict("observation is not valid UTF-8".to_owned()))?;
+        .map_err(|_| CaptureError::Conflict("observation is not valid UTF-8".to_owned()))?;
     let field = |name: &str| {
         content
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{name}: ")))
-            .ok_or_else(|| V2CaptureError::Conflict(format!("observation omits {name}")))
+            .ok_or_else(|| CaptureError::Conflict(format!("observation omits {name}")))
     };
     if field("schema_version")? != "2" {
-        return Err(V2CaptureError::Conflict(
+        return Err(CaptureError::Conflict(
             "observation has an unsupported schema version".to_owned(),
         ));
     }
     ObservationType::parse(field("type")?)
-        .map_err(|error| V2CaptureError::Conflict(error.to_string()))?;
+        .map_err(|error| CaptureError::Conflict(error.to_string()))?;
     let parse_json = |name: &str| {
         serde_json::from_str::<String>(field(name)?)
-            .map_err(|_| V2CaptureError::Conflict(format!("observation has invalid {name}")))
+            .map_err(|_| CaptureError::Conflict(format!("observation has invalid {name}")))
     };
     let parse_number = |name: &str| {
         field(name)?
             .parse::<u32>()
-            .map_err(|_| V2CaptureError::Conflict(format!("observation has invalid {name}")))
+            .map_err(|_| CaptureError::Conflict(format!("observation has invalid {name}")))
     };
     let job_id = parse_json("job_id")?;
     let session_id = parse_json("session_id")?;
     let range = CaptureRange::try_new(parse_number("from_turn")?, parse_number("through_turn")?)
-        .map_err(|error| V2CaptureError::Conflict(error.to_string()))?;
+        .map_err(|error| CaptureError::Conflict(error.to_string()))?;
     let ordinal = field("observation_ordinal")?
         .parse::<usize>()
-        .map_err(|_| V2CaptureError::Conflict("observation has invalid ordinal".to_owned()))?;
+        .map_err(|_| CaptureError::Conflict("observation has invalid ordinal".to_owned()))?;
     let count = field("observation_count")?
         .parse::<usize>()
-        .map_err(|_| V2CaptureError::Conflict("observation has invalid count".to_owned()))?;
+        .map_err(|_| CaptureError::Conflict("observation has invalid count".to_owned()))?;
     Ok(RecoveryMetadata {
         job_id,
         session_id,
@@ -1972,7 +2028,7 @@ fn recovery_metadata(bytes: &[u8]) -> Result<RecoveryMetadata> {
 
 fn reject_symlink(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(V2CaptureError::Invalid(format!(
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CaptureError::Invalid(format!(
             "symbolic links are not allowed at {}",
             path.display()
         ))),
@@ -1982,13 +2038,13 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
-fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> V2CaptureError {
-    V2CaptureError::Io {
+fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> CaptureError {
+    CaptureError::Io {
         path: path.as_ref().to_path_buf(),
         source,
     }
 }
 
 #[cfg(test)]
-#[path = "v2_capture_tests.rs"]
+#[path = "capture_store_tests.rs"]
 mod tests;

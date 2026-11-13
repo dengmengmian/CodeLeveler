@@ -259,9 +259,9 @@ mod tests {
         )
         .unwrap();
         let policy = std::sync::Arc::new(
-            leveler_memory::V2MemoryAccessPolicy::new(&global, &workspace_memory).unwrap(),
+            leveler_memory::MemoryAccessPolicy::new(&global, &workspace_memory).unwrap(),
         );
-        let ctx = ctx.with_memory(leveler_memory::MemoryV2AccessResource(policy));
+        let ctx = ctx.with_memory(leveler_memory::MemoryAccessResource(policy));
 
         // A broad search of the memory scope must not surface retained archive
         // bytes, while the same traversal still finds ordinary topic content.

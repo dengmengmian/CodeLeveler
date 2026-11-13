@@ -8,11 +8,11 @@
 
 use std::path::Path;
 
-use leveler_memory::{MemoryV2AccessResource, MemoryV2Write};
+use leveler_memory::{MemoryAccessResource, MemoryWrite};
 
 use crate::ToolContext;
 
-fn resource(context: &ToolContext) -> Option<MemoryV2AccessResource> {
+fn resource(context: &ToolContext) -> Option<MemoryAccessResource> {
     context.execution.memory.clone()
 }
 
@@ -73,9 +73,9 @@ pub(crate) async fn write_file(
     context: &ToolContext,
     path: &Path,
     contents: &[u8],
-) -> Result<MemoryV2Write, String> {
+) -> Result<MemoryWrite, String> {
     let Some(memory) = resource(context) else {
-        return Ok(MemoryV2Write::Outside);
+        return Ok(MemoryWrite::Outside);
     };
     let path = path.to_path_buf();
     let contents = contents.to_vec();

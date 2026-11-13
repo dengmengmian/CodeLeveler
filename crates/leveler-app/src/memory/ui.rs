@@ -13,7 +13,7 @@ use leveler_client_protocol::{
 };
 use leveler_core::SessionId;
 use leveler_memory::{
-    ForgetReason, ForgetRequest, MAX_FORGET_FILE_BYTES, V2MaintenanceStore, V2MemoryScope,
+    ForgetReason, ForgetRequest, MAX_FORGET_FILE_BYTES, MaintenanceStore, MemoryScope,
 };
 
 use super::{MemoryActivity, MemoryRuntime, MemoryScopeSummary, SessionMemoryStatus};
@@ -38,10 +38,10 @@ impl MemoryScopeKind {
         }
     }
 
-    fn v2(self) -> V2MemoryScope {
+    fn v2(self) -> MemoryScope {
         match self {
-            Self::Global => V2MemoryScope::Global,
-            Self::Workspace => V2MemoryScope::Workspace,
+            Self::Global => MemoryScope::Global,
+            Self::Workspace => MemoryScope::Workspace,
         }
     }
 }
@@ -178,7 +178,7 @@ impl MemoryRuntime {
         let expected_hash = expected_hash.to_owned();
         let scope_dir = self.scope_root(scope).to_path_buf();
         let forgotten = tokio::task::spawn_blocking(move || {
-            let store = V2MaintenanceStore::open(
+            let store = MaintenanceStore::open(
                 &scope_dir,
                 scope.v2(),
                 storage.global_dir(),

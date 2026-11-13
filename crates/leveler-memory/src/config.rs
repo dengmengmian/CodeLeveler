@@ -29,7 +29,7 @@ impl Default for MemoryIndexConfig {
 /// How much of the memory pipeline a session is allowed to run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MemoryV2Rollout {
+pub enum MemoryRollout {
     /// Disable every memory read, capture, Dream, and write path.
     #[default]
     Off,
@@ -41,7 +41,7 @@ pub enum MemoryV2Rollout {
     Active,
 }
 
-impl MemoryV2Rollout {
+impl MemoryRollout {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -65,12 +65,12 @@ impl MemoryV2Rollout {
 
     /// The more restrictive of two rollout values.
     pub fn restrict(self, other: Self) -> Self {
-        fn rank(value: MemoryV2Rollout) -> u8 {
+        fn rank(value: MemoryRollout) -> u8 {
             match value {
-                MemoryV2Rollout::Off => 0,
-                MemoryV2Rollout::RecordOnly => 1,
-                MemoryV2Rollout::Shadow => 2,
-                MemoryV2Rollout::Active => 3,
+                MemoryRollout::Off => 0,
+                MemoryRollout::RecordOnly => 1,
+                MemoryRollout::Shadow => 2,
+                MemoryRollout::Active => 3,
             }
         }
         if rank(self) <= rank(other) {
@@ -84,8 +84,8 @@ impl MemoryV2Rollout {
 /// Concrete memory controls pinned when a session starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-pub struct MemoryV2Config {
-    pub rollout: MemoryV2Rollout,
+pub struct MemoryConfig {
+    pub rollout: MemoryRollout,
     pub capture_enabled: bool,
     pub automatic_dream_enabled: bool,
     pub manual_dream_enabled: bool,
@@ -99,10 +99,10 @@ pub struct MemoryV2Config {
     pub job_retention_days: u64,
 }
 
-impl Default for MemoryV2Config {
+impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            rollout: MemoryV2Rollout::Off,
+            rollout: MemoryRollout::Off,
             capture_enabled: true,
             automatic_dream_enabled: true,
             manual_dream_enabled: true,
@@ -118,7 +118,7 @@ impl Default for MemoryV2Config {
     }
 }
 
-impl MemoryV2Config {
+impl MemoryConfig {
     pub fn can_capture(self) -> bool {
         self.rollout.allows_capture() && self.capture_enabled && self.file_writes_enabled
     }
@@ -128,18 +128,14 @@ impl MemoryV2Config {
     }
 
     pub fn can_run_automatic_dream(self) -> bool {
-        matches!(
-            self.rollout,
-            MemoryV2Rollout::Shadow | MemoryV2Rollout::Active
-        ) && self.automatic_dream_enabled
+        matches!(self.rollout, MemoryRollout::Shadow | MemoryRollout::Active)
+            && self.automatic_dream_enabled
             && self.file_writes_enabled
     }
 
     pub fn can_run_manual_dream(self) -> bool {
-        matches!(
-            self.rollout,
-            MemoryV2Rollout::Shadow | MemoryV2Rollout::Active
-        ) && self.manual_dream_enabled
+        matches!(self.rollout, MemoryRollout::Shadow | MemoryRollout::Active)
+            && self.manual_dream_enabled
             && self.file_writes_enabled
     }
 

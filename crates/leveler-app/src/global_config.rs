@@ -137,14 +137,14 @@ pub struct GlobalConfig {
 
 /// `[memory]`: the cross-session memory pipeline.
 ///
-/// Every field is optional so the resolved [`leveler_memory::config::MemoryV2Config`]
+/// Every field is optional so the resolved [`leveler_memory::config::MemoryConfig`]
 /// keeps its own defaults as the single source of truth. `rollout` is the
 /// master switch: `off` (default), `record_only`, `shadow`, or `active`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalMemory {
     #[serde(default)]
-    rollout: Option<leveler_memory::config::MemoryV2Rollout>,
+    rollout: Option<leveler_memory::config::MemoryRollout>,
     #[serde(default)]
     capture_enabled: Option<bool>,
     #[serde(default)]
@@ -174,10 +174,10 @@ struct GlobalMemory {
 }
 
 impl GlobalMemory {
-    fn resolve(self) -> (leveler_memory::config::MemoryV2Config, Option<String>) {
-        let defaults = leveler_memory::config::MemoryV2Config::default();
+    fn resolve(self) -> (leveler_memory::config::MemoryConfig, Option<String>) {
+        let defaults = leveler_memory::config::MemoryConfig::default();
         (
-            leveler_memory::config::MemoryV2Config {
+            leveler_memory::config::MemoryConfig {
                 rollout: self.rollout.unwrap_or(defaults.rollout),
                 capture_enabled: self.capture_enabled.unwrap_or(defaults.capture_enabled),
                 automatic_dream_enabled: self
@@ -638,7 +638,7 @@ pub struct GlobalBundle {
     /// `[retry]`: the bounded recovery budget for one logical model request.
     pub retry: leveler_model::RetryBudget,
     /// `[memory]`, resolved. `Off` unless the user opted in.
-    pub memory: leveler_memory::config::MemoryV2Config,
+    pub memory: leveler_memory::config::MemoryConfig,
     /// `[memory].model`: the route for capture and Dream extraction.
     pub memory_model: Option<String>,
 }
@@ -1735,11 +1735,11 @@ mod tests {
         let bundle = toml::from_str::<GlobalConfig>("").unwrap().into_bundle();
         assert_eq!(
             bundle.memory,
-            leveler_memory::config::MemoryV2Config::default()
+            leveler_memory::config::MemoryConfig::default()
         );
         assert_eq!(
             bundle.memory.rollout,
-            leveler_memory::config::MemoryV2Rollout::Off
+            leveler_memory::config::MemoryRollout::Off
         );
         assert_eq!(bundle.memory_model, None);
 
@@ -1751,7 +1751,7 @@ mod tests {
         .into_bundle();
         assert_eq!(
             bundle.memory.rollout,
-            leveler_memory::config::MemoryV2Rollout::Active
+            leveler_memory::config::MemoryRollout::Active
         );
         assert!(bundle.memory.can_capture());
         assert!(bundle.memory.can_run_automatic_dream());

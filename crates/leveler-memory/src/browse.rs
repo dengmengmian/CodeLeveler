@@ -1,11 +1,11 @@
-//! Secure enumeration of files visible through memory v2 browsing.
+//! Secure enumeration of files visible through memory browsing.
 
 use std::path::{Path, PathBuf};
 
-use crate::v2::{
-    MAX_DIRECTORY_ENTRIES, MAX_DISCOVERED_FILES, V2ManifestBudget, V2StateLedgers, state_ledgers,
+use crate::scope::{
+    MAX_DIRECTORY_ENTRIES, MAX_DISCOVERED_FILES, ManifestBudget, MemoryStateLedgers, state_ledgers,
 };
-use crate::v2_topic_reads::{compare_observations_newest_first, compare_topics_by_use};
+use crate::topic_reads::{compare_observations_newest_first, compare_topics_by_use};
 
 pub(super) fn list_memory_files(
     global_dir: &Path,
@@ -34,7 +34,7 @@ fn list_memory_files_with_caps(
     let storage_root = global_dir.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "v2 global directory has no storage root",
+            "memory global directory has no storage root",
         )
     })?;
     let canonical_root = match dunce::canonicalize(storage_root) {
@@ -46,7 +46,7 @@ fn list_memory_files_with_caps(
     // Browse lists each scope in the order the next `MEMORY.md` render uses:
     // the index, topics (ranked by use when the compact index is configured),
     // then inbox notes newest first.
-    let rank_by_use = V2ManifestBudget::configured().slug_tail;
+    let rank_by_use = ManifestBudget::configured().slug_tail;
     let mut files = Vec::new();
     for scope_dir in [global_dir, workspace_dir] {
         reject_symlink(scope_dir)?;
@@ -56,7 +56,7 @@ fn list_memory_files_with_caps(
             Err(error) => return Err(error),
         };
         ensure_descendant(&canonical_scope, &canonical_root)?;
-        let V2StateLedgers {
+        let MemoryStateLedgers {
             excluded,
             read_counts,
         } = state_ledgers(scope_dir).map_err(std::io::Error::other)?;
@@ -82,7 +82,7 @@ fn list_memory_files_with_caps(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "v2 memory directory {} exceeds the {max_entries}-entry safety limit",
+                            "memory directory {} exceeds the {max_entries}-entry safety limit",
                             directory.display()
                         ),
                     ));
@@ -104,7 +104,7 @@ fn list_memory_files_with_caps(
                     tracing::warn!(
                         directory = %directory.display(),
                         limit = max_files,
-                        "v2 memory listing reached its file cap; omitting remaining files"
+                        "memory listing reached its file cap; omitting remaining files"
                     );
                     break;
                 }
@@ -170,7 +170,7 @@ fn reject_symlink_components(root: &Path, target: &Path) -> std::io::Result<()> 
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "v2 memory path {} escapes {}",
+                "memory path {} escapes {}",
                 target.display(),
                 root.display()
             ),
@@ -189,7 +189,7 @@ fn reject_symlink(path: &Path) -> std::io::Result<()> {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "symbolic links are not allowed in memory v2: {}",
+                "symbolic links are not allowed in memory: {}",
                 path.display()
             ),
         )),
@@ -209,7 +209,7 @@ fn is_safe_markdown_file(path: &Path, canonical_scope: &Path) -> std::io::Result
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "symbolic links are not allowed in memory v2: {}",
+                "symbolic links are not allowed in memory: {}",
                 path.display()
             ),
         ));
@@ -227,14 +227,10 @@ fn ensure_descendant(path: &Path, root: &Path) -> std::io::Result<()> {
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        format!(
-            "v2 memory path {} escapes {}",
-            path.display(),
-            root.display()
-        ),
+        format!("memory path {} escapes {}", path.display(), root.display()),
     ))
 }
 
 #[cfg(test)]
-#[path = "storage_v2_tests.rs"]
+#[path = "browse_tests.rs"]
 mod tests;

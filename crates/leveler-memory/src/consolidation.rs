@@ -1,4 +1,4 @@
-//! Durable, fenced consolidation of pending memory-v2 observations.
+//! Durable, fenced consolidation of pending memory observations.
 //!
 //! A claim records an immutable inbox snapshot in SQLite while capture keeps
 //! publishing new files. Model work happens outside transactions. The final
@@ -13,12 +13,13 @@ use std::time::Duration;
 use crate::sqlite_journal::JournalMode;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 
-use crate::storage::MemoryStorage;
-use crate::v2::{
-    V2ManifestBudget, V2MemoryScope, bump_manifest_revision, content_hash,
-    regenerate_scope_manifest,
+use crate::scope::{
+    ManifestBudget, MemoryScope, bump_manifest_revision, content_hash, regenerate_scope_manifest,
 };
-use crate::{MemoryIndex, SharedV2Clock, V2MemoryAccessPolicy, V2PathClass, system_v2_clock};
+use crate::storage::MemoryStorage;
+use crate::{
+    MemoryAccessPolicy, MemoryIndex, MemoryPathClass, SharedMemoryClock, system_memory_clock,
+};
 
 const MAX_OWNER_BYTES: usize = 128;
 const MAX_CLAIMED_OBSERVATIONS: usize = 512;
@@ -36,7 +37,7 @@ const MAX_DURABLE_PLAN_PROBES: usize = 64;
 /// Inbox scans stop after this many entries so a runaway inbox cannot stall a claim.
 const MAX_INBOX_SCAN_ENTRIES: usize = 100_000;
 
-pub type Result<T> = std::result::Result<T, V2ConsolidationError>;
+pub type Result<T> = std::result::Result<T, ConsolidationError>;
 
 /// Whether a lease owner names a process this machine can still observe.
 ///
@@ -66,10 +67,10 @@ pub(crate) fn lease_is_active(owner: Option<&str>, expires_at: Option<i64>, now:
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum V2ConsolidationError {
+pub enum ConsolidationError {
     #[error("invalid consolidation request: {0}")]
     Invalid(String),
-    #[error("another memory-v2 consolidation is running")]
+    #[error("another memory consolidation is running")]
     Busy,
     #[error("consolidation lease is stale or no longer owned by this worker")]
     StaleLease,
@@ -83,7 +84,7 @@ pub enum V2ConsolidationError {
         #[source]
         source: std::io::Error,
     },
-    #[error("memory-v2 access policy rejected consolidation: {0}")]
+    #[error("memory access policy rejected consolidation: {0}")]
     Access(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("consolidation index or manifest convergence failed: {0}")]
     Convergence(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -221,19 +222,19 @@ pub struct DreamEligibility {
 /// Independent handles coordinate through `memory_state.sqlite`; no process
 /// global or session-actor state participates in exclusivity.
 #[derive(Debug)]
-pub struct V2ConsolidationStore {
+pub struct ConsolidationStore {
     scope_dir: PathBuf,
-    scope: V2MemoryScope,
+    scope: MemoryScope,
     state_path: PathBuf,
-    access: V2MemoryAccessPolicy,
-    clock: SharedV2Clock,
+    access: MemoryAccessPolicy,
+    clock: SharedMemoryClock,
 }
 
-impl V2ConsolidationStore {
-    /// Open and additively migrate one initialized v2 scope.
+impl ConsolidationStore {
+    /// Open and additively migrate one initialized memory scope.
     pub fn open(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
+        scope: MemoryScope,
         global_root: &Path,
         workspace_root: &Path,
     ) -> Result<Self> {
@@ -242,20 +243,20 @@ impl V2ConsolidationStore {
             scope,
             global_root,
             workspace_root,
-            system_v2_clock(),
+            system_memory_clock(),
         )
     }
 
     pub fn open_with_clock(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
+        scope: MemoryScope,
         global_root: &Path,
         workspace_root: &Path,
-        clock: SharedV2Clock,
+        clock: SharedMemoryClock,
     ) -> Result<Self> {
         let scope_dir = scope_dir.as_ref().to_path_buf();
-        let access = V2MemoryAccessPolicy::new(global_root, workspace_root)
-            .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
+        let access = MemoryAccessPolicy::new(global_root, workspace_root)
+            .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
         let store = Self {
             state_path: scope_dir.join("memory_state.sqlite"),
             scope_dir,
@@ -287,16 +288,16 @@ impl V2ConsolidationStore {
         validate_text("lease owner", &request.owner, MAX_OWNER_BYTES)?;
         validate_timestamp(request.now)?;
         let duration = i64::try_from(request.duration.as_secs())
-            .map_err(|_| V2ConsolidationError::Invalid("lease duration is too large".to_owned()))?;
+            .map_err(|_| ConsolidationError::Invalid("lease duration is too large".to_owned()))?;
         if duration == 0 {
-            return Err(V2ConsolidationError::Invalid(
+            return Err(ConsolidationError::Invalid(
                 "lease duration must be at least one second".to_owned(),
             ));
         }
         let expires_at = request
             .now
             .checked_add(duration)
-            .ok_or_else(|| V2ConsolidationError::Invalid("lease expiry overflows".to_owned()))?;
+            .ok_or_else(|| ConsolidationError::Invalid("lease expiry overflows".to_owned()))?;
         let mut connection = self.open_state()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lock = transaction
@@ -314,7 +315,7 @@ impl V2ConsolidationStore {
             .optional()?
             .unwrap_or((None, None, 0));
         if lease_is_active(lock.0.as_deref(), lock.1, request.now) {
-            return Err(V2ConsolidationError::Busy);
+            return Err(ConsolidationError::Busy);
         }
         let has_batch_plan = transaction.query_row(
             "SELECT EXISTS(
@@ -330,7 +331,7 @@ impl V2ConsolidationStore {
             |row| row.get::<_, bool>(0),
         )?;
         if has_batch_plan {
-            return Err(V2ConsolidationError::Conflict(
+            return Err(ConsolidationError::Conflict(
                 "a batch Dream plan must be applied or repaired by batch Dream".to_owned(),
             ));
         }
@@ -646,12 +647,12 @@ impl V2ConsolidationStore {
     ) -> Result<DreamEligibility> {
         validate_timestamp(now)?;
         if config.min_pending_count == 0 {
-            return Err(V2ConsolidationError::Invalid(
+            return Err(ConsolidationError::Invalid(
                 "minimum pending count must be positive".to_owned(),
             ));
         }
         let max_age = i64::try_from(config.max_pending_age.as_secs())
-            .map_err(|_| V2ConsolidationError::Invalid("pending age is too large".to_owned()))?;
+            .map_err(|_| ConsolidationError::Invalid("pending age is too large".to_owned()))?;
         let mut connection = self.open_state()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_capture_files = transaction.query_row(
@@ -816,7 +817,7 @@ impl V2ConsolidationStore {
             }
             let bytes = match read_bounded(&entry.path(), MAX_OBSERVATION_BYTES) {
                 Ok(bytes) => bytes,
-                Err(V2ConsolidationError::Io { source, .. })
+                Err(ConsolidationError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
                     continue;
@@ -878,7 +879,7 @@ impl V2ConsolidationStore {
         validate_timestamp(now)?;
         let changes = self.prepare_changes(lease, operations)?;
         if changes.is_empty() {
-            return Err(V2ConsolidationError::Invalid(
+            return Err(ConsolidationError::Invalid(
                 "consolidation plan must contain at least one topic change".to_owned(),
             ));
         }
@@ -928,7 +929,7 @@ impl V2ConsolidationStore {
             let path = self.scope_dir.join(&observation.relative_path);
             let content = self.read_policy_file(&path, MAX_OBSERVATION_BYTES)?;
             if content_hash(content.as_bytes()) != observation.content_hash {
-                return Err(V2ConsolidationError::Conflict(format!(
+                return Err(ConsolidationError::Conflict(format!(
                     "claimed observation {} changed",
                     observation.relative_path.display()
                 )));
@@ -974,13 +975,13 @@ impl V2ConsolidationStore {
             });
         }
         if operations.len() > MAX_TOPIC_OPERATIONS {
-            return Err(V2ConsolidationError::Invalid(format!(
+            return Err(ConsolidationError::Invalid(format!(
                 "plan exceeds the {MAX_TOPIC_OPERATIONS}-operation limit"
             )));
         }
         let changes = self.prepare_changes(lease, operations)?;
         if changes.is_empty() {
-            return Err(V2ConsolidationError::Invalid(
+            return Err(ConsolidationError::Invalid(
                 "consolidation plan must contain at least one topic change".to_owned(),
             ));
         }
@@ -994,7 +995,7 @@ impl V2ConsolidationStore {
             // persisted it would be replayed by every later reclaim and fail
             // the same way each time.
             if changes.is_empty() {
-                return Err(V2ConsolidationError::Invalid(
+                return Err(ConsolidationError::Invalid(
                     "consolidation plan must contain at least one topic change".to_owned(),
                 ));
             }
@@ -1008,7 +1009,7 @@ impl V2ConsolidationStore {
                 .flatten()
                 && existing != plan_hash
             {
-                return Err(V2ConsolidationError::Conflict(
+                return Err(ConsolidationError::Conflict(
                     "operation was already planned with different topic changes".to_owned(),
                 ));
             }
@@ -1148,7 +1149,7 @@ impl V2ConsolidationStore {
         validate_lease_tx(&transaction, lease, now)?;
         let changes = read_durable_changes(&transaction, &lease.operation_id)?;
         if changes.is_empty() {
-            return Err(V2ConsolidationError::Invalid(
+            return Err(ConsolidationError::Invalid(
                 "consolidation plan must contain at least one topic change".to_owned(),
             ));
         }
@@ -1160,26 +1161,26 @@ impl V2ConsolidationStore {
                         Ok(bytes) => {
                             self.access
                                 .record_read_typed(&path, &bytes)
-                                .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
+                                .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
                         }
-                        Err(V2ConsolidationError::Io { source, .. })
+                        Err(ConsolidationError::Io { source, .. })
                             if source.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error),
                     }
                     let outcome = self
                         .access
                         .write_file_typed_in_transaction(&path, content.as_bytes(), &transaction)
-                        .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
-                    if matches!(outcome, crate::access::MemoryV2Write::Outside) {
-                        return Err(V2ConsolidationError::Access(Box::new(
-                            crate::V2AccessError::EscapesScope(path),
+                        .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
+                    if matches!(outcome, crate::access::MemoryWrite::Outside) {
+                        return Err(ConsolidationError::Access(Box::new(
+                            crate::MemoryAccessError::EscapesScope(path),
                         )));
                     }
                 }
                 None => {
                     let bytes = match read_bounded(&path, MAX_TOPIC_BYTES as u64) {
                         Ok(bytes) => bytes,
-                        Err(V2ConsolidationError::Io { source, .. })
+                        Err(ConsolidationError::Io { source, .. })
                             if source.kind() == std::io::ErrorKind::NotFound =>
                         {
                             continue;
@@ -1188,10 +1189,10 @@ impl V2ConsolidationStore {
                     };
                     self.access
                         .record_read_typed(&path, &bytes)
-                        .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
+                        .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
                     self.access
                         .remove_topic_file_in_transaction(&path, &transaction)
-                        .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
+                        .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
                 }
             }
         }
@@ -1211,7 +1212,7 @@ impl V2ConsolidationStore {
         for observation in &lease.observations {
             let source = self.scope_dir.join(&observation.relative_path);
             let file_name = observation.relative_path.file_name().ok_or_else(|| {
-                V2ConsolidationError::Invalid("observation path has no filename".to_owned())
+                ConsolidationError::Invalid("observation path has no filename".to_owned())
             })?;
             let archived_relative = PathBuf::from("archive")
                 .join(&lease.operation_id)
@@ -1293,21 +1294,21 @@ impl V2ConsolidationStore {
             crate::config::MemoryIndexConfig::default(),
             1,
         )
-        .map_err(|error| V2ConsolidationError::Convergence(Box::new(error)))?;
+        .map_err(|error| ConsolidationError::Convergence(Box::new(error)))?;
         let source = match self.scope {
-            V2MemoryScope::Global => "global",
-            V2MemoryScope::Workspace => "workspace",
+            MemoryScope::Global => "global",
+            MemoryScope::Workspace => "workspace",
         };
         for (relative, content) in changes {
             let path = self.scope_dir.join(relative);
             if content.is_some() {
                 index
                     .reindex_file(&path, source)
-                    .map_err(|error| V2ConsolidationError::Convergence(Box::new(error)))?;
+                    .map_err(|error| ConsolidationError::Convergence(Box::new(error)))?;
             } else {
                 index
                     .delete_path(&path)
-                    .map_err(|error| V2ConsolidationError::Convergence(Box::new(error)))?;
+                    .map_err(|error| ConsolidationError::Convergence(Box::new(error)))?;
             }
         }
         let archived = {
@@ -1326,17 +1327,13 @@ impl V2ConsolidationStore {
             remove_idempotently(&source_path, &expected_hash)?;
             index
                 .delete_path(&source_path)
-                .map_err(|error| V2ConsolidationError::Convergence(Box::new(error)))?;
+                .map_err(|error| ConsolidationError::Convergence(Box::new(error)))?;
         }
         bump_manifest_revision(&self.scope_dir)
             .and_then(|_| {
-                regenerate_scope_manifest(
-                    &self.scope_dir,
-                    self.scope,
-                    V2ManifestBudget::configured(),
-                )
+                regenerate_scope_manifest(&self.scope_dir, self.scope, ManifestBudget::configured())
             })
-            .map_err(|error| V2ConsolidationError::Convergence(Box::new(error)))?;
+            .map_err(|error| ConsolidationError::Convergence(Box::new(error)))?;
         Ok(())
     }
 
@@ -1357,7 +1354,7 @@ impl V2ConsolidationStore {
                 TopicOperation::Create { path, content, .. } => {
                     self.validate_topic_path(path)?;
                     if self.scope_dir.join(path).exists() {
-                        return Err(V2ConsolidationError::Conflict(format!(
+                        return Err(ConsolidationError::Conflict(format!(
                             "create target already exists: {}",
                             path.display()
                         )));
@@ -1389,7 +1386,7 @@ impl V2ConsolidationStore {
                     ..
                 } => {
                     if sources.len() < 2 {
-                        return Err(V2ConsolidationError::Invalid(
+                        return Err(ConsolidationError::Invalid(
                             "merge requires at least two source topics".to_owned(),
                         ));
                     }
@@ -1413,7 +1410,7 @@ impl V2ConsolidationStore {
                 } => {
                     self.require_existing_topic(source)?;
                     if destinations.len() < 2 {
-                        return Err(V2ConsolidationError::Invalid(
+                        return Err(ConsolidationError::Invalid(
                             "split requires at least two destination topics".to_owned(),
                         ));
                     }
@@ -1437,7 +1434,7 @@ impl V2ConsolidationStore {
         if self.scope_dir.join(relative).is_file() {
             Ok(())
         } else {
-            Err(V2ConsolidationError::Conflict(format!(
+            Err(ConsolidationError::Conflict(format!(
                 "topic does not exist: {}",
                 relative.display()
             )))
@@ -1449,7 +1446,7 @@ impl V2ConsolidationStore {
         if self.scope_dir.join(relative).is_file()
             && !rewritten_sources.iter().any(|source| source == relative)
         {
-            return Err(V2ConsolidationError::Conflict(format!(
+            return Err(ConsolidationError::Conflict(format!(
                 "destination already exists: {}",
                 relative.display()
             )));
@@ -1465,7 +1462,7 @@ impl V2ConsolidationStore {
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
         {
-            return Err(V2ConsolidationError::Invalid(format!(
+            return Err(ConsolidationError::Invalid(format!(
                 "invalid topic path: {}",
                 relative.display()
             )));
@@ -1474,10 +1471,10 @@ impl V2ConsolidationStore {
         let class = self
             .access
             .classify_path(&absolute)
-            .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
-        if class != V2PathClass::Topic(self.scope) {
-            return Err(V2ConsolidationError::Access(Box::new(
-                crate::V2AccessError::Protected(absolute),
+            .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
+        if class != MemoryPathClass::Topic(self.scope) {
+            return Err(ConsolidationError::Access(Box::new(
+                crate::MemoryAccessError::Protected(absolute),
             )));
         }
         let is_excluded = self.open_state()?.query_row(
@@ -1490,7 +1487,7 @@ impl V2ConsolidationStore {
             |row| row.get::<_, bool>(0),
         )?;
         if is_excluded {
-            return Err(V2ConsolidationError::Conflict(format!(
+            return Err(ConsolidationError::Conflict(format!(
                 "topic path is durably excluded: {}",
                 relative.display()
             )));
@@ -1514,14 +1511,14 @@ impl V2ConsolidationStore {
                 continue;
             }
             if paths.len() == MAX_TOPIC_INPUT_COUNT {
-                return Err(V2ConsolidationError::Invalid(format!(
+                return Err(ConsolidationError::Invalid(format!(
                     "topic input exceeds the {MAX_TOPIC_INPUT_COUNT}-file limit"
                 )));
             }
             let relative = entry
                 .path()
                 .strip_prefix(&self.scope_dir)
-                .map_err(|_| V2ConsolidationError::Invalid("topic escaped scope".to_owned()))?
+                .map_err(|_| ConsolidationError::Invalid("topic escaped scope".to_owned()))?
                 .to_path_buf();
             let is_excluded = self.open_state()?.query_row(
                 "SELECT EXISTS(
@@ -1543,16 +1540,16 @@ impl V2ConsolidationStore {
         for path in paths {
             let content = self.read_policy_file(&path, MAX_TOPIC_BYTES as u64)?;
             total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
-                V2ConsolidationError::Invalid("topic input byte count overflows".to_owned())
+                ConsolidationError::Invalid("topic input byte count overflows".to_owned())
             })?;
             if total_bytes > MAX_TOPIC_INPUT_BYTES {
-                return Err(V2ConsolidationError::Invalid(format!(
+                return Err(ConsolidationError::Invalid(format!(
                     "topic input exceeds the {MAX_TOPIC_INPUT_BYTES}-byte limit"
                 )));
             }
             topics.push((
                 path.strip_prefix(&self.scope_dir)
-                    .map_err(|_| V2ConsolidationError::Invalid("topic escaped scope".to_owned()))?
+                    .map_err(|_| ConsolidationError::Invalid("topic escaped scope".to_owned()))?
                     .to_path_buf(),
                 content,
             ));
@@ -1564,15 +1561,15 @@ impl V2ConsolidationStore {
         if !self
             .access
             .validate_read_typed(path)
-            .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?
+            .map_err(|error| ConsolidationError::Access(Box::new(error)))?
         {
-            return Err(V2ConsolidationError::Access(Box::new(
-                crate::V2AccessError::EscapesScope(path.to_path_buf()),
+            return Err(ConsolidationError::Access(Box::new(
+                crate::MemoryAccessError::EscapesScope(path.to_path_buf()),
             )));
         }
         let metadata = std::fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
         if !metadata.file_type().is_file() || metadata.len() > max_bytes {
-            return Err(V2ConsolidationError::Invalid(format!(
+            return Err(ConsolidationError::Invalid(format!(
                 "{} is not a bounded regular file",
                 path.display()
             )));
@@ -1586,15 +1583,15 @@ impl V2ConsolidationStore {
             })
             .map_err(|source| io_error(path, source))?;
         if bytes.len() as u64 > max_bytes {
-            return Err(V2ConsolidationError::Invalid(
-                "memory-v2 file exceeds its read limit".to_owned(),
+            return Err(ConsolidationError::Invalid(
+                "memory file exceeds its read limit".to_owned(),
             ));
         }
         self.access
             .record_read_typed(path, &bytes)
-            .map_err(|error| V2ConsolidationError::Access(Box::new(error)))?;
+            .map_err(|error| ConsolidationError::Access(Box::new(error)))?;
         String::from_utf8(bytes)
-            .map_err(|_| V2ConsolidationError::Invalid("memory-v2 file is not UTF-8".to_owned()))
+            .map_err(|_| ConsolidationError::Invalid("memory file is not UTF-8".to_owned()))
     }
 
     fn validate_lease(&self, lease: &ConsolidationLease, now: i64) -> Result<()> {
@@ -1646,8 +1643,8 @@ impl V2ConsolidationStore {
             INSERT OR IGNORE INTO consolidation_lock(singleton, generation)
             VALUES (1, 0);",
         )?;
-        crate::v2_maintenance::migrate_v2_hardening(&transaction)
-            .map_err(|error| V2ConsolidationError::Convergence(Box::new(error)))?;
+        crate::maintenance::migrate_hardening(&transaction)
+            .map_err(|error| ConsolidationError::Convergence(Box::new(error)))?;
         transaction.commit()?;
         Ok(())
     }
@@ -1655,7 +1652,7 @@ impl V2ConsolidationStore {
     fn open_state(&self) -> Result<rusqlite::Connection> {
         JournalMode::for_db_path(&self.state_path)
             .open(&self.state_path)
-            .map_err(V2ConsolidationError::Database)
+            .map_err(ConsolidationError::Database)
     }
 }
 
@@ -1676,7 +1673,7 @@ fn validate_lease_tx(
     if matches == 1 {
         Ok(())
     } else {
-        Err(V2ConsolidationError::StaleLease)
+        Err(ConsolidationError::StaleLease)
     }
 }
 
@@ -1689,7 +1686,7 @@ fn release_lock(transaction: &rusqlite::Transaction<'_>, lease: &ConsolidationLe
     if changed == 1 {
         Ok(())
     } else {
-        Err(V2ConsolidationError::StaleLease)
+        Err(ConsolidationError::StaleLease)
     }
 }
 
@@ -1706,17 +1703,17 @@ fn read_durable_changes(
             Ok((PathBuf::from(row.get::<_, String>(0)?), row.get(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(V2ConsolidationError::Database)
+        .map_err(ConsolidationError::Database)
 }
 
 fn validate_evidence(evidence: &[PathBuf], claimed: &BTreeSet<PathBuf>) -> Result<()> {
     if evidence.is_empty() || evidence.len() > MAX_EVIDENCE_PER_OPERATION {
-        return Err(V2ConsolidationError::Invalid(format!(
+        return Err(ConsolidationError::Invalid(format!(
             "every topic operation requires 1..={MAX_EVIDENCE_PER_OPERATION} claimed evidence files"
         )));
     }
     if let Some(unclaimed) = evidence.iter().find(|path| !claimed.contains(*path)) {
-        return Err(V2ConsolidationError::Invalid(format!(
+        return Err(ConsolidationError::Invalid(format!(
             "operation cites unclaimed observation: {}",
             unclaimed.display()
         )));
@@ -1730,7 +1727,7 @@ fn insert_change(
     content: Option<String>,
 ) -> Result<()> {
     if changes.insert(path.to_path_buf(), content).is_some() {
-        return Err(V2ConsolidationError::Conflict(format!(
+        return Err(ConsolidationError::Conflict(format!(
             "plan mutates {} more than once",
             path.display()
         )));
@@ -1769,7 +1766,7 @@ fn normalize_topic_content(content: &str) -> Result<String> {
     let content = strip_legacy_provenance(content);
     let content = content.trim_end();
     if content.is_empty() || content.len() > MAX_TOPIC_BYTES {
-        return Err(V2ConsolidationError::Invalid(format!(
+        return Err(ConsolidationError::Invalid(format!(
             "topic content must contain 1..={MAX_TOPIC_BYTES} bytes"
         )));
     }
@@ -1821,14 +1818,14 @@ fn copy_idempotently(source: &Path, destination: &Path, expected_hash: &str) -> 
     if destination.exists() {
         let bytes = read_bounded(destination, MAX_OBSERVATION_BYTES)?;
         if content_hash(&bytes) != expected_hash {
-            return Err(V2ConsolidationError::Conflict(format!(
+            return Err(ConsolidationError::Conflict(format!(
                 "archive destination differs: {}",
                 destination.display()
             )));
         }
         let source_bytes = read_bounded(source, MAX_OBSERVATION_BYTES)?;
         if source_bytes != bytes {
-            return Err(V2ConsolidationError::Conflict(format!(
+            return Err(ConsolidationError::Conflict(format!(
                 "archive source differs: {}",
                 source.display()
             )));
@@ -1837,13 +1834,13 @@ fn copy_idempotently(source: &Path, destination: &Path, expected_hash: &str) -> 
     }
     let bytes = read_bounded(source, MAX_OBSERVATION_BYTES)?;
     if content_hash(&bytes) != expected_hash {
-        return Err(V2ConsolidationError::Conflict(format!(
+        return Err(ConsolidationError::Conflict(format!(
             "archive source hash differs: {}",
             source.display()
         )));
     }
     let parent = destination.parent().ok_or_else(|| {
-        V2ConsolidationError::Invalid("archive destination has no parent".to_owned())
+        ConsolidationError::Invalid("archive destination has no parent".to_owned())
     })?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).map_err(|error| io_error(destination, error))?;
@@ -1859,7 +1856,7 @@ fn copy_idempotently(source: &Path, destination: &Path, expected_hash: &str) -> 
 fn remove_idempotently(source: &Path, expected_hash: &str) -> Result<()> {
     let bytes = match read_bounded(source, MAX_OBSERVATION_BYTES) {
         Ok(bytes) => bytes,
-        Err(V2ConsolidationError::Io { source, .. })
+        Err(ConsolidationError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
             return Ok(());
@@ -1867,7 +1864,7 @@ fn remove_idempotently(source: &Path, expected_hash: &str) -> Result<()> {
         Err(error) => return Err(error),
     };
     if content_hash(&bytes) != expected_hash {
-        return Err(V2ConsolidationError::Conflict(format!(
+        return Err(ConsolidationError::Conflict(format!(
             "archive source hash differs: {}",
             source.display()
         )));
@@ -1878,7 +1875,7 @@ fn remove_idempotently(source: &Path, expected_hash: &str) -> Result<()> {
 fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
     if !metadata.file_type().is_file() || metadata.len() > max_bytes {
-        return Err(V2ConsolidationError::Invalid(format!(
+        return Err(ConsolidationError::Invalid(format!(
             "{} is not a bounded regular file",
             path.display()
         )));
@@ -1896,7 +1893,7 @@ fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
 
 fn validate_text(name: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
-        Err(V2ConsolidationError::Invalid(format!(
+        Err(ConsolidationError::Invalid(format!(
             "{name} must contain 1..={max_bytes} safe bytes"
         )))
     } else {
@@ -1906,7 +1903,7 @@ fn validate_text(name: &str, value: &str, max_bytes: usize) -> Result<()> {
 
 fn validate_timestamp(value: i64) -> Result<()> {
     if value < 0 {
-        Err(V2ConsolidationError::Invalid(
+        Err(ConsolidationError::Invalid(
             "timestamp cannot be negative".to_owned(),
         ))
     } else {
@@ -1917,16 +1914,16 @@ fn validate_timestamp(value: i64) -> Result<()> {
 fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(|path| path.replace('\\', "/"))
-        .ok_or_else(|| V2ConsolidationError::Invalid("path is not valid UTF-8".to_owned()))
+        .ok_or_else(|| ConsolidationError::Invalid("path is not valid UTF-8".to_owned()))
 }
 
-fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> V2ConsolidationError {
-    V2ConsolidationError::Io {
+fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> ConsolidationError {
+    ConsolidationError::Io {
         path: path.as_ref().to_path_buf(),
         source,
     }
 }
 
 #[cfg(test)]
-#[path = "v2_consolidation_tests.rs"]
+#[path = "consolidation_tests.rs"]
 mod tests;

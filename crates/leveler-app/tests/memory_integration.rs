@@ -18,8 +18,8 @@ use leveler_client_protocol::{
 use leveler_core::SessionId;
 use leveler_execution::PermissionProfile;
 use leveler_memory::{
-    CaptureOutcomeDraft, CaptureRange, ClaimRequest, MemoryStorage, ObservationDraft,
-    ObservationType, V2CaptureStore, V2ManifestBudget, V2MemoryScope, regenerate_scope_manifest,
+    CaptureOutcomeDraft, CaptureRange, CaptureStore, ClaimRequest, ManifestBudget, MemoryScope,
+    MemoryStorage, ObservationDraft, ObservationType, regenerate_scope_manifest,
 };
 use leveler_model::ModelRef;
 use leveler_project::Layout;
@@ -536,8 +536,8 @@ fn seed_topic(harness: &Harness, relative: &str, content: &str) {
     std::fs::write(&path, content).unwrap();
     regenerate_scope_manifest(
         storage.workspace_dir(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
+        MemoryScope::Workspace,
+        ManifestBudget::default(),
     )
     .unwrap();
 }
@@ -554,7 +554,7 @@ fn seed_observation(
 ) -> String {
     let storage = harness.memory_storage();
     storage.ensure_initialized().unwrap();
-    let store = V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace).unwrap();
+    let store = CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace).unwrap();
     store.enqueue(session, range).unwrap();
     let lease = store
         .claim_for_session(
@@ -915,7 +915,7 @@ async fn an_automatic_dream_runs_when_the_oldest_pending_observation_is_old() {
     // session. The next capture's follow-up sees the age threshold satisfied.
     let storage = harness.memory_storage();
     storage.ensure_initialized().unwrap();
-    let store = V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace).unwrap();
+    let store = CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace).unwrap();
     let seed_session = leveler_core::new_uuid_string();
     let old_now = leveler_core::now().timestamp() - 25 * 60 * 60;
     store
@@ -1079,7 +1079,7 @@ async fn a_corrupt_memory_database_degrades_the_agent_without_breaking_it() {
     }
     std::fs::write(&state, b"this is not a sqlite database").unwrap();
     assert!(
-        V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace).is_err(),
+        CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace).is_err(),
         "the fixture corruption is visible to the store"
     );
     let reinit = storage.ensure_initialized();
@@ -1365,8 +1365,7 @@ async fn a_capture_interrupted_by_restart_is_recovered_from_its_durable_job() {
     let storage = MemoryStorage::for_workspace(root.path(), &root.path().join("memory"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let store =
-            V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace).unwrap();
+        let store = CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace).unwrap();
         let work = store.work_state(session.as_str(), 1).unwrap();
         if work.running == 0 {
             break;
@@ -1410,7 +1409,7 @@ async fn a_capture_interrupted_by_restart_is_recovered_from_its_durable_job() {
         let activity = app.memory().activity(session.as_str());
         let work = {
             let store =
-                V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace).unwrap();
+                CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace).unwrap();
             store.work_state(session.as_str(), 2).unwrap()
         };
         if !activity.active && work.pending == 0 && work.running == 0 && work.failed == 0 {
@@ -1946,10 +1945,10 @@ async fn the_session_toggle_pauses_memory_for_this_session_only() {
         .await;
     assert!(resumed.ok, "{resumed:?}");
     harness.submit("third turn").await;
-    // The paused turn was never requested, so the resume captures the gap:
-    // turns 2 and 3 settle as one range.
+    // The paused turn is not a capture gap. Only the turn that settled after
+    // resume is queued, and its transcript does not include the paused turn.
     harness
-        .wait_for_capture_range(&harness.session, (2, 3))
+        .wait_for_capture_range(&harness.session, (3, 3))
         .await;
     let bodies = harness.server().request_bodies().await;
     assert_eq!(harness.server().request_count(), 5, "{bodies:#?}");
@@ -1962,5 +1961,60 @@ async fn the_session_toggle_pauses_memory_for_this_session_only() {
         bodies[4].contains("record_memory_observations"),
         "capture runs after the resume: {}",
         bodies[4]
+    );
+    assert!(
+        bodies[4].contains("third turn"),
+        "the resumed turn is what capture sees: {}",
+        bodies[4]
+    );
+    assert!(
+        !bodies[4].contains("second turn"),
+        "the paused turn is not backfilled into the capture transcript: {}",
+        bodies[4]
+    );
+    let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+    let cursors = store.cursors(harness.session.as_str()).unwrap();
+    assert_eq!(
+        (cursors.requested, cursors.captured),
+        (3, 3),
+        "skipping the paused turn must not leave the cursor behind"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_releases_the_capture_lease_this_process_owns() {
+    let harness = harness(vec![text_response("first"), MockResponse::NeverResponds]).await;
+    harness.submit("first turn").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+        if store
+            .work_state(harness.session.as_str(), 1)
+            .is_ok_and(|state| state.running == 1)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "capture never claimed a lease"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    harness.client.send(ClientCommand::Quit).await.unwrap();
+    let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+    let state = store.work_state(harness.session.as_str(), 1).unwrap();
+    assert_eq!(
+        state.running, 0,
+        "a normal quit must release this process's lease: {state:?}"
+    );
+    assert_eq!(state.failed, 1, "the job stays retryable: {state:?}");
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled")),
+        "the release records the cancel, not a stolen lease: {state:?}"
     );
 }

@@ -62,7 +62,7 @@ impl TopicCatalog {
             }
             let metadata = entry.metadata()?;
             let (title, description) =
-                crate::v2::summarize_file(&entry.path(), crate::v2::MAX_DESCRIPTION_BYTES)?;
+                crate::scope::summarize_file(&entry.path(), crate::scope::MAX_DESCRIPTION_BYTES)?;
             entries.push(CatalogEntry {
                 path,
                 title: single_line(&title),
@@ -182,7 +182,7 @@ impl TopicCatalog {
                 continue;
             }
             let (title, description) =
-                crate::v2::summarize_file(&absolute, crate::v2::MAX_DESCRIPTION_BYTES)?;
+                crate::scope::summarize_file(&absolute, crate::scope::MAX_DESCRIPTION_BYTES)?;
             let status = if self
                 .entries
                 .binary_search_by(|entry| entry.path.as_str().cmp(path))

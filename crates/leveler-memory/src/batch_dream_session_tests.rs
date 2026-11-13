@@ -1,5 +1,5 @@
 use super::*;
-use crate::V2MemoryScope;
+use crate::MemoryScope;
 use crate::batch_dream::BatchClaimRequest;
 use crate::batch_dream_catalog::CATALOG_BUDGET_BYTES;
 use crate::batch_dream_plan::BatchPlan;
@@ -20,8 +20,8 @@ impl Fixture {
         let temp = TempDir::new().unwrap();
         let global = temp.path().join("global");
         let workspace = temp.path().join("workspace");
-        crate::ensure_scope_initialized(temp.path(), &global, V2MemoryScope::Global).unwrap();
-        crate::ensure_scope_initialized(temp.path(), &workspace, V2MemoryScope::Workspace).unwrap();
+        crate::ensure_scope_initialized(temp.path(), &global, MemoryScope::Global).unwrap();
+        crate::ensure_scope_initialized(temp.path(), &workspace, MemoryScope::Workspace).unwrap();
         for (name, body) in topics {
             std::fs::write(workspace.join(format!("topics/{name}")), body).unwrap();
         }
@@ -32,8 +32,7 @@ impl Fixture {
             filetime::set_file_mtime(&path, modified).unwrap();
         }
         let store = Arc::new(
-            BatchDreamStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-                .unwrap(),
+            BatchDreamStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap(),
         );
         let catalog = Arc::new(TopicCatalog::build(&store, CATALOG_BUDGET_BYTES).unwrap());
         let lease = store
