@@ -2416,9 +2416,9 @@ static ZH: UiText = UiText {
     },
     memory: MemoryText {
         title: "跨会话记忆",
-        footer_list: "↑↓ 选择 · ←→ 切换范围 · / 搜索 · Enter 展开预览 · x 遗忘 · y 复制路径\nr 刷新 · t 记忆开关 · d 整理 · D 批量整理 · f 刷新索引 · Ctrl+F 全屏 · Esc 返回",
+        footer_list: "↑↓ 选择 · ←→ 切换范围 · / 搜索 · Enter 展开预览 · x 遗忘 · y 复制路径\nr 刷新 · t 记忆开关 · d 整理 · D 批量整理 · f 立即捕获 · Ctrl+F 全屏 · Esc 返回",
         footer_filter: "输入以筛选 · Backspace 删除 · Ctrl+U 清空 · Enter/Esc 结束筛选",
-        footer_preview: "↑↓/PgUp PgDn 滚动 · g/G 顶部/底部 · Ctrl+F 或 Esc 返回列表 · x 遗忘 · y 复制路径\nt 记忆开关 · r 刷新 · d 整理 · D 批量整理",
+        footer_preview: "↑↓/PgUp PgDn 滚动 · g/G 顶部/底部 · Ctrl+F 或 Esc 返回列表 · x 遗忘 · y 复制路径\nt 记忆开关 · r 刷新 · d 整理 · D 批量整理 · f 立即捕获",
         loading: "正在读取记忆…",
         empty: "这个范围还没有记忆文件。",
         empty_filter: "没有匹配当前筛选的文件。",
@@ -3533,9 +3533,9 @@ static EN: UiText = UiText {
     },
     memory: MemoryText {
         title: "Cross-session memory",
-        footer_list: "↑↓ Select · ←→ Scope · / Search · Enter Expand · x Forget · y Copy path\nr Refresh · t Toggle memory · d Consolidate · D Batch · f Refresh index · Ctrl+F Fullscreen · Esc Back",
+        footer_list: "↑↓ Select · ←→ Scope · / Search · Enter Expand · x Forget · y Copy path\nr Refresh · t Toggle memory · d Consolidate · D Batch · f Capture now · Ctrl+F Fullscreen · Esc Back",
         footer_filter: "Type to filter · Backspace delete · Ctrl+U clear · Enter/Esc end search",
-        footer_preview: "↑↓/PgUp PgDn Scroll · g/G Top/Bottom · Ctrl+F or Esc Back to list · x Forget · y Copy path\nt Memory toggle · r Refresh · d Consolidate · D Batch",
+        footer_preview: "↑↓/PgUp PgDn Scroll · g/G Top/Bottom · Ctrl+F or Esc Back to list · x Forget · y Copy path\nt Memory toggle · r Refresh · d Consolidate · D Batch · f Capture now",
         loading: "Reading memory…",
         empty: "This scope has no memory files yet.",
         empty_filter: "No file matches the current search.",

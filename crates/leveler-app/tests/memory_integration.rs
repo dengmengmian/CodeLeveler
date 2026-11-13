@@ -1897,6 +1897,11 @@ async fn the_session_toggle_pauses_memory_for_this_session_only() {
     );
 
     // Pause through the same command the page sends.
+    // A file the user already has must stay visible while capture is paused:
+    // pausing stops new work, it does not erase the store.
+    let topics = harness.workspace_memory().join("topics");
+    std::fs::create_dir_all(&topics).unwrap();
+    std::fs::write(topics.join("pause-visibility.md"), "# note\n").unwrap();
     let paused = harness
         .action(ClientCommand::ToggleMemory {
             session_id: harness.session.clone(),
@@ -1910,6 +1915,14 @@ async fn the_session_toggle_pauses_memory_for_this_session_only() {
     assert!(!status.enabled, "the page reports the pause");
     assert_eq!(status.rollout, "active", "the configuration is unchanged");
     assert!(!status.capture_enabled);
+    assert!(
+        status
+            .workspace
+            .files
+            .iter()
+            .any(|file| file.path == "topics/pause-visibility.md"),
+        "a paused session still reads the files it has: {status:?}"
+    );
     assert_eq!(
         harness
             .app

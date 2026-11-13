@@ -117,13 +117,15 @@ impl MemoryStatus {
 impl MemoryRuntime {
     /// Read the current status. `session` adds that session's cursors.
     ///
-    /// An `off` rollout touches nothing on disk: opening a scope would create
-    /// its directory and state database, and a default installation must stay
-    /// exactly as it was until the user opts in.
+    /// A configured `off` rollout touches nothing on disk: opening a scope
+    /// would create its directory and state database, and a default
+    /// installation must stay exactly as it was until the user opts in. A
+    /// session pause is not that case: it stops new capture and injection,
+    /// but the files the user already has are still read and shown.
     pub async fn status(&self, session: Option<&SessionId>) -> MemoryStatus {
         let configured = self.config();
         let config = self.config_for(session.map(SessionId::as_str));
-        if config.rollout == MemoryRollout::Off {
+        if configured.rollout == MemoryRollout::Off {
             let ephemeral = self.storage.is_ephemeral();
             return MemoryStatus {
                 rollout: configured.rollout,
@@ -212,7 +214,7 @@ impl MemoryRuntime {
             .unwrap_or_default();
         MemoryStatus {
             rollout: configured.rollout,
-            enabled: true,
+            enabled: config.rollout != MemoryRollout::Off,
             capture_enabled: config.can_capture() && !self.storage.is_ephemeral(),
             automatic_dream_enabled: config.can_run_automatic_dream()
                 && !self.storage.is_ephemeral(),

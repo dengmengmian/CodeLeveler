@@ -38,7 +38,7 @@ impl MemoryScopeKind {
         }
     }
 
-    fn v2(self) -> MemoryScope {
+    fn as_memory_scope(self) -> MemoryScope {
         match self {
             Self::Global => MemoryScope::Global,
             Self::Workspace => MemoryScope::Workspace,
@@ -180,7 +180,7 @@ impl MemoryRuntime {
         let forgotten = tokio::task::spawn_blocking(move || {
             let store = MaintenanceStore::open(
                 &scope_dir,
-                scope.v2(),
+                scope.as_memory_scope(),
                 storage.global_dir(),
                 storage.workspace_dir(),
             )
