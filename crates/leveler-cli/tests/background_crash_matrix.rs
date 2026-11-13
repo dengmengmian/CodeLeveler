@@ -647,8 +647,17 @@ fn h2_host_crash_after_spawn_before_started_never_replays_the_side_effect() {
             wait_until(|| Ok(!alive(host)), "the injected host death")
                 .await
                 .unwrap();
+            // The shell creates the file before writing the pid into it, so
+            // existence alone can observe an empty file. Wait for the whole
+            // `echo $$` write: a trailing newline and a parseable pid.
             wait_until(
-                || Ok(env.repo.join("h2-child.pid").exists()),
+                || {
+                    Ok(std::fs::read_to_string(env.repo.join("h2-child.pid"))
+                        .ok()
+                        .is_some_and(|text| {
+                            text.ends_with('\n') && text.trim().parse::<u32>().is_ok()
+                        }))
+                },
                 "the real child process",
             )
             .await
