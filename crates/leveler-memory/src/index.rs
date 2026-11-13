@@ -15,6 +15,20 @@ use crate::schema;
 use crate::sqlite_journal::JournalMode;
 use crate::storage::MemoryStorage;
 
+/// The stored identity of a file path.
+///
+/// One file can reach the index through several spellings: native separators
+/// from a filesystem walk, `/`-normalized database paths, a verbatim Windows
+/// prefix, or a join that mixes the two. They name the same file, so the key
+/// is normalized before it is stored or looked up; otherwise an update or
+/// deletion silently misses the row written under the other spelling.
+pub(crate) fn path_key(path: &Path) -> String {
+    let path = dunce::simplified(path);
+    // Memory layouts only generate ordinary names; `/` is the portable
+    // spelling every store already uses, so `\` is a separator here too.
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// A record from the `chunks` table.
 #[derive(Debug, Clone)]
 pub struct ChunkRecord {
@@ -140,7 +154,7 @@ impl MemoryIndex {
 
         let new_chunks = chunk_markdown(content, &self.chunk_config);
         span.record("chunk_count", new_chunks.len() as i64);
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = path_key(path);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -402,7 +416,7 @@ impl MemoryIndex {
 
     /// Delete every indexed chunk for a file path in one transaction.
     pub fn delete_path(&mut self, path: &Path) -> Result<usize, rusqlite::Error> {
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = path_key(path);
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -462,6 +476,8 @@ impl MemoryIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn index(root: &Path) -> MemoryIndex {
@@ -501,6 +517,36 @@ mod tests {
         std::fs::write(&file, "# Build\n\ncargo test all targets\n").unwrap();
         index.reindex_file(&file, "workspace").unwrap();
         assert_eq!(index.delete_path(&file).unwrap(), 1);
+        assert!(index.search_fts("cargo", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_path_has_one_key_across_separator_spellings() {
+        // The same file reaches the index as a native path, a stored path
+        // joined onto a scope, or a `/`-normalized database path.
+        for spelling in [
+            Path::new("C:\\memory\\topics\\build.md"),
+            Path::new("C:/memory/topics/build.md"),
+            Path::new("C:\\memory/topics/build.md"),
+        ] {
+            assert_eq!(path_key(spelling), "C:/memory/topics/build.md");
+        }
+    }
+
+    #[test]
+    fn delete_path_uses_the_same_key_as_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = index(dir.path());
+        let native = dir.path().join("topics").join("build.md");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, "# Build\n\ncargo test all targets\n").unwrap();
+        index.reindex_file(&native, "workspace").unwrap();
+
+        // On Windows the alternative spelling differs from `native`; on Unix
+        // the same bytes spell the same path, so both cases must resolve.
+        let slashed: PathBuf = dir.path().to_string_lossy().replace('\\', "/").into();
+        let alternate = slashed.join("topics/build.md");
+        assert_eq!(index.delete_path(&alternate).unwrap(), 1);
         assert!(index.search_fts("cargo", 10).unwrap().is_empty());
     }
 

@@ -105,11 +105,16 @@ fn manifest_is_deterministic_and_includes_topics_before_observations() {
     let capture = scope.join("observations/_inbox/01a0-session__t000002-000002__n000.md");
     std::fs::write(&capture, "# Newer capture\n\nLater evidence.").unwrap();
     let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    std::fs::File::open(&remember)
+    // Windows only updates timestamps through a writable handle.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&remember)
         .unwrap()
         .set_modified(base)
         .unwrap();
-    std::fs::File::open(&capture)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&capture)
         .unwrap()
         .set_modified(base + std::time::Duration::from_secs(60))
         .unwrap();

@@ -183,6 +183,10 @@ impl MemoryAccessPolicy {
     /// Returns [`MemoryAccessError::Inspect`] if the nearest existing path prefix
     /// cannot be resolved.
     pub fn classify_path(&self, path: &Path) -> MemoryAccessResult<MemoryPathClass> {
+        // Resolvers may hand back the verbatim spelling (`\\?\C:\…`) while
+        // the configured roots keep the compatible one. They name the same
+        // file, so classification compares one spelling.
+        let path = dunce::simplified(path);
         if !path.is_absolute() {
             return Err(MemoryAccessError::RelativePath(path.to_path_buf()));
         }
@@ -460,6 +464,7 @@ impl MemoryAccessPolicy {
         path: &Path,
         class: MemoryPathClass,
     ) -> MemoryAccessResult<PathBuf> {
+        let path = dunce::simplified(path);
         let Some(scope) = class.scope() else {
             return Ok(path.to_path_buf());
         };
@@ -843,6 +848,11 @@ fn reject_symlink_components(root: &Path, path: &Path) -> MemoryAccessResult<()>
     let mut current = root.to_path_buf();
     for component in relative.components() {
         current.push(component);
+        // A drive prefix or root is not a file: inspecting the prefix alone
+        // (`\\?\C:`) fails with an OS error before the first real component.
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(MemoryAccessError::Symlink(current));
