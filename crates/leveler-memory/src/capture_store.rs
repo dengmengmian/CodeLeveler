@@ -776,12 +776,34 @@ impl CaptureStore {
     /// Relinquish an exact owner+attempt during cancellation without waiting
     /// for the persisted lease deadline.
     pub fn release_retryable(&self, lease: &CaptureLease, error: &str) -> Result<()> {
+        self.release_matching(lease, error, false)
+    }
+
+    /// Relinquish a lease interrupted by a normal shutdown.
+    ///
+    /// A process that quits is not an extraction failure: the range is
+    /// untouched and a later process must retry it. The claim's attempt is
+    /// therefore refunded, so repeatedly quitting shortly after a turn cannot
+    /// exhaust the retry budget and terminal-fail legitimate knowledge. Real
+    /// extraction failures keep their attempt; the bound still applies to
+    /// them.
+    pub fn release_cancelled(&self, lease: &CaptureLease, error: &str) -> Result<()> {
+        self.release_matching(lease, error, true)
+    }
+
+    fn release_matching(
+        &self,
+        lease: &CaptureLease,
+        error: &str,
+        refund_attempt: bool,
+    ) -> Result<()> {
         let error = sanitize_failure(error);
         let mut connection = self.open_state()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
             "UPDATE capture_jobs SET status = 'failed', lease_owner = NULL,
-                lease_expires_at = NULL, last_error = ?2
+                lease_expires_at = NULL, last_error = ?2,
+                attempt = CASE WHEN ?6 = 1 THEN MAX(attempt - 1, 0) ELSE attempt END
              WHERE job_id = ?1 AND session_id = ?3 AND status = 'running'
                 AND lease_owner = ?4 AND attempt = ?5",
             params![
@@ -789,7 +811,8 @@ impl CaptureStore {
                 error,
                 lease.job.session_id,
                 lease.owner,
-                lease.job.attempt
+                lease.job.attempt,
+                refund_attempt
             ],
         )?;
         if updated != 1 {

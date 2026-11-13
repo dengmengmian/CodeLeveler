@@ -658,7 +658,15 @@ async fn run_capture_worker(
                     }
                 }
             }
-            Err(failure) => {
+            Err(ExtractionError::Cancelled) => {
+                tracing::info!(
+                    from_turn = range.start_turn(),
+                    through_turn = range.through_turn(),
+                    "memory capture interrupted by shutdown"
+                );
+                release_cancelled(&store, &lease).await;
+            }
+            Err(ExtractionError::Failure(failure)) => {
                 tracing::warn!(
                     from_turn = range.start_turn(),
                     through_turn = range.through_turn(),
@@ -695,6 +703,19 @@ struct ExtractionFailure {
     terminal: bool,
 }
 
+/// A shutdown is not an extraction failure: the range is untouched and a
+/// later process must retry it without charging the failure budget.
+enum ExtractionError {
+    Cancelled,
+    Failure(ExtractionFailure),
+}
+
+impl From<ExtractionFailure> for ExtractionError {
+    fn from(failure: ExtractionFailure) -> Self {
+        Self::Failure(failure)
+    }
+}
+
 /// Extract one claimed range. A missing/oversized transcript and a malformed
 /// model answer are retryable until the attempt bound; a corrupt stored
 /// payload is terminal, because retrying cannot change the evidence.
@@ -706,7 +727,7 @@ async fn extract_range(
     model: &ModelRef,
     job: &leveler_memory::CaptureJob,
     cancel: &CancellationToken,
-) -> Result<CaptureOutcomeDraft, ExtractionFailure> {
+) -> Result<CaptureOutcomeDraft, ExtractionError> {
     let registry = config.snapshot().registry.clone();
     let route = runtime.model_override().unwrap_or_else(|| model.clone());
     let turns = TurnRepository::new(db)
@@ -727,10 +748,10 @@ async fn extract_range(
     let from = usize::try_from(job.range.start_turn().saturating_sub(1)).unwrap_or(usize::MAX);
     let through = usize::try_from(job.range.through_turn()).unwrap_or(usize::MAX);
     let Some(selected) = eligible.get(from..through) else {
-        return Err(ExtractionFailure {
+        return Err(ExtractionError::Failure(ExtractionFailure {
             detail: "capture range no longer maps to settled turns".to_owned(),
             terminal: true,
-        });
+        }));
     };
     // A job must not hand a paused or disabled turn to the extraction model,
     // even if an older range index still names it.
@@ -796,10 +817,7 @@ async fn extract_range(
     let result = tokio::select! {
         biased;
         () = cancel.cancelled() => {
-            return Err(ExtractionFailure {
-                detail: "capture worker cancelled".to_owned(),
-                terminal: false,
-            });
+            return Err(ExtractionError::Cancelled);
         }
         result = tokio::time::timeout(
             EXTRACTION_TIMEOUT,
@@ -840,10 +858,10 @@ async fn extract_range(
         terminal: false,
     })?;
     if response.finish_reason == FinishReason::Length {
-        return Err(ExtractionFailure {
+        return Err(ExtractionError::Failure(ExtractionFailure {
             detail: "extraction output was truncated".to_owned(),
             terminal: job.attempt >= MAX_CAPTURE_ATTEMPTS,
-        });
+        }));
     }
     let arguments = response
         .message
@@ -860,9 +878,11 @@ async fn extract_range(
             terminal: false,
         })?;
     parse_model_outcome(&arguments, &route.model, leveler_core::now().timestamp()).map_err(
-        |detail| ExtractionFailure {
-            detail,
-            terminal: job.attempt >= MAX_CAPTURE_ATTEMPTS,
+        |detail| {
+            ExtractionError::Failure(ExtractionFailure {
+                detail,
+                terminal: job.attempt >= MAX_CAPTURE_ATTEMPTS,
+            })
         },
     )
 }
@@ -892,6 +912,22 @@ async fn fail_lease(
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%error, "memory capture lease release failed"),
         Err(error) => tracing::warn!(%error, "memory capture lease release task failed"),
+    }
+}
+
+/// Release a claim interrupted by shutdown without charging the extraction
+/// failure budget. The range stays retryable for the next process.
+async fn release_cancelled(store: &CaptureStore, lease: &leveler_memory::CaptureLease) {
+    let store = store.clone();
+    let lease = lease.clone();
+    let released = tokio::task::spawn_blocking(move || {
+        store.release_cancelled(&lease, "capture worker cancelled")
+    })
+    .await;
+    match released {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "memory capture cancel release failed"),
+        Err(error) => tracing::warn!(%error, "memory capture cancel release task failed"),
     }
 }
 

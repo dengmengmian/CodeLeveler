@@ -670,6 +670,36 @@ fn cancellation_release_makes_lease_immediately_retryable() {
 }
 
 #[test]
+fn a_shutdown_cancellation_does_not_charge_the_retry_budget() {
+    let (_temp, store) = setup();
+    store.enqueue("session", range(1, 1)).unwrap();
+
+    // Quit while extraction is in flight, repeatedly. Each claim is refunded,
+    // so the bounded failure budget stays available for real failures.
+    for round in 1..=5 {
+        let lease = claim(&store, "worker", 10 + round);
+        assert_eq!(lease.job.attempt, 1, "round {round}");
+        store
+            .release_cancelled(&lease, "capture worker cancelled")
+            .unwrap();
+        let state = store.work_state("session", 1).unwrap();
+        assert_eq!(state.failed, 1, "round {round}");
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("capture worker cancelled")
+        );
+    }
+
+    // A real failure after those cancellations still counts.
+    let lease = claim(&store, "worker", 20);
+    assert_eq!(lease.job.attempt, 1);
+    store
+        .fail_retryable(&lease, 21, "malformed structured output")
+        .unwrap();
+    assert_eq!(claim(&store, "worker", 22).job.attempt, 2);
+}
+
+#[test]
 fn retry_same_bytes_is_idempotent_and_different_outcome_is_rejected() {
     let (_temp, store) = setup();
     store.enqueue("session", range(1, 2)).unwrap();

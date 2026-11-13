@@ -2096,3 +2096,70 @@ async fn a_restarted_process_resumes_the_cancelled_capture_without_a_new_turn() 
         "the recovered extraction committed its observation"
     );
 }
+
+#[tokio::test]
+async fn normal_quits_do_not_exhaust_the_capture_retry_budget() {
+    let harness = harness(vec![
+        text_response("first"),
+        MockResponse::NeverResponds,
+        MockResponse::NeverResponds,
+        MockResponse::NeverResponds,
+        capture_response(observation(
+            "Quitting the application is not an extraction failure.",
+        )),
+    ])
+    .await;
+    harness.submit("first turn").await;
+
+    // Three normal exits, each with the extraction in flight. A shutdown
+    // cancellation must not consume the bounded extraction-failure budget.
+    for cycle in 1..=3 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let store =
+                CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+            if store
+                .work_state(harness.session.as_str(), 1)
+                .is_ok_and(|state| state.running == 1)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cycle {cycle}: capture never claimed a lease"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        harness.client.send(ClientCommand::Quit).await.unwrap();
+
+        let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+        assert_eq!(
+            store.cursors(harness.session.as_str()).unwrap().captured,
+            0,
+            "cycle {cycle}: nothing was captured before the cancel"
+        );
+        assert!(
+            store
+                .sessions_with_claimable_jobs(leveler_core::now().timestamp(), 16)
+                .unwrap()
+                .contains(&harness.session.as_str().to_owned()),
+            "cycle {cycle}: an interrupted range stays recoverable"
+        );
+
+        // The pass a fresh process performs at startup.
+        harness
+            .app
+            .recover_memory_captures(&harness.models[0])
+            .await;
+    }
+    harness.wait_for_capture().await;
+
+    let store = CaptureStore::open(harness.workspace_memory(), MemoryScope::Workspace).unwrap();
+    assert_eq!(
+        store.cursors(harness.session.as_str()).unwrap().captured,
+        1,
+        "the fourth attempt captured the range"
+    );
+    let notes = harness.inbox_notes();
+    assert_eq!(notes.len(), 1, "exactly one observation, not a duplicate");
+}
