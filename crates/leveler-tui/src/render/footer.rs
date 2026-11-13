@@ -182,10 +182,10 @@ pub(crate) fn render_slash_popup(
     transcript: Rect,
     composer: Rect,
     state: &AppState,
-) {
+) -> Option<Rect> {
     let matches = slash_popup_match_rows(state);
     if matches.is_empty() {
-        return;
+        return None;
     }
     let theme = &state.theme;
     // Keep the highlighted row visible.
@@ -198,7 +198,7 @@ pub(crate) fn render_slash_popup(
     let rows = (end - start) as u16;
     let (popup, inner, content) = slash_popup_geometry(transcript, composer, rows);
     if popup.width == 0 || popup.height == 0 {
-        return;
+        return None;
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -214,7 +214,7 @@ pub(crate) fn render_slash_popup(
     theme.paint_surface(frame, popup, theme.surface.elevated);
     frame.render_widget(block, popup);
     if inner.width == 0 || inner.height == 0 || content.width == 0 {
-        return;
+        return Some(popup);
     }
     let content_right = content.x.saturating_add(content.width);
     let buf = frame.buffer_mut();
@@ -278,6 +278,7 @@ pub(crate) fn render_slash_popup(
             put_clipped(buf, x, y, &cells.desc, content_right, desc_style);
         }
     }
+    Some(popup)
 }
 
 /// Visible candidate rows. The menu scrolls; it never grows without bound.
@@ -357,10 +358,10 @@ pub(crate) fn render_shell_completion(
     transcript: Rect,
     composer: Rect,
     state: &mut AppState,
-) {
+) -> Option<Rect> {
     if !state.completion.open || state.completion.items.is_empty() {
         state.completion.rect = None;
-        return;
+        return None;
     }
     // The fixed live-activity row sits directly above the composer and must
     // stay visible under the menu, so the menu anchors above it.
@@ -374,7 +375,7 @@ pub(crate) fn render_shell_completion(
         completion_geometry(transcript, anchor, state.completion.items.len());
     if rows == 0 || popup.width == 0 || popup.height == 0 {
         state.completion.rect = None;
-        return;
+        return None;
     }
     let theme = &state.theme;
     let total = state.completion.items.len();
@@ -392,7 +393,7 @@ pub(crate) fn render_shell_completion(
     theme.paint_surface(frame, popup, theme.surface.elevated);
     frame.render_widget(block, popup);
     if inner.width == 0 || inner.height == 0 || content.width == 0 {
-        return;
+        return Some(popup);
     }
     let content_right = content.x.saturating_add(content.width);
     let content_w = content.width as usize;
@@ -493,6 +494,7 @@ pub(crate) fn render_shell_completion(
     // The visible window itself is state: mouse hit-testing maps a row back
     // to the same items the reader sees.
     state.completion.visible_start = start;
+    Some(popup)
 }
 
 /// Shared match list for slash / @file / $skill popups (name, description).
@@ -1707,7 +1709,7 @@ mod slash_popup_layout_tests {
                 let line = stain.repeat(8);
                 let lines = vec![Line::from(line); frame.area().height as usize];
                 frame.render_widget(Paragraph::new(lines), frame.area());
-                render_slash_popup(frame, transcript, composer, &state);
+                let _ = render_slash_popup(frame, transcript, composer, &state);
             })
             .unwrap();
         let matches = slash_popup_match_rows(&state);
@@ -1741,7 +1743,9 @@ mod slash_popup_layout_tests {
             };
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
-                .draw(|frame| render_slash_popup(frame, transcript, composer, &state))
+                .draw(|frame| {
+                    let _ = render_slash_popup(frame, transcript, composer, &state);
+                })
                 .expect("painting the menu must not run past the buffer");
             let matches = slash_popup_match_rows(&state);
             let rows = matches.len().min(8) as u16;

@@ -1326,6 +1326,7 @@ use screens::{
 /// Conversation uses the workbench layout (Header / Conversation viewport /
 /// Plan / Input / Footer). Other screens keep the classic full-screen panes.
 pub fn render(frame: &mut Frame, state: &mut AppState) {
+    state.plan_hit = None;
     state.background_stop_hits.clear();
     state.background_list_hits.clear();
     // Every page republishes its own row hits, so a page that publishes none

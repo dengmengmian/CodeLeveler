@@ -1363,3 +1363,63 @@ async fn submitted_user_messages_cross_the_boundary_in_order() {
         "harness notices must never read as user input:\n{block}"
     );
 }
+
+/// The checkpoint carries the plan the model last declared, not the mirror the
+/// ledger happened to hold. The blocked reconciliation can rewrite a plan
+/// inside a window; window 2 must resume from the rewritten list.
+#[tokio::test]
+async fn the_checkpoint_plan_is_the_latest_declaration_after_a_rewrite() {
+    let fx = fixture().await;
+    let step = |text: &str, status: &str| leveler_lifecycle::PlanStep {
+        step: text.to_string(),
+        status: status.to_string(),
+        id: None,
+        origin: leveler_lifecycle::PlanOrigin::ModelExplicit,
+    };
+    append_event(
+        &fx,
+        EngineEvent::PlanUpdated {
+            steps: vec![step("stage-5", "completed"), step("stage-6", "pending")],
+            created: true,
+            call_id: Some("p1".into()),
+        },
+    )
+    .await;
+    append_event(
+        &fx,
+        EngineEvent::PlanUpdated {
+            steps: vec![
+                step("stage-5", "completed"),
+                step("stage-6 folded into stage-5", "completed"),
+                step("stage-7 needs the registry", "pending"),
+            ],
+            created: false,
+            call_id: Some("p2".into()),
+        },
+    )
+    .await;
+    append_messages(&fx, &["continue after the plan rewrite"]).await;
+
+    let record = create_goal_checkpoint(
+        &fx.engine,
+        &fx.session,
+        &fx.scope,
+        CheckpointReason::Milestone,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("running goal checkpoint");
+    let plan = record.payload.plan.expect("the declared plan crosses");
+    assert_eq!(
+        plan.total, 3,
+        "the rewritten list is the current plan, not the first one"
+    );
+    assert_eq!(plan.completed, 2);
+    assert_eq!(
+        plan.next_step.as_deref(),
+        Some("stage-7 needs the registry"),
+        "resume points at the open work in the latest declaration"
+    );
+}
