@@ -93,7 +93,7 @@ impl Tool for WriteFileTool {
                 crate::memory_access::write_file(&context, &memory_path, input.content.as_bytes())
                     .await;
             return match written {
-                Ok(leveler_memory::MemoryV2Write::Written { previous_content }) => {
+                Ok(leveler_memory::MemoryWrite::Written { previous_content }) => {
                     let verb = if previous_content.is_some() {
                         "Replaced"
                     } else {
@@ -114,7 +114,7 @@ impl Tool for WriteFileTool {
                             .with_metadata(meta),
                     )
                 }
-                Ok(leveler_memory::MemoryV2Write::Outside) => Ok(ToolOutput::error(
+                Ok(leveler_memory::MemoryWrite::Outside) => Ok(ToolOutput::error(
                     "the memory policy accepted this path but did not persist it; \
                      nothing was written",
                 )),

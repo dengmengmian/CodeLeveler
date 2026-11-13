@@ -16,11 +16,10 @@ impl Fixture {
         let temp = TempDir::new().unwrap();
         let global = temp.path().join("global");
         let workspace = temp.path().join("workspace");
-        crate::ensure_scope_initialized(temp.path(), &global, V2MemoryScope::Global).unwrap();
-        crate::ensure_scope_initialized(temp.path(), &workspace, V2MemoryScope::Workspace).unwrap();
+        crate::ensure_scope_initialized(temp.path(), &global, MemoryScope::Global).unwrap();
+        crate::ensure_scope_initialized(temp.path(), &workspace, MemoryScope::Workspace).unwrap();
         let store =
-            BatchDreamStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-                .unwrap();
+            BatchDreamStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
         Fixture {
             _temp: temp,
             workspace,
@@ -135,7 +134,7 @@ fn interrupted_commit_publishes_nothing() {
     let lease = f.claim(10, 10_000, &[]).unwrap();
     let interrupted = BatchDreamStore::open(
         &f.workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &f.global,
         &f.workspace,
     )

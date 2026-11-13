@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::v2::{self, V2MemoryScope, V2StorageError, ensure_scope_initialized};
+use crate::scope::{self, MemoryScope, MemoryScopeError, ensure_scope_initialized};
 
 /// Root-relative directory layout for one workspace's memory.
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ impl MemoryStorage {
 
     /// A flat root where the global and workspace scopes are the same directory.
     ///
-    /// The v2 stores use this when they already hold an explicit scope
+    /// The memory stores use this when they already hold an explicit scope
     /// directory and only need the index's storage handle.
     pub fn new_flat(cwd: &Path, root: &Path) -> Self {
         Self {
@@ -74,24 +74,26 @@ impl MemoryStorage {
     ///
     /// Ephemeral workspaces keep their memory in the global scope only, so
     /// temporary directories never accumulate workspace state.
-    pub fn ensure_initialized(&self) -> Result<(), V2StorageError> {
-        ensure_scope_initialized(self.storage_root(), &self.global_dir, V2MemoryScope::Global)?;
+    pub fn ensure_initialized(&self) -> Result<(), MemoryScopeError> {
+        ensure_scope_initialized(self.storage_root(), &self.global_dir, MemoryScope::Global)?;
         if !self.ephemeral {
             ensure_scope_initialized(
                 self.storage_root(),
                 &self.workspace_dir,
-                V2MemoryScope::Workspace,
+                MemoryScope::Workspace,
             )?;
         } else {
             // No memory belongs to a temporary working directory, but the
-            // scope root is still passed to V2MemoryAccessPolicy, which
+            // scope root is still passed to MemoryAccessPolicy, which
             // canonicalizes both roots. Create only the empty directory so
             // that a global-scope read or maintenance open does not fail on
             // a root the policy is told to guard.
-            std::fs::create_dir_all(&self.workspace_dir).map_err(|source| V2StorageError::Io {
-                operation: "create ephemeral v2 workspace directory",
-                path: self.workspace_dir.clone(),
-                source,
+            std::fs::create_dir_all(&self.workspace_dir).map_err(|source| {
+                MemoryScopeError::Io {
+                    operation: "create ephemeral memory workspace directory",
+                    path: self.workspace_dir.clone(),
+                    source,
+                }
             })?;
         }
         Ok(())
@@ -102,19 +104,19 @@ impl MemoryStorage {
     /// The note is normalized into Markdown (a short first line becomes the
     /// observation heading), initialized lazily so `/remember` works in a fresh
     /// installation, and rejected before any write when it exceeds the limit.
-    pub fn save_remember_note(&self, content: &str) -> Result<Option<PathBuf>, V2StorageError> {
+    pub fn save_remember_note(&self, content: &str) -> Result<Option<PathBuf>, MemoryScopeError> {
         let normalized = normalize_memory_content(content);
         if normalized.is_empty() {
             return Ok(None);
         }
-        if normalized.len() > crate::v2::MAX_MANUAL_OBSERVATION_BYTES {
-            return Err(V2StorageError::ObservationTooLarge {
+        if normalized.len() > crate::scope::MAX_MANUAL_OBSERVATION_BYTES {
+            return Err(MemoryScopeError::ObservationTooLarge {
                 actual_bytes: normalized.len(),
-                limit_bytes: crate::v2::MAX_MANUAL_OBSERVATION_BYTES,
+                limit_bytes: crate::scope::MAX_MANUAL_OBSERVATION_BYTES,
             });
         }
-        ensure_scope_initialized(self.storage_root(), &self.global_dir, V2MemoryScope::Global)?;
-        v2::persist_observation(&self.global_dir, &normalized).map(Some)
+        ensure_scope_initialized(self.storage_root(), &self.global_dir, MemoryScope::Global)?;
+        scope::persist_observation(&self.global_dir, &normalized).map(Some)
     }
 
     pub fn global_memory_file(&self) -> PathBuf {
@@ -127,7 +129,7 @@ impl MemoryStorage {
 
     /// Files the Memory UI may browse, in manifest order with per-scope caps.
     pub fn list_memory_files(&self) -> std::io::Result<Vec<PathBuf>> {
-        crate::storage_v2::list_memory_files(&self.global_dir, &self.workspace_dir)
+        crate::browse::list_memory_files(&self.global_dir, &self.workspace_dir)
     }
 }
 
@@ -338,7 +340,7 @@ mod tests {
         let storage = MemoryStorage::for_workspace(cwd.path(), root.path());
         assert!(storage.is_ephemeral());
         storage.ensure_initialized().unwrap();
-        let policy = crate::v2_access::V2MemoryAccessPolicy::new(
+        let policy = crate::access_policy::MemoryAccessPolicy::new(
             storage.global_dir(),
             storage.workspace_dir(),
         )

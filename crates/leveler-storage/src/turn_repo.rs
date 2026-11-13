@@ -2,9 +2,43 @@
 //! orchestrated node, repair attempt). Turns own their transcript messages
 //! (`session_messages.turn_id`) and give resume its boundaries.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use leveler_core::{SessionId, Timestamp, TurnId};
+
+/// Whether automatic memory capture may queue this turn later.
+///
+/// The first write wins. A paused or globally disabled turn stays ineligible
+/// after memory is turned back on. A missing row is not a disposition: the
+/// caller decides whether that turn predates the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCaptureDisposition {
+    /// Memory was enabled when the turn settled.
+    Eligible,
+    /// The user paused memory, or memory was off, when the turn settled.
+    Ineligible,
+}
+
+impl MemoryCaptureDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Ineligible => "ineligible",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "eligible" => Ok(Self::Eligible),
+            "ineligible" => Ok(Self::Ineligible),
+            other => Err(StorageError::InvalidData(format!(
+                "unknown memory capture disposition `{other}`"
+            ))),
+        }
+    }
+}
 
 use crate::database::{Database, StorageError};
 
@@ -204,6 +238,75 @@ impl<'a> TurnRepository<'a> {
         };
         Ok(rows)
     }
+
+    /// Record the first capture decision for a turn. A later call does not
+    /// change it: re-enabling memory must not rewrite a turn that settled
+    /// while memory was paused or off.
+    pub async fn admit_memory_capture(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        disposition: MemoryCaptureDisposition,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO memory_capture_eligibility(
+                turn_id, session_id, disposition, decided_at
+             )
+             SELECT ?1, ?2, ?3, ?4 FROM turns WHERE id = ?1 AND session_id = ?2",
+        )
+        .bind(turn_id)
+        .bind(session_id.as_str())
+        .bind(disposition.as_str())
+        .bind(now.to_rfc3339())
+        .execute(self.db.pool())
+        .await?;
+        if inserted.rows_affected() == 1 {
+            return Ok(());
+        }
+        if self.memory_capture_disposition(turn_id).await?.is_some() {
+            return Ok(());
+        }
+        Err(StorageError::InvalidData(format!(
+            "turn `{turn_id}` is not in session `{}`",
+            session_id.as_str()
+        )))
+    }
+
+    /// The recorded decision, if this turn has one.
+    pub async fn memory_capture_disposition(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<MemoryCaptureDisposition>, StorageError> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT disposition FROM memory_capture_eligibility WHERE turn_id = ?1",
+        )
+        .bind(turn_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        value
+            .as_deref()
+            .map(MemoryCaptureDisposition::parse)
+            .transpose()
+    }
+
+    /// Every recorded decision in one session, keyed by turn id.
+    pub async fn memory_capture_dispositions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<HashMap<String, MemoryCaptureDisposition>, StorageError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT turn_id, disposition FROM memory_capture_eligibility WHERE session_id = ?1",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut decisions = HashMap::with_capacity(rows.len());
+        for (turn_id, disposition) in rows {
+            decisions.insert(turn_id, MemoryCaptureDisposition::parse(&disposition)?);
+        }
+        Ok(decisions)
+    }
 }
 
 #[cfg(test)]
@@ -379,5 +482,46 @@ mod tests {
         let payload = turn.payload.unwrap();
         assert!(!payload.contains("turn-secret-value"), "{payload}");
         assert!(payload.contains("[REDACTED]"), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn memory_capture_admission_sticks_and_does_not_upgrade() {
+        let (db, session) = db_with_session().await;
+        let repo = TurnRepository::new(&db);
+        let turn = repo
+            .start(&session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        assert!(
+            repo.memory_capture_disposition(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        repo.admit_memory_capture(
+            &session,
+            &turn.id,
+            MemoryCaptureDisposition::Ineligible,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        repo.admit_memory_capture(
+            &session,
+            &turn.id,
+            MemoryCaptureDisposition::Eligible,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.memory_capture_disposition(&turn.id).await.unwrap(),
+            Some(MemoryCaptureDisposition::Ineligible)
+        );
+        let listed = repo.memory_capture_dispositions(&session).await.unwrap();
+        assert_eq!(
+            listed.get(&turn.id).copied(),
+            Some(MemoryCaptureDisposition::Ineligible)
+        );
     }
 }

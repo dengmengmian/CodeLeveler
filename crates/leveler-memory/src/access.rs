@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 /// Result of routing a write through the memory policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemoryV2Write {
+pub enum MemoryWrite {
     /// The path is outside configured memory roots; preserve normal tool behavior.
     Outside,
     /// The policy completed the write and refreshed the generated manifest.
@@ -16,7 +16,7 @@ pub enum MemoryV2Write {
 }
 
 /// Session-scoped policy implemented by the memory storage layer.
-pub trait MemoryV2Access: std::fmt::Debug + Send + Sync {
+pub trait MemoryAccess: std::fmt::Debug + Send + Sync {
     /// Validate a read/search/list target. Returns whether it belongs to memory.
     fn validate_read(&self, path: &Path) -> Result<bool, String>;
 
@@ -27,7 +27,7 @@ pub trait MemoryV2Access: std::fmt::Debug + Send + Sync {
     fn preflight_write(&self, path: &Path, contents: &[u8]) -> Result<bool, String>;
 
     /// Atomically create or replace a permitted memory file.
-    fn write_file(&self, path: &Path, contents: &[u8]) -> Result<MemoryV2Write, String>;
+    fn write_file(&self, path: &Path, contents: &[u8]) -> Result<MemoryWrite, String>;
 
     /// Return both configured scope roots for prompt and UI metadata.
     fn scope_roots(&self) -> [PathBuf; 2];
@@ -35,10 +35,10 @@ pub trait MemoryV2Access: std::fmt::Debug + Send + Sync {
 
 /// Shared handle installed in the tool execution resources.
 #[derive(Clone)]
-pub struct MemoryV2AccessResource(pub Arc<dyn MemoryV2Access>);
+pub struct MemoryAccessResource(pub Arc<dyn MemoryAccess>);
 
-impl std::fmt::Debug for MemoryV2AccessResource {
+impl std::fmt::Debug for MemoryAccessResource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("MemoryV2AccessResource").finish()
+        formatter.debug_struct("MemoryAccessResource").finish()
     }
 }

@@ -9,7 +9,7 @@ use crate::sqlite_journal::JournalMode;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 
 use crate::batch_dream_io::{hash_bytes, read_bounded};
-use crate::{V2MemoryAccessPolicy, V2MemoryScope, V2PathClass};
+use crate::{MemoryAccessPolicy, MemoryPathClass, MemoryScope};
 
 pub use crate::batch_dream_catalog::{CATALOG_BUDGET_BYTES, CatalogTier, TopicCatalog};
 pub use crate::batch_dream_control::BatchDreamControl;
@@ -63,9 +63,9 @@ pub enum BatchDreamError {
     #[error("batch Dream filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("batch Dream access denied: {0}")]
-    Access(#[from] crate::V2AccessError),
+    Access(#[from] crate::MemoryAccessError),
     #[error("batch Dream manifest or index update failed: {0}")]
-    Storage(#[from] crate::V2StorageError),
+    Storage(#[from] crate::MemoryScopeError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,8 +173,8 @@ pub struct BatchReport {
 #[derive(Debug)]
 pub struct BatchDreamStore {
     pub(crate) scope_dir: PathBuf,
-    pub(crate) scope: V2MemoryScope,
-    pub(crate) access: V2MemoryAccessPolicy,
+    pub(crate) scope: MemoryScope,
+    pub(crate) access: MemoryAccessPolicy,
     pub(crate) control: BatchDreamControl,
 }
 
@@ -186,15 +186,15 @@ impl BatchDreamStore {
     /// symlinked component, and access, I/O, or database errors otherwise.
     pub fn open(
         scope_dir: impl AsRef<Path>,
-        scope: V2MemoryScope,
+        scope: MemoryScope,
         global_dir: &Path,
         workspace_dir: &Path,
     ) -> Result<BatchDreamStore> {
         let scope_dir = scope_dir.as_ref().to_path_buf();
-        let access = V2MemoryAccessPolicy::new(global_dir, workspace_dir)?;
+        let access = MemoryAccessPolicy::new(global_dir, workspace_dir)?;
         let expected = match scope {
-            V2MemoryScope::Global => global_dir,
-            V2MemoryScope::Workspace => workspace_dir,
+            MemoryScope::Global => global_dir,
+            MemoryScope::Workspace => workspace_dir,
         };
         if dunce::canonicalize(&scope_dir)? != dunce::canonicalize(expected)? {
             return Err(BatchDreamError::Invalid(
@@ -218,7 +218,7 @@ impl BatchDreamStore {
         };
         let mut connection = store.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::v2_maintenance::migrate_v2_hardening(&transaction)
+        crate::maintenance::migrate_hardening(&transaction)
             .map_err(|error| BatchDreamError::Invalid(error.to_string()))?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS batch_dream_queue (
@@ -428,7 +428,7 @@ impl BatchDreamStore {
                 None
             };
             // Capture publishes the file before its outcome row commits.
-            if capture.is_none() && crate::v2_consolidation::is_capture_note_name(&name) {
+            if capture.is_none() && crate::consolidation::is_capture_note_name(&name) {
                 continue;
             }
             let bytes = match read_bounded(&entry.path(), MAX_NOTE_BYTES as u64) {
@@ -593,7 +593,7 @@ impl BatchDreamStore {
             )));
         }
         let absolute = self.scope_dir.join(path);
-        if self.access.classify_path(&absolute)? != V2PathClass::Topic(self.scope) {
+        if self.access.classify_path(&absolute)? != MemoryPathClass::Topic(self.scope) {
             return Err(BatchDreamError::Invalid(format!(
                 "path is outside this scope's topics: {relative}"
             )));

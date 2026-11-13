@@ -209,7 +209,7 @@ pub struct LoadedConfig {
     /// `[retry]`: the bounded recovery budget for one logical model request.
     pub retry: leveler_model::RetryBudget,
     /// `[memory]`, resolved. `Off` unless the user opted in.
-    pub memory: leveler_memory::config::MemoryV2Config,
+    pub memory: leveler_memory::config::MemoryConfig,
     /// `[memory].model`: the route for capture and Dream extraction.
     pub memory_model: Option<String>,
 }
@@ -399,7 +399,7 @@ impl Default for LoadedConfig {
             model_context_soft_percent: Vec::new(),
             web_search: None,
             retry: leveler_model::RetryBudget::default(),
-            memory: leveler_memory::config::MemoryV2Config::default(),
+            memory: leveler_memory::config::MemoryConfig::default(),
             memory_model: None,
         }
     }
@@ -755,9 +755,9 @@ pub struct Application {
 
 impl Drop for Application {
     fn drop(&mut self) {
-        // A turn may have just handed a range to a capture worker. Their
-        // durable jobs survive the process; the leases expire, so cancelling
-        // here only stops work that this process can no longer own.
+        // A normal quit releases leases before `process::exit` (Drop does not
+        // run on that path). A process that returns normally still cancels
+        // here. A kill skips both, and that lease waits out its own term.
         self.memory.cancel_workers();
     }
 }

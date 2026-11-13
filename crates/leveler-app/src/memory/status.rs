@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use leveler_core::SessionId;
-use leveler_memory::config::MemoryV2Rollout;
-use leveler_memory::{CaptureWorkState, V2MaintenanceStore, V2MemoryScope, V2ScopeStatus};
+use leveler_memory::config::MemoryRollout;
+use leveler_memory::{CaptureWorkState, MaintenanceStore, MemoryScope, MemoryScopeStatus};
 
 use super::MemoryRuntime;
 
@@ -68,7 +68,7 @@ impl MemoryActivity {
 pub struct MemoryScopeSummary {
     pub root: PathBuf,
     pub files: Vec<PathBuf>,
-    pub state: Option<V2ScopeStatus>,
+    pub state: Option<MemoryScopeStatus>,
     /// The read failed. A failure is shown, never rendered as an empty scope.
     pub error: Option<String>,
 }
@@ -78,7 +78,7 @@ pub struct MemoryScopeSummary {
 pub struct MemoryStatus {
     /// The configured rollout. A session pause narrows the effective rollout
     /// to `off` but does not rewrite this value.
-    pub rollout: MemoryV2Rollout,
+    pub rollout: MemoryRollout,
     /// Memory is on for this session after the page toggle.
     pub enabled: bool,
     pub capture_enabled: bool,
@@ -123,7 +123,7 @@ impl MemoryRuntime {
     pub async fn status(&self, session: Option<&SessionId>) -> MemoryStatus {
         let configured = self.config();
         let config = self.config_for(session.map(SessionId::as_str));
-        if config.rollout == MemoryV2Rollout::Off {
+        if config.rollout == MemoryRollout::Off {
             let ephemeral = self.storage.is_ephemeral();
             return MemoryStatus {
                 rollout: configured.rollout,
@@ -163,7 +163,7 @@ impl MemoryRuntime {
             let workspace_dir = storage.workspace_dir().to_path_buf();
             let global = read_scope(
                 &global_dir,
-                V2MemoryScope::Global,
+                MemoryScope::Global,
                 storage.global_dir(),
                 storage.workspace_dir(),
                 &files,
@@ -178,7 +178,7 @@ impl MemoryRuntime {
             } else {
                 read_scope(
                     &workspace_dir,
-                    V2MemoryScope::Workspace,
+                    MemoryScope::Workspace,
                     storage.global_dir(),
                     storage.workspace_dir(),
                     &files,
@@ -229,12 +229,12 @@ impl MemoryRuntime {
 
 fn read_scope(
     scope_dir: &std::path::Path,
-    scope: V2MemoryScope,
+    scope: MemoryScope,
     global_dir: &std::path::Path,
     workspace_dir: &std::path::Path,
     files: &[PathBuf],
 ) -> MemoryScopeSummary {
-    let state = V2MaintenanceStore::open(scope_dir, scope, global_dir, workspace_dir)
+    let state = MaintenanceStore::open(scope_dir, scope, global_dir, workspace_dir)
         .and_then(|store| store.status(leveler_core::now().timestamp()))
         .map_err(|error| error.to_string());
     MemoryScopeSummary {
@@ -264,7 +264,7 @@ fn read_session(
     if ephemeral {
         return status;
     }
-    let Ok(store) = leveler_memory::V2CaptureStore::open(workspace_dir, V2MemoryScope::Workspace)
+    let Ok(store) = leveler_memory::CaptureStore::open(workspace_dir, MemoryScope::Workspace)
     else {
         return status;
     };

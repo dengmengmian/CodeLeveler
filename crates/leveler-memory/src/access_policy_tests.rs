@@ -1,31 +1,31 @@
 use std::sync::Arc;
 
-use crate::access::{MemoryV2Access as _, MemoryV2Write};
+use crate::access::{MemoryAccess as _, MemoryWrite};
 use crate::sqlite_journal::JournalMode;
 use rusqlite::params;
 use tempfile::TempDir;
 
 use super::*;
-use crate::V2CaptureStore;
-use crate::v2::ensure_scope_initialized;
+use crate::CaptureStore;
+use crate::scope::ensure_scope_initialized;
 
 struct Fixture {
     _temp: TempDir,
     global: PathBuf,
     workspace: PathBuf,
-    policy: Arc<V2MemoryAccessPolicy>,
+    policy: Arc<MemoryAccessPolicy>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("memory-v2");
+        let root = temp.path().join("memory");
         let global = root.join("global");
         let workspace = root.join("workspaces/project");
         std::fs::create_dir_all(&root).unwrap();
-        ensure_scope_initialized(&root, &global, V2MemoryScope::Global).unwrap();
-        ensure_scope_initialized(&root, &workspace, V2MemoryScope::Workspace).unwrap();
-        let policy = Arc::new(V2MemoryAccessPolicy::new(&global, &workspace).unwrap());
+        ensure_scope_initialized(&root, &global, MemoryScope::Global).unwrap();
+        ensure_scope_initialized(&root, &workspace, MemoryScope::Workspace).unwrap();
+        let policy = Arc::new(MemoryAccessPolicy::new(&global, &workspace).unwrap());
         Self {
             _temp: temp,
             global,
@@ -43,35 +43,35 @@ fn classifies_both_scopes_and_protected_paths() {
             .policy
             .classify_path(&fixture.global.join("MEMORY.md"))
             .unwrap(),
-        V2PathClass::Manifest(V2MemoryScope::Global)
+        MemoryPathClass::Manifest(MemoryScope::Global)
     );
     assert_eq!(
         fixture
             .policy
             .classify_path(&fixture.workspace.join("topics/rust.md"))
             .unwrap(),
-        V2PathClass::Topic(V2MemoryScope::Workspace)
+        MemoryPathClass::Topic(MemoryScope::Workspace)
     );
     assert_eq!(
         fixture
             .policy
             .classify_path(&fixture.global.join("observations/_inbox/new.md"))
             .unwrap(),
-        V2PathClass::Observation(V2MemoryScope::Global)
+        MemoryPathClass::Observation(MemoryScope::Global)
     );
     assert_eq!(
         fixture
             .policy
             .classify_path(&fixture.workspace.join("archive/old.md"))
             .unwrap(),
-        V2PathClass::ArchivedObservation(V2MemoryScope::Workspace)
+        MemoryPathClass::ArchivedObservation(MemoryScope::Workspace)
     );
     assert_eq!(
         fixture
             .policy
             .classify_path(fixture._temp.path().join("outside.md").as_path())
             .unwrap(),
-        V2PathClass::Outside
+        MemoryPathClass::Outside
     );
 }
 
@@ -83,7 +83,7 @@ fn rejects_traversal_protected_and_non_markdown_writes() {
             .policy
             .classify_path(&fixture.workspace.join("topics/../archive/x.md"))
             .unwrap(),
-        V2PathClass::Protected(V2MemoryScope::Workspace)
+        MemoryPathClass::Protected(MemoryScope::Workspace)
     );
     assert!(
         fixture
@@ -104,7 +104,7 @@ fn rejects_traversal_protected_and_non_markdown_writes() {
 #[test]
 fn rejects_recreating_durably_excluded_paths() {
     let fixture = Fixture::new();
-    V2CaptureStore::open(&fixture.workspace, V2MemoryScope::Workspace).unwrap();
+    CaptureStore::open(&fixture.workspace, MemoryScope::Workspace).unwrap();
     let state_path = fixture.workspace.join("memory_state.sqlite");
     JournalMode::for_db_path(&state_path)
         .open(&state_path)
@@ -121,13 +121,13 @@ fn rejects_recreating_durably_excluded_paths() {
         fixture
             .policy
             .write_file_inner(&fixture.workspace.join("topics/forgotten.md"), b"resurrect"),
-        Err(V2AccessError::Excluded(_))
+        Err(MemoryAccessError::Excluded(_))
     ));
     assert!(matches!(
         fixture
             .policy
             .validate_read_inner(&fixture.workspace.join("topics/forgotten.md")),
-        Err(V2AccessError::Excluded(_))
+        Err(MemoryAccessError::Excluded(_))
     ));
 }
 
@@ -158,11 +158,11 @@ fn dot_alias_to_manifest_stays_protected() {
     let alias = fixture.workspace.join("topics/../MEMORY.md");
     assert_eq!(
         fixture.policy.classify_path(&alias).unwrap(),
-        V2PathClass::Manifest(V2MemoryScope::Workspace)
+        MemoryPathClass::Manifest(MemoryScope::Workspace)
     );
     assert!(matches!(
         fixture.policy.write_file_inner(&alias, b"bad"),
-        Err(V2AccessError::Protected(_))
+        Err(MemoryAccessError::Protected(_))
     ));
 }
 
@@ -178,15 +178,15 @@ fn prefix_symlink_alias_to_manifest_stays_protected() {
 
     assert_eq!(
         fixture.policy.classify_path(&alias).unwrap(),
-        V2PathClass::Manifest(V2MemoryScope::Workspace)
+        MemoryPathClass::Manifest(MemoryScope::Workspace)
     );
     assert!(matches!(
         fixture.policy.write_file_inner(&alias, b"bad"),
-        Err(V2AccessError::Protected(_))
+        Err(MemoryAccessError::Protected(_))
     ));
     assert!(matches!(
         fixture.policy.validate_read_inner(&alias),
-        Err(V2AccessError::Symlink(_))
+        Err(MemoryAccessError::Symlink(_))
     ));
 }
 
@@ -196,15 +196,15 @@ fn canonical_root_alias_to_manifest_stays_protected() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().unwrap();
-    let real_root = temp.path().join("real-memory-v2");
+    let real_root = temp.path().join("real-memory");
     let real_global = real_root.join("global");
     let real_workspace = real_root.join("workspaces/project");
     std::fs::create_dir_all(&real_root).unwrap();
-    ensure_scope_initialized(&real_root, &real_global, V2MemoryScope::Global).unwrap();
-    ensure_scope_initialized(&real_root, &real_workspace, V2MemoryScope::Workspace).unwrap();
-    let configured_root = temp.path().join("configured-memory-v2");
+    ensure_scope_initialized(&real_root, &real_global, MemoryScope::Global).unwrap();
+    ensure_scope_initialized(&real_root, &real_workspace, MemoryScope::Workspace).unwrap();
+    let configured_root = temp.path().join("configured-memory");
     symlink(&real_root, &configured_root).unwrap();
-    let policy = V2MemoryAccessPolicy::new(
+    let policy = MemoryAccessPolicy::new(
         &configured_root.join("global"),
         &configured_root.join("workspaces/project"),
     )
@@ -213,11 +213,11 @@ fn canonical_root_alias_to_manifest_stays_protected() {
 
     assert_eq!(
         policy.classify_path(&canonical_alias).unwrap(),
-        V2PathClass::Manifest(V2MemoryScope::Workspace)
+        MemoryPathClass::Manifest(MemoryScope::Workspace)
     );
     assert!(matches!(
         policy.write_file_inner(&canonical_alias, b"bad"),
-        Err(V2AccessError::Protected(_))
+        Err(MemoryAccessError::Protected(_))
     ));
 }
 
@@ -228,9 +228,9 @@ fn case_alias_to_manifest_stays_protected_on_case_insensitive_filesystems() {
     let global = root.join("global");
     let workspace = root.join("workspaces/project");
     std::fs::create_dir_all(&root).unwrap();
-    ensure_scope_initialized(&root, &global, V2MemoryScope::Global).unwrap();
-    ensure_scope_initialized(&root, &workspace, V2MemoryScope::Workspace).unwrap();
-    let policy = V2MemoryAccessPolicy::new(&global, &workspace).unwrap();
+    ensure_scope_initialized(&root, &global, MemoryScope::Global).unwrap();
+    ensure_scope_initialized(&root, &workspace, MemoryScope::Workspace).unwrap();
+    let policy = MemoryAccessPolicy::new(&global, &workspace).unwrap();
     let alias = temp.path().join("casememory/workspaces/project/MEMORY.md");
     if !alias.exists() {
         return;
@@ -238,11 +238,11 @@ fn case_alias_to_manifest_stays_protected_on_case_insensitive_filesystems() {
 
     assert_eq!(
         policy.classify_path(&alias).unwrap(),
-        V2PathClass::Manifest(V2MemoryScope::Workspace)
+        MemoryPathClass::Manifest(MemoryScope::Workspace)
     );
     assert!(matches!(
         policy.write_file_inner(&alias, b"bad"),
-        Err(V2AccessError::Protected(_))
+        Err(MemoryAccessError::Protected(_))
     ));
 }
 
@@ -255,7 +255,7 @@ fn creates_atomically_then_requires_read_for_edits_and_refreshes_manifest() {
             .policy
             .write_file(&path, b"# Style\n\nUse Rust.")
             .unwrap(),
-        MemoryV2Write::Written {
+        MemoryWrite::Written {
             previous_content: None
         }
     );
@@ -265,7 +265,7 @@ fn creates_atomically_then_requires_read_for_edits_and_refreshes_manifest() {
             .contains("topics/style.md")
     );
 
-    let fresh_policy = V2MemoryAccessPolicy::new(&fixture.global, &fixture.workspace).unwrap();
+    let fresh_policy = MemoryAccessPolicy::new(&fixture.global, &fixture.workspace).unwrap();
     assert!(
         fresh_policy
             .write_file(&path, b"# Style\n\nUse Go.")
@@ -280,7 +280,7 @@ fn creates_atomically_then_requires_read_for_edits_and_refreshes_manifest() {
         .unwrap();
     assert_eq!(
         result,
-        MemoryV2Write::Written {
+        MemoryWrite::Written {
             previous_content: Some(original)
         }
     );
@@ -300,25 +300,25 @@ fn rejects_nested_topic_and_observation_paths() {
 
     assert_eq!(
         fixture.policy.classify_path(&nested_topic).unwrap(),
-        V2PathClass::Nested(V2MemoryScope::Workspace)
+        MemoryPathClass::Nested(MemoryScope::Workspace)
     );
     assert!(matches!(
         fixture
             .policy
             .write_file_inner(&nested_topic, b"# Conventions"),
-        Err(V2AccessError::NestedPath(_))
+        Err(MemoryAccessError::NestedPath(_))
     ));
     assert!(!fixture.workspace.join("topics/frontend").exists());
 
     assert_eq!(
         fixture.policy.classify_path(&nested_observation).unwrap(),
-        V2PathClass::Nested(V2MemoryScope::Global)
+        MemoryPathClass::Nested(MemoryScope::Global)
     );
     assert!(matches!(
         fixture
             .policy
             .write_file_inner(&nested_observation, b"# Note"),
-        Err(V2AccessError::NestedPath(_))
+        Err(MemoryAccessError::NestedPath(_))
     ));
     assert!(!fixture.global.join("observations/_inbox/2026").exists());
     assert!(
@@ -345,7 +345,7 @@ fn rejects_oversized_writes_before_touching_the_filesystem() {
         .unwrap_err();
     assert!(matches!(
         error,
-        V2AccessError::TooLarge {
+        MemoryAccessError::TooLarge {
             limit_bytes: MAX_TOPIC_FILE_BYTES,
             ..
         }
@@ -375,7 +375,7 @@ fn rejects_oversized_writes_before_touching_the_filesystem() {
         .unwrap_err();
     assert!(matches!(
         error,
-        V2AccessError::TooLarge {
+        MemoryAccessError::TooLarge {
             limit_bytes: MAX_WRITE_OBSERVATION_BYTES,
             ..
         }
@@ -404,7 +404,7 @@ fn caps_new_file_contents_before_filesystem_access() {
             .policy
             .write_file_inner(&outside_path, &oversized)
             .unwrap(),
-        MemoryV2Write::Outside
+        MemoryWrite::Outside
     );
     assert!(!outside_path.parent().unwrap().exists());
 
@@ -426,7 +426,7 @@ fn caps_new_file_contents_before_filesystem_access() {
         .unwrap_err();
     assert!(matches!(
         error,
-        V2AccessError::TooLarge {
+        MemoryAccessError::TooLarge {
             limit_bytes,
             ..
         } if limit_bytes == MAX_TOPIC_FILE_BYTES
@@ -506,7 +506,7 @@ fn rejects_oversized_previous_content_without_replacing_it() {
         .unwrap_err();
     assert!(matches!(
         error,
-        V2AccessError::TooLarge {
+        MemoryAccessError::TooLarge {
             limit_bytes: MAX_PREVIOUS_CONTENT_BYTES,
             ..
         }
@@ -522,7 +522,7 @@ async fn read_snapshot_survives_a_blocking_handoff() {
     let fixture = Fixture::new();
     let path = fixture.workspace.join("topics/async.md");
     fixture.policy.write_file(&path, b"before").unwrap();
-    let policy: Arc<dyn MemoryV2Access> = fixture.policy.clone();
+    let policy: Arc<dyn MemoryAccess> = fixture.policy.clone();
 
     let read_policy = policy.clone();
     let read_path = path.clone();
@@ -540,7 +540,7 @@ async fn read_snapshot_survives_a_blocking_handoff() {
             .unwrap();
     assert_eq!(
         written,
-        MemoryV2Write::Written {
+        MemoryWrite::Written {
             previous_content: Some(b"before".to_vec())
         }
     );
@@ -577,7 +577,7 @@ fn manifest_refresh_error_retains_storage_source() {
         .policy
         .write_file_inner(&path, b"content")
         .unwrap_err();
-    assert!(matches!(error, V2AccessError::ManifestRefresh { .. }));
+    assert!(matches!(error, MemoryAccessError::ManifestRefresh { .. }));
     assert!(error.source().is_some());
     assert!(!path.exists());
 }
@@ -597,7 +597,7 @@ fn manifest_refresh_failure_restores_existing_content() {
         .policy
         .write_file_inner(&path, b"after")
         .unwrap_err();
-    assert!(matches!(error, V2AccessError::ManifestRefresh { .. }));
+    assert!(matches!(error, MemoryAccessError::ManifestRefresh { .. }));
     assert_eq!(std::fs::read(&path).unwrap(), b"before");
 }
 
@@ -613,7 +613,7 @@ fn manifest_refresh_failure_restores_deleted_topic() {
     std::fs::create_dir(&manifest).unwrap();
 
     let error = fixture.policy.remove_topic_file(&path).unwrap_err();
-    assert!(matches!(error, V2AccessError::ManifestRefresh { .. }));
+    assert!(matches!(error, MemoryAccessError::ManifestRefresh { .. }));
     assert_eq!(std::fs::read(&path).unwrap(), b"before");
 
     std::fs::remove_dir(&manifest).unwrap();
@@ -668,7 +668,7 @@ fn nonexistent_target_under_existing_writable_directory_is_safe() {
     let path = fixture.global.join("observations/_inbox/future.md");
     assert_eq!(
         fixture.policy.classify_path(&path).unwrap(),
-        V2PathClass::Observation(V2MemoryScope::Global)
+        MemoryPathClass::Observation(MemoryScope::Global)
     );
     assert!(fixture.policy.validate_read(&path).unwrap());
 }
@@ -722,7 +722,7 @@ fn removal_rejects_oversized_topic_without_deleting_it() {
 
     assert!(matches!(
         fixture.policy.remove_topic_file(&path),
-        Err(V2AccessError::Inspect { .. })
+        Err(MemoryAccessError::Inspect { .. })
     ));
     assert!(path.is_file());
 }

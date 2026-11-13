@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use leveler_core::SessionId;
-use leveler_memory::config::MemoryV2Rollout;
+use leveler_memory::config::MemoryRollout;
 use leveler_memory::{
-    ConsolidationInput, ConsolidationLease, ConsolidationStatus, DreamClaimRequest,
-    DreamEligibilityConfig, DreamTriggerDisposition, TopicOperation, V2ConsolidationError,
-    V2ConsolidationStore, V2MemoryScope,
+    ConsolidationError, ConsolidationInput, ConsolidationLease, ConsolidationStatus,
+    ConsolidationStore, DreamClaimRequest, DreamEligibilityConfig, DreamTriggerDisposition,
+    MemoryScope, TopicOperation,
 };
 use leveler_model::{
     ContentPart, FinishReason, ModelRef, ModelRequest, ModelRuntime, Role, ToolChoice,
@@ -47,6 +47,9 @@ const DREAM_MAX_OUTPUT_TOKENS: u32 = 16 * 1024;
 /// The reference's automatic trigger thresholds.
 const DREAM_MIN_PENDING_COUNT: usize = 20;
 const DREAM_MAX_PENDING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Bounded repeats when the model ignores the forced tool or returns a plan
+/// the schema rejects. Transport failures and cancellation are not retried.
+const DREAM_PLAN_ATTEMPTS: u32 = 3;
 
 /// The forced tool the Dream model answers with. CodeLeveler's model protocol
 /// has no `response_format`, so the reference's plan schema becomes this tool's
@@ -65,7 +68,8 @@ const DREAM_SYSTEM_PROMPT: &str = "Consolidate only the supplied claimed observa
             headings: file paths, constants, commands, invariants, decisions, and user preferences. \
             Put changing state under `## Recent state` or omit it. Do not narrate conversations. Drop \
             facts that newer observations contradict or make stale. \
-            Return one JSON object with an `operations` array. \
+            Call the record_memory_plan tool exactly once. Its arguments are one object \
+            with an `operations` array. Do not answer with plain text. \
             Every operation must have an `op` field identifying its type: create, update, delete, \
             rename, merge, or split. Use exactly the fields listed for each type; do not add other fields. \
             create and update: op, path, content, evidence. delete: op, path, evidence. \
@@ -80,8 +84,8 @@ const DREAM_SYSTEM_PROMPT: &str = "Consolidate only the supplied claimed observa
             must be exactly `topics/<slug>.md`: one markdown file directly in `topics/`, no subdirectories. A slug is \
             lowercase letters, digits, and hyphens, for example `topics/preferences.md`. Preserve still-valid facts. \
             Do not include `<!-- memory-v2 provenance -->` comments in content; they are stripped and not stored. \
-            Do not mention or attempt tools, shell, workspace files, MEMORY.md, databases, archive, \
-            extraction, or another Dream.";
+            Do not call any tool other than record_memory_plan. Do not mention shell, workspace files, \
+            MEMORY.md, databases, archive, extraction, or another Dream.";
 
 /// Which entry point asked for this Dream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +187,7 @@ pub(crate) async fn after_capture(
             &cancel,
         )
         .await;
-        tracing::info!(outcome = %outcome.message(), "memory-v2 automatic Dream finished");
+        tracing::info!(outcome = %outcome.message(), "memory automatic Dream finished");
         runtime.release_dream_worker().await;
     });
 }
@@ -242,7 +246,7 @@ async fn execute(
     if runtime.is_workspace_ephemeral() {
         return DreamOutcome::WorkspaceEphemeral;
     }
-    let shadow = memory_config.rollout == MemoryV2Rollout::Shadow;
+    let shadow = memory_config.rollout == MemoryRollout::Shadow;
     let scope = session_id.as_str().to_owned();
     let storage = runtime.storage();
     let global_dir = storage.global_dir().to_path_buf();
@@ -255,9 +259,9 @@ async fn execute(
         let global_dir = global_dir.clone();
         let workspace_dir = workspace_dir.clone();
         move || {
-            V2ConsolidationStore::open(
+            ConsolidationStore::open(
                 scope_dir,
-                V2MemoryScope::Workspace,
+                MemoryScope::Workspace,
                 &global_dir,
                 &workspace_dir,
             )
@@ -319,7 +323,7 @@ async fn execute(
     let lease = match claimed {
         Ok(Ok(Some(lease))) => lease,
         Ok(Ok(None)) => return DreamOutcome::NoWork,
-        Ok(Err(V2ConsolidationError::Busy)) => return DreamOutcome::Busy,
+        Ok(Err(ConsolidationError::Busy)) => return DreamOutcome::Busy,
         Ok(Err(error)) => return DreamOutcome::Failed(error.to_string()),
         Err(error) => return DreamOutcome::Failed(format!("Dream claim task failed: {error}")),
     };
@@ -480,7 +484,38 @@ fn finish_activity(runtime: &MemoryRuntime, session_scope: &str, success: bool) 
     );
 }
 
+fn dream_rejection_is_retryable(error: &str) -> bool {
+    error == "Dream model did not call the required tool"
+        || error.starts_with("invalid Dream plan:")
+}
+
 async fn request_plan(
+    registry: &Arc<leveler_provider::ProviderRegistry>,
+    route: &ModelRef,
+    db: &Database,
+    session_id: &SessionId,
+    input: &ConsolidationInput,
+    cancel: &CancellationToken,
+) -> Result<Vec<TopicOperation>, String> {
+    let mut last_error = String::new();
+    for attempt in 1..=DREAM_PLAN_ATTEMPTS {
+        match request_plan_once(registry, route, db, session_id, input, cancel).await {
+            Ok(plan) => return Ok(plan),
+            Err(error) if attempt < DREAM_PLAN_ATTEMPTS && dream_rejection_is_retryable(&error) => {
+                tracing::warn!(
+                    attempt,
+                    %error,
+                    "memory dream plan was rejected; retrying the forced tool call"
+                );
+                last_error = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
+async fn request_plan_once(
     registry: &Arc<leveler_provider::ProviderRegistry>,
     route: &ModelRef,
     db: &Database,
@@ -567,13 +602,13 @@ async fn request_plan(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct V2DreamPlan {
-    operations: Vec<V2DreamPlanOperation>,
+struct DreamPlan {
+    operations: Vec<DreamPlanOperation>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum V2DreamPlanOperation {
+enum DreamPlanOperation {
     Create {
         path: String,
         content: String,
@@ -602,21 +637,21 @@ enum V2DreamPlanOperation {
     },
     Split {
         source: String,
-        destinations: Vec<V2DreamDestination>,
+        destinations: Vec<DreamDestination>,
         evidence: Vec<String>,
     },
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct V2DreamDestination {
+struct DreamDestination {
     path: String,
     content: String,
 }
 
 /// Parse the forced tool call's arguments into typed operations.
 pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOperation>, String> {
-    let plan: V2DreamPlan = serde_json::from_value(value.clone())
+    let plan: DreamPlan = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid Dream plan: {error}"))?;
     if plan.operations.is_empty() {
         return Err("invalid Dream plan: operations must not be empty".to_owned());
@@ -626,7 +661,7 @@ pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOpe
         .operations
         .into_iter()
         .map(|operation| match operation {
-            V2DreamPlanOperation::Create {
+            DreamPlanOperation::Create {
                 path,
                 content,
                 evidence,
@@ -635,7 +670,7 @@ pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOpe
                 content,
                 evidence: paths(evidence),
             },
-            V2DreamPlanOperation::Update {
+            DreamPlanOperation::Update {
                 path,
                 content,
                 evidence,
@@ -644,11 +679,11 @@ pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOpe
                 content,
                 evidence: paths(evidence),
             },
-            V2DreamPlanOperation::Delete { path, evidence } => TopicOperation::Delete {
+            DreamPlanOperation::Delete { path, evidence } => TopicOperation::Delete {
                 path: path.into(),
                 evidence: paths(evidence),
             },
-            V2DreamPlanOperation::Rename {
+            DreamPlanOperation::Rename {
                 from,
                 to,
                 content,
@@ -659,7 +694,7 @@ pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOpe
                 content,
                 evidence: paths(evidence),
             },
-            V2DreamPlanOperation::Merge {
+            DreamPlanOperation::Merge {
                 sources,
                 destination,
                 content,
@@ -670,7 +705,7 @@ pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOpe
                 content,
                 evidence: paths(evidence),
             },
-            V2DreamPlanOperation::Split {
+            DreamPlanOperation::Split {
                 source,
                 destinations,
                 evidence,
@@ -686,7 +721,7 @@ pub(crate) fn parse_dream_plan(value: &serde_json::Value) -> Result<Vec<TopicOpe
         .collect())
 }
 
-/// The bare JSON schema for the forced tool, mirroring [`V2DreamPlan`] and the
+/// The bare JSON schema for the forced tool, mirroring [`DreamPlan`] and the
 /// reference's `dream_plan_schema`.
 pub(crate) fn dream_plan_schema() -> serde_json::Value {
     let strings = serde_json::json!({ "type": "array", "items": { "type": "string" } });
@@ -743,11 +778,11 @@ pub(crate) fn dream_plan_schema() -> serde_json::Value {
 /// `disarm` releases the claim so a later pass does not wait for the lease to
 /// expire.
 struct DreamLeaseGuard {
-    resources: Option<(Arc<V2ConsolidationStore>, ConsolidationLease)>,
+    resources: Option<(Arc<ConsolidationStore>, ConsolidationLease)>,
 }
 
 impl DreamLeaseGuard {
-    fn new(store: Arc<V2ConsolidationStore>, lease: ConsolidationLease) -> Self {
+    fn new(store: Arc<ConsolidationStore>, lease: ConsolidationLease) -> Self {
         Self {
             resources: Some((store, lease)),
         }
@@ -765,7 +800,7 @@ impl DreamLeaseGuard {
         self.resources = None;
     }
 
-    fn into_parts(mut self) -> (Arc<V2ConsolidationStore>, ConsolidationLease) {
+    fn into_parts(mut self) -> (Arc<ConsolidationStore>, ConsolidationLease) {
         self.resources
             .take()
             .expect("an armed Dream lease guard owns its resources")
@@ -781,8 +816,8 @@ impl DreamLeaseGuard {
             tokio::task::spawn_blocking(move || store.fail_retryable(&lease, now, &error)).await;
         match released {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "memory-v2 Dream lease release failed"),
-            Err(error) => tracing::warn!(%error, "memory-v2 Dream lease release task failed"),
+            Ok(Err(error)) => tracing::warn!(%error, "memory Dream lease release failed"),
+            Err(error) => tracing::warn!(%error, "memory Dream lease release task failed"),
         }
     }
 }
@@ -797,7 +832,7 @@ impl Drop for DreamLeaseGuard {
             if let Err(error) =
                 store.fail_retryable(&lease, now, "Dream worker exited before completion")
             {
-                tracing::warn!(%error, "memory-v2 abandoned Dream lease release failed");
+                tracing::warn!(%error, "memory abandoned Dream lease release failed");
             }
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -830,5 +865,22 @@ mod tests {
     #[test]
     fn an_empty_plan_is_rejected_instead_of_reaching_the_durable_boundary() {
         assert!(parse_dream_plan(&serde_json::json!({"operations": []})).is_err());
+    }
+
+    #[test]
+    fn only_a_missing_or_invalid_plan_is_retried() {
+        assert!(dream_rejection_is_retryable(
+            "Dream model did not call the required tool"
+        ));
+        assert!(dream_rejection_is_retryable(
+            "invalid Dream plan: operations is empty"
+        ));
+        assert!(!dream_rejection_is_retryable("Dream task cancelled"));
+        assert!(!dream_rejection_is_retryable(
+            "memory Dream timed out after 30 seconds"
+        ));
+        assert!(!dream_rejection_is_retryable(
+            "extraction output was truncated"
+        ));
     }
 }

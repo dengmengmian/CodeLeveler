@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 
-use crate::v2_capture::{
+use crate::capture_store::{
     CaptureOutcomeDraft, MAX_ALIASES, MAX_BODY_BYTES, MAX_KEYWORDS, MAX_OBSERVATIONS,
     MAX_STATEMENT_BYTES, MAX_TERM_BYTES, MAX_TOPIC_BYTES, ObservationDraft, ObservationType,
 };
@@ -30,23 +30,25 @@ pub const CAPTURE_SYSTEM_PROMPT: &str = "Extract durable, reusable observations 
      {\"outcome\":\"noop\",\"observations\":[]}. \
      Keep statements concise and factual. `topic_hint` names the broad subject area the \
      observation belongs to (a system, repository area, tool, person, or workflow), not \
-     the specific fact. You have no tools and cannot modify files.";
+     the specific fact. Call record_memory_observations exactly once and do not \
+     answer with plain text. You cannot modify files.";
 
 /// True when `completed_turn` contains turns the cursor has not requested yet.
 pub fn missing_range(
     requested: u32,
     completed_turn: u32,
-) -> Result<Option<crate::v2_capture::CaptureRange>, crate::v2_capture::V2CaptureError> {
+) -> Result<Option<crate::capture_store::CaptureRange>, crate::capture_store::CaptureError> {
     if completed_turn <= requested {
         return Ok(None);
     }
-    crate::v2_capture::CaptureRange::try_new(requested.saturating_add(1), completed_turn).map(Some)
+    crate::capture_store::CaptureRange::try_new(requested.saturating_add(1), completed_turn)
+        .map(Some)
 }
 
 /// User message carrying the range and the durable conversation snapshot.
 pub fn extraction_user_message(
     session_id: &str,
-    range: crate::v2_capture::CaptureRange,
+    range: crate::capture_store::CaptureRange,
     transcript_json: &str,
 ) -> String {
     format!(
@@ -216,7 +218,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_capture::CaptureRange;
+    use crate::capture_store::CaptureRange;
 
     #[test]
     fn missing_ranges_coalesce_without_overlap() {

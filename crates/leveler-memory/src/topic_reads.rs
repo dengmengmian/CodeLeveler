@@ -1,8 +1,8 @@
 //! Per-topic read ledger that ranks the compact memory index by use.
 //!
-//! Only the tool-facing `MemoryV2Access::record_read` counts a read, so Dream,
+//! Only the tool-facing `MemoryAccess::record_read` counts a read, so Dream,
 //! forget, and carry-over reads never skew the ranking. Counting runs for every
-//! v2 user so the ledger is warm when `compact_index_enabled` turns on. The
+//! reader so the ledger is warm when `compact_index_enabled` turns on. The
 //! ledger is advisory: a failed count or a failed lookup degrades to path order
 //! and never fails the read, the render, or the browse listing.
 
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::sqlite_journal::JournalMode;
 use rusqlite::{OpenFlags, params};
 
-use crate::v2::{Result, V2StorageError};
+use crate::scope::{MemoryScopeError, Result};
 
 /// Declared by `initialize_state_db` so the read path never runs DDL.
 pub(crate) const TOPIC_READS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS memory_v2_topic_reads (
@@ -51,7 +51,7 @@ pub(crate) fn compare_observations_newest_first(
 ///
 /// # Errors
 ///
-/// Returns [`V2StorageError::Database`] if the upsert fails, including when
+/// Returns [`MemoryScopeError::Database`] if the upsert fails, including when
 /// the scope's write lock is held longer than [`COUNT_BUSY_TIMEOUT`].
 pub(crate) fn record_topic_read(scope_dir: &Path, relative_path: &str) -> Result<()> {
     let state_path = scope_dir.join("memory_state.sqlite");
@@ -62,14 +62,14 @@ pub(crate) fn record_topic_read(scope_dir: &Path, relative_path: &str) -> Result
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
-            return Err(V2StorageError::Io {
-                operation: "inspect v2 state read ledger",
+            return Err(MemoryScopeError::Io {
+                operation: "inspect memory state read ledger",
                 path: state_path,
                 source,
             });
         }
     }
-    let database_error = |source| V2StorageError::Database {
+    let database_error = |source| MemoryScopeError::Database {
         database: "state",
         path: state_path.clone(),
         source,

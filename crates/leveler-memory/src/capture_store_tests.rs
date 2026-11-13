@@ -5,11 +5,11 @@ use std::time::Duration;
 use super::*;
 use tempfile::TempDir;
 
-fn setup() -> (TempDir, V2CaptureStore) {
+fn setup() -> (TempDir, CaptureStore) {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
-    crate::v2::ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap();
-    let store = V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
+    crate::scope::ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap();
+    let store = CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
     (temp, store)
 }
 
@@ -17,7 +17,7 @@ fn range(from: u32, through: u32) -> CaptureRange {
     CaptureRange::try_new(from, through).unwrap()
 }
 
-fn claim(store: &V2CaptureStore, owner: &str, now: i64) -> CaptureLease {
+fn claim(store: &CaptureStore, owner: &str, now: i64) -> CaptureLease {
     store
         .claim(&ClaimRequest {
             owner: owner.to_owned(),
@@ -47,7 +47,7 @@ fn observations(statement: &str) -> CaptureOutcomeDraft {
 }
 
 fn prepare(
-    store: &V2CaptureStore,
+    store: &CaptureStore,
     job: &CaptureJob,
     outcome: &CaptureOutcomeDraft,
 ) -> PreparedOutcome {
@@ -61,7 +61,7 @@ struct AdvancingClock {
     calls: AtomicUsize,
 }
 
-impl crate::V2Clock for AdvancingClock {
+impl crate::MemoryClock for AdvancingClock {
     fn now_unix_seconds(&self) -> i64 {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.next.fetch_add(100, Ordering::SeqCst)
@@ -244,8 +244,8 @@ fn schema_migrates_v1_and_reopen_is_idempotent() {
         .unwrap();
     drop(connection);
 
-    V2CaptureStore::open(&scope, V2MemoryScope::Global).unwrap();
-    V2CaptureStore::open(&scope, V2MemoryScope::Global).unwrap();
+    CaptureStore::open(&scope, MemoryScope::Global).unwrap();
+    CaptureStore::open(&scope, MemoryScope::Global).unwrap();
     let connection = JournalMode::for_db_path(&state_path)
         .open_readonly(&state_path)
         .unwrap();
@@ -268,7 +268,7 @@ fn schema_migrates_v1_and_reopen_is_idempotent() {
                 |row| row.get::<_, u32>(0)
             )
             .unwrap(),
-        5
+        6
     );
     assert_eq!(
         connection
@@ -283,14 +283,54 @@ fn schema_migrates_v1_and_reopen_is_idempotent() {
 }
 
 #[test]
+fn a_skipped_range_does_not_stall_later_capture() {
+    let (_temp, store) = setup();
+    let session = "01a08895-f3c6-7903-a6f9-652c72b44530";
+    store.enqueue(session, range(1, 1)).unwrap();
+    store.record_skipped_range(session, range(2, 3)).unwrap();
+    store.enqueue(session, range(4, 4)).unwrap();
+    let cursors = store.cursors(session).unwrap();
+    assert_eq!(cursors.requested, 4);
+    assert_eq!(
+        cursors.captured, 0,
+        "a skip must not pretend a still-pending earlier job is done"
+    );
+
+    let lease = claim(&store, "worker", 10);
+    assert_eq!(lease.job.range.start_turn(), 1);
+    store
+        .commit(&lease, &CaptureOutcomeDraft::Noop, 11)
+        .unwrap();
+    assert_eq!(
+        store.cursors(session).unwrap().captured,
+        3,
+        "once the preceding job is terminal the skip is walked"
+    );
+
+    let lease = claim(&store, "worker", 12);
+    assert_eq!(lease.job.range.start_turn(), 4);
+    store
+        .commit(&lease, &CaptureOutcomeDraft::Noop, 13)
+        .unwrap();
+    let cursors = store.cursors(session).unwrap();
+    assert_eq!(
+        (cursors.requested, cursors.captured, cursors.indexed),
+        (4, 4, 4)
+    );
+
+    store.record_skipped_range(session, range(2, 3)).unwrap();
+    assert_eq!(store.cursors(session).unwrap().requested, 4);
+}
+
+#[test]
 fn network_mounted_capture_store_fails_before_creating_shared_state() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
     std::fs::create_dir(&scope).unwrap();
 
-    let error = match V2CaptureStore::open_with_journal_mode(
+    let error = match CaptureStore::open_with_journal_mode(
         &scope,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         Some(JournalMode::Truncate),
     ) {
         Ok(_) => panic!("network-mounted capture unexpectedly opened"),
@@ -299,7 +339,7 @@ fn network_mounted_capture_store_fails_before_creating_shared_state() {
 
     assert!(matches!(
         error,
-        V2CaptureError::UnsupportedNetworkFilesystem { path } if path == scope
+        CaptureError::UnsupportedNetworkFilesystem { path } if path == scope
     ));
     assert!(!scope.join("observations").exists());
     assert!(!scope.join("memory_state.sqlite").exists());
@@ -338,7 +378,7 @@ fn capture_job_persists_source_prompt_locator() {
     assert_eq!(lease.job.source_prompt_index, 7);
     assert!(matches!(
         store.enqueue_for_prompt("session", range(1, 1), 8),
-        Err(V2CaptureError::Conflict(_))
+        Err(CaptureError::Conflict(_))
     ));
 }
 
@@ -554,7 +594,7 @@ fn cancellation_release_makes_lease_immediately_retryable() {
     );
     assert!(matches!(
         store.release_retryable(&interrupted, "stale cleanup"),
-        Err(V2CaptureError::StaleLease)
+        Err(CaptureError::StaleLease)
     ));
 }
 
@@ -570,7 +610,7 @@ fn retry_same_bytes_is_idempotent_and_different_outcome_is_rejected() {
     assert!(second.was_already_committed);
     assert!(matches!(
         store.commit(&lease, &observations("Changed retry bytes"), 12),
-        Err(V2CaptureError::Conflict(_))
+        Err(CaptureError::Conflict(_))
     ));
 }
 
@@ -597,7 +637,7 @@ fn expired_lease_is_reclaimed_and_stale_owner_is_fenced() {
     assert_eq!(new.job.attempt, old.job.attempt + 1);
     assert!(matches!(
         store.commit(&old, &CaptureOutcomeDraft::Noop, 15),
-        Err(V2CaptureError::StaleLease)
+        Err(CaptureError::StaleLease)
     ));
     store.commit(&new, &CaptureOutcomeDraft::Noop, 16).unwrap();
 }
@@ -800,7 +840,7 @@ fn slow_convergence_does_not_block_capture_queue_writes() {
     persist_outcome(&transaction, &lease.job, &prepared, 11).unwrap();
     transaction.commit().unwrap();
 
-    let queue_store = V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
+    let queue_store = CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
     let (convergence_started_tx, convergence_started_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let reconcile = std::thread::spawn(move || {
@@ -853,8 +893,8 @@ fn stale_reconcile_cannot_replace_newer_cross_handle_manifest() {
 
     store.enqueue("session", range(3, 4)).unwrap();
     let second_lease = claim(&store, "second-worker", 20);
-    let newer = V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
-    let observer = V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
+    let newer = CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
+    let observer = CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
     let (older_rendered_tx, older_rendered_rx) = std::sync::mpsc::channel();
     let (resume_older_tx, resume_older_rx) = std::sync::mpsc::channel();
     let older = std::thread::spawn(move || {
@@ -914,11 +954,11 @@ fn stale_capture_manifest_cannot_replace_topic_writer_manifest() {
     store
         .reconcile_at_with(20, || {
             std::fs::write(scope.join("topics/dream.md"), "# Dream\n\nNew topic state.").unwrap();
-            crate::v2::bump_manifest_revision(&scope).unwrap();
+            crate::scope::bump_manifest_revision(&scope).unwrap();
             crate::regenerate_scope_manifest(
                 &scope,
-                V2MemoryScope::Workspace,
-                V2ManifestBudget::default(),
+                MemoryScope::Workspace,
+                ManifestBudget::default(),
             )
             .unwrap();
             Ok(())
@@ -1027,7 +1067,7 @@ fn reconcile_uses_one_injected_timestamp_for_adoption_and_quarantine() {
         calls: AtomicUsize::new(0),
     });
     let injected =
-        V2CaptureStore::open_with_clock(&scope, V2MemoryScope::Workspace, clock.clone()).unwrap();
+        CaptureStore::open_with_clock(&scope, MemoryScope::Workspace, clock.clone()).unwrap();
     injected.reconcile().unwrap();
 
     let connection = injected.open_state().unwrap();
@@ -1283,7 +1323,7 @@ fn recovery_directory_and_database_scans_fail_at_named_caps() {
     }
     assert!(matches!(
         store.reconcile(),
-        Err(V2CaptureError::RecoveryDirectoryLimit { limit, .. })
+        Err(CaptureError::RecoveryDirectoryLimit { limit, .. })
             if limit == MAX_INBOX_ENTRIES
     ));
 
@@ -1304,7 +1344,7 @@ fn recovery_directory_and_database_scans_fail_at_named_caps() {
     transaction.commit().unwrap();
     assert!(matches!(
         store.reconcile(),
-        Err(V2CaptureError::RecoveryRowLimit { rows, limit })
+        Err(CaptureError::RecoveryRowLimit { rows, limit })
             if rows == "uncommitted capture jobs" && limit == MAX_RECOVERY_JOBS
     ));
 }
@@ -1343,7 +1383,7 @@ fn committed_observation_scan_has_a_named_row_cap() {
     transaction.commit().unwrap();
     assert!(matches!(
         store.reconcile(),
-        Err(V2CaptureError::RecoveryRowLimit { rows, limit })
+        Err(CaptureError::RecoveryRowLimit { rows, limit })
             if rows == "committed observation files"
                 && limit == MAX_COMMITTED_OBSERVATION_ROWS
     ));
@@ -1357,7 +1397,7 @@ fn convergence_errors_preserve_typed_sources() {
     std::fs::remove_file(temp.path().join("scope/MEMORY.md")).unwrap();
     std::fs::create_dir(temp.path().join("scope/MEMORY.md")).unwrap();
     let error = store.reconcile().unwrap_err();
-    assert!(matches!(&error, V2CaptureError::Manifest(_)));
+    assert!(matches!(&error, CaptureError::Manifest(_)));
     assert!(error.source().is_some());
 
     let (temp, store) = setup();
@@ -1374,11 +1414,11 @@ fn convergence_errors_preserve_typed_sources() {
     std::fs::remove_file(temp.path().join("scope/index.sqlite")).unwrap();
     std::fs::create_dir(temp.path().join("scope/index.sqlite")).unwrap();
     let error = store.reconcile().unwrap_err();
-    assert!(matches!(&error, V2CaptureError::Index { .. }));
+    assert!(matches!(&error, CaptureError::Index { .. }));
     assert!(error.source().is_some());
 }
 
-fn commit_one(store: &V2CaptureStore, range: CaptureRange, statement: &str, now: i64) -> PathBuf {
+fn commit_one(store: &CaptureStore, range: CaptureRange, statement: &str, now: i64) -> PathBuf {
     store.enqueue("session", range).unwrap();
     let lease = claim(store, "worker", now);
     store
@@ -1522,12 +1562,8 @@ fn edited_inbox_file_is_durably_quarantined_from_index_and_manifest() {
         .unwrap()
         .replace("Original edited token", "Tampered replacement token");
     std::fs::write(scope.join(&first), &edited).unwrap();
-    crate::regenerate_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
-    )
-    .unwrap();
+    crate::regenerate_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::default())
+        .unwrap();
     assert!(
         !std::fs::read_to_string(scope.join("MEMORY.md"))
             .unwrap()
@@ -1623,7 +1659,7 @@ fn completed_job_retries_reconciliation_without_reextracting() {
 fn independent_handles_for_two_sessions_preserve_files_and_manifest() {
     let (temp, first) = setup();
     let scope = temp.path().join("scope");
-    let second = V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
+    let second = CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
     first.enqueue("session-a", range(1, 3)).unwrap();
     first.enqueue("session-b", range(1, 3)).unwrap();
     let barrier = Arc::new(Barrier::new(2));
@@ -1717,7 +1753,7 @@ fn invalid_ranges_bounds_controls_and_symlinks_fail_closed() {
             &CaptureOutcomeDraft::Observations(vec![invalid]),
             11
         ),
-        Err(V2CaptureError::Invalid(_))
+        Err(CaptureError::Invalid(_))
     ));
     let mut invalid = observation("valid");
     invalid.keywords = (0..=MAX_KEYWORDS).map(|index| index.to_string()).collect();
@@ -1741,7 +1777,7 @@ fn invalid_ranges_bounds_controls_and_symlinks_fail_closed() {
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, scope.join("observations/_inbox")).unwrap();
-        assert!(V2CaptureStore::open(&scope, V2MemoryScope::Workspace).is_err());
+        assert!(CaptureStore::open(&scope, MemoryScope::Workspace).is_err());
         assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
     }
 }

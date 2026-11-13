@@ -2,29 +2,26 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+use crate::scope::{MAX_MANUAL_OBSERVATION_BYTES, MemoryScopeError};
 use crate::storage::MemoryStorage;
-use crate::v2::{MAX_MANUAL_OBSERVATION_BYTES, V2StorageError};
 
-fn make_v2_storage(temp: &TempDir) -> MemoryStorage {
-    MemoryStorage::for_workspace(
-        Path::new("/home/user/project"),
-        &temp.path().join("memory-v2"),
-    )
+fn make_memory_storage(temp: &TempDir) -> MemoryStorage {
+    MemoryStorage::for_workspace(Path::new("/home/user/project"), &temp.path().join("memory"))
 }
 
 #[test]
-fn v2_scope_paths_live_under_the_configured_root() {
+fn scope_paths_live_under_the_configured_root() {
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
 
     assert_eq!(
         storage.global_dir(),
-        temp.path().join("memory-v2").join("global")
+        temp.path().join("memory").join("global")
     );
     assert!(
         storage
             .workspace_dir()
-            .starts_with(temp.path().join("memory-v2").join("workspaces")),
+            .starts_with(temp.path().join("memory").join("workspaces")),
         "workspace memory must stay under the storage root"
     );
     assert!(
@@ -40,7 +37,7 @@ fn v2_scope_paths_live_under_the_configured_root() {
 #[test]
 fn remember_notes_are_published_as_distinct_global_observations() {
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
 
     storage
         .save_remember_note("Prefer concise explanations")
@@ -83,13 +80,13 @@ fn remember_notes_are_published_as_distinct_global_observations() {
 #[test]
 fn oversized_remember_note_is_rejected_with_typed_error() {
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
     let oversized = "x".repeat(MAX_MANUAL_OBSERVATION_BYTES + 1);
 
     let error = storage.save_remember_note(&oversized).unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::ObservationTooLarge {
+        MemoryScopeError::ObservationTooLarge {
             actual_bytes,
             limit_bytes: MAX_MANUAL_OBSERVATION_BYTES,
         } if actual_bytes > MAX_MANUAL_OBSERVATION_BYTES
@@ -101,16 +98,16 @@ fn oversized_remember_note_is_rejected_with_typed_error() {
 }
 
 #[test]
-fn v2_listing_enforces_directory_entry_and_file_caps() {
+fn listing_enforces_directory_entry_and_file_caps() {
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
     let topics = storage.global_dir().join("topics");
     std::fs::create_dir_all(&topics).unwrap();
     for index in 0..5 {
         std::fs::write(topics.join(format!("topic-{index}.md")), "# Topic").unwrap();
     }
     let list = |max_entries, max_files| {
-        crate::storage_v2::list_memory_files_with_caps(
+        crate::browse::list_memory_files_with_caps(
             storage.global_dir(),
             storage.workspace_dir(),
             max_entries,
@@ -127,8 +124,8 @@ fn v2_listing_enforces_directory_entry_and_file_caps() {
     assert_eq!(list(100, 3).unwrap().len(), 3);
     assert_eq!(
         list(
-            crate::v2::MAX_DIRECTORY_ENTRIES,
-            crate::v2::MAX_DISCOVERED_FILES
+            crate::scope::MAX_DIRECTORY_ENTRIES,
+            crate::scope::MAX_DISCOVERED_FILES
         )
         .unwrap(),
         storage.list_memory_files().unwrap(),
@@ -137,11 +134,11 @@ fn v2_listing_enforces_directory_entry_and_file_caps() {
 }
 
 #[test]
-fn v2_listing_omits_hidden_and_tombstoned_observations() {
+fn listing_omits_hidden_and_tombstoned_observations() {
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
     storage.ensure_initialized().unwrap();
-    crate::V2CaptureStore::open(storage.global_dir(), crate::V2MemoryScope::Global).unwrap();
+    crate::CaptureStore::open(storage.global_dir(), crate::MemoryScope::Global).unwrap();
 
     let inbox = storage.global_dir().join("observations/_inbox");
     let hidden = inbox.join("hidden.md");
@@ -186,12 +183,12 @@ fn v2_listing_omits_hidden_and_tombstoned_observations() {
 
 #[cfg(unix)]
 #[test]
-fn v2_listing_rejects_symlinked_source_directories() {
+fn listing_rejects_symlinked_source_directories() {
     use std::os::unix::fs::symlink;
 
     for relative in ["topics", "observations/_inbox"] {
         let temp = TempDir::new().unwrap();
-        let storage = make_v2_storage(&temp);
+        let storage = make_memory_storage(&temp);
         storage.ensure_initialized().unwrap();
 
         let outside = temp.path().join("outside");
@@ -211,11 +208,11 @@ fn v2_listing_rejects_symlinked_source_directories() {
 
 #[cfg(unix)]
 #[test]
-fn v2_listing_rejects_symlinked_markdown_files() {
+fn listing_rejects_symlinked_markdown_files() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
     storage.ensure_initialized().unwrap();
 
     let outside = temp.path().join("outside.md");
@@ -230,11 +227,11 @@ fn v2_listing_rejects_symlinked_markdown_files() {
 
 #[cfg(unix)]
 #[test]
-fn v2_listing_rejects_symlinked_workspace_root() {
+fn listing_rejects_symlinked_workspace_root() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
     storage.ensure_initialized().unwrap();
 
     let outside = temp.path().join("outside");
@@ -252,7 +249,7 @@ fn v2_listing_rejects_symlinked_workspace_root() {
 #[test]
 fn listing_follows_manifest_order_within_each_scope() {
     let temp = TempDir::new().unwrap();
-    let storage = make_v2_storage(&temp);
+    let storage = make_memory_storage(&temp);
     storage.ensure_initialized().unwrap();
     let scope = storage.workspace_dir().to_path_buf();
     for slug in ["alpha", "beta", "gamma"] {

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use leveler_memory::V2MemoryScope;
+use leveler_memory::MemoryScope;
 use leveler_memory::batch_dream::{
     BatchClaimRequest, BatchCommit, BatchDreamControl, BatchDreamError, BatchDreamSession,
     BatchDreamStore, BatchLease, BatchReport, BatchResponse, CAPACITY_DEFERRAL_REASON,
@@ -188,7 +188,7 @@ fn storage_stop(error: &BatchDreamError, cancel: &CancellationToken) -> BatchDre
         BatchDreamError::Interrupted if cancel.is_cancelled() => BatchDreamStop::Cancelled,
         BatchDreamError::Interrupted => BatchDreamStop::Timeout,
         _ => {
-            tracing::warn!(%error, "memory-v2 batch Dream storage operation failed");
+            tracing::warn!(%error, "memory batch Dream storage operation failed");
             BatchDreamStop::Storage
         }
     }
@@ -237,13 +237,13 @@ impl LeaseGuard {
     fn release_sync(options: &BatchDreamOptions, lease: &BatchLease) {
         let released = BatchDreamStore::open(
             &options.workspace_dir,
-            V2MemoryScope::Workspace,
+            MemoryScope::Workspace,
             &options.global_dir,
             &options.workspace_dir,
         )
         .and_then(|store| store.release(lease, "interrupted", leveler_core::now().timestamp()));
         if let Err(error) = released {
-            tracing::warn!(%error, "memory-v2 batch Dream could not release its lease");
+            tracing::warn!(%error, "memory batch Dream could not release its lease");
         }
     }
 
@@ -255,7 +255,7 @@ impl LeaseGuard {
         if let Err(error) =
             tokio::task::spawn_blocking(move || LeaseGuard::release_sync(&options, &lease)).await
         {
-            tracing::warn!(%error, "memory-v2 batch Dream lease release task failed");
+            tracing::warn!(%error, "memory batch Dream lease release task failed");
         }
     }
 }
@@ -312,7 +312,7 @@ where
         move || {
             let store = BatchDreamStore::open(
                 &options.workspace_dir,
-                V2MemoryScope::Workspace,
+                MemoryScope::Workspace,
                 &options.global_dir,
                 &options.workspace_dir,
             )?
@@ -385,7 +385,7 @@ where
             })
             .await
             .unwrap_or_else(|error| {
-                tracing::warn!(%error, "memory-v2 batch Dream could not summarize changed topics");
+                tracing::warn!(%error, "memory batch Dream could not summarize changed topics");
                 String::new()
             });
             format!(
@@ -612,7 +612,7 @@ fn commit_or_release(
 ) -> Result<BatchReport, BatchDreamError> {
     match session.commit(commit, now) {
         Err(error @ (BatchDreamError::Conflict(_) | BatchDreamError::Invalid(_))) => {
-            tracing::warn!(%error, "memory-v2 batch Dream commit failed; notes returned to the inbox");
+            tracing::warn!(%error, "memory batch Dream commit failed; notes returned to the inbox");
             session.release("the commit conflicted with a concurrent edit", now)
         }
         result => result,
@@ -773,10 +773,10 @@ pub(crate) async fn run(
                 )
                 .await
                 {
-                    tracing::warn!(%error, "memory-v2 batch Dream call was not recorded");
+                    tracing::warn!(%error, "memory batch Dream call was not recorded");
                 }
                 let response = outcome.map_err(|error| {
-                    tracing::warn!(%error, "memory-v2 batch Dream model call failed");
+                    tracing::warn!(%error, "memory batch Dream model call failed");
                     BatchDreamStop::Model
                 })?;
                 let truncated = response.finish_reason == FinishReason::Length;

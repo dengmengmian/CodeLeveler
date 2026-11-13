@@ -36,9 +36,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use leveler_memory::config::{MemoryV2Config, MemoryV2Rollout};
+use leveler_memory::config::{MemoryConfig, MemoryRollout};
 use leveler_memory::{
-    MemoryStorage, MemoryV2AccessResource, V2ManifestBudget, V2MemoryAccessPolicy, V2MemoryScope,
+    ManifestBudget, MemoryAccessPolicy, MemoryAccessResource, MemoryScope, MemoryStorage,
     regenerate_scope_manifest,
 };
 
@@ -51,9 +51,9 @@ pub use status::{
 /// One policy handle exposes both the host-facing resource for file tools and
 /// the concrete policy the composition root uses for browser reads and forget.
 #[derive(Clone)]
-struct MemoryAccess {
-    policy: Arc<V2MemoryAccessPolicy>,
-    resource: MemoryV2AccessResource,
+struct InstalledMemoryAccess {
+    policy: Arc<MemoryAccessPolicy>,
+    resource: MemoryAccessResource,
 }
 
 /// Per-process memory owner.
@@ -71,7 +71,7 @@ pub struct MemoryRuntime {
     config: Arc<ConfigManager>,
     /// Lazily built after the scope directories exist. A policy caches read
     /// snapshots, so it must not be recreated per call.
-    access: Arc<tokio::sync::Mutex<Option<MemoryAccess>>>,
+    access: Arc<tokio::sync::Mutex<Option<InstalledMemoryAccess>>>,
     /// Sessions whose capture worker is currently running.
     capture_workers: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// The automatic Dream worker, shared by the whole process: Dream is a
@@ -86,6 +86,9 @@ pub struct MemoryRuntime {
     /// authority for whether memory may run at all; this only suppresses it
     /// for one session and never promotes an `off` configuration.
     paused_sessions: Arc<Mutex<HashSet<String>>>,
+    /// When this process started. A turn that finished earlier has no capture
+    /// decision from this process, so it is not backfilled.
+    process_started: leveler_core::Timestamp,
 }
 
 impl MemoryRuntime {
@@ -112,11 +115,12 @@ impl MemoryRuntime {
             activity: Arc::new(Mutex::new(HashMap::new())),
             index_cache: Arc::new(Mutex::new(HashMap::new())),
             paused_sessions: Arc::new(Mutex::new(HashSet::new())),
+            process_started: leveler_core::now(),
         }
     }
 
     /// The memory configuration of the current generation.
-    pub fn config(&self) -> MemoryV2Config {
+    pub fn config(&self) -> MemoryConfig {
         self.config.snapshot().loaded.memory
     }
 
@@ -125,7 +129,7 @@ impl MemoryRuntime {
     /// A pause only narrows the rollout to `off`; it never widens what the
     /// configuration permits. `None` is the process-level view used by
     /// surfaces that are not acting for one session.
-    pub fn config_for(&self, session_scope: Option<&str>) -> MemoryV2Config {
+    pub fn config_for(&self, session_scope: Option<&str>) -> MemoryConfig {
         let mut config = self.config();
         if let Some(scope) = session_scope
             && self
@@ -134,7 +138,7 @@ impl MemoryRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(scope)
         {
-            config.rollout = MemoryV2Rollout::Off;
+            config.rollout = MemoryRollout::Off;
         }
         config
     }
@@ -149,9 +153,9 @@ impl MemoryRuntime {
         &self,
         session_id: &leveler_core::SessionId,
         enabled: bool,
-    ) -> Result<MemoryV2Config, String> {
+    ) -> Result<MemoryConfig, String> {
         let configured = self.config();
-        if enabled && configured.rollout == MemoryV2Rollout::Off {
+        if enabled && configured.rollout == MemoryRollout::Off {
             return Err(
                 "Memory is disabled by configuration (`[memory].rollout = \"off\"`). Set \
                  rollout = \"active\" in config.toml to enable it."
@@ -217,18 +221,18 @@ impl MemoryRuntime {
     pub async fn access_resource(
         &self,
         session_scope: Option<&str>,
-    ) -> Option<MemoryV2AccessResource> {
+    ) -> Option<MemoryAccessResource> {
         self.load_access(session_scope)
             .await
             .map(|access| access.resource)
     }
 
     /// The concrete policy, for the composition root's own browser reads.
-    pub(crate) async fn access_policy(&self) -> Option<Arc<V2MemoryAccessPolicy>> {
+    pub(crate) async fn access_policy(&self) -> Option<Arc<MemoryAccessPolicy>> {
         self.load_access(None).await.map(|access| access.policy)
     }
 
-    async fn load_access(&self, session_scope: Option<&str>) -> Option<MemoryAccess> {
+    async fn load_access(&self, session_scope: Option<&str>) -> Option<InstalledMemoryAccess> {
         let config = self.config_for(session_scope);
         if !config.can_capture() && !config.can_expose_memory() {
             return None;
@@ -242,26 +246,26 @@ impl MemoryRuntime {
             storage
                 .ensure_initialized()
                 .map_err(|error| error.to_string())?;
-            V2MemoryAccessPolicy::new(storage.global_dir(), storage.workspace_dir())
+            MemoryAccessPolicy::new(storage.global_dir(), storage.workspace_dir())
                 .map_err(|error| error.to_string())
         })
         .await;
         match built {
             Ok(Ok(policy)) => {
                 let policy = Arc::new(policy);
-                let access = MemoryAccess {
-                    resource: MemoryV2AccessResource(policy.clone()),
+                let access = InstalledMemoryAccess {
+                    resource: MemoryAccessResource(policy.clone()),
                     policy,
                 };
                 *slot = Some(access.clone());
                 Some(access)
             }
             Ok(Err(error)) => {
-                tracing::warn!(%error, "memory-v2 access policy unavailable");
+                tracing::warn!(%error, "memory access policy unavailable");
                 None
             }
             Err(error) => {
-                tracing::warn!(%error, "memory-v2 access policy task failed");
+                tracing::warn!(%error, "memory access policy task failed");
                 None
             }
         }
@@ -308,11 +312,9 @@ impl MemoryRuntime {
             storage
                 .ensure_initialized()
                 .map_err(|error| error.to_string())?;
-            let store = leveler_memory::V2CaptureStore::open(
-                storage.workspace_dir(),
-                V2MemoryScope::Workspace,
-            )
-            .map_err(|error| error.to_string())?;
+            let store =
+                leveler_memory::CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace)
+                    .map_err(|error| error.to_string())?;
             store
                 .promote_hidden_observations_now()
                 .map_err(|error| error.to_string())
@@ -397,22 +399,59 @@ impl MemoryRuntime {
         *self.dream_worker.lock().await = None;
     }
 
-    /// Shut down every background worker. Called when the application drops.
+    /// Ask every background worker to stop. The slot stays occupied until that
+    /// worker releases its own lease and leaves, so a second worker cannot
+    /// claim the same job while the first is still winding down.
     pub fn cancel_workers(&self) {
-        let workers = {
-            let mut map = self
-                .capture_workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut *map)
-        };
-        for token in workers.into_values() {
+        let workers = self
+            .capture_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for token in workers.values() {
             token.cancel();
         }
-        if let Ok(mut slot) = self.dream_worker.try_lock()
-            && let Some(token) = slot.take()
+        drop(workers);
+        if let Ok(slot) = self.dream_worker.try_lock()
+            && let Some(token) = slot.as_ref()
         {
             token.cancel();
+        }
+    }
+
+    /// Cancel workers and wait until they drop the slots they own.
+    ///
+    /// A normal quit calls this before `process::exit`. Exit skips `Drop`, so
+    /// without the wait a capture lease stays `running` until it expires.
+    /// The wait does not steal another process's lease and does not shorten
+    /// the lease of a worker that never observes the cancel. Five seconds is
+    /// enough for the in-flight claim to release; a model call is dropped by
+    /// the cancellation token rather than run to completion.
+    pub async fn shutdown_workers(&self) {
+        const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+        self.cancel_workers();
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+        loop {
+            let captures_left = self
+                .capture_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            let dream_left = match self.dream_worker.try_lock() {
+                Ok(slot) => slot.is_some(),
+                Err(_) => true,
+            };
+            if captures_left == 0 && !dream_left {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    captures_left,
+                    dream_left,
+                    "memory workers did not release their leases before shutdown"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
@@ -437,7 +476,7 @@ impl MemoryRuntime {
 ///
 /// Regenerating is also how `MEMORY.md` is refreshed, so the file a user opens
 /// is exactly the index the model saw.
-fn build_prompt_index(storage: &MemoryStorage, config: MemoryV2Config) -> Result<Arc<str>, String> {
+fn build_prompt_index(storage: &MemoryStorage, config: MemoryConfig) -> Result<Arc<str>, String> {
     storage
         .ensure_initialized()
         .map_err(|error| error.to_string())?;
@@ -449,17 +488,17 @@ fn build_prompt_index(storage: &MemoryStorage, config: MemoryV2Config) -> Result
     // this turn's prompt.
     if !ephemeral
         && let Err(error) =
-            leveler_memory::V2CaptureStore::open(storage.workspace_dir(), V2MemoryScope::Workspace)
+            leveler_memory::CaptureStore::open(storage.workspace_dir(), MemoryScope::Workspace)
                 .and_then(|store| store.promote_hidden_observations_now())
     {
-        tracing::warn!(%error, "memory-v2 observation promotion deferred");
+        tracing::warn!(%error, "memory observation promotion deferred");
     }
     let budget = if config.compact_index_enabled {
-        V2ManifestBudget::compact()
+        ManifestBudget::compact()
     } else {
-        V2ManifestBudget::default()
+        ManifestBudget::default()
     };
-    let global = regenerate_scope_manifest(storage.global_dir(), V2MemoryScope::Global, budget)
+    let global = regenerate_scope_manifest(storage.global_dir(), MemoryScope::Global, budget)
         .map_err(|error| error.to_string())?;
     let global_body = global.content.trim();
     // A temporary working directory has no workspace scope, so there is no
@@ -471,7 +510,7 @@ fn build_prompt_index(storage: &MemoryStorage, config: MemoryV2Config) -> Result
             .to_owned()
     } else {
         let workspace =
-            regenerate_scope_manifest(storage.workspace_dir(), V2MemoryScope::Workspace, budget)
+            regenerate_scope_manifest(storage.workspace_dir(), MemoryScope::Workspace, budget)
                 .map_err(|error| error.to_string())?;
         let workspace_body = workspace.content.trim();
         format!(

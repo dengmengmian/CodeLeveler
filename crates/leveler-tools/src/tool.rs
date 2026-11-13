@@ -92,7 +92,7 @@ pub struct ExecutionResources {
     /// roots through this policy so memory files keep their own containment,
     /// concurrency and manifest guarantees. `None` = every path behaves as an
     /// ordinary file.
-    pub memory: Option<leveler_memory::MemoryV2AccessResource>,
+    pub memory: Option<leveler_memory::MemoryAccessResource>,
     /// The bounded memory index rendered for this turn, when the memory
     /// pipeline exposes it. Held here (not recomputed in the executor) so every
     /// model round of one turn sends the same bytes and the provider's prefix
@@ -502,7 +502,7 @@ impl ToolContext {
     }
 
     /// Attach the host memory policy for ordinary file-tool routing.
-    pub fn with_memory(mut self, memory: leveler_memory::MemoryV2AccessResource) -> Self {
+    pub fn with_memory(mut self, memory: leveler_memory::MemoryAccessResource) -> Self {
         self.execution.memory = Some(memory);
         self
     }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::v2_topic_reads::record_topic_read;
+use crate::topic_reads::record_topic_read;
 use tempfile::TempDir;
 
 #[test]
@@ -9,7 +9,7 @@ fn initialization_creates_complete_scope_and_is_idempotent() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
 
-    ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap();
     let expected = [
         "topics",
         "observations",
@@ -25,7 +25,7 @@ fn initialization_creates_complete_scope_and_is_idempotent() {
 
     std::fs::write(scope.join("topics/new.md"), "# New\n\nFresh content.").unwrap();
     std::fs::write(scope.join("MEMORY.md"), "stale sentinel").unwrap();
-    ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap();
     let refreshed_manifest = std::fs::read_to_string(scope.join("MEMORY.md")).unwrap();
     assert!(refreshed_manifest.contains("topics/new.md"));
     assert!(!refreshed_manifest.contains("stale sentinel"));
@@ -68,7 +68,7 @@ fn concurrent_initialization_is_safe() {
             let root = root.clone();
             let scope = scope.clone();
             std::thread::spawn(move || {
-                ensure_scope_initialized(&root, &scope, V2MemoryScope::Global).unwrap();
+                ensure_scope_initialized(&root, &scope, MemoryScope::Global).unwrap();
             })
         })
         .collect();
@@ -117,11 +117,10 @@ fn manifest_is_deterministic_and_includes_topics_before_observations() {
     std::fs::create_dir_all(scope.join("topics/nested")).unwrap();
     std::fs::write(scope.join("topics/nested/ignored.md"), "# Nested").unwrap();
 
-    let first = render_scope_manifest(scope, V2MemoryScope::Workspace, V2ManifestBudget::default())
-        .unwrap();
+    let first =
+        render_scope_manifest(scope, MemoryScope::Workspace, ManifestBudget::default()).unwrap();
     let second =
-        render_scope_manifest(scope, V2MemoryScope::Workspace, V2ManifestBudget::default())
-            .unwrap();
+        render_scope_manifest(scope, MemoryScope::Workspace, ManifestBudget::default()).unwrap();
 
     assert_eq!(first, second);
     assert_eq!(first.discovered_entries, 4);
@@ -159,16 +158,16 @@ fn manifest_is_deterministic_and_includes_topics_before_observations() {
     let source = collect_scope_manifest_source(scope).unwrap();
     let full = render_manifest_from_source(
         &source,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         scope,
-        V2ManifestBudget::default(),
+        ManifestBudget::default(),
     );
     assert_eq!(full, first);
     let compact = render_manifest_from_source(
         &source,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         scope,
-        V2ManifestBudget::compact(),
+        ManifestBudget::compact(),
     );
     assert_eq!(compact.discovered_entries, 2);
     assert_eq!(compact.included_entries, 2);
@@ -200,8 +199,8 @@ fn compact_manifest_lists_titles_then_slugs_then_counts_the_rest() {
     write_topics(200);
     let manifest = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::compact(),
+        MemoryScope::Workspace,
+        ManifestBudget::compact(),
     )
     .unwrap();
     assert!(manifest.content.len() <= 8 * 1024);
@@ -230,8 +229,8 @@ fn compact_manifest_lists_titles_then_slugs_then_counts_the_rest() {
     write_topics(2_000);
     let manifest = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::compact(),
+        MemoryScope::Workspace,
+        ManifestBudget::compact(),
     )
     .unwrap();
     assert!(manifest.content.len() <= 8 * 1024);
@@ -249,8 +248,8 @@ fn compact_manifest_lists_titles_then_slugs_then_counts_the_rest() {
 
     let full = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
+        MemoryScope::Workspace,
+        ManifestBudget::default(),
     )
     .unwrap();
     assert!(full.is_truncated);
@@ -269,8 +268,8 @@ fn compact_manifest_with_only_inbox_notes_reports_no_topics() {
     .unwrap();
     let compact = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::compact(),
+        MemoryScope::Workspace,
+        ManifestBudget::compact(),
     )
     .unwrap();
     assert_eq!(compact.discovered_entries, 0);
@@ -284,8 +283,8 @@ fn compact_manifest_with_only_inbox_notes_reports_no_topics() {
 
     let full = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
+        MemoryScope::Workspace,
+        ManifestBudget::default(),
     )
     .unwrap();
     assert_eq!(full.discovered_entries, 1);
@@ -297,7 +296,7 @@ fn compact_manifest_with_only_inbox_notes_reports_no_topics() {
 fn compact_manifest_ranks_read_topics_first_and_keeps_the_tail_alphabetical() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("workspace");
-    ensure_scope_initialized(&scope, &scope, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(&scope, &scope, MemoryScope::Workspace).unwrap();
     for index in 0..200 {
         std::fs::write(
             scope.join("topics").join(format!("topic-{index:04}.md")),
@@ -306,12 +305,8 @@ fn compact_manifest_ranks_read_topics_first_and_keeps_the_tail_alphabetical() {
         .unwrap();
     }
     // Before any read the titled tier is alphabetical and the ledger is absent.
-    let unread = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::compact(),
-    )
-    .unwrap();
+    let unread =
+        render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::compact()).unwrap();
     let (unread_titled, _) = unread.content.split_once("\n## More topics\n").unwrap();
     assert!(unread_titled.contains("(`topics/topic-0000.md`)"));
     assert!(!unread_titled.contains("(`topics/topic-0199.md`)"));
@@ -325,12 +320,8 @@ fn compact_manifest_ranks_read_topics_first_and_keeps_the_tail_alphabetical() {
     record_topic_read(&scope, "topics\\topic-0198.md").unwrap();
     record_topic_read(&scope, "topics/deleted-topic.md").unwrap();
 
-    let ranked = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::compact(),
-    )
-    .unwrap();
+    let ranked =
+        render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::compact()).unwrap();
     assert_eq!(ranked.discovered_entries, 200);
     assert_eq!(ranked.included_entries, 200);
     assert!(!ranked.content.contains("deleted-topic"));
@@ -363,10 +354,10 @@ fn compact_manifest_ranks_read_topics_first_and_keeps_the_tail_alphabetical() {
     // still reaches the titled tier.
     let capped = render_scope_manifest(
         &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget {
+        MemoryScope::Workspace,
+        ManifestBudget {
             max_entries: 10,
-            ..V2ManifestBudget::compact()
+            ..ManifestBudget::compact()
         },
     )
     .unwrap();
@@ -391,12 +382,8 @@ fn compact_manifest_ranks_read_topics_first_and_keeps_the_tail_alphabetical() {
         }
     }
     record_topic_read(&scope, "topics/topic-1999.md").unwrap();
-    let overflowing = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::compact(),
-    )
-    .unwrap();
+    let overflowing =
+        render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::compact()).unwrap();
     assert!(overflowing.is_truncated);
     let (titled, tail) = overflowing
         .content
@@ -417,12 +404,8 @@ fn compact_manifest_ranks_read_topics_first_and_keeps_the_tail_alphabetical() {
     assert!(tail.contains("more topics are not listed."));
 
     // The full render ignores the ledger and stays alphabetical.
-    let full = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
-    )
-    .unwrap();
+    let full =
+        render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::default()).unwrap();
     let full_first = full.content.find("(`topics/topic-0000.md`)").unwrap();
     let full_last = full.content.find("(`topics/topic-0001.md`)").unwrap();
     assert!(full_first < full_last);
@@ -443,12 +426,12 @@ fn manifest_budget_is_a_hard_utf8_safe_cap() {
 
     let manifest = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget {
+        MemoryScope::Workspace,
+        ManifestBudget {
             max_bytes: 257,
             max_entries: 3,
             max_description_bytes: 97,
-            ..V2ManifestBudget::default()
+            ..ManifestBudget::default()
         },
     )
     .unwrap();
@@ -461,12 +444,12 @@ fn manifest_budget_is_a_hard_utf8_safe_cap() {
 
     let entry_limited = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget {
+        MemoryScope::Workspace,
+        ManifestBudget {
             max_bytes: MAX_MANIFEST_BYTES,
             max_entries: 3,
             max_description_bytes: 8,
-            ..V2ManifestBudget::default()
+            ..ManifestBudget::default()
         },
     )
     .unwrap();
@@ -488,14 +471,14 @@ fn oversized_entry_does_not_starve_later_manifest_entries() {
 
     let manifest = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget {
+        MemoryScope::Workspace,
+        ManifestBudget {
             // Room for the header plus one small entry, but not the 2 KB
             // oversized title.
             max_bytes: 400,
             max_entries: 2,
             max_description_bytes: 32,
-            ..V2ManifestBudget::default()
+            ..ManifestBudget::default()
         },
     )
     .unwrap();
@@ -511,12 +494,12 @@ fn zero_budget_produces_empty_bounded_manifest() {
     let temp = TempDir::new().unwrap();
     let manifest = render_scope_manifest(
         temp.path(),
-        V2MemoryScope::Global,
-        V2ManifestBudget {
+        MemoryScope::Global,
+        ManifestBudget {
             max_bytes: 0,
             max_entries: 0,
             max_description_bytes: 0,
-            ..V2ManifestBudget::default()
+            ..ManifestBudget::default()
         },
     )
     .unwrap();
@@ -528,8 +511,8 @@ fn zero_budget_produces_empty_bounded_manifest() {
 fn exclusion_ledger_normalizes_windows_separators() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
-    ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap();
-    let _capture = crate::V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap();
+    let _capture = crate::CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
     std::fs::write(scope.join("topics/forgotten.md"), "# Forgotten").unwrap();
     std::fs::write(
         scope.join("observations/_inbox/hidden.md"),
@@ -558,12 +541,8 @@ fn exclusion_ledger_normalizes_windows_separators() {
 
     assert!(is_durably_excluded(&scope, Path::new("topics/forgotten.md")).unwrap());
     assert!(is_durably_excluded(&scope, Path::new("observations/_inbox/hidden.md")).unwrap());
-    let manifest = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
-    )
-    .unwrap();
+    let manifest =
+        render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::default()).unwrap();
     assert!(!manifest.content.contains("forgotten.md"));
     assert!(!manifest.content.contains("hidden.md"));
 }
@@ -572,21 +551,17 @@ fn exclusion_ledger_normalizes_windows_separators() {
 fn manifest_accepts_maintenance_schema_without_capture_tables() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
-    ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap();
     let state_path = scope.join("memory_state.sqlite");
     let connection = JournalMode::for_db_path(&state_path)
         .open(&state_path)
         .unwrap();
-    crate::v2_maintenance::migrate_v2_hardening(&connection).unwrap();
+    crate::maintenance::migrate_hardening(&connection).unwrap();
     drop(connection);
     std::fs::write(scope.join("topics/healthy.md"), "# Healthy").unwrap();
 
-    let manifest = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
-    )
-    .unwrap();
+    let manifest =
+        render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::default()).unwrap();
     assert!(manifest.content.contains("topics/healthy.md"));
 }
 
@@ -604,8 +579,8 @@ fn manifest_ignores_symlinks_even_when_the_target_is_markdown() {
 
     let manifest = render_scope_manifest(
         &temp.path().join("scope"),
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
+        MemoryScope::Workspace,
+        ManifestBudget::default(),
     )
     .unwrap();
     assert_eq!(manifest.discovered_entries, 0);
@@ -629,15 +604,11 @@ fn manifest_rejects_symlinked_source_directory() {
     std::fs::create_dir_all(&scope).unwrap();
     symlink(&outside, scope.join("topics")).unwrap();
 
-    let error = render_scope_manifest(
-        &scope,
-        V2MemoryScope::Workspace,
-        V2ManifestBudget::default(),
-    )
-    .unwrap_err();
+    let error = render_scope_manifest(&scope, MemoryScope::Workspace, ManifestBudget::default())
+        .unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::Io {
+        MemoryScopeError::Io {
             source,
             ..
         } if source.kind() == std::io::ErrorKind::PermissionDenied
@@ -655,10 +626,10 @@ fn initialization_rejects_symlinked_scope_and_database_without_touching_targets(
     let linked_scope = temp.path().join("linked-scope");
     symlink(&outside_scope, &linked_scope).unwrap();
     let error =
-        ensure_scope_initialized(&linked_scope, &linked_scope, V2MemoryScope::Global).unwrap_err();
+        ensure_scope_initialized(&linked_scope, &linked_scope, MemoryScope::Global).unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::Io {
+        MemoryScopeError::Io {
             source,
             ..
         } if source.kind() == std::io::ErrorKind::PermissionDenied
@@ -666,13 +637,13 @@ fn initialization_rejects_symlinked_scope_and_database_without_touching_targets(
     assert_eq!(std::fs::read_dir(&outside_scope).unwrap().count(), 0);
     let error = render_scope_manifest(
         &linked_scope,
-        V2MemoryScope::Global,
-        V2ManifestBudget::default(),
+        MemoryScope::Global,
+        ManifestBudget::default(),
     )
     .unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::Io {
+        MemoryScopeError::Io {
             source,
             ..
         } if source.kind() == std::io::ErrorKind::PermissionDenied
@@ -686,12 +657,12 @@ fn initialization_rejects_symlinked_scope_and_database_without_touching_targets(
     let error = ensure_scope_initialized(
         &root,
         &root.join("workspaces/project"),
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
     )
     .unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::Io {
+        MemoryScopeError::Io {
             source,
             ..
         } if source.kind() == std::io::ErrorKind::PermissionDenied
@@ -703,11 +674,10 @@ fn initialization_rejects_symlinked_scope_and_database_without_touching_targets(
     let outside_db = temp.path().join("outside.sqlite");
     std::fs::write(&outside_db, "sentinel").unwrap();
     symlink(&outside_db, scope.join("memory_state.sqlite")).unwrap();
-    let error =
-        ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap_err();
+    let error = ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::Io {
+        MemoryScopeError::Io {
             source,
             ..
         } if source.kind() == std::io::ErrorKind::PermissionDenied
@@ -722,13 +692,13 @@ fn initialization_refuses_network_filesystems_before_creating_state() {
     let error = ensure_scope_initialized_with_journal_mode(
         temp.path(),
         &scope,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         Some(JournalMode::Truncate),
     )
     .unwrap_err();
     assert!(matches!(
         error,
-        V2StorageError::UnsupportedNetworkFilesystem { ref path } if path == &scope
+        MemoryScopeError::UnsupportedNetworkFilesystem { ref path } if path == &scope
     ));
     let state_files = std::fs::read_dir(&scope)
         .unwrap()
@@ -742,8 +712,8 @@ fn initialization_refuses_network_filesystems_before_creating_state() {
 fn exclusion_ledger_checks_stat_the_effective_database_path() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
-    ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Workspace).unwrap();
-    let _capture = crate::V2CaptureStore::open(&scope, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(temp.path(), &scope, MemoryScope::Workspace).unwrap();
+    let _capture = crate::CaptureStore::open(&scope, MemoryScope::Workspace).unwrap();
     let bare = scope.join("memory_state.sqlite");
     let connection = JournalMode::for_db_path(&bare).open(&bare).unwrap();
     connection
@@ -791,12 +761,11 @@ fn exclusion_ledger_checks_stat_the_effective_database_path() {
 fn regeneration_atomically_replaces_existing_manifest() {
     let temp = TempDir::new().unwrap();
     let scope = temp.path().join("scope");
-    ensure_scope_initialized(temp.path(), &scope, V2MemoryScope::Global).unwrap();
+    ensure_scope_initialized(temp.path(), &scope, MemoryScope::Global).unwrap();
     std::fs::write(scope.join("topics/fact.md"), b"# Fact\n\n\xff durable").unwrap();
 
     let manifest =
-        regenerate_scope_manifest(&scope, V2MemoryScope::Global, V2ManifestBudget::default())
-            .unwrap();
+        regenerate_scope_manifest(&scope, MemoryScope::Global, ManifestBudget::default()).unwrap();
     assert_eq!(
         std::fs::read_to_string(scope.join("MEMORY.md")).unwrap(),
         manifest.content

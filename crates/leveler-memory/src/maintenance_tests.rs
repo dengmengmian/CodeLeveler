@@ -5,33 +5,33 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    CaptureOutcomeDraft, CaptureRange, ClaimRequest, DreamClaimRequest, ObservationDraft,
-    ObservationType, SharedV2Clock, TopicOperation, V2CaptureStore, V2Clock, V2ConsolidationStore,
-    ensure_scope_initialized,
+    CaptureOutcomeDraft, CaptureRange, CaptureStore, ClaimRequest, ConsolidationStore,
+    DreamClaimRequest, MemoryClock, ObservationDraft, ObservationType, SharedMemoryClock,
+    TopicOperation, ensure_scope_initialized,
 };
 
 #[derive(Debug)]
 struct FixedClock(i64);
 
-impl V2Clock for FixedClock {
+impl MemoryClock for FixedClock {
     fn now_unix_seconds(&self) -> i64 {
         self.0
     }
 }
 
-fn fixed_clock(now: i64) -> SharedV2Clock {
+fn fixed_clock(now: i64) -> SharedMemoryClock {
     std::sync::Arc::new(FixedClock(now))
 }
 
 fn fixture() -> (TempDir, PathBuf, PathBuf) {
     let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("memory-v2");
+    let root = temporary.path().join("memory");
     let global = root.join("global");
     let workspace = root.join("workspaces/project");
     std::fs::create_dir_all(&global).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
-    ensure_scope_initialized(&root, &global, V2MemoryScope::Global).unwrap();
-    ensure_scope_initialized(&root, &workspace, V2MemoryScope::Workspace).unwrap();
+    ensure_scope_initialized(&root, &global, MemoryScope::Global).unwrap();
+    ensure_scope_initialized(&root, &workspace, MemoryScope::Workspace).unwrap();
     (temporary, global, workspace)
 }
 
@@ -40,7 +40,7 @@ fn capture_one(workspace: &Path) -> PathBuf {
 }
 
 fn capture_one_with_visibility(workspace: &Path, session: &str, is_exposed: bool) -> PathBuf {
-    let store = V2CaptureStore::open(workspace, V2MemoryScope::Workspace).unwrap();
+    let store = CaptureStore::open(workspace, MemoryScope::Workspace).unwrap();
     let range = CaptureRange::try_new(1, 1).unwrap();
     store
         .enqueue_with_visibility(session, range, is_exposed)
@@ -82,8 +82,8 @@ fn forgetting_is_durable_and_reconciliation_cannot_resurrect_observation() {
     let relative = capture_one(&workspace);
     let bytes = std::fs::read(workspace.join(&relative)).unwrap();
     let expected_content_hash = blake3::hash(&bytes).to_hex().to_string();
-    let store = V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-        .unwrap();
+    let store =
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let result = store
         .forget(&ForgetRequest {
             relative_path: relative.clone(),
@@ -106,14 +106,13 @@ fn forgetting_is_durable_and_reconciliation_cannot_resurrect_observation() {
             .was_already_forgotten
     );
 
-    V2CaptureStore::open(&workspace, V2MemoryScope::Workspace)
+    CaptureStore::open(&workspace, MemoryScope::Workspace)
         .unwrap()
         .reconcile()
         .unwrap();
     assert!(!workspace.join(&relative).exists());
     let reopened =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let status = reopened.status(21).unwrap();
     assert_eq!(status.tombstone_count, 1);
     assert_eq!(status.pending_observations, 0);
@@ -129,8 +128,8 @@ fn forgetting_a_topic_does_not_count_as_a_read() {
     let (_temporary, global, workspace) = fixture();
     let topic = workspace.join("topics/rust.md");
     std::fs::write(&topic, "# Rust\n\nNotes.").unwrap();
-    let store = V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-        .unwrap();
+    let store =
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     store
         .forget(&ForgetRequest {
             relative_path: PathBuf::from("topics/rust.md"),
@@ -167,16 +166,15 @@ fn settled_tombstones_leave_the_manifest_alone_until_a_file_is_removed() {
         now,
     };
     let manifest = workspace.join("MEMORY.md");
-    let store = V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-        .unwrap();
+    let store =
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     store.forget(&forget_request(&first, 20)).unwrap();
 
     // Reopening reconciles the settled tombstone again; nothing was removed, so the
     // manifest on disk is not rewritten.
     std::fs::write(&manifest, "sentinel").unwrap();
     let reopened =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     assert_eq!("sentinel", std::fs::read_to_string(&manifest).unwrap());
 
     reopened.forget(&forget_request(&second, 21)).unwrap();
@@ -192,7 +190,7 @@ fn settled_tombstones_leave_the_manifest_alone_until_a_file_is_removed() {
 fn archive_exclusion_join_is_served_by_the_normalized_source_path_index() {
     let (_temporary, global, workspace) = fixture();
     capture_one(&workspace);
-    V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace).unwrap();
+    MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let state_path = workspace.join("memory_state.sqlite");
     let connection = JournalMode::for_db_path(&state_path)
         .open(&state_path)
@@ -200,7 +198,7 @@ fn archive_exclusion_join_is_served_by_the_normalized_source_path_index() {
     let plan: Vec<String> = connection
         .prepare(&format!(
             "EXPLAIN QUERY PLAN {}",
-            crate::v2::COMMITTED_UNARCHIVED_FILES_SQL
+            crate::scope::COMMITTED_UNARCHIVED_FILES_SQL
         ))
         .unwrap()
         .query_map(params![1], |row| row.get::<_, String>(3))
@@ -220,8 +218,7 @@ fn forgetting_matches_legacy_backslash_archive_paths() {
     let (_temporary, global, workspace) = fixture();
     let observation = capture_one(&workspace);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim(&DreamClaimRequest {
             owner: "dreamer".to_owned(),
@@ -263,7 +260,7 @@ fn forgetting_matches_legacy_backslash_archive_paths() {
         .to_hex()
         .to_string();
 
-    V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
+    MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace)
         .unwrap()
         .forget(&ForgetRequest {
             relative_path: archive_path.clone().into(),
@@ -293,9 +290,9 @@ fn opening_store_reconciles_crash_window_tombstone_with_injected_clock() {
         )
         .unwrap();
 
-    V2MaintenanceStore::open_with_clock(
+    MaintenanceStore::open_with_clock(
         &workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &global,
         &workspace,
         fixed_clock(21),
@@ -357,9 +354,9 @@ fn tampered_tombstone_is_quarantined_without_blocking_other_forgets() {
         .unwrap();
     std::fs::write(workspace.join(&first), "recreated with unrelated bytes").unwrap();
 
-    V2MaintenanceStore::open_with_clock(
+    MaintenanceStore::open_with_clock(
         &workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &global,
         &workspace,
         fixed_clock(21),
@@ -385,8 +382,7 @@ fn maintenance_backfills_pre_hardening_retention_rows() {
     let (_temporary, global, workspace) = fixture();
     let observation = capture_one(&workspace);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim(&DreamClaimRequest {
             owner: "dreamer".to_owned(),
@@ -415,7 +411,7 @@ fn maintenance_backfills_pre_hardening_retention_rows() {
         .unwrap();
     drop(connection);
 
-    V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace).unwrap();
+    MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let connection = JournalMode::for_db_path(&state_path)
         .open_readonly(&state_path)
         .unwrap();
@@ -456,11 +452,10 @@ fn status_matches_legacy_backslash_tombstones() {
         )
         .unwrap();
 
-    let status =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap()
-            .status(12)
-            .unwrap();
+    let status = MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace)
+        .unwrap()
+        .status(12)
+        .unwrap();
     assert_eq!(status.pending_observations, 0);
     assert_eq!(status.hidden_pending_observations, 0);
 }
@@ -470,8 +465,7 @@ fn retention_gc_is_idempotent_and_refuses_active_dream() {
     let (_temporary, global, workspace) = fixture();
     let relative = capture_one(&workspace);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim(&DreamClaimRequest {
             owner: "dreamer".to_owned(),
@@ -480,9 +474,9 @@ fn retention_gc_is_idempotent_and_refuses_active_dream() {
         })
         .unwrap()
         .unwrap();
-    let maintenance = V2MaintenanceStore::open_with_clock(
+    let maintenance = MaintenanceStore::open_with_clock(
         &workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &global,
         &workspace,
         fixed_clock(21),
@@ -496,7 +490,7 @@ fn retention_gc_is_idempotent_and_refuses_active_dream() {
                 terminal_job_days: 0,
             }
         ),
-        Err(V2MaintenanceError::ActiveLease)
+        Err(MaintenanceError::ActiveLease)
     ));
     dream
         .commit(
@@ -563,8 +557,7 @@ fn archive_gc_before_job_expiry_does_not_resurrect_pending_observations() {
     let (_temporary, global, workspace) = fixture();
     let relative = capture_one(&workspace);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim(&DreamClaimRequest {
             owner: "dreamer".to_owned(),
@@ -596,8 +589,7 @@ fn archive_gc_before_job_expiry_does_not_resurrect_pending_observations() {
         .unwrap();
 
     let maintenance =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let archive_only = RetentionPolicy {
         archived_observation_days: 0,
         terminal_job_days: 365,
@@ -621,7 +613,7 @@ fn archive_gc_before_job_expiry_does_not_resurrect_pending_observations() {
             .is_none(),
         "an expired archive must not become claimable again"
     );
-    V2CaptureStore::open(&workspace, V2MemoryScope::Workspace)
+    CaptureStore::open(&workspace, MemoryScope::Workspace)
         .unwrap()
         .reconcile()
         .unwrap();
@@ -644,8 +636,7 @@ fn retention_gc_preserves_unarchived_hidden_and_shadow_observations() {
     let (_temporary, global, workspace) = fixture();
     let hidden = capture_one_with_visibility(&workspace, "shadow-session", false);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim_shadow(&DreamClaimRequest {
             owner: "shadow-worker".to_owned(),
@@ -666,8 +657,7 @@ fn retention_gc_preserves_unarchived_hidden_and_shadow_observations() {
         )
         .unwrap();
     let maintenance =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let before = maintenance.status(22).unwrap();
     assert_eq!(before.pending_observations, 0);
     assert_eq!(before.hidden_pending_observations, 1);
@@ -703,7 +693,7 @@ fn retention_gc_preserves_unarchived_hidden_and_shadow_observations() {
         assert_eq!(count, 1, "{table} was collected while still pending");
     }
     drop(connection);
-    let capture = V2CaptureStore::open(&workspace, V2MemoryScope::Workspace).unwrap();
+    let capture = CaptureStore::open(&workspace, MemoryScope::Workspace).unwrap();
     assert_eq!(capture.promote_hidden_observations(23).unwrap(), 1);
     let active = dream
         .claim(&DreamClaimRequest {
@@ -728,7 +718,7 @@ fn retention_gc_preserves_unarchived_hidden_and_shadow_observations() {
             )
             .unwrap_err()
             .to_string(),
-        V2MaintenanceError::ActiveLease.to_string()
+        MaintenanceError::ActiveLease.to_string()
     );
 }
 
@@ -739,8 +729,7 @@ fn status_does_not_reconcile_tombstones_during_active_dream() {
     let bytes = std::fs::read(workspace.join(&relative)).unwrap();
     let content_hash = blake3::hash(&bytes).to_hex().to_string();
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim(&DreamClaimRequest {
             owner: "dreamer".to_owned(),
@@ -761,9 +750,9 @@ fn status_does_not_reconcile_tombstones_during_active_dream() {
         )
         .unwrap();
 
-    let maintenance = V2MaintenanceStore::open_with_clock(
+    let maintenance = MaintenanceStore::open_with_clock(
         &workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &global,
         &workspace,
         fixed_clock(21),
@@ -782,7 +771,7 @@ fn status_does_not_reconcile_tombstones_during_active_dream() {
                 terminal_job_days: 0,
             }
         ),
-        Err(V2MaintenanceError::ActiveLease)
+        Err(MaintenanceError::ActiveLease)
     ));
     assert!(workspace.join(&relative).exists());
 
@@ -805,14 +794,14 @@ fn maintenance_access_errors_preserve_their_source() {
 
     let (_temporary, _global, workspace) = fixture();
     let missing_global = workspace.join("missing-global");
-    let error = V2MaintenanceStore::open(
+    let error = MaintenanceStore::open(
         &workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &missing_global,
         &workspace,
     )
     .unwrap_err();
-    assert!(matches!(error, V2MaintenanceError::Access(_)));
+    assert!(matches!(error, MaintenanceError::Access(_)));
     assert!(error.source().is_some());
 }
 
@@ -820,14 +809,13 @@ fn maintenance_access_errors_preserve_their_source() {
 fn active_promotion_exposes_record_only_and_shadow_history_without_erasing_evaluation() {
     let (_temporary, global, workspace) = fixture();
     let record_only = capture_one_with_visibility(&workspace, "record-only", false);
-    let capture = V2CaptureStore::open(&workspace, V2MemoryScope::Workspace).unwrap();
+    let capture = CaptureStore::open(&workspace, MemoryScope::Workspace).unwrap();
     assert_eq!(capture.promote_hidden_observations(15).unwrap(), 1);
     assert_eq!(capture.promote_hidden_observations(15).unwrap(), 0);
 
     let shadow = capture_one_with_visibility(&workspace, "shadow", false);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim_shadow(&DreamClaimRequest {
             owner: "shadow-worker".to_owned(),
@@ -905,7 +893,7 @@ fn status_buckets_retry_terminal_failure_and_visibility_disjointly() {
     let (_temporary, global, workspace) = fixture();
     capture_one_with_visibility(&workspace, "visible", true);
     capture_one_with_visibility(&workspace, "hidden", false);
-    let capture = V2CaptureStore::open(&workspace, V2MemoryScope::Workspace).unwrap();
+    let capture = CaptureStore::open(&workspace, MemoryScope::Workspace).unwrap();
     capture
         .enqueue("retry", CaptureRange::try_new(1, 1).unwrap())
         .unwrap();
@@ -937,11 +925,10 @@ fn status_buckets_retry_terminal_failure_and_visibility_disjointly() {
         .unwrap();
     capture.fail_terminal(&terminal, 21, "terminal").unwrap();
 
-    let status =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap()
-            .status(22)
-            .unwrap();
+    let status = MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace)
+        .unwrap()
+        .status(22)
+        .unwrap();
     assert_eq!(status.retry_capture_jobs, 1);
     assert_eq!(status.failed_capture_jobs, 1);
     assert_eq!(status.pending_observations, 1);
@@ -964,8 +951,8 @@ fn status_buckets_retry_terminal_failure_and_visibility_disjointly() {
 #[test]
 fn forgetting_rejects_broad_protected_and_stale_requests() {
     let (_temporary, global, workspace) = fixture();
-    let store = V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-        .unwrap();
+    let store =
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     for relative_path in ["topics", "../topics/fact.md", "MEMORY.md"] {
         assert!(matches!(
             store.forget(&ForgetRequest {
@@ -974,7 +961,7 @@ fn forgetting_rejects_broad_protected_and_stale_requests() {
                 reason: ForgetReason::Privacy,
                 now: 1,
             }),
-            Err(V2MaintenanceError::Invalid(_) | V2MaintenanceError::Protected)
+            Err(MaintenanceError::Invalid(_) | MaintenanceError::Protected)
         ));
     }
 }
@@ -982,7 +969,7 @@ fn forgetting_rejects_broad_protected_and_stale_requests() {
 #[test]
 fn manifest_exclusions_support_schema_three_without_quarantine_table() {
     let (_temporary, _global, workspace) = fixture();
-    V2CaptureStore::open(&workspace, V2MemoryScope::Workspace).unwrap();
+    CaptureStore::open(&workspace, MemoryScope::Workspace).unwrap();
     let state_path = workspace.join("memory_state.sqlite");
     JournalMode::for_db_path(&state_path)
         .open(&state_path)
@@ -1001,7 +988,7 @@ fn manifest_exclusions_support_schema_three_without_quarantine_table() {
         )
         .unwrap();
 
-    let excluded = crate::v2::excluded_manifest_paths(&workspace).unwrap();
+    let excluded = crate::scope::excluded_manifest_paths(&workspace).unwrap();
     assert_eq!(excluded.len(), 2);
     assert!(excluded.contains("topics/forgotten.md"));
     assert!(excluded.contains("observations/_inbox/hidden.md"));
@@ -1025,7 +1012,7 @@ fn manifest_integrity_scan_matches_legacy_backslash_archives() {
         .unwrap();
     std::fs::remove_file(workspace.join(&observation)).unwrap();
 
-    let excluded = crate::v2::excluded_manifest_paths(&workspace).unwrap();
+    let excluded = crate::scope::excluded_manifest_paths(&workspace).unwrap();
     assert!(
         !excluded.contains(observation.to_str().unwrap()),
         "an archived capture must not be treated as a damaged committed observation"
@@ -1035,7 +1022,7 @@ fn manifest_integrity_scan_matches_legacy_backslash_archives() {
 #[test]
 fn manifest_fails_closed_when_current_exclusion_ledger_is_partially_corrupt() {
     let (_temporary, _global, workspace) = fixture();
-    V2CaptureStore::open(&workspace, V2MemoryScope::Workspace).unwrap();
+    CaptureStore::open(&workspace, MemoryScope::Workspace).unwrap();
     let state_path = workspace.join("memory_state.sqlite");
     let connection = JournalMode::for_db_path(&state_path)
         .open(&state_path)
@@ -1056,10 +1043,10 @@ fn manifest_fails_closed_when_current_exclusion_ledger_is_partially_corrupt() {
     assert!(matches!(
         crate::render_scope_manifest(
             &workspace,
-            V2MemoryScope::Workspace,
-            V2ManifestBudget::default(),
+            MemoryScope::Workspace,
+            ManifestBudget::default(),
         ),
-        Err(crate::V2StorageError::Database { .. })
+        Err(crate::MemoryScopeError::Database { .. })
     ));
 }
 
@@ -1068,8 +1055,7 @@ fn active_lifecycle_converges_through_dream_forget_and_restart() {
     let (_temporary, global, workspace) = fixture();
     let observation = capture_one(&workspace);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let lease = dream
         .claim(&DreamClaimRequest {
             owner: "e2e-dream".to_owned(),
@@ -1102,8 +1088,7 @@ fn active_lifecycle_converges_through_dream_forget_and_restart() {
         .to_hex()
         .to_string();
     let maintenance =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     maintenance
         .forget(&ForgetRequest {
             relative_path: PathBuf::from("topics/build.md"),
@@ -1113,13 +1098,12 @@ fn active_lifecycle_converges_through_dream_forget_and_restart() {
         })
         .unwrap();
 
-    V2CaptureStore::open(&workspace, V2MemoryScope::Workspace)
+    CaptureStore::open(&workspace, MemoryScope::Workspace)
         .unwrap()
         .reconcile()
         .unwrap();
     let reopened =
-        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        MaintenanceStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     let status = reopened.status(23).unwrap();
     assert_eq!(status.tombstone_count, 1);
     assert_eq!(status.archive_count, 1);
@@ -1167,8 +1151,7 @@ fn status_reports_a_dead_owner_lease_as_expired_and_allows_maintenance() {
     let (_temporary, global, workspace) = fixture();
     capture_one(&workspace);
     let dream =
-        V2ConsolidationStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
-            .unwrap();
+        ConsolidationStore::open(&workspace, MemoryScope::Workspace, &global, &workspace).unwrap();
     dream
         .claim(&DreamClaimRequest {
             owner: format!("{}-crashed", reaped_pid()),
@@ -1178,9 +1161,9 @@ fn status_reports_a_dead_owner_lease_as_expired_and_allows_maintenance() {
         .unwrap()
         .unwrap();
 
-    let maintenance = V2MaintenanceStore::open_with_clock(
+    let maintenance = MaintenanceStore::open_with_clock(
         &workspace,
-        V2MemoryScope::Workspace,
+        MemoryScope::Workspace,
         &global,
         &workspace,
         fixed_clock(21),
