@@ -180,6 +180,8 @@ pub struct AccentColors {
 pub struct PlanColors {
     /// The indicator's identity ink: glyph, progress and the entry arrow.
     pub primary: Color,
+    /// The active segment, distinct from the completed segment.
+    pub active: Color,
     /// The dim end of the running glyph's breath.
     pub dim: Color,
 }
@@ -384,6 +386,7 @@ fn map_theme_colors(theme: Theme, map: impl Fn(Color) -> Color) -> Theme {
         },
         plan: PlanColors {
             primary: map(theme.plan.primary),
+            active: map(theme.plan.active),
             dim: map(theme.plan.dim),
         },
         shell: ShellColors {
@@ -720,6 +723,7 @@ impl Theme {
             // purple (not a grey) so the breath is luminance, not hue.
             plan: PlanColors {
                 primary: rgb(0xA78BFA),
+                active: rgb(0xD8B4FE),
                 dim: rgb(0x6D5BC4),
             },
             shell: ShellColors {
@@ -812,6 +816,7 @@ impl Theme {
             // moves toward the lighter end because that reads as the fade.
             plan: PlanColors {
                 primary: rgb(0x7C3AED),
+                active: rgb(0x9A4DDF),
                 dim: rgb(0xA78BFA),
             },
             shell: ShellColors {
@@ -898,6 +903,7 @@ impl Theme {
             },
             plan: PlanColors {
                 primary: rgb(0xC9A8FF),
+                active: rgb(0xE9D5FF),
                 dim: rgb(0x8B62E8),
             },
             shell: ShellColors {
@@ -1001,6 +1007,7 @@ impl Theme {
             },
             plan: PlanColors {
                 primary: Color::Reset,
+                active: Color::Reset,
                 dim: Color::Reset,
             },
             shell: ShellColors {

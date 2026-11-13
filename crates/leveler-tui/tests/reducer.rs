@@ -165,6 +165,43 @@ fn reconnect_during_finalization_restores_busy_without_waiting_for_model() {
     assert!(!frame.contains("等待模型"), "{frame}");
 }
 
+#[test]
+fn resumed_plan_keeps_nonsequential_status_and_clears_its_hit_when_removed() {
+    use leveler_client_protocol::PlanStepStatus::*;
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.status = "running".into();
+    snap.plan = Some(UiPlan {
+        steps: [Pending, Done, Running, Skipped, Abandoned]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| UiPlanStep {
+                index,
+                description: format!("恢复计划 {index}"),
+                status,
+            })
+            .collect(),
+        state: Default::default(),
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snap.clone(),
+        }),
+    );
+    let frame = rendered(&mut s, 100, 24);
+    assert!(frame.contains("计划 2/4 ─ ━ ━ · 恢复计划 2"), "{frame}");
+    assert!(s.plan_hit.is_some());
+    snap.plan = None;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    let frame = rendered(&mut s, 100, 24);
+    assert!(!frame.contains("计划 2/4"), "{frame}");
+    assert!(s.plan_hit.is_none());
+}
+
 fn key(code: KeyCode) -> Action {
     Action::Key(KeyEvent::new(code, KeyModifiers::empty()))
 }
@@ -4930,7 +4967,7 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
         .lines()
         .position(|line| line.contains("计划 0/20"))
         .unwrap_or_else(|| panic!("plan indicator missing:\n{workbench}")) as u16;
-    let (hit_row, x0, x1) = s.plan_hit.expect("the plan paints a hit region");
+    let (hit_row, _, x1) = s.plan_hit.expect("the plan paints a hit region");
     assert_eq!(hit_row, row, "the hit tracks the painted row:\n{workbench}");
     let click = |column: u16| {
         Action::Mouse(MouseEvent {
@@ -4940,12 +4977,20 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
             modifiers: KeyModifiers::empty(),
         })
     };
-    // The runtime side of the merged row is not the plan's target.
-    reduce(&mut s, click(x0 - 1));
+    // A click directly below the arrow belongs to the runtime row.
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x1 - 1,
+            row: hit_row + 1,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
     assert_eq!(
         format!("{:?}", s.active_screen),
         "Conversation",
-        "the runtime half must not open the plan"
+        "the runtime row must not open the plan"
     );
     // The plan's whole visible area is: glyph through arrow, including the
     // arrow at the far end.
@@ -4953,6 +4998,10 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
     assert_eq!(format!("{:?}", s.active_screen), "Plan");
 
     let first = rendered(&mut s, 70, 10);
+    assert!(
+        s.plan_hit.is_none(),
+        "the detail page clears the previous hit"
+    );
     assert!(first.contains("完整计划步骤 1"), "{first}");
     reduce(&mut s, key(KeyCode::PageDown));
     assert!(s.screen_scroll > 0);

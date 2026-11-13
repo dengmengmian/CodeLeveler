@@ -439,11 +439,10 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
     status_lines_with(state, width, true)
 }
 
-/// The runtime side of the merged state strip (see `workbench::render_state_strip`).
+/// The runtime side of the state strip (see `workbench::state_strip`).
 ///
-/// `stats` false keeps only the never-dropped live label — the plan indicator
-/// sizes its own claim against that first, and the secondary numbers (elapsed,
-/// tool count, tokens) are what refill whatever the plan leaves. A shape with
+/// `stats` false keeps only the live label. Background and issue entries
+/// claim their space before the secondary numbers (elapsed, tool count, tokens). A shape with
 /// no separate stats (idle label, blocked wait, awaiting-user hint) is the same
 /// line either way.
 pub(crate) fn status_strip_line(state: &AppState, width: usize, stats: bool) -> Line<'static> {
@@ -511,9 +510,14 @@ fn idle_status_lines(state: &AppState) -> Vec<Line<'static>> {
 
 const WAIT_MARKER: &str = "◌";
 
-/// The busy runtime line. Plan progress is NOT on it: the merged state strip's
-/// plan indicator owns the plan (progress, current step, entry arrow), and a
-/// second copy here read as two different authorities for one fact.
+/// Plan and runtime reserve the same one-cell marker plus one-cell gap.
+pub(crate) fn status_marker(glyph: &str) -> String {
+    let width = UnicodeWidthStr::width(glyph);
+    debug_assert_eq!(width, 1);
+    format!("{glyph} ")
+}
+
+/// The busy runtime line. Plan progress lives on its own row.
 fn busy_status_line(state: &AppState, width: usize, stats: bool) -> Line<'static> {
     let theme = &state.theme;
     let t = state.t();
@@ -595,7 +599,8 @@ fn busy_status_line(state: &AppState, width: usize, stats: bool) -> Line<'static
     // An activity that owns a clock — a long command's heartbeat — reports its
     // own elapsed. Appending the turn's as well printed two adjacent durations
     // with nothing to tell them apart.
-    let mut parts = vec![format!("{frame} {turn_mode}{label}")];
+    let marker = status_marker(frame);
+    let mut parts = vec![format!("{marker}{turn_mode}{label}")];
     parts.push(fmt_elapsed(
         state.activity_elapsed_secs.unwrap_or(state.elapsed_secs),
     ));
@@ -680,7 +685,10 @@ fn blocked_wait_lines(
     } else {
         WAIT_MARKER
     };
-    let text = truncate_to_width(&format!("{marker} {turn_mode}{headline}"), width);
+    let text = truncate_to_width(
+        &format!("{}{turn_mode}{headline}", status_marker(marker)),
+        width,
+    );
     let rest = text.strip_prefix(marker).unwrap_or(&text);
     vec![Line::from(vec![
         Span::styled(
