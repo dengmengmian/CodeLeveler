@@ -21,6 +21,7 @@ mod info_cmds;
 mod init_cmd;
 mod login_cmd;
 mod mcp_lsp_cmds;
+mod memory_cmd;
 mod native_cmd;
 mod output;
 mod permissions_cmds;
@@ -351,6 +352,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             ModelSubcommand::Probe { model } => cmd_model_probe(layout, &model).await,
         },
         Command::Sessions(sc) => cmd_sessions(layout, sc).await,
+        Command::Memory(command) => memory_cmd::cmd_memory(layout, command).await,
         Command::Background(bc) => background_cmd::cmd_background(layout, bc).await,
         Command::Clean {
             safe,

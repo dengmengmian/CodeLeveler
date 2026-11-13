@@ -453,6 +453,80 @@ pub enum ClientCommand {
         /// runtime host's. Range is validated by the runtime (`-1440..=1440`).
         utc_offset_minutes: i32,
     },
+    /// Read-only memory status: the two scope manifests' counters and the
+    /// files a page may list. Answers with [`crate::RuntimeEvent::MemoryLoaded`].
+    /// Opens no model turn and mutates nothing.
+    QueryMemory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// Load one memory file for the preview pane. The runtime bounds the path
+    /// to the named scope and caps the payload. Answers with
+    /// [`crate::RuntimeEvent::MemoryFileLoaded`].
+    ReadMemoryFile {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        /// `global` or `workspace`.
+        scope: String,
+        /// Scope-relative path exactly as [`crate::UiMemoryFile::path`] listed it.
+        path: String,
+    },
+    /// Store a user-authored note in the global memory scope. A typed
+    /// management action: it creates no agent turn and reaches no model.
+    /// Answers with [`crate::RuntimeEvent::MemoryActionFinished`].
+    RememberMemory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        content: String,
+    },
+    /// Run one Dream pass now. `batch = false` is the normal consolidation;
+    /// `batch = true` is the read-then-edit Batch Dream. Both answer with
+    /// [`crate::RuntimeEvent::MemoryActionFinished`] once settled.
+    RunMemoryDream {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        batch: bool,
+    },
+    /// Promote observations captured under RecordOnly/Shadow into the
+    /// visible manifest. Idempotent. Answers with
+    /// [`crate::RuntimeEvent::MemoryActionFinished`].
+    FlushMemory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// Turn cross-session memory on or off for one session.
+    ///
+    /// The configured `[memory].rollout` stays the authority: this can only
+    /// pause a rollout that is already on, and refuses to promote a
+    /// configuration that says `off`. The change is session-scoped and lasts
+    /// for this process; a new session starts from the configuration again.
+    /// Answers with [`crate::RuntimeEvent::MemoryActionFinished`].
+    ToggleMemory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        enabled: bool,
+    },
+    /// Forget exactly the file the user inspected. The expected content hash
+    /// binds the tombstone to those bytes; a changed file is refused rather
+    /// than silently deleted. Answers with
+    /// [`crate::RuntimeEvent::MemoryActionFinished`].
+    ForgetMemory {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        /// `global` or `workspace`.
+        scope: String,
+        /// Scope-relative path.
+        path: String,
+        /// BLAKE3 from [`crate::UiMemoryFile::content_hash`].
+        content_hash: String,
+    },
     /// Load one child's findings for the Contribution Inspector.
     ///
     /// A query, not a subscription: findings live in the ledger, and pushing
@@ -618,6 +692,13 @@ impl ClientCommand {
             | ClientCommand::DeleteAgent { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. }
             | ClientCommand::QueryUsage { session_id, .. }
+            | ClientCommand::QueryMemory { session_id, .. }
+            | ClientCommand::ReadMemoryFile { session_id, .. }
+            | ClientCommand::RememberMemory { session_id, .. }
+            | ClientCommand::RunMemoryDream { session_id, .. }
+            | ClientCommand::FlushMemory { session_id, .. }
+            | ClientCommand::ToggleMemory { session_id, .. }
+            | ClientCommand::ForgetMemory { session_id, .. }
             | ClientCommand::QueryContext { session_id, .. } => Some(session_id),
             ClientCommand::QueryGlobalTasks { requester_session_id, .. }
             | ClientCommand::ManageSchedule {

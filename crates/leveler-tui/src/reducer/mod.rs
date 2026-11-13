@@ -3219,6 +3219,12 @@ fn page_tail_queries(state: &mut AppState) -> Vec<Effect> {
         state,
         std::time::Instant::now(),
     ));
+    // The memory page's capture/Dream counters move while the page is open,
+    // and its preview follows the selection. Both are read-only queries.
+    effects.extend(crate::memory::tail_queries(
+        state,
+        std::time::Instant::now(),
+    ));
     effects
 }
 

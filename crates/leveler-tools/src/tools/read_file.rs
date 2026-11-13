@@ -102,6 +102,13 @@ impl Tool for ReadFileTool {
         let path = context
             .execution_workspace()?
             .resolve_for_read(&input.path)?;
+        // A memory file is read through its own policy: excluded or escaping
+        // paths fail here rather than revealing anything, and a successful
+        // read records the snapshot a later edit is checked against.
+        let is_memory = match crate::memory_access::validate_read(&context, &path) {
+            Ok(is_memory) => is_memory,
+            Err(reason) => return Ok(ToolOutput::error(reason)),
+        };
 
         // Page at the budget the registry will enforce, less the room the
         // marker needs. `saturating_sub` keeps a pathologically small budget
@@ -152,6 +159,17 @@ impl Tool for ReadFileTool {
             .execution
             .file_state
             .record_fingerprint(&path, read.observation.fingerprint);
+
+        if is_memory {
+            // Memory files are small and capped by the policy; the snapshot
+            // must be the exact bytes, not the rendered window.
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| ToolError::Io(format!("read {}: {error}", input.path)))?;
+            if let Err(reason) = crate::memory_access::record_read(&context, &path, bytes).await {
+                return Ok(ToolOutput::error(reason));
+            }
+        }
 
         let total_lines = read.observation.total_lines;
         let mut out = String::new();

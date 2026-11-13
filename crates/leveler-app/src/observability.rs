@@ -45,6 +45,38 @@ pub(crate) async fn record_auxiliary_call(
     budget_scope: Option<&str>,
     estimated_tokens: Option<u64>,
 ) -> Result<(), leveler_storage::StorageError> {
+    record_auxiliary_call_in_registry(
+        &app.registry(),
+        db,
+        session_id,
+        kind,
+        provider,
+        model,
+        reasoning_effort,
+        outcome,
+        latency_ms,
+        budget_scope,
+        estimated_tokens,
+    )
+    .await
+}
+
+/// The same ledger row, for a caller that owns a pinned registry generation
+/// but not the `Application` (memory workers outlive one turn).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_auxiliary_call_in_registry(
+    registry: &leveler_provider::ProviderRegistry,
+    db: &Database,
+    session_id: &SessionId,
+    kind: leveler_storage::ModelCallKind,
+    provider: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    outcome: &Result<leveler_model::ModelResponse, leveler_model::ModelError>,
+    latency_ms: u64,
+    budget_scope: Option<&str>,
+    estimated_tokens: Option<u64>,
+) -> Result<(), leveler_storage::StorageError> {
     let (usage, finish_reason, provider_request_id, error_kind, error_detail) = match outcome {
         Ok(response) => (
             response.usage,
@@ -64,8 +96,7 @@ pub(crate) async fn record_auxiliary_call(
         ),
     };
     use leveler_model::ModelRuntime;
-    let profile = app
-        .registry()
+    let profile = registry
         .profile(&leveler_model::ModelRef::new(provider, model))
         .await
         .ok();

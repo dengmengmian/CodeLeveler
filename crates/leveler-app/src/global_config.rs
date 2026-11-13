@@ -128,6 +128,94 @@ pub struct GlobalConfig {
     /// Bounded automatic recovery for transient model-provider failures.
     #[serde(default)]
     retry: leveler_model::RetryBudget,
+    /// Cross-session memory. Absent means Off; nothing is captured or
+    /// injected until the user opts in. An explicit `/remember` still writes
+    /// the note the user asked for, so it survives a later opt-in.
+    #[serde(default)]
+    memory: GlobalMemory,
+}
+
+/// `[memory]`: the cross-session memory pipeline.
+///
+/// Every field is optional so the resolved [`leveler_memory::config::MemoryV2Config`]
+/// keeps its own defaults as the single source of truth. `rollout` is the
+/// master switch: `off` (default), `record_only`, `shadow`, or `active`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalMemory {
+    #[serde(default)]
+    rollout: Option<leveler_memory::config::MemoryV2Rollout>,
+    #[serde(default)]
+    capture_enabled: Option<bool>,
+    #[serde(default)]
+    automatic_dream_enabled: Option<bool>,
+    #[serde(default)]
+    manual_dream_enabled: Option<bool>,
+    #[serde(default)]
+    batch_dream_enabled: Option<bool>,
+    #[serde(default)]
+    batch_dream_max_run_secs: Option<u64>,
+    #[serde(default)]
+    batch_dream_max_calls_per_batch: Option<usize>,
+    #[serde(default)]
+    batch_dream_max_batch_note_bytes: Option<usize>,
+    #[serde(default)]
+    compact_index_enabled: Option<bool>,
+    #[serde(default)]
+    file_writes_enabled: Option<bool>,
+    #[serde(default)]
+    archived_retention_days: Option<u64>,
+    #[serde(default)]
+    job_retention_days: Option<u64>,
+    /// `provider/model` for capture and Dream extraction. Unset reuses the
+    /// session's model (the route the turn actually ran on).
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl GlobalMemory {
+    fn resolve(self) -> (leveler_memory::config::MemoryV2Config, Option<String>) {
+        let defaults = leveler_memory::config::MemoryV2Config::default();
+        (
+            leveler_memory::config::MemoryV2Config {
+                rollout: self.rollout.unwrap_or(defaults.rollout),
+                capture_enabled: self.capture_enabled.unwrap_or(defaults.capture_enabled),
+                automatic_dream_enabled: self
+                    .automatic_dream_enabled
+                    .unwrap_or(defaults.automatic_dream_enabled),
+                manual_dream_enabled: self
+                    .manual_dream_enabled
+                    .unwrap_or(defaults.manual_dream_enabled),
+                batch_dream_enabled: self
+                    .batch_dream_enabled
+                    .unwrap_or(defaults.batch_dream_enabled),
+                batch_dream_max_run_secs: self
+                    .batch_dream_max_run_secs
+                    .unwrap_or(defaults.batch_dream_max_run_secs),
+                batch_dream_max_calls_per_batch: self
+                    .batch_dream_max_calls_per_batch
+                    .unwrap_or(defaults.batch_dream_max_calls_per_batch),
+                batch_dream_max_batch_note_bytes: self
+                    .batch_dream_max_batch_note_bytes
+                    .unwrap_or(defaults.batch_dream_max_batch_note_bytes),
+                compact_index_enabled: self
+                    .compact_index_enabled
+                    .unwrap_or(defaults.compact_index_enabled),
+                file_writes_enabled: self
+                    .file_writes_enabled
+                    .unwrap_or(defaults.file_writes_enabled),
+                archived_retention_days: self
+                    .archived_retention_days
+                    .unwrap_or(defaults.archived_retention_days),
+                job_retention_days: self
+                    .job_retention_days
+                    .unwrap_or(defaults.job_retention_days),
+            },
+            self.model
+                .map(|model| model.trim().to_owned())
+                .filter(|model| !model.is_empty()),
+        )
+    }
 }
 
 /// `[storage]`. Bounds on what CodeLeveler may reclaim from its own home.
@@ -549,6 +637,10 @@ pub struct GlobalBundle {
     pub web_search: Option<WebSearchSettings>,
     /// `[retry]`: the bounded recovery budget for one logical model request.
     pub retry: leveler_model::RetryBudget,
+    /// `[memory]`, resolved. `Off` unless the user opted in.
+    pub memory: leveler_memory::config::MemoryV2Config,
+    /// `[memory].model`: the route for capture and Dream extraction.
+    pub memory_model: Option<String>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -1368,6 +1460,7 @@ impl GlobalConfig {
             })
             .collect();
 
+        let (memory_config, memory_model) = self.memory.resolve();
         GlobalBundle {
             providers,
             models,
@@ -1389,6 +1482,8 @@ impl GlobalConfig {
             model_soft_percent,
             web_search,
             retry: self.retry,
+            memory: memory_config,
+            memory_model,
         }
     }
 }
@@ -1631,6 +1726,53 @@ mod tests {
 
         assert!(toml::from_str::<GlobalConfig>("[retry]\nmax_retry = 2\n").is_err());
         assert!(toml::from_str::<GlobalConfig>("[retry]\nmax_retries = -1\n").is_err());
+    }
+
+    /// `[memory]` is off unless the user opts in, and a typo must not silently
+    /// leave the pipeline disabled or enabled.
+    #[test]
+    fn memory_is_off_by_default_and_parses_its_rollout() {
+        let bundle = toml::from_str::<GlobalConfig>("").unwrap().into_bundle();
+        assert_eq!(
+            bundle.memory,
+            leveler_memory::config::MemoryV2Config::default()
+        );
+        assert_eq!(
+            bundle.memory.rollout,
+            leveler_memory::config::MemoryV2Rollout::Off
+        );
+        assert_eq!(bundle.memory_model, None);
+
+        let bundle = toml::from_str::<GlobalConfig>(
+            "[memory]\nrollout = \"active\"\nmodel = \"deepseek/deepseek-v4-pro\"\n\
+             batch_dream_enabled = true\narchived_retention_days = 7\n",
+        )
+        .unwrap()
+        .into_bundle();
+        assert_eq!(
+            bundle.memory.rollout,
+            leveler_memory::config::MemoryV2Rollout::Active
+        );
+        assert!(bundle.memory.can_capture());
+        assert!(bundle.memory.can_run_automatic_dream());
+        assert!(bundle.memory.batch_dream_enabled);
+        assert_eq!(bundle.memory.archived_retention_days, 7);
+        assert_eq!(
+            bundle.memory_model.as_deref(),
+            Some("deepseek/deepseek-v4-pro")
+        );
+
+        let disabled = toml::from_str::<GlobalConfig>(
+            "[memory]\nrollout = \"active\"\ncapture_enabled = false\n\
+             file_writes_enabled = false\n",
+        )
+        .unwrap()
+        .into_bundle();
+        assert!(!disabled.memory.can_capture());
+        assert!(!disabled.memory.can_run_automatic_dream());
+
+        assert!(toml::from_str::<GlobalConfig>("[memory]\nrollout = \"sometimes\"\n").is_err());
+        assert!(toml::from_str::<GlobalConfig>("[memory]\nrolout = \"active\"\n").is_err());
     }
 
     // ── Thinking Level: one vocabulary, three places it can be set ──────────

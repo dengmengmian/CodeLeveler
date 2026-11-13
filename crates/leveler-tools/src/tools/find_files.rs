@@ -80,6 +80,9 @@ impl Tool for FindFilesTool {
         let base = context
             .execution_workspace()?
             .resolve_for_read(base_label)?;
+        if let Err(reason) = crate::memory_access::validate_read(&context, &base) {
+            return Ok(ToolOutput::error(reason));
+        }
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
 
         let found = match WorkspaceSearch::find(

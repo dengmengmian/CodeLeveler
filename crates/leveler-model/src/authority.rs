@@ -215,6 +215,8 @@ pub enum PromptSource {
     },
     SkillCatalog,
     AgentCatalog,
+    /// The bounded index of cross-session memory topics for this turn.
+    MemoryIndex,
     ExecutionState,
     Resume,
     Finalization,

@@ -80,6 +80,7 @@ leveler update
 ## 使用文档
 
 - [日常使用](docs/USAGE.zh-CN.md)
+- [跨会话记忆](docs/MEMORY.zh-CN.md)
 - [自定义 Agent](docs/AGENT_EXTENSIBILITY.zh-CN.md)
 - [本版更新](docs/RELEASE.zh-CN.md)
 - [历史版本](CHANGELOG.zh-CN.md)

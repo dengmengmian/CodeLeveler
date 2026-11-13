@@ -555,6 +555,12 @@ export type RuntimeEvent =
   | { type: 'observability_loaded'; observation: UiObservabilityLoaded; query_id?: CommandId | null }
   /** Result of [`crate::ClientCommand::QueryUsage`]. A projection of the runtime's durable model-call ledger for one scope. Read-only: it answers while a turn runs, and it never drives a provider request. */
   | { type: 'usage_loaded'; query_id?: CommandId | null; report: UiUsageReport }
+  /** Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection of both memory scopes. The file list carries no contents; a page asks for one file at a time with `ReadMemoryFile`. */
+  | { type: 'memory_loaded'; query_id?: CommandId | null; status: UiMemoryStatus }
+  /** Result of [`crate::ClientCommand::ReadMemoryFile`]. `content.error` is set when the path was refused or the read failed, so an empty preview can never be mistaken for an empty file. */
+  | { type: 'memory_file_loaded'; file: UiMemoryFileContent; query_id?: CommandId | null }
+  /** Result of a memory management command (`RememberMemory`, `RunMemoryDream`, `FlushMemory`, `ToggleMemory`, `ForgetMemory`). One settled outcome per command; the UI shows `message` and, for an ok result, refreshes with `QueryMemory`. */
+  | { type: 'memory_action_finished'; query_id?: CommandId | null; result: UiMemoryActionResult }
   /** Result of [`crate::ClientCommand::ReloadConfig`], and the notification of an automatically applied generation. `outcome` is one of `applied` / `unchanged` / `failed`. `version` is the generation now in force — the PREVIOUS one on a failure, because a failed reload keeps the last known good configuration. `changed` names the dimensions that moved (never their values, and never a credential). `deferred_to_next_turn` is true when a turn was already running: it keeps the generation it started with, and the next turn uses this one. */
   | { type: 'config_reloaded'; changed?: string[]; deferred_to_next_turn?: boolean; error?: string | null; model?: string | null; outcome: string; provider?: string | null; query_id?: CommandId | null; restart_required?: string[]; thinking?: string | null; version: number }
   /** Result of [`crate::ClientCommand::QuerySessionHistory`]: the latest turns in order. `omitted_turns` older turns were left out to bound the response; they are still in the session. */
@@ -1300,6 +1306,103 @@ export interface UiLaneAccounting {
   requests: number;
 }
 
+/** A management action's mechanical result. `ok` reflects the runtime's own store outcome, never a model claim. */
+export interface UiMemoryActionResult {
+  /** `remember`, `dream`, `batch_dream`, `flush`, or `forget`. */
+  action: string;
+  message: string;
+  ok: boolean;
+}
+
+/** What the memory pipeline is doing for this session. */
+export interface UiMemoryActivity {
+  active: boolean;
+  /** `idle`, `capturing`, `dreaming`, or `failed`. */
+  kind: string;
+  last_captured_range?: unknown[] | null;
+  last_dream_at?: number | null;
+  last_error?: string | null;
+}
+
+/** One file a memory page may list and preview. */
+export interface UiMemoryFile {
+  bytes: number;
+  /** The runtime would accept a forget for these bytes. Manifests, protected files and files above the store's forget bound are not deletable. */
+  deletable: boolean;
+  /** `manifest`, `topic`, `observation`, `archive`, or `other`. */
+  kind: string;
+  /** Unix seconds, when the platform reports it. */
+  modified_at?: number | null;
+  /** Path relative to the scope root, with `/` separators. */
+  path: string;
+  scope: string;
+}
+
+/** One file's contents, bounded by the runtime. */
+export interface UiMemoryFileContent {
+  content: string;
+  /** BLAKE3 of the bytes that produced `content`. Forget sends this back so the tombstone names exactly the content the user saw. */
+  content_hash: string;
+  /** The read failed. Never rendered as an empty file. */
+  error?: string | null;
+  path: string;
+  scope: string;
+  total_bytes: number;
+  /** The file was larger than the projection cap; `content` is its prefix. */
+  truncated: boolean;
+}
+
+/** One scope's health and counters. */
+export interface UiMemoryScope {
+  archive_count: number;
+  completed_capture_jobs: number;
+  dream_lease: string;
+  /** The scope could not be opened; the page shows this instead of zeros. */
+  error?: string | null;
+  failed_capture_jobs: number;
+  /** Sorted topic/observation files that may be previewed. */
+  files: UiMemoryFile[];
+  hidden_pending_observations: number;
+  last_failure_at?: number | null;
+  last_success_at?: number | null;
+  pending_capture_jobs: number;
+  pending_observations: number;
+  retry_capture_jobs: number;
+  root: string;
+  running_capture_jobs: number;
+  /** `global` or `workspace`. */
+  scope: string;
+  tombstone_count: number;
+}
+
+/** One session's durable capture cursors and queued work. */
+export interface UiMemorySession {
+  active: number;
+  captured: number;
+  failed: number;
+  indexed: number;
+  pending: number;
+  requested: number;
+  session_id: string;
+}
+
+/** Everything the memory page lists without opening a file. */
+export interface UiMemoryStatus {
+  activity: UiMemoryActivity;
+  automatic_dream_enabled: boolean;
+  batch_dream_enabled: boolean;
+  capture_enabled: boolean;
+  /** Memory is on for this session. False when the configured rollout is `off`, or when the session toggle paused it; `rollout` distinguishes the two. */
+  enabled: boolean;
+  global: UiMemoryScope;
+  manual_dream_enabled: boolean;
+  /** The configured rollout: `off`, `record_only`, `shadow`, or `active`. */
+  rollout: string;
+  session?: UiMemorySession | null;
+  workspace: UiMemoryScope;
+  workspace_ephemeral: boolean;
+}
+
 /** A rendered message in the transcript. */
 export interface UiMessage {
   id: MessageId;
@@ -1829,6 +1932,20 @@ export type ClientCommand =
   | { type: 'query_context'; query_id?: CommandId | null; session_id: SessionId }
   /** Read-only usage query over the runtime's durable model-call ledger. Read-only in the strictest sense: it opens no turn, sends no provider request, and mutates nothing. Answers with [`crate::RuntimeEvent::UsageLoaded`]. A client may issue it while a turn runs; the numbers come from rows that already settled. */
   | { type: 'query_usage'; query_id?: CommandId | null; scope: UiUsageScope; session_id: SessionId; utc_offset_minutes: number }
+  /** Read-only memory status: the two scope manifests' counters and the files a page may list. Answers with [`crate::RuntimeEvent::MemoryLoaded`]. Opens no model turn and mutates nothing. */
+  | { type: 'query_memory'; query_id?: CommandId | null; session_id: SessionId }
+  /** Load one memory file for the preview pane. The runtime bounds the path to the named scope and caps the payload. Answers with [`crate::RuntimeEvent::MemoryFileLoaded`]. */
+  | { type: 'read_memory_file'; path: string; query_id?: CommandId | null; scope: string; session_id: SessionId }
+  /** Store a user-authored note in the global memory scope. A typed management action: it creates no agent turn and reaches no model. Answers with [`crate::RuntimeEvent::MemoryActionFinished`]. */
+  | { type: 'remember_memory'; content: string; query_id?: CommandId | null; session_id: SessionId }
+  /** Run one Dream pass now. `batch = false` is the normal consolidation; `batch = true` is the read-then-edit Batch Dream. Both answer with [`crate::RuntimeEvent::MemoryActionFinished`] once settled. */
+  | { type: 'run_memory_dream'; batch: boolean; query_id?: CommandId | null; session_id: SessionId }
+  /** Promote observations captured under RecordOnly/Shadow into the visible manifest. Idempotent. Answers with [`crate::RuntimeEvent::MemoryActionFinished`]. */
+  | { type: 'flush_memory'; query_id?: CommandId | null; session_id: SessionId }
+  /** Turn cross-session memory on or off for one session. The configured `[memory].rollout` stays the authority: this can only pause a rollout that is already on, and refuses to promote a configuration that says `off`. The change is session-scoped and lasts for this process; a new session starts from the configuration again. Answers with [`crate::RuntimeEvent::MemoryActionFinished`]. */
+  | { type: 'toggle_memory'; enabled: boolean; query_id?: CommandId | null; session_id: SessionId }
+  /** Forget exactly the file the user inspected. The expected content hash binds the tombstone to those bytes; a changed file is refused rather than silently deleted. Answers with [`crate::RuntimeEvent::MemoryActionFinished`]. */
+  | { type: 'forget_memory'; content_hash: string; path: string; query_id?: CommandId | null; scope: string; session_id: SessionId }
   /** Load one child's findings for the Contribution Inspector. A query, not a subscription: findings live in the ledger, and pushing them through the event stream would duplicate the record and re-grow the payloads the event pipeline was trimmed of. The client asks when the user opens a detail view. */
   | { type: 'query_child_contribution'; child_id: string; query_id?: CommandId | null; session_id: SessionId }
   /** Cut a durable goal checkpoint for the session's current goal and surface it as a Recap (long-goal P3, `/recap`). This is NOT "summarize the visible transcript": the runtime projects authoritative facts (event log, evidence ledger, goal row) into a persisted GoalCheckpoint and answers with [`crate::RuntimeEvent::GoalRecapCreated`]. Idempotent at the same event boundary — a transport retry returns the same checkpoint. */
