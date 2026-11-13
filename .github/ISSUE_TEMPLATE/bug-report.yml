@@ -1,0 +1,91 @@
+name: Bug Report
+description: Report reproducible behavior that may be a defect
+title: "[Bug]: "
+labels:
+  - "status: needs triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve CodeLeveler. Please remove API keys, tokens, credentials, and other sensitive data before submitting.
+
+  - type: input
+    id: version
+    attributes:
+      label: CodeLeveler version
+      description: Run `leveler --version` or provide the commit SHA.
+      placeholder: "vX.Y.Z or commit SHA"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the OS version, terminal or shell, installation method, provider, and model when relevant.
+      placeholder: |
+        OS version:
+        Terminal or shell:
+        Installation method:
+        Provider and model:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest reliable sequence that triggers the problem.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove API keys, tokens, credentials, personal data, and sensitive paths. If logs are unavailable, explain why.
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I removed API keys, tokens, credentials, and other sensitive data.
+          required: true
