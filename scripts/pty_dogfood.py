@@ -2377,11 +2377,135 @@ SCENARIOS = {
 }
 
 
+def plan_status_turns():
+    def plan(states):
+        titles = ["Plan probe A", "计划验收：检查命令输出并记录跨语言终端布局与滚动边界", "Plan probe C"]
+        return tool_turn("update_plan", json.dumps({"plan": [
+            {"id": f"probe-{i}", "step": title, "status": status}
+            for i, (title, status) in enumerate(zip(titles, states))
+        ]}))
+
+    def deltas(key, text, count):
+        return [json.dumps({"choices": [{"delta": {key: f"{text} {i}\n"}}]})
+                for i in range(count)]
+
+    return [
+        plan(["pending", "in_progress", "completed"]),
+        tool_turn("run_command", json.dumps({"program": "sh", "args": [
+            "-c", "sleep 1; exit 7",
+        ], "background": True})),
+        tool_turn("run_command", json.dumps({"program": "sleep", "args": [
+            "35",
+        ], "background": True})),
+        deltas("reasoning_content", "Reasoning probe 思考", 40)
+        + tool_turn("run_command", json.dumps({"program": "sh", "args": [
+            "-c", "printf 'PLAN_COMMAND_PROBE\\n'; sleep 5",
+        ]})),
+        plan(["in_progress", "completed", "completed"]),
+        deltas("reasoning_content", "Second reasoning probe", 16)
+        + plan(["completed", "completed", "completed"]),
+        deltas("content", "Final plan probe", 15) + tool_turn("update_goal", json.dumps({
+            "status": "complete",
+            "summary": "PTY probe complete",
+            "deliver_answer": True,
+            "verification": {"status": "not_applicable", "detail": "Read-only PTY probe"},
+        })),
+    ]
+
+
+def scenario_plan_status(report: Report, provider: str, mock):
+    if mock is not None:
+        mock.stream_delay = 0.23
+    env = make_env(provider, mock)
+    name = "PLAN-STATUS"
+    evidence_layer = "baseline" if report.baseline else provider
+    p = spawn(env.env, env.repo, 112, 32, [])
+    sizes = [[0, 112, 32]]
+
+    def plan_hit(fraction=None):
+        for y, cells in enumerate(p.screen.grid):
+            line = "".join(cells)
+            if ("计划 " in line or "plan " in line) and "↗" in cells:
+                if fraction is None or fraction in line:
+                    return y, cells.index("↗")
+        return None
+
+    def check(stage, ok):
+        report.dump(f"{name}-{evidence_layer}-{stage}", p)
+        report.check(name, stage, ok)
+
+    def resize(cols, rows):
+        sizes.append([len(p.raw), cols, rows])
+        p.resize(cols, rows)
+
+    def settled(text):
+        return "/goal 执行中" not in text and "Esc 打断" not in text and plan_hit() is None
+
+    try:
+        check("boot", p.wait_for("CodeLeveler", 20))
+        p.key("/goal 完成三项只读终端检查：先用 update_plan 建立三项计划，"
+              "检查当前目录和 Git 状态，运行命令打印 PLAN_COMMAND_PROBE 并等待五秒，"
+              "然后更新计划、检查命令结果，最后完成计划并输出 PLAN_FINISHED。"
+              "不要改文件、不要联网、不要运行其他命令。", "\r")
+        first = wait_until(p, lambda _: plan_hit("1/3" if mock else None), 60)
+        check("plan-created", first)
+        if not first:
+            return
+        if mock is None:
+            check("real-command-running", p.wait_for("命令运行中", 60))
+            check("real-task-finished", wait_until(
+                p, lambda t: settled(t) and "PLAN_FINISHED" in t
+                and ("✓目标收尾" in t or "任务已完成" in t or "已完成，但有警告" in t), 90
+            ))
+            return
+        thought = p.wait_for("Reasoning probe", 25)
+        hit = plan_hit("1/3")
+        y = hit[0] if hit else -1
+        check("thinking", thought and hit is not None)
+        if hit is None:
+            return
+        if report.baseline:
+            return
+        check("aligned", "目标模式" in "".join(p.screen.grid[y + 1]))
+        check("background-and-issue-during-thinking", wait_until(
+            p, lambda _: all(label in "".join(p.screen.grid[y + 1])
+                             for label in ("目标模式 · 思考", "后台 1 ↗", "后台失败 1 ↗")),
+            4,
+        ))
+        p.key("draft-probe")
+        check("draft-while-thinking", p.wait_for("draft-probe", 3) and plan_hit("1/3") == hit)
+        p.wheel(up=True, row=max(1, y - 5), col=10, times=2)
+        check("scroll-keeps-plan", plan_hit("1/3") == hit)
+        resize(36, 32)
+        narrow = plan_hit("1/3")
+        check("narrow", narrow is not None and narrow != hit and "draft-probe" in p.screen.text())
+        if narrow:
+            p.click(*narrow)
+            check("detail", p.wait_for("Plan probe", 3) and plan_hit("1/3") is None)
+            p.key("\x1b")
+            check("return", wait_until(p, lambda _: plan_hit("1/3") is not None, 3))
+        resize(112, 32)
+        check("command", p.wait_for("命令运行中", 18) and plan_hit("1/3") == hit)
+        check("advanced", wait_until(p, lambda _: plan_hit("2/3") is not None, 15))
+        check("streaming-reply", p.wait_for("Final plan probe", 15))
+        at_idle = wait_until(p, lambda t: settled(t) and "full · chat" in t, 25)
+        check("scroll-anchor-held", at_idle and "Final plan probe 0" in p.screen.text()
+              and "PTY probe complete" not in p.screen.text())
+        p.wheel(up=False, row=max(1, y - 5), col=10, times=12)
+        check("finished", at_idle and p.wait_for("PTY probe complete", 4)
+              and "draft-probe" in p.screen.text())
+    finally:
+        with open(os.path.join(EVIDENCE, f"{name}-{evidence_layer}-sizes.json"), "w") as fh:
+            json.dump(sizes, fh)
+        p.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", choices=["mock", "real"], default="mock")
     parser.add_argument("--transport", choices=["in-process", "daemon"], default="in-process")
     parser.add_argument("--only", default="", help="comma-separated scenario names")
+    parser.add_argument("--plan-status-baseline", action="store_true", help="capture the old plan layout")
     args = parser.parse_args()
     global TRANSPORT
     TRANSPORT = args.transport
@@ -2397,7 +2521,8 @@ def main() -> int:
         for name in skipped:
             print("=== scenario %s SKIPPED (needs --provider real) ===" % name)
         selected = [s for s in selected if s not in ("live", "badge", "amend", "multigoal", "reconnect")]
-    report = Report(args.provider)
+    report = Report("baseline" if args.plan_status_baseline else args.provider)
+    report.baseline = args.plan_status_baseline
     for name in selected:
         fn, script = SCENARIOS[name]
         mock = None
@@ -2424,6 +2549,9 @@ def main() -> int:
     if report.failures:
         return 1
     return 3 if report.blocked else 0
+
+
+SCENARIOS["plan-status"] = (scenario_plan_status, plan_status_turns)
 
 
 if __name__ == "__main__":
