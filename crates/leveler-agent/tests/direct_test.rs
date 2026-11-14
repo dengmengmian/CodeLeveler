@@ -4463,12 +4463,16 @@ async fn a_completion_that_cites_an_unrun_command_is_refused_then_not_applicable
             .any(|(kind, detail)| kind == "verification_refused" && detail.contains("never ran")),
         "the unrun citation must be refused with the fact: {intercepted:?}"
     );
-    assert_eq!(report.completion_warnings.len(), 1);
-    assert!(
-        report.completion_warnings[0].contains("without executable verification"),
-        "{:?}",
-        report.completion_warnings
+    assert!(report.completion_warnings.is_empty());
+    let verification = report.verification.as_ref().expect("verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Reported,
+        "a read-only goal's not_applicable is model judgement, not missing evidence: \
+         {verification:?}"
     );
+    assert!(verification.records.is_empty());
+    assert!(verification.notes.is_empty());
     // The UI projects this same refusal: the preview names the gate, so a
     // client can state the reason without re-reading the model-facing prose.
     assert!(
@@ -4698,7 +4702,7 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
                     (
                         "command",
                         "run the acceptance script",
-                        "./verify.sh",
+                        "sh ./verify.sh",
                         "sh ./verify.sh",
                     ),
                 ],
@@ -5047,7 +5051,7 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
                     (
                         "command",
                         "run the acceptance script",
-                        "./verify.sh",
+                        "sh ./verify.sh",
                         "sh ./verify.sh",
                     ),
                 ],
@@ -5310,7 +5314,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
                 (
                     "command",
                     "run the acceptance script",
-                    "./verify.sh",
+                    "sh ./verify.sh",
                     "sh ./verify.sh",
                 ),
             ],
@@ -5543,7 +5547,7 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
                     (
                         "command",
                         "run the acceptance script",
-                        "./verify.sh",
+                        "sh ./verify.sh",
                         "sh ./verify.sh",
                     ),
                 ],

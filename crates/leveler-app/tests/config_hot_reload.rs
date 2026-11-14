@@ -842,3 +842,52 @@ async fn the_watcher_applies_an_external_edit_without_a_command() {
         Some("b/beta")
     );
 }
+
+/// A memory-only edit is the case that made `/memory` show "not enabled" to a
+/// user whose config said `active`: the reload classified the change as a
+/// comment-only edit and republished the old bundle. Both the snapshot and the
+/// memory runtime read by the UI must move to the new rollout.
+#[tokio::test]
+async fn a_memory_only_edit_reaches_the_running_runtime() {
+    use leveler_memory::config::MemoryRollout;
+
+    let _guard = config_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    isolate_global_config(tmp.path());
+    let first = MockServer::start_one(text_response("ok")).await;
+    let second = MockServer::start_one(text_response("ok")).await;
+    write_global_config(
+        "a/alpha",
+        &first.base_url(),
+        &second.base_url(),
+        "[memory]\nrollout = \"off\"\n",
+    );
+    let app = assemble(&tmp);
+    assert_eq!(
+        app.config_snapshot().loaded.memory.rollout,
+        MemoryRollout::Off
+    );
+    assert_eq!(app.memory().config().rollout, MemoryRollout::Off);
+
+    write_global_config(
+        "a/alpha",
+        &first.base_url(),
+        &second.base_url(),
+        "[memory]\nrollout = \"active\"\n",
+    );
+    let outcome = app.reload_config(ReloadOrigin::Command, true).await;
+    let ReloadOutcome::Applied(applied) = outcome else {
+        panic!("a memory-only edit must apply, not be read as a comment: {outcome:?}");
+    };
+    assert!(applied.change.labels().contains(&"memory"));
+    assert_eq!(
+        app.config_snapshot().loaded.memory.rollout,
+        MemoryRollout::Active,
+        "the published snapshot must carry the loaded bundle, not the old one"
+    );
+    assert_eq!(
+        app.memory().config().rollout,
+        MemoryRollout::Active,
+        "the memory runtime the UI queries reads the new generation"
+    );
+}

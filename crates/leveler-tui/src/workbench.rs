@@ -790,9 +790,9 @@ fn state_strip(state: &AppState, width: usize) -> Option<StateStrip> {
         .and_then(|severe| severe_strip(state, &issues, severe, width.saturating_sub(label_floor)))
         .is_some_and(|item| claim(item, &mut committed, &mut claimed));
     // 2. Active issues (when no blocking one owns the cell): the active issue
-    //    outranks the background entry. Labelled when it fits, the count form otherwise. A
-    //    seen issue is exactly as active as an unread one — only its marker
-    //    differs, and that lives on the page.
+    //    outranks the background entry. Labelled when it fits, the count form
+    //    otherwise. The strip states the fact; the issue page owns the kind
+    //    and the details.
     if !severe_claimed && !issues.is_empty() {
         // Claim first, degrade on failure: the labelled form is offered to the
         // budget itself, never predicted (a prediction that ignores the gap
@@ -877,7 +877,7 @@ fn render_state_strip(
 }
 
 /// `后台 N ↗` — RUNNING background tasks only. A finished task is history (the
-/// list page keeps it) and a failed one is an issue, never a count here.
+/// list page keeps it, including a failure), never part of this count.
 ///
 /// The keyboard focus reads the same as the plan's: reversed while
 /// `WorkbenchFocus::Background` owns the keys (Enter opens the jobs list).
@@ -911,11 +911,11 @@ fn background_strip(state: &AppState, running: usize, ready: usize) -> StripItem
     }
 }
 
-/// The issue cell in its two non-blocking forms: `⚠ 后台失败 N ↗` names the
-/// kind and its count, and the bare `⚠ N ↗` is the compact form when the
-/// labelled one does not fit. Every form counts real active issues; none of
-/// them clears anything. (A blocking issue owns its own cell — see
-/// [`severe_strip`] — because "问题 3" would hide which failure it is.)
+/// The issue cell in its two non-blocking forms: `⚠ 问题 N ↗` names the count,
+/// and the bare `⚠ N ↗` is the compact form when the labelled one does not
+/// fit. Every form counts real active issues; none of them clears anything.
+/// (A blocking issue owns its own cell — see [`severe_strip`] — because
+/// "问题 3" would hide which failure it is.)
 fn issue_strip(state: &AppState, summary: &crate::issue::IssueSummary, labeled: bool) -> StripItem {
     let t = state.t();
     let (glyph, ink) = if summary.severe_active {
@@ -925,14 +925,7 @@ fn issue_strip(state: &AppState, summary: &crate::issue::IssueSummary, labeled: 
     };
     let body = if !labeled {
         summary.total.to_string()
-    } else if summary.background_unread == summary.total {
-        // Every counted issue is a failed background task; naming that kind
-        // is exact.
-        t.background_failed_only
-            .replace("{}", &summary.total.to_string())
     } else {
-        // A version mismatch (or a mix) is not a background failure: name no
-        // kind rather than the wrong one.
         t.issue_count.replace("{}", &summary.total.to_string())
     };
     let text = format!("{glyph}{body}");
@@ -1863,6 +1856,9 @@ mod tests {
         state
             .background_task_labels
             .insert("err".into(), bg_failed_task("failure", 0, 1));
+        // The second strip cell is a real issue; the failed task beside it is
+        // a record and owns no cell (see `issue` for the contract).
+        state.runtime_version_mismatch = true;
         state.notification = Some(crate::state::Notification {
             level: leveler_client_protocol::NotificationLevel::Info,
             message: "notice probe".into(),
@@ -4799,13 +4795,17 @@ mod tests {
         state
             .background_task_labels
             .insert("f1".into(), bg_failed_task("go test -race ./...", 7, 1));
+        // The second cell comes from a real active issue; a failed background
+        // task is a record, not one.
+        state.runtime_version_mismatch = true;
 
         let buf = strip_buffer(&mut state, Some(sample_plan()), 140);
         let rows = strip_rows(&mut state, Some(sample_plan()), 140);
         let line = rows[1].trim_end();
         assert!(line.contains("运行 cargo test"), "{line}");
         assert!(line.contains("后台 2 ↗"), "{line}");
-        assert!(line.contains("后台失败 1 ↗"), "{line}");
+        assert!(line.contains("问题 1 ↗"), "{line}");
+        assert!(!line.contains("后台失败"), "{line}");
         assert!(rows[0].contains("计划 1/3"), "{rows:?}");
         assert!(
             !line.contains("go test -race"),
@@ -4877,18 +4877,21 @@ mod tests {
         assert_eq!(glyph.fg, state.theme.status.error);
 
         // Other active issues are not hidden behind the named one: they are
-        // the count suffix, and the Issue page lists them.
+        // the count suffix, and the Issue page lists them. A failed background
+        // task is not one of them.
         state
             .background_task_labels
             .insert("f1".into(), bg_failed_task("npm start", 7, 1));
+        state.runtime_version_mismatch = true;
         let rows = strip_rows(&mut state, None, 120);
         let line = rows[0].trim_end();
         assert!(line.contains("✕ 模型认证失败 +1 ↗"), "{line}");
         assert!(
-            !line.contains("⚠ 后台失败"),
-            "the blocking cell owns the issue slot: {line}"
+            !line.contains("后台失败"),
+            "a background failure never reaches the issue cell: {line}"
         );
         state.background_task_labels.clear();
+        state.runtime_version_mismatch = false;
 
         // A later turn clears the cell — the block stays in the transcript.
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
@@ -4908,9 +4911,7 @@ mod tests {
         state
             .background_task_labels
             .insert("b1".into(), bg_running_task("make up", 3));
-        state
-            .background_task_labels
-            .insert("f1".into(), bg_failed_task("npm start", 7, 1));
+        state.runtime_version_mismatch = true;
         for width in 18..140u16 {
             let rows = strip_rows(&mut state, Some(running_plan(4, 2)), width);
             assert!(rows[0].contains("计划 2/4"), "{rows:?}");
@@ -4931,7 +4932,7 @@ mod tests {
     }
 
     /// Running count only: a settled task leaves the background cell, and a
-    /// failed one is an issue instead — never both.
+    /// failed one is a record on its page — never chrome, never an issue.
     #[test]
     fn a_settled_task_leaves_the_background_cell() {
         let mut state = test_state();
@@ -4951,13 +4952,14 @@ mod tests {
             .background_task_labels
             .insert("f1".into(), bg_failed_task("npm start", 7, 1));
         let rows = strip_rows(&mut state, None, 100);
-        assert!(rows[0].contains("后台失败 1"), "{rows:?}");
+        assert!(!rows[0].contains("后台失败"), "{rows:?}");
         assert!(
             !rows[0].contains("后台 1"),
             "a failed task is not a running count: {rows:?}"
         );
         assert!(state.background_hit.is_none());
-        assert!(state.issue_hit.is_some());
+        assert!(state.issue_hit.is_none());
+        assert_eq!(state.background_task_labels["f1"].exit_code, Some(1));
     }
 
     /// A settled plan outside its turn is history, not chrome: the strip is
@@ -5248,7 +5250,6 @@ mod tests {
         width: u16,
         height: u16,
         tasks: Vec<(&str, crate::state::BackgroundTaskChrome)>,
-        seen: &[&str],
         focus: crate::state::WorkbenchFocus,
     ) -> Vec<String> {
         use ratatui::Terminal;
@@ -5274,9 +5275,6 @@ mod tests {
         state.background_task_labels.clear();
         for (id, chrome) in tasks {
             state.background_task_labels.insert(id.into(), chrome);
-        }
-        for id in seen {
-            state.background_failures_seen.insert((*id).into());
         }
         state.workbench_focus = focus;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -5304,8 +5302,7 @@ mod tests {
     /// issue cell exists, and the footer stays the single existing row.
     #[test]
     fn no_background_tasks_add_nothing_to_the_footer() {
-        let lines =
-            render_background_case(100, 30, vec![], &[], crate::state::WorkbenchFocus::Input);
+        let lines = render_background_case(100, 30, vec![], crate::state::WorkbenchFocus::Input);
         let all = lines.join("\n");
         assert!(!all.contains("后台"), "{all}");
         assert!(!all.contains('↗'), "{all}");
@@ -5321,7 +5318,6 @@ mod tests {
             100,
             30,
             vec![("bg-1", bg_running("make up", 28))],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
@@ -5344,7 +5340,6 @@ mod tests {
             100,
             30,
             vec![("bg-1", bg_running("make up", 0)), ("bg-2", ready)],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let strip = lines.join("\n");
@@ -5363,7 +5358,6 @@ mod tests {
             48,
             20,
             vec![("bg-1", ready)],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let strip = lines.join("\n");
@@ -5384,7 +5378,6 @@ mod tests {
                 ("bg-2", bg_running("cargo test", 20)),
                 ("bg-3", bg_running("dev server", 30)),
             ],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
@@ -5402,10 +5395,10 @@ mod tests {
         }
     }
 
-    /// Running and failed are separate cells with separate inks: a failed task
-    /// is an issue, never folded into the running count.
+    /// Running tasks are counted; a failed one is a record and never joins the
+    /// count or opens an issue cell.
     #[test]
-    fn running_and_failed_are_separate_cells() {
+    fn a_running_count_never_folds_in_a_failure() {
         let lines = render_background_case(
             120,
             30,
@@ -5414,21 +5407,21 @@ mod tests {
                 ("bg-2", bg_running("cargo test", 20)),
                 ("bg-3", bg_terminal("npm start", false, false, 0, 30_000)),
             ],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
         assert!(all.contains("后台 2"), "{all}");
-        assert!(all.contains("后台失败 1"), "{all}");
+        assert!(!all.contains("后台失败"), "{all}");
         assert!(
             !all.contains("后台 3"),
             "failed is not folded into running: {all}"
         );
+        assert!(!all.contains('⚠'), "{all}");
     }
 
-    /// Only failures: the issue cell names the kind and its count.
+    /// Only failures: the strip says nothing about finished work.
     #[test]
-    fn failures_alone_read_as_an_issue_cell() {
+    fn failures_alone_show_nothing_on_the_strip() {
         let lines = render_background_case(
             120,
             30,
@@ -5436,13 +5429,13 @@ mod tests {
                 ("bg-1", bg_terminal("npm start", false, false, 0, 30_000)),
                 ("bg-2", bg_terminal("cargo test", false, false, 0, 24_000)),
             ],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
-        assert!(all.contains('⚠'), "{all}");
-        assert!(all.contains("后台失败 2"), "{all}");
+        assert!(!all.contains('⚠'), "{all}");
+        assert!(!all.contains("后台失败"), "{all}");
         assert!(!all.contains("后台 2"), "{all}");
+        assert!(!all.contains('↗'), "{all}");
     }
 
     /// A completed task never lingers in the chassis — its history is the list.
@@ -5452,7 +5445,6 @@ mod tests {
             120,
             30,
             vec![("bg-1", bg_terminal("cargo check", true, false, 0, 18_000))],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
@@ -5468,7 +5460,6 @@ mod tests {
             120,
             30,
             vec![("bg-1", bg_terminal("npm start", false, true, 0, 24_000))],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
@@ -5476,36 +5467,20 @@ mod tests {
         assert!(!all.contains('↗'), "{all}");
     }
 
-    /// Acknowledged means READ, not solved: the reminder leaves the strip, and
-    /// the failure itself stays as an active record on its page and in the
-    /// jobs list. An unviewed one still reminds.
+    /// A failure never becomes a strip reminder, whether or not its record
+    /// has been opened. There is nothing to acknowledge.
     #[test]
-    fn a_viewed_failure_stops_reminding_an_unviewed_one_does_not() {
+    fn a_failure_never_reminds_on_the_strip() {
         let lines = render_background_case(
             120,
             30,
             vec![("bg-1", bg_terminal("npm start", false, false, 0, 30_000))],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
-        assert!(
-            all.contains("后台失败 1"),
-            "an unseen failure reminds: {all}"
-        );
-
-        let lines = render_background_case(
-            120,
-            30,
-            vec![("bg-1", bg_terminal("npm start", false, false, 0, 30_000))],
-            &["bg-1"],
-            crate::state::WorkbenchFocus::Input,
-        );
-        let all = lines.join("\n");
-        assert!(
-            !all.contains("后台失败"),
-            "a viewed one-shot failure stops reminding: {all}"
-        );
+        assert!(!all.contains("后台失败"), "{all}");
+        assert!(!all.contains('⚠'), "{all}");
+        assert!(!all.contains('↗'), "{all}");
     }
 
     /// A focused background cell is reachable: the hint row names Enter.
@@ -5515,7 +5490,6 @@ mod tests {
             120,
             30,
             vec![("bg-1", bg_running("make up", 10))],
-            &[],
             crate::state::WorkbenchFocus::Background,
         );
         let all = lines.join("\n");
@@ -5532,7 +5506,6 @@ mod tests {
             60,
             30,
             vec![("bg-1", bg_running(label, 10))],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
@@ -5553,7 +5526,6 @@ mod tests {
             48,
             30,
             vec![("bg-1", bg_running("构建前端生产包并部署到预发环境", 10))],
-            &[],
             crate::state::WorkbenchFocus::Input,
         );
         for row in &lines {
@@ -5565,8 +5537,7 @@ mod tests {
     }
 
     /// Narrow terminals never underflow, overlap or panic. A running task
-    /// keeps the clock; an unread failure outranks the clock, which is exactly
-    /// the responsive contract.
+    /// keeps the clock, and a finished failure never takes a row of its own.
     #[test]
     fn narrow_terminals_are_safe_with_a_background_summary() {
         for width in [12u16, 16, 20, 24, 32, 40] {
@@ -5574,7 +5545,6 @@ mod tests {
                 width,
                 24,
                 vec![("bg-1", bg_running("make up", 10))],
-                &[],
                 crate::state::WorkbenchFocus::Input,
             );
             assert_eq!(running_only.len(), 24, "one row per line at width {width}");
@@ -5596,10 +5566,12 @@ mod tests {
                     ("bg-1", bg_running("make up", 10)),
                     ("bg-2", bg_terminal("npm start", false, false, 0, 30_000)),
                 ],
-                &[],
                 crate::state::WorkbenchFocus::Input,
             );
             assert_eq!(with_failure.len(), 24);
+            let all = with_failure.join("\n");
+            assert!(all.contains("后台 1"), "{all}");
+            assert!(!all.contains("后台失败"), "{all}");
             for row in &with_failure {
                 assert!(
                     unicode_width::UnicodeWidthStr::width(row.as_str()) <= width as usize,

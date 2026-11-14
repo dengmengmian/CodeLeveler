@@ -113,6 +113,7 @@ struct UncommittedDelivery {
     stop: StopReason,
     model_steps: u32,
     modified_files: Vec<String>,
+    verification: Option<VerificationReport>,
     /// The transcript boundary (exclusive next ordinal) the accepted answer
     /// belongs to. `None` on deliveries written before the binding existed.
     transcript_ordinal: Option<u64>,
@@ -1325,7 +1326,9 @@ impl CodingRuntime {
             crate::coding::turn::last_persisted_progress(stores.events.as_ref(), session_id)
                 .await?;
         let verification = if let Some(goal) = goal.as_ref() {
-            crate::coding::turn::load_goal_verification_runs(stores, session_id, &goal.id).await?
+            crate::coding::turn::load_goal_verification(stores, session_id, &goal.id)
+                .await?
+                .runs
         } else {
             Vec::new()
         };
@@ -2761,6 +2764,7 @@ impl CodingRuntime {
             model_steps,
             modified_files,
             transcript_ordinal,
+            verification,
         } = EngineEvent::from_payload(&delivery.payload)?
         else {
             return Ok(None);
@@ -2879,6 +2883,7 @@ impl CodingRuntime {
             model_steps,
             modified_files,
             transcript_ordinal,
+            verification,
             turn_open,
             review,
         }))
@@ -3168,6 +3173,7 @@ impl CodingRuntime {
                 model_steps: delivery.model_steps,
                 modified_files: delivery.modified_files.clone(),
                 transcript_ordinal: delivery.transcript_ordinal,
+                verification: delivery.verification.clone(),
             });
             observer(EngineEvent::RunFinished {
                 text: delivery.text.clone(),
@@ -3282,6 +3288,7 @@ impl CodingRuntime {
                 model_steps: delivery.model_steps,
                 modified_files: delivery.modified_files.clone(),
                 transcript_ordinal: delivery.transcript_ordinal,
+                verification: delivery.verification.clone(),
             });
             observer(EngineEvent::RunFinished {
                 text: delivery.text.clone(),
@@ -3316,6 +3323,7 @@ impl CodingRuntime {
                 delivery.stop,
                 delivery.model_steps,
             );
+            report.verification = delivery.verification;
             apply_review_warnings(&mut report, review);
             let result = Ok(report);
             self.finish_from_result(
@@ -3351,6 +3359,7 @@ impl CodingRuntime {
                 model_steps: delivery.model_steps,
                 modified_files: delivery.modified_files.clone(),
                 transcript_ordinal: delivery.transcript_ordinal,
+                verification: delivery.verification.clone(),
             });
             observer(EngineEvent::RunFinished {
                 text: delivery.text.clone(),
@@ -4089,16 +4098,16 @@ impl CodingRuntime {
         };
         // The goal's commands from earlier windows are part of the task's
         // verification record; a resumed window must not forget them.
-        let verification_runs = match lineage.goal_id.as_ref() {
+        let verification = match lineage.goal_id.as_ref() {
             Some(goal_id) => {
-                crate::coding::turn::load_goal_verification_runs(
+                crate::coding::turn::load_goal_verification(
                     &self.engine.stores,
                     &runner.session_id,
                     goal_id,
                 )
                 .await?
             }
-            None => Vec::new(),
+            None => Default::default(),
         };
         let recorded = runner
             .run_turn(kind, start, observer, cancellation.clone(), |ports| {
@@ -4112,7 +4121,7 @@ impl CodingRuntime {
                         lineage_turn_ids: lineage.turn_ids,
                         root_turn_id: lineage.root_turn_id,
                         goal_id: lineage.goal_id,
-                        verification_runs,
+                        verification,
                     },
                     true,
                     runner.session_id.clone(),
@@ -4242,7 +4251,7 @@ impl CodingRuntime {
             .await?;
         // A goal that already ran windows keeps their mechanical verification
         // facts. A brand-new goal has none, and the loader returns empty.
-        let verification_runs = crate::coding::turn::load_goal_verification_runs(
+        let verification = crate::coding::turn::load_goal_verification(
             &self.engine.stores,
             &runner.session_id,
             goal_id,
@@ -4274,7 +4283,7 @@ impl CodingRuntime {
                             content: task.content,
                             prior,
                             goal_id: goal_id.clone(),
-                            verification_runs,
+                            verification,
                             continuing: continuing_goal,
                         },
                         prior_epoch_open,
@@ -5660,6 +5669,7 @@ mod compaction_facts_tests {
             target: None,
             source_quote: text.into(),
             check: None,
+            verification: None,
             state: leveler_lifecycle::RequirementState::Active,
             superseded_by: None,
         }
@@ -5762,6 +5772,7 @@ mod effective_acceptance_facts_tests {
             target: None,
             source_quote: text.into(),
             check: None,
+            verification: None,
             state: leveler_lifecycle::RequirementState::Active,
             superseded_by: None,
         }

@@ -1341,7 +1341,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
     state.theme.paint_canvas(frame, area);
 
-    if state.active_screen == Screen::Conversation {
+    if state.active_screen == Screen::Conversation || state.active_screen == Screen::Memory {
         // The side thread is a surface of its own, not a card over the main
         // workbench: it owns the viewport and the composer while focused.
         if state.surface == crate::btw::SurfaceFocus::Btw {
@@ -1355,6 +1355,13 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             crate::update::render_panel(frame, area, view, &state.theme, state.t());
         }
         screens::render_history_search(frame, area, state);
+        // Memory is an observational overlay over the conversation: the
+        // transcript and composer stay where they are, and an interrupting
+        // runtime overlay (approval/clarification) draws above it once the
+        // reducer gives that overlay the keys.
+        if state.active_screen == Screen::Memory && state.overlay.is_none() {
+            crate::memory::render_overlay(frame, area, state);
+        }
         return;
     }
 
@@ -1366,6 +1373,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     // conversation.
     match state.active_screen {
         Screen::Conversation => unreachable!(),
+        Screen::Memory => unreachable!("memory renders as an overlay over the conversation"),
         Screen::Tools => render_tools_screen(frame, area, state),
         Screen::Diff => render_diff_screen(frame, area, state),
         Screen::Sessions => render_sessions_screen(frame, area, state),
@@ -1382,7 +1390,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Context => crate::context::render_stats_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
         Screen::Schedules => crate::schedules::render_screen(frame, area, state),
-        Screen::Memory => crate::memory::render_screen(frame, area, state),
         Screen::Output => render_output_screen(frame, area, state),
     }
     if let Some(overlay) = &state.overlay {
@@ -1457,14 +1464,13 @@ fn goal_detail_lines(
     lines
 }
 
-/// The Issue page: every active issue with its own real detail behind it.
+/// The Issue page: every active session issue with its own real detail.
 ///
 /// A row is one interaction: clicking it (or Enter) selects it and toggles its
-/// expansion, `▸`/`▾`. Expanded, a failed task shows its command, its runtime
-/// facts and an explicit entry into the task's existing page (`Screen::Activity`,
-/// whose Esc comes back here); a failed turn shows its typed machine detail in
-/// place. Read-only otherwise. Every painted row and entry publishes its hit,
-/// so the mouse acts on exactly what is on screen.
+/// expansion, `▸`/`▾`. Expanded, a failed turn shows its typed machine detail
+/// in place; a version mismatch shows both build identities. Read-only
+/// otherwise. Every painted row publishes its hit, so the mouse acts on
+/// exactly what is on screen.
 fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
@@ -1477,7 +1483,6 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let body = layout.content;
     state.issue_row_hits.clear();
-    state.issue_detail_hits.clear();
     if body.width == 0 || body.height == 0 {
         return;
     }
@@ -1530,36 +1535,13 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }
         state.issue_row_hits.push((y, body.x, right, key.clone()));
     }
-    for (line, x0, x1, key) in &view.details {
-        if *line < scroll {
-            continue;
-        }
-        let Ok(offset) = u16::try_from(*line - scroll) else {
-            continue;
-        };
-        let Some(y) = body.y.checked_add(offset) else {
-            continue;
-        };
-        if y >= bottom {
-            continue;
-        }
-        state.issue_detail_hits.push((
-            y,
-            body.x.saturating_add(*x0 as u16),
-            body.x.saturating_add(*x1 as u16),
-            key.clone(),
-        ));
-    }
     render_scrolled(frame, body, state, view.lines);
 }
 
-/// The Issue page's body: its lines plus the hit geometry of what is painted
-/// (row headers and expanded detail entries), in content-line coordinates.
+/// The Issue page's body: its lines plus the hit geometry of what is painted.
 struct IssuePageView {
     lines: Vec<Line<'static>>,
     rows: Vec<(usize, String)>,
-    /// (line, x_start, x_end, key) of each expanded row's detail entry.
-    details: Vec<(usize, usize, usize, String)>,
 }
 
 fn issue_page_view(
@@ -1572,7 +1554,6 @@ fn issue_page_view(
     let mut view = IssuePageView {
         lines: Vec::new(),
         rows: Vec::new(),
-        details: Vec::new(),
     };
     if issues.is_empty() {
         view.lines.push(Line::from(Span::styled(
@@ -1585,27 +1566,10 @@ fn issue_page_view(
     let warning = Style::default().fg(theme.status.warning);
     let selected = state.issue_selected.as_deref();
     let indent = crate::layout::DETAIL_BODY_INDENT;
-    let indent_w = indent.len();
-    let mut history_header = false;
     for issue in issues {
-        // The viewed history is labeled once, where it starts: unread failures
-        // lead, so a bare list of failed rows never reads as "all new".
-        if !issue.unread
-            && issue.kind == crate::issue::IssueKind::BackgroundFailure
-            && !history_header
-            && !view.rows.is_empty()
-        {
-            view.lines.push(Line::from(Span::styled(
-                t.issue_page_viewed.to_string(),
-                Style::default().fg(theme.text.muted),
-            )));
-            view.lines.push(Line::from(""));
-            history_header = true;
-        }
         let expanded = crate::issue::is_expanded(state, &issue.key);
         let (glyph, ink) = match issue.kind {
             crate::issue::IssueKind::TurnFailure => ("✕", error),
-            crate::issue::IssueKind::BackgroundFailure => ("⚠", warning),
             crate::issue::IssueKind::RuntimeVersion => ("⟳", warning),
         };
         let cursor = if selected == Some(issue.key.as_str()) {
@@ -1619,7 +1583,7 @@ fn issue_page_view(
             Span::styled("▸ ", Style::default().fg(theme.text.secondary))
         };
         let marker_w = 4; // cursor + chevron
-        let mut spans = vec![
+        let spans = vec![
             cursor,
             chevron,
             Span::styled(
@@ -1630,12 +1594,6 @@ fn issue_page_view(
                 ink,
             ),
         ];
-        if issue.unread {
-            spans.push(Span::styled(
-                format!("{}  ", t.issue_row_new),
-                Style::default().fg(theme.accent.primary),
-            ));
-        }
         view.rows.push((view.lines.len(), issue.key.clone()));
         view.lines.push(Line::from(spans));
         if !expanded {
@@ -1643,33 +1601,6 @@ fn issue_page_view(
             continue;
         }
         match issue.kind {
-            crate::issue::IssueKind::BackgroundFailure => {
-                if issue.label != truncate_display(&issue.label, width.saturating_sub(marker_w + 2))
-                {
-                    for row in crate::render::wrap(&issue.label, width.saturating_sub(indent_w + 1))
-                    {
-                        view.lines.push(Line::from(Span::styled(
-                            format!("{indent}{row}"),
-                            Style::default().fg(theme.text.primary),
-                        )));
-                    }
-                }
-                if let Some(meta) = &issue.meta {
-                    view.lines.push(Line::from(Span::styled(
-                        format!("{indent}{meta}"),
-                        Style::default().fg(theme.text.muted),
-                    )));
-                }
-                let entry = t.issue_task_detail;
-                let x0 = indent_w;
-                let x1 = indent_w + unicode_width::UnicodeWidthStr::width(entry);
-                let line = view.lines.len();
-                view.lines.push(Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled(entry.to_string(), Style::default().fg(theme.accent.primary)),
-                ]));
-                view.details.push((line, x0, x1, issue.key.clone()));
-            }
             crate::issue::IssueKind::TurnFailure => {
                 if let Some(meta) = &issue.meta {
                     view.lines.push(Line::from(Span::styled(

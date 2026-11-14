@@ -222,6 +222,7 @@ impl ToolGroupBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnEndStatus {
     Completed,
+    CompletedPartiallyUnverified,
     CompletedWithWarnings,
     Answered,
     /// The turn answered, but its `commit_task` declaration was refused, so

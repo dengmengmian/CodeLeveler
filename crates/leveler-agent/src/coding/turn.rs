@@ -20,6 +20,9 @@ use leveler_storage::EventStore;
 
 use crate::coding::checkpoint::{CodingCheckpointContext, CodingCompactionCheckpoint};
 use crate::coding::factory::{ExecutorFactory, TurnProfile};
+use crate::executor::goal_verification::{
+    PendingCommand, RegisteredCheckStart, VerificationFacts, VerificationRun, command_label,
+};
 use crate::sub_agent::SettledChildNotice;
 use crate::{AgentError, AgentEvent, AgentOutcome, DriveAborted, Executor};
 
@@ -38,7 +41,7 @@ pub enum TurnInput {
         /// Commands this goal already ran in earlier windows, rebuilt from
         /// its durable events. The completion gate judges the task, not just
         /// the window that happens to be open.
-        verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+        verification: VerificationFacts,
         /// This turn continues a goal that already ran windows, rather than
         /// opening one. The goal's plan belongs to the same goal, so it is the
         /// active declaration again: a new window must see the steps it
@@ -63,8 +66,8 @@ pub enum TurnInput {
         lineage_turn_ids: Vec<leveler_core::TurnId>,
         root_turn_id: leveler_core::TurnId,
         goal_id: Option<leveler_core::GoalId>,
-        /// See [`TurnInput::Goal::verification_runs`].
-        verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+        /// See [`TurnInput::Goal::verification`].
+        verification: VerificationFacts,
     },
     /// A conversational turn: prior transcript + new content parts.
     Content {
@@ -234,14 +237,11 @@ pub async fn drive_turn(
         // Durable identity for a `/goal` declared while this Chat turn runs.
         .with_goal_binder(goals.clone())
         // What this goal already proved in earlier windows (resume / retry).
-        .with_verification_runs(match &input {
-            TurnInput::Goal {
-                verification_runs, ..
+        .with_verification_facts(match &input {
+            TurnInput::Goal { verification, .. } | TurnInput::Resume { verification, .. } => {
+                verification.clone()
             }
-            | TurnInput::Resume {
-                verification_runs, ..
-            } => verification_runs.clone(),
-            TurnInput::Content { .. } => Vec::new(),
+            TurnInput::Content { .. } => VerificationFacts::default(),
         })
         .with_clarification_answers(clarification_answers);
 
@@ -360,7 +360,7 @@ pub async fn drive_turn(
             origin,
             prior,
             goal_id: _,
-            verification_runs: _,
+            verification: _,
             continuing: _,
         } => {
             let objective = leveler_lifecycle::ObjectiveAnchor::from_session_goal(goal.as_str());
@@ -383,7 +383,7 @@ pub async fn drive_turn(
             lineage_turn_ids: _,
             root_turn_id: _,
             goal_id: _,
-            verification_runs: _,
+            verification: _,
         } => {
             // Persist the continuation message before running: it is this
             // turn's user input, and the transcript must match what the user
@@ -468,11 +468,11 @@ pub async fn drive_turn(
 /// Only observed facts are reconstructed: the command text, whether it
 /// succeeded, the model step that ran it, and the ledger's mutation count at
 /// that point (which is what "after the last file change" compares).
-pub(crate) async fn load_goal_verification_runs(
+pub(crate) async fn load_goal_verification(
     stores: &leveler_storage::EngineStores,
     session_id: &SessionId,
     goal_id: &leveler_core::GoalId,
-) -> Result<Vec<crate::executor::goal_verification::VerificationRun>, EngineError> {
+) -> Result<VerificationFacts, EngineError> {
     let turns = stores.turns.list_for_session(session_id).await?;
     let turn_ids: std::collections::HashSet<&str> = turns
         .iter()
@@ -486,7 +486,7 @@ pub(crate) async fn load_goal_verification_runs(
         .map(|turn| turn.id.as_str())
         .collect();
     if turn_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(VerificationFacts::default());
     }
     let rows = stores.events.load(session_id).await?;
     let mut calls: std::collections::HashMap<String, (String, serde_json::Value, u32)> =
@@ -495,6 +495,8 @@ pub(crate) async fn load_goal_verification_runs(
     // whole window: a background task's RESULT arrives later, keyed by that
     // call, and must be labelled by the call rather than by the process.
     let mut started: std::collections::HashMap<String, (String, serde_json::Value, u32)> =
+        std::collections::HashMap::new();
+    let mut pending: std::collections::HashMap<String, PendingCommand> =
         std::collections::HashMap::new();
     let mut mutation_ops = 0u64;
     let mut runs = Vec::new();
@@ -516,12 +518,17 @@ pub(crate) async fn load_goal_verification_runs(
         } = &event
         {
             if owner_goal.as_ref().is_none_or(|owner| owner == goal_id)
-                && status
-                    .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited)
-                && let Some(run) =
+                && let Some(mut run) =
                     background_result_run(&started, call_id, *is_error, *exit_code, mutation_ops)
             {
-                runs.push(run);
+                started.remove(call_id);
+                run.check_start = pending.remove(call_id).and_then(|start| start.check_start);
+                let exited = status
+                    .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited);
+                if exited || run.check_start.is_some() {
+                    run.ok &= exited;
+                    runs.push(run);
+                }
             }
             continue;
         }
@@ -544,6 +551,39 @@ pub(crate) async fn load_goal_verification_runs(
                     let step = model_step.unwrap_or(0);
                     started.insert(call_id.clone(), (name.clone(), arguments.clone(), step));
                     calls.insert(call_id, (name, arguments, step));
+                }
+            }
+            EngineEvent::RegisteredCheckStarted {
+                call_id,
+                fingerprint,
+                registrations,
+                order,
+                mutation_ops,
+            } => {
+                if let Some((name, arguments, _)) = calls.get(&call_id)
+                    && let Some(label) = command_label(name, arguments)
+                {
+                    pending.insert(
+                        call_id.clone(),
+                        PendingCommand {
+                            label,
+                            task_id: None,
+                            call_id: Some(call_id),
+                            check_start: Some(RegisteredCheckStart {
+                                fingerprint,
+                                registrations,
+                                order,
+                                mutation_ops,
+                            }),
+                        },
+                    );
+                }
+            }
+            EngineEvent::BackgroundTaskStarted {
+                call_id, task_id, ..
+            } => {
+                if let Some(start) = pending.get_mut(&call_id) {
+                    start.task_id = Some(task_id);
                 }
             }
             EngineEvent::ToolCallFinished {
@@ -572,13 +612,15 @@ pub(crate) async fn load_goal_verification_runs(
                     // stays a failed run — it really did fail.
                     && (is_error || exit_code.is_some())
                 {
-                    runs.push(crate::executor::goal_verification::VerificationRun {
+                    let check_start = pending.remove(&call_id).and_then(|start| start.check_start);
+                    runs.push(VerificationRun {
                         label,
                         ok: !is_error,
                         exit_code,
                         model_step,
                         mutation_ops,
                         call_id: Some(call_id),
+                        check_start,
                     });
                 }
             }
@@ -589,35 +631,42 @@ pub(crate) async fn load_goal_verification_runs(
         }
     }
     // The live collector keeps the newest 64; a rebuilt record must answer
-    // the same questions a live one would.
-    if runs.len() > crate::executor::goal_verification::MAX_VERIFICATION_RUNS {
-        runs.drain(..runs.len() - crate::executor::goal_verification::MAX_VERIFICATION_RUNS);
-    }
-    Ok(runs)
+    // the same questions a live one would. A check that is still owed beyond
+    // that window keeps its latest run, so a long goal can resolve a
+    // registered acceptance check it declared early.
+    let active_registrations: std::collections::HashSet<String> = stores
+        .goals
+        .requirements(goal_id)
+        .await?
+        .into_iter()
+        .filter(|item| item.state == leveler_lifecycle::RequirementState::Active)
+        .filter_map(|item| item.verification)
+        .map(|check| check.registered_by)
+        .collect();
+    crate::executor::goal_verification::retain_verification_runs(&mut runs, &active_registrations);
+    Ok(VerificationFacts {
+        runs,
+        pending: pending.into_values().collect(),
+    })
 }
 
-/// The evidence run for one durable background-task result.
-///
-/// The result names the call that started the task; the call's own name and
-/// arguments — recorded in this goal's window — are what label it. A result for
-/// a call this goal never started is not this goal's evidence, and a call that
-/// is not a command has no label at all: neither can justify completion.
+/// Attribute a durable background result to the call that started it.
 fn background_result_run(
     started: &std::collections::HashMap<String, (String, serde_json::Value, u32)>,
     call_id: &str,
     is_error: bool,
     exit_code: Option<i32>,
     mutation_ops: u64,
-) -> Option<crate::executor::goal_verification::VerificationRun> {
+) -> Option<VerificationRun> {
     let (name, arguments, model_step) = started.get(call_id)?;
-    let label = crate::executor::goal_verification::command_label(name, arguments)?;
-    Some(crate::executor::goal_verification::VerificationRun {
-        label,
+    Some(VerificationRun {
+        label: command_label(name, arguments)?,
         ok: !is_error,
         exit_code,
         model_step: *model_step,
         mutation_ops,
         call_id: Some(call_id.to_string()),
+        check_start: None,
     })
 }
 
@@ -1391,9 +1440,10 @@ mod goal_verification_replay_tests {
         )
         .await;
 
-        let runs = load_goal_verification_runs(&stores, &session, &this_goal)
+        let runs = load_goal_verification(&stores, &session, &this_goal)
             .await
-            .unwrap();
+            .unwrap()
+            .runs;
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].call_id.as_deref(), Some("call-this"));
     }
@@ -1405,9 +1455,10 @@ mod goal_verification_replay_tests {
     async fn an_acknowledged_unknown_outcome_is_not_a_failed_verification_run() {
         let (stores, session, goal) =
             goal_with_one_call(true, None, leveler_engine::USER_ACKNOWLEDGED_CRASH_PREVIEW).await;
-        let runs = load_goal_verification_runs(&stores, &session, &goal)
+        let runs = load_goal_verification(&stores, &session, &goal)
             .await
-            .unwrap();
+            .unwrap()
+            .runs;
         assert!(
             runs.is_empty(),
             "an unknown outcome is not verification evidence, got {runs:?}"
@@ -1483,9 +1534,10 @@ mod goal_verification_replay_tests {
             )
             .await
             .unwrap();
-        let runs = load_goal_verification_runs(&stores, &session, &goal)
+        let runs = load_goal_verification(&stores, &session, &goal)
             .await
-            .unwrap();
+            .unwrap()
+            .runs;
         assert_eq!(runs.len(), 2, "{runs:?}");
         assert_eq!(runs[0].mutation_ops, 0);
         assert_eq!(
@@ -1499,9 +1551,10 @@ mod goal_verification_replay_tests {
     #[tokio::test]
     async fn a_real_failed_command_is_still_a_failed_verification_run() {
         let (stores, session, goal) = goal_with_one_call(true, Some(1), "boom").await;
-        let runs = load_goal_verification_runs(&stores, &session, &goal)
+        let runs = load_goal_verification(&stores, &session, &goal)
             .await
-            .unwrap();
+            .unwrap()
+            .runs;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].label, "cargo test");
         assert!(!runs[0].ok);

@@ -14,7 +14,7 @@ work the same way because no word list is involved.
 | That the source quote or span resolves to real user text | Runtime (`quote_is_in_input` / `resolve_source_span`) |
 | Which goal the requirement belongs to | Runtime (the turn's bound goal) |
 | Requirement identity (`R1`, `R2`, …), state and order | `leveler_lifecycle::apply_scope_declaration` |
-| The durable result | `leveler-storage` (ordered `goal_requirement_events`, migration 0055) |
+| The durable result | `leveler-storage` (ordered `goal_requirement_events`) |
 | Whether an accounted requirement is mechanically satisfied | `leveler-agent::executor::scope_gate` |
 | What the client shows | Runtime facts projected by TUI / Web / CLI |
 
@@ -35,7 +35,8 @@ Each live requirement carries:
 | `target` | The path, literal location or exact command, when the kind needs one. |
 | `source_quote` | Verbatim span of the user message the declaration was anchored to. |
 | `source_span` | Declaration-only alternative to `source_quote`: a 1-based inclusive line range. The runtime cuts the exact text from the authoritative message, stores it as `source_quote`, and drops the coordinate. |
-| `check` | Optional acceptance check the model associated with the requirement. |
+| `check` | Optional human-readable acceptance plan entry. |
+| `verification` | Optional registered command assertion for a `named` deliverable. When present, the check must pass before completion. |
 | `state` | `active`, `waived` or `superseded`. |
 | `superseded_by` | The replacement id when a `replace` retired this one. |
 
@@ -53,7 +54,7 @@ amend `text` to the literal rather than rewrite the file.
 
 Two structured entry points, both model-called:
 
-- `commit_task(requirements=[{kind, text, target, source_quote | source_span, check}])`
+- `commit_task(requirements=[{kind, text, target, source_quote | source_span, check, verification}])`
   seeds the initial set when a Chat turn registers a goal. The seeds are applied
   in array order and mint `R1..Rn`.
 - `declare_scope({operations: [...]})` changes an already bound goal's set. The
@@ -93,6 +94,29 @@ a compound change is one event sequence, not several independent writes.
 `get_goal_scope` reads the current set (ids, kinds, states, quotes, checks) and,
 on request, the ordered change history with the turn that authorized each event.
 
+For a `named` outcome with a checkable acceptance condition, register the
+assertion before executing it. For example, a project can provide a read-only
+script that exits nonzero if the configured database contains demo accounts.
+The declaration can carry:
+
+```json
+{
+  "kind": "named",
+  "text": "The configured database contains no demo accounts",
+  "source_quote": "no demo accounts",
+  "verification": {
+    "tool": "run_command",
+    "arguments": {"program": "./scripts/check-no-demo-accounts", "cwd": "backend"}
+  }
+}
+```
+
+Invoke the command through the regular tool and permission path. Use project
+configuration or environment references for credentials. A registered assertion
+may be changed through an authorized scope amendment, and a changed definition
+requires a new execution. Changing the outcome of a bound requirement also
+requires registering its check again. Other amendments can keep the existing check.
+
 ## Validation
 
 1. **Schema and bounds.** Unknown kinds/operations are refused; text, quote,
@@ -119,7 +143,8 @@ on request, the ordered change history with the turn that authorized each event.
 
 `goal_requirement_events` stores, per goal, the `seq` order, the declaring
 `turn_id`, the operation, the requirement identity, the kind/text/target, the
-verbatim `source_quote`, the check, the reason and the timestamp. The current
+verbatim `source_quote`, the check, the reason and the timestamp. A registered
+check contributes an invocation fingerprint and registration revision ID. The current
 set is a fold of that history — there is no second mutable copy that a resume,
 a context fold or a crash can shrink. `record_scope` folds the history, applies
 and validates the declaration, then appends its new events in one transaction.
@@ -135,17 +160,25 @@ stable id** (`requirements=[{id, status, evidence}]`):
 - `artifact` / `artifact_absent` are checked against the current workspace and
   recorded changes;
 - `content` is checked as a line of the target file;
-- `command` must match a successful recorded run after the last change — the
-  evidence may cite `call_id:<id>` or the command line;
+- `command` must match a successful recorded run of the exact command after
+  the last change; a different or compound line is not its record, and the
+  newest matching execution is the command's current state;
 - `tests` declares its exact command in `target`; a passing recorded run of
-  that command after the last change accounts for the requirement. The runtime
-  has no structured test result, so command success alone is reported as
-  `unverified` test coverage and the record states that limitation: a command
-  that exits 0 without running a test cannot claim test coverage. No runner
-  name or output format is recognised. Legacy `tests` requirements recorded
-  without a `target` are accepted at the same explicit unverified boundary
-  instead of blocking a goal that was legally recorded;
-- `named` is accepted with an explicit "no mechanical check" warning.
+  that exact line after the last change satisfies the requirement. A different
+  or compound command is not its record. The declared command is the evidence
+  contract: the runtime records that exact execution and does not read the
+  runner's name, output or test count. `verified` therefore means the declared
+  command contract held — the line ran and exited 0 after the last change — not
+  that the command executed any test. Legacy `tests` requirements recorded
+  without a `target` are accepted at the explicit unverified boundary instead
+  of blocking a goal that was legally recorded;
+- a `named` requirement is model judgement. A delivered `done` account is
+  recorded as `reported` and completes normally: there is no missing
+  mechanical check to warn about. A registered check makes the requirement
+  mechanical instead: it needs a successful recorded invocation of that
+  definition after registration, cited in `requirements[].check_call_id`.
+  `unverifiable` is the model's explicit boundary for a delivery it could not
+  establish, and keeps its `unverified` record and warning.
 
 The gate reads the durable set on every completion claim, so a compacted
 transcript or a restarted process cannot narrow the scope. A model that never
@@ -176,12 +209,15 @@ An accepted completion persists a `VerificationReport` on the task terminal
 
 ```json
 {
-  "status": "unverified",
+  "status": "reported",
   "records": [
-    {"requirement_id": "R2", "kind": "tests", "state": "unverified",
-     "detail": "`make regression` exited 0 at workspace version 4 (step 7), but the runtime observed no structured test result: command success does not establish that any test executed, so the test coverage remains unverified",
+    {"requirement_id": "R1", "kind": "tests", "state": "verified",
+     "detail": "verified against the execution record: `make regression` exited 0 at workspace version 4",
      "call_id": "call-12", "command": "make regression", "exit_code": 0,
-     "workspace_version": 4, "model_step": 7}
+     "workspace_version": 4, "model_step": 7},
+    {"requirement_id": "R12", "kind": "deliverable", "state": "reported",
+     "detail": "delivered on the model's account; this requirement's contract is model judgement, so no mechanical check applies",
+     "workspace_version": 4, "model_step": 0}
   ]
 }
 ```
@@ -189,10 +225,16 @@ An accepted completion persists a `VerificationReport` on the task terminal
 `records` has one entry per owed requirement, in requirement order. A record
 carries the evidence fields only when a recorded execution backed it; otherwise
 `call_id`/`command`/`exit_code` are absent and `detail` says what the runtime
-could not check. `workspace_version` is the mutation counter the verdict was
-taken against, so a stale verdict is visible without replaying the transcript.
-`Verified` requires at least one owed requirement record and every record
-`verified`; a partial or empty record set is `unverified`.
+observed or could not check. `workspace_version` is the mutation counter the
+verdict was taken against, so a stale verdict is visible without replaying the
+transcript. `Verified` requires at least one owed requirement record and every
+record `verified`. For a `tests` requirement that verdict comes from the exact
+declared command's current run; the record states that execution and never
+claims a test count or coverage the runtime did not observe. `Reported` means
+every mechanical check held and at least one record rests on a delivered model
+judgement. `Unverified` means at least
+one required fact is missing or could not be established; that is the only
+aggregate that raises an evidence warning.
 
 Replay is additive. Terminals written before 2026-09-23 carry the removed
 host-owned verdict as a bare string under the same field
@@ -207,13 +249,18 @@ computed verdict:
 | Outcome | Representation |
 | --- | --- |
 | Verified | `TaskOutcome::Completed` + `VerificationStatus::Verified` |
+| Reported | `TaskOutcome::Completed` + `VerificationStatus::Reported` (normal completion; the model judged and delivered its own requirements, and every mechanical check held) |
 | CompletedUnverified | `TaskOutcome::Completed` + `VerificationStatus::Unverified` |
 | Incomplete | a non-delivery `StopReason` (budget, interruption) |
 | Blocked | `TaskOutcome::Blocked` |
 
 An unverified completion is accepted and delivered. It is not held for user
 confirmation: the warning and the report tell the user what the runtime could
-and could not prove, and the user decides what to do about it.
+and could not prove, and the user decides what to do about it. A reported
+completion carries no warning; its records preserve which requirements were
+mechanically checked and which rest on the model's account. A read-only goal
+whose declaration is `not_applicable` carries `Reported` with no records:
+there is no workspace change to verify.
 
 ## Not in this contract
 

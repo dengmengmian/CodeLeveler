@@ -7,13 +7,15 @@ runtime: an observation inbox captures facts after a turn settles, consolidation
 turns those observations into Markdown topics, and every turn's prompt carries a
 bounded index of the topics the agent may read.
 
-Memory is **off by default**. Nothing is captured, no database is opened, and no
-directory is created until the rollout is enabled.
+Memory is **on by default**. The complete pipeline runs unless the rollout is
+explicitly disabled with `rollout = "off"`; an `off` rollout captures nothing,
+opens no database, and creates no directory.
 
-## Enable it
+## Configure it
 
-Set the rollout in the global config (`~/.leveler/config.toml`, or
-`$LEVELER_HOME/config.toml`):
+The rollout lives in the global config (`~/.leveler/config.toml`, or
+`$LEVELER_HOME/config.toml`). The default is `active`, so an existing config
+needs no `[memory]` section to use memory; set `off` to opt out.
 
 ```toml
 [memory]
@@ -22,10 +24,10 @@ rollout = "active"
 
 | Rollout | What it does |
 | --- | --- |
-| `off` | No capture, no consolidation, no reads. The default. |
+| `off` | No capture, no consolidation, no reads, no store creation. |
 | `record_only` | Captures observations as files; does not expose them or run Dream. |
 | `shadow` | Runs capture and Dream plans without committing curated topic changes. |
-| `active` | The complete pipeline, and the only rollout that exposes memory to the model. |
+| `active` | The complete pipeline and the only rollout that exposes memory to the model. The default. |
 
 Other keys, all optional:
 
@@ -46,9 +48,11 @@ archived_retention_days = 30
 job_retention_days = 14
 ```
 
-A rollout change takes effect for sessions started after the edit. `/remember`
-is the one exception that works while the rollout is `off`: it writes exactly
-the note the user asked for so the note survives a later opt-in.
+A rollout edit is live configuration: after the runtime reloads the file (the
+config watcher, or `/reload`), the Memory page and the next capture/Dream
+decision use the new value. `/remember` also works while the rollout is `off`:
+it writes exactly the note the user asked for so the note survives a later
+re-enable.
 
 ## Where it lives
 

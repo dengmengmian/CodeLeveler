@@ -1832,6 +1832,18 @@ async fn a_temporary_workspace_keeps_the_automatic_pipeline_off() {
     );
 
     let status = harness.app.memory().ui_status(Some(&harness.session)).await;
+    // The off-state guidance the page shows must name the file this process
+    // actually loaded, not a hard-coded `~/.leveler/config.toml`.
+    let wire = serde_json::to_value(&status).unwrap();
+    let config_path = wire
+        .get("config_path")
+        .and_then(|value| value.as_str())
+        .expect("the status carries the effective config path");
+    assert_eq!(
+        std::path::Path::new(config_path),
+        harness.app.layout.home().config_file(),
+        "the reported path is the one the loader used"
+    );
     assert!(status.workspace_ephemeral);
     assert!(!status.capture_enabled, "capture is unavailable");
     assert!(!status.automatic_dream_enabled);

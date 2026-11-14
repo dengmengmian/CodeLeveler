@@ -162,6 +162,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         }
         RuntimeEvent::TurnFinalizing { stage } => view.finalization_stage = Some(*stage),
         RuntimeEvent::TurnCompleted
+        | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
         | RuntimeEvent::TurnCompletedWithWarnings { .. }
         | RuntimeEvent::TurnAnswered
         | RuntimeEvent::TurnPaused { .. }
@@ -420,6 +421,9 @@ mod tests {
     fn every_turn_terminal_removes_the_plan_from_the_live_view() {
         let terminal_events = [
             RuntimeEvent::TurnCompleted,
+            RuntimeEvent::TurnCompletedPartiallyUnverified {
+                requirements: Vec::new(),
+            },
             RuntimeEvent::TurnCompletedWithWarnings {
                 reason: "warning".to_string(),
                 unregistered_task: false,

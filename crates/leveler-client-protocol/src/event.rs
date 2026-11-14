@@ -654,6 +654,9 @@ pub enum RuntimeEvent {
     AwaySummary { text: String },
     /// The current turn finished successfully.
     TurnCompleted,
+    /// The goal settled with an incomplete verification report.
+    /// An empty list indicates that verification was assessed only at goal level.
+    TurnCompletedPartiallyUnverified { requirements: Vec<String> },
     /// The work completed and project verification retains its own result,
     /// but a separate required completion contract produced warnings.
     ///

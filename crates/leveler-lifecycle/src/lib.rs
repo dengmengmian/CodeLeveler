@@ -68,12 +68,12 @@ pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{ABANDONED, PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 pub use requirement::{
-    AppliedRequirementEvent, REQUIREMENT_REASON_MAX_CHARS, REQUIREMENT_TARGET_MAX_CHARS,
-    REQUIREMENT_TEXT_MAX_CHARS, RequirementItem, RequirementKind, RequirementSeed,
-    RequirementState, SCOPE_OPERATIONS_MAX, SCOPE_REQUIREMENTS_MAX, SCOPE_SOURCE_QUOTE_MAX_CHARS,
-    ScopeDeclaration, ScopeError, ScopeOperation, ScopeOperationKind, ScopeProjection,
-    apply_scope_declaration, fold_scope_events, initial_scope, next_requirement_id,
-    validate_declaration,
+    AppliedRequirementEvent, EvidencePolicy, REQUIREMENT_REASON_MAX_CHARS,
+    REQUIREMENT_TARGET_MAX_CHARS, REQUIREMENT_TEXT_MAX_CHARS, RequirementItem, RequirementKind,
+    RequirementSeed, RequirementState, RequirementVerification, SCOPE_OPERATIONS_MAX,
+    SCOPE_REQUIREMENTS_MAX, SCOPE_SOURCE_QUOTE_MAX_CHARS, ScopeDeclaration, ScopeError,
+    ScopeOperation, ScopeOperationKind, ScopeProjection, apply_scope_declaration,
+    fold_scope_events, initial_scope, next_requirement_id, validate_declaration,
 };
 pub use user_intent::{
     INTENT_OPERATIONS_MAX, INTENT_SOURCE_QUOTE_MAX_CHARS, IntentError, IntentProjection,

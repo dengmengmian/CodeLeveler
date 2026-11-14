@@ -46,6 +46,18 @@ describe('completionTruth', () => {
     expect(truth?.facts).toEqual(['5 files changed']);
   });
 
+  it('keeps an incomplete verification boundary distinct from execution failure', () => {
+    const truth = completionTruth(session({
+      lastTurn: { outcome: 'completed_partially_unverified', detail: '数据库连接目标', ms: 1000 },
+    }));
+    expect(truth).toMatchObject({
+      kind: 'success',
+      title: '已完成 · 部分未验证',
+      trust: 'unverified',
+      verify: 'incomplete',
+    });
+  });
+
   it('failed work keeps its retry hint', () => {
     const truth = completionTruth(session({ lastTurn: { outcome: 'failed', detail: 'boom', ms: 10 } }));
     expect(truth?.kind).toBe('failure');
