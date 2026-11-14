@@ -1089,9 +1089,9 @@ async fn a_model_recovers_from_a_refusal_and_registers_the_full_scope() {
                     "summary": "三项社区业务完成",
                     "verification": {"status": "passed", "detail": test_runner_label()},
                     "requirements": [
-                        {"id": "R1", "status": "done", "evidence": "发布链路可访问"},
-                        {"id": "R2", "status": "done", "evidence": "回复可见"},
-                        {"id": "R3", "status": "done", "evidence": "作者/管理员/只读"},
+                        {"id": "R1", "status": "unverifiable", "evidence": "发布链路可访问"},
+                        {"id": "R2", "status": "unverifiable", "evidence": "回复可见"},
+                        {"id": "R3", "status": "unverifiable", "evidence": "作者/管理员/只读"},
                         {"id": "R4", "status": "done", "evidence": test_runner_label()}
                     ]
                 }),
@@ -1183,7 +1183,7 @@ async fn a_first_declaration_accepts_a_line_span_and_keeps_the_users_punctuation
                     "verification": {"status": "passed", "detail": test_runner_label()},
                     "requirements": [
                         {"id": "R1", "status": "done", "evidence": "report.txt 存在"},
-                        {"id": "R2", "status": "done", "evidence": "页面文案保持中文"}
+                        {"id": "R2", "status": "unverifiable", "evidence": "页面文案保持中文"}
                     ]
                 }),
             ),
@@ -1771,9 +1771,9 @@ async fn the_goal_scope_reads_the_declared_requirements_by_id() {
                     "summary": "三项社区业务完成",
                     "verification": {"status": "passed", "detail": test_runner_label()},
                     "requirements": [
-                        {"id": "R1", "status": "done", "evidence": "发布链路可访问"},
-                        {"id": "R2", "status": "done", "evidence": "回复可见"},
-                        {"id": "R3", "status": "done", "evidence": "作者/管理员/只读"}
+                        {"id": "R1", "status": "unverifiable", "evidence": "发布链路可访问"},
+                        {"id": "R2", "status": "unverifiable", "evidence": "回复可见"},
+                        {"id": "R3", "status": "unverifiable", "evidence": "作者/管理员/只读"}
                     ]
                 }),
             ),
@@ -2108,8 +2108,8 @@ async fn a_clarification_answer_is_a_user_requirement_source() {
                     "status": "complete",
                     "summary": "媒体库接入完成",
                     "requirements": [
-                        {"id": "R1", "status": "done", "evidence": "外链 URL 字段已接入"},
-                        {"id": "R2", "status": "done", "evidence": "全链路已完成"}
+                        {"id": "R1", "status": "unverifiable", "evidence": "外链 URL 字段已接入"},
+                        {"id": "R2", "status": "unverifiable", "evidence": "全链路已完成"}
                     ]
                 }),
             ),
@@ -2235,7 +2235,7 @@ async fn a_durable_clarification_answer_survives_into_a_later_window() {
                     "status": "complete",
                     "summary": "媒体库接入完成",
                     "requirements": [
-                        {"id": "R1", "status": "done", "evidence": "外链 URL 字段已接入"}
+                        {"id": "R1", "status": "unverifiable", "evidence": "外链 URL 字段已接入"}
                     ]
                 }),
             ),
@@ -2459,7 +2459,7 @@ async fn a_clarification_answer_authorizes_a_scope_amendment() {
                     "status": "complete",
                     "summary": "媒体库接入完成",
                     "requirements": [
-                        {"id": "R1", "status": "done", "evidence": "标题已使用英文"}
+                        {"id": "R1", "status": "unverifiable", "evidence": "标题已使用英文"}
                     ]
                 }),
             ),
@@ -2489,12 +2489,12 @@ async fn a_clarification_answer_authorizes_a_scope_amendment() {
     );
 }
 
-/// A completion the runtime cannot mechanically check still completes: it is
-/// accepted as unverified and the terminal says exactly which requirement
-/// rests on the model's account. An unverified boundary is not a gate that
-/// waits for the user to confirm anything.
+/// A `named` deliverable is a model judgement. A delivered `done` account is
+/// a normal completion: it is neither refused nor turned into a warning, and
+/// the terminal keeps the record as `Reported` rather than claiming that the
+/// runtime verified the content.
 #[tokio::test]
-async fn an_unverified_completion_is_accepted_and_records_the_boundary() {
+async fn a_delivered_named_requirement_completes_as_reported() {
     let fx = fixture(
         vec![
             Scripted::Tool(
@@ -2517,6 +2517,73 @@ async fn an_unverified_completion_is_accepted_and_records_the_boundary() {
                     ]
                 }),
             ),
+            Scripted::Text("文章发布已经做完了。"),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "a delivered model judgement is a normal completion: {report:?}"
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "a `named` requirement has no mechanical check to miss: {:?}",
+        report.completion_warnings
+    );
+    let verification = report.verification.expect("a verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Reported,
+        "{verification:?}"
+    );
+    assert_eq!(verification.records.len(), 1);
+    assert_eq!(
+        verification.records[0].state,
+        leveler_lifecycle::VerificationRecordState::Reported
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
+}
+
+/// A reported delivery is only as good as the delivery itself. A model that
+/// settles a `named` requirement and then never writes an answer must not
+/// leave a `Reported` claim behind: the terminal downgrades it to an explicit
+/// unverified boundary and names the missing delivery.
+#[tokio::test]
+async fn a_reported_delivery_without_a_final_answer_is_unverified() {
+    let complete = || {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "文章发布完成",
+                "deliver_answer": true,
+                "requirements": [
+                    {"id": "R1", "status": "done", "evidence": "发布链路已可用"}
+                ]
+            }),
+        )
+    };
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["文章发布可访问"],
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"}
+                    ]
+                }),
+            ),
+            complete(),
+            complete(),
+            complete(),
         ],
         false,
     )
@@ -2524,22 +2591,141 @@ async fn an_unverified_completion_is_accepted_and_records_the_boundary() {
 
     let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
     assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
-    let verification = report
-        .verification
-        .expect("an accepted completion carries its verification report");
+    let verification = report.verification.expect("a verification report");
     assert_eq!(
         verification.status,
-        leveler_lifecycle::VerificationStatus::Unverified
+        leveler_lifecycle::VerificationStatus::Unverified,
+        "a delivery that never happened cannot keep a reported verdict: {verification:?}"
     );
-    assert_eq!(verification.records.len(), 1);
-    let record = &verification.records[0];
-    assert_eq!(record.requirement_id, "R1");
     assert_eq!(
-        record.state,
+        verification.records[0].state,
         leveler_lifecycle::VerificationRecordState::Unverified
     );
-    assert!(record.call_id.is_none());
-    assert!(record.command.is_none());
+    assert!(
+        verification.records[0].detail.contains("no final answer"),
+        "{}",
+        verification.records[0].detail
+    );
+    assert!(
+        report
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("no final answer")),
+        "{:?}",
+        report.completion_warnings
+    );
+}
+
+/// A whitespace-only answer is not a delivery either. The record must not
+/// keep a `Reported` claim when the model wrote nothing the person can read.
+#[tokio::test]
+async fn a_whitespace_only_final_answer_is_not_a_reported_delivery() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["文章发布可访问"],
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "文章发布完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "发布链路已可用"}
+                    ]
+                }),
+            ),
+            Scripted::Text("   "),
+            Scripted::Text("   "),
+            Scripted::Text("   "),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, STAGED_REQUEST, CancellationToken::new()).await;
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Completed);
+    let verification = report.verification.expect("a verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Unverified,
+        "a blank answer cannot carry a reported delivery: {verification:?}"
+    );
+    assert_eq!(
+        verification.records[0].state,
+        leveler_lifecycle::VerificationRecordState::Unverified
+    );
+    assert!(
+        verification.records[0].detail.contains("no final answer"),
+        "{}",
+        verification.records[0].detail
+    );
+}
+
+/// A cancellation while the final answer is still owed ends the window
+/// without a `Reported` claim. The goal stays running; the model was not
+/// delivered as complete.
+#[tokio::test]
+async fn a_cancelled_delivery_does_not_leave_a_reported_claim() {
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": STAGED_REQUEST,
+                    "acceptance": ["文章发布可访问"],
+                    "requirements": [
+                        {"kind": "named", "text": "文章发布", "source_quote": "文章发布"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "文章发布完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": "发布链路已可用"}
+                    ]
+                }),
+            ),
+            Scripted::Text("文章发布已经做完了。"),
+        ],
+        false,
+    )
+    .await;
+    fx.runtime.cancel_after.store(3, Ordering::SeqCst);
+
+    let result = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, STAGED_REQUEST),
+            vec![ContentPart::Text {
+                text: STAGED_REQUEST.into(),
+            }],
+            &mut |_| {},
+            fx.cancel.clone(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a cancelled delivery is not a completed one"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Running,
+        "the goal was not resolved without its final answer: {goals:?}"
+    );
 }
 
 /// The requirement contract is language-independent. The model reads the
@@ -2636,19 +2822,19 @@ async fn the_same_requirement_contract_holds_in_any_language() {
         let verification = report
             .verification
             .unwrap_or_else(|| panic!("{}: no verification report", case.label));
-        // The declared command ran and passed in every language. Its coverage
-        // stays unverified because no structured test result exists, not
-        // because of the language it was declared in.
+        // The declared command ran and passed in every language. Its passing
+        // run is the requirement's evidence contract, whatever words the
+        // requirement and the user's message were written in.
         assert_eq!(
             verification.status,
-            leveler_lifecycle::VerificationStatus::Unverified,
+            leveler_lifecycle::VerificationStatus::Verified,
             "{}: {verification:?}",
             case.label
         );
         assert_eq!(verification.records.len(), 1, "{}", case.label);
         assert_eq!(
             verification.records[0].state,
-            leveler_lifecycle::VerificationRecordState::Unverified,
+            leveler_lifecycle::VerificationRecordState::Verified,
             "{}",
             case.label
         );
@@ -2827,10 +3013,10 @@ async fn a_declared_artifact_requirement_is_verified_by_the_workspace() {
     );
 }
 
-/// A semantic requirement the runtime cannot check is delivered, but its
-/// report says so: `named` is unverified, never silently verified.
+/// An explicit unverifiable account is still delivered. It is the boundary
+/// for work no executable check can prove, and the report says so.
 #[tokio::test]
-async fn a_semantic_requirement_completes_unverified() {
+async fn an_explicitly_unverifiable_requirement_completes_unverified() {
     const REQUEST: &str = "实现文章发布，完成后确认。";
     let fx = fixture(
         vec![
@@ -2853,7 +3039,7 @@ async fn a_semantic_requirement_completes_unverified() {
                     "status": "complete",
                     "summary": "文章发布已实现",
                     "requirements": [
-                        {"id": "R1", "status": "done", "evidence": "implemented the publish flow"}
+                        {"id": "R1", "status": "unverifiable", "evidence": "implemented the publish flow"}
                     ]
                 }),
             ),
@@ -4110,17 +4296,282 @@ async fn a_tests_requirement_needs_its_declared_command_to_run() {
     let verification = report.verification.expect("report");
     assert_eq!(
         verification.status,
-        leveler_lifecycle::VerificationStatus::Unverified,
-        "the run proves command success, not structured test results: {verification:?}"
+        leveler_lifecycle::VerificationStatus::Verified,
+        "the declared test command's passing run is its evidence contract: {verification:?}"
     );
     assert_eq!(verification.records.len(), 1);
     assert_eq!(
         verification.records[0].state,
-        leveler_lifecycle::VerificationRecordState::Unverified
+        leveler_lifecycle::VerificationRecordState::Verified
     );
     assert_eq!(
         verification.records[0].command.as_deref(),
         Some(test_runner_label())
+    );
+}
+
+/// A real failed test run keeps its requirement owed: `update_goal(complete)`
+/// is refused with the failed execution, and the model must report the block
+/// instead of claiming a verification it does not have.
+#[tokio::test]
+async fn a_failed_declared_test_command_cannot_be_completed() {
+    let (target, run_call) = if cfg!(windows) {
+        (
+            "cmd /c run-tests.cmd",
+            serde_json::json!({"program": "cmd", "args": ["/c", "run-tests.cmd"]}),
+        )
+    } else {
+        (
+            "./run-tests.sh",
+            serde_json::json!({"program": "./run-tests.sh"}),
+        )
+    };
+    let objective = format!(
+        "运行 {target} 做完整验收，并把结果整理成 report.md。只有测试真实通过才允许标记完成；如果失败，报告阻塞原因。"
+    );
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": objective.clone(),
+                    "acceptance": ["验收脚本通过"],
+                    "requirements": [
+                        {"kind": "tests", "text": "运行验收脚本并通过",
+                         "target": target, "source_quote": target},
+                        {"kind": "artifact", "text": "结果报告",
+                         "target": "report.md", "source_quote": "把结果整理成 report.md"}
+                    ]
+                }),
+            ),
+            Scripted::Tool("run_command", run_call),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "验收完成",
+                    "requirements": [
+                        {"id": "R1", "status": "done", "evidence": target},
+                        {"id": "R2", "status": "done", "evidence": "报告已写入"}
+                    ]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "blocked",
+                    "summary": format!("{target} 执行失败，无法标记完成")
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    if cfg!(windows) {
+        std::fs::write(
+            fx.dir.path().join("run-tests.cmd"),
+            "@echo off\r\necho FAIL: expected 2, observed 1\r\nexit /b 1\r\n",
+        )
+        .unwrap();
+    } else {
+        use std::os::unix::fs::PermissionsExt;
+        let runner = fx.dir.path().join("run-tests.sh");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\necho 'FAIL: expected 2, observed 1'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(fx.dir.path().join("report.md"), "验收失败\n").unwrap();
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, &objective),
+            vec![ContentPart::Text {
+                text: objective.clone(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "requirements_refused"
+                    && detail.contains("R1")
+                    && detail.contains(target)
+                    && detail.contains("failed")
+        )),
+        "a failed declared test command must refuse completion: {events:?}"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Blocked,
+        "the model reports the block instead of a false completion: {report:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Blocked);
+    assert!(
+        report.verification.is_none(),
+        "a blocked goal carries no accepted completion report: {report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals.len(), 1);
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Running,
+        "an unmet test requirement keeps the goal owed: {goals:?}"
+    );
+}
+
+#[tokio::test]
+async fn registered_requirement_checks_need_a_current_run_after_registration() {
+    let objective =
+        "Verify the database contains only initial data and uses the configured database.";
+    let command = checker_call();
+    let mut registered = command.clone();
+    registered.as_object_mut().unwrap().remove("reason");
+    let check = serde_json::json!({"tool": "run_command", "arguments": registered});
+    let complete = |call: &str| {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "Database verified",
+                "requirements": [
+                    {"id": "R1", "status": "done", "evidence": "initial data only", "check_call_id": call},
+                    {"id": "R2", "status": "done", "evidence": "configured database", "check_call_id": call}
+                ]
+            }),
+        )
+    };
+    let fx = fixture(
+        vec![
+            Scripted::Tool("run_command", command.clone()),
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": objective,
+                    "acceptance": ["The database assertions pass"],
+                    "requirements": [
+                        {"kind": "named", "text": "only initial data", "source_quote": "only initial data", "verification": check},
+                        {"kind": "named", "text": "configured database", "source_quote": "configured database", "verification": check}
+                    ]
+                }),
+            ),
+            complete("call-1"),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "actual-count.txt", "content": "3\n"}),
+            ),
+            Scripted::Tool("run_command", command.clone()),
+            complete("call-5"),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "actual-count.txt", "content": "0\n"}),
+            ),
+            Scripted::Tool("run_command", command),
+            complete("call-8"),
+            Scripted::Text("The database checks passed."),
+        ],
+        false,
+    )
+    .await;
+    std::fs::write(fx.dir.path().join("actual-count.txt"), "0\n").unwrap();
+    let (name, script) = if cfg!(windows) {
+        (
+            "check.cmd",
+            "@echo off\r\nfindstr /x 0 actual-count.txt > nul\r\nexit /b %errorlevel%\r\n",
+        )
+    } else {
+        (
+            "check.sh",
+            "#!/bin/sh\ntest \"$(cat actual-count.txt)\" = 0\n",
+        )
+    };
+    std::fs::write(fx.dir.path().join(name), script).unwrap();
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, objective),
+            vec![ContentPart::Text {
+                text: objective.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.iter().filter(|event| matches!(
+        event,
+        leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+            if kind == "requirements_refused" && detail.contains("R1") && detail.contains("R2")
+    )).count(), 2, "{events:?}");
+    assert_eq!(report.stop_reason, leveler_lifecycle::StopReason::Completed);
+    assert!(report.completion_warnings.is_empty());
+    let report = report.verification.unwrap();
+    assert_eq!(
+        report.status,
+        leveler_lifecycle::VerificationStatus::Verified
+    );
+    assert_eq!(report.records.len(), 2);
+    assert!(
+        report.records.iter().all(|record| {
+            record.call_id.as_deref() == Some("call-8")
+                && record.state == leveler_lifecycle::VerificationRecordState::Verified
+        }),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_change_after_acceptance_prevents_verified_delivery() {
+    let objective = "Verify the generated report is current.";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": objective,
+                    "acceptance": ["The report assertion passes"],
+                    "requirements": [{
+                        "kind": "named", "text": "current report", "source_quote": "report is current",
+                        "verification": {"tool": "run_command", "arguments": {
+                            "program": checker_call()["program"], "args": checker_call()["args"]
+                        }}
+                    }]
+                }),
+            ),
+            Scripted::Tool("run_command", checker_call()),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete", "summary": "Report verified",
+                    "requirements": [{
+                        "id": "R1", "status": "done", "evidence": "check passed", "check_call_id": "call-2"
+                    }]
+                }),
+            ),
+            Scripted::Tool("write_file", serde_json::json!({"path": "report.txt", "content": "different report"})),
+            Scripted::Text("The report is current."),
+        ],
+        false,
+    )
+    .await;
+    write_verifier(fx.dir.path());
+    let report = chat_with_request(&fx, objective, CancellationToken::new()).await;
+    assert_ne!(report.stop_reason, leveler_lifecycle::StopReason::Completed);
+    assert!(report.verification.is_none());
+    assert_eq!(
+        goal_records(&fx).await[0].state,
+        leveler_storage::GoalState::Running
     );
 }
 
@@ -6009,15 +6460,11 @@ async fn an_authorized_window_is_not_cut_short_as_paused() {
     std::fs::remove_dir_all(fx.dir.path()).ok();
 }
 
-/// An accepted completion can still have a boundary the runtime could not
-/// verify. That boundary was stated only on the terminal, so the model wrote
-/// the delivery without it and could claim more than the record held. The
-/// acceptance the model reads must carry the runtime's own facts.
+/// "把全部功能真实测试一遍" names no file, command or suite. Its completion
+/// contract is model judgement, so a delivered account settles the goal as
+/// `Reported` instead of being refused for a missing mechanical check.
 #[tokio::test]
-async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
-    // "把全部功能真实测试一遍" names no file, no command and no suite: the
-    // runtime can hold the model to naming the subject, but it can never prove
-    // the coverage. That is a boundary, and it must reach the model.
+async fn an_uncheckable_deliverable_is_reported_to_the_model_as_delivered() {
     let objective = "本地启动项目，把全部功能真实测试一遍。";
     let fx = fixture(
         vec![
@@ -6045,11 +6492,11 @@ async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
                     ]
                 }),
             ),
+            Scripted::Text("全部功能都测过了。"),
         ],
         false,
     )
     .await;
-    let mut events = Vec::new();
     let report = fx
         .coding
         .chat(
@@ -6058,33 +6505,34 @@ async fn an_accepted_completion_tells_the_model_what_it_could_not_verify() {
             vec![ContentPart::Text {
                 text: objective.into(),
             }],
-            &mut |event| events.push(event),
+            &mut |_| {},
             CancellationToken::new(),
         )
         .await
         .unwrap();
 
-    let receipt = events
-        .iter()
-        .find_map(|event| match event {
-            leveler_engine::EngineEvent::ToolCallFinished {
-                name,
-                is_error,
-                preview,
-                ..
-            } if name == "update_goal" && !is_error => Some(preview.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("the accepted completion has no tool result: {events:?}"));
-    assert!(
-        receipt.contains("全部功能") && receipt.contains("no mechanical check"),
-        "the receipt must carry the boundary the runtime computed: {receipt}"
-    );
-    assert_ne!(
+    assert_eq!(
         report.outcome,
-        leveler_lifecycle::TaskOutcome::Failed,
-        "an accepted completion with a boundary is still a completion: {report:?}"
+        leveler_lifecycle::TaskOutcome::Completed,
+        "a delivered model judgement completes the goal: {report:?}"
     );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "{:?}",
+        report.completion_warnings
+    );
+    let verification = report.verification.expect("a verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Reported,
+        "{verification:?}"
+    );
+    assert_eq!(
+        verification.records[0].state,
+        leveler_lifecycle::VerificationRecordState::Reported
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(goals[0].state, leveler_storage::GoalState::Settled);
     std::fs::remove_dir_all(fx.dir.path()).ok();
 }
 

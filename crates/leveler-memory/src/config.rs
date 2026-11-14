@@ -31,13 +31,14 @@ impl Default for MemoryIndexConfig {
 #[serde(rename_all = "snake_case")]
 pub enum MemoryRollout {
     /// Disable every memory read, capture, Dream, and write path.
-    #[default]
     Off,
     /// Persist extracted observations without exposing them in manifests or Dream.
     RecordOnly,
     /// Evaluate capture and Dream plans without committing curated topic changes.
     Shadow,
-    /// Enable the complete pipeline.
+    /// Enable the complete pipeline. The product default: memory is on unless
+    /// the user explicitly opts out with `rollout = "off"`.
+    #[default]
     Active,
 }
 
@@ -102,7 +103,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            rollout: MemoryRollout::Off,
+            rollout: MemoryRollout::Active,
             capture_enabled: true,
             automatic_dream_enabled: true,
             manual_dream_enabled: true,

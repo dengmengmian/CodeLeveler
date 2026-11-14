@@ -6,14 +6,16 @@
 //! - a **failed turn** — `RuntimeStatus::Error` is the runtime's own "the last
 //!   turn ended in failure" state, and the transcript's failure block carries
 //!   its typed summary/subtitle/detail;
-//! - a **failed background task** — the task's failed terminal state in the
-//!   projection the runtime's events built, keyed by its stable task id;
 //! - a **client/runtime version mismatch** — two known build identities
 //!   disagree. It stays active until a matching build is observed, so the
 //!   risk outlives any dismissible notice.
 //!
 //! What is deliberately NOT here:
 //!
+//! - a **failed background task**. Its process exited, but the session is
+//!   still healthy: the failure is a record (exit code, duration, output) in
+//!   the background page and the conversation row, not a standing session
+//!   fault. Nothing accumulates, so nothing needs acknowledging;
 //! - ordinary tool failures (`exit 1` from a test command the agent is working
 //!   through). They stay in the execution timeline; a non-zero exit is not a
 //!   session-level fault;
@@ -25,13 +27,8 @@
 //!
 //! Lifecycle: an issue is active exactly as long as its source fact is. A
 //! failed turn stops being active when a later turn reports `Busy`/`Idle`; a
-//! failed task stops being active when its entry leaves the projection (the
-//! bounded terminal window, a session switch). The STRIP's reminder, however,
-//! is an attention signal, not a durable fact: an unviewed one-shot failure
-//! reminds, and viewing it — opening the issue page, or that task's own detail
-//! — clears the reminder while the record stays active and listed as history.
-//! A failed turn is a persistent fault: only the runtime's own status leaving
-//! `Error` clears it, never a viewing.
+//! version mismatch stops when a matching build is observed. Neither is
+//! cleared by viewing it.
 
 use leveler_client_protocol::RuntimeStatus;
 
@@ -43,9 +40,6 @@ pub(crate) enum IssueKind {
     /// The runtime reported the last turn failed (provider, authentication,
     /// runtime, permission — its typed category is in the block's subtitle).
     TurnFailure,
-    /// A background task reached the runtime's failed terminal state. A
-    /// stopped task is not a failure and never appears here.
-    BackgroundFailure,
     /// The client and the runtime it talks to are known to be different
     /// builds. Only a matching observed build clears it.
     RuntimeVersion,
@@ -56,7 +50,6 @@ impl IssueKind {
     pub fn key(self) -> &'static str {
         match self {
             Self::TurnFailure => "turn-failure",
-            Self::BackgroundFailure => "background-failure",
             Self::RuntimeVersion => "runtime-version",
         }
     }
@@ -66,38 +59,25 @@ impl IssueKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Issue {
     pub kind: IssueKind,
-    /// Dedupe key: the task's stable id, or the kind key for the turn failure.
+    /// Dedupe key: the kind key, stable across re-reductions.
     pub key: String,
-    /// Short label: the failure's own summary, or the task's command label.
+    /// Short label: the failure's own summary.
     pub label: String,
-    /// One muted machine line: provider · category for a turn failure, exit
-    /// code and duration for a task.
+    /// One muted machine line: provider · category for a turn failure.
     pub meta: Option<String>,
-    /// The safe technical detail (turn failures only; task detail lives in the
-    /// task's own page).
+    /// The safe technical detail (turn failures only).
     pub detail: Option<String>,
-    /// New since the user last looked. Seen is not solved: an unread issue and
-    /// a read one are equally active.
-    pub unread: bool,
 }
 
-/// Summary of the issues the strip must REMIND about: the persistent failed
-/// turn (always) and the unviewed one-shot failures. Viewed failures are
-/// history, not reminders — they stay on the page, never on the strip.
+/// What the strip's issue cell counts: the failed turn and a version mismatch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IssueSummary {
-    /// What the strip's issue cell counts: the severe issue plus the unviewed
-    /// background failures.
     pub total: usize,
     /// The severe issue's label — a failed turn. The strip shows it in full
     /// (truncated) instead of hiding it behind a count.
     pub severe: Option<String>,
     /// `true` while any active turn-failure issue exists.
     pub severe_active: bool,
-    /// The number of counted issues that are unviewed background failures.
-    /// `background_unread == total` therefore means every counted issue is a
-    /// background failure; anything else includes a version mismatch.
-    pub background_unread: usize,
 }
 
 impl IssueSummary {
@@ -107,10 +87,7 @@ impl IssueSummary {
 }
 
 /// Every active issue, in display order: the failed turn first, then a
-/// client/runtime version mismatch, then failed background tasks oldest-first
-/// (the projection's own start clock, so the order is deterministic and never
-/// a hash iteration order). Unviewed failures lead their viewed history, so
-/// what needs attention is what the eye lands on.
+/// client/runtime version mismatch.
 pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
     let mut issues = Vec::new();
     if state.status == RuntimeStatus::Error {
@@ -132,7 +109,6 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
             label,
             meta,
             detail,
-            unread: false,
         });
     }
     if state.runtime_version_mismatch {
@@ -155,59 +131,23 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
             label: state.t().runtime_version_mismatch.to_string(),
             meta,
             detail: None,
-            unread: false,
-        });
-    }
-    let mut failed: Vec<(&String, &crate::state::BackgroundTaskChrome)> = state
-        .background_task_labels
-        .iter()
-        .filter(|(_, chrome)| chrome.is_failed())
-        .collect();
-    failed.sort_by(|a, b| {
-        let unread = |id: &String| !state.background_failures_seen.contains(id);
-        unread(b.0)
-            .cmp(&unread(a.0))
-            .then_with(|| a.1.started_elapsed_secs.cmp(&b.1.started_elapsed_secs))
-            .then_with(|| a.0.cmp(b.0))
-    });
-    for (id, chrome) in failed {
-        let mut meta = Vec::new();
-        if let Some(code) = chrome.exit_code {
-            meta.push(format!("exit {code}"));
-        }
-        if let Some(ms) = chrome.duration_ms {
-            meta.push(crate::status_line::fmt_elapsed(ms / 1000));
-        }
-        issues.push(Issue {
-            kind: IssueKind::BackgroundFailure,
-            key: id.clone(),
-            label: chrome.label.clone(),
-            meta: (!meta.is_empty()).then(|| meta.join(" · ")),
-            detail: None,
-            unread: !state.background_failures_seen.contains(id),
         });
     }
     issues
 }
 
-/// Sum up what the strip must remind about: the severe label when a failed
-/// turn is active, the persistent version mismatch, and the count of
-/// background failures that still need attention.
+/// Sum up what the strip must report: the severe label when a failed turn is
+/// active, plus a persistent version mismatch.
 pub(crate) fn issue_summary(state: &AppState) -> IssueSummary {
     let issues = active_issues(state);
     let severe = issues
         .iter()
         .find(|issue| issue.kind == IssueKind::TurnFailure)
         .map(|issue| issue.label.clone());
-    let unread = issues
-        .iter()
-        .filter(|issue| issue.kind == IssueKind::BackgroundFailure && issue.unread)
-        .count();
     IssueSummary {
-        total: usize::from(severe.is_some()) + usize::from(state.runtime_version_mismatch) + unread,
+        total: usize::from(severe.is_some()) + usize::from(state.runtime_version_mismatch),
         severe_active: severe.is_some(),
         severe,
-        background_unread: unread,
     }
 }
 
@@ -254,15 +194,6 @@ pub(crate) fn collapse_selected(state: &mut AppState) -> bool {
         return false;
     };
     state.issue_expanded.remove(&key)
-}
-
-/// The issue the page's cursor is on, if it still exists. Keyed by stable
-/// identity, so a failure that left the projection is never acted on.
-pub(crate) fn selected_issue(state: &AppState) -> Option<Issue> {
-    let key = state.issue_selected.as_deref()?;
-    active_issues(state)
-        .into_iter()
-        .find(|issue| issue.key == key)
 }
 
 /// Move the page's selection over the active issues.
@@ -328,10 +259,11 @@ mod tests {
         assert!(active_issues(&state).is_empty());
     }
 
-    /// Running, completed and stopped tasks are not issues. A cancel is a
-    /// user/agent decision, never a failure.
+    /// Background tasks are execution records, not session issues. Running,
+    /// completed, stopped and failed tasks all leave the strip's issue cell
+    /// alone; a failed one keeps its exit, duration, and place in the page.
     #[test]
-    fn only_failed_tasks_are_issues() {
+    fn a_failed_background_task_is_a_record_not_an_issue() {
         let mut state = state();
         state.background_task_labels.insert(
             "run".into(),
@@ -352,74 +284,42 @@ mod tests {
                 ..BackgroundTaskChrome::running("sleep 99", 2)
             },
         );
-        assert!(active_issues(&state).is_empty(), "nothing failed");
 
         failed_task(&mut state, "t1", 3, 1);
-        let issues = active_issues(&state);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].kind, IssueKind::BackgroundFailure);
-        assert_eq!(issues[0].key, "t1");
-        assert_eq!(issues[0].label, "go test -race t1");
-        assert_eq!(issues[0].meta.as_deref(), Some("exit 1 · 2m 17s"));
-        assert!(issues[0].unread);
-    }
-
-    /// Looking at a failure is not solving it: acknowledging clears the
-    /// "new" marker and the reminder, and the issue stays active on the page.
-    #[test]
-    fn seen_is_not_solved() {
-        let mut state = state();
-        failed_task(&mut state, "t1", 3, 1);
-        assert_eq!(issue_summary(&state).total, 1, "an unseen failure reminds");
-        crate::activity::acknowledge_failures(&mut state);
-        let issues = active_issues(&state);
-        assert_eq!(issues.len(), 1, "an acknowledged failure is still active");
-        assert!(!issues[0].unread, "but it is no longer new");
+        failed_task(&mut state, "t2", 4, 2);
         assert!(
-            issue_summary(&state).is_empty(),
-            "and it stops reminding; the record is what stays, not the reminder"
+            active_issues(&state).is_empty(),
+            "a failure is not an issue"
         );
-        assert!(
-            state.background_task_labels.contains_key("t1"),
-            "the failed record is never deleted by viewing it"
-        );
-    }
-
-    /// One viewed failure does not swallow the next: a new failure is a new
-    /// stable identity, so it reminds on its own.
-    #[test]
-    fn a_new_failure_reminds_after_earlier_ones_were_viewed() {
-        let mut state = state();
-        failed_task(&mut state, "t1", 3, 1);
-        crate::activity::acknowledge_failures(&mut state);
         assert!(issue_summary(&state).is_empty());
-        failed_task(&mut state, "t2", 9, 2);
-        let summary = issue_summary(&state);
-        assert_eq!(summary.total, 1, "only the unviewed failure counts");
-        let issues = active_issues(&state);
-        assert_eq!(issues[0].key, "t2", "unread failures lead the page");
-        assert_eq!(issues[1].key, "t1", "viewed ones follow as history");
-        assert!(issues[0].unread);
-        assert!(!issues[1].unread);
+
+        let record = &state.background_task_labels["t1"];
+        assert_eq!(record.exit_code, Some(1));
+        assert_eq!(record.duration_ms, Some(137_000));
+        assert!(record.is_failed());
+        assert!(state.background_task_labels.contains_key("t2"));
     }
 
-    /// Viewing failures never clears the failed turn: its activity is the
-    /// runtime's status, and only the status changing is recovery.
+    /// A failed turn is the only session-level fault; a failed background task
+    /// next to it never inflates the count and never accumulates a reminder.
     #[test]
-    fn viewing_never_clears_a_failed_turn() {
+    fn a_failed_turn_is_not_multiplied_by_background_failures() {
         let mut state = state();
         state.status = RuntimeStatus::Error;
         failed_task(&mut state, "t1", 3, 1);
-        assert_eq!(issue_summary(&state).total, 2);
-        crate::activity::acknowledge_failures(&mut state);
+        failed_task(&mut state, "t2", 4, 2);
         let summary = issue_summary(&state);
-        assert!(summary.severe_active, "the failed turn still stands");
-        assert_eq!(summary.total, 1, "only the unviewed failure was cleared");
+        assert_eq!(summary.total, 1);
+        assert!(summary.severe_active);
         assert_eq!(summary.severe.as_deref(), Some("请求失败"));
         state.status = RuntimeStatus::Idle;
         assert!(
             issue_summary(&state).is_empty(),
             "recovery is the runtime's own status change, nothing else"
+        );
+        assert!(
+            state.background_task_labels.contains_key("t1"),
+            "the task record outlives the turn"
         );
     }
 
@@ -506,38 +406,35 @@ mod tests {
         assert!(active_issues(&state).is_empty());
     }
 
-    /// Several distinct problems aggregate; a single kind names itself.
+    /// The two persistent faults aggregate; background failures add nothing.
     #[test]
-    fn kinds_aggregate_and_order_deterministically() {
+    fn persistent_faults_aggregate_and_order_deterministically() {
         let mut state = state();
         failed_task(&mut state, "t2", 9, 1);
         failed_task(&mut state, "t1", 3, 2);
-        let summary = issue_summary(&state);
-        assert_eq!(summary.total, 2);
-        assert!(!summary.severe_active);
-        let issues = active_issues(&state);
-        assert_eq!(issues[0].key, "t1", "oldest first");
-        assert_eq!(issues[1].key, "t2");
+        assert!(active_issues(&state).is_empty());
 
         state.status = RuntimeStatus::Error;
+        state.runtime_version_mismatch = true;
         let summary = issue_summary(&state);
         assert!(summary.severe_active);
-        assert_eq!(summary.total, 3);
+        assert_eq!(summary.total, 2);
+        let issues = active_issues(&state);
+        assert_eq!(issues[0].kind, IssueKind::TurnFailure);
+        assert_eq!(issues[1].kind, IssueKind::RuntimeVersion);
     }
 
-    /// The strip summary never counts one fact twice: a task cannot fail
-    /// twice, and the turn failure is keyed by kind, not repeated per event.
+    /// The strip summary never counts one fact twice: the model is derived
+    /// from state, so repeated reads cannot multiply anything.
     #[test]
     fn one_fact_is_one_issue() {
         let mut state = state();
         failed_task(&mut state, "t1", 3, 1);
         state.status = RuntimeStatus::Error;
-        // Repeated reductions of "the same" failure do not multiply it: the
-        // model is derived, so it cannot drift from the source.
         for _ in 0..5 {
             let _ = issue_summary(&state);
         }
-        assert_eq!(issue_summary(&state).total, 2);
+        assert_eq!(issue_summary(&state).total, 1);
     }
 
     /// A notification is not a source: a dismissed notice changes nothing.

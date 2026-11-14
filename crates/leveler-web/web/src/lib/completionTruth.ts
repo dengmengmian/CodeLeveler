@@ -125,9 +125,11 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
     };
   }
 
+  const terminalVerify: VerifyState =
+    s.lastTurn.outcome === 'completed_partially_unverified' ? 'incomplete' : verify;
   const p = presentTurnEnd(s.lastTurn);
   const kind = kindFrom(s, p.tone);
-  const trust = trustFrom(s, kind, verify);
+  const trust = trustFrom(s, kind, terminalVerify);
   const recovery =
     s.lastTurn.outcome === 'failed' || s.lastTurn.outcome === 'truncated' || s.lastTurn.outcome === 'cancelled'
       ? '可重试上一轮'
@@ -139,7 +141,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
     tone: p.tone,
     detail: p.detail,
     trust,
-    verify,
+    verify: terminalVerify,
     changesApplied,
     artifacts,
     pending: 'none',
@@ -150,6 +152,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
 
 function kindFrom(s: SessionView, tone: TurnTone): CompletionKind {
   const outcome = s.lastTurn?.outcome;
+  if (outcome === 'completed_partially_unverified') return 'success';
   if (tone === 'error' || outcome === 'failed' || outcome === 'truncated') return 'failure';
   if (tone === 'muted' || outcome === 'cancelled') return 'failure';
   if (tone === 'warn') return 'warning';

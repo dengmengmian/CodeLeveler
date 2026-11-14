@@ -82,6 +82,7 @@ pub fn should_refresh(event: &RuntimeEvent) -> bool {
         event,
         TokenUsage { .. }
             | TurnCompleted
+            | TurnCompletedPartiallyUnverified { .. }
             | TurnCompletedWithWarnings { .. }
             | TurnAnswered
             | TurnFailed { .. }

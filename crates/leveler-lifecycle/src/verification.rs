@@ -28,16 +28,27 @@ pub struct VerificationReport {
     /// verdict comes from the goal-level verification declaration alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub records: Vec<VerificationRecord>,
+    /// Goal-wide diagnostics when no individual requirement owns the check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// What the runtime could establish about one recorded requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationRecordState {
-    /// A mechanical check matched the execution record.
+    /// A mechanical check matched the execution record. For a `tests`
+    /// requirement, that record is the exact declared command's passing run:
+    /// the check proves the command contract, not that any test executed.
     Verified,
-    /// Accepted on the model's account: no mechanical check exists, the
-    /// observation boundary is unknown, or the model declared the boundary.
+    /// The requirement's completion contract is model judgement: the model
+    /// delivered it, and no mechanical check applies or was declared. This is
+    /// a normal completion, not an evidence gap; the record keeps the
+    /// difference from [`Self::Verified`] for diagnostics and audit.
+    Reported,
+    /// The runtime did not establish the fact and the requirement needed it:
+    /// the observation boundary is unknown, the evidence is missing, or the
+    /// model accounted the requirement as unverifiable.
     Unverified,
 }
 
@@ -46,6 +57,9 @@ pub enum VerificationRecordState {
 pub struct VerificationRecord {
     /// The stable requirement id the account was keyed by (`R1`, `R2`, …).
     pub requirement_id: String,
+    /// User-facing requirement text, absent on older reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirement_text: Option<String>,
     /// The declared requirement kind, as its wire label (`artifact`, `tests`,
     /// `named`, …). The terminal stores the label rather than the enum so a
     /// reader never has to import the Coding requirement vocabulary.
@@ -78,7 +92,11 @@ pub struct VerificationRecord {
 impl VerificationReport {
     /// Build a report from its parts.
     pub fn new(status: VerificationStatus, records: Vec<VerificationRecord>) -> Self {
-        Self { status, records }
+        Self {
+            status,
+            records,
+            notes: Vec::new(),
+        }
     }
 }
 
@@ -92,6 +110,7 @@ mod tests {
             VerificationStatus::Verified,
             vec![VerificationRecord {
                 requirement_id: "R1".to_string(),
+                requirement_text: None,
                 kind: "tests".to_string(),
                 state: VerificationRecordState::Verified,
                 detail: "`cargo test` passed (step 3)".to_string(),

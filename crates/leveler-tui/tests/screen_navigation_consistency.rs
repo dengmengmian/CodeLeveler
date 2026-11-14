@@ -140,18 +140,6 @@ fn summary(id: &str, goal: &str) -> UiSessionSummary {
     }
 }
 
-fn failed_task(state: &mut AppState, id: &str, label: &str) {
-    state.background_task_labels.insert(
-        id.to_string(),
-        BackgroundTaskChrome {
-            ok: Some(false),
-            exit_code: Some(3),
-            duration_ms: Some(1_200),
-            ..BackgroundTaskChrome::running(label, 0)
-        },
-    );
-}
-
 // ---- 1. A child page returns to the page that opened it ---------------------
 
 /// Chat → Sessions → Trace → Esc lands on Sessions, the page that opened the
@@ -267,56 +255,45 @@ fn the_wheel_scrolls_a_page_whose_body_overflows() {
 
 // ---- 4. Keyboard and mouse reach the same things ----------------------------
 
-/// The Issue page's expanded row carries a detail entry. A mouse can click it,
-/// so the keyboard must reach it too — otherwise the task's own page is
-/// unreachable without a pointer.
+/// On the Issue page, keyboard and mouse reach the same thing: one real
+/// issue's expansion. There is no detail entry to reach — the row itself
+/// holds the facts — so Enter and `→` never open another page.
 #[test]
-fn the_issue_page_opens_its_detail_entry_from_the_keyboard() {
+fn the_issue_page_keyboard_expands_the_same_row_a_click_does() {
     let mut s = opened();
-    failed_task(&mut s, "bg-1", "sh -c 'exit 3'");
+    s.status = RuntimeStatus::Error;
+    s.runtime_version_mismatch = true;
     s.active_screen = Screen::Issue;
-    s.issue_selected = Some("bg-1".into());
+    s.issue_selected = Some("turn-failure".into());
 
-    // Enter expands the row (the same interaction a row click runs)...
+    // Enter expands the selected row (the same interaction a row click runs).
     reduce(&mut s, key(KeyCode::Enter));
     assert!(
-        s.issue_expanded.contains("bg-1"),
+        s.issue_expanded.contains("turn-failure"),
         "Enter expands the selected row"
     );
-
-    // ...and a second, distinct binding enters the detail the expanded row
-    // advertises. Enter must NOT do this: one action never means both.
-    reduce(&mut s, key(KeyCode::Right));
-    assert_eq!(
-        s.active_screen,
-        Screen::Activity,
-        "→ opens the selected expanded row's detail entry"
-    );
-    assert_eq!(s.detail_return, Some(Screen::Issue), "and it returns here");
-
-    reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Issue);
-    assert!(
-        s.issue_expanded.contains("bg-1"),
-        "the expansion survives the round trip"
-    );
-}
 
-/// With the row collapsed there is no detail entry on screen, so `→` must not
-/// invent one.
-#[test]
-fn the_issue_page_does_not_open_a_detail_that_is_not_on_screen() {
-    let mut s = opened();
-    failed_task(&mut s, "bg-1", "sh -c 'exit 3'");
-    s.active_screen = Screen::Issue;
-    s.issue_selected = Some("bg-1".into());
-
+    // There is no detail entry: `→` is inert even on an open row, and no
+    // return target is invented.
     reduce(&mut s, key(KeyCode::Right));
     assert_eq!(
         s.active_screen,
         Screen::Issue,
-        "a collapsed row advertises no detail entry"
+        "an open row advertises no detail entry"
     );
+    assert_eq!(s.detail_return, None);
+
+    // Down moves to the second real issue; Enter expands that one too.
+    reduce(&mut s, key(KeyCode::Down));
+    assert_eq!(s.issue_selected.as_deref(), Some("runtime-version"));
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(s.issue_expanded.contains("runtime-version"));
+
+    // `←` collapses the selected row and stays on the page; Esc is the back.
+    reduce(&mut s, key(KeyCode::Left));
+    assert!(!s.issue_expanded.contains("runtime-version"));
+    assert_eq!(s.active_screen, Screen::Issue);
 }
 
 // ---- 5. One safe content rect for header, rules, body and footer ------------
@@ -487,27 +464,26 @@ fn a_wheel_notch_moves_the_same_cursor_the_keys_move() {
     }
 }
 
-/// A selection the user cannot see is a selection the user does not have: the
-/// Issue page's cursor drags the window with it when it moves, exactly as the
-/// other list pages' does.
+/// The Issue page's cursor never leaves the screen and moves over exactly its
+/// real issues; both rows stay painted in a short window.
 #[test]
 fn the_issue_page_keeps_its_cursor_on_screen() {
     let mut s = opened();
     seed(&mut s, Screen::Issue);
-    let rows = s.background_task_labels.len();
-    assert!(
-        rows >= 8,
-        "the fixture needs a list taller than the viewport"
-    );
-    // The page's own opener picks the first issue; stand in for it here.
-    s.issue_selected = Some("bg-0".into());
-    // A window too short for the whole list, so the cursor has to move it.
+    s.issue_selected = Some("turn-failure".into());
     let cursor_row = |page: &Page| {
         page.lines
             .iter()
             .position(|l| l.trim_start().starts_with("→"))
     };
-    assert!(cursor_row(&Page::of(&mut s, 80, 10)).is_some(), "no cursor");
+    let page = Page::of(&mut s, 80, 10);
+    assert!(
+        cursor_row(&page).is_some(),
+        "no cursor:\n{}",
+        page.lines.join("\n")
+    );
+    let rows = s.issue_row_hits.len();
+    assert_eq!(rows, 2, "both real issues are painted");
 
     for step in 0..rows {
         let page = Page::of(&mut s, 80, 10);
@@ -518,6 +494,7 @@ fn the_issue_page_keeps_its_cursor_on_screen() {
         );
         reduce(&mut s, key(KeyCode::Down));
     }
+    assert_eq!(rows, 2, "the fixture is the two real issue kinds");
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -558,12 +535,12 @@ fn pages_with_clickable_rows() -> Vec<(Screen, &'static str)> {
     ]
 }
 
-/// Pages whose seeded body is longer than a 12-row viewport.
+/// Pages whose seeded body is longer than a 12-row viewport. The Issue page
+/// is absent: its real sources are at most two rows, so it cannot overflow.
 fn overflowing_pages() -> Vec<(Screen, &'static str)> {
     vec![
         (Screen::Plan, "Plan"),
         (Screen::Help, "Help"),
-        (Screen::Issue, "Issue"),
         (Screen::Sessions, "Sessions"),
     ]
 }
@@ -588,9 +565,11 @@ fn seed(state: &mut AppState, screen: Screen) {
             state.goal = "a bounded objective, long enough to need more than one line".into();
         }
         Screen::Issue => {
-            for i in 0..10 {
-                failed_task(state, &format!("bg-{i}"), &format!("sh -c 'exit {i}'"));
-            }
+            // The two persistent faults the page can show: a failed turn and
+            // a client/runtime version mismatch. Background failures are
+            // records on the background page, never issues.
+            state.status = RuntimeStatus::Error;
+            state.runtime_version_mismatch = true;
         }
         Screen::ActivityList => {
             for i in 0..8 {

@@ -1494,6 +1494,28 @@
       }
     },
     {
+      "description": "The goal settled with an incomplete verification report. An empty list indicates that verification was assessed only at goal level.",
+      "type": "object",
+      "required": [
+        "requirements",
+        "type"
+      ],
+      "properties": {
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_completed_partially_unverified"
+          ]
+        }
+      }
+    },
+    {
       "description": "The work completed and project verification retains its own result, but a separate required completion contract produced warnings.\n\n`unregistered_task` is a structured terminal fact, not a reading of `reason`: the turn was an answer whose `commit_task` declaration was refused, so no durable task was registered. It must never settle a Goal. Omitted on legacy events, where the old semantics apply.",
       "type": "object",
       "required": [
@@ -5448,6 +5470,28 @@
               "type": "string",
               "enum": [
                 "turn_completed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The goal settled with an incomplete verification report. An empty list indicates that verification was assessed only at goal level.",
+          "type": "object",
+          "required": [
+            "requirements",
+            "type"
+          ],
+          "properties": {
+            "requirements": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_completed_partially_unverified"
               ]
             }
           }
@@ -9680,6 +9724,7 @@
         "automatic_dream_enabled",
         "batch_dream_enabled",
         "capture_enabled",
+        "config_path",
         "enabled",
         "global",
         "manual_dream_enabled",
@@ -9699,6 +9744,10 @@
         },
         "capture_enabled": {
           "type": "boolean"
+        },
+        "config_path": {
+          "description": "The global config file this runtime loaded and watches. The page uses it when it explains how to change the rollout, so the instruction names the file that will actually take effect.",
+          "type": "string"
         },
         "enabled": {
           "description": "Memory is on for this session. False when the configured rollout is `off`, or when the session toggle paused it; `rollout` distinguishes the two.",

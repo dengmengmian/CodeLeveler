@@ -12,7 +12,7 @@
 | 引用的 quote 或 span 是否解析出真实用户原文 | Runtime（`quote_is_in_input` / `resolve_source_span`） |
 | 需求属于哪个 Goal | Runtime（本轮绑定的 Goal） |
 | 需求身份（`R1`、`R2`…)、状态与顺序 | `leveler_lifecycle::apply_scope_declaration` |
-| 持久结果 | `leveler-storage`（有序 `goal_requirement_events`，迁移 0055） |
+| 持久结果 | `leveler-storage`（有序 `goal_requirement_events`） |
 | 已记账的需求是否被机械证据满足 | `leveler-agent::executor::scope_gate` |
 | 客户端显示什么 | TUI / Web / CLI 投射 Runtime 事实 |
 
@@ -32,7 +32,8 @@ quote 只证明来源存在，不证明模型的解释正确；原始用户消�
 | `target` | 路径、文本位置或精确命令；需要目标的种类必填。 |
 | `source_quote` | 声明所锚定的用户消息原文片段。 |
 | `source_span` | 仅声明时可用的 `source_quote` 替代：1-based 闭区间行号。Runtime 从权威消息中切出原文并存为 `source_quote`，不保留坐标。 |
-| `check` | 模型为该项关联的可选验收检查。 |
+| `check` | 可选的验收计划说明。 |
+| `verification` | `named` 交付项可登记的命令断言。一旦登记，必须通过才能结算。 |
 | `state` | `active`、`waived` 或 `superseded`。 |
 | `superseded_by` | replace 退休旧项后，指向替代它的新 id。 |
 
@@ -48,7 +49,7 @@ quote 只证明来源存在，不证明模型的解释正确；原始用户消�
 
 两个结构化入口，都由模型调用：
 
-- `commit_task(requirements=[{kind, text, target, source_quote | source_span, check}])`：
+- `commit_task(requirements=[{kind, text, target, source_quote | source_span, check, verification}])`：
   Chat 轮注册任务时声明初始集合，按数组顺序应用，生成 `R1..Rn`。
 - `declare_scope({operations: [...]})`：修改已绑定 Goal 的集合。`/goal` 轮、
   恢复的 Goal、已提交任务的补充需求都使用同一套操作。
@@ -81,6 +82,24 @@ id，`restore` 恢复已 waived 的需求。声明按数组顺序应用，复合
 `get_goal_scope` 读取当前集合（id、种类、状态、quote、check），并可按需读取
 带授权轮次的有序变更历史。
 
+如果 `named` 交付项有可执行的验收条件，先登记断言，再通过正常的工具与权限路径执行。
+例如项目可以提供只读脚本，检查配置指向的数据库。一旦发现演示账号，脚本就以非零状态退出。
+
+```json
+{
+  "kind": "named",
+  "text": "配置指向的数据库没有演示账号",
+  "source_quote": "不要演示账号",
+  "verification": {
+    "tool": "run_command",
+    "arguments": {"program": "./scripts/check-no-demo-accounts", "cwd": "backend"}
+  }
+}
+```
+
+凭据由项目配置或环境引用提供。可以通过获得授权的需求修改调整断言，定义修改后需要重新执行。
+如果改变已绑定需求的交付结果，需要重新登记检查。其他修改可以保留原定义。
+
 ## 校验
 
 1. **Schema 与边界。** 未知种类 / 操作拒绝；text、quote、target、reason 都有
@@ -102,6 +121,7 @@ id，`restore` 恢复已 waived 的需求。声明按数组顺序应用，复合
 
 `goal_requirement_events` 按 Goal 保存：`seq` 顺序、声明所在 `turn_id`、操作、
 需求身份、kind/text/target、用户原文 `source_quote`、check、reason 与时间戳。
+已登记的断言仅保存执行指纹和登记修订 ID。
 当前集合是这段历史折叠出来的结果——不存在第二份可变副本，因此恢复、上下文折叠
 或崩溃都无法缩小范围。`record_scope` 在同一事务里折叠历史、应用并校验声明、
 追加新事件。
@@ -115,15 +135,19 @@ id，`restore` 恢复已 waived 的需求。声明按数组顺序应用，复合
 - `unverifiable` 是明确的未验证边界，不是对 Runtime 可观察事实的豁免；
 - `artifact` / `artifact_absent` 对照当前工作区与记录的变更；
 - `content` 按目标文件的一行检查；
-- `command` 必须匹配最后一次变更之后的成功运行记录，evidence 可写
-  `call_id:<id>` 或命令行；
+- `command` 必须匹配最后一次变更之后的精确命令成功运行记录；不同命令或复合
+  命令行不是它的执行记录，同一命令的最新一次执行才是当前状态；
 - `tests` 在 `target` 中声明精确的测试命令；该命令在最后一次变更之后的通过
-  运行记录可以记账。Runtime 没有结构化测试结果，因此只有命令成功时，报告为
-  **未验证的测试覆盖**，并在记录中说明这一局限：一个没有运行任何测试却退出 0
-  的命令不能声称测试覆盖。Runtime 不认识任何 runner 名称或输出格式。历史上
-  未带 `target` 的 `tests` 需求，按同一显式未验证边界接受，而不是阻塞一个
-  合法记录的 Goal；
-- `named` 接受，但附带「无机械检查」的显式警告。
+  运行记录即满足该需求。不同命令或复合命令行不是它的记录。声明的命令就是证据
+  契约：Runtime 记录这次精确执行，不读取 runner 名称、输出或测试数量。因此
+  `verified` 表示声明的命令契约成立——这一行在最后一次变更之后执行并以 0 退出
+  ——不表示该命令真的执行了任何测试。历史上未带 `target` 的 `tests` 需求，
+  按显式未验证边界接受，而不是阻塞一个合法记录的 Goal；
+- `named` 交付项属于模型判断。已交付的 `done` 记账记录为 `reported`，正常完成，
+  不会因为「没有机械检查」产生警告。登记验收后则成为机械需求：必须在登记后
+  执行同一定义并通过，并在 `requirements[].check_call_id` 引用该次执行。
+  `unverifiable` 是模型对无法确立的交付给出的显式边界，保留 `unverified`
+  记录与警告。
 
 Gate 在每次完成声明时读取持久集合，因此被折叠的 transcript 或重启的进程都
 无法缩小范围。模型完全不声明时 Gate 没有可执行集合；所以 Goal mode 在契约里
@@ -150,21 +174,27 @@ Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命�
 
 ```json
 {
-  "status": "unverified",
+  "status": "reported",
   "records": [
-    {"requirement_id": "R2", "kind": "tests", "state": "unverified",
-     "detail": "`make regression` exited 0 at workspace version 4 (step 7), but the runtime observed no structured test result: command success does not establish that any test executed, so the test coverage remains unverified",
+    {"requirement_id": "R1", "kind": "tests", "state": "verified",
+     "detail": "verified against the execution record: `make regression` exited 0 at workspace version 4",
      "call_id": "call-12", "command": "make regression", "exit_code": 0,
-     "workspace_version": 4, "model_step": 7}
+     "workspace_version": 4, "model_step": 7},
+    {"requirement_id": "R12", "kind": "deliverable", "state": "reported",
+     "detail": "delivered on the model's account; this requirement's contract is model judgement, so no mechanical check applies",
+     "workspace_version": 4, "model_step": 0}
   ]
 }
 ```
 
 `records` 按需求顺序、每个应交付项一条。只有真实执行记录支撑时才会出现证据
-字段；否则 `call_id`/`command`/`exit_code` 缺省，`detail` 说明 Runtime 无法
-检查什么。`workspace_version` 是判定针对的变更计数器，因此无需重放 transcript
-就能看出结论是否过期。`Verified` 要求至少有一条应交付项记录，且每条记录都是
-`verified`；部分或空记录集一律是 `unverified`。
+字段；否则 `call_id`/`command`/`exit_code` 缺省，`detail` 说明 Runtime 观测到
+什么、无法检查什么。`workspace_version` 是判定针对的变更计数器，因此无需重放
+transcript 就能看出结论是否过期。`Verified` 要求至少有一条应交付项记录，且每条
+记录都是 `verified`。对 `tests` 需求，该结论来自所声明精确命令的当前运行；
+记录陈述该次执行，不会声称 Runtime 未观测到的测试数量或覆盖率。`Reported`
+表示所有机械检查均通过，且至少一条记录来自已交付的模型判断。`Unverified` 表示至少一项必要事实缺失或无法确立；只有这种聚合才会
+产生证据警告。
 
 重放是增量的。2026-09-23 之前的终态把已移除的宿主验证结论写成同一个字段里的
 裸字符串（`"verification": "not_run"`）；它不是报告，读作「没有报告」，旧会话
@@ -176,12 +206,15 @@ Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命�
 | 结果 | 表示 |
 | --- | --- |
 | Verified | `TaskOutcome::Completed` + `VerificationStatus::Verified` |
+| Reported | `TaskOutcome::Completed` + `VerificationStatus::Reported`（正常完成：模型判断并交付自身需求，且所有机械检查均通过） |
 | CompletedUnverified | `TaskOutcome::Completed` + `VerificationStatus::Unverified` |
 | Incomplete | 被接受轮次上的非交付 `StopReason`（预算、中断） |
 | Blocked | `TaskOutcome::Blocked` |
 
 未验证的完成照常接受并交付，不会停下来等待用户确认：警告与报告告诉用户
-Runtime 证明了什么、没能证明什么，由用户决定后续处理。
+Runtime 证明了什么、没能证明什么，由用户决定后续处理。Reported 完成不带警告；
+它的记录保留哪些需求经过机械检查、哪些来自模型判断。只读 Goal 显式声明
+`not_applicable` 时，报告为 `Reported` 且记录为空：没有工作区变更需要验证。
 
 ## 不属于本契约
 

@@ -1257,6 +1257,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn verification_boundary_replays_as_completed_with_unverified_requirements() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Completed),
+                warnings: Vec::new(),
+                verification: Some(leveler_lifecycle::VerificationReport::new(
+                    leveler_lifecycle::VerificationStatus::Unverified,
+                    vec![leveler_lifecycle::VerificationRecord {
+                        requirement_id: "R2".into(),
+                        requirement_text: Some("实际连接的数据库与配置一致".into()),
+                        kind: "deliverable".into(),
+                        state: leveler_lifecycle::VerificationRecordState::Unverified,
+                        detail: "Internal diagnostic".into(),
+                        call_id: None,
+                        command: None,
+                        exit_code: None,
+                        workspace_version: 0,
+                        model_step: 0,
+                    }],
+                )),
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert!(entries.iter().any(|entry| {
+            serde_json::to_value(&entry.event).unwrap()
+                == serde_json::json!({
+                    "type": "turn_completed_partially_unverified",
+                    "requirements": ["实际连接的数据库与配置一致"]
+                })
+        }));
+    }
+
     /// A plain Chat answer with a review warning replays with that warning and
     /// no unregistered fact: no declaration was attempted, so the durable log
     /// has no refusal to carry.

@@ -712,6 +712,15 @@ pub enum EngineEvent {
     EvidenceLedgerUpdated {
         ledger: leveler_lifecycle::EvidenceLedger,
     },
+    /// A local Coding association between an admitted execution and the
+    /// acceptance check registrations in force when dispatch began.
+    RegisteredCheckStarted {
+        call_id: String,
+        fingerprint: String,
+        registrations: Vec<String>,
+        order: u64,
+        mutation_ops: u64,
+    },
     /// Cross-round progress / closeout ledger (engine continue reads last).
     ProgressUpdated {
         ledger: leveler_lifecycle::ProgressLedger,
@@ -842,6 +851,9 @@ pub enum EngineEvent {
         model_steps: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modified_files: Vec<String>,
+        /// The accepted verification report used to recover an uncommitted terminal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<leveler_lifecycle::VerificationReport>,
         /// The session transcript boundary (exclusive next ordinal) at which
         /// the accepted answer sits. It binds the delivery to the exact
         /// message prefix instead of comparing answer text; `None` on rows
@@ -1103,6 +1115,7 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            | EngineEvent::RegisteredCheckStarted { .. }
             // Harness round-attribution fact: persisted locally for eval and
             // audit; no remote peer needs it, so it stays local.
             | EngineEvent::RuntimeInjection { .. }
@@ -1278,6 +1291,7 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            | EngineEvent::RegisteredCheckStarted { .. }
             | EngineEvent::RuntimeInjection { .. }
             // Local control state. It says nothing a remote peer needs and
             // deny-by-default is the right answer for it.

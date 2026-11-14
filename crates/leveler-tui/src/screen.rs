@@ -30,10 +30,10 @@ pub enum Screen {
     /// Observational like the roster itself: nothing here cancels work.
     Team,
     /// Active issues, opened from the state strip's issue cell: a failed turn
-    /// and the failed background tasks the projection still holds. A row is one
-    /// interaction — Enter or a click selects it and toggles its expansion, and
-    /// the expanded row's detail entry (or `→`) opens its [`Screen::Activity`]
-    /// page. Nothing here cancels work or clears a failure record.
+    /// and a client/runtime version mismatch. A row is one interaction — Enter
+    /// or a click selects it and toggles its expansion. Nothing here cancels
+    /// work or clears a failure record; background-task failures are records
+    /// on the background page, not issues.
     Issue,
     /// Full active plan, opened from the workbench's one-line plan summary.
     Plan,
@@ -55,9 +55,9 @@ pub enum Screen {
     /// management API — list, detail, create/edit, pause, run now, history,
     /// grant and OS wakeup. The runtime owns every definition and run.
     Schedules,
-    /// `/memory`: durable cross-session memory. A searchable file list beside
-    /// a bounded, read-only preview; the runtime owns the store, the capture
-    /// queue and every tombstone.
+    /// `/memory`: a centered overlay over the conversation. Both scopes share
+    /// one grouped list beside a bounded, read-only Markdown preview; the
+    /// runtime owns the store, the capture queue and every tombstone.
     Memory,
     /// Complete output of a finished local command. File-backed and windowed:
     /// the page paints only the visible rows, so a 50 MiB result costs the

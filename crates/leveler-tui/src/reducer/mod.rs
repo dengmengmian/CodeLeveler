@@ -167,6 +167,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let turn_ended = matches!(
                 event,
                 RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
@@ -181,6 +182,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::ToolCallStarted { .. }
                     | RuntimeEvent::ToolCallCompleted { .. }
                     | RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
@@ -235,6 +237,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     matches!(
                         turn.status,
                         crate::transcript::TurnEndStatus::Completed
+                            | crate::transcript::TurnEndStatus::CompletedPartiallyUnverified
                             | crate::transcript::TurnEndStatus::CompletedWithWarnings
                             | crate::transcript::TurnEndStatus::Answered
                             | crate::transcript::TurnEndStatus::AnsweredUnregistered
@@ -1144,18 +1147,6 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     if state.active_screen == Screen::Issue {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // The expanded row's detail entry wins over its row: the entry
-                // opens the task's existing page, the row toggles.
-                if let Some((_, _, _, key)) = state
-                    .issue_detail_hits
-                    .iter()
-                    .find(|(row, x0, x1, _)| {
-                        *row == mouse.row && (*x0..*x1).contains(&mouse.column)
-                    })
-                    .cloned()
-                {
-                    return screen_nav::open_issue_detail(state, &key);
-                }
                 if let Some((_, _, _, key)) = state
                     .issue_row_hits
                     .iter()
@@ -1325,8 +1316,8 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 return crate::activity::open(state, id);
             }
             if background_hit {
-                // An observational entry: opening the list acknowledges the
-                // failures (the existing seen-marker) and cancels nothing.
+                // An observational entry: opening the list is an index over
+                // the runtime's records, and it cancels nothing.
                 state.workbench_focus = WorkbenchFocus::Background;
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
@@ -2335,8 +2326,8 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             screen_nav::open_goal_screen(state);
             return Vec::new();
         }
-        // Background focus: Enter opens the aggregated jobs list. The list page
-        // is what acknowledges the failures, so the badge clears on return.
+        // Background focus: Enter opens the aggregated jobs list, the index
+        // over the runtime's background records.
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Background => {
             crate::activity::open_background_list(state);
             return Vec::new();

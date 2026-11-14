@@ -159,24 +159,25 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             delivering that part while quietly exempting the rest — with or \
             without a rationalization — is still a false completion. Blocked, \
             naming which part cannot be satisfied and why. \
-            `complete` needs `verification`: `passed` citing the executions \
+            For goal-wide evidence, use `verification`: `passed` citing the executions \
             you rely on, one per line in `detail` (each citation is checked \
             against the runtime's execution record, after your last change), or \
             `not_applicable` with the reason in `detail`. The runtime never \
             classifies a command by its name: the citation is what makes an \
             execution evidence, and a completion that changed the workspace \
             with no citation is accepted as unverified, never as a verified \
-            success. When the goal has a \
+            success. Do not duplicate a registered requirement check in goal-wide \
+            verification. When the goal has a \
             recorded requirement set, `requirements` must account for every \
             active deliverable by its stable id; a missing or `not_done` \
-            requirement refuses completion, and the requirement's own account \
-            is the evidence the terminal carries. A `tests` requirement names \
-            its exact test command in `target`; a passing recorded run of that \
-            command accounts for it, but command success alone is reported as \
-            unverified test coverage — the runtime has no structured test \
-            result to confirm that any test executed. \
-            `unverifiable` marks delivered work the runtime cannot prove, not \
-            work you skipped.",
+            requirement refuses completion, and its account is the evidence the \
+            terminal carries. A requirement with a path, literal or declared \
+            command is checked against the workspace or the recorded executions \
+            (a `tests` requirement's declared command must have a passing run). \
+            A `named` requirement is model judgement: account it `done` when \
+            delivered. A registered check must pass and is cited in \
+            `check_call_id`. `unverifiable` is an explicit boundary, not an \
+            exemption from an observed fact.",
     );
     ToolDefinition {
         name: UPDATE_GOAL_TOOL.to_string(),
@@ -245,7 +246,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                             },
                             "evidence": {
                                 "type": "string",
-                                "description": "What proves it. For a `tests` requirement, put `call_id:<id>` of a passing run of the declared test command (`target`), or that exact command, on its own line."
+                                "description": "What proves it. A `tests` or `command` requirement is satisfied by the newest recorded run of its exact `target` command; the runtime reads that execution record, not this account."
+                            },
+                            "check_call_id": {
+                                "type": "string",
+                                "description": "Tool call id of the latest passing run of the registered check."
                             }
                         },
                         "required": ["id", "status", "evidence"],
@@ -400,6 +405,66 @@ fn requirement_target_contract() -> String {
     )
 }
 
+fn requirement_verification_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Executable check for a named deliverable; exits nonzero when its outcome is absent.",
+        "properties": {
+            "tool": {"type": "string", "enum": ["run_command", "shell_command"]},
+            "arguments": {
+                "type": "object",
+                "description": "Arguments for the chosen tool.",
+                "properties": {
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "cmd": {"type": "string"},
+                    "cwd": {"type": "string"}
+                },
+                "additionalProperties": false
+            }
+        },
+        "required": ["tool", "arguments"],
+        "additionalProperties": false
+    })
+}
+
+/// Parse a model-facing definition without retaining its command arguments.
+pub(crate) fn parse_requirement_verification(
+    value: &serde_json::Value,
+    registered_by: &str,
+) -> Result<leveler_lifecycle::RequirementVerification, &'static str> {
+    let shape_error = "expected a verification object with tool and arguments";
+    let input = value
+        .as_object()
+        .filter(|fields| fields.len() == 2)
+        .ok_or(shape_error)?;
+    let tool = input
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(shape_error)?;
+    let arguments = input.get("arguments").ok_or(shape_error)?;
+    let fields = arguments
+        .as_object()
+        .ok_or("verification arguments must be an object")?;
+    let allowed = match tool {
+        "run_command" => ["program", "args", "cwd"].as_slice(),
+        "shell_command" => ["cmd", "cwd"].as_slice(),
+        _ => return Err("verification tool must be run_command or shell_command"),
+    };
+    if fields.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("verification arguments contain a field unsupported by the registered tool");
+    }
+    if arguments.to_string().len() > 16_384 {
+        return Err("verification arguments may not exceed 16384 bytes");
+    }
+    let fingerprint = crate::executor::goal_verification::command_invocation(tool, arguments)
+        .ok_or("verification arguments must describe a command with valid program or cmd, args, and cwd")?;
+    Ok(leveler_lifecycle::RequirementVerification {
+        fingerprint,
+        registered_by: registered_by.to_string(),
+    })
+}
+
 /// Declare what the user's newest message changes about the goal's
 /// requirements.
 ///
@@ -457,7 +522,7 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             },
                             "text": {
                                 "type": "string",
-                                "description": "For `content`, the exact line the target must contain — not a description of it. Otherwise the requirement in the user's terms. Required for add and replace; optional for amend."
+                                "description": "The user's requirement. For content, the exact line the target must contain. Required for add and replace; optional for amend."
                             },
                             "target": {
                                 "type": "string",
@@ -483,6 +548,7 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                                 "type": "string",
                                 "description": "An acceptance check that covers this requirement, copied exactly from the goal's acceptance list. Omit when none covers it."
                             },
+                            "verification": requirement_verification_schema(),
                             "reason": {
                                 "type": "string",
                                 "description": "Optional short note, especially for waive or replace: why the requirement changed."
@@ -620,31 +686,15 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
 
 pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
     let description = String::from(
-        "Declare that the user's request is execution work this turn must carry \
-            to completion, and commit the turn to the task lifecycle. Call it before the \
-            first edit only when ALL THREE hold: (1) the user asked you to perform work, \
-            not to explain, discuss, check or confirm something; (2) the request states a \
-            concrete result you can deliver (files, modules, endpoints, stages, migrations); \
-            (3) finishing it needs several steps, tracking or acceptance, so a stage summary \
-            would not prove it done — or the user said to finish everything before stopping. \
-            Call it even when you expect to finish this turn: the commitment is what keeps it \
-            alive if the work outlasts it. Do NOT call it for a question, an explanation, a status \
-            or verification check, a discussion, a single small fix, or when the user asked you \
-            not to modify anything. If you are unsure whether this is execution work, do not \
-            call it. `objective` is the user's stated end state, neither narrower nor larger; \
-            when the user's message itself is non-empty the runtime records it as the durable \
-            objective, so `objective` is unused. \
-            `acceptance` lists the concrete checks that will prove it. If the user stated \
-            explicit deliverables or constraints, declare them in `requirements`, one entry \
-            each, with `source_quote` or `source_span` pointing at the user's message or at \
-            their answer to your question: that structured set is what the \
-            completion gate reads, and the runtime never re-derives it from prose. After the commit, the \
-            runtime keeps this turn running: a stage summary or a quiet end does NOT finish the \
-            task. Continue the work and resolve it with update_goal(complete|blocked). Do not \
-            substitute update_plan for the acceptance contract: a plan records intended steps, \
-            not proof that the user's deliverables exist. This is not a Git commit: it records \
-            an execution task in CodeLeveler and does not stage, commit or alter repository \
-            files. The session itself stays a Chat session.",
+        "Commit a Chat turn to carrying out the user's requested work. Call before the first \
+         edit when the user asked you to perform work, specified a concrete result, and finishing \
+         needs several steps, tracking or acceptance, or the user said to finish everything. Do \
+         not call for a question, status or verification check, explanation, discussion, a small \
+         fix, or if the user asked for no modifications. If unsure, do not call. Use the user's \
+         requested scope. Declare explicit deliverables and constraints in requirements and anchor \
+         each to the user's words. Register a named deliverable's executable check before running \
+         it. The task persists until update_goal(complete|blocked). The session remains Chat, and \
+         this tool does not commit files to Git.",
     );
     let kind_enum = requirement_kind_enum();
     let target_contract = requirement_target_contract();
@@ -668,7 +718,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                 "requirements": {
                     "type": "array",
                     "maxItems": 40,
-                    "description": "The user's stated deliverables and constraints, one entry each with a `source_quote` or `source_span`. Omit if none beyond the objective.",
+                    "description": "One entry per explicit deliverable or constraint, anchored by source_quote or source_span.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -677,14 +727,14 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                                 "enum": kind_enum,
                                 "description": format!(
                                     "artifact = must exist; artifact_absent = must be gone; \
-                                     command = exact command; named = no mechanical check; \
+                                     command = exact command; named = outcome with an optional registered verification; \
                                      content = literal in target; tests = suite run by `target`; \
                                      others not owed. {target_contract}"
                                 )
                             },
                             "text": {
                                 "type": "string",
-                                "description": "For `content`, the exact line the target must contain — not a description of it. Otherwise the requirement in the user's terms."
+                                "description": "The user's requirement. For content, the exact line the target must contain."
                             },
                             "target": {
                                 "type": "string",
@@ -707,7 +757,8 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                             "check": {
                                 "type": "string",
                                 "description": "One `acceptance` entry covering it, copied exactly."
-                            }
+                            },
+                            "verification": requirement_verification_schema()
                         },
                         "required": ["kind", "text", "source_quote"],
                         "oneOf": [
@@ -720,7 +771,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                 "task_relation": {
                     "type": "string",
                     "enum": ["continue", "new"],
-                    "description": "Required when this task already owes a running goal and the objective differs: \"continue\" joins that goal (the user is extending the same work), \"new\" starts an independent task with its own objective, acceptance and budget. Omit only when no goal is running or the objective is identical; the runtime refuses to guess."
+                    "description": "When a goal is already running and the objective differs, use continue to extend it or new for independent work."
                 }
             },
             "required": ["objective", "acceptance"],
@@ -1583,6 +1634,32 @@ mod scope_fidelity_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn registered_acceptance_input_produces_only_a_durable_identity() {
+        let input = serde_json::json!({
+            "tool": "run_command",
+            "arguments": {"program": "./verify-release", "args": ["release 17"], "cwd": "backend"}
+        });
+        let check = parse_requirement_verification(&input, "call-commit").unwrap();
+        assert_eq!(check.registered_by, "call-commit");
+        let durable = serde_json::to_string(&check).unwrap();
+        assert!(!durable.contains("verify-release"));
+        assert!(!durable.contains("release 17"));
+        assert!(
+            parse_requirement_verification(&serde_json::to_value(check).unwrap(), "model").is_err()
+        );
+        assert!(
+            parse_requirement_verification(
+                &serde_json::json!({
+                    "tool": "shell_command",
+                    "arguments": {"cmd": "test -f RELEASE", "program": "true"}
+                }),
+                "call-commit",
+            )
+            .is_err()
+        );
+    }
+
     /// A requirement kind is tied to `target` in prose only when one clause
     /// names the kind and the field together.
     fn schema_states_target_for(description: &str, kind: &str) -> bool {
@@ -2318,13 +2395,13 @@ mod receipt_tests {
     #[test]
     fn a_boundary_is_stated_on_the_acceptance() {
         let warnings = vec![
-            "requirement `全部功能` is reported done but has no mechanical check; the completion \
-             rests on the model's account, not runtime evidence"
+            "requirement `R2` [tests] `the suite must pass` is accounted done, but no passing \
+             run of the declared test command was recorded after the last change"
                 .to_string(),
         ];
         let receipt = super::completion_receipt("Goal completed", &warnings);
         assert!(receipt.starts_with("Goal completed."), "{receipt}");
-        assert!(receipt.contains("全部功能"), "{receipt}");
+        assert!(receipt.contains("R2"), "{receipt}");
         assert!(receipt.contains("not on evidence"), "{receipt}");
         assert!(
             receipt.contains("must not present these as verified"),

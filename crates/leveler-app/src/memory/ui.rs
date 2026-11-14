@@ -53,6 +53,7 @@ impl MemoryRuntime {
         UiMemoryStatus {
             rollout: status.rollout.as_str().to_owned(),
             enabled: status.enabled,
+            config_path: self.config.config_file().display().to_string(),
             capture_enabled: status.capture_enabled,
             automatic_dream_enabled: status.automatic_dream_enabled,
             manual_dream_enabled: status.manual_dream_enabled,

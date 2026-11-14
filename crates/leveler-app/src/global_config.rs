@@ -128,9 +128,9 @@ pub struct GlobalConfig {
     /// Bounded automatic recovery for transient model-provider failures.
     #[serde(default)]
     retry: leveler_model::RetryBudget,
-    /// Cross-session memory. Absent means Off; nothing is captured or
-    /// injected until the user opts in. An explicit `/remember` still writes
-    /// the note the user asked for, so it survives a later opt-in.
+    /// Cross-session memory. Absent means Active; set `rollout = "off"` to
+    /// stop capture and injection. An explicit `/remember` still writes the
+    /// note the user asked for, so it survives a later re-enable.
     #[serde(default)]
     memory: GlobalMemory,
 }
@@ -139,7 +139,7 @@ pub struct GlobalConfig {
 ///
 /// Every field is optional so the resolved [`leveler_memory::config::MemoryConfig`]
 /// keeps its own defaults as the single source of truth. `rollout` is the
-/// master switch: `off` (default), `record_only`, `shadow`, or `active`.
+/// master switch: `active` (default), `off`, `record_only`, or `shadow`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalMemory {
@@ -637,7 +637,7 @@ pub struct GlobalBundle {
     pub web_search: Option<WebSearchSettings>,
     /// `[retry]`: the bounded recovery budget for one logical model request.
     pub retry: leveler_model::RetryBudget,
-    /// `[memory]`, resolved. `Off` unless the user opted in.
+    /// `[memory]`, resolved. Active unless the user opts out.
     pub memory: leveler_memory::config::MemoryConfig,
     /// `[memory].model`: the route for capture and Dream extraction.
     pub memory_model: Option<String>,
@@ -1728,10 +1728,10 @@ mod tests {
         assert!(toml::from_str::<GlobalConfig>("[retry]\nmax_retries = -1\n").is_err());
     }
 
-    /// `[memory]` is off unless the user opts in, and a typo must not silently
+    /// Memory is on unless the user opts out, and a typo must not silently
     /// leave the pipeline disabled or enabled.
     #[test]
-    fn memory_is_off_by_default_and_parses_its_rollout() {
+    fn memory_is_active_by_default_and_parses_its_rollout() {
         let bundle = toml::from_str::<GlobalConfig>("").unwrap().into_bundle();
         assert_eq!(
             bundle.memory,
@@ -1739,22 +1739,22 @@ mod tests {
         );
         assert_eq!(
             bundle.memory.rollout,
-            leveler_memory::config::MemoryRollout::Off
+            leveler_memory::config::MemoryRollout::Active
         );
         assert_eq!(bundle.memory_model, None);
 
         let bundle = toml::from_str::<GlobalConfig>(
-            "[memory]\nrollout = \"active\"\nmodel = \"deepseek/deepseek-v4-pro\"\n\
+            "[memory]\nrollout = \"off\"\nmodel = \"deepseek/deepseek-v4-pro\"\n\
              batch_dream_enabled = true\narchived_retention_days = 7\n",
         )
         .unwrap()
         .into_bundle();
         assert_eq!(
             bundle.memory.rollout,
-            leveler_memory::config::MemoryRollout::Active
+            leveler_memory::config::MemoryRollout::Off
         );
-        assert!(bundle.memory.can_capture());
-        assert!(bundle.memory.can_run_automatic_dream());
+        assert!(!bundle.memory.can_capture());
+        assert!(!bundle.memory.can_run_automatic_dream());
         assert!(bundle.memory.batch_dream_enabled);
         assert_eq!(bundle.memory.archived_retention_days, 7);
         assert_eq!(

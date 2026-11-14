@@ -78,6 +78,9 @@ pub struct ConfigChange {
     /// `[retry]`: the registry generation carries the recovery budget, so a
     /// policy change rebuilds it like any other route fact.
     pub retry: bool,
+    /// `[memory]`: the rollout, its per-capability switches and its extraction
+    /// route are live runtime inputs. A memory-only edit is a real generation.
+    pub memory: bool,
     pub ui: bool,
     /// `[browser].default`: the browser capability's product is chosen when
     /// the browser handle is built, so a change is reported as restart-scoped
@@ -114,6 +117,7 @@ impl ConfigChange {
             (self.context, "context"),
             (self.web_search, "web_search"),
             (self.retry, "retry"),
+            (self.memory, "memory"),
             (self.ui, "ui"),
             (self.browser, "browser"),
             (self.assists, "assists"),
@@ -239,6 +243,13 @@ impl ConfigManager {
             .clone()
     }
 
+    /// The global config file this manager loads and watches. Surfaces that
+    /// tell the user where to edit memory settings show this path, never a
+    /// hard-coded guess.
+    pub fn config_file(&self) -> PathBuf {
+        self.layout.home().config_file()
+    }
+
     /// The last load/validation failure, or `None` when the current generation
     /// came from a clean load.
     pub fn last_error(&self) -> Option<String> {
@@ -360,12 +371,15 @@ impl ConfigManager {
 
         // The source bytes moved but nothing the runtime consumes did (a
         // comment, key order, re-indenting). Adopt the new fingerprint without
-        // advancing the version or rebuilding anything.
+        // advancing the version or rebuilding anything. Publish the bundle
+        // that was just parsed, never the previous one: a field missing from
+        // `diff` must not be frozen for the life of the process (memory was
+        // exactly that bug).
         if change.is_empty() {
             let replacement = Arc::new(ConfigSnapshot {
                 version: previous.version,
                 fingerprint,
-                loaded: previous.loaded.clone(),
+                loaded,
                 registry_digest: previous.registry_digest.clone(),
                 project_digest: previous.project_digest.clone(),
                 registry: previous.registry.clone(),
@@ -628,6 +642,7 @@ pub fn diff(previous: &LoadedConfig, next: &LoadedConfig) -> ConfigChange {
             || previous.model_context_soft_percent != next.model_context_soft_percent,
         web_search: previous.web_search != next.web_search,
         retry: previous.retry != next.retry,
+        memory: previous.memory != next.memory || previous.memory_model != next.memory_model,
         ui: previous.lang != next.lang,
         browser: previous.browser_default != next.browser_default,
         assists: previous.assist_prompt_suggestions != next.assist_prompt_suggestions
@@ -797,6 +812,25 @@ mod tests {
         assert_ne!(before, after);
         a.retry = b.retry;
         assert!(diff(&a, &b).is_empty());
+    }
+
+    /// `[memory]` is a live runtime input: a change to it must not be
+    /// classified as a comment-only edit, or the reload publishes the old
+    /// `loaded` bundle and the running process never sees the new rollout.
+    #[test]
+    fn a_memory_only_edit_is_a_real_change() {
+        let mut before = config("p/m", ("p", "m"));
+        before.memory.rollout = leveler_memory::config::MemoryRollout::Off;
+        let mut after = before.clone();
+        after.memory.rollout = leveler_memory::config::MemoryRollout::Active;
+
+        let change = diff(&before, &after);
+        assert!(!change.is_empty());
+        assert!(change.labels().contains(&"memory"), "{:?}", change.labels());
+
+        let mut other_route = after.clone();
+        other_route.memory_model = Some("p/m".to_owned());
+        assert!(diff(&after, &other_route).labels().contains(&"memory"));
     }
 
     #[test]

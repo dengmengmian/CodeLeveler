@@ -708,6 +708,26 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::TurnCompleted => {
             finish_turn(state, TurnEndStatus::Completed, None);
         }
+        RuntimeEvent::TurnCompletedPartiallyUnverified { requirements } => {
+            let detail = requirements.first().map(|requirement| {
+                let mut detail = requirement.split_whitespace().collect::<Vec<_>>().join(" ");
+                if let Some((end, _)) = detail.char_indices().nth(72) {
+                    detail.truncate(end);
+                    detail.push('…');
+                }
+                if requirements.len() > 1 {
+                    let remaining = requirements.len() - 1;
+                    detail.push(' ');
+                    detail.push_str(&state.t().final_unverified_more.replacen(
+                        "{}",
+                        &remaining.to_string(),
+                        1,
+                    ));
+                }
+                detail
+            });
+            finish_turn(state, TurnEndStatus::CompletedPartiallyUnverified, detail);
+        }
         RuntimeEvent::TurnCompletedWithWarnings {
             reason,
             unregistered_task,
@@ -1277,6 +1297,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // not a new task: it refreshes the live entry silently. It never
             // turns a settled task back into a running one — a reused id is
             // an identity conflict, not a resurrection.
+            //
+            // The start is already recorded by the conversation row (the
+            // tool result names this task id) and by the strip's running
+            // count. A second notice here would repeat the same fact.
             match state.background_task_labels.get_mut(&task_id) {
                 Some(chrome) => {
                     if chrome.is_running() {
@@ -1289,16 +1313,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                         task_id.clone(),
                         crate::state::BackgroundTaskChrome {
                             pid,
-                            ..crate::state::BackgroundTaskChrome::running(
-                                label.clone(),
-                                state.elapsed_secs,
-                            )
+                            ..crate::state::BackgroundTaskChrome::running(label, state.elapsed_secs)
                         },
                     );
-                    state.notification = Some(Notification {
-                        level: NotificationLevel::Info,
-                        message: state.t().background_task_started.replace("{}", &label),
-                    });
                 }
             }
         }
@@ -1461,10 +1478,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     Some(NotificationLevel::Info),
                 )
             } else {
-                // A failure is not a transient notice: it becomes an ACTIVE
-                // issue (the strip's issue cell and its page) and the task's
-                // own row/output keep the evidence. A banner repeating the
-                // command and exit code was the third surface for one fact.
+                // A failure is a record, not a notice: the task's own row,
+                // its output and the jobs list keep the evidence. Repeating
+                // the command and exit code in a banner was the second
+                // surface for one fact.
                 let failed = t.background_task_failed.replace("{}", &label);
                 let message = match exit_code {
                     Some(code) => format!("{failed} · exit {code}"),
@@ -1662,7 +1679,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // header red because the model closed with `update_goal` and no sentence.
     let goal_completed = matches!(
         status,
-        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings
+        TurnEndStatus::Completed
+            | TurnEndStatus::CompletedPartiallyUnverified
+            | TurnEndStatus::CompletedWithWarnings
     );
     // A goal the user paused is still owed, and this turn answering an
     // ordinary question is not that goal's terminal: the runtime never ran it,
@@ -1695,6 +1714,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     let unregistered = matches!(status, TurnEndStatus::AnsweredUnregistered);
     let status = match status {
         TurnEndStatus::Completed
+        | TurnEndStatus::CompletedPartiallyUnverified
         | TurnEndStatus::Answered
         | TurnEndStatus::AnsweredUnregistered
             if !answered =>
@@ -1741,9 +1761,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
                 TurnEndStatus::Yielded => {}
                 TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
                 TurnEndStatus::AnsweredUnregistered => {}
-                TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings => {
-                    goal.complete(now)
-                }
+                TurnEndStatus::Completed
+                | TurnEndStatus::CompletedPartiallyUnverified
+                | TurnEndStatus::CompletedWithWarnings => goal.complete(now),
             }
         }
     }
@@ -1800,7 +1820,10 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
 fn work_is_finished(status: TurnEndStatus) -> bool {
     matches!(
         status,
-        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
+        TurnEndStatus::Completed
+            | TurnEndStatus::CompletedPartiallyUnverified
+            | TurnEndStatus::CompletedWithWarnings
+            | TurnEndStatus::Answered
     )
 }
 

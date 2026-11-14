@@ -85,6 +85,7 @@ fn sanitize(text: &str) -> String {
 fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
     match end {
         TurnEndStatus::Completed
+        | TurnEndStatus::CompletedPartiallyUnverified
         | TurnEndStatus::CompletedWithWarnings
         | TurnEndStatus::Answered => TerminalTaskStatus::Completed,
         // A yielded window is a boundary inside the task, not its end: the

@@ -8,7 +8,7 @@ use leveler_context::{
 };
 use leveler_lifecycle::{
     EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
-    VerificationReport, VerificationStatus,
+    VerificationRecordState, VerificationReport, VerificationStatus,
 };
 use leveler_model::{
     CompactionRecord, ContentPart, ControlContext, FinishReason, Message, ModelError,
@@ -250,6 +250,8 @@ pub(crate) struct Drive<'a> {
     /// reason (no result yet) and names the task to wait on. Bounded: this is
     /// feedback, not a ledger.
     pending_commands: Vec<super::goal_verification::PendingCommand>,
+    /// Goal-local order of registered check dispatch, preserved on resume.
+    registered_check_order: u64,
     /// Background task executions whose terminal result this drive already
     /// registered, by task id. The auto-delivered notice and an active
     /// `wait_task`/`get_task` read are two observations of ONE execution; this
@@ -1092,8 +1094,9 @@ impl Executor {
             // Unified closeout nudge budget shared by every quiet-round
             // mechanism (goal resolution, empty answer).
             closeout_budget: CloseoutBudget::new(CLOSEOUT_NUDGE_BUDGET),
-            verification_runs: self.seeded_verification_runs.clone(),
-            pending_commands: Vec::new(),
+            verification_runs: self.seeded_verification.runs.clone(),
+            pending_commands: self.seeded_verification.pending.clone(),
+            registered_check_order: self.seeded_verification.latest_check_order(),
             recorded_background_tasks: HashSet::new(),
             goal_gate_recovery_rounds: 0,
             answer_candidate: None,
@@ -2058,6 +2061,39 @@ impl<'a> Drive<'a> {
         Ok(())
     }
 
+    /// A verified completion judges the workspace those checks observed.
+    ///
+    /// A later mutation makes the recorded passes stale. The goal stays
+    /// running; delivering it would report evidence that no longer matches
+    /// the tree. Unverified requirements have no mechanical pass to expire.
+    fn withdraw_stale_verified_completion(&mut self) -> bool {
+        let stale = self
+            .settled_goal
+            .as_ref()
+            .is_some_and(|(reason, _)| *reason == StopReason::Completed)
+            && self.completion_verification.as_ref().is_some_and(|report| {
+                report.records.iter().any(|record| {
+                    record.state == VerificationRecordState::Verified
+                        && record.workspace_version < self.ledger.total_mutation_ops
+                })
+            });
+        if !stale {
+            return false;
+        }
+        self.settled_goal = None;
+        self.settled_rounds = 0;
+        self.delivery_followup_issued = false;
+        self.completion_verification = None;
+        self.terminal_answer = None;
+        (self.observer)(AgentEvent::GoalIntercepted {
+            kind: "verification_expired".to_string(),
+            detail: "the workspace changed after a verified check passed; the completion was \
+                     withdrawn and the goal is still running"
+                .to_string(),
+        });
+        true
+    }
+
     /// Publish the terminal for a goal whose resolution this drive accepted.
     ///
     /// The person's answer is the model's own final text; the goal summary is
@@ -2079,6 +2115,14 @@ impl<'a> Drive<'a> {
             .terminal_answer
             .as_ref()
             .is_some_and(|text| !text.trim().is_empty());
+        // A `Reported` requirement is a delivered model judgement. When the
+        // goal resolved without a final answer, that delivery did not happen,
+        // so the record must not keep claiming it.
+        if reason == StopReason::Completed
+            && let Some(report) = self.completion_verification.as_mut()
+        {
+            scope_gate::settle_reported_delivery(report, delivered);
+        }
         // A yielded window resolves nothing, so the model owes no final answer
         // for it and its summary is a window note for the display, not a
         // delivery. Blocked IS a decision about the work: the declared summary
@@ -2113,6 +2157,7 @@ impl<'a> Drive<'a> {
                 model_steps,
                 modified_files: self.modified_files.clone(),
                 transcript_ordinal,
+                verification: self.completion_verification.clone(),
             });
             // Mechanical bar: the pump has persisted every canonical event
             // emitted so far before the terminal path continues.
@@ -2513,6 +2558,37 @@ impl Drive<'_> {
         let mut arguments = call.arguments.clone();
         resolve_scope_source_spans(&mut arguments, &self.latest_user_input)
             .map_err(IntentCall::Refused)?;
+        if let Some(operations) = arguments
+            .get_mut("operations")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for operation in operations
+                .iter_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+            {
+                let Some(value) = operation
+                    .remove("verification")
+                    .filter(|value| !value.is_null())
+                else {
+                    continue;
+                };
+                if !matches!(
+                    operation.get("op").and_then(|value| value.as_str()),
+                    Some("add" | "amend" | "replace")
+                ) {
+                    return Err(IntentCall::Refused(
+                        "only add, amend and replace accept a registered verification check"
+                            .to_string(),
+                    ));
+                }
+                let check = crate::injected_tools::parse_requirement_verification(
+                    &value,
+                    &leveler_core::new_uuid_string(),
+                )
+                .map_err(|error| IntentCall::Refused(error.to_string()))?;
+                operation.insert("verification".to_string(), serde_json::json!(check));
+            }
+        }
         let declaration: ScopeDeclaration = serde_json::from_value(arguments).map_err(|error| {
             IntentCall::Refused(format!(
                 "declare_scope is not a valid declaration: {error}. Each operation needs \
@@ -3892,7 +3968,7 @@ impl AgentHarness for Drive<'_> {
                     self.last_text.trim().to_string()
                 });
             }
-            if self.settled_goal.is_some() {
+            if self.settled_goal.is_some() && !self.withdraw_stale_verified_completion() {
                 if self.terminal_answer.is_none()
                     && self.settled_rounds == 0
                     && !self.delivery_followup_issued
@@ -4203,6 +4279,7 @@ impl AgentHarness for Drive<'_> {
                     model_steps,
                     modified_files: self.modified_files.clone(),
                     transcript_ordinal,
+                    verification: None,
                 });
                 self.settlements_durable().await?;
                 leveler_core::test_crash::point("after_delivery_durable");
@@ -4637,7 +4714,7 @@ impl AgentHarness for Drive<'_> {
                             } else {
                                 Vec::new()
                             };
-                            let text = structured_scope_text(
+                            let mut text = structured_scope_text(
                                 &scope.objective,
                                 &scope.acceptance,
                                 &items,
@@ -4646,6 +4723,34 @@ impl AgentHarness for Drive<'_> {
                                 offset,
                                 limit,
                             );
+                            for item in items
+                                .iter()
+                                .skip(offset)
+                                .take(limit)
+                                .filter(|item| item.is_owed())
+                            {
+                                let Some(check) = &item.verification else {
+                                    continue;
+                                };
+                                let passed = self.verification_runs.iter().rev().find_map(|run| {
+                                    let id = run.call_id.as_deref()?;
+                                    super::goal_verification::registered_run(
+                                        check,
+                                        id,
+                                        &self.verification_runs,
+                                        &self.pending_commands,
+                                        self.ledger.total_mutation_ops,
+                                    )
+                                    .ok()
+                                    .map(|_| id)
+                                });
+                                if let Some(id) = passed {
+                                    text.push_str(&format!(
+                                        "\n{}: registered check passed; check_call_id: {id}",
+                                        item.id
+                                    ));
+                                }
+                            }
                             let (text, _) = leveler_core::sanitize_model_visible(&text);
                             (text, false)
                         }
@@ -5405,6 +5510,7 @@ impl AgentHarness for Drive<'_> {
                 // and a changed workspace must name either a command that
                 // actually passed after the change or an explicit
                 // `not_applicable` reason. No semantic judgement is made here.
+                let mut verification_notes = Vec::new();
                 if reason == StopReason::Completed {
                     // A refused attempt leaves no verdict behind: the next
                     // attempt re-derives it from its own declaration and facts.
@@ -5452,7 +5558,7 @@ impl AgentHarness for Drive<'_> {
                     };
                     let modified = !self.progress.cumulative_modified_paths.is_empty()
                         || !self.modified_files.is_empty();
-                    match super::goal_verification::decide(
+                    let (mut verification, mut goal_notes) = match super::goal_verification::decide(
                         &claim,
                         &self.verification_runs,
                         &self.pending_commands,
@@ -5463,10 +5569,11 @@ impl AgentHarness for Drive<'_> {
                             status,
                             warnings,
                         } => {
-                            self.completion_warnings.extend(warnings);
-                            self.completion_verification =
-                                status.map(|status| VerificationReport::new(status, Vec::new()));
                             self.repeated_gate_refusal = None;
+                            (
+                                status.map(|status| VerificationReport::new(status, Vec::new())),
+                                warnings,
+                            )
                         }
                         super::goal_verification::VerificationDecision::Refuse(message) => {
                             self.note_refused_completion(
@@ -5500,7 +5607,7 @@ impl AgentHarness for Drive<'_> {
                             });
                             continue;
                         }
-                    }
+                    };
                     // Structured requirement accounting. The recorded set —
                     // not a re-reading of the objective's prose — is the
                     // authority, and it is read here from durable history, so
@@ -5571,9 +5678,17 @@ impl AgentHarness for Drive<'_> {
                                 warnings,
                                 records,
                             } => {
-                                self.completion_warnings.extend(warnings);
-                                self.completion_verification =
-                                    status.map(|status| VerificationReport::new(status, records));
+                                // Warnings here name a real evidence gap; the
+                                // terminal must carry them. `Reported` records
+                                // are normal completions and produce none.
+                                verification_notes = warnings;
+                                self.completion_warnings
+                                    .extend(verification_notes.iter().cloned());
+                                verification = status.map(|status| {
+                                    let mut report = VerificationReport::new(status, records);
+                                    report.notes.clone_from(&verification_notes);
+                                    report
+                                });
                                 self.repeated_gate_refusal = None;
                                 self.requirements_refusal = None;
                             }
@@ -5627,19 +5742,32 @@ impl AgentHarness for Drive<'_> {
                     // record set — a claim of coverage the runtime never
                     // established. The completion still stands; its report
                     // says exactly what was and was not verified.
-                    if self.completion_verification.as_ref().is_some_and(|report| {
+                    if verification.as_ref().is_some_and(|report| {
                         report.status == VerificationStatus::Verified && report.records.is_empty()
                     }) {
-                        self.completion_verification = Some(VerificationReport::new(
+                        verification = Some(VerificationReport::new(
                             VerificationStatus::Unverified,
                             Vec::new(),
                         ));
-                        self.completion_warnings.push(
+                        goal_notes.push(
                             "the goal recorded no owed requirement, so no declared deliverable \
                              was mechanically verified; the completion is unverified"
                                 .to_string(),
                         );
                     }
+                    // The scope report describes requirement coverage when a scope exists.
+                    // Commit the verdict and its diagnostics only after both gates accept.
+                    if owed == 0 {
+                        if let Some(report) = &mut verification {
+                            report.notes.clone_from(&goal_notes);
+                        }
+                        // No requirement set owns the check, so the goal-level
+                        // declaration is the only assessment; its boundaries
+                        // are the terminal's warnings.
+                        self.completion_warnings.extend(goal_notes.iter().cloned());
+                        verification_notes = goal_notes;
+                    }
+                    self.completion_verification = verification;
                 }
                 // The plan is the model's declared progress, not a completion
                 // authority: the runtime can see that a step is still
@@ -5659,10 +5787,6 @@ impl AgentHarness for Drive<'_> {
                         });
                     }
                 }
-                // An accepted completion is not "nothing to say": whatever the
-                // runtime could not verify mechanically is a boundary of THIS
-                // completion, and the model writing the delivery is the one
-                // party that must not present it as verified.
                 // An accepted completion is not "nothing to say": whatever the
                 // runtime could not verify mechanically is a boundary of THIS
                 // completion, and the model writing the delivery is the one
@@ -5692,10 +5816,7 @@ impl AgentHarness for Drive<'_> {
                 } else if reason == StopReason::Yielded {
                     crate::injected_tools::completion_receipt("Goal yielded", &[])
                 } else {
-                    crate::injected_tools::completion_receipt(
-                        "Goal completed",
-                        &self.completion_warnings,
-                    )
+                    crate::injected_tools::completion_receipt("Goal completed", &verification_notes)
                 };
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
@@ -6442,6 +6563,7 @@ impl AgentHarness for Drive<'_> {
             // call runs here, in order.
             // A non-conflicting mutation guard remains held through dispatch;
             // ownership conflicts have already been resolved by host admission.
+            let mut check_start = None;
             let (
                 content,
                 is_error,
@@ -6477,6 +6599,47 @@ impl AgentHarness for Drive<'_> {
                     continue;
                 }
                 Ok(admitted) => {
+                    if let Some(fingerprint) = super::goal_verification::command_invocation(
+                        &admitted.call.name,
+                        &admitted.call.arguments,
+                    ) && let Some(binder) = self.executor.goal_binder()
+                        && binder.bound().is_some()
+                    {
+                        let registrations: Vec<String> = binder
+                            .requirements()
+                            .await?
+                            .into_iter()
+                            .filter(|item| item.is_owed())
+                            .filter_map(|item| item.verification)
+                            .filter(|check| check.fingerprint == fingerprint)
+                            .map(|check| check.registered_by)
+                            .collect();
+                        if !registrations.is_empty() {
+                            self.registered_check_order += 1;
+                            (self.observer)(AgentEvent::RegisteredCheckStarted {
+                                call_id: admitted.call.id.as_str().to_string(),
+                                fingerprint: fingerprint.clone(),
+                                registrations: registrations.clone(),
+                                order: self.registered_check_order,
+                                mutation_ops: self.ledger.total_mutation_ops,
+                            });
+                            if let Some(barrier) = &self.executor.event_barrier {
+                                barrier.flush().await?;
+                            }
+                            if let Some(fence) = &self.executor.execution_fence {
+                                fence
+                                    .ensure_current()
+                                    .await
+                                    .map_err(AgentError::StaleOwnership)?;
+                            }
+                            check_start = Some(super::goal_verification::RegisteredCheckStart {
+                                fingerprint,
+                                registrations,
+                                order: self.registered_check_order,
+                                mutation_ops: self.ledger.total_mutation_ops,
+                            });
+                        }
+                    }
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
@@ -6655,6 +6818,14 @@ impl AgentHarness for Drive<'_> {
             // rule) and only advances on success.
             let mut content = content;
             let mut is_error = is_error;
+            if check_start.is_some() {
+                use std::fmt::Write;
+                let _ = write!(
+                    content,
+                    "\nRegistered check execution ID: {}",
+                    call.id.as_str()
+                );
+            }
             if let Some(steps) = plan
                 && !is_error
             {
@@ -6759,6 +6930,7 @@ impl AgentHarness for Drive<'_> {
                             model_step: model_steps,
                             mutation_ops: self.ledger.total_mutation_ops,
                             call_id: Some(call.id.as_str().to_string()),
+                            check_start,
                         });
                     if self.verification_runs.len()
                         > super::goal_verification::MAX_VERIFICATION_RUNS
@@ -6778,9 +6950,15 @@ impl AgentHarness for Drive<'_> {
                             label,
                             task_id: command_facts.started_task.clone(),
                             call_id: Some(call.id.as_str().to_string()),
+                            check_start,
                         });
-                    if self.pending_commands.len() > MAX_PENDING_COMMANDS {
-                        self.pending_commands.remove(0);
+                    if self.pending_commands.len() > MAX_PENDING_COMMANDS
+                        && let Some(index) = self
+                            .pending_commands
+                            .iter()
+                            .position(|pending| pending.check_start.is_none())
+                    {
+                        self.pending_commands.remove(index);
                     }
                 }
             }
@@ -7563,39 +7741,102 @@ impl AgentHarness for Drive<'_> {
         if let Some((reason, summary)) = goal_resolution {
             let already_settled = self.settled_goal.is_some();
             self.settled_goal = Some((reason, summary));
-            // A yielded window is a boundary inside the goal, not a report on
-            // it: nothing was delivered to the person, and this round's text is
-            // progress narration. The next window continues the same objective.
-            if reason == StopReason::Yielded {
-                self.terminal_answer = None;
-                return self.finish_settled_goal(rt, messages, model_steps).await;
-            }
-            // A blocked goal still owes the work itself, and its resolution is
-            // a report, so its round ends exactly as before — but the report
-            // is THIS round's prose. Reaching back for text from before the
-            // block would present a refused or abandoned claim as the report.
-            if reason != StopReason::Completed {
-                self.terminal_answer = if round_spoke && !work_executed {
-                    Some(round_prose.trim().to_string())
-                } else {
-                    None
-                };
-                // A blocked report is the person's delivery exactly like an
-                // accepted completion. The model declared that this round's
-                // text is the answer but wrote none, so the runtime owes it one
-                // delivery request. Without that declaration the summary is the
-                // honest account and no request is fabricated.
-                if self.terminal_answer.is_none()
-                    && goal_delivery_declared
-                    && !already_settled
-                    && !self.delivery_followup_issued
+            // A tool later in this same round can mutate the tree the check
+            // just verified. That acceptance does not survive the round.
+            if !self.withdraw_stale_verified_completion() {
+                // A yielded window is a boundary inside the goal, not a report on
+                // it: nothing was delivered to the person, and this round's text is
+                // progress narration. The next window continues the same objective.
+                if reason == StopReason::Yielded {
+                    self.terminal_answer = None;
+                    return self.finish_settled_goal(rt, messages, model_steps).await;
+                }
+                // A blocked goal still owes the work itself, and its resolution is
+                // a report, so its round ends exactly as before — but the report
+                // is THIS round's prose. Reaching back for text from before the
+                // block would present a refused or abandoned claim as the report.
+                if reason != StopReason::Completed {
+                    self.terminal_answer = if round_spoke && !work_executed {
+                        Some(round_prose.trim().to_string())
+                    } else {
+                        None
+                    };
+                    // A blocked report is the person's delivery exactly like an
+                    // accepted completion. The model declared that this round's
+                    // text is the answer but wrote none, so the runtime owes it one
+                    // delivery request. Without that declaration the summary is the
+                    // honest account and no request is fabricated.
+                    if self.terminal_answer.is_none()
+                        && goal_delivery_declared
+                        && !already_settled
+                        && !self.delivery_followup_issued
+                    {
+                        let running = Self::running_background_task_lines(
+                            self.executor.background_tasks.as_ref(),
+                            self.executor.tool_context.session_scope(),
+                        )
+                        .await;
+                        self.delivery_followup_issued = true;
+                        self.inject_settled_delivery(
+                            messages,
+                            model_steps,
+                            settled_delivery_notice(reason, &running),
+                        )
+                        .await?;
+                        return Ok(Flow::NextRound);
+                    }
+                    return self.finish_settled_goal(rt, messages, model_steps).await;
+                }
+                // Delivery is an explicit commit. A refusal did not settle the
+                // goal, so the answer offered with it is only a candidate; the
+                // accepting round may deliver that candidate, must not let its own
+                // repair prose take the candidate's place, and may replace it only
+                // when the model explicitly says the answer changed.
+                if goal_answer_revised {
+                    // The replacing text is this round's declared prose (or the
+                    // last prose before a bookkeeping-only round). No text means
+                    // there is nothing to revise with: ask for the answer.
+                    if self
+                        .terminal_answer
+                        .as_ref()
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        self.answer_candidate = self.terminal_answer.clone();
+                        return self.finish_settled_goal(rt, messages, model_steps).await;
+                    }
+                    self.terminal_answer = None;
+                } else if let Some(candidate) = self
+                    .answer_candidate
+                    .clone()
+                    .filter(|text| !text.trim().is_empty())
                 {
+                    self.terminal_answer = Some(candidate);
+                    return self.finish_settled_goal(rt, messages, model_steps).await;
+                } else if !goal_delivery_declared {
+                    self.terminal_answer = None;
+                } else if self.terminal_answer.is_some() {
+                    // The declared text is the answer, already written: deliver it
+                    // as written. It may be this round's prose, or the latest
+                    // prose before a bookkeeping-only round.
+                    return self.finish_settled_goal(rt, messages, model_steps).await;
+                }
+                // Resolving a goal this turn already resolved, without doing any
+                // new work, is the model still not answering. It counts against
+                // the wrap-up bound so it cannot spin.
+                if already_settled && !work_executed {
+                    self.settled_rounds = self.settled_rounds.saturating_add(1);
+                    if self.settled_rounds >= MAX_SETTLED_DELIVERY_ROUNDS
+                        || self.delivery_followup_issued
+                    {
+                        return self.finish_settled_goal(rt, messages, model_steps).await;
+                    }
+                }
+                if !already_settled && self.terminal_answer.is_none() {
                     let running = Self::running_background_task_lines(
                         self.executor.background_tasks.as_ref(),
                         self.executor.tool_context.session_scope(),
                     )
                     .await;
-                    self.delivery_followup_issued = true;
                     self.inject_settled_delivery(
                         messages,
                         model_steps,
@@ -7604,65 +7845,6 @@ impl AgentHarness for Drive<'_> {
                     .await?;
                     return Ok(Flow::NextRound);
                 }
-                return self.finish_settled_goal(rt, messages, model_steps).await;
-            }
-            // Delivery is an explicit commit. A refusal did not settle the
-            // goal, so the answer offered with it is only a candidate; the
-            // accepting round may deliver that candidate, must not let its own
-            // repair prose take the candidate's place, and may replace it only
-            // when the model explicitly says the answer changed.
-            if goal_answer_revised {
-                // The replacing text is this round's declared prose (or the
-                // last prose before a bookkeeping-only round). No text means
-                // there is nothing to revise with: ask for the answer.
-                if self
-                    .terminal_answer
-                    .as_ref()
-                    .is_some_and(|text| !text.trim().is_empty())
-                {
-                    self.answer_candidate = self.terminal_answer.clone();
-                    return self.finish_settled_goal(rt, messages, model_steps).await;
-                }
-                self.terminal_answer = None;
-            } else if let Some(candidate) = self
-                .answer_candidate
-                .clone()
-                .filter(|text| !text.trim().is_empty())
-            {
-                self.terminal_answer = Some(candidate);
-                return self.finish_settled_goal(rt, messages, model_steps).await;
-            } else if !goal_delivery_declared {
-                self.terminal_answer = None;
-            } else if self.terminal_answer.is_some() {
-                // The declared text is the answer, already written: deliver it
-                // as written. It may be this round's prose, or the latest
-                // prose before a bookkeeping-only round.
-                return self.finish_settled_goal(rt, messages, model_steps).await;
-            }
-            // Resolving a goal this turn already resolved, without doing any
-            // new work, is the model still not answering. It counts against
-            // the wrap-up bound so it cannot spin.
-            if already_settled && !work_executed {
-                self.settled_rounds = self.settled_rounds.saturating_add(1);
-                if self.settled_rounds >= MAX_SETTLED_DELIVERY_ROUNDS
-                    || self.delivery_followup_issued
-                {
-                    return self.finish_settled_goal(rt, messages, model_steps).await;
-                }
-            }
-            if !already_settled && self.terminal_answer.is_none() {
-                let running = Self::running_background_task_lines(
-                    self.executor.background_tasks.as_ref(),
-                    self.executor.tool_context.session_scope(),
-                )
-                .await;
-                self.inject_settled_delivery(
-                    messages,
-                    model_steps,
-                    settled_delivery_notice(reason, &running),
-                )
-                .await?;
-                return Ok(Flow::NextRound);
             }
         }
 
@@ -7670,7 +7852,10 @@ impl AgentHarness for Drive<'_> {
         // an answer, so the turn does not end here: the model still has to see
         // them. Past the bound, exactly one follow-up request carries that
         // duty. Spending the follow-up on more tools ends the turn honestly.
-        if self.settled_goal.is_some() && work_executed {
+        if self.settled_goal.is_some()
+            && work_executed
+            && !self.withdraw_stale_verified_completion()
+        {
             self.settled_rounds = self.settled_rounds.saturating_add(1);
             if self.delivery_followup_issued {
                 self.completion_warnings.push(
@@ -8825,6 +9010,9 @@ fn structured_scope_text(
         if let Some(check) = &item.check {
             line.push_str(&format!(" [check: {check}]"));
         }
+        if item.verification.is_some() {
+            line.push_str(" [registered verification required]");
+        }
         if let Some(replaced_by) = &item.superseded_by {
             line.push_str(&format!(" [replaced by {replaced_by}]"));
         }
@@ -9270,6 +9458,17 @@ fn parse_commit_requirements(
             target,
             source_quote,
             check,
+            verification: object
+                .get("verification")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    crate::injected_tools::parse_requirement_verification(
+                        value,
+                        &leveler_core::new_uuid_string(),
+                    )
+                })
+                .transpose()
+                .map_err(|error| format!("requirements[{index}].verification: {error}"))?,
         });
     }
     Ok(seeds)

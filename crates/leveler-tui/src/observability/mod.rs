@@ -47,6 +47,7 @@ pub fn should_refresh_trace(event: &leveler_client_protocol::RuntimeEvent) -> bo
             | TokenUsage { .. }
             | SubAgentUpdated { .. }
             | TurnCompleted
+            | TurnCompletedPartiallyUnverified { .. }
             | TurnAnswered
             | TurnFailed { .. }
             | TurnIncomplete { .. }

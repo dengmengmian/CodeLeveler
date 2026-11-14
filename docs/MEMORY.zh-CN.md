@@ -6,11 +6,13 @@ CodeLeveler 可以跨会话记住持久事实。记忆是运行时原生能力�
 事实提取到观测收件箱；Dream 把观测整理成 Markdown 主题；每轮提示里带一份有界的主题
 索引，模型按需读取。
 
-记忆**默认关闭**。在启用 rollout 之前，不捕获、不打开数据库、也不创建目录。
+记忆**默认开启**。完整流水线默认运行；显式设置 `rollout = "off"` 才会关闭——
+关闭后不捕获、不打开数据库，也不创建目录。
 
-## 启用
+## 配置
 
-在全局配置（`~/.leveler/config.toml` 或 `$LEVELER_HOME/config.toml`）中设置：
+rollout 位于全局配置（`~/.leveler/config.toml` 或 `$LEVELER_HOME/config.toml`）。
+默认值为 `active`，因此已有配置无需写 `[memory]` 段即可使用记忆；设置 `off` 表示退出。
 
 ```toml
 [memory]
@@ -19,10 +21,10 @@ rollout = "active"
 
 | Rollout | 行为 |
 | --- | --- |
-| `off` | 不捕获、不整理、不读取。默认值。 |
+| `off` | 不捕获、不整理、不读取，也不创建存储。 |
 | `record_only` | 只把观测写成文件，不暴露给模型，也不运行 Dream。 |
 | `shadow` | 运行 Capture 与 Dream 计划，但不提交主题变更。 |
-| `active` | 完整流水线；只有该值会把记忆暴露给模型。 |
+| `active` | 完整流水线；只有该值会把记忆暴露给模型。默认值。 |
 
 其余键均可省略：
 
@@ -43,8 +45,9 @@ archived_retention_days = 30
 job_retention_days = 14
 ```
 
-rollout 修改对之后启动的会话生效。唯一例外是 `/remember`：即使 rollout 为 `off`，
-它也按用户要求写入那条笔记，确保之后启用的记忆能读到它。
+rollout 修改是热配置：运行时重新加载文件后（配置 watcher 或 `/reload`），Memory 页面
+和下一次 Capture/Dream 决策都会使用新值。`/remember` 在 rollout 为 `off` 时仍可用：
+它按用户要求写入那条笔记，确保之后重新开启的记忆能读到它。
 
 ## 数据位置
 

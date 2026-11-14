@@ -11243,6 +11243,7 @@ mod context_ops_tests {
                     e.event,
                     RuntimeEvent::TurnAnswered
                         | RuntimeEvent::TurnCompleted
+                        | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
                         | RuntimeEvent::TurnCompletedWithWarnings { .. }
                 ))
                 .count(),

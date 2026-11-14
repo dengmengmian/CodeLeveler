@@ -27,6 +27,31 @@ pub const REQUIREMENT_REASON_MAX_CHARS: usize = 2000;
 pub const SCOPE_REQUIREMENTS_MAX: usize = 200;
 
 /// What kind of evidence can decide one requirement.
+///
+/// This is derived from the requirement's kind, never declared independently:
+/// a model cannot register a weaker contract for a fact the runtime can check,
+/// and it cannot claim a mechanical check for a model judgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidencePolicy {
+    /// The runtime must observe the declared fact in its execution record or
+    /// the current workspace.
+    Mechanical,
+    /// A delivered model judgement is this requirement's completion contract.
+    /// The runtime records the account but does not claim independent
+    /// verification.
+    ModelJudgment,
+}
+
+impl EvidencePolicy {
+    fn strength(self) -> u8 {
+        match self {
+            Self::Mechanical => 2,
+            Self::ModelJudgment => 1,
+        }
+    }
+}
+
+/// What kind of evidence can decide one requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequirementKind {
@@ -37,7 +62,7 @@ pub enum RequirementKind {
     ArtifactAbsent,
     /// An executable path the user asked to run.
     Command,
-    /// An explicitly requested deliverable with no mechanical check.
+    /// An explicitly requested deliverable whose check, if any, is registered separately.
     Named,
     /// A literal the user asked to appear in a named file.
     Content,
@@ -154,6 +179,27 @@ impl RequirementKind {
     pub fn requires_target(self) -> bool {
         self.target_purpose().is_some()
     }
+
+    /// The evidence this kind's completion contract requires.
+    ///
+    /// `None` means the kind is not owed at all (a prohibition, a baseline, a
+    /// preparation step or a quality constraint), so there is no completion
+    /// contract to assess.
+    pub fn evidence_policy(self) -> Option<EvidencePolicy> {
+        match self {
+            Self::Artifact | Self::ArtifactAbsent | Self::Command | Self::Content | Self::Tests => {
+                Some(EvidencePolicy::Mechanical)
+            }
+            Self::Named => Some(EvidencePolicy::ModelJudgment),
+            Self::Forbidden | Self::Baseline | Self::Preparation | Self::Constraint => None,
+        }
+    }
+
+    /// Ordering for change validation: a change may strengthen this contract
+    /// but never silently weaken it.
+    pub(crate) fn evidence_strength(self) -> u8 {
+        self.evidence_policy().map_or(0, |policy| policy.strength())
+    }
 }
 
 /// Where one requirement currently stands.
@@ -183,6 +229,15 @@ impl RequirementState {
     }
 }
 
+/// The identity of an acceptance check registered by the domain adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequirementVerification {
+    /// A versioned fingerprint of the exact invocation. Raw arguments are not stored here.
+    pub fingerprint: String,
+    /// The host-issued revision identity of this registration.
+    pub registered_by: String,
+}
+
 /// One requirement as it currently stands after folding the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequirementItem {
@@ -198,6 +253,7 @@ pub struct RequirementItem {
     pub source_quote: String,
     /// The acceptance check the model associated with it, when one exists.
     pub check: Option<String>,
+    pub verification: Option<RequirementVerification>,
     pub state: RequirementState,
     /// For a superseded item, the requirement that replaced it.
     pub superseded_by: Option<String>,
@@ -223,6 +279,7 @@ pub struct AppliedRequirementEvent {
     pub target: Option<String>,
     pub source_quote: String,
     pub check: Option<String>,
+    pub verification: Option<RequirementVerification>,
     pub reason: Option<String>,
 }
 
@@ -271,6 +328,8 @@ pub enum ScopeOperation {
         source_quote: String,
         #[serde(default)]
         check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<RequirementVerification>,
         #[serde(default)]
         reason: Option<String>,
     },
@@ -285,6 +344,8 @@ pub enum ScopeOperation {
         source_quote: String,
         #[serde(default)]
         check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<RequirementVerification>,
         #[serde(default)]
         reason: Option<String>,
     },
@@ -297,6 +358,8 @@ pub enum ScopeOperation {
         source_quote: String,
         #[serde(default)]
         check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<RequirementVerification>,
         #[serde(default)]
         reason: Option<String>,
     },
@@ -351,6 +414,7 @@ pub struct RequirementSeed {
     pub target: Option<String>,
     pub source_quote: String,
     pub check: Option<String>,
+    pub verification: Option<RequirementVerification>,
 }
 
 /// The result of accepting a declaration: the new current set and the ordered
@@ -393,6 +457,21 @@ pub enum ScopeError {
     RequirementNotWaived { id: String },
     #[error("the goal already carries {max} requirements; waive or replace one first")]
     TooManyRequirements { max: usize },
+    #[error("registered verification is only supported for `named` requirements")]
+    VerificationRequiresNamed,
+    #[error("requirement `{id}` has registered verification; keep it or register its replacement")]
+    CannotDropVerification { id: String },
+    #[error("requirement `{id}` changed its outcome; register its acceptance check again")]
+    VerificationNeedsRegistration { id: String },
+    #[error(
+        "requirement `{id}` cannot weaken its completion contract from `{from}` to `{to}` through \
+         `amend`; `replace` it with a new requirement anchored to the user's newest words"
+    )]
+    EvidencePolicyDowngrade {
+        id: String,
+        from: &'static str,
+        to: &'static str,
+    },
     #[error("the recorded scope history is corrupt: {0}")]
     CorruptHistory(String),
 }
@@ -429,13 +508,22 @@ pub fn validate_declaration(declaration: &ScopeDeclaration) -> Result<(), ScopeE
         }
         match operation {
             ScopeOperation::Add {
-                kind, text, target, ..
+                kind,
+                text,
+                target,
+                verification,
+                ..
             }
             | ScopeOperation::Replace {
-                kind, text, target, ..
+                kind,
+                text,
+                target,
+                verification,
+                ..
             } => {
                 validate_text(text)?;
                 validate_target(*kind, target.as_deref())?;
+                validate_verification(*kind, verification.as_ref())?;
             }
             ScopeOperation::Amend {
                 requirement_id,
@@ -465,6 +553,16 @@ pub fn validate_declaration(declaration: &ScopeDeclaration) -> Result<(), ScopeE
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_verification(
+    kind: RequirementKind,
+    verification: Option<&RequirementVerification>,
+) -> Result<(), ScopeError> {
+    if verification.is_some() && kind != RequirementKind::Named {
+        return Err(ScopeError::VerificationRequiresNamed);
     }
     Ok(())
 }
@@ -545,6 +643,7 @@ fn apply_operation(
             target,
             source_quote,
             check,
+            verification,
             reason,
         } => {
             if items
@@ -565,6 +664,7 @@ fn apply_operation(
                 target: normalized(target),
                 source_quote: source_quote.trim().to_string(),
                 check: normalized(check),
+                verification: verification.clone(),
                 state: RequirementState::Active,
                 superseded_by: None,
             });
@@ -577,6 +677,7 @@ fn apply_operation(
                 target: normalized(target),
                 source_quote: source_quote.trim().to_string(),
                 check: normalized(check),
+                verification: verification.clone(),
                 reason: normalized(reason),
             });
         }
@@ -587,11 +688,51 @@ fn apply_operation(
             target,
             source_quote,
             check,
+            verification,
             reason,
         } => {
             let index = active_index(items, requirement_id)?;
+            let next_kind = kind.unwrap_or(items[index].kind);
+            // A registered check belongs to the named judgement it was
+            // registered for. A stronger mechanical kind owns its own
+            // evidence, so it does not inherit that registration.
+            let keeps_registered_check = next_kind == RequirementKind::Named;
+            validate_verification(
+                next_kind,
+                verification.as_ref().or_else(|| {
+                    keeps_registered_check
+                        .then_some(items[index].verification.as_ref())
+                        .flatten()
+                }),
+            )?;
+            if let Some(next) = kind
+                && next.evidence_strength() < items[index].kind.evidence_strength()
+            {
+                // A requirement the runtime can check cannot turn into model
+                // judgement in place. Retiring it through `replace` is an
+                // explicit, separately recorded change with a new identity.
+                return Err(ScopeError::EvidencePolicyDowngrade {
+                    id: requirement_id.clone(),
+                    from: items[index].kind.label(),
+                    to: next.label(),
+                });
+            }
+            if items[index].verification.is_some()
+                && verification.is_none()
+                && keeps_registered_check
+                && text
+                    .as_deref()
+                    .is_some_and(|text| text.trim() != items[index].text)
+            {
+                return Err(ScopeError::VerificationNeedsRegistration {
+                    id: requirement_id.clone(),
+                });
+            }
             if let Some(kind) = kind {
                 items[index].kind = *kind;
+                if *kind != RequirementKind::Named {
+                    items[index].verification = None;
+                }
             }
             if let Some(text) = text {
                 items[index].text = text.trim().to_string();
@@ -601,6 +742,9 @@ fn apply_operation(
             }
             if check.is_some() {
                 items[index].check = normalized(check);
+            }
+            if let Some(verification) = verification {
+                items[index].verification = Some(verification.clone());
             }
             items[index].source_quote = source_quote.trim().to_string();
             events.push(AppliedRequirementEvent {
@@ -612,6 +756,7 @@ fn apply_operation(
                 target: normalized(target),
                 source_quote: source_quote.trim().to_string(),
                 check: normalized(check),
+                verification: verification.clone(),
                 reason: normalized(reason),
             });
         }
@@ -622,9 +767,18 @@ fn apply_operation(
             target,
             source_quote,
             check,
+            verification,
             reason,
         } => {
             let index = active_index(items, requirement_id)?;
+            if items[index].verification.is_some()
+                && verification.is_none()
+                && kind.evidence_strength() <= items[index].kind.evidence_strength()
+            {
+                return Err(ScopeError::CannotDropVerification {
+                    id: requirement_id.clone(),
+                });
+            }
             if items
                 .iter()
                 .filter(|item| item.state != RequirementState::Superseded)
@@ -645,6 +799,7 @@ fn apply_operation(
                 target: normalized(target),
                 source_quote: source_quote.trim().to_string(),
                 check: normalized(check),
+                verification: verification.clone(),
                 state: RequirementState::Active,
                 superseded_by: None,
             });
@@ -657,6 +812,7 @@ fn apply_operation(
                 target: normalized(target),
                 source_quote: source_quote.trim().to_string(),
                 check: normalized(check),
+                verification: verification.clone(),
                 reason: normalized(reason),
             });
         }
@@ -676,6 +832,7 @@ fn apply_operation(
                 target: None,
                 source_quote: source_quote.trim().to_string(),
                 check: None,
+                verification: None,
                 reason: normalized(reason),
             });
         }
@@ -704,6 +861,7 @@ fn apply_operation(
                 target: None,
                 source_quote: source_quote.trim().to_string(),
                 check: None,
+                verification: None,
                 reason: normalized(reason),
             });
         }
@@ -765,6 +923,7 @@ pub fn fold_scope_events(
                     target: event.target.clone(),
                     source_quote: event.source_quote.clone(),
                     check: event.check.clone(),
+                    verification: event.verification.clone(),
                     state: RequirementState::Active,
                     superseded_by: None,
                 });
@@ -788,6 +947,12 @@ pub fn fold_scope_events(
                 }
                 if let Some(kind) = event.kind {
                     items[index].kind = kind;
+                    if kind != RequirementKind::Named {
+                        // The amend moved the requirement to a stronger
+                        // mechanical kind; the named registration it used to
+                        // carry is not part of that contract.
+                        items[index].verification = None;
+                    }
                 }
                 if let Some(text) = &event.text {
                     items[index].text = text.clone();
@@ -797,6 +962,9 @@ pub fn fold_scope_events(
                 }
                 if event.check.is_some() {
                     items[index].check = event.check.clone();
+                }
+                if let Some(verification) = &event.verification {
+                    items[index].verification = Some(verification.clone());
                 }
                 items[index].source_quote = event.source_quote.clone();
             }
@@ -839,6 +1007,7 @@ pub fn fold_scope_events(
                     target: event.target.clone(),
                     source_quote: event.source_quote.clone(),
                     check: event.check.clone(),
+                    verification: event.verification.clone(),
                     state: RequirementState::Active,
                     superseded_by: None,
                 });
@@ -913,6 +1082,7 @@ pub fn initial_scope(seeds: &[RequirementSeed]) -> Result<ScopeProjection, Scope
             });
         }
         validate_target(seed.kind, seed.target.as_deref())?;
+        validate_verification(seed.kind, seed.verification.as_ref())?;
         let id = next_requirement_id(&items);
         items.push(RequirementItem {
             id: id.clone(),
@@ -921,6 +1091,7 @@ pub fn initial_scope(seeds: &[RequirementSeed]) -> Result<ScopeProjection, Scope
             target: normalized(&seed.target),
             source_quote: quote.to_string(),
             check: normalized(&seed.check),
+            verification: seed.verification.clone(),
             state: RequirementState::Active,
             superseded_by: None,
         });
@@ -933,6 +1104,7 @@ pub fn initial_scope(seeds: &[RequirementSeed]) -> Result<ScopeProjection, Scope
             target: normalized(&seed.target),
             source_quote: quote.to_string(),
             check: normalized(&seed.check),
+            verification: seed.verification.clone(),
             reason: None,
         });
     }
@@ -951,6 +1123,7 @@ mod tests {
             target: None,
             source_quote: text.to_string(),
             check: None,
+            verification: None,
             state: RequirementState::Active,
             superseded_by: None,
         }
@@ -963,6 +1136,7 @@ mod tests {
             target: None,
             source_quote: quote.to_string(),
             check: None,
+            verification: None,
             reason: None,
         }
     }
@@ -1039,6 +1213,7 @@ mod tests {
                 target: None,
                 source_quote: "把深色主题换成浅色主题".to_string(),
                 check: None,
+                verification: None,
                 reason: None,
             }]),
         )
@@ -1074,6 +1249,7 @@ mod tests {
                 target: None,
                 source_quote: "update docs".to_string(),
                 check: None,
+                verification: None,
                 reason: None,
             }]),
         )
@@ -1082,6 +1258,69 @@ mod tests {
             error,
             ScopeError::RequirementNotActive { state, .. } if state == "waived"
         ));
+    }
+
+    #[test]
+    fn an_amend_cannot_weaken_a_mechanical_contract() {
+        let mut tests = item("R1", RequirementKind::Tests, "the suite must pass");
+        tests.target = Some("make check".to_string());
+        let amend = |kind| {
+            declaration(vec![ScopeOperation::Amend {
+                requirement_id: "R1".to_string(),
+                kind: Some(kind),
+                text: None,
+                target: None,
+                source_quote: "just summarize it".to_string(),
+                check: None,
+                verification: None,
+                reason: None,
+            }])
+        };
+        let weakened = apply_scope_declaration(&[tests.clone()], &amend(RequirementKind::Named))
+            .expect_err("a mechanical fact cannot become model judgement in place");
+        assert!(
+            matches!(
+                weakened,
+                ScopeError::EvidencePolicyDowngrade {
+                    from: "tests",
+                    to: "deliverable",
+                    ..
+                }
+            ),
+            "{weakened:?}"
+        );
+        let dropped = apply_scope_declaration(&[tests], &amend(RequirementKind::Constraint))
+            .expect_err("an owed requirement cannot stop being owed in place");
+        assert!(
+            matches!(
+                dropped,
+                ScopeError::EvidencePolicyDowngrade {
+                    to: "constraint",
+                    ..
+                }
+            ),
+            "{dropped:?}"
+        );
+    }
+
+    #[test]
+    fn an_amend_may_strengthen_a_model_judgement_contract() {
+        let projected = apply_scope_declaration(
+            &[item("R1", RequirementKind::Named, "the report")],
+            &declaration(vec![ScopeOperation::Amend {
+                requirement_id: "R1".to_string(),
+                kind: Some(RequirementKind::Artifact),
+                text: None,
+                target: Some("report.md".to_string()),
+                source_quote: "write report.md".to_string(),
+                check: None,
+                verification: None,
+                reason: None,
+            }]),
+        )
+        .expect("strengthening the contract is allowed");
+        assert_eq!(projected.items[0].kind, RequirementKind::Artifact);
+        assert_eq!(projected.items[0].target.as_deref(), Some("report.md"));
     }
 
     #[test]
@@ -1113,6 +1352,7 @@ mod tests {
                 target: None,
                 source_quote: "append Verified.".to_string(),
                 check: None,
+                verification: None,
                 reason: None,
             }]),
         )
@@ -1132,6 +1372,7 @@ mod tests {
                 target: None,
                 source_quote: "运行 sh verify.sh".to_string(),
                 check: None,
+                verification: None,
                 reason: None,
             }]),
         )
@@ -1155,6 +1396,7 @@ mod tests {
                 target: None,
                 source_quote: "run the suite".to_string(),
                 check: None,
+                verification: None,
                 reason: None,
             }]),
         )
@@ -1204,6 +1446,7 @@ mod tests {
                     target: None,
                     source_quote: "no, amend first".to_string(),
                     check: None,
+                    verification: None,
                     reason: None,
                 },
                 ScopeOperation::Waive {
@@ -1222,6 +1465,182 @@ mod tests {
             .map(|event| event.operation.as_str())
             .collect::<Vec<_>>();
         assert_eq!(operations, vec!["add", "amend", "waive"]);
+    }
+
+    /// `replace` is the explicit, separately recorded way to retire a
+    /// mechanical obligation. The retired requirement keeps its kind, target
+    /// and identity in the history; the new requirement has its own identity.
+    /// Nothing is silently deleted.
+    #[test]
+    fn replacing_a_mechanical_contract_retires_it_as_a_recorded_event() {
+        let seeded = initial_scope(&[RequirementSeed {
+            kind: RequirementKind::Tests,
+            text: "the suite must pass".to_string(),
+            target: Some("make regression".to_string()),
+            source_quote: "run the suite".to_string(),
+            check: None,
+            verification: None,
+        }])
+        .expect("seed");
+        let projected = apply_scope_declaration(
+            &seeded.items,
+            &declaration(vec![ScopeOperation::Replace {
+                requirement_id: "R1".to_string(),
+                kind: RequirementKind::Named,
+                text: "summarize the suite result".to_string(),
+                target: None,
+                source_quote: "只要总结测试结果".to_string(),
+                check: None,
+                verification: None,
+                reason: Some("the user asked for a summary instead".to_string()),
+            }]),
+        )
+        .expect("an explicitly anchored replacement applies");
+        assert_eq!(projected.items[0].state, RequirementState::Superseded);
+        assert_eq!(projected.items[0].kind, RequirementKind::Tests);
+        assert_eq!(
+            projected.items[0].target.as_deref(),
+            Some("make regression")
+        );
+        assert_eq!(projected.items[0].superseded_by.as_deref(), Some("R2"));
+        assert_eq!(projected.items[1].state, RequirementState::Active);
+        assert_eq!(projected.items[1].kind, RequirementKind::Named);
+        assert_eq!(projected.events.len(), 1);
+        assert_eq!(projected.events[0].operation, ScopeOperationKind::Replace);
+        assert_eq!(projected.events[0].supersedes.as_deref(), Some("R1"));
+        assert_eq!(
+            projected.events[0].source_quote,
+            "只要总结测试结果".to_string()
+        );
+        let history = [seeded.events, projected.events].concat();
+        assert_eq!(fold_scope_events(&history).unwrap(), projected.items);
+    }
+
+    /// A registered acceptance check is part of the requirement's contract.
+    /// `replace` cannot drop it: the replacement must register its own check.
+    #[test]
+    fn a_registered_check_cannot_be_dropped_by_replace() {
+        let seeded = initial_scope(&[RequirementSeed {
+            kind: RequirementKind::Named,
+            text: "the database has no demo accounts".to_string(),
+            target: None,
+            source_quote: "no demo accounts".to_string(),
+            check: None,
+            verification: Some(RequirementVerification {
+                fingerprint: "v1:check".to_string(),
+                registered_by: "call-commit".to_string(),
+            }),
+        }])
+        .expect("seed");
+        let replacement = |verification| ScopeOperation::Replace {
+            requirement_id: "R1".to_string(),
+            kind: RequirementKind::Named,
+            text: "the database has no demo accounts".to_string(),
+            target: None,
+            source_quote: "no demo accounts".to_string(),
+            check: None,
+            verification,
+            reason: None,
+        };
+        assert_eq!(
+            apply_scope_declaration(&seeded.items, &declaration(vec![replacement(None)])),
+            Err(ScopeError::CannotDropVerification {
+                id: "R1".to_string()
+            })
+        );
+        let new_check = RequirementVerification {
+            fingerprint: "v1:check-v2".to_string(),
+            registered_by: "call-replace".to_string(),
+        };
+        let projected = apply_scope_declaration(
+            &seeded.items,
+            &declaration(vec![replacement(Some(new_check.clone()))]),
+        )
+        .expect("the replacement registers its own check");
+        assert_eq!(projected.items[0].state, RequirementState::Superseded);
+        assert_eq!(
+            projected.items[0].verification, seeded.items[0].verification,
+            "the retired requirement keeps the check it was judged by"
+        );
+        assert_eq!(projected.items[1].verification.as_ref(), Some(&new_check));
+    }
+
+    /// A registered check is not a ceiling: a legitimate steer may replace the
+    /// model judgement with a stronger mechanical requirement. The new
+    /// requirement's own kind is the stronger contract, so the old
+    /// registration is not owed.
+    #[test]
+    fn a_registered_named_requirement_may_strengthen_to_tests() {
+        let seeded = initial_scope(&[RequirementSeed {
+            kind: RequirementKind::Named,
+            text: "the database has no demo accounts".to_string(),
+            target: None,
+            source_quote: "no demo accounts".to_string(),
+            check: None,
+            verification: Some(RequirementVerification {
+                fingerprint: "v1:check".to_string(),
+                registered_by: "call-commit".to_string(),
+            }),
+        }])
+        .expect("seed");
+        let replacement = ScopeOperation::Replace {
+            requirement_id: "R1".to_string(),
+            kind: RequirementKind::Tests,
+            text: "the database assertion suite passes".to_string(),
+            target: Some("make check".to_string()),
+            source_quote: "run the database checks".to_string(),
+            check: None,
+            verification: None,
+            reason: Some("the user asked for an executable check".to_string()),
+        };
+        let projected = apply_scope_declaration(&seeded.items, &declaration(vec![replacement]))
+            .expect("a stronger mechanical contract may replace a registered judgement");
+        assert_eq!(projected.items[0].state, RequirementState::Superseded);
+        assert_eq!(
+            projected.items[0].verification,
+            seeded.items[0].verification
+        );
+        assert_eq!(projected.items[1].kind, RequirementKind::Tests);
+        assert_eq!(projected.items[1].target.as_deref(), Some("make check"));
+        assert!(projected.items[1].verification.is_none());
+    }
+
+    #[test]
+    fn amending_a_registered_named_requirement_into_tests_drops_the_registration() {
+        let seeded = initial_scope(&[RequirementSeed {
+            kind: RequirementKind::Named,
+            text: "the database has no demo accounts".to_string(),
+            target: None,
+            source_quote: "no demo accounts".to_string(),
+            check: None,
+            verification: Some(RequirementVerification {
+                fingerprint: "v1:check".to_string(),
+                registered_by: "call-commit".to_string(),
+            }),
+        }])
+        .expect("seed");
+        let projected = apply_scope_declaration(
+            &seeded.items,
+            &declaration(vec![ScopeOperation::Amend {
+                requirement_id: "R1".to_string(),
+                kind: Some(RequirementKind::Tests),
+                target: Some("make check".to_string()),
+                text: Some("the database assertion suite passes".to_string()),
+                source_quote: "run the database checks".to_string(),
+                check: None,
+                verification: None,
+                reason: None,
+            }]),
+        )
+        .expect("a stronger mechanical kind may replace the registered judgement");
+        assert_eq!(projected.items[0].kind, RequirementKind::Tests);
+        assert_eq!(projected.items[0].target.as_deref(), Some("make check"));
+        assert!(
+            projected.items[0].verification.is_none(),
+            "the tests requirement owns its mechanical check; it must not inherit the named registration"
+        );
+        let history = [seeded.events, projected.events].concat();
+        assert_eq!(fold_scope_events(&history).unwrap(), projected.items);
     }
 
     #[test]
@@ -1254,6 +1673,7 @@ mod tests {
             target: None,
             source_quote: "docs".to_string(),
             check: None,
+            verification: None,
         }])
         .expect("initial scope")
         .events
@@ -1287,5 +1707,99 @@ mod tests {
         )
         .expect_err("too many");
         assert_eq!(too_many, ScopeError::TooManyOperations);
+    }
+    #[test]
+    fn a_named_requirement_declaration_preserves_its_registered_check() {
+        let declaration = serde_json::json!({
+            "operations": [{
+                "op": "add",
+                "kind": "named",
+                "text": "The rebuilt store has no demo accounts",
+                "source_quote": "no demo accounts",
+                "verification": {
+                    "fingerprint": "v1:invocation",
+                    "registered_by": "call-definition"
+                }
+            }]
+        });
+        let parsed: ScopeDeclaration = serde_json::from_value(declaration.clone()).unwrap();
+        let applied = apply_scope_declaration(&[], &parsed).unwrap();
+        assert_eq!(fold_scope_events(&applied.events).unwrap(), applied.items);
+        assert!(applied.items[0].verification.is_some());
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap()["operations"][0]["verification"],
+            declaration["operations"][0]["verification"]
+        );
+    }
+
+    #[test]
+    fn amending_a_registered_requirement_preserves_or_replaces_its_check() {
+        let original = RequirementVerification {
+            fingerprint: "original".into(),
+            registered_by: "call-commit".into(),
+        };
+        let replacement = RequirementVerification {
+            fingerprint: "replacement".into(),
+            registered_by: "call-amend".into(),
+        };
+        let seed = initial_scope(&[RequirementSeed {
+            kind: RequirementKind::Named,
+            text: "The service runs the new build".into(),
+            target: None,
+            source_quote: "run the new build".into(),
+            check: None,
+            verification: Some(original.clone()),
+        }])
+        .unwrap();
+        let amendment = |kind, text: Option<&str>, verification| ScopeOperation::Amend {
+            requirement_id: "R1".into(),
+            kind,
+            text: text.map(str::to_string),
+            target: None,
+            source_quote: "run the new build".into(),
+            check: None,
+            verification,
+            reason: None,
+        };
+        let unchanged =
+            apply_scope_declaration(&seed.items, &declaration(vec![amendment(None, None, None)]))
+                .unwrap();
+        assert_eq!(unchanged.items[0].verification.as_ref(), Some(&original));
+        let changed_outcome = Some("The service serves the new build");
+        assert_eq!(
+            apply_scope_declaration(
+                &unchanged.items,
+                &declaration(vec![amendment(None, changed_outcome, None)])
+            ),
+            Err(ScopeError::VerificationNeedsRegistration { id: "R1".into() })
+        );
+        let updated = apply_scope_declaration(
+            &unchanged.items,
+            &declaration(vec![amendment(
+                None,
+                changed_outcome,
+                Some(replacement.clone()),
+            )]),
+        )
+        .unwrap();
+        let events = [seed.events, unchanged.events, updated.events].concat();
+        let replayed = fold_scope_events(&events).unwrap();
+        assert_eq!(replayed[0].verification.as_ref(), Some(&replacement));
+        assert_eq!(replayed, updated.items);
+        assert_eq!(
+            apply_scope_declaration(
+                &replayed,
+                &declaration(vec![amendment(
+                    Some(RequirementKind::Constraint),
+                    None,
+                    None
+                )])
+            ),
+            Err(ScopeError::EvidencePolicyDowngrade {
+                id: "R1".to_string(),
+                from: "deliverable",
+                to: "constraint",
+            })
+        );
     }
 }

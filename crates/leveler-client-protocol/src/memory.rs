@@ -84,6 +84,10 @@ pub struct UiMemoryStatus {
     /// `off`, or when the session toggle paused it; `rollout` distinguishes
     /// the two.
     pub enabled: bool,
+    /// The global config file this runtime loaded and watches. The page uses
+    /// it when it explains how to change the rollout, so the instruction names
+    /// the file that will actually take effect.
+    pub config_path: String,
     pub capture_enabled: bool,
     pub automatic_dream_enabled: bool,
     pub manual_dream_enabled: bool,

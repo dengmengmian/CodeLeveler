@@ -7,11 +7,11 @@
 //! consolidation, maintenance) stay in `leveler-memory`; this layer only
 //! decides when a session asks it to act.
 //!
-//! Memory is off unless `[memory].rollout` opts in. The automatic pipeline
-//! creates nothing and opens no database while the rollout is `off`, so a
-//! default installation pays no cost and creates no store. The one exception
-//! is a user's explicit `/remember`: it writes the
-//! requested note so it survives a later opt-in.
+//! Memory is active by default; `[memory].rollout = "off"` opts out. The
+//! automatic pipeline creates nothing and opens no database while the rollout
+//! is `off`, so an opted-out installation pays no cost and creates no store.
+//! The one exception is a user's explicit `/remember`: it writes the requested
+//! note so it survives a later re-enable.
 
 mod batch;
 mod capture;
