@@ -29,6 +29,7 @@ A permanent error (authentication, an invalid request, a rejected conversation) 
 - `/output` opens full local command output; `/copy output` copies it.
 - An edit paints its complete applied diff by default; click its head row or press `Ctrl+O` to fold it to one `+A/-R` row. Dragging over the diff copies the selected source lines (no gutter, no `+`/`-` marker); `/copy diff` copies the complete applied patch instead.
 - `Ctrl+B` moves a running local command to the background; `Ctrl+C` stops that execution.
+- Windows Terminal's native `Ctrl+V` submits at newlines and replaces non-BMP emoji with `?` in native console programs. On Windows, `Alt+V` reads the system clipboard directly and inserts it as one paste, preserving newlines and emoji; `Ctrl+V` remains available for images or single-line text.
 
 Open background tasks from the footer to inspect output or stop an individual task. Esc only returns to the list. Closing the terminal does not stop background tasks when connected to the background service.
 

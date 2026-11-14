@@ -974,11 +974,24 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         t.shell_completion_hint.to_string()
     } else if state.composer.is_empty() && state.turn_nav.is_none() {
         // `!` sits right after `/`: both are composer entry points, and the
-        // width-truncation rule keeps the two openers alive longest.
-        format!(
-            "/ {} · ! {} · @ {} · Shift+Tab {} · Ctrl+? {}",
-            t.hint_commands, t.hint_user_shell, t.hint_files, t.hint_permission, t.hint_shortcuts
-        )
+        // width-truncation rule keeps the two openers alive longest. Windows
+        // Terminal's native paste submits at newlines in a console app, so the
+        // application-level Alt+V paste is surfaced here too.
+        let mut parts = vec![
+            format!("/ {}", t.hint_commands),
+            format!("! {}", t.hint_user_shell),
+            format!("@ {}", t.hint_files),
+            format!("Shift+Tab {}", t.hint_permission),
+        ];
+        if cfg!(windows) {
+            parts.push(t.hint_paste_clipboard.to_string());
+        }
+        parts.push(format!("Ctrl+? {}", t.hint_shortcuts));
+        // ConHost's font renders U+00B7 as a wide glyph while the cell layout
+        // counts it as one. In a long styled row that accumulated mismatch
+        // blanks a later CJK glyph (the historical `@ 件`). ASCII `|` is
+        // unambiguous; other terminals keep the designed middle dot.
+        parts.join(if cfg!(windows) { " | " } else { " · " })
     } else {
         return Vec::new();
     };
@@ -1232,6 +1245,11 @@ mod p1_tests {
         let text = hint_text(&s, 120);
         assert!(text.contains("/ 命令"), "{text}");
         assert!(text.contains("! Shell"), "{text}");
+        if cfg!(windows) {
+            assert!(text.contains("Alt+V"), "{text}");
+            assert!(text.contains("@ 文件"), "{text}");
+            assert!(text.contains(" | "), "{text}");
+        }
         let mut en = state();
         en.locale = crate::i18n::Locale::En;
         let text = hint_text(&en, 120);

@@ -3658,8 +3658,17 @@ impl InProcessRuntimeClient {
                     )
                 {
                     // Spawn/sandbox failures never produced output — put the host
-                    // error where the user will look for it.
-                    store.append_output(&session_id, &id, &format!("{error}\n"));
+                    // error where the user will look for it. The live view is a
+                    // separate projection of this same fact: the store keeps it
+                    // for reconnect and the terminal record, the event makes the
+                    // refusal legible while the command is still on screen.
+                    let reason = format!("{error}\n");
+                    store.append_output(&session_id, &id, &reason);
+                    let _ = events.send(RuntimeEvent::UserShellOutput {
+                        execution_id: id.clone(),
+                        stream: "stderr".to_string(),
+                        chunk: reason,
+                    });
                 }
                 let (retained_tail, retained_truncated) = store
                     .foreground_output(&session_id, &id)

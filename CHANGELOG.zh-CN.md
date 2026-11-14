@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- Windows 子进程输出改为增量解码：跨管道分片的多字节字符保持为一个字符，后台日志使用同一解码器，被截断的 GBK 结果不再把保留的头部变成替换符。TUI 完整输出优先读取原始捕获旁的 UTF-8 展示副本；原始 stdout/stderr 捕获文件仍保持逐字节精确。
+- 未真正启动就失败的用户 Shell（例如 Windows 主机缺少 `leveler-confine.exe` 时的 Assisted 命令）会把宿主拒绝原因显示在实时视图中，而不只在重连后的记录里可见。
+
 ## [1.0.27] - 2026-11-14
 
 - 新增默认关闭的跨会话记忆。`[memory].rollout` 为 `off`（默认）、`record_only`、`shadow` 或 `active`，只有 `active` 会把记忆暴露给模型。所有数据位于 `<LevelerHome>/memory/`；工作区身份取自 git remote，临时工作目录没有工作区作用域。

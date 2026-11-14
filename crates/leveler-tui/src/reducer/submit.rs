@@ -1053,7 +1053,7 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
         Ok(()) => {
             // A persistent transcript note keeps the path on screen (and
             // selectable) rather than a toast that vanishes in a few seconds.
-            let msg = format!("已导出对话到 {}", path.display());
+            let msg = format!("已导出对话到 {}", leveler_core::path::display_path(&path));
             state.transcript.push_note(msg.clone());
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,

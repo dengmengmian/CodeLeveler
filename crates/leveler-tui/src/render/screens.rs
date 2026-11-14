@@ -430,7 +430,7 @@ pub(super) fn render_foreign_sessions_screen(frame: &mut Frame, area: Rect, stat
         let mut meta = format!("{} · {}", session.native_id, session.updated_at);
         if let Some(cwd) = &session.cwd {
             meta.push_str(" · ");
-            meta.push_str(cwd);
+            meta.push_str(&leveler_core::path::display_path(std::path::Path::new(cwd)));
         }
         if let Some(branch) = &session.branch {
             meta.push_str(" · ⎇ ");

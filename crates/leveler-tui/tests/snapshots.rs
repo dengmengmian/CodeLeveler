@@ -254,8 +254,15 @@ fn empty_session_shows_splash_with_logo() {
     let mut state = opened_state();
     let text = render_at(100, 24, &mut state);
     assert!(
-        text.contains("CodeLeveler") && text.contains('█'),
-        "empty session splash missing brand/logo: {text}"
+        text.contains("CodeLeveler"),
+        "empty session splash missing the brand: {text}"
+    );
+    // W03: when no native image protocol is available the splash is text-only.
+    // The old `█/▀` block-art fallback was removed on purpose; a test snapshot
+    // that still requires it would re-introduce the product decision by test.
+    assert!(
+        !text.contains('█') && !text.contains('▀'),
+        "the splash must not fall back to block art: {text}"
     );
     assert!(
         text.contains("让每个模型发挥最大能力"),

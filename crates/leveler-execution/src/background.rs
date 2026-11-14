@@ -15,6 +15,7 @@ use crate::command::{
     CommandRunner, ManagedProcess, OutputChunk, OutputStream, ProcessHandoff, ProcessIdentity,
     ProcessRequest,
 };
+use crate::encoding::OutputDecoder;
 use crate::snapshot::SnapshotId;
 
 /// Pre-spawn workspace snapshot and write authority, used to settle a
@@ -3516,6 +3517,7 @@ fn spawn_log_pump<R>(
     };
     tokio::spawn(async move {
         let mut reader = BufReader::new(stream);
+        let mut decoder = OutputDecoder::new();
         let mut buf = [0u8; 4096];
         loop {
             let read = tokio::select! {
@@ -3527,7 +3529,7 @@ fn spawn_log_pump<R>(
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some((owner_scope, chunk)) =
-                        append_log(&reg, &tid, output_stream, &buf[..n]).await
+                        append_log(&reg, &tid, output_stream, &mut decoder, &buf[..n]).await
                     {
                         let _ = lifecycle_events.send(BackgroundTaskEvent::Output {
                             owner_scope,
@@ -3538,6 +3540,18 @@ fn spawn_log_pump<R>(
                 }
                 Err(_) => break,
             }
+        }
+        // A character split by the final read has no later bytes to wait for.
+        let rest = decoder.finish();
+        if !rest.is_empty()
+            && let Some((owner_scope, chunk)) =
+                append_text_log(&reg, &tid, output_stream, &rest).await
+        {
+            let _ = lifecycle_events.send(BackgroundTaskEvent::Output {
+                owner_scope,
+                task_id: tid.clone(),
+                chunk,
+            });
         }
         let mut st = reg.lock().await;
         if let Some(task) = st.tasks.get_mut(&tid) {
@@ -3641,9 +3655,13 @@ async fn append_log(
     reg: &Arc<Mutex<RegistryState>>,
     id: &str,
     stream: BackgroundOutputStream,
+    decoder: &mut OutputDecoder,
     bytes: &[u8],
 ) -> Option<(Option<String>, String)> {
-    let raw = String::from_utf8_lossy(bytes);
+    let raw = decoder.push(bytes);
+    if raw.is_empty() {
+        return None;
+    }
     append_text_log(reg, id, stream, &raw).await
 }
 

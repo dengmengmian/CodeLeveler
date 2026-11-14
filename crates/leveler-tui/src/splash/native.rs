@@ -28,11 +28,20 @@ impl std::fmt::Debug for NativeMascot {
 impl NativeMascot {
     pub(crate) fn detect() -> Result<Option<Self>, image::ImageError> {
         let env = leveler_core::environment();
+        let multiplexer = env.var_os("TMUX").is_some() || env.var_os("STY").is_some();
+        let wt_session = env.var_os("WT_SESSION").is_some();
+        // Windows Terminal does not set TERM or TERM_PROGRAM. Its DA1 reply
+        // advertises Sixel with attribute 4, so ask the terminal rather than
+        // guessing from the OS name. The probe is bounded and runs before the
+        // first frame; a failed probe simply keeps the image hidden.
+        let sixel = wt_session && !multiplexer && probe_sixel();
         let protocol = protocol_for(
             env.var("TERM_PROGRAM").as_deref(),
             env.var("TERM").as_deref(),
             env.var("LC_TERMINAL").as_deref(),
-            env.var_os("TMUX").is_some() || env.var_os("STY").is_some(),
+            multiplexer,
+            wt_session,
+            sixel,
         );
         let Some(protocol) = protocol else {
             return Ok(None);
@@ -58,6 +67,15 @@ impl NativeMascot {
         font: (u16, u16),
     ) -> Result<Self, image::ImageError> {
         let source = image::load_from_memory_with_format(bytes, ImageFormat::Png)?;
+        // The painted slot is at most ~22x10 terminal cells. Encoding the
+        // 1312px master on startup adds seconds of CPU for pixels no terminal
+        // can show; keep a high-resolution working copy that still covers a
+        // large window and high-DPI cell metrics.
+        let source = if source.width() > 512 || source.height() > 512 {
+            source.resize(512, 512, image::imageops::FilterType::Lanczos3)
+        } else {
+            source
+        };
         let mut picker = Picker::from_fontsize(font);
         picker.set_protocol_type(protocol);
         picker.set_background_color([0, 0, 0, 0]);
@@ -144,15 +162,28 @@ fn protocol_for(
     term: Option<&str>,
     lc_terminal: Option<&str>,
     multiplexer: bool,
+    wt_session: bool,
+    sixel: bool,
 ) -> Option<ProtocolType> {
     if multiplexer {
         return None;
     }
+    let term = term.map(str::trim).unwrap_or_default();
+    if term.eq_ignore_ascii_case("dumb") {
+        return None;
+    }
+    // DA1 attribute 4 is the terminal's own claim that it can decode Sixel;
+    // WT_SESSION only says which host asked. Both are required.
+    if wt_session && sixel {
+        return Some(ProtocolType::Sixel);
+    }
     // An unset TERM cannot tell us what the terminal is; dumb and the
     // multiplexer TERM families are known to be unsafe for inline graphics.
-    let term = term.map(str::trim).filter(|term| !term.is_empty())?;
+    if term.is_empty() {
+        return None;
+    }
     let term = term.to_ascii_lowercase();
-    if term == "dumb" || term.starts_with("screen") || term.starts_with("tmux") {
+    if term.starts_with("screen") || term.starts_with("tmux") {
         return None;
     }
     let program = program.map(str::trim).filter(|program| !program.is_empty());
@@ -176,6 +207,98 @@ fn protocol_for(
     None
 }
 
+/// Ask the terminal for its primary device attributes (DA1).
+///
+/// Only Windows Terminal needs this path: it sets neither TERM nor
+/// TERM_PROGRAM, and its DA1 reply (`ESC[?61;4;...c`) advertises Sixel with
+/// attribute 4. The probe is bounded to 150 ms and runs after raw mode is
+/// enabled but before the first frame. A key already waiting means the user is
+/// typing, so the probe backs off instead of consuming it.
+#[cfg(windows)]
+fn probe_sixel() -> bool {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::{Event, KeyCode, poll, read};
+
+    // A just-created terminal window often has a Resize or mouse event queued.
+    // Those are terminal bookkeeping, not user input; discard them after a
+    // short settle so the DA1 reply can be read. A pending key does back off.
+    std::thread::sleep(Duration::from_millis(30));
+    let mut key_pending = false;
+    for _ in 0..64 {
+        match poll(Duration::ZERO) {
+            Ok(true) => match read() {
+                Ok(Event::Key(_)) => {
+                    key_pending = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            _ => break,
+        }
+    }
+    if key_pending {
+        return false;
+    }
+    let mut stdout = std::io::stdout();
+    if stdout
+        .write_all(b"\x1b[c")
+        .and_then(|_| stdout.flush())
+        .is_err()
+    {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(150);
+    let mut response = String::new();
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match poll(left) {
+            Ok(true) => match read() {
+                Ok(Event::Key(key)) => {
+                    match key.code {
+                        KeyCode::Esc => response.push('\x1b'),
+                        KeyCode::Char(c) => response.push(c),
+                        _ => {}
+                    }
+                    if response.ends_with('c') {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            },
+            _ => break,
+        }
+    }
+    da1_advertises_sixel(&response)
+}
+
+#[cfg(not(windows))]
+fn probe_sixel() -> bool {
+    false
+}
+
+#[cfg(any(windows, test))]
+fn da1_advertises_sixel(response: &str) -> bool {
+    // Crossterm delivers the reply as key events and may consume the leading
+    // ESC as the start of the sequence. Accept both the raw and the
+    // ESC-stripped form; the `[?` prefix and trailing `c` are the identity.
+    let start = response
+        .find("\x1b[?")
+        .map(|index| index + 3)
+        .or_else(|| response.find("[?").map(|index| index + 2));
+    let Some(start) = start else {
+        return false;
+    };
+    let rest = &response[start..];
+    let Some(end) = rest.find('c') else {
+        return false;
+    };
+    rest[..end].split(';').any(|param| param.trim() == "4")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,7 +307,25 @@ mod tests {
     enum Seen {
         Kitty,
         Iterm2,
+        Sixel,
         Hidden,
+    }
+
+    fn seen_with(
+        program: Option<&str>,
+        term: Option<&str>,
+        lc_terminal: Option<&str>,
+        multiplexer: bool,
+        wt_session: bool,
+        sixel: bool,
+    ) -> Seen {
+        match protocol_for(program, term, lc_terminal, multiplexer, wt_session, sixel) {
+            Some(ProtocolType::Kitty) => Seen::Kitty,
+            Some(ProtocolType::Iterm2) => Seen::Iterm2,
+            Some(ProtocolType::Sixel) => Seen::Sixel,
+            None => Seen::Hidden,
+            other => panic!("unexpected protocol {other:?}"),
+        }
     }
 
     fn seen(
@@ -193,12 +334,7 @@ mod tests {
         lc_terminal: Option<&str>,
         multiplexer: bool,
     ) -> Seen {
-        match protocol_for(program, term, lc_terminal, multiplexer) {
-            Some(ProtocolType::Kitty) => Seen::Kitty,
-            Some(ProtocolType::Iterm2) => Seen::Iterm2,
-            None => Seen::Hidden,
-            other => panic!("unexpected protocol {other:?}"),
-        }
+        seen_with(program, term, lc_terminal, multiplexer, false, false)
     }
 
     #[test]
@@ -230,6 +366,54 @@ mod tests {
             seen(None, Some("xterm-256color"), Some("iTerm2"), false),
             Seen::Iterm2
         );
+    }
+
+    #[test]
+    fn windows_terminal_sixel_probe_enables_native_images() {
+        assert_eq!(seen_with(None, None, None, false, true, true), Seen::Sixel);
+        assert_eq!(
+            seen_with(
+                Some("Windows_Terminal"),
+                Some("xterm-256color"),
+                None,
+                false,
+                true,
+                true
+            ),
+            Seen::Sixel
+        );
+        // The host identity alone is not capability: without the DA1 claim
+        // the image stays hidden.
+        assert_eq!(
+            seen_with(None, None, None, false, true, false),
+            Seen::Hidden
+        );
+        // A positive probe is not enough without the host that answers DA1.
+        assert_eq!(
+            seen_with(None, Some("xterm-256color"), None, false, false, true),
+            Seen::Hidden
+        );
+        // Multiplexers and dumb terminals stay text-only.
+        assert_eq!(seen_with(None, None, None, true, true, true), Seen::Hidden);
+        assert_eq!(
+            seen_with(None, Some("dumb"), None, false, true, true),
+            Seen::Hidden
+        );
+    }
+
+    #[test]
+    fn da1_reply_with_sixel_attribute_is_recognized() {
+        assert!(da1_advertises_sixel(
+            "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"
+        ));
+        // Crossterm can strip the leading ESC while parsing the reply.
+        assert!(da1_advertises_sixel(
+            "[?61;4;6;7;14;21;22;23;24;28;32;42;52c"
+        ));
+        assert!(da1_advertises_sixel("user text\x1b[?61;4;6;7c trailing"));
+        assert!(!da1_advertises_sixel("\x1b[?1;2c"));
+        assert!(!da1_advertises_sixel("\x1b[?61;42;52c"));
+        assert!(!da1_advertises_sixel(""));
     }
 
     #[test]
@@ -389,10 +573,23 @@ mod tests {
     }
 
     #[test]
-    fn source_png_keeps_its_transparent_pixels() {
+    fn source_png_is_bounded_and_keeps_transparency() {
         let image = NativeMascot::new(ProtocolType::Iterm2, (10, 20)).unwrap();
-        assert_eq!((image.source.width(), image.source.height()), (1312, 1199));
+        let (width, height) = image.aspect();
+        assert!(width <= 512 && height <= 512);
+        let original = 1312.0 / 1199.0;
+        let working = f64::from(width) / f64::from(height);
+        assert!((original - working).abs() < 0.01);
         assert_eq!(image.source.to_rgba8().get_pixel(0, 0)[3], 0);
         assert_eq!(image.protocol.background_color().0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn sixel_has_no_out_of_band_cleanup() {
+        let mut image = NativeMascot::new(ProtocolType::Sixel, (10, 20)).unwrap();
+        image.mark_uploaded();
+        image.reset();
+        image.retire();
+        assert!(image.take_cleanup().is_empty());
     }
 }

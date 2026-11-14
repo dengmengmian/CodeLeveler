@@ -149,7 +149,7 @@ pub async fn run(
         match crate::splash::NativeMascot::detect() {
             Ok(image) => state.welcome_image = image,
             Err(error) => {
-                tracing::warn!(%error, "welcome PNG could not be decoded; using terminal logo")
+                tracing::warn!(%error, "welcome PNG could not be decoded; hiding the image")
             }
         }
         if let Some((r, g, b)) = crate::theme::sample_rgb(state.theme.surface.canvas)
