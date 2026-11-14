@@ -222,8 +222,8 @@ impl BackgroundTaskChrome {
     }
 
     /// Terminal and unsuccessful because the work itself failed — not because
-    /// it was stopped. This is the only state that counts toward the failure
-    /// badge.
+    /// it was stopped. The jobs list and the task's recorded outcome read
+    /// this; it is a record, not a session-level fault.
     pub fn is_failed(&self) -> bool {
         self.ok == Some(false) && !self.stopped && !self.unknown
     }
@@ -572,12 +572,6 @@ pub struct AppState {
     /// the page owns no scroll state, so a resize cannot strand the row.
     pub team_selected: Option<String>,
     pub background_list_selected: Option<String>,
-    /// Task ids whose failure the user has already seen. Session-local: it
-    /// marks the issue "read", never solved — the task's terminal state,
-    /// history and its place in the active issue list all stay until the
-    /// source fact does. Deliberately not persisted — "unread" is a live
-    /// attention signal, not durable data.
-    pub background_failures_seen: std::collections::HashSet<String>,
     /// Last-painted state-strip background-indicator hit (row, x_start, x_end).
     pub background_hit: Option<(u16, u16, u16)>,
     /// Last-painted state-strip issue-indicator hit (row, x_start, x_end).
@@ -591,10 +585,6 @@ pub struct AppState {
     /// Last-painted Issue-page row hits: (row, x_start, x_end, issue key).
     /// A click selects the row and toggles its expansion.
     pub issue_row_hits: Vec<(u16, u16, u16, String)>,
-    /// Last-painted Issue-page detail-entry hits (the expanded row's
-    /// "task detail" affordance): (row, x_start, x_end, issue key). Checked
-    /// before the row hit so the entry never toggles its own row.
-    pub issue_detail_hits: Vec<(u16, u16, u16, String)>,
     /// Last-painted `←` back-glyph hit on a Secondary Surface's header row:
     /// (row, x_start, x_end). Clicking it runs the SAME one-level back as Esc.
     pub back_hit: Option<(u16, u16, u16)>,
@@ -861,13 +851,11 @@ impl AppState {
             activity_hits: Vec::new(),
             team_selected: None,
             background_list_selected: None,
-            background_failures_seen: std::collections::HashSet::new(),
             background_hit: None,
             issue_hit: None,
             issue_selected: None,
             issue_expanded: std::collections::HashSet::new(),
             issue_row_hits: Vec::new(),
-            issue_detail_hits: Vec::new(),
             back_hit: None,
             detail_return: None,
             issue_selected_line: None,

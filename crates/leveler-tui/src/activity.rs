@@ -340,35 +340,6 @@ pub(crate) fn has_status_activities(state: &AppState) -> bool {
         .any(|s| s.kind == ActivityKind::ChildAgent)
 }
 
-/// Mark every currently-failed task as seen.
-///
-/// "New" is an attention signal, not durable data: acknowledging clears the
-/// marker only. The issue stays ACTIVE on the strip, and terminal state, exit
-/// code, output and history are all untouched — the jobs list still shows the
-/// failures, because looking at one solves nothing.
-pub(crate) fn acknowledge_failures(state: &mut AppState) {
-    let failed: Vec<String> = state
-        .background_task_labels
-        .iter()
-        .filter(|(id, chrome)| chrome.is_failed() && !state.background_failures_seen.contains(*id))
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in failed {
-        state.background_failures_seen.insert(id);
-    }
-}
-
-/// Acknowledge one task's failure, if it has one. Used when its detail opens.
-pub(crate) fn acknowledge_failure(state: &mut AppState, id: &str) {
-    if state
-        .background_task_labels
-        .get(id)
-        .is_some_and(|c| c.is_failed())
-    {
-        state.background_failures_seen.insert(id.to_string());
-    }
-}
-
 /// The background-jobs list page's two ordered sections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackgroundJobList {
@@ -443,10 +414,9 @@ pub(crate) fn selected_list_task(state: &AppState) -> Option<String> {
     state.background_list_selected.clone()
 }
 
-/// Open the background-jobs list. Observational, and NOT an acknowledgement:
-/// the list is an index, and seeing a row is not seeing the task — the
-/// reminder clears when that task's own detail opens ([`open`]), which is the
-/// same rule as the issue page. Nothing here cancels or deletes work.
+/// Open the background-jobs list. Observational: the list is an index over
+/// the runtime's records, and opening it changes nothing about the tasks.
+/// Nothing here cancels, deletes or acknowledges work.
 pub(crate) fn open_background_list(state: &mut AppState) {
     ensure_list_selection(state);
     state.background_list_focus = BackgroundPane::List;
@@ -569,12 +539,9 @@ pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::E
                 )]
             }
         }
-        ActivityId::Background(task_id) => {
-            // Opening a failed task is seeing it: clear its footer reminder
-            // without touching the terminal record.
-            acknowledge_failure(state, &task_id);
-            Vec::new()
-        }
+        // A background task's own page is the record; opening it changes no
+        // other state. There is no reminder to clear.
+        ActivityId::Background(_) => Vec::new(),
         // The Team row opens the Team page; it never reaches this detail view.
         ActivityId::Team => Vec::new(),
     }
@@ -812,14 +779,9 @@ pub(crate) fn toggle_background_focus(state: &mut AppState) {
 }
 
 /// Focus the selected task's own detail pane on the jobs page — its command,
-/// runtime facts and retained output. That pane IS the task's detail here, so
-/// focusing it is viewing that one failure: its reminder clears, and no other
-/// task's does. A running task has no failure to acknowledge.
+/// runtime facts and retained output. That pane IS the task's detail here.
 pub(crate) fn focus_background_output(state: &mut AppState) {
     state.background_list_focus = BackgroundPane::Output;
-    if let Some(id) = state.background_list_selected.clone() {
-        acknowledge_failure(state, &id);
-    }
 }
 
 pub(crate) fn focus_background_list(state: &mut AppState) {
@@ -851,7 +813,6 @@ pub(crate) fn bound_terminal_background(state: &mut AppState) {
     terminal.sort_by_key(|(_, started)| *started);
     for (id, _) in terminal.into_iter().take(excess) {
         state.background_task_labels.remove(&id);
-        state.background_failures_seen.remove(&id);
         state.background_task_views.remove(&id);
         if matches!(&state.background_list_selected, Some(sel) if sel == &id) {
             state.background_list_selected = None;
@@ -1722,7 +1683,7 @@ second line ignored"
         assert!(state.background_task_labels.contains_key("bg-2"));
     }
 
-    // ── Footer aggregation and failure acknowledgement ─────────────────────
+    // ── Footer aggregation and failure records ─────────────────────────────
 
     fn finished(
         label: &str,
@@ -1805,9 +1766,10 @@ second line ignored"
         );
     }
 
-    /// An unexpected non-zero exit IS a failure — and becomes an active issue.
+    /// An unexpected non-zero exit IS a failure — a record in the jobs page,
+    /// never a session issue and never a reminder.
     #[test]
-    fn an_unexpected_nonzero_exit_is_a_failure() {
+    fn an_unexpected_nonzero_exit_is_a_record_not_an_issue() {
         let mut state = test_state();
         state.elapsed_secs = 90;
         state.background_task_labels.insert(
@@ -1817,15 +1779,15 @@ second line ignored"
         let chrome = state.background_task_labels.get("bg-1").unwrap();
         assert_eq!(chrome.outcome(), crate::state::BackgroundOutcome::Failed);
         assert!(chrome.is_failed());
-        let issues = crate::issue::active_issues(&state);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].unread);
+        assert!(crate::issue::active_issues(&state).is_empty());
+        assert!(crate::issue::issue_summary(&state).is_empty());
+        assert_eq!(background_job_list(&state).finished.len(), 1);
     }
 
-    /// Acknowledging marks read — it solves nothing: the issue stays active,
-    /// and terminal state, exit code and history are untouched.
+    /// Failures accumulate as records with their terminal facts; the list is
+    /// the only place they show up.
     #[test]
-    fn acknowledging_a_failure_marks_it_read_not_solved() {
+    fn failures_stay_listed_with_their_terminal_facts() {
         let mut state = test_state();
         state.elapsed_secs = 90;
         state.background_task_labels.insert(
@@ -1836,17 +1798,7 @@ second line ignored"
             "bg-2".into(),
             finished("cargo test", false, false, 0, 24_000),
         );
-        assert!(crate::issue::active_issues(&state).iter().all(|i| i.unread));
-        acknowledge_failures(&mut state);
-        let issues = crate::issue::active_issues(&state);
-        assert_eq!(issues.len(), 2, "a read issue is still an active issue");
-        assert!(
-            issues.iter().all(|i| !i.unread),
-            "acknowledging clears the new marker only"
-        );
-        // History and terminal facts survive.
-        assert!(state.background_task_labels.contains_key("bg-1"));
-        assert!(state.background_task_labels.contains_key("bg-2"));
+        assert!(crate::issue::active_issues(&state).is_empty());
         assert!(
             state
                 .background_task_labels
@@ -1854,7 +1806,11 @@ second line ignored"
                 .unwrap()
                 .is_failed()
         );
-        assert_eq!(background_job_list(&state).finished.len(), 2);
+        let list = background_job_list(&state);
+        assert_eq!(list.finished.len(), 2);
+        let failed = state.background_task_labels.get("bg-1").unwrap();
+        assert_eq!(failed.exit_code, Some(1));
+        assert_eq!(failed.duration_ms, Some(30_000));
     }
 
     /// The list page groups running first, then recently finished newest first.

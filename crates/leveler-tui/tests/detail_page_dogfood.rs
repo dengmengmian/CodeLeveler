@@ -495,8 +495,8 @@ fn dogfood_sub_agent_detail_page() {
 
 /// CASE C — the closure: background work lives in the input footer as an
 /// aggregate, then the jobs list, then a detail. It never returns to the
-/// conversation body. The list acknowledges nothing; viewing the failed
-/// task's own detail clears exactly its reminder, never its history.
+/// conversation body. A failure is a record there, not a reminder: nothing
+/// acknowledges it and nothing clears it, because nothing counts it.
 #[test]
 fn dogfood_background_jobs_footer_and_list() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -538,14 +538,13 @@ fn dogfood_background_jobs_footer_and_list() {
     );
 
     // The conversation body has no task rows: the state strip carries the
-    // running count and the failure as two separate cells, and neither names
-    // a task's raw command.
+    // running count only. The failure owns no cell and no count.
     let home = render_text(&mut s, 120, 30);
     println!("--- HOME (2 running, 1 failed) ---\n{home}");
     assert_eq!(
         home.matches('↗').count(),
-        2,
-        "the background and issue cells each own their entry:\n{home}"
+        1,
+        "only the background cell owns an entry:\n{home}"
     );
     let strip = home
         .lines()
@@ -553,9 +552,10 @@ fn dogfood_background_jobs_footer_and_list() {
         .unwrap_or_else(|| panic!("strip row missing:\n{home}"));
     assert!(strip.contains("2 jobs"), "running count:\n{home}");
     assert!(
-        strip.contains("background failed 1"),
-        "failure count:\n{home}"
+        !strip.contains("background failed"),
+        "a failure is not counted:\n{home}"
     );
+    assert!(s.issue_hit.is_none(), "and it is not an issue");
     for raw in ["npm", "cargo", "make", "EADDRINUSE"] {
         assert!(
             !strip.contains(raw),
@@ -575,14 +575,10 @@ fn dogfood_background_jobs_footer_and_list() {
     println!("--- BACKGROUND JOBS LIST ---\n{list}");
     assert!(list.contains("Running"), "{list}");
     assert!(list.contains("Recently finished"), "{list}");
-
-    // Opening the list acknowledged nothing: the list is an index, and only a
-    // task's own detail is a viewing.
     assert!(
-        !s.background_failures_seen.contains("bg-fail"),
-        "the list alone is not a viewing"
+        !list.contains("background failed"),
+        "the list carries records, not reminders:\n{list}"
     );
-    assert!(s.background_task_labels.contains_key("bg-fail"));
 
     // Enter focuses the selected task's live output inside the same page.
     s.background_list_selected = Some("bg-run".into());
@@ -613,24 +609,24 @@ fn dogfood_background_jobs_footer_and_list() {
         .unwrap_or_else(|| panic!("no strip row:\n{back}"));
     assert!(strip.contains("2 jobs"), "{strip:?}");
     assert!(
-        strip.contains("background failed 1"),
-        "the failure was not viewed, so it must still remind: {strip:?}"
+        !strip.contains("background failed"),
+        "browsing changed nothing, and there was no reminder to change: {strip:?}"
     );
     assert!(
         s.background_task_labels.contains_key("bg-fail"),
-        "history survives browsing"
+        "the failed record is there, untouched"
     );
 
-    // Now view the FAILED task's own detail: that clears its reminder while
-    // every record stays.
+    // The failed task's own detail shows its terminal facts and changes no
+    // state outside its own view.
     s.workbench_focus = leveler_tui::state::WorkbenchFocus::Background;
     press(&mut s, KeyCode::Enter);
     s.background_list_selected = Some("bg-fail".into());
     press(&mut s, KeyCode::Enter);
-    assert!(
-        s.background_failures_seen.contains("bg-fail"),
-        "viewing the failed task's detail acknowledges exactly it"
-    );
+    let failed_detail = render_text(&mut s, 90, 24);
+    println!("--- DETAIL (failed) ---\n{failed_detail}");
+    assert!(failed_detail.contains("EADDRINUSE"), "{failed_detail}");
+    assert!(failed_detail.contains("1"), "{failed_detail}");
     assert!(s.background_task_labels.contains_key("bg-fail"));
     press(&mut s, KeyCode::Esc);
     press(&mut s, KeyCode::Esc);
@@ -642,14 +638,15 @@ fn dogfood_background_jobs_footer_and_list() {
         .unwrap_or_else(|| panic!("no strip row:\n{after}"));
     assert!(
         !strip.contains("background failed"),
-        "the viewed failure stops reminding: {strip:?}"
+        "a failure never reminds: {strip:?}"
     );
     assert!(
         after.contains("2 jobs"),
         "the running tasks are unaffected: {after}"
     );
-    assert!(
-        s.background_task_labels.contains_key("bg-fail"),
-        "the failed record is history now, never deleted"
+    assert_eq!(
+        s.background_task_labels["bg-fail"].exit_code,
+        Some(1),
+        "the failed record keeps its exit code"
     );
 }

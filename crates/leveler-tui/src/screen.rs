@@ -30,10 +30,10 @@ pub enum Screen {
     /// Observational like the roster itself: nothing here cancels work.
     Team,
     /// Active issues, opened from the state strip's issue cell: a failed turn
-    /// and the failed background tasks the projection still holds. A row is one
-    /// interaction — Enter or a click selects it and toggles its expansion, and
-    /// the expanded row's detail entry (or `→`) opens its [`Screen::Activity`]
-    /// page. Nothing here cancels work or clears a failure record.
+    /// and a client/runtime version mismatch. A row is one interaction — Enter
+    /// or a click selects it and toggles its expansion. Nothing here cancels
+    /// work or clears a failure record; background-task failures are records
+    /// on the background page, not issues.
     Issue,
     /// Full active plan, opened from the workbench's one-line plan summary.
     Plan,

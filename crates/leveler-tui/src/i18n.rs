@@ -1055,10 +1055,8 @@ pub struct UiText {
     pub settled_search: &'static str,
     pub settled_work_many: &'static str,
     pub settled_explore: &'static str,
-    /// Live parallel area overflow: "… 还有 {} 个" running members without rows.
     /// Background task lifecycle toasts. The task's opaque runtime id is
     /// never the user-facing name: these carry what it is actually running.
-    pub background_task_started: &'static str,
     pub background_task_done: &'static str,
     pub background_task_failed: &'static str,
     /// A background task stopped on purpose: a user/agent cancel or session
@@ -1085,23 +1083,14 @@ pub struct UiText {
     pub background_running_count: &'static str,
     /// Same cell, the subset that announced readiness: "就绪 {}".
     pub background_ready_count: &'static str,
-    /// Issue indicator when one kind is active: "后台失败 {}".
-    pub background_failed_only: &'static str,
-    /// Issue indicator for a mix of kinds, where naming one kind would be
-    /// false (e.g. a version mismatch next to a failed task): "问题 {}".
+    /// Issue indicator for active issues: "问题 {}".
     pub issue_count: &'static str,
     /// Issue page title.
     pub issue_page_title: &'static str,
-    /// Issue page footer: select, expand/collapse, open a task's detail, back.
+    /// Issue page footer: select, expand/collapse, back.
     pub issue_page_hint: &'static str,
     /// Issue page with nothing active.
     pub issue_page_empty: &'static str,
-    /// Marker on an issue the user has not looked at yet. Seen is not solved.
-    pub issue_row_new: &'static str,
-    /// Section label separating viewed failures (history) from unread ones.
-    pub issue_page_viewed: &'static str,
-    /// The expanded task row's entry into its existing task detail page.
-    pub issue_task_detail: &'static str,
     /// Background-jobs list page title.
     pub background_list_title: &'static str,
     /// List section: still-running tasks.
@@ -1136,6 +1125,7 @@ pub struct UiText {
     pub background_meta_no_output: &'static str,
     /// Footer hint while the output pane owns the keys.
     pub background_hint_output: &'static str,
+    /// Live parallel area overflow: "… 还有 {} 项" running members without rows.
     pub activity_more: &'static str,
     pub activity_no_output: &'static str,
     /// A child with no projectable activity yet.
@@ -2636,7 +2626,6 @@ static ZH: UiText = UiText {
     settled_search: "已搜索代码库",
     settled_work_many: "已完成 {} 项操作",
     settled_explore: "已检查代码库",
-    background_task_started: "已在后台启动：{}",
     background_task_done: "后台任务已完成：{}",
     background_task_failed: "后台任务失败：{}",
     background_task_stopped: "后台任务已停止：{}",
@@ -2648,14 +2637,10 @@ static ZH: UiText = UiText {
     background_task_generic: "后台任务",
     background_running_count: "后台 {}",
     background_ready_count: "就绪 {}",
-    background_failed_only: "后台失败 {}",
     issue_count: "问题 {}",
     issue_page_title: "问题",
     issue_page_hint: "↑↓ 选择 · Enter 展开/收起 · Esc 返回",
     issue_page_empty: "当前没有需要关注的问题",
-    issue_row_new: "新",
-    issue_page_viewed: "已查看",
-    issue_task_detail: "查看任务详情 ↗",
     background_list_title: "后台任务",
     background_list_running: "运行中",
     background_list_finished: "最近结束",
@@ -3753,7 +3738,6 @@ static EN: UiText = UiText {
     settled_search: "Searched the codebase",
     settled_work_many: "Completed {} operations",
     settled_explore: "Inspected the codebase",
-    background_task_started: "Started in the background: {}",
     background_task_done: "Background task finished: {}",
     background_task_failed: "Background task failed: {}",
     background_task_stopped: "Background task stopped: {}",
@@ -3765,14 +3749,10 @@ static EN: UiText = UiText {
     background_task_generic: "background task",
     background_running_count: "{} jobs",
     background_ready_count: "{} ready",
-    background_failed_only: "background failed {}",
     issue_count: "open issues: {}",
     issue_page_title: "Issues",
     issue_page_hint: "↑↓ select · Enter expand/collapse · Esc back",
     issue_page_empty: "Nothing needs attention right now",
-    issue_row_new: "new",
-    issue_page_viewed: "Viewed",
-    issue_task_detail: "task detail ↗",
     background_list_title: "Background tasks",
     background_list_running: "Running",
     background_list_finished: "Recently finished",

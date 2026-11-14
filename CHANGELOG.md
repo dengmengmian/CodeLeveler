@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- Background task display: starting a task no longer posts a second notice next to the tool row, and a failed task is a record in the conversation and the jobs page instead of a footer reminder that needs acknowledging. The running-count cell counts only tasks that are running now.
+
 ## [1.0.27] - 2026-11-14
 
 - Cross-session memory is available as an opt-in capability. `[memory].rollout` is `off` (the default), `record_only`, `shadow` or `active`; only `active` exposes memory to the model. Everything lives under `<LevelerHome>/memory/`; a workspace is identified by its git remote, and a temporary working directory has no workspace scope.
