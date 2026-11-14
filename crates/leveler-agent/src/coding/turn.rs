@@ -498,6 +498,13 @@ pub(crate) async fn load_goal_verification(
         std::collections::HashMap::new();
     let mut pending: std::collections::HashMap<String, PendingCommand> =
         std::collections::HashMap::new();
+    // The durable dispatch-boundary window of every command call. A run
+    // rebuilt from this log carries the same start/finish versions the live
+    // window recorded instead of re-dating the execution to its result.
+    let mut windows: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
+    let mut task_by_call: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut mutation_ops = 0u64;
     let mut runs = Vec::new();
     for row in rows {
@@ -522,7 +529,17 @@ pub(crate) async fn load_goal_verification(
                     background_result_run(&started, call_id, *is_error, *exit_code, mutation_ops)
             {
                 started.remove(call_id);
-                run.check_start = pending.remove(call_id).and_then(|start| start.check_start);
+                let start = pending.remove(call_id);
+                run.check_start = start.as_ref().and_then(|start| start.check_start.clone());
+                // The result closes the window the launch opened. The launch
+                // version is never replaced by this newer observation. The
+                // durable window row also covers a crash between the launch
+                // and its `ToolCallFinished` row, which leaves no pending.
+                run.started_mutation_ops = start
+                    .as_ref()
+                    .and_then(|start| start.started_mutation_ops)
+                    .or_else(|| windows.get(call_id).map(|(start, _)| *start));
+                run.finished_mutation_ops = Some(mutation_ops);
                 let exited = status
                     .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited);
                 if exited || run.check_start.is_some() {
@@ -558,7 +575,7 @@ pub(crate) async fn load_goal_verification(
                 fingerprint,
                 registrations,
                 order,
-                mutation_ops,
+                mutation_ops: started_mutation_ops,
             } => {
                 if let Some((name, arguments, _)) = calls.get(&call_id)
                     && let Some(label) = command_label(name, arguments)
@@ -569,19 +586,28 @@ pub(crate) async fn load_goal_verification(
                             label,
                             task_id: None,
                             call_id: Some(call_id),
+                            started_mutation_ops: Some(started_mutation_ops),
                             check_start: Some(RegisteredCheckStart {
                                 fingerprint,
                                 registrations,
                                 order,
-                                mutation_ops,
+                                mutation_ops: started_mutation_ops,
                             }),
                         },
                     );
                 }
             }
+            EngineEvent::CommandExecutionVersions {
+                call_id,
+                started_mutation_ops,
+                returned_mutation_ops,
+            } => {
+                windows.insert(call_id, (started_mutation_ops, returned_mutation_ops));
+            }
             EngineEvent::BackgroundTaskStarted {
                 call_id, task_id, ..
             } => {
+                task_by_call.insert(call_id.clone(), task_id.clone());
                 if let Some(start) = pending.get_mut(&call_id) {
                     start.task_id = Some(task_id);
                 }
@@ -601,17 +627,22 @@ pub(crate) async fn load_goal_verification(
                     calls.remove(&call_id);
                     continue;
                 }
-                if let Some((name, arguments, model_step)) = calls.remove(&call_id)
-                    && let Some(label) =
-                        crate::executor::goal_verification::command_label(&name, &arguments)
-                    // A successful result with no exit code is a command that
-                    // only STARTED (a background task, or a foreground run
-                    // handed to the background). The live collector skips the
-                    // same shape (`execution_status` absent); a resumed window
-                    // must not turn that start into a pass. A failed start
-                    // stays a failed run — it really did fail.
-                    && (is_error || exit_code.is_some())
-                {
+                let Some((name, arguments, model_step)) = calls.remove(&call_id) else {
+                    continue;
+                };
+                let Some(label) =
+                    crate::executor::goal_verification::command_label(&name, &arguments)
+                else {
+                    continue;
+                };
+                // A successful result with no exit code is a command that only
+                // STARTED (a background task, or a foreground run handed to the
+                // background). The live collector skips the same shape
+                // (`execution_status` absent); a resumed window must not turn
+                // that start into a pass. A failed start stays a failed run —
+                // it really did fail.
+                if is_error || exit_code.is_some() {
+                    let window = windows.get(&call_id).copied();
                     let check_start = pending.remove(&call_id).and_then(|start| start.check_start);
                     runs.push(VerificationRun {
                         label,
@@ -619,9 +650,35 @@ pub(crate) async fn load_goal_verification(
                         exit_code,
                         model_step,
                         mutation_ops,
+                        started_mutation_ops: window.map(|(start, _)| start),
+                        finished_mutation_ops: window.map(|(_, end)| end),
                         call_id: Some(call_id),
                         check_start,
                     });
+                } else {
+                    // The start of a background task is a pending fact after a
+                    // restart too: its citation must say "running or unknown",
+                    // not "never ran", and its launch version is the window
+                    // start when the result later arrives.
+                    let existing = pending.remove(&call_id);
+                    let existing_started = existing
+                        .as_ref()
+                        .and_then(|start| start.started_mutation_ops);
+                    let existing_task = existing.as_ref().and_then(|start| start.task_id.clone());
+                    let check_start = existing.and_then(|start| start.check_start);
+                    pending.insert(
+                        call_id.clone(),
+                        PendingCommand {
+                            label,
+                            task_id: task_by_call.get(&call_id).cloned().or(existing_task),
+                            call_id: Some(call_id.clone()),
+                            started_mutation_ops: windows
+                                .get(&call_id)
+                                .map(|(start, _)| *start)
+                                .or(existing_started),
+                            check_start,
+                        },
+                    );
                 }
             }
             EngineEvent::EvidenceLedgerUpdated { ledger } => {
@@ -665,6 +722,10 @@ fn background_result_run(
         exit_code,
         model_step: *model_step,
         mutation_ops,
+        // The caller attaches the launch window from the pending start; the
+        // result observation alone never dates the execution backwards.
+        started_mutation_ops: None,
+        finished_mutation_ops: None,
         call_id: Some(call_id.to_string()),
         check_start: None,
     })
@@ -1558,6 +1619,159 @@ mod goal_verification_replay_tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].label, "cargo test");
         assert!(!runs[0].ok);
+    }
+
+    /// Replay must rebuild a background run with the launch version the
+    /// dispatch boundary recorded, not re-date it to the version current when
+    /// its result arrived after a resume.
+    #[tokio::test]
+    async fn a_background_result_replays_with_its_launch_version() {
+        let (stores, session, goal) = goal_with_background_call("call-bg", true).await;
+        let facts = load_goal_verification(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(facts.runs.len(), 1, "{:?}", facts.runs);
+        let run = &facts.runs[0];
+        assert_eq!(run.started_mutation_ops, Some(0));
+        assert_eq!(run.finished_mutation_ops, Some(2));
+        assert_eq!(run.mutation_ops, 2);
+        assert!(
+            facts.pending.is_empty(),
+            "the terminal result retires its start"
+        );
+        assert!(matches!(
+            crate::executor::goal_verification::version_applicability(run, 2),
+            crate::executor::goal_verification::VersionApplicability::ChangedDuringRun {
+                started: 0,
+                finished: 2
+            }
+        ));
+    }
+
+    /// A legacy record without the launch row keeps the real exit status but
+    /// leaves the start version unknown; it must not be upgraded into a
+    /// consistency claim.
+    #[tokio::test]
+    async fn a_legacy_background_result_replays_with_an_unknown_start_version() {
+        let (stores, session, goal) = goal_with_background_call("call-legacy", false).await;
+        let facts = load_goal_verification(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(facts.runs.len(), 1);
+        let run = &facts.runs[0];
+        assert_eq!(run.started_mutation_ops, None);
+        assert!(run.ok, "a real zero exit stays a real exit");
+        assert!(matches!(
+            crate::executor::goal_verification::version_applicability(run, 2),
+            crate::executor::goal_verification::VersionApplicability::UnknownStart
+        ));
+    }
+
+    /// One background command launched at version 0, an edit advances the
+    /// ledger to 2, and its result arrives afterwards.
+    async fn goal_with_background_call(
+        call_id: &str,
+        with_launch_row: bool,
+    ) -> (EngineStores, SessionId, leveler_core::GoalId) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
+        let goal = leveler_core::GoalId::new("goal-background-replay");
+        let payload = serde_json::json!({
+            "version": 2,
+            "initiating_message": null,
+            "objective": ObjectiveAnchor::from_user_message("verify"),
+            "continuation_root_turn_id": null,
+            "goal_id": goal,
+        })
+        .to_string();
+        let turn = stores
+            .turns
+            .start(&session, "goal", Some(&payload), leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let append = |event: EngineEvent| {
+            let stores = &stores;
+            let session = &session;
+            let turn_id = &turn_id;
+            async move {
+                stores
+                    .events
+                    .append(
+                        session,
+                        Some(turn_id),
+                        "event",
+                        &serde_json::to_string(&event).unwrap(),
+                        leveler_core::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        append(EngineEvent::ToolCallStarted {
+            call_id: call_id.into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "program": "sh", "args": ["run-tests.sh"], "background": true
+            })
+            .to_string(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(2),
+        })
+        .await;
+        if with_launch_row {
+            append(EngineEvent::CommandExecutionVersions {
+                call_id: call_id.into(),
+                started_mutation_ops: 0,
+                returned_mutation_ops: 0,
+            })
+            .await;
+        }
+        append(EngineEvent::BackgroundTaskStarted {
+            call_id: call_id.into(),
+            task_id: "task-bg".into(),
+            program: "sh".into(),
+            args: vec!["run-tests.sh".into()],
+            lifetime: "goal".into(),
+        })
+        .await;
+        append(EngineEvent::ToolCallFinished {
+            call_id: call_id.into(),
+            name: "run_command".into(),
+            is_error: false,
+            preview: "started".into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        })
+        .await;
+        append(EngineEvent::EvidenceLedgerUpdated {
+            ledger: leveler_lifecycle::EvidenceLedger {
+                total_mutation_ops: 2,
+                ..Default::default()
+            },
+        })
+        .await;
+        append(EngineEvent::BackgroundTaskFinished {
+            call_id: call_id.into(),
+            task_id: "task-bg".into(),
+            goal_id: Some(goal.clone()),
+            program: "sh".into(),
+            args: vec!["run-tests.sh".into()],
+            is_error: false,
+            exit_code: Some(0),
+            status: Some(leveler_execution::BackgroundTaskStatus::Exited),
+            output: String::new(),
+            output_truncated: false,
+        })
+        .await;
+        (stores, session, goal)
     }
 }
 

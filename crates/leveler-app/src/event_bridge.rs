@@ -762,6 +762,9 @@ impl EventBridge {
             // registry bridge already tells this runtime's clients that a task
             // started; this event exists for the ones that connect later.
             EngineEvent::BackgroundTaskStarted { .. } => {}
+            // Durable evidence plumbing: the workspace-version window of a
+            // command execution. No client-facing projection exists for it.
+            EngineEvent::CommandExecutionVersions { .. } => {}
             EngineEvent::FinalizationStarted { .. } => {
                 if !self.terminal_published {
                     let _ = self.events.send(RuntimeEvent::TurnFinalizing {
@@ -3577,6 +3580,9 @@ mod projection_equivalence {
                     command: None,
                     exit_code: None,
                     workspace_version: 0,
+                    started_workspace_version: None,
+                    finished_workspace_version: None,
+                    current_workspace_version: None,
                     model_step: 0,
                 }],
             )),
@@ -3618,6 +3624,9 @@ mod projection_equivalence {
                     command: None,
                     exit_code: None,
                     workspace_version: 0,
+                    started_workspace_version: None,
+                    finished_workspace_version: None,
+                    current_workspace_version: None,
                     model_step: 0,
                 }],
             )),

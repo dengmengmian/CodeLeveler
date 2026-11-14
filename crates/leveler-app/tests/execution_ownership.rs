@@ -12,8 +12,10 @@ use leveler_core::{BootId, SessionId};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
+#[cfg(windows)]
+use leveler_storage::SessionRepository;
 use leveler_storage::{
-    OwnershipStore, SessionInputRepository, SessionRepository, TaskOwner, TaskStore, TurnRepository,
+    OwnershipStore, SessionInputRepository, TaskOwner, TaskStore, TurnRepository,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -878,6 +880,7 @@ async fn shell_event(
 
 /// Drain one user shell's stderr and terminal fact. The started fact and any
 /// stdout are not what these permission tests assert.
+#[cfg(windows)]
 async fn shell_terminal(
     events: &mut tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent>,
 ) -> (String, Option<i32>, String) {

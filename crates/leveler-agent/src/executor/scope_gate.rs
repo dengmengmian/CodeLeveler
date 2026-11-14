@@ -388,8 +388,9 @@ fn record(
     state: VerificationRecordState,
     detail: String,
     run: Option<&VerificationRun>,
-    workspace_version: u64,
+    current_workspace_version: u64,
 ) -> VerificationRecord {
+    let window = run.and_then(crate::executor::goal_verification::execution_window);
     VerificationRecord {
         requirement_id: item.id.clone(),
         requirement_text: Some(item.text.clone()),
@@ -401,7 +402,10 @@ fn record(
             .filter(|_| item.verification.is_none())
             .map(|run| run.label.clone()),
         exit_code: run.and_then(|run| run.exit_code),
-        workspace_version: run.map_or(workspace_version, |run| run.mutation_ops),
+        workspace_version: run.map_or(current_workspace_version, |run| run.mutation_ops),
+        started_workspace_version: window.map(|(started, _)| started),
+        finished_workspace_version: window.map(|(_, finished)| finished),
+        current_workspace_version: Some(current_workspace_version),
         model_step: run.map_or(0, |run| run.model_step),
     }
 }
@@ -562,6 +566,18 @@ fn check_mechanical<'a>(
                      failed (step {})",
                     item.id, run.model_step
                 )),
+                RunCheck::Inconsistent(run) => Mechanical::Failed(version_inconsistent_message(
+                    item,
+                    target,
+                    run,
+                    facts.mutation_ops,
+                )),
+                RunCheck::UnknownVersion(run) => Mechanical::Failed(version_unknown_message(
+                    item,
+                    target,
+                    run,
+                    facts.mutation_ops,
+                )),
                 RunCheck::Missing => Mechanical::Failed(format!(
                     "`{}` [command] `{target}` is accounted done, but no successful run after \
                      the last change matches it",
@@ -604,6 +620,18 @@ fn check_mechanical<'a>(
                      failed (step {})",
                     item.id, run.model_step
                 )),
+                RunCheck::Inconsistent(run) => Mechanical::Failed(version_inconsistent_message(
+                    item,
+                    target,
+                    run,
+                    facts.mutation_ops,
+                )),
+                RunCheck::UnknownVersion(run) => Mechanical::Failed(version_unknown_message(
+                    item,
+                    target,
+                    run,
+                    facts.mutation_ops,
+                )),
                 RunCheck::Missing => Mechanical::Failed(format!(
                     "`{}` [tests] is accounted done, but no passing run of the declared test \
                      command `{target}` was recorded after the last change. Run the declared \
@@ -623,6 +651,53 @@ fn check_mechanical<'a>(
         | RequirementKind::Preparation
         | RequirementKind::Constraint => Mechanical::NotCheckable,
     }
+}
+
+/// The command exited 0, but the tree changed between its start and its end.
+/// The execution is real; its applicability to the current workspace is not.
+fn version_inconsistent_message(
+    item: &RequirementItem,
+    command: &str,
+    run: &VerificationRun,
+    current: u64,
+) -> String {
+    let (started, finished) = crate::executor::goal_verification::execution_window(run)
+        .expect("RunCheck::Inconsistent is only produced from a known execution window");
+    let execution = run
+        .call_id
+        .as_deref()
+        .map(|id| format!(" (execution `{id}`)"))
+        .unwrap_or_default();
+    format!(
+        "`{}` [{}] `{command}`{execution} started at workspace version {started} but finished at \
+         workspace version {finished} (current: {current}): the workspace changed while it was \
+         running, so this execution cannot establish verification for the current workspace \
+         version. Run the declared command again against the current workspace.",
+        item.id,
+        item.kind.label()
+    )
+}
+
+/// The execution record predates durable start-version capture. Its exit
+/// status is real; which workspace version it observed is not established.
+fn version_unknown_message(
+    item: &RequirementItem,
+    command: &str,
+    run: &VerificationRun,
+    current: u64,
+) -> String {
+    let execution = run
+        .call_id
+        .as_deref()
+        .map(|id| format!(" (execution `{id}`)"))
+        .unwrap_or_default();
+    format!(
+        "`{}` [{}] `{command}`{execution} has no recorded execution start version, so the runtime \
+         cannot establish which workspace version it verified (current: {current}). Run the \
+         declared command again against the current workspace.",
+        item.id,
+        item.kind.label()
+    )
 }
 
 /// A command that has only started is not a satisfied requirement: its result
@@ -649,6 +724,12 @@ enum RunCheck<'a> {
     /// The command started and has no result yet.
     Pending(&'a PendingCommand),
     Stale(&'a VerificationRun),
+    /// The tree changed while the command was running. Its exit status is a
+    /// real execution fact, but it cannot establish the current version.
+    Inconsistent(&'a VerificationRun),
+    /// The record has no start version, so which version it verified is
+    /// unknown. The runtime must not guess.
+    UnknownVersion(&'a VerificationRun),
     Failed(&'a VerificationRun),
     Missing,
 }
@@ -677,13 +758,16 @@ fn successful_run<'a>(facts: &ScopeFacts<'a>, command: &str) -> RunCheck<'a> {
 }
 
 fn classify(run: &VerificationRun, mutation_ops: u64) -> RunCheck<'_> {
+    use crate::executor::goal_verification::VersionApplicability;
     if !run.ok {
         return RunCheck::Failed(run);
     }
-    if run.mutation_ops < mutation_ops {
-        return RunCheck::Stale(run);
+    match crate::executor::goal_verification::version_applicability(run, mutation_ops) {
+        VersionApplicability::Current => RunCheck::Found(run),
+        VersionApplicability::Stale => RunCheck::Stale(run),
+        VersionApplicability::ChangedDuringRun { .. } => RunCheck::Inconsistent(run),
+        VersionApplicability::UnknownStart => RunCheck::UnknownVersion(run),
     }
-    RunCheck::Found(run)
 }
 
 fn refusal_message(refusals: &[String]) -> String {
@@ -744,6 +828,8 @@ mod tests {
             exit_code: Some(if ok { 0 } else { 1 }),
             model_step: 1,
             mutation_ops,
+            started_mutation_ops: Some(mutation_ops),
+            finished_mutation_ops: Some(mutation_ops),
             call_id: Some(call_id.to_string()),
             check_start: None,
         }
@@ -962,6 +1048,7 @@ mod tests {
             label: "sh verify.sh".to_string(),
             task_id: Some("bg-1".to_string()),
             call_id: Some("call-1".to_string()),
+            started_mutation_ops: Some(0),
             check_start: None,
         }];
         let decision = decide(&ScopeFacts {
@@ -1075,6 +1162,86 @@ mod tests {
             record.detail.contains("`make regression` exited 0"),
             "the record states the execution it verified: {}",
             record.detail
+        );
+        assert_eq!(record.started_workspace_version, Some(4));
+        assert_eq!(record.finished_workspace_version, Some(4));
+        assert_eq!(record.current_workspace_version, Some(4));
+    }
+
+    /// A tests run that exited 0 while the tree changed cannot satisfy the
+    /// requirement for the version being completed. Its exit status stays a
+    /// real fact; the refusal names the command, its execution, both versions
+    /// and the current version.
+    #[test]
+    fn a_tests_run_that_straddled_a_change_is_refused() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the suite must pass",
+            Some("sh run-tests.sh"),
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "call_id:call-9")];
+        let mut across_change = run("sh run-tests.sh", true, 1, "call-9");
+        across_change.started_mutation_ops = Some(0);
+        across_change.finished_mutation_ops = Some(1);
+        let mut refusals = Vec::new();
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounts),
+            runs: &[across_change],
+            pending: &[],
+            mutation_ops: 1,
+            artifact: &absent,
+            literal: &unknown_literal,
+        });
+        let ScopeDecision::Refuse(message) = decision else {
+            panic!("a run that straddled a change cannot satisfy a tests requirement");
+        };
+        refusals.push(message);
+        let message = &refusals[0];
+        assert!(message.contains("sh run-tests.sh"), "{message}");
+        assert!(message.contains("call-9"), "{message}");
+        assert!(
+            message.contains("workspace changed while it was running"),
+            "{message}"
+        );
+        assert!(
+            message.contains("version 0")
+                && message.contains("version 1")
+                && message.contains("current: 1"),
+            "{message}"
+        );
+    }
+
+    /// An old record without a start version is not upgraded into a
+    /// consistency claim. The model is told to run the command again.
+    #[test]
+    fn a_tests_run_without_a_start_version_is_refused() {
+        let requirements = [item(
+            "R1",
+            RequirementKind::Tests,
+            "the suite must pass",
+            Some("sh run-tests.sh"),
+        )];
+        let accounts = [account("R1", AccountStatus::Done, "call_id:legacy")];
+        let mut legacy = run("sh run-tests.sh", true, 1, "legacy");
+        legacy.started_mutation_ops = None;
+        legacy.finished_mutation_ops = None;
+        let decision = decide(&ScopeFacts {
+            requirements: &requirements,
+            accounting: Some(&accounts),
+            runs: &[legacy],
+            pending: &[],
+            mutation_ops: 1,
+            artifact: &absent,
+            literal: &unknown_literal,
+        });
+        let ScopeDecision::Refuse(message) = decision else {
+            panic!("an unknown start version cannot satisfy a tests requirement");
+        };
+        assert!(
+            message.contains("no recorded execution start version"),
+            "{message}"
         );
     }
 

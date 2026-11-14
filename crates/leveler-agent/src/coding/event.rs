@@ -200,6 +200,15 @@ impl From<AgentEvent> for EngineEvent {
                 order,
                 mutation_ops,
             },
+            A::CommandExecutionVersions {
+                call_id,
+                started_mutation_ops,
+                returned_mutation_ops,
+            } => EngineEvent::CommandExecutionVersions {
+                call_id,
+                started_mutation_ops,
+                returned_mutation_ops,
+            },
             A::ProgressUpdated { ledger } => EngineEvent::ProgressUpdated { ledger },
             A::ContextSnapshot {
                 messages,

@@ -164,8 +164,9 @@ stable id** (`requirements=[{id, status, evidence}]`):
   the last change; a different or compound line is not its record, and the
   newest matching execution is the command's current state;
 - `tests` declares its exact command in `target`; a passing recorded run of
-  that exact line after the last change satisfies the requirement. A different
-  or compound command is not its record. The declared command is the evidence
+  that exact line after the last change, whose execution started and finished
+  on one workspace version, satisfies the requirement. A different or
+  compound command is not its record. The declared command is the evidence
   contract: the runtime records that exact execution and does not read the
   runner's name, output or test count. `verified` therefore means the declared
   command contract held — the line ran and exited 0 after the last change — not
@@ -196,13 +197,29 @@ Completion has two layers, and they are different kinds of fact:
 | Layer | Source | What it establishes |
 | --- | --- | --- |
 | `update_goal(verification)` | Model declaration | Which executions the model says it ran |
-| `VerificationRun` | Runtime execution record (`ToolCallStarted` + `ToolCallFinished`, background completion) | The command, its call id, exit status, workspace version and model step |
+| `VerificationRun` | Runtime execution record (`ToolCallStarted` + `CommandExecutionVersions` + `ToolCallFinished`, background completion) | The command, its call id, exit status, the workspace version window it started and finished on, and model step |
 
 The gate resolves each citation against the record. A citation may name a
 `call_id`, the exact command line, or the command plus a trailing note; a run
 that failed, that predates the last change, or that a later run of the same
 command contradicted is refused for that exact reason. Whether a command "is a
 test runner" is never decided from its name or its output.
+
+A passing run is evidence only for the workspace version it actually covered.
+The runtime samples the mutation counter immediately before the process starts
+and again when the execution ends, and records both on the durable
+`CommandExecutionVersions` row. A run is current evidence only when its start
+and end versions are equal and at least the completion's version. A background
+task keeps running after the call that launched it, so its start version is the
+launch version and its end version is the terminal result; collecting that
+result later never re-dates the execution to the newer tree. A run whose window
+straddles a change is still a real execution with its real exit status, but it
+cannot establish the current version; the gate refuses it and asks for a rerun.
+A record written before start versions were captured keeps its real exit status
+and cannot claim version consistency — the model must run the command again.
+The mutation counter covers changes the runtime observed through tool calls;
+it is not a filesystem monitor, so an edit made outside the agent's tools does
+not advance it.
 
 An accepted completion persists a `VerificationReport` on the task terminal
 (`TaskFinished.verification`, and the same report on `TaskReport`):
@@ -214,7 +231,9 @@ An accepted completion persists a `VerificationReport` on the task terminal
     {"requirement_id": "R1", "kind": "tests", "state": "verified",
      "detail": "verified against the execution record: `make regression` exited 0 at workspace version 4",
      "call_id": "call-12", "command": "make regression", "exit_code": 0,
-     "workspace_version": 4, "model_step": 7},
+     "workspace_version": 4, "started_workspace_version": 4,
+     "finished_workspace_version": 4, "current_workspace_version": 4,
+     "model_step": 7},
     {"requirement_id": "R12", "kind": "deliverable", "state": "reported",
      "detail": "delivered on the model's account; this requirement's contract is model judgement, so no mechanical check applies",
      "workspace_version": 4, "model_step": 0}
@@ -226,9 +245,12 @@ An accepted completion persists a `VerificationReport` on the task terminal
 carries the evidence fields only when a recorded execution backed it; otherwise
 `call_id`/`command`/`exit_code` are absent and `detail` says what the runtime
 observed or could not check. `workspace_version` is the mutation counter the
-verdict was taken against, so a stale verdict is visible without replaying the
-transcript. `Verified` requires at least one owed requirement record and every
-record `verified`. For a `tests` requirement that verdict comes from the exact
+run is credited with (including a command's own reported workspace writes);
+`started_workspace_version` / `finished_workspace_version` are the execution
+window and `current_workspace_version` is the counter the completion was
+assessed against, so a stale or inconsistent verdict is visible without
+replaying the transcript. `Verified` requires at least one owed requirement
+record and every record `verified`. For a `tests` requirement that verdict comes from the exact
 declared command's current run; the record states that execution and never
 claims a test count or coverage the runtime did not observe. `Reported` means
 every mechanical check held and at least one record rests on a delivered model

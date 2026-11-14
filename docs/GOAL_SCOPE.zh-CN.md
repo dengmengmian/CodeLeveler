@@ -137,8 +137,9 @@ id，`restore` 恢复已 waived 的需求。声明按数组顺序应用，复合
 - `content` 按目标文件的一行检查；
 - `command` 必须匹配最后一次变更之后的精确命令成功运行记录；不同命令或复合
   命令行不是它的执行记录，同一命令的最新一次执行才是当前状态；
-- `tests` 在 `target` 中声明精确的测试命令；该命令在最后一次变更之后的通过
-  运行记录即满足该需求。不同命令或复合命令行不是它的记录。声明的命令就是证据
+- `tests` 在 `target` 中声明精确的测试命令；该命令在最后一次变更之后、且启动与
+  结束时处于同一工作区版本的通过运行记录，即满足该需求。不同命令或复合命令行
+  不是它的记录。声明的命令就是证据
   契约：Runtime 记录这次精确执行，不读取 runner 名称、输出或测试数量。因此
   `verified` 表示声明的命令契约成立——这一行在最后一次变更之后执行并以 0 退出
   ——不表示该命令真的执行了任何测试。历史上未带 `target` 的 `tests` 需求，
@@ -162,12 +163,23 @@ Gate 在每次完成声明时读取持久集合，因此被折叠的 transcript 
 | 层 | 来源 | 证明什么 |
 | --- | --- | --- |
 | `update_goal(verification)` | 模型声明 | 模型声称自己运行了哪些执行 |
-| `VerificationRun` | Runtime 执行记录（`ToolCallStarted` + `ToolCallFinished`、后台完成） | 命令、call id、退出状态、工作区版本与所在模型步 |
+| `VerificationRun` | Runtime 执行记录（`ToolCallStarted` + `CommandExecutionVersions` + `ToolCallFinished`、后台完成） | 命令、call id、退出状态、启动与结束时的工作区版本窗口、所在模型步 |
 
 Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命令行，或命令行加
 尾部备注；失败的运行、早于最后一次变更的运行、以及被同一命令更晚一次运行推翻
 的引用，都会按真实原因拒绝。命令「是不是测试 runner」永远不会由名称或输出
 决定。
+
+成功的运行只能证明它实际覆盖的那个工作区版本。Runtime 在进程真正启动前采样
+一次变更计数器，在执行结束时再采样一次，并把两者记录在持久化的
+`CommandExecutionVersions` 行上。只有当启动版本与结束版本相同、且不早于完成
+判定时的当前版本，该运行才是当前证据。后台任务在被启动的调用返回后仍继续
+运行，因此它的启动版本就是启动时的版本，结束版本是终态结果；稍后收取结果
+不会把这次执行改写成更新的工作区。跨过变更的运行仍是真实执行、保留真实退出
+状态，但不能证明当前版本，Gate 会拒绝并要求重新运行。在启动版本被记录之前
+写入的旧记录保留真实退出状态，但不能声称版本一致，模型必须重新运行命令。
+变更计数器覆盖 Runtime 通过工具调用观测到的改动；它不是文件系统监控，Agent
+工具之外的进程修改不会推进它。
 
 被接受的完成会在任务终态持久化一份 `VerificationReport`
 （`TaskFinished.verification`，`TaskReport` 上也是同一份）：
@@ -179,7 +191,9 @@ Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命�
     {"requirement_id": "R1", "kind": "tests", "state": "verified",
      "detail": "verified against the execution record: `make regression` exited 0 at workspace version 4",
      "call_id": "call-12", "command": "make regression", "exit_code": 0,
-     "workspace_version": 4, "model_step": 7},
+     "workspace_version": 4, "started_workspace_version": 4,
+     "finished_workspace_version": 4, "current_workspace_version": 4,
+     "model_step": 7},
     {"requirement_id": "R12", "kind": "deliverable", "state": "reported",
      "detail": "delivered on the model's account; this requirement's contract is model judgement, so no mechanical check applies",
      "workspace_version": 4, "model_step": 0}
@@ -189,9 +203,11 @@ Gate 用执行记录解析每个引用。引用可以写 `call_id`、精确命�
 
 `records` 按需求顺序、每个应交付项一条。只有真实执行记录支撑时才会出现证据
 字段；否则 `call_id`/`command`/`exit_code` 缺省，`detail` 说明 Runtime 观测到
-什么、无法检查什么。`workspace_version` 是判定针对的变更计数器，因此无需重放
-transcript 就能看出结论是否过期。`Verified` 要求至少有一条应交付项记录，且每条
-记录都是 `verified`。对 `tests` 需求，该结论来自所声明精确命令的当前运行；
+什么、无法检查什么。`workspace_version` 是该执行被计入的变更计数器（包含命令
+自己报告的写入）；`started_workspace_version` / `finished_workspace_version`
+是执行窗口，`current_workspace_version` 是完成判定时的当前计数器。因此无需
+重放 transcript 就能看出结论是否过期或版本是否一致。`Verified` 要求至少有一条
+应交付项记录，且每条记录都是 `verified`。对 `tests` 需求，该结论来自所声明精确命令的当前运行；
 记录陈述该次执行，不会声称 Runtime 未观测到的测试数量或覆盖率。`Reported`
 表示所有机械检查均通过，且至少一条记录来自已交付的模型判断。`Unverified` 表示至少一项必要事实缺失或无法确立；只有这种聚合才会
 产生证据警告。

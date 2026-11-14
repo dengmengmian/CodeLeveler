@@ -6564,6 +6564,11 @@ impl AgentHarness for Drive<'_> {
             // A non-conflicting mutation guard remains held through dispatch;
             // ownership conflicts have already been resolved by host admission.
             let mut check_start = None;
+            // The workspace version at the REAL execution boundary of this
+            // call, not when its result was observed. A background task keeps
+            // running after the call returns; its terminal result supplies the
+            // end of the window.
+            let mut execution_versions: Option<(u64, u64)> = None;
             let (
                 content,
                 is_error,
@@ -6676,6 +6681,7 @@ impl AgentHarness for Drive<'_> {
                                 (None, None)
                             };
                         let mut lines = super::dispatch::OutputLines::default();
+                        let started_mutation_ops = self.ledger.total_mutation_ops;
                         let dispatch_fut = self.executor.dispatch(
                             &admitted,
                             &mut self.modified_files,
@@ -6714,6 +6720,13 @@ impl AgentHarness for Drive<'_> {
                                 }
                             }
                         };
+                        // The call returned. Sampled BEFORE this call's own
+                        // mutation note is applied below, so the window covers
+                        // what the command itself could have observed; the
+                        // call's own reported writes are credited separately
+                        // by the existing freshness contract.
+                        execution_versions =
+                            Some((started_mutation_ops, self.ledger.total_mutation_ops));
                         // The call has returned, so every sender is gone: what
                         // is still queued is the tail of its output.
                         if let Some(rx) = output_rx.as_mut() {
@@ -6852,6 +6865,21 @@ impl AgentHarness for Drive<'_> {
                 }
             }
 
+            // The execution window of a command call is a durable fact about
+            // the workspace version it really observed. Sampled at dispatch,
+            // not when the result was later collected: a background task that
+            // outlived an edit must not inherit the newer version.
+            if let (Some((started_mutation_ops, returned_mutation_ops)), Some(_)) = (
+                execution_versions,
+                super::goal_verification::command_label(&call.name, &call.arguments),
+            ) {
+                (self.observer)(AgentEvent::CommandExecutionVersions {
+                    call_id: call.id.as_str().to_string(),
+                    started_mutation_ops,
+                    returned_mutation_ops,
+                });
+            }
+
             // The start of a background task is a durable fact in its own
             // right: the registry that hosts it is process state and dies with
             // a crash, so this row is what lets a later snapshot say the task
@@ -6929,6 +6957,8 @@ impl AgentHarness for Drive<'_> {
                             exit_code: command_facts.exit_code,
                             model_step: model_steps,
                             mutation_ops: self.ledger.total_mutation_ops,
+                            started_mutation_ops: execution_versions.map(|(start, _)| start),
+                            finished_mutation_ops: execution_versions.map(|(_, end)| end),
                             call_id: Some(call.id.as_str().to_string()),
                             check_start,
                         });
@@ -6950,6 +6980,7 @@ impl AgentHarness for Drive<'_> {
                             label,
                             task_id: command_facts.started_task.clone(),
                             call_id: Some(call.id.as_str().to_string()),
+                            started_mutation_ops: execution_versions.map(|(start, _)| start),
                             check_start,
                         });
                     if self.pending_commands.len() > MAX_PENDING_COMMANDS

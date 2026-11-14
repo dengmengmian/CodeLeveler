@@ -348,6 +348,18 @@ pub enum AgentEvent {
         order: u64,
         mutation_ops: u64,
     },
+    /// The workspace mutation versions at one command call's real execution
+    /// boundary: sampled immediately before the process was launched and
+    /// immediately after the call returned. For a background task the return
+    /// is its launch, not its exit; the task's terminal result is the end of
+    /// that execution window. Durable so a resumed window can tell which
+    /// workspace version a run started on instead of assuming the version it
+    /// happened to observe when the result arrived.
+    CommandExecutionVersions {
+        call_id: String,
+        started_mutation_ops: u64,
+        returned_mutation_ops: u64,
+    },
     /// Cross-round progress / closeout ledger (resume + engine continue).
     ProgressUpdated { ledger: ProgressLedger },
     /// The harness started an advisory (tool-free) model call during closeout —

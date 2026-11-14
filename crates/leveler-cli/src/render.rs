@@ -178,6 +178,8 @@ fn render_event_text(event: AgentEvent) {
             );
         }
         AgentEvent::RegisteredCheckStarted { .. } => {}
+        // Internal evidence plumbing; the durable event log carries it.
+        AgentEvent::CommandExecutionVersions { .. } => {}
         AgentEvent::ProgressUpdated { ledger } => {
             if ledger.closing || ledger.no_progress_streak > 0 {
                 println!(
@@ -254,7 +256,10 @@ fn render_event_text(event: AgentEvent) {
 }
 
 fn render_event_jsonl(event: AgentEvent) {
-    if matches!(event, AgentEvent::RegisteredCheckStarted { .. }) {
+    if matches!(
+        event,
+        AgentEvent::RegisteredCheckStarted { .. } | AgentEvent::CommandExecutionVersions { .. }
+    ) {
         return;
     }
     emit_jsonl(event_jsonl(event));
@@ -510,6 +515,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "intercepts": ledger.intercepts.len(),
         }),
         AgentEvent::RegisteredCheckStarted { .. } => serde_json::Value::Null,
+        AgentEvent::CommandExecutionVersions { .. } => serde_json::Value::Null,
         AgentEvent::ProgressUpdated { ledger } => serde_json::json!({
             "type": "progress_updated",
             "closing": ledger.closing,

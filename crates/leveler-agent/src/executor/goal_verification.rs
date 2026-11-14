@@ -45,7 +45,19 @@ pub struct VerificationRun {
     pub model_step: u32,
     /// Workspace version: `EvidenceLedger::total_mutation_ops` when it ran, so
     /// "after the last file change" is a comparison, not a timestamp guess.
+    /// This is the version the call is CREDITED with: for a command that
+    /// reported its own workspace writes, its own mutation note is included.
     pub mutation_ops: u64,
+    /// The workspace version at the real execution start. `None` only for a
+    /// run rebuilt from a record written before this fact existed; such a run
+    /// cannot claim version consistency.
+    pub started_mutation_ops: Option<u64>,
+    /// The workspace version when the execution ended, sampled before the
+    /// call's own mutation note (for a background task: when its terminal
+    /// result was registered). A value different from
+    /// [`Self::started_mutation_ops`] means the tree changed while the command
+    /// was running, so the run cannot establish the current version.
+    pub finished_mutation_ops: Option<u64>,
     /// The tool call that produced this run. A citation of `call_id:<id>`
     /// names this execution, not whatever later run shares the command text.
     /// `None` for a record rebuilt before call ids were stored.
@@ -259,7 +271,99 @@ pub(crate) struct PendingCommand {
     pub task_id: Option<String>,
     /// The tool call that started it, so the result can be cited by that id.
     pub call_id: Option<String>,
+    /// The workspace version when the process was launched. Its terminal
+    /// result is the end of this execution's window; the value is not copied
+    /// from the result-observation moment.
+    pub started_mutation_ops: Option<u64>,
     pub check_start: Option<RegisteredCheckStart>,
+}
+
+/// How one execution's workspace-version window stands against the tree a
+/// completion is about to judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionApplicability {
+    /// The run covered one workspace version and is not stale for the one the
+    /// completion judges. A command that reported its own workspace writes is
+    /// credited with them, so its window may end one note before the credited
+    /// version; the freshness rule below is what admits it.
+    Current,
+    /// The tree changed while the command was running. Its exit status is a
+    /// real execution fact, but it cannot establish the current version.
+    ChangedDuringRun { started: u64, finished: u64 },
+    /// The record predates durable start-version capture. The runtime cannot
+    /// establish which version the run observed; it must not guess.
+    UnknownStart,
+    /// The run finished before the tree reached its current version.
+    Stale,
+}
+
+/// The workspace-version window one run covered, when the record knows it.
+///
+/// A registered check's start version is already persisted in its own event,
+/// so it is one authoritative source rather than a duplicated field.
+pub(crate) fn execution_window(run: &VerificationRun) -> Option<(u64, u64)> {
+    let started = run
+        .started_mutation_ops
+        .or_else(|| run.check_start.as_ref().map(|start| start.mutation_ops))?;
+    Some((
+        started,
+        run.finished_mutation_ops.unwrap_or(run.mutation_ops),
+    ))
+}
+
+/// Decide whether a passed run can establish the CURRENT workspace version.
+///
+/// This is the version part of evidence applicability only. It does not judge
+/// whether the command is the right check: that is the requirement's declared
+/// target. `Stale` is the existing "ran before the last change" rule and is
+/// returned here so every consumer keeps the same order of reasons.
+pub(crate) fn version_applicability(
+    run: &VerificationRun,
+    mutation_ops: u64,
+) -> VersionApplicability {
+    // Freshness first, unchanged: a command that reported its own workspace
+    // writes is credited with them, so it is never judged against a
+    // pre-command count (F-07).
+    if run.mutation_ops < mutation_ops {
+        return VersionApplicability::Stale;
+    }
+    let Some((started, finished)) = execution_window(run) else {
+        return VersionApplicability::UnknownStart;
+    };
+    if started != finished {
+        return VersionApplicability::ChangedDuringRun { started, finished };
+    }
+    VersionApplicability::Current
+}
+
+/// The model-facing reason a run cannot establish the current workspace.
+pub(crate) fn version_refusal(run: &VerificationRun, mutation_ops: u64) -> Option<String> {
+    let execution = run
+        .call_id
+        .as_deref()
+        .map(|id| format!(" (execution `{id}`)"))
+        .unwrap_or_default();
+    match version_applicability(run, mutation_ops) {
+        VersionApplicability::Current => None,
+        VersionApplicability::ChangedDuringRun { started, finished } => Some(format!(
+            "`{}`{execution} started at workspace version {started} but finished at workspace \
+             version {finished} (current: {mutation_ops}): the workspace changed while it was \
+             running, so this execution cannot establish verification for the current workspace \
+             version. Run it again against the current workspace.",
+            run.label
+        )),
+        VersionApplicability::UnknownStart => Some(format!(
+            "`{}`{execution} has no recorded execution start version, so the runtime cannot \
+             establish which workspace version it verified (current: {mutation_ops}). Run it \
+             again against the current workspace.",
+            run.label
+        )),
+        VersionApplicability::Stale => Some(format!(
+            "`{}`{execution} verification expired: it passed before the most recent file change. \
+             Re-run it against the current workspace before marking the goal complete.",
+            run.label
+        )),
+    }
 }
 
 /// A terminal observation of one background task execution.
@@ -322,6 +426,9 @@ pub(crate) fn record_background_result(
     else {
         return false;
     };
+    let window_start = started
+        .as_ref()
+        .and_then(|start| start.started_mutation_ops);
     let call_id = started
         .and_then(|start| start.call_id)
         .or(fact.start_call_id);
@@ -338,7 +445,12 @@ pub(crate) fn record_background_result(
         ok: fact.ok && fact.evidence,
         exit_code: fact.exit_code,
         model_step,
+        // The terminal observation's version closes the execution window that
+        // the pending start opened. The start version is never replaced by
+        // this newer value.
         mutation_ops,
+        started_mutation_ops: window_start,
+        finished_mutation_ops: Some(mutation_ops),
         call_id,
         check_start,
     });
@@ -429,13 +541,11 @@ pub(crate) fn decide(
                 // A pass must judge the current tree. This applies to any cited
                 // command: the runtime does not know which commands are
                 // "verification", so it treats the model's own citation as the
-                // claim it is.
-                if run.mutation_ops < mutation_ops {
-                    return VerificationDecision::Refuse(format!(
-                        "`{cited}` verification expired: it passed before the most recent file \
-                         change. Re-run it against the current workspace before marking the goal \
-                         complete."
-                    ));
+                // claim it is. A run whose start and end saw different
+                // workspace versions cannot establish the current one even
+                // when it exited 0.
+                if let Some(reason) = version_refusal(run, mutation_ops) {
+                    return VerificationDecision::Refuse(reason);
                 }
             }
             VerificationDecision::Accept {
@@ -1106,6 +1216,8 @@ mod tests {
             exit_code: Some(if ok { 0 } else { 1 }),
             model_step: step,
             mutation_ops,
+            started_mutation_ops: Some(mutation_ops),
+            finished_mutation_ops: Some(mutation_ops),
             call_id: None,
             check_start: None,
         }
@@ -1165,6 +1277,7 @@ mod tests {
             label: pass.label.clone(),
             task_id: Some("background".into()),
             call_id: Some("pending".into()),
+            started_mutation_ops: Some(4),
             check_start: pass.check_start.clone(),
         };
         pending.check_start.as_mut().unwrap().order = 2;
@@ -1578,6 +1691,7 @@ mod tests {
             label: label.to_string(),
             task_id: Some(task_id.to_string()),
             call_id: Some(call_id.to_string()),
+            started_mutation_ops: Some(0),
             check_start: None,
         }
     }
@@ -1754,6 +1868,7 @@ mod tests {
             label: "make up CONFIG=probe.yaml".to_string(),
             task_id: Some("bg-1".to_string()),
             call_id: None,
+            started_mutation_ops: Some(0),
             check_start: None,
         }];
         let decision = decide(
@@ -1784,6 +1899,7 @@ mod tests {
             label: "go test ./... -count=1".to_string(),
             task_id: Some("host-42".to_string()),
             call_id: Some("call-start".to_string()),
+            started_mutation_ops: Some(0),
             check_start: None,
         }];
         let decision = decide(
@@ -2082,6 +2198,103 @@ mod tests {
             } => {}
             other => panic!("nothing was declared, so the boundary is unverified: {other:?}"),
         }
+    }
+
+    /// A background test's result is collected after it exits, which can be
+    /// after the model edited the tree. The exit status is real; the current
+    /// version was never established.
+    #[test]
+    fn a_run_that_finished_after_a_change_started_mid_execution_is_refused() {
+        let mut across_change = run("sh run-tests.sh", true, 3, 1);
+        across_change.started_mutation_ops = Some(0);
+        across_change.finished_mutation_ops = Some(1);
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["sh run-tests.sh".into()]),
+            &[across_change],
+            &[],
+            1,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("a run that straddled a change is not current evidence");
+        };
+        assert!(
+            message.contains("workspace changed while it was running"),
+            "{message}"
+        );
+        assert!(
+            message.contains("version 0") && message.contains("version 1"),
+            "{message}"
+        );
+    }
+
+    /// A run rebuilt from a record written before start versions existed has
+    /// a real exit status but no established start version. The runtime must
+    /// not assume the version it happened to observe when it read the result.
+    #[test]
+    fn a_run_without_a_recorded_start_version_cannot_claim_consistency() {
+        let mut legacy = run("sh run-tests.sh", true, 3, 1);
+        legacy.started_mutation_ops = None;
+        legacy.finished_mutation_ops = None;
+        let decision = decide(
+            &VerificationClaim::Passed(vec!["sh run-tests.sh".into()]),
+            &[legacy],
+            &[],
+            1,
+            true,
+        );
+        let VerificationDecision::Refuse(message) = decision else {
+            panic!("an unknown start version is not a consistency claim");
+        };
+        assert!(
+            message.contains("no recorded execution start version"),
+            "{message}"
+        );
+    }
+
+    /// The ordinary background case: started and finished on the same version
+    /// the completion judges. Nothing about this contract may make a normal
+    /// background verification produce a warning.
+    #[test]
+    fn a_background_run_on_the_current_version_is_current_evidence() {
+        let mut consistent = run("sh run-tests.sh", true, 3, 1);
+        consistent.started_mutation_ops = Some(1);
+        consistent.finished_mutation_ops = Some(1);
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec!["sh run-tests.sh".into()]),
+                &[consistent],
+                &[],
+                1,
+                true,
+            ),
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
+        );
+    }
+
+    /// A run that reported its own workspace write is credited with it, and
+    /// its start/finish window stays consistent: the F-07 contract holds.
+    #[test]
+    fn a_self_mutating_run_keeps_its_credited_freshness() {
+        let mut mutating = run("cargo fmt", true, 2, 2);
+        mutating.started_mutation_ops = Some(1);
+        mutating.finished_mutation_ops = Some(1);
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec!["cargo fmt".into()]),
+                &[mutating],
+                &[],
+                2,
+                true,
+            ),
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
+        );
     }
 
     #[test]

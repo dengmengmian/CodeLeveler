@@ -6979,3 +6979,371 @@ async fn an_over_long_acceptance_entry_names_its_length_and_limit() {
     assert!(result.contains("500"), "{result}");
     assert!(result.contains("Fix:"), "{result}");
 }
+
+/// A background verification run is evidence for the workspace version it
+/// STARTED on, not the version that happens to be current when the runtime
+/// collects its result. A test that exits 0 while the model was editing the
+/// tree cannot prove the tree the goal is about to complete on.
+///
+/// The barrier is deterministic: the background script signals that it really
+/// started, the edit waits for that signal, and the test waits for the edit.
+#[tokio::test]
+async fn a_background_test_that_ran_while_the_workspace_changed_cannot_complete_the_goal() {
+    const REQUEST: &str = "运行 sh run-tests.sh 验证结果，并在改动完成后再次验证。";
+    let barrier = tempfile::tempdir().unwrap();
+    let started = barrier.path().join("started.flag");
+    let go = barrier.path().join("go.flag");
+    let runner = format!(
+        "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ]; do\n  i=$((i+1))\n  \
+         if [ \"$i\" -gt 3000 ]; then exit 7; fi\n  sleep 0.01\ndone\nexit 0\n",
+        started.display(),
+        go.display()
+    );
+    let edit = format!(
+        "i=0; while [ ! -f '{}' ]; do i=$((i+1)); \
+         if [ \"$i\" -gt 3000 ]; then exit 7; fi; sleep 0.01; done; \
+         printf 'changed\\n' >> src.txt; : > '{}'",
+        started.display(),
+        go.display()
+    );
+    let complete = |evidence: &str| {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "测试通过",
+                "verification": {"status": "passed", "detail": "sh run-tests.sh"},
+                "requirements": [{"id": "R1", "status": "done", "evidence": evidence}]
+            }),
+        )
+    };
+    let fx = fixture_with_mode(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["sh run-tests.sh 通过"],
+                    "requirements": [{
+                        "kind": "tests",
+                        "text": "sh run-tests.sh 通过",
+                        "target": "sh run-tests.sh",
+                        "source_quote": "运行 sh run-tests.sh 验证结果"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({
+                    "program": "sh", "args": ["run-tests.sh"], "background": true
+                }),
+            ),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({"program": "sh", "args": ["-c", edit]}),
+            ),
+            Scripted::WaitLatestBackground,
+            complete("sh run-tests.sh exited 0"),
+            Scripted::run_tests(),
+            complete("the run after the edit exited 0"),
+            Scripted::Text("改动完成后重新运行了测试并通过。"),
+        ],
+        false,
+        PermissionProfile::FullAccess,
+    )
+    .await;
+    std::fs::write(fx.dir.path().join("run-tests.sh"), runner).unwrap();
+    // A git baseline is what lets the command tool report the files it
+    // changed; without one the edit would be invisible to the evidence
+    // ledger and the test would not exercise the version window at all.
+    leveler_test_support::git::init_repo(fx.dir.path());
+    std::fs::write(fx.dir.path().join("seed.txt"), "seed\n").unwrap();
+    leveler_test_support::git::run(fx.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(fx.dir.path(), &["commit", "-qm", "seed"]);
+
+    let mut refusals = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && (kind == "verification_refused" || kind == "requirements_refused")
+                {
+                    refusals.push(detail.to_string());
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        fx.dir.path().join("src.txt").is_file(),
+        "the controlled edit must really have happened: {:?}",
+        tool_results(&fx)
+    );
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the run that started before the edit must be refused exactly once: {refusals:?}"
+    );
+    assert!(
+        refusals[0].contains("sh run-tests.sh")
+            && refusals[0].contains("workspace changed while it was running"),
+        "the refusal must name the command and the version inconsistency: {}",
+        refusals[0]
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the rerun after the edit must permit completion: {report:?}"
+    );
+    let verification = report.verification.expect("an accepted completion report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified
+    );
+    let record = &verification.records[0];
+    assert!(
+        record.call_id.as_deref().is_some(),
+        "the accepted evidence names its execution: {record:?}"
+    );
+    assert_eq!(
+        record.started_workspace_version, record.finished_workspace_version,
+        "the accepted evidence must cover one workspace version: {record:?}"
+    );
+    assert_eq!(
+        record.finished_workspace_version, record.current_workspace_version,
+        "the accepted evidence must be current when the goal completes: {record:?}"
+    );
+}
+
+/// The ordinary background case must stay ordinary: a suite that starts and
+/// finishes on one workspace version satisfies its declared `tests` contract,
+/// records the window it covered, and adds no warning or extra gate.
+#[tokio::test]
+async fn a_normal_background_verification_completes_as_verified() {
+    const REQUEST: &str = "在后台运行 sh run-tests.sh 验证结果。";
+    let fx = fixture_with_mode(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["sh run-tests.sh 通过"],
+                    "requirements": [{
+                        "kind": "tests",
+                        "text": "sh run-tests.sh 通过",
+                        "target": "sh run-tests.sh",
+                        "source_quote": "在后台运行 sh run-tests.sh"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({
+                    "program": "sh", "args": ["run-tests.sh"], "background": true
+                }),
+            ),
+            Scripted::WaitLatestBackground,
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "后台测试通过",
+                    "verification": {"status": "passed", "detail": "sh run-tests.sh"},
+                    "requirements": [{
+                        "id": "R1", "status": "done",
+                        "evidence": "the background run of sh run-tests.sh exited 0"
+                    }]
+                }),
+            ),
+            Scripted::Text("后台测试已通过。"),
+        ],
+        false,
+        PermissionProfile::FullAccess,
+    )
+    .await;
+    leveler_test_support::git::init_repo(fx.dir.path());
+    std::fs::write(fx.dir.path().join("seed.txt"), "seed\n").unwrap();
+    leveler_test_support::git::run(fx.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(fx.dir.path(), &["commit", "-qm", "seed"]);
+
+    let mut refusals = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && (kind == "verification_refused" || kind == "requirements_refused")
+                {
+                    refusals.push(detail.to_string());
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(refusals.is_empty(), "{refusals:?}");
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "{report:?}"
+    );
+    assert!(
+        report.completion_warnings.is_empty(),
+        "a normal background verification must not add a warning: {report:?}"
+    );
+    let verification = report.verification.expect("an accepted completion report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified
+    );
+    let record = &verification.records[0];
+    assert_eq!(record.call_id.as_deref(), Some("call-2"));
+    assert_eq!(
+        record.started_workspace_version, record.finished_workspace_version,
+        "{record:?}"
+    );
+    assert_eq!(
+        record.finished_workspace_version, record.current_workspace_version,
+        "{record:?}"
+    );
+}
+
+/// When the version-inconsistent run cannot be replaced by a passing current
+/// run, the honest terminal is blocked — not a downgraded Reported completion
+/// and not a fabricated Verified one.
+#[tokio::test]
+async fn a_stale_background_test_without_a_valid_rerun_blocks_honestly() {
+    const REQUEST: &str = "后台运行 sh run-tests.sh，并在改动后保持测试证据有效。";
+    let barrier = tempfile::tempdir().unwrap();
+    let started = barrier.path().join("started.flag");
+    let go = barrier.path().join("go.flag");
+    let runner = format!(
+        "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ]; do\n  i=$((i+1))\n  \
+         if [ \"$i\" -gt 3000 ]; then exit 7; fi\n  sleep 0.01\ndone\nexit 0\n",
+        started.display(),
+        go.display()
+    );
+    // The edit lands, then the environment removes the declared runner: the
+    // suite that passed is stale and cannot be rerun at the current version.
+    let edit = format!(
+        "i=0; while [ ! -f '{}' ]; do i=$((i+1)); \
+         if [ \"$i\" -gt 3000 ]; then exit 7; fi; sleep 0.01; done; \
+         printf 'changed\\n' >> src.txt; rm -f run-tests.sh; : > '{}'",
+        started.display(),
+        go.display()
+    );
+    let fx = fixture_with_mode(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["sh run-tests.sh 通过"],
+                    "requirements": [{
+                        "kind": "tests",
+                        "text": "sh run-tests.sh 通过",
+                        "target": "sh run-tests.sh",
+                        "source_quote": "后台运行 sh run-tests.sh"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({
+                    "program": "sh", "args": ["run-tests.sh"], "background": true
+                }),
+            ),
+            Scripted::Tool(
+                "run_command",
+                serde_json::json!({"program": "sh", "args": ["-c", edit]}),
+            ),
+            Scripted::WaitLatestBackground,
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "测试通过",
+                    "verification": {"status": "passed", "detail": "sh run-tests.sh"},
+                    "requirements": [{
+                        "id": "R1", "status": "done",
+                        "evidence": "the background run of sh run-tests.sh exited 0"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "blocked",
+                    "blocked_kind": "external",
+                    "summary": "run-tests.sh 已被移除，无法在当前版本重新取得通过证据"
+                }),
+            ),
+        ],
+        false,
+        PermissionProfile::FullAccess,
+    )
+    .await;
+    std::fs::write(fx.dir.path().join("run-tests.sh"), runner).unwrap();
+    leveler_test_support::git::init_repo(fx.dir.path());
+    std::fs::write(fx.dir.path().join("seed.txt"), "seed\n").unwrap();
+    leveler_test_support::git::run(fx.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(fx.dir.path(), &["commit", "-qm", "seed"]);
+
+    let mut refusals = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
+                    && kind == "verification_refused"
+                {
+                    refusals.push(detail.to_string());
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the stale pass must be refused exactly once: {refusals:?}"
+    );
+    assert!(
+        refusals[0].contains("sh run-tests.sh")
+            && refusals[0].contains("workspace changed while it was running"),
+        "{refusals:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Blocked);
+    assert_eq!(report.outcome, leveler_lifecycle::TaskOutcome::Blocked);
+    assert!(
+        report.verification.is_none(),
+        "a blocked goal carries no accepted completion report: {report:?}"
+    );
+    let goals = goal_records(&fx).await;
+    assert_eq!(
+        goals[0].state,
+        leveler_storage::GoalState::Running,
+        "the unmet tests obligation keeps the goal owed: {goals:?}"
+    );
+}

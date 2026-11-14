@@ -84,6 +84,21 @@ pub struct VerificationRecord {
     /// change" is a comparison, not a timestamp guess.
     #[serde(default)]
     pub workspace_version: u64,
+    /// The workspace version the execution started on, when the runtime
+    /// recorded it. Absent when the evidence was not an execution, and on
+    /// records written before start versions were captured; such a record
+    /// never claims the version it verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_workspace_version: Option<u64>,
+    /// The workspace version the execution ended on. Different from
+    /// `started_workspace_version` means the tree changed while the command
+    /// ran; the exit status stays real, but the run does not establish the
+    /// current version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_workspace_version: Option<u64>,
+    /// The workspace version the completion was assessed against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_workspace_version: Option<u64>,
     /// The model step that ran the cited command; ordering only.
     #[serde(default)]
     pub model_step: u32,
@@ -118,6 +133,9 @@ mod tests {
                 command: Some("cargo test".to_string()),
                 exit_code: Some(0),
                 workspace_version: 2,
+                started_workspace_version: Some(2),
+                finished_workspace_version: Some(2),
+                current_workspace_version: Some(2),
                 model_step: 3,
             }],
         );

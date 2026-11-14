@@ -721,6 +721,17 @@ pub enum EngineEvent {
         order: u64,
         mutation_ops: u64,
     },
+    /// The workspace mutation versions at one command call's real execution
+    /// boundary. Written by the dispatch owner (not inferred later from the
+    /// result): a background task keeps running after this row, so its
+    /// terminal `BackgroundTaskFinished` supplies the end of the window.
+    /// Legacy records lack this row; a run without it cannot claim version
+    /// consistency.
+    CommandExecutionVersions {
+        call_id: String,
+        started_mutation_ops: u64,
+        returned_mutation_ops: u64,
+    },
     /// Cross-round progress / closeout ledger (engine continue reads last).
     ProgressUpdated {
         ledger: leveler_lifecycle::ProgressLedger,
@@ -1116,6 +1127,7 @@ impl EngineEvent {
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
             | EngineEvent::RegisteredCheckStarted { .. }
+            | EngineEvent::CommandExecutionVersions { .. }
             // Harness round-attribution fact: persisted locally for eval and
             // audit; no remote peer needs it, so it stays local.
             | EngineEvent::RuntimeInjection { .. }
@@ -1292,6 +1304,7 @@ impl EngineEvent {
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
             | EngineEvent::RegisteredCheckStarted { .. }
+            | EngineEvent::CommandExecutionVersions { .. }
             | EngineEvent::RuntimeInjection { .. }
             // Local control state. It says nothing a remote peer needs and
             // deny-by-default is the right answer for it.
