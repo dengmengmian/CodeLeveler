@@ -251,6 +251,8 @@ refuse non-FullAccess spawn with write_root=... Use FullAccess explicitly...")
 | `--version` | `1.0.26 (b1f002d75863)` |
 | ZIP | `leveler-1.0.26-windows-x64.zip`，SHA-256 `50B4973261BE7A8FEAB30528FF33865E620207FA97AB480C6FDA4A7F3FE581D2` |
 
+**最终 release 真实模型冒烟**：用候选 `leveler.exe` 在 ledger 启动，真实 provider 执行 `请只回复 OK。` → `OK`，1 s，12,388 tokens；截图 `evidence/final/final-release-model.png`。这验证了最终候选的 TUI + provider 路径，而不仅是启动/版本。
+
 启动时间（同一机器、同一尺寸 120×30、同一 audit home，`launch-case` 到首屏）：
 
 | 二进制 | 样本 | 启动 ms |
