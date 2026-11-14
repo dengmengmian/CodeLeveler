@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodeLeveler Windows 兼容性与 TUI 质量验收</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-2: #171e2c;
+    --line: #263044;
+    --text: #dbe4f0;
+    --muted: #8b98ad;
+    --accent: #5aa9ff;
+    --green: #45d483;
+    --amber: #f0b35a;
+    --red: #ff6b6b;
+    --mono: "Cascadia Mono", "Consolas", "SFMono-Regular", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(90,169,255,.12), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(69,212,131,.07), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.7 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 24px 80px; }
+  header.hero {
+    border: 1px solid var(--line);
+    background: linear-gradient(160deg, rgba(90,169,255,.10), rgba(18,23,34,.92) 45%);
+    border-radius: 18px;
+    padding: 34px 34px 28px;
+    margin-bottom: 26px;
+  }
+  .eyebrow { color: var(--accent); font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
+  h1 { margin: 8px 0 8px; font-size: clamp(26px, 4vw, 42px); line-height: 1.15; letter-spacing: -.02em; }
+  .sub { color: var(--muted); max-width: 850px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-top: 20px; color: var(--muted); font-family: var(--mono); font-size: 12.5px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+  .chip { border: 1px solid var(--line); background: var(--panel-2); color: var(--text); border-radius: 999px; padding: 4px 11px; font-size: 12.5px; }
+  .chip.green { border-color: rgba(69,212,131,.35); color: var(--green); background: rgba(69,212,131,.07); }
+  .chip.amber { border-color: rgba(240,179,90,.35); color: var(--amber); background: rgba(240,179,90,.07); }
+  .chip.red { border-color: rgba(255,107,107,.35); color: var(--red); background: rgba(255,107,107,.07); }
+  section { margin: 34px 0; }
+  h2 { font-size: 23px; margin: 0 0 14px; letter-spacing: -.01em; }
+  h3 { font-size: 17px; margin: 24px 0 10px; }
+  p { margin: 8px 0; }
+  .muted { color: var(--muted); }
+  .grid { display: grid; gap: 14px; }
+  .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 900px) { .g2, .g3, .g4 { grid-template-columns: 1fr; } }
+  .card { border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 18px; }
+  .card h3 { margin-top: 0; }
+  .stat { font-size: 28px; font-weight: 700; letter-spacing: -.02em; font-family: var(--mono); }
+  .stat.ok { color: var(--green); }
+  .stat.warn { color: var(--amber); }
+  .stat.bad { color: var(--red); }
+  .label { color: var(--muted); font-size: 12.5px; text-transform: uppercase; letter-spacing: .08em; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; vertical-align: top; padding: 11px 13px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-size: 12.5px; text-transform: uppercase; letter-spacing: .06em; background: var(--panel-2); }
+  tr:last-child td { border-bottom: 0; }
+  code, .mono { font-family: var(--mono); font-size: .92em; }
+  code { background: rgba(90,169,255,.08); border: 1px solid rgba(90,169,255,.16); padding: 1px 5px; border-radius: 5px; }
+  pre { background: #0a0d14; border: 1px solid var(--line); border-radius: 12px; padding: 15px; overflow: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; }
+  blockquote { margin: 12px 0; padding: 12px 16px; border-left: 3px solid var(--accent); background: rgba(90,169,255,.06); border-radius: 0 10px 10px 0; color: #c6d2e3; }
+  .shot { border: 1px solid var(--line); background: var(--panel); border-radius: 14px; overflow: hidden; }
+  .shot img { display: block; width: 100%; height: auto; background: #000; }
+  .shot figcaption { padding: 10px 13px; color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--line); }
+  figure { margin: 0; }
+  .ok { color: var(--green); }
+  .warn { color: var(--amber); }
+  .bad { color: var(--red); }
+  details { border: 1px solid var(--line); background: var(--panel); border-radius: 12px; padding: 12px 16px; margin: 10px 0; }
+  summary { cursor: pointer; color: var(--text); font-weight: 600; }
+  .toc { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 13px; }
+  .toc a { color: var(--muted); }
+  .toc a:hover { color: var(--accent); }
+  .divider { height: 1px; background: var(--line); margin: 28px 0; }
+  .callout { border: 1px solid rgba(240,179,90,.3); background: rgba(240,179,90,.06); border-radius: 12px; padding: 14px 16px; }
+  .callout strong { color: var(--amber); }
+  footer { color: var(--muted); font-size: 12.5px; margin-top: 44px; border-top: 1px solid var(--line); padding-top: 18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">CodeLeveler · Windows special project · 2026-11-14</div>
+  <h1>Windows 兼容性与 TUI 质量验收</h1>
+  <p class="sub">在真实 Windows 10、Windows Terminal、Console Host、PowerShell/CMD 与真实模型中完成基线测试、根因修复、回归测试和四组 dogfood。结论按可观测证据分级；未测试的环境明确标记为 NOT VERIFIED。</p>
+  <div class="meta">
+    <span>分支 <b>windows/tui-quality</b></span>
+    <span>代码提交 <b>b1f002d</b></span>
+    <span>基线 <b>99fef72 · 1.0.26</b></span>
+    <span>候选 <b>windows-audit/candidate/final/</b></span>
+  </div>
+  <div class="chips">
+    <span class="chip green">Windows 10 已测试环境 PASS</span>
+    <span class="chip amber">Windows 11 NOT VERIFIED</span>
+    <span class="chip green">Medium integrity 非提升会话 PASS</span>
+    <span class="chip amber">标准用户 NOT VERIFIED</span>
+    <span class="chip amber">macOS/Linux 真实终端 NOT VERIFIED</span>
+  </div>
+</header>
+
+<div class="toc">
+  <a href="#summary">摘要</a>
+  <a href="#env">环境</a>
+  <a href="#findings">问题与修复</a>
+  <a href="#dogfood">真实模型 Dogfood</a>
+  <a href="#tests">测试与候选</a>
+  <a href="#limits">未验证与风险</a>
+  <a href="#evidence">证据索引</a>
+</div>
+
+<section id="summary">
+  <h2>1. 结论摘要</h2>
+  <div class="grid g4">
+    <div class="card"><div class="label">TUI 回归</div><div class="stat ok">1630</div><div class="muted">passed · 0 failed · 23 ignored</div></div>
+    <div class="card"><div class="label">真实模型 Dogfood</div><div class="stat ok">A–D</div><div class="muted">修复 / Goal / 取消恢复 / 中文路径</div></div>
+    <div class="card"><div class="label">Windows 10 宿主</div><div class="stat ok">4</div><div class="muted">WT+PS/CMD · ConHost+PS/CMD</div></div>
+    <div class="card"><div class="label">代码修复</div><div class="stat">5</div><div class="muted">W01 · W03 · W04 · W07 · W09</div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card">
+      <h3 class="ok">已验证</h3>
+      <ul>
+        <li>Windows 10 Education 19045 + Windows Terminal 1.25 + PowerShell/CMD</li>
+        <li>Windows 10 + Console Host + PowerShell/CMD</li>
+        <li>80×24、100×30、120×30、130×30、133×33（最大化）resize</li>
+        <li>中文、emoji、ZWJ、组合字符、IME、Alt+V 多行粘贴</li>
+        <li>GBK/CP936 进程输出与中文错误解码</li>
+        <li>Goal/Plan/Steer/澄清/取消/退出/恢复/中文空格路径</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 class="warn">未验证 / 边界</h3>
+      <ul>
+        <li><b>Windows 11：NOT VERIFIED</b>，不得由 Windows 10 外推</li>
+        <li><b>标准用户账户：NOT VERIFIED</b>；已测试 Medium integrity、非提升令牌</li>
+        <li><b>macOS/Linux 真实终端：NOT VERIFIED</b></li>
+        <li>ConHost 默认字体缺 <code>⑂</code>；U+00B7 在长样式行按宽字形绘制</li>
+        <li>Windows Terminal 原生 Ctrl+V 丢失换行/非 BMP emoji；Alt+V 为应用层替代</li>
+        <li>中文/空格仓库默认 target dir 下 MinGW ld 失败；需无空格 target-dir</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="env">
+  <h2>2. 环境</h2>
+  <table>
+    <tr><th>项</th><th>值</th></tr>
+    <tr><td>OS</td><td>Windows 10 Education 10.0.19045，build 19045；LENOVO 20UFA008CD</td></tr>
+    <tr><td>终端宿主</td><td>Windows Terminal 1.25.3131.0；Console Host 10.0.19041.4522</td></tr>
+    <tr><td>Shell</td><td>PowerShell 5.1.19041.5486；CMD 10.0.19045.5487</td></tr>
+    <tr><td>工具链</td><td>rustc 1.90.0；cargo 1.90.0；MinGW-Builds GCC 16.2.0</td></tr>
+    <tr><td>显示 / 代码页</td><td>1920×1080 @150%（144 dpi 物理）；console CP 65001，OEM/ACP 936</td></tr>
+    <tr><td>权限</td><td>Medium integrity，<code>admin=False</code>，Administrators 为 deny-only（非提升）</td></tr>
+    <tr><td>模型</td><td><code>deepseek/deepseek-v4.1-flash-1017</code>（OpenAI-compatible relay；密钥未记录）</td></tr>
+  </table>
+  <p class="muted">未修改系统区域/代码页/字体/注册表/安全策略/终端设置/用户账户；未 push、未打 tag、未发布。</p>
+</section>
+
+<section id="findings">
+  <h2>3. 问题与修复</h2>
+
+  <h3>W01 · Console Host 空闲提示缺 <code>文</code></h3>
+  <p><b>基线：</b>Windows Terminal 完整；Console Host 显示 <code>@ 件</code>。原生 <code>Write-Host "@ 文件"</code> 正常，排除字体缺字。</p>
+  <p><b>根因：</b>独立 ratatui/crossterm 探针证明，长样式行中的 U+00B7 <code>·</code> 被 ConHost 按宽字形绘制，但布局只计 1 列；累计偏移后后续 CJK 字形被空格覆盖。改为 <code>|</code> 或只替换第一个 <code>·</code> 即恢复完整。</p>
+  <p><b>修复：</b>Windows 空闲提示使用 <code> | </code>；非 Windows 保留 <code> · </code>。新增 Windows 断言。</p>
+  <pre>/ 命令 | ! Shell | @ 文件 | Shift+Tab 权限 | Alt+V 粘贴 | Ctrl+? 快捷键</pre>
+  <div class="grid g2">
+    <figure class="shot"><a href="evidence/final/w01-conhost-before.png"><img src="evidence/final/w01-conhost-before-crop.png" alt="Console Host 修复前"></a><figcaption>修复前：长样式提示中的 CJK 字形被掩盖（点击查看完整窗口）。</figcaption></figure>
+    <figure class="shot"><a href="evidence/final/w01-conhost-fixed.png"><img src="evidence/final/w01-conhost-fixed-crop.png" alt="Console Host 修复后空闲提示"></a><figcaption>修复后：<code>@ 文件</code> 完整；默认字体仍缺 <code>⑂</code>，分支文本可见（点击查看完整窗口）。</figcaption></figure>
+  </div>
+  <details>
+    <summary>W01 独立 ConHost 探针证据</summary>
+    <div class="grid g3" style="margin-top:12px">
+      <figure class="shot"><img loading="lazy" src="evidence/final/w01-probe-style-matrix.png" alt="样式矩阵探针"><figcaption>样式/分隔符矩阵：只有含 <code>·</code> 的长样式行缺字。</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="evidence/final/w01-probe-separators.png" alt="分隔符探针"><figcaption>分隔符对照：<code>|</code>/<code>-</code>/空格正常。</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="evidence/final/w01-native-text.png" alt="原生文本探针"><figcaption>原生 <code>Write-Host</code> 完整：不是字体缺字。</figcaption></figure>
+    </div>
+  </details>
+
+  <h3>W02 / W06 · 布局、resize、滚动与残影</h3>
+  <p>实测 <code>120×30 → 80×24 → 100×30 → 130×30 → 133×33 → 120×30</code>；TUI 日志确认收到真实 cells 尺寸。80×24 压缩布局、隐藏 mascot、footer 不溢出；最大化后回到 120×30 无可见残影。</p>
+  <div class="grid g3">
+    <figure class="shot"><img src="evidence/final/w06-80x24.png" alt="80x24"><figcaption>80×24：紧凑布局，mascot 正确隐藏。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w06-130x30.png" alt="130x30"><figcaption>130×30：宽屏布局。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w06-maximized.png" alt="最大化"><figcaption>最大化 133×33。</figcaption></figure>
+  </div>
+
+  <h3>W03 · 欢迎吉祥物与无块状回退</h3>
+  <div class="grid g2">
+    <div>
+      <p>删除 <code>brand.rs</code> 与块状字符画回退；无原生图片时欢迎页只显示文本并回收列宽。Windows Terminal 通过 <code>WT_SESSION</code> + DA1 <code>ESC[?61;4;...c</code> 双重确认 Sixel；探针有界（150 ms），源图最大 512 px；Sixel 清理不越界发送。</p>
+      <p>ConHost 无 Sixel 时隐藏图片；80×24 高度不足时隐藏图片且不留块状占位。</p>
+    </div>
+    <figure class="shot"><img src="evidence/final/welcome-sixel.png" alt="Windows Terminal Sixel 吉祥物"><figcaption>Windows Terminal：真实 Sixel 3D 吉祥物。</figcaption></figure>
+  </div>
+
+  <h3>W04 · 友好路径展示</h3>
+  <p>新增 <code>leveler-core::path::display_path</code>：仅展示层去掉 <code>\\?\</code>（drive/UNC），保留 device/incomplete 路径；操作路径、身份校验与子进程参数不变。接入 doctor、状态行、外部会话 cwd、工具摘要、完整输出错误、skills/problem、导出 toast。</p>
+  <div class="grid g2">
+    <div>
+      <blockquote>doctor 实际输出：<code>repo: C:\...</code>、<code>config: C:\...</code>；测试覆盖 <code>\\?\C:\</code>、<code>\\?\UNC\</code>、<code>Volume{...}</code>、<code>GLOBALROOT</code>、不完整路径与普通路径。</blockquote>
+      <p class="muted">观察（未作为 W08 依据）：CLI <code>doctor</code> 在该测试 shell 的默认 sandbox 工具探测中报告 git/cargo 不在 PATH，而 <code>where.exe</code> 能看到两者；TUI full-access 工具与 dogfood 的 cargo/git 调用均成功。疑似 low-integrity sandbox 探测，未在本次 TUI 修复范围内继续定位。</p>
+    </div>
+    <figure class="shot"><img src="evidence/final/w08-final-chinese.png" alt="最终 release 从中文空格路径启动"><figcaption>最终 release 从中文/空格路径启动：header 完整显示 <code>中文 项目</code>，Sixel 吉祥物正常。</figcaption></figure>
+  </div>
+
+  <h3>W07 · 输入、IME、快捷键与粘贴</h3>
+  <div class="grid g3">
+    <figure class="shot"><img src="evidence/final/w07-ime2-committed.png" alt="IME 提交"><figcaption>Sogou IME 候选提交为 <code>你好</code>。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w07-altv-paste-multiline.png" alt="Alt+V 多行粘贴"><figcaption>Alt+V：多行与非 BMP emoji 完整保留，未提交。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w07-sessions.png" alt="会话列表"><figcaption>Alt+1 历史会话；会话可恢复。</figcaption></figure>
+  </div>
+  <p>Windows Terminal 原生 Ctrl+V 会把换行变为 Enter、非 BMP emoji 变为 <code>?</code>；剪贴板本身正确。这是宿主输入限制，不是 CodeLeveler 剪贴板读取；Alt+V 为应用层替代，已写入 USAGE。</p>
+
+  <h3>W09 · Windows 控制台代码页解码</h3>
+  <div class="grid g2">
+    <div>
+      <p>合法 UTF-8 原样返回；Windows 非法 UTF-8 使用 <code>GetConsoleOutputCP()</code>，当其为 0/65001 时回退 <code>GetOEMCP()</code>，再用 <code>MultiByteToWideChar</code> 两阶段解码。接入模型工具实时/最终输出、后台日志、用户 shell 完成捕获和 TUI 完整输出。</p>
+      <p>用户 shell 保留原始 <code>combined.log</code> 为权威，另写解码 <code>combined.utf8.log</code>；TUI 优先读取 UTF-8 sidecar。</p>
+    </div>
+    <figure class="shot"><img src="evidence/final/w09-powershell-output.png" alt="中文 cmd 错误解码"><figcaption>cmd 中文错误正确显示，不再是 <code>�</code>/<code>◆</code>。</figcaption></figure>
+  </div>
+  <div class="grid g2" style="margin-top:14px">
+    <figure class="shot"><img src="evidence/final/w09-unicode-output.png" alt="中文输出"><figcaption><code>echo 中文测试</code> 输出正确。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w13-shell-background-real.png" alt="后台任务"><figcaption>用户 shell 30.6 s 后台任务；完成后可查看结果。</figcaption></figure>
+  </div>
+
+  <h3>W08 · 四种宿主/Shell 组合</h3>
+  <div class="grid g3">
+    <figure class="shot"><img src="evidence/final/w08-wt-ps.png" alt="WT + PowerShell"><figcaption>Windows Terminal + PowerShell。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w08-conhost-ps.png" alt="ConHost + PowerShell"><figcaption>Console Host + PowerShell。</figcaption></figure>
+    <figure class="shot"><img src="evidence/final/w08-conhost-cmd.png" alt="ConHost + CMD"><figcaption>Console Host + CMD。</figcaption></figure>
+  </div>
+</section>
+
+<section id="dogfood">
+  <h2>4. 真实模型 Dogfood</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>A · ledger：修复 + CLI + 测试 + diff</h3>
+      <p class="mono">d7f63991-026b-42ae-9c4d-0480e403c5b8</p>
+      <p>59 s · 10 轮 · 22 工具 · 209,369 tokens（TUI）。模型提交 Goal，Plan 完成；首次目标收尾被运行时以“条件尚未全部满足”拦截，修正 R3 后重新提交成功。</p>
+      <p><b>独立验证：</b>cargo test 6 passed；report 成功路径 <code>from=70 to=50</code> exit 0；同账户/非正金额/余额不足均 stderr + exit 1；测试文件未修改。</p>
+    </div>
+    <figure class="shot"><img src="evidence/dogfood/a-04-progress.png" alt="Dogfood A Goal 与工具"><figcaption>A：Goal 提交、工具执行与 Plan 状态。</figcaption></figure>
+  </div>
+
+  <div class="grid g2" style="margin-top:14px">
+    <figure class="shot"><img src="evidence/dogfood/b-05-steer-typed.png" alt="Dogfood B Steer"><figcaption>B：运行中 Steer 已输入，footer 显示“Tab 当前完成后处理”。</figcaption></figure>
+    <div class="card">
+      <h3>B · inventory：/goal、5 步 Plan、Steer、澄清</h3>
+      <p class="mono">31dbe065-cee7-4e26-98b9-9762f8c0ba23</p>
+      <p>2 m 47 s · 19 轮 · 33 工具 · 499,943 tokens。Plan 从 2/5 到 5/5；Steer 显示“已保存 · 等待投递”，模型确认“收到补充要求，我记入范围”；<code>cargo fmt --check</code> 既有测试文件差异通过澄清面板询问，用户选择保持原样。</p>
+      <p><b>运行时纪律：</b>最终“已完成，但有警告”；运行时不把命令 exit 0 当作测试覆盖，fmt 与中文总结同样标记未机械验证。</p>
+      <p><b>独立验证：</b>cargo test 6 passed；serial 6 passed；仅 <code>src/lib.rs</code> 改动 75+/5-；测试文件未修改。</p>
+    </div>
+  </div>
+  <div class="grid g2" style="margin-top:14px">
+    <figure class="shot"><img src="evidence/dogfood/b-08-plan3.png" alt="Dogfood B Plan 4/5"><figcaption>B：专用 Plan 行 4/5 与澄清选择。</figcaption></figure>
+    <figure class="shot"><img src="evidence/dogfood/b-15-finalizing.png" alt="Dogfood B warning"><figcaption>B：运行时的“已完成，但有警告”与逐条未验证声明。</figcaption></figure>
+  </div>
+
+  <div class="grid g2" style="margin-top:14px">
+    <figure class="shot"><img src="evidence/dogfood/c-03-cancelled.png" alt="Dogfood C 取消"><figcaption>C：Esc 取消，Goal 暂停，可继续输入。</figcaption></figure>
+    <figure class="shot"><img src="evidence/dogfood/c-08-resumed.png" alt="Dogfood C 恢复"><figcaption>C：退出后按 session 恢复；取消 recap 与下一步建议。</figcaption></figure>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <h3>C · Goal 取消、退出、恢复、继续</h3>
+    <p class="mono">efe53fa9-ca34-4d33-b35e-28608adb7f15</p>
+    <p>11 s 时 Esc 取消（1 轮/4 工具）→ Ctrl+C 退出 → <code>--session</code> 恢复 → 发送“继续完成 CLI 任务” → 46 s、6 轮、8 工具、136,183 tokens 后完成 CLI 与 14 个契约测试。独立验证 cargo test 20 passed。恢复后的 Goal 没有 owed requirement，运行时如实给出未验证警告。</p>
+  </div>
+
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card">
+      <h3>D · 中文/空格路径</h3>
+      <p>仓库 <code>...\dogfood\中文 项目</code>；33 s · 8 轮 · 11 工具 · 158,706 tokens。TUI 标题完整显示 <code>中文 项目</code>；<code>Get-Content -LiteralPath '数据 示例.txt'</code> 正常，内容无乱码；修复 <code>formal_greeting</code> 并更新中文文档。</p>
+      <p><b>独立验证：</b>默认 target dir 下 MinGW ld 对中文/空格路径报找不到 object 文件（exit 101）；改用无空格 <code>--target-dir</code> 后 2 tests passed。属于工具链限制，不是 CodeLeveler 文件 I/O 失败。</p>
+    </div>
+    <figure class="shot"><img src="evidence/dogfood/d-05-complete.png" alt="Dogfood D 完成"><figcaption>D：中文项目完成总结、测试与 diff；header 显示中文仓库名。</figcaption></figure>
+  </div>
+  <div class="grid g3" style="margin-top:14px">
+    <figure class="shot"><img src="evidence/dogfood/a-02-thinking.png" alt="思考/流式"><figcaption>A：真实思考/流式状态。</figcaption></figure>
+    <figure class="shot"><img src="evidence/dogfood/c-11-writing.png" alt="恢复后写文件"><figcaption>C：恢复后继续写 CLI 与测试。</figcaption></figure>
+    <figure class="shot"><img src="evidence/dogfood/d-03-working.png" alt="中文文档 diff"><figcaption>D：Markdown diff 与中文文档更新。</figcaption></figure>
+  </div>
+</section>
+
+<section id="tests">
+  <h2>5. 测试、候选与性能</h2>
+  <table>
+    <tr><th>范围</th><th>结果</th></tr>
+    <tr><td><code>cargo test -p leveler-tui --lib</code></td><td class="ok">1630 passed, 0 failed, 23 ignored</td></tr>
+    <tr><td><code>cargo test -p leveler-app --lib user_shell</code></td><td class="ok">11 passed</td></tr>
+    <tr><td><code>cargo test -p leveler-app --test execution_ownership user_shell</code></td><td class="bad">2 failed（Windows + Assisted：FS sandbox unsupported，exit_code=None）</td></tr>
+    <tr><td><code>cargo test -p leveler-execution --lib encoding::</code></td><td class="ok">2 passed</td></tr>
+    <tr><td><code>cargo check -p leveler-core -p leveler-execution -p leveler-app -p leveler-cli -p leveler-tui</code></td><td class="ok">pass</td></tr>
+    <tr><td><code>cargo fmt -p ... -- --check</code></td><td class="ok">pass</td></tr>
+    <tr><td>最终 release build</td><td class="ok">exit 0 · 14m51s（首次）；提交后重建见候选包</td></tr>
+    <tr><td>已知警告</td><td class="warn">leveler-execution/src/execution_host.rs:2184 既有 unused <code>exited</code>；本次未触达</td></tr>
+  </table>
+  <div class="callout" style="margin-top:12px">
+    <p><strong>两个 app 集成测试失败（平台缺口）：</strong> <code>execution_ownership</code> 的用户 shell 用例固定使用 <code>PermissionProfile::Assisted</code>；Windows 上 FS sandbox 能力为 <code>unsupported</code>，运行时按契约拒绝非 FullAccess spawn，<code>exit_code=None</code>。运行时的拒绝是正确的（不静默降权）；TUI FullAccess 用户 shell 与 dogfood 已通过。该路径不在本次 TUI/编码 diff 中，未在基线复跑，也未修改产品权限模型。</p>
+  </div>
+
+  <h3>最终候选</h3>
+  <table>
+    <tr><th>项</th><th>值</th></tr>
+    <tr><td>leveler.exe size</td><td>65,718,784 bytes (62.7 MiB)</td></tr>
+    <tr><td>leveler.exe SHA-256</td><td class="mono">EBC466872EB711CD4938F43A4D9F7AFFD9A80BFA03B54781ED79C32329D4F8F3</td></tr>
+    <tr><td>leveler-confine.exe SHA-256</td><td class="mono">F7FBFFC81FCF2FD435332EFEDA864F9603E1B1682C1BEE2E78E33CDE7E61845F</td></tr>
+    <tr><td><code>--version</code></td><td>1.0.26 (b1f002d75863)</td></tr>
+    <tr><td>ZIP</td><td class="mono">leveler-1.0.26-windows-x64.zip · SHA-256 50B4973261BE7A8FEAB30528FF33865E620207FA97AB480C6FDA4A7F3FE581D2</td></tr>
+  </table>
+
+  <h3>启动与内存</h3>
+  <table>
+    <tr><th>二进制</th><th>样本</th><th>启动 ms</th></tr>
+    <tr><td>baseline release（99fef72）</td><td>2 runs: 1244 / 761 ms</td><td>median 1003 ms</td></tr>
+    <tr><td>final release（b1f002d）</td><td>3 runs: 907 / 922 / 850 ms</td><td>median 907 ms</td></tr>
+    <tr><td>final + 205k-token 长会话</td><td>1 run: 825 ms</td><td>825 ms</td></tr>
+  </table>
+  <p class="muted">baseline WS 22.9 / 23.1 MB，private 8.6 / 8.9 MB；final WS 26.8 MB，private 11.1–11.4 MB；final + 长会话 WS 62.2 MB，private 42.6 MB；空闲 2 s CPU 0%（单核）</p>
+  <p class="muted">方法：同一机器、同一 120×30 窗口、同一 audit home；以 TUI 首次设置标题为 first paint，启动时间从 TUI 进程创建到该时刻；final 含 Sixel 检测/图片路径。样本量小，用于发现数量级回归。原始值：<a href="evidence/perf/release-startup.csv">release-startup.csv</a>、<a href="evidence/perf/final-long.csv">final-long.csv</a>。</p>
+  <p class="muted">CLI <code>doctor</code> 在该测试 shell 的默认 sandbox 工具探测中报告 git/cargo 不在 PATH，而 <code>where.exe</code> 可见；TUI full-access 工具与 dogfood cargo/git 调用均成功。该探测未作为 W08 依据，疑似 low-integrity sandbox 行为。</p>
+</section>
+
+<section id="limits">
+  <h2>6. 未验证与剩余风险</h2>
+  <div class="callout">
+    <p><strong>Windows 11：NOT VERIFIED。</strong> 本次没有 Windows 11 实机；Windows 10 的宿主/字体/ConPTY 结论不得直接外推到 Windows 11。</p>
+    <p><strong>标准用户账户：NOT VERIFIED。</strong> 当前是 Medium integrity、<code>admin=False</code>、Administrators deny-only 的非提升会话；标准用户/受限令牌未单独验证。</p>
+    <p><strong>macOS/Linux 真实终端：NOT VERIFIED。</strong> 相关代码有平台分支与非 Windows lossy 测试，但本机无宿主可运行真实回归。</p>
+  </div>
+  <ul>
+    <li>其他宿主（VS Code、Tabby、ConEmu、SSH/PTY）未验证。</li>
+    <li>App 集成测试平台缺口：<code>execution_ownership</code> 用户 shell 用例在 Windows + Assisted 下因 FS sandbox <code>unsupported</code> 被运行时拒绝（正确拒绝，不静默降权）；TUI FullAccess 用户 shell 已验证。</li>
+    <li>ConHost 默认字体缺 <code>⑂</code>；U+00B7 在长样式行按宽字形绘制。已修复空闲提示的可复现案例，未声称修复所有宿主字体/宽度问题。</li>
+    <li>Windows Terminal 原生 Ctrl+V 丢失换行/非 BMP emoji；Alt+V 为应用层替代。</li>
+    <li>中文/空格仓库默认 target dir 下 MinGW ld 失败；无空格 target-dir 通过。属于工具链限制。</li>
+    <li>真实模型单次 dogfood，存在模型/温度/网络波动；运行时的警告是证据纪律，不是兜底。</li>
+    <li>截图右下角 Windows 激活水印是环境 artifact，不是 TUI 内容。</li>
+    <li>未 push、未打 tag、未发布；无远端变更。</li>
+  </ul>
+</section>
+
+<section id="evidence">
+  <h2>7. 证据索引</h2>
+  <details open>
+    <summary>核心截图</summary>
+    <div class="grid g3" style="margin-top:12px">
+      <figure class="shot"><img loading="lazy" src="evidence/baseline/wt-120x30-welcome.png" alt="基线欢迎页"><figcaption>基线：WT 欢迎页（块状 logo）。</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="evidence/final/welcome-sixel.png" alt="最终欢迎页"><figcaption>最终：WT Sixel 吉祥物。</figcaption></figure>
+      <figure class="shot"><img loading="lazy" src="evidence/final/w01-conhost-fixed.png" alt="ConHost 修复"><figcaption>最终：ConHost 中文提示完整。</figcaption></figure>
+    </div>
+  </details>
+  <details>
+    <summary>Dogfood 原始证据</summary>
+    <ul>
+      <li><a href="evidence/logs/session-a-show.txt">Dogfood A session show</a>；<a href="evidence/logs/trace-a.json">trace JSON</a></li>
+      <li><a href="evidence/logs/session-b-show.txt">Dogfood B session show</a>；<a href="evidence/logs/session-c-show.txt">Dogfood C session show</a>；<a href="evidence/logs/session-d-show.txt">Dogfood D session show</a></li>
+      <li><a href="evidence/logs/w06-resize-events.log">resize 原始事件日志</a></li>
+      <li><a href="evidence/logs/d-default-target.log">中文路径默认 target 失败日志</a>；<a href="evidence/logs/d-nospace-target.log">无空格 target 通过日志</a></li>
+      <li><a href="evidence/env/environment.txt">环境原始记录</a></li>
+    </ul>
+  </details>
+  <details>
+    <summary>复现入口</summary>
+    <pre>windows-audit\scripts\run-tui.cmd &lt;repo&gt;
+# 审计工作区脚本，不提交仓库；真实窗口捕获与输入自动化</pre>
+  </details>
+  <p class="muted">所有截图来自真实 Windows 窗口捕获；未使用 mock、脚本伪造或合成 UI。模型输出与运行时警告保留原文；独立测试结果见第 4、5 节。</p>
+</section>
+
+<footer>
+  CodeLeveler Windows 兼容性与 TUI 质量专项 · 2026-11-14 · branch <span class="mono">windows/tui-quality</span> · commit <span class="mono">b1f002d</span><br>
+  结论边界：Windows 10 已测试环境 PASS；Windows 11 / 标准用户 / macOS-Linux 真实终端 NOT VERIFIED。未 push、未打 tag、未发布。
+</footer>
+
+</div>
+</body>
+</html>

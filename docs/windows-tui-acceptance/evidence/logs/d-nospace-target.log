@@ -1,0 +1,31 @@
+﻿cargo :    Compiling greeter v0.1.0 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audi
+t\dogfood\中文 项目)
+At line:1 char:1001
++ ... th $env:TMP 'zh-target'; cargo test --target-dir $target 2>&1 | Tee-O ...
++                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling gr...\dogfood\中文 项目):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running unittests src\lib.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\tmp\zh-target\
+debug\deps\greeter-3dc708d8263b1642.exe)
+
+running 1 test
+test tests::informal_greeting_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\formal.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\tmp\zh-target\debug
+\deps\formal-bf3ca5e531f81317.exe)
+
+running 1 test
+test formal_greeting_uses_full_width_punctuation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests greeter
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
