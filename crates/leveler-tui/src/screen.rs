@@ -55,9 +55,9 @@ pub enum Screen {
     /// management API — list, detail, create/edit, pause, run now, history,
     /// grant and OS wakeup. The runtime owns every definition and run.
     Schedules,
-    /// `/memory`: durable cross-session memory. A searchable file list beside
-    /// a bounded, read-only preview; the runtime owns the store, the capture
-    /// queue and every tombstone.
+    /// `/memory`: a centered overlay over the conversation. Both scopes share
+    /// one grouped list beside a bounded, read-only Markdown preview; the
+    /// runtime owns the store, the capture queue and every tombstone.
     Memory,
     /// Complete output of a finished local command. File-backed and windowed:
     /// the page paints only the visible rows, so a 50 MiB result costs the

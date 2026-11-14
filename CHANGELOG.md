@@ -5,6 +5,9 @@
 ## [Unreleased]
 
 - Completion verification now has an explicit evidence policy per requirement kind. A `named` deliverable is model judgement: a delivered `done` account is recorded as `reported` and completes normally, with no "no mechanical check" warning. A passing recorded run of a declared `tests`/`command` satisfies it only when that run is the exact declared command and is the newest matching execution; a different or compound line is not its record. For `tests`, `verified` is the declared command contract — the line ran and exited 0 after the last change — not a claim that the command executed tests. Requirements that need evidence the runtime cannot obtain stay `unverified` and keep their warning.
+- Memory is on by default: an absent `[memory]` section resolves to `rollout = "active"`, and `rollout = "off"` is the explicit opt-out. Docs, CLI status and the TUI empty state follow the resolved rollout.
+- Editing `[memory]` is a live configuration change. The config diff now classifies `memory` / `memory_model` as real dimensions, and a reload publishes the freshly parsed bundle instead of the previous one — a memory-only edit can no longer be mistaken for a comment and freeze the boot-time rollout (previously `/memory` kept reporting "not enabled" until the process restarted).
+- `/memory` opens as a centered overlay over the conversation: Global and Workspace grouped in one list, a live Markdown preview, search, `Ctrl+F` fullscreen, and the existing management keys. The off state names the config file the runtime actually loaded instead of a hard-coded path.
 - Background task display: starting a task no longer posts a second notice next to the tool row, and a failed task is a record in the conversation and the jobs page instead of a footer reminder that needs acknowledging. The running-count cell counts only tasks that are running now.
 
 ## [1.0.27] - 2026-11-14
