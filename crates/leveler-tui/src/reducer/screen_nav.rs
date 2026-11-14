@@ -359,22 +359,10 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             KeyCode::Up | KeyCode::Char('k') => crate::issue::move_selection(state, -1),
             KeyCode::Down | KeyCode::Char('j') => crate::issue::move_selection(state, 1),
             // Enter is the same interaction as clicking the row: select and
-            // expand/collapse in place. The task's own page stays behind the
-            // expanded row's explicit detail entry, so Enter never jumps.
+            // expand/collapse in place.
             KeyCode::Enter => crate::issue::toggle_expanded(state),
-            // The detail entry is a control the page paints, so the keyboard
-            // reaches it too: `→` enters the selected expanded row's detail and
-            // `←` collapses it — the same one-level pair the header's `←`
-            // glyph and Esc run. A row with no painted entry has no binding.
-            KeyCode::Right => {
-                let entry = crate::issue::selected_issue(state).filter(|issue| {
-                    issue.kind == crate::issue::IssueKind::BackgroundFailure
-                        && crate::issue::is_expanded(state, &issue.key)
-                });
-                if let Some(issue) = entry {
-                    return open_issue_detail(state, &issue.key);
-                }
-            }
+            // `←` collapses the open row — the same one-level pair the
+            // header's `←` glyph and Esc run.
             KeyCode::Left => {
                 crate::issue::collapse_selected(state);
             }
@@ -587,22 +575,6 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
     Vec::new()
 }
 
-/// Enter the task detail a selected issue row advertises.
-///
-/// This is the ONE action behind both the mouse's click on the row's
-/// `查看任务详情 ↗` entry and the keyboard's `→`, so the two inputs can never
-/// diverge. The opener records where the detail returns to — the detail itself
-/// never guesses its parent. (`activity::open` resets the field, so the record
-/// must come after it.)
-pub(super) fn open_issue_detail(state: &mut AppState, key: &str) -> Vec<Effect> {
-    let effects = crate::activity::open(
-        state,
-        crate::activity::ActivityId::Background(key.to_string()),
-    );
-    state.detail_return = Some(Screen::Issue);
-    effects
-}
-
 /// Keyboard and mouse share the same live-state check and runtime command.
 /// Sending the intent never manufactures a terminal state in the client.
 pub(super) fn cancel_background_task(state: &AppState, task_id: &str) -> Vec<Effect> {
@@ -619,21 +591,15 @@ pub(super) fn cancel_background_task(state: &AppState, task_id: &str) -> Vec<Eff
     })]
 }
 
-/// Open the Issue page with its first active issue selected, acknowledging the
-/// failures this visit actually shows.
+/// Open the Issue page with its first active issue selected.
 ///
-/// The acknowledgement is a snapshot taken here, before the page is painted:
-/// a failure that arrives while the page is open was not part of what the user
-/// came to see and stays unread (it still reminds when the page is left). The
-/// failed turn is never acknowledged — it is a persistent fault, and only the
-/// runtime's own status leaving `Error` clears it. Closing the page clears
-/// nothing: records, exit codes and output all stay.
+/// Closing the page clears nothing: a failed turn and a version mismatch are
+/// cleared only by their own facts (a later turn, a matching build).
 pub(super) fn open_issue_screen(state: &mut AppState) {
     if crate::issue::issue_summary(state).is_empty() {
         return;
     }
     crate::issue::ensure_selection(state);
-    crate::activity::acknowledge_failures(state);
     state.active_screen = crate::screen::Screen::Issue;
     state.screen_scroll = 0;
     // Forget where the cursor sat on the previous visit, so the first frame

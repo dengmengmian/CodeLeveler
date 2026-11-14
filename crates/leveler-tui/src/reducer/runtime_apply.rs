@@ -1277,6 +1277,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // not a new task: it refreshes the live entry silently. It never
             // turns a settled task back into a running one — a reused id is
             // an identity conflict, not a resurrection.
+            //
+            // The start is already recorded by the conversation row (the
+            // tool result names this task id) and by the strip's running
+            // count. A second notice here would repeat the same fact.
             match state.background_task_labels.get_mut(&task_id) {
                 Some(chrome) => {
                     if chrome.is_running() {
@@ -1289,16 +1293,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                         task_id.clone(),
                         crate::state::BackgroundTaskChrome {
                             pid,
-                            ..crate::state::BackgroundTaskChrome::running(
-                                label.clone(),
-                                state.elapsed_secs,
-                            )
+                            ..crate::state::BackgroundTaskChrome::running(label, state.elapsed_secs)
                         },
                     );
-                    state.notification = Some(Notification {
-                        level: NotificationLevel::Info,
-                        message: state.t().background_task_started.replace("{}", &label),
-                    });
                 }
             }
         }
@@ -1461,10 +1458,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     Some(NotificationLevel::Info),
                 )
             } else {
-                // A failure is not a transient notice: it becomes an ACTIVE
-                // issue (the strip's issue cell and its page) and the task's
-                // own row/output keep the evidence. A banner repeating the
-                // command and exit code was the third surface for one fact.
+                // A failure is a record, not a notice: the task's own row,
+                // its output and the jobs list keep the evidence. Repeating
+                // the command and exit code in a banner was the second
+                // surface for one fact.
                 let failed = t.background_task_failed.replace("{}", &label);
                 let message = match exit_code {
                     Some(code) => format!("{failed} · exit {code}"),
