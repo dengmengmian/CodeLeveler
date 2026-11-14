@@ -254,12 +254,14 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             model_steps,
             modified_files,
             transcript_ordinal,
+            verification,
         } => AgentEvent::DeliveryCommitted {
             text,
             stop,
             model_steps,
             modified_files,
             transcript_ordinal,
+            verification,
         },
         EngineEvent::RunFinished { text } => AgentEvent::Finished(text),
         // Engine lifecycle & strategy events: persisted; engine-aware
@@ -1347,6 +1349,7 @@ mod tests {
                 model_steps: 3,
                 modified_files: vec!["src/main.rs".into()],
                 transcript_ordinal: Some(7),
+                verification: None,
             },
             &mut observer,
         );

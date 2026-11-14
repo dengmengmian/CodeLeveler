@@ -957,6 +957,8 @@ pub struct UiText {
 
     // Final status (turn closeout)
     pub final_completed: &'static str,
+    pub final_completed_partially_unverified: &'static str,
+    pub final_unverified_more: &'static str,
     pub final_completed_warnings: &'static str,
     pub final_waiting_confirmation: &'static str,
     pub final_blocked: &'static str,
@@ -2572,6 +2574,8 @@ static ZH: UiText = UiText {
     update_up_to_date: "✓ 已是最新版本",
     update_failed: "✗ 更新失败",
     final_completed: "已完成",
+    final_completed_partially_unverified: "已完成 · 部分未验证",
+    final_unverified_more: "及另外 {} 项",
     final_completed_warnings: "已完成，但有警告",
     final_waiting_confirmation: "等待确认",
     final_blocked: "未完成",
@@ -3684,6 +3688,8 @@ static EN: UiText = UiText {
     update_up_to_date: "✓ Already up to date",
     update_failed: "✗ Update failed",
     final_completed: "Completed",
+    final_completed_partially_unverified: "Completed · Not fully verified",
+    final_unverified_more: "and {} more",
     final_completed_warnings: "Completed with warnings",
     final_waiting_confirmation: "Waiting for confirmation",
     final_blocked: "Incomplete",

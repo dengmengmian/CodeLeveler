@@ -406,6 +406,7 @@ fn task_finished_event(
     failure: Option<leveler_model::ModelError>,
     stop: Option<StopReason>,
     warnings: Vec<String>,
+    verification: Option<leveler_lifecycle::VerificationReport>,
     unregistered_task: bool,
 ) -> RuntimeEvent {
     let detail_with_warnings = || {
@@ -443,10 +444,23 @@ fn task_finished_event(
             unregistered_task,
         };
     }
-    if outcome == leveler_lifecycle::TaskOutcome::Completed && stop == Some(StopReason::Completed) {
-        return RuntimeEvent::TurnCompleted;
-    }
-    if outcome == leveler_lifecycle::TaskOutcome::Completed && stop.is_none() {
+    if outcome == leveler_lifecycle::TaskOutcome::Completed
+        && matches!(stop, None | Some(StopReason::Completed))
+    {
+        if let Some(report) = verification
+            && report.status == leveler_lifecycle::VerificationStatus::Unverified
+        {
+            return RuntimeEvent::TurnCompletedPartiallyUnverified {
+                requirements: report
+                    .records
+                    .into_iter()
+                    .filter(|record| {
+                        record.state == leveler_lifecycle::VerificationRecordState::Unverified
+                    })
+                    .map(|record| record.requirement_text.unwrap_or(record.requirement_id))
+                    .collect(),
+            };
+        }
         return RuntimeEvent::TurnCompleted;
     }
     if let Some(stop) = stop {
@@ -1132,7 +1146,8 @@ impl EventBridge {
                     });
                 }
             }
-            EngineEvent::EvidenceLedgerUpdated { .. } => {
+            EngineEvent::EvidenceLedgerUpdated { .. }
+            | EngineEvent::RegisteredCheckStarted { .. } => {
                 // Persisted by engine; no dedicated UI cell in v1.
             }
             EngineEvent::GoalCheckpointCreated {
@@ -1438,21 +1453,33 @@ impl EventBridge {
                 failure,
                 stop,
                 warnings,
-                // The structured verification report is engine-only state:
-                // the turn event already carries its user-visible consequence
-                // (a completion with any unverified boundary produces
-                // `TurnCompletedWithWarnings`). Clients read the report from
-                // the persisted terminal, not from this transient bridge.
-                verification: _,
+                mut verification,
             } => {
                 if !self.terminal_published {
                     self.terminal_published = true;
+                    // Live observers receive the original event. The storage
+                    // boundary already scrubbed the replayed event separately.
+                    if let Some(report) = verification.as_mut() {
+                        let session_id =
+                            self.progress.as_ref().map(|(_, session)| session.as_str());
+                        for title in report
+                            .records
+                            .iter_mut()
+                            .filter_map(|record| record.requirement_text.as_mut())
+                        {
+                            *title = leveler_core::redact_secrets(title);
+                            if let Some(session_id) = session_id {
+                                *title = leveler_core::scrub_registered_secrets(session_id, title);
+                            }
+                        }
+                    }
                     let event = task_finished_event(
                         outcome,
                         reason,
                         failure,
                         stop,
                         warnings,
+                        verification,
                         self.registration_refused,
                     );
                     if let Some(publish) = self.terminal_publisher.take() {
@@ -1549,6 +1576,7 @@ mod bridge_tests {
             model_steps: 2,
             modified_files: Vec::new(),
             transcript_ordinal: Some(4),
+            verification: None,
         });
         assert_eq!(
             drain(&mut rx),
@@ -2868,6 +2896,7 @@ mod bridge_tests {
             None,
             Some(StopReason::Blocked),
             Vec::new(),
+            None,
             false,
         );
         assert!(
@@ -2885,6 +2914,7 @@ mod bridge_tests {
             None,
             None,
             Vec::new(),
+            None,
             false,
         );
         assert!(matches!(legacy, RuntimeEvent::TurnBlocked { .. }));
@@ -3173,6 +3203,7 @@ mod projection_equivalence {
             if matches!(
                 event,
                 RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
@@ -3498,6 +3529,106 @@ mod projection_equivalence {
         });
 
         assert!(terminal_was_visible.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_verification_boundary_has_its_own_completed_terminal() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(StopReason::Completed),
+            warnings: Vec::new(),
+            verification: Some(leveler_lifecycle::VerificationReport::new(
+                leveler_lifecycle::VerificationStatus::Unverified,
+                Vec::new(),
+            )),
+        });
+        assert_eq!(
+            serde_json::to_value(rx.try_recv().unwrap()).unwrap(),
+            serde_json::json!({"type": "turn_completed_partially_unverified", "requirements": []})
+        );
+    }
+
+    /// A `Reported` completion is a normal completion. Its records keep the
+    /// model-judgement distinction for diagnostics, but the user sees no
+    /// warning terminal: there is no missing evidence to report.
+    #[test]
+    fn a_reported_completion_carries_no_warning_terminal() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(StopReason::Completed),
+            warnings: Vec::new(),
+            verification: Some(leveler_lifecycle::VerificationReport::new(
+                leveler_lifecycle::VerificationStatus::Reported,
+                vec![leveler_lifecycle::VerificationRecord {
+                    requirement_id: "R12".into(),
+                    requirement_text: Some("用中文总结每个类别的金额、总计和测试结果".into()),
+                    kind: "deliverable".into(),
+                    state: leveler_lifecycle::VerificationRecordState::Reported,
+                    detail: "delivered on the model's account".into(),
+                    call_id: None,
+                    command: None,
+                    exit_code: None,
+                    workspace_version: 0,
+                    model_step: 0,
+                }],
+            )),
+        });
+        assert_eq!(
+            serde_json::to_value(rx.try_recv().unwrap()).unwrap(),
+            serde_json::json!({"type": "turn_completed"})
+        );
+    }
+
+    #[test]
+    fn live_verification_receipt_does_not_expose_a_registered_secret() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let session_id = leveler_core::SessionId::generate();
+        let secret = "opaque-secret-value";
+        leveler_core::register_session_secrets(
+            session_id.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: secret.into(),
+                key: "token".into(),
+            }],
+        );
+        let mut bridge = EventBridge::new(tx).with_progress(Default::default(), session_id.clone());
+        bridge.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(StopReason::Completed),
+            warnings: Vec::new(),
+            verification: Some(leveler_lifecycle::VerificationReport::new(
+                leveler_lifecycle::VerificationStatus::Unverified,
+                vec![leveler_lifecycle::VerificationRecord {
+                    requirement_id: "R1".into(),
+                    requirement_text: Some(format!("Check value {secret}")),
+                    kind: "deliverable".into(),
+                    state: leveler_lifecycle::VerificationRecordState::Unverified,
+                    detail: "Internal diagnostic".into(),
+                    call_id: None,
+                    command: None,
+                    exit_code: None,
+                    workspace_version: 0,
+                    model_step: 0,
+                }],
+            )),
+        });
+        leveler_core::clear_session_secrets(session_id.as_str());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            RuntimeEvent::TurnCompletedPartiallyUnverified {
+                requirements: vec!["Check value [REDACTED]".into()],
+            }
+        );
     }
 
     #[test]

@@ -163,13 +163,17 @@ impl FromStr for TaskOutcome {
 
 /// How far the runtime could verify an accepted completion.
 ///
-/// Present only on a completion the runtime accepted: the model declared the
-/// work done and every recorded requirement that admits a mechanical check was
-/// checked against the execution record. `Verified` means every such check was
-/// satisfied and no requirement rests on the model's account; `Unverified`
-/// means the completion is accepted with at least one boundary the runtime
-/// could not check. Neither is a claim that the user's objective was met, and
-/// neither blocks the completion or waits for user confirmation.
+/// Present only on a completion the runtime accepted. `Verified` means every
+/// recorded requirement was checked mechanically and held. `Reported` means
+/// no required evidence is missing: every mechanical check that applies held,
+/// and the remaining completion rests on a delivered model judgement (a
+/// read-only goal's explicit `not_applicable` is the empty-record case). The
+/// records keep that distinction, and no boundary is raised. `Unverified`
+/// means the completion is accepted with at least one requirement whose
+/// required evidence is missing, contradicted, or explicitly unavailable.
+///
+/// None of these is a claim that the user's objective was met, and none
+/// blocks an accepted completion or waits for user confirmation.
 ///
 /// The other two completion semantics are not verification states:
 /// `Incomplete` is [`TaskOutcome`] plus a non-delivery [`StopReason`], and
@@ -178,9 +182,19 @@ impl FromStr for TaskOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
-    /// Every mechanical check the runtime had was satisfied.
+    /// Every requirement was established by a mechanical check.
+    ///
+    /// A `tests` requirement's mechanical check is the exact command it
+    /// declared: that line ran and exited 0 after the last change. This is the
+    /// requirement's declared evidence contract, not an independent
+    /// observation that the command executed any test.
     Verified,
-    /// At least one accepted requirement rests on the model's account.
+    /// Delivered model work remains, and every mechanical check that applies
+    /// held. The report's records say which requirements rest on the model's
+    /// account; the completion itself is normal.
+    Reported,
+    /// At least one requirement's required evidence is missing or could not be
+    /// established.
     Unverified,
 }
 
@@ -188,6 +202,7 @@ impl VerificationStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             VerificationStatus::Verified => "verified",
+            VerificationStatus::Reported => "reported",
             VerificationStatus::Unverified => "unverified",
         }
     }
@@ -199,6 +214,7 @@ impl FromStr for VerificationStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "verified" => VerificationStatus::Verified,
+            "reported" => VerificationStatus::Reported,
             "unverified" => VerificationStatus::Unverified,
             other => {
                 return Err(UnknownVariant {

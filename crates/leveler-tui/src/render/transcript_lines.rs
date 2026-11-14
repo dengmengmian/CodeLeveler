@@ -768,6 +768,10 @@ pub(crate) fn turn_end_marker(
 ) -> (String, ratatui::style::Color) {
     match block.status {
         TurnEndStatus::Completed => (format!("✓ {}", t.turn_end_completed), theme.status.success),
+        TurnEndStatus::CompletedPartiallyUnverified => (
+            format!("· {}", t.final_completed_partially_unverified),
+            theme.text.secondary,
+        ),
         // A clean turn that ended with an answer, not with a completion
         // declaration. The status names the turn's own end state — the answer
         // arrived — so it leads the receipt while still not claiming that the
@@ -849,6 +853,7 @@ fn turn_receipt_stats(block: &TurnEndBlock, t: &crate::i18n::UiText) -> String {
     if matches!(
         block.status,
         TurnEndStatus::Completed
+            | TurnEndStatus::CompletedPartiallyUnverified
             | TurnEndStatus::CompletedWithWarnings
             | TurnEndStatus::Answered
             | TurnEndStatus::AnsweredUnregistered
@@ -878,6 +883,13 @@ fn turn_end_lines(
     let mut detail_below = false;
     let unregistered = block.status == TurnEndStatus::AnsweredUnregistered;
     let blocked = block.status == TurnEndStatus::Blocked;
+    let localize_detail = |detail| {
+        if block.status == TurnEndStatus::CompletedPartiallyUnverified {
+            detail
+        } else {
+            localized_turn_detail(detail, t)
+        }
+    };
     let detail = if unregistered {
         Some(t.turn_unregistered_detail)
     } else if blocked {
@@ -888,7 +900,7 @@ fn turn_end_lines(
         block.detail.as_deref()
     };
     if let Some(detail) = detail {
-        let d = localized_turn_detail(detail, t);
+        let d = localize_detail(detail);
         if !d.is_empty() {
             let prefix = UnicodeWidthStr::width(star)
                 + if label.is_empty() {
@@ -933,10 +945,7 @@ fn turn_end_lines(
         out.push(Line::from(spans));
     }
     if detail_below && let Some(detail) = detail {
-        for line in wrap(
-            localized_turn_detail(detail, t),
-            width.saturating_sub(4).max(8),
-        ) {
+        for line in wrap(localize_detail(detail), width.saturating_sub(4).max(8)) {
             out.push(Line::from(Span::styled(
                 format!("   {line}"),
                 Style::default().fg(theme.text.secondary),
@@ -3169,6 +3178,17 @@ mod tests {
             below.contains("produced no verdict"),
             "the whole reason is readable: {lines:#?}"
         );
+    }
+
+    #[test]
+    fn unverified_completion_uses_a_neutral_label_and_requirement() {
+        let rendered = turn_end_text(
+            TurnEndStatus::CompletedPartiallyUnverified,
+            Some("数据库连接目标"),
+        );
+        assert!(rendered.contains("已完成 · 部分未验证"), "{rendered}");
+        assert!(rendered.contains("数据库连接目标"), "{rendered}");
+        assert!(!rendered.contains('⚠'), "{rendered}");
     }
 
     #[test]

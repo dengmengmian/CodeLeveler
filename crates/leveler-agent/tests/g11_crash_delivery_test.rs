@@ -265,6 +265,49 @@ fn declared_answer() -> ModelResponse {
     )
 }
 
+#[tokio::test]
+async fn crash_recovery_preserves_the_delivery_verification_report() {
+    let answer = says_and_calls(
+        "g1",
+        ANSWER,
+        "update_goal",
+        serde_json::json!({
+            "status": "complete",
+            "summary": "Goal complete.",
+            "deliver_answer": true,
+            "verification": {"status": "not_applicable", "detail": "Review requires human judgment"}
+        }),
+    );
+    let fx = fixture(vec![answer]).await;
+    fx.terminal.inject();
+    let spec = spec(&fx);
+    let first = fx
+        .coding
+        .run(&fx.session, &spec, &mut |_| {}, CancellationToken::new())
+        .await;
+    assert!(first.is_err());
+
+    let recovered = fresh_coding(&fx);
+    let report = recovered
+        .resume(&fx.session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    let verification = report.verification.expect("a verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Reported,
+        "a read-only goal's explicit not_applicable rests on model judgement, not on missing \
+         evidence: {verification:?}"
+    );
+    assert!(verification.records.is_empty());
+    assert!(verification.notes.is_empty());
+    assert!(events(&fx).await.iter().any(|event| matches!(
+        event,
+        EngineEvent::TaskFinished { verification: Some(replayed), .. } if replayed == &verification
+    )));
+    assert_eq!(model_requests(&fx).await, 1);
+}
+
 /// The compatibility path's trigger: a textless settlement round, followed by
 /// the delivery the runtime requests.
 fn undeclared_settlement() -> ModelResponse {

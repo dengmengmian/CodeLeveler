@@ -177,6 +177,7 @@ fn render_event_text(event: AgentEvent) {
                 ledger.intercepts.len()
             );
         }
+        AgentEvent::RegisteredCheckStarted { .. } => {}
         AgentEvent::ProgressUpdated { ledger } => {
             if ledger.closing || ledger.no_progress_streak > 0 {
                 println!(
@@ -253,6 +254,9 @@ fn render_event_text(event: AgentEvent) {
 }
 
 fn render_event_jsonl(event: AgentEvent) {
+    if matches!(event, AgentEvent::RegisteredCheckStarted { .. }) {
+        return;
+    }
     emit_jsonl(event_jsonl(event));
 }
 
@@ -342,6 +346,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             model_steps,
             modified_files,
             transcript_ordinal,
+            ..
         } => serde_json::json!({
             "type": "delivery_committed",
             "text": text,
@@ -504,6 +509,7 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "mutations": ledger.mutations.len(),
             "intercepts": ledger.intercepts.len(),
         }),
+        AgentEvent::RegisteredCheckStarted { .. } => serde_json::Value::Null,
         AgentEvent::ProgressUpdated { ledger } => serde_json::json!({
             "type": "progress_updated",
             "closing": ledger.closing,
@@ -544,6 +550,7 @@ mod jsonl_tests {
                 model_steps: 3,
                 modified_files: vec!["src/main.rs".into()],
                 transcript_ordinal: Some(7),
+                verification: None,
             })
             .expect("headless delivery event");
         let line = event_jsonl(event);

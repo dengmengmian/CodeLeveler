@@ -319,6 +319,7 @@ export function turnTerminalFromEvent(type,messages,tools){
  if(type==='turn_completed'||type==='turn_answered'){
   return committedFinalAnswer(messages,tools)===null?'no_final_answer':(type==='turn_answered'?'answered':'completed');
  }
+ if(type==='turn_completed_partially_unverified')return committedFinalAnswer(messages,tools)===null?'no_final_answer':'completed_partially_unverified';
  if(type==='turn_completed_with_warnings')return 'completed_with_warnings';
  if(type==='turn_truncated')return 'truncated';
  if(type==='turn_incomplete')return 'incomplete';
@@ -422,6 +423,7 @@ export function elapsedLabel(ms) {
 const RECEIPT_LABELS = {
   answered: ['✓', '回答结束'],
   completed: ['✓', '任务已完成'],
+  completed_partially_unverified: ['·', '已完成 · 部分未验证'],
   completed_with_warnings: ['⚠', '已完成，但有警告'],
   truncated: ['⚠', '已完成，但有警告'],
   incomplete: ['⚠', '未完成'],

@@ -1494,6 +1494,28 @@
       }
     },
     {
+      "description": "The goal settled with an incomplete verification report. An empty list indicates that verification was assessed only at goal level.",
+      "type": "object",
+      "required": [
+        "requirements",
+        "type"
+      ],
+      "properties": {
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_completed_partially_unverified"
+          ]
+        }
+      }
+    },
+    {
       "description": "The work completed and project verification retains its own result, but a separate required completion contract produced warnings.\n\n`unregistered_task` is a structured terminal fact, not a reading of `reason`: the turn was an answer whose `commit_task` declaration was refused, so no durable task was registered. It must never settle a Goal. Omitted on legacy events, where the old semantics apply.",
       "type": "object",
       "required": [
@@ -5448,6 +5470,28 @@
               "type": "string",
               "enum": [
                 "turn_completed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The goal settled with an incomplete verification report. An empty list indicates that verification was assessed only at goal level.",
+          "type": "object",
+          "required": [
+            "requirements",
+            "type"
+          ],
+          "properties": {
+            "requirements": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_completed_partially_unverified"
               ]
             }
           }

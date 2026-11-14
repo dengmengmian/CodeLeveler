@@ -708,6 +708,26 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::TurnCompleted => {
             finish_turn(state, TurnEndStatus::Completed, None);
         }
+        RuntimeEvent::TurnCompletedPartiallyUnverified { requirements } => {
+            let detail = requirements.first().map(|requirement| {
+                let mut detail = requirement.split_whitespace().collect::<Vec<_>>().join(" ");
+                if let Some((end, _)) = detail.char_indices().nth(72) {
+                    detail.truncate(end);
+                    detail.push('…');
+                }
+                if requirements.len() > 1 {
+                    let remaining = requirements.len() - 1;
+                    detail.push(' ');
+                    detail.push_str(&state.t().final_unverified_more.replacen(
+                        "{}",
+                        &remaining.to_string(),
+                        1,
+                    ));
+                }
+                detail
+            });
+            finish_turn(state, TurnEndStatus::CompletedPartiallyUnverified, detail);
+        }
         RuntimeEvent::TurnCompletedWithWarnings {
             reason,
             unregistered_task,
@@ -1659,7 +1679,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // header red because the model closed with `update_goal` and no sentence.
     let goal_completed = matches!(
         status,
-        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings
+        TurnEndStatus::Completed
+            | TurnEndStatus::CompletedPartiallyUnverified
+            | TurnEndStatus::CompletedWithWarnings
     );
     // A goal the user paused is still owed, and this turn answering an
     // ordinary question is not that goal's terminal: the runtime never ran it,
@@ -1692,6 +1714,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     let unregistered = matches!(status, TurnEndStatus::AnsweredUnregistered);
     let status = match status {
         TurnEndStatus::Completed
+        | TurnEndStatus::CompletedPartiallyUnverified
         | TurnEndStatus::Answered
         | TurnEndStatus::AnsweredUnregistered
             if !answered =>
@@ -1738,9 +1761,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
                 TurnEndStatus::Yielded => {}
                 TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
                 TurnEndStatus::AnsweredUnregistered => {}
-                TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings => {
-                    goal.complete(now)
-                }
+                TurnEndStatus::Completed
+                | TurnEndStatus::CompletedPartiallyUnverified
+                | TurnEndStatus::CompletedWithWarnings => goal.complete(now),
             }
         }
     }
@@ -1797,7 +1820,10 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
 fn work_is_finished(status: TurnEndStatus) -> bool {
     matches!(
         status,
-        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
+        TurnEndStatus::Completed
+            | TurnEndStatus::CompletedPartiallyUnverified
+            | TurnEndStatus::CompletedWithWarnings
+            | TurnEndStatus::Answered
     )
 }
 

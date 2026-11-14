@@ -1623,6 +1623,7 @@ fn call_target(arguments: &str) -> String {
 fn turn_end_status(status: TurnEndStatus) -> &'static str {
     match status {
         TurnEndStatus::Completed => "completed",
+        TurnEndStatus::CompletedPartiallyUnverified => "completed_partially_unverified",
         TurnEndStatus::CompletedWithWarnings => "completed_with_warnings",
         TurnEndStatus::Answered => "answered",
         TurnEndStatus::AnsweredUnregistered => "answered_unregistered",

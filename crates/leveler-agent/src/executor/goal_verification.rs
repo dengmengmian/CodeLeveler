@@ -8,11 +8,13 @@
 //! - its last run must have succeeded, and
 //! - it must have run after the most recent file change.
 //!
-//! A Goal that changed files must therefore close in one of two honest ways:
-//! cite verification that mechanically matches the record, or declare
+//! A Goal that changed files must close in one of two honest ways: cite
+//! verification that mechanically matches the record, or declare
 //! `not_applicable` with a reason (the completion is then accepted with a
-//! warning, never as a silently verified success). A failed test/build in the
-//! task is hard evidence and cannot be overridden by either declaration.
+//! warning, never as a silently verified success). A read-only goal owes no
+//! executable fact: `not_applicable` there is a normal completion with no
+//! boundary. A failed test/build in the task is hard evidence and cannot be
+//! overridden by either declaration.
 //!
 //! Everything here is a fact about commands and exit codes. No LLM call, no
 //! keyword reading of the user's goal, no opinion about whether the change is
@@ -22,7 +24,8 @@
 
 use std::collections::HashSet;
 
-use leveler_lifecycle::VerificationStatus;
+use leveler_lifecycle::{RequirementVerification, VerificationStatus};
+use sha2::{Digest, Sha256};
 
 /// Bound on the retained execution record. The newest runs are the ones a
 /// completion can cite; older entries only cost memory and mismatch work.
@@ -47,6 +50,172 @@ pub struct VerificationRun {
     /// names this execution, not whatever later run shares the command text.
     /// `None` for a record rebuilt before call ids were stored.
     pub call_id: Option<String>,
+    pub(crate) check_start: Option<RegisteredCheckStart>,
+}
+
+/// The active registrations associated with one actual command dispatch.
+/// Unlike the human-facing label, the fingerprint preserves argv boundaries
+/// and the requested working directory without persisting raw arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegisteredCheckStart {
+    pub fingerprint: String,
+    pub registrations: Vec<String>,
+    pub order: u64,
+    pub mutation_ops: u64,
+}
+
+/// Goal-owned execution evidence reconstructed from its existing event log.
+#[derive(Debug, Clone, Default)]
+pub struct VerificationFacts {
+    pub(crate) runs: Vec<VerificationRun>,
+    pub(crate) pending: Vec<PendingCommand>,
+}
+
+impl VerificationFacts {
+    pub(crate) fn latest_check_order(&self) -> u64 {
+        self.runs
+            .iter()
+            .filter_map(|run| run.check_start.as_ref())
+            .chain(
+                self.pending
+                    .iter()
+                    .filter_map(|pending| pending.check_start.as_ref()),
+            )
+            .map(|check| check.order)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+pub(crate) fn command_invocation(name: &str, args: &serde_json::Value) -> Option<String> {
+    use serde_json::{Value, json};
+
+    let args = args.as_object()?;
+    if args.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "cmd"
+                | "program"
+                | "args"
+                | "cwd"
+                | "workdir"
+                | "timeout_seconds"
+                | "background"
+                | "background_lifetime"
+                | "reason"
+                | "escalate"
+        )
+    }) {
+        return None;
+    }
+    let cwd = args.get("cwd");
+    let workdir = args.get("workdir");
+    if workdir.is_some() && (name != "shell_command" || cwd.is_some()) {
+        return None;
+    }
+    let cwd = cwd
+        .or(workdir)
+        .filter(|value| !value.is_null())
+        .map_or(Some("."), Value::as_str)?;
+    let invocation = match name {
+        "shell_command" if !args.contains_key("program") && !args.contains_key("args") => {
+            let cmd = args.get("cmd")?.as_str()?.trim();
+            if cmd.is_empty() {
+                return None;
+            }
+            json!([name, cmd, cwd])
+        }
+        "run_command" if !args.contains_key("cmd") => {
+            let program = args.get("program")?.as_str()?.trim();
+            if program.is_empty() {
+                return None;
+            }
+            let argv = args.get("args").map_or(Some(Vec::new()), |value| {
+                value
+                    .as_array()?
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+            })?;
+            json!([name, program, argv, cwd])
+        }
+        _ => return None,
+    };
+    Some(format!("v1:{:x}", Sha256::digest(invocation.to_string())))
+}
+
+/// The run has to name this exact invocation, as registered before dispatch.
+/// A newer observed result supersedes an earlier pass of the same check.
+pub(crate) fn registered_run<'a>(
+    check: &RequirementVerification,
+    call_id: &str,
+    runs: &'a [VerificationRun],
+    pending: &[PendingCommand],
+    mutation_ops: u64,
+) -> Result<&'a VerificationRun, &'static str> {
+    let matches = |start: &RegisteredCheckStart| {
+        start.fingerprint == check.fingerprint && start.registrations.contains(&check.registered_by)
+    };
+    let run = runs
+        .iter()
+        .filter_map(|run| {
+            run.check_start
+                .as_ref()
+                .filter(|start| matches(start))
+                .map(|start| (start, run))
+        })
+        .max_by_key(|(start, _)| start.order);
+    if pending.iter().any(|pending| {
+        pending.check_start.as_ref().is_some_and(|start| {
+            matches(start) && run.is_none_or(|(previous, _)| start.order >= previous.order)
+        })
+    }) {
+        return Err("the registered check is still running or its outcome is unknown");
+    }
+    let (start, run) =
+        run.ok_or("no matching execution started after this check was registered")?;
+    if !run.ok || run.exit_code != Some(0) {
+        return Err("the latest matching check did not pass");
+    }
+    if run.call_id.as_deref() != Some(call_id) {
+        return Err("cite the latest matching execution of this registered check");
+    }
+    if start.mutation_ops != mutation_ops || run.mutation_ops != mutation_ops {
+        return Err("the workspace changed since the registered check started");
+    }
+    Ok(run)
+}
+
+/// Preserve the latest result for active acceptance registrations beyond the
+/// bounded ordinary citation window. A goal can owe more than 64 checks.
+pub(crate) fn retain_verification_runs(
+    runs: &mut Vec<VerificationRun>,
+    active_registrations: &HashSet<String>,
+) {
+    let ordinary_window = runs.len().saturating_sub(MAX_VERIFICATION_RUNS);
+    let mut latest = std::collections::HashMap::new();
+    for (index, run) in runs.iter().enumerate() {
+        let Some(start) = &run.check_start else {
+            continue;
+        };
+        for registration in &start.registrations {
+            if active_registrations.contains(registration.as_str()) {
+                let entry = latest
+                    .entry((registration, &start.fingerprint))
+                    .or_insert((start.order, index));
+                if entry.0 < start.order {
+                    *entry = (start.order, index);
+                }
+            }
+        }
+    }
+    let keep: HashSet<usize> = latest.values().map(|&(_, index)| index).collect();
+    let mut index = 0;
+    runs.retain(|_| {
+        let retain = index >= ordinary_window || keep.contains(&index);
+        index += 1;
+        retain
+    });
 }
 
 /// What the model said about verification in `update_goal`.
@@ -90,6 +259,7 @@ pub(crate) struct PendingCommand {
     pub task_id: Option<String>,
     /// The tool call that started it, so the result can be cited by that id.
     pub call_id: Option<String>,
+    pub check_start: Option<RegisteredCheckStart>,
 }
 
 /// A terminal observation of one background task execution.
@@ -132,20 +302,32 @@ pub(crate) fn record_background_result(
     model_step: u32,
     mutation_ops: u64,
 ) -> bool {
+    let started = pending
+        .iter()
+        .find(|started| started.task_id.as_deref() == Some(fact.task_id.as_str()))
+        .cloned();
     pending.retain(|started| started.task_id.as_deref() != Some(fact.task_id.as_str()));
     if !recorded.insert(fact.task_id.clone()) {
         return false;
     }
-    if !fact.evidence {
+    let check_start = started.as_ref().and_then(|start| start.check_start.clone());
+    if !fact.evidence && check_start.is_none() {
         return false;
     }
-    let Some(label) = fact.label.filter(|label| !label.trim().is_empty()) else {
+    let Some(label) = started
+        .as_ref()
+        .map(|start| start.label.clone())
+        .or(fact.label)
+        .filter(|label| !label.trim().is_empty())
+    else {
         return false;
     };
+    let call_id = started
+        .and_then(|start| start.call_id)
+        .or(fact.start_call_id);
     // A run rebuilt from the durable log already names this execution by its
     // starting call. Re-registering it would count the same execution twice.
-    if fact
-        .start_call_id
+    if call_id
         .as_deref()
         .is_some_and(|id| runs.iter().any(|run| run.call_id.as_deref() == Some(id)))
     {
@@ -153,15 +335,13 @@ pub(crate) fn record_background_result(
     }
     runs.push(VerificationRun {
         label,
-        ok: fact.ok,
+        ok: fact.ok && fact.evidence,
         exit_code: fact.exit_code,
         model_step,
         mutation_ops,
-        call_id: fact.start_call_id,
+        call_id,
+        check_start,
     });
-    if runs.len() > MAX_VERIFICATION_RUNS {
-        runs.remove(0);
-    }
     true
 }
 
@@ -270,6 +450,16 @@ pub(crate) fn decide(
             } else {
                 reason
             };
+            if !modified {
+                // Nothing in this goal changed the workspace, so there is no
+                // executable fact the completion owes. The model's reason is
+                // its own account, not an evidence boundary; the report keeps
+                // that this completion rests on model judgement.
+                return VerificationDecision::Accept {
+                    status: Some(VerificationStatus::Reported),
+                    warnings: Vec::new(),
+                };
+            }
             VerificationDecision::Accept {
                 status: Some(VerificationStatus::Unverified),
                 warnings: vec![format!(
@@ -714,24 +904,15 @@ fn cited_run<'a>(cited: &str, runs: &'a [VerificationRun]) -> CitedRun<'a> {
     CitedRun::Unmatched
 }
 
-/// Resolve one evidence line to the execution it names.
+/// Whether a recorded command is exactly the command a requirement names.
 ///
-/// Structured requirement accounts cite a run the same way `verification`
-/// does, so both readings share one identity rule: a `call_id:<id>`, or the
-/// command the runtime actually recorded.
-pub(crate) fn cited_run_in<'a>(
-    line: &str,
-    runs: &'a [VerificationRun],
-) -> Option<&'a VerificationRun> {
-    match cited_run(line, runs) {
-        CitedRun::Found(run) => Some(run),
-        CitedRun::Refuse(_) | CitedRun::Unmatched => None,
-    }
-}
-
-/// Whether a recorded command is the command a requirement names.
+/// A `tests` or `command` requirement declares the exact command line whose
+/// run is its evidence, so a different line that merely contains it is a
+/// different execution (`echo make test` did not run `make test`). Only
+/// presentation is normalized: quoting and a trailing result note.
 pub(crate) fn run_matches_command(label: &str, command: &str) -> bool {
-    cites(label, command)
+    let cited = command_tokens(strip_trailing_note(command));
+    !cited.is_empty() && command_tokens(label) == cited
 }
 
 fn result_note_marker(token: &str) -> bool {
@@ -926,7 +1107,83 @@ mod tests {
             model_step: step,
             mutation_ops,
             call_id: None,
+            check_start: None,
         }
+    }
+
+    #[test]
+    fn an_unrelated_successful_command_cannot_pass_a_registered_check() {
+        let registered = registered_check("service");
+        let mut wrong_dir = run_id("assert_state", true, 1, 0, "wrong-dir");
+        wrong_dir.check_start = Some(RegisteredCheckStart {
+            fingerprint: registered_check("other").fingerprint,
+            registrations: vec![registered.registered_by.clone()],
+            order: 1,
+            mutation_ops: 0,
+        });
+        let runs = [wrong_dir];
+        assert!(registered_run(&registered, "wrong-dir", &runs, &[], 0).is_err());
+    }
+
+    fn registered_check(cwd: &str) -> leveler_lifecycle::RequirementVerification {
+        leveler_lifecycle::RequirementVerification {
+            fingerprint: command_invocation(
+                "shell_command",
+                &serde_json::json!({"cmd": "assert_state", "cwd": cwd}),
+            )
+            .unwrap(),
+            registered_by: "scope-revision".to_string(),
+        }
+    }
+
+    #[test]
+    fn registered_check_needs_a_current_observed_pass_of_its_revision() {
+        let registered = registered_check("service");
+        let mut pass = run_id("assert_state", true, 1, 4, "pass");
+        pass.check_start = Some(RegisteredCheckStart {
+            fingerprint: registered.fingerprint.clone(),
+            registrations: vec![registered.registered_by.clone()],
+            order: 1,
+            mutation_ops: 4,
+        });
+        assert!(registered_run(&registered, "pass", std::slice::from_ref(&pass), &[], 4).is_ok());
+        assert!(registered_run(&registered, "pass", std::slice::from_ref(&pass), &[], 5).is_err());
+        let mut crossed_mutation = pass.clone();
+        crossed_mutation.mutation_ops = 5;
+        assert!(registered_run(&registered, "pass", &[crossed_mutation], &[], 5).is_err());
+
+        let mut later_failure = pass.clone();
+        later_failure.call_id = Some("fail".into());
+        later_failure.ok = false;
+        later_failure.exit_code = Some(1);
+        later_failure.check_start.as_mut().unwrap().order = 2;
+        assert!(
+            registered_run(&registered, "pass", &[pass.clone(), later_failure], &[], 4).is_err()
+        );
+
+        let mut pending = PendingCommand {
+            label: pass.label.clone(),
+            task_id: Some("background".into()),
+            call_id: Some("pending".into()),
+            check_start: pass.check_start.clone(),
+        };
+        pending.check_start.as_mut().unwrap().order = 2;
+        assert!(
+            registered_run(
+                &registered,
+                "pass",
+                std::slice::from_ref(&pass),
+                &[pending],
+                4
+            )
+            .is_err()
+        );
+
+        let new_revision = leveler_lifecycle::RequirementVerification {
+            registered_by: "amended-scope".into(),
+            ..registered
+        };
+        assert!(registered_run(&new_revision, "pass", &[pass], &[], 4).is_err());
     }
 
     fn run_id(
@@ -1321,6 +1578,7 @@ mod tests {
             label: label.to_string(),
             task_id: Some(task_id.to_string()),
             call_id: Some(call_id.to_string()),
+            check_start: None,
         }
     }
 
@@ -1496,6 +1754,7 @@ mod tests {
             label: "make up CONFIG=probe.yaml".to_string(),
             task_id: Some("bg-1".to_string()),
             call_id: None,
+            check_start: None,
         }];
         let decision = decide(
             &VerificationClaim::Passed(vec!["make up CONFIG=probe.yaml".into()]),
@@ -1525,6 +1784,7 @@ mod tests {
             label: "go test ./... -count=1".to_string(),
             task_id: Some("host-42".to_string()),
             call_id: Some("call-start".to_string()),
+            check_start: None,
         }];
         let decision = decide(
             &VerificationClaim::Passed(vec![
@@ -1846,6 +2106,25 @@ mod tests {
             }
             other => panic!("expected an accepted warning, got {other:?}"),
         }
+    }
+
+    /// A read-only goal has no workspace change to verify. `not_applicable`
+    /// there is a normal model-judgement completion, not an evidence boundary.
+    #[test]
+    fn a_read_only_not_applicable_carries_no_boundary() {
+        assert_eq!(
+            decide(
+                &VerificationClaim::NotApplicable("read-only investigation".into()),
+                &[],
+                &[],
+                0,
+                false,
+            ),
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Reported),
+                warnings: Vec::new(),
+            }
+        );
     }
 
     #[test]

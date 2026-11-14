@@ -3,7 +3,7 @@ import type { RuntimeEvent } from '../types/protocol';
 import { commandProgressLabel, finalizationStageLabel, presentTurnEnd, turnEndFromEvent, turnFooterPrimary } from './turn';
 
 describe('turn truth', () => {
-  it('maps every supported terminal event without a verification terminal', () => {
+  it('maps every supported terminal event', () => {
     const cases: Array<[RuntimeEvent, string]> = [
       [{ type: 'turn_completed' }, 'completed'],
       [{ type: 'turn_completed_with_warnings', reason: 'review unavailable' }, 'completed_with_warnings'],
@@ -16,6 +16,18 @@ describe('turn truth', () => {
       [{ type: 'task_cancelled' }, 'cancelled'],
     ];
     for (const [event, outcome] of cases) expect(turnEndFromEvent(event)?.outcome).toBe(outcome);
+  });
+
+  it('shows the verification boundary without an execution warning', () => {
+    const end = turnEndFromEvent({
+      type: 'turn_completed_partially_unverified',
+      requirements: ['数据库连接目标'],
+    });
+    expect(presentTurnEnd(end!)).toMatchObject({
+      label: '已完成 · 部分未验证',
+      tone: 'muted',
+      detail: '数据库连接目标',
+    });
   });
 
   it('finalization progress is not a terminal fact', () => {
