@@ -479,6 +479,8 @@ export type RuntimeEvent =
   | { type: 'away_summary'; text: string }
   /** The current turn finished successfully. */
   | { type: 'turn_completed' }
+  /** The goal settled with an incomplete verification report. An empty list indicates that verification was assessed only at goal level. */
+  | { type: 'turn_completed_partially_unverified'; requirements: string[] }
   /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. `unregistered_task` is a structured terminal fact, not a reading of `reason`: the turn was an answer whose `commit_task` declaration was refused, so no durable task was registered. It must never settle a Goal. Omitted on legacy events, where the old semantics apply. */
   | { type: 'turn_completed_with_warnings'; reason: string; unregistered_task?: boolean }
   /** The assistant naturally finished its answer, without claiming that an external task was independently verified as complete. */
@@ -1392,6 +1394,8 @@ export interface UiMemoryStatus {
   automatic_dream_enabled: boolean;
   batch_dream_enabled: boolean;
   capture_enabled: boolean;
+  /** The global config file this runtime loaded and watches. The page uses it when it explains how to change the rollout, so the instruction names the file that will actually take effect. */
+  config_path: string;
   /** Memory is on for this session. False when the configured rollout is `off`, or when the session toggle paused it; `rollout` distinguishes the two. */
   enabled: boolean;
   global: UiMemoryScope;

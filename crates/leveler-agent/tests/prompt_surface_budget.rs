@@ -1046,8 +1046,14 @@ async fn progressive_initial_surface_inventory() {
     // `background_lifetime` docs, and `update_goal`'s status/blocked_kind
     // enums restated the prose above them. Removing the duplicate copy keeps
     // every fact (each now has one authoritative field description) and
-    // measures 8542 tokens, so the fixed 8750 ceiling again holds. 208 tokens
-    // of headroom still rejects one new field-sized surface.
+    // measures 8542 tokens, so the fixed 8750 ceiling again holds.
+    //
+    // 8739 after the registered acceptance check: the check schema is part of
+    // both declaration tools and `update_goal` carries its `check_call_id`
+    // account field. Those are new structured capability, not restated prose,
+    // and the declarative prose they replaced was trimmed to keep the ceiling.
+    // The remaining headroom is small on purpose: a new field-sized surface
+    // still needs its own budget decision.
     assert!(
         schema_tokens <= 8750,
         "initial schema grew beyond its fixed budget: {schema_tokens}"

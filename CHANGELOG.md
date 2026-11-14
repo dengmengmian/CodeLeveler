@@ -4,6 +4,7 @@
 
 ## [Unreleased]
 
+- Completion verification now has an explicit evidence policy per requirement kind. A `named` deliverable is model judgement: a delivered `done` account is recorded as `reported` and completes normally, with no "no mechanical check" warning. A passing recorded run of a declared `tests`/`command` satisfies it only when that run is the exact declared command and is the newest matching execution; a different or compound line is not its record. For `tests`, `verified` is the declared command contract — the line ran and exited 0 after the last change — not a claim that the command executed tests. Requirements that need evidence the runtime cannot obtain stay `unverified` and keep their warning.
 - Background task display: starting a task no longer posts a second notice next to the tool row, and a failed task is a record in the conversation and the jobs page instead of a footer reminder that needs acknowledging. The running-count cell counts only tasks that are running now.
 
 ## [1.0.27] - 2026-11-14

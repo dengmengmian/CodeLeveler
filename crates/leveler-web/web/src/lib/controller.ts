@@ -677,6 +677,7 @@ export class RuntimeBridge {
       // 终态只能是 no_final_answer —— 工具跑完不等于任务做完（Contract v1 §I9）。
       const outcome =
         (end.outcome === 'completed' ||
+          end.outcome === 'completed_partially_unverified' ||
           end.outcome === 'answered' ||
           end.outcome === 'answered_unregistered') &&
         current &&

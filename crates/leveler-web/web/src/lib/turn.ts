@@ -1,12 +1,13 @@
 // Turn Truth：runtime 终态 → web 状态与展示的唯一映射点。
 // 原则：状态层永不丢失 outcome/detail；presentation 层的措辞与 TUI 对齐
 // （crates/leveler-tui/src/render/transcript_lines.rs::turn_end_lines），
-// incomplete 保留 reason，任务完成不再附加第二套验证结论。
+// incomplete 保留 reason，验证覆盖按 runtime 的结论展示。
 
 import type { FinalizationStage, RuntimeEvent } from '../types/protocol';
 
 export type TurnOutcome =
   | 'completed'
+  | 'completed_partially_unverified'
   | 'completed_with_warnings'
   | 'answered'
   | 'answered_unregistered'
@@ -28,6 +29,15 @@ export function turnEndFromEvent(ev: RuntimeEvent): TurnEnd | null {
   switch (ev.type) {
     case 'turn_completed':
       return { outcome: 'completed', detail: null };
+    case 'turn_completed_partially_unverified': {
+      const [first, ...remaining] = ev.requirements;
+      const chars = Array.from(first?.trim().replace(/\s+/g, ' ') ?? '');
+      const title = chars.length > 72 ? `${chars.slice(0, 72).join('')}…` : chars.join('');
+      return {
+        outcome: 'completed_partially_unverified',
+        detail: title ? `${title}${remaining.length ? ` 及另外 ${remaining.length} 项` : ''}` : null,
+      };
+    }
     case 'turn_completed_with_warnings':
       // A refused declaration means no durable task was registered. The model
       // answered, but the answer does not prove the user's deliverables exist,
@@ -88,6 +98,8 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
   switch (end.outcome) {
     case 'completed':
       return { glyph: '✓', label: '任务已完成', tone: 'success', detail: null };
+    case 'completed_partially_unverified':
+      return { glyph: '·', label: '已完成 · 部分未验证', tone: 'muted', detail: token };
     case 'no_final_answer':
       // 工具跑完不等于任务做完（Contract v1 §I9）：回合在没有 commit 的
       // FinalAnswer 上终态，不得显示绿色完成。文案对齐 TUI turn_no_final_answer。

@@ -3066,7 +3066,7 @@ const TRAJECTORY_LIVE_ONLY = new Set([
   'goal_recap_created', 'unfinished_goals_loaded', 'child_contribution_loaded',
 ]);
 const TRAJECTORY_TERMINALS = new Set([
-  'turn_completed', 'turn_completed_with_warnings', 'turn_answered', 'turn_cancelled',
+  'turn_completed', 'turn_completed_partially_unverified', 'turn_completed_with_warnings', 'turn_answered', 'turn_cancelled',
   'task_cancelled', 'turn_truncated', 'turn_incomplete', 'turn_failed', 'session_completed',
 ]);
 

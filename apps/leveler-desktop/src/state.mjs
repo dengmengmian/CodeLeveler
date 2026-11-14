@@ -297,6 +297,13 @@ export function applyEvent(state,event) {
     const answer=committedFinalAnswer(next.messages,next.tools);
     if(answer!==null)for(let i=next.messages.length-1;i>=0;i-=1){const message=next.messages[i];if(message.role==='assistant'&&message.text===answer){message.final=true;break;}}
     const status=turnTerminalFromEvent(event.type,next.messages,next.tools);
+    let detail = event.reason ?? event.error ?? event.failure?.message ?? null;
+    if (status === 'completed_partially_unverified') {
+      const [first, ...remaining] = event.requirements;
+      const chars = Array.from(first?.trim().replace(/\s+/g, ' ') ?? '');
+      const title = chars.length > 72 ? `${chars.slice(0, 72).join('')}…` : chars.join('');
+      detail = title ? `${title}${remaining.length ? ` 及另外 ${remaining.length} 项` : ''}` : null;
+    }
     next.lastTerminal=status;
     const terminalSeq=event.seq??((next.nextSeq??0)-0.5);
     next.turnTerminals=[...(next.turnTerminals??[]),{
@@ -305,7 +312,7 @@ export function applyEvent(state,event) {
       at:Date.now(),
       endedHm:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false}),
       elapsedMs:Number.isFinite(next.turnStartedAt)?Math.max(0,Date.now()-next.turnStartedAt):null,
-      detail:event.reason??event.error??event.failure?.message??null,
+      detail,
     }];
     next.turnStartedAt=null;
     // A segment the runtime never completed is INTERRUPTED: kept and folded,
@@ -321,7 +328,7 @@ export function commandEnvelope(sessionId,command,observedVersion) {
   if(versioned&&(!Number.isSafeInteger(observedVersion)||observedVersion<0))throw new Error('snapshot version required');
   return {command_id:crypto.randomUUID(),session_id:sessionId,expected_version:versioned?observedVersion:null,issued_at:new Date().toISOString(),command};
 }
-export const terminalEvents = new Set(['turn_completed','turn_completed_with_warnings','turn_answered','turn_failed','turn_cancelled','task_cancelled','turn_truncated','turn_incomplete']);
+export const terminalEvents = new Set(['turn_completed','turn_completed_partially_unverified','turn_completed_with_warnings','turn_answered','turn_failed','turn_cancelled','task_cancelled','turn_truncated','turn_incomplete']);
 export function approvalDecisions(request){return request.requires_human_consent?['approve_once','deny']:['approve_once','approve_session',...(request.always_persists?['approve_always']:[]),'deny'];}
 export function clarificationAnswer(question,{picks=[],text=''}){
   const kind=question.kind??'single';text=text.trim();

@@ -502,13 +502,32 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             ],
         ),
         EngineEvent::TaskFinished {
-            outcome, reason, ..
+            outcome,
+            reason,
+            verification,
+            ..
         } => (
             ObservationClass::Terminal,
             format!("task {outcome:?}"),
             reason.clone().unwrap_or_default(),
             "info".into(),
-            vec![("Outcome".into(), format!("{outcome:?}"))],
+            {
+                let mut fields = vec![("Outcome".into(), format!("{outcome:?}"))];
+                if let Some(report) = verification {
+                    fields.push(("Verification".into(), format!("{:?}", report.status)));
+                    fields.extend(report.records.iter().map(|record| {
+                        let title = record
+                            .requirement_text
+                            .as_deref()
+                            .unwrap_or(&record.requirement_id);
+                        (
+                            record.requirement_id.clone(),
+                            format!("{title} · {:?}", record.state),
+                        )
+                    }));
+                }
+                fields
+            },
         ),
         EngineEvent::SubAgentStarted {
             id,
@@ -638,6 +657,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
         | EngineEvent::ReasoningDelta { .. }
         | EngineEvent::ReasoningCompleted { .. }
         | EngineEvent::EvidenceLedgerUpdated { .. }
+        | EngineEvent::RegisteredCheckStarted { .. }
         | EngineEvent::ProgressUpdated { .. }
         | EngineEvent::TokenUsage { .. } => return None,
         _ => (
@@ -1095,6 +1115,56 @@ mod tests {
     async fn persist(db: &Database, sid: &SessionId, ev: EngineEvent) {
         let (ty, payload) = ev.to_row().unwrap();
         db.append(sid, None, &ty, &payload, now()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_trace_lists_each_assessed_requirement() {
+        use leveler_lifecycle::{
+            StopReason, TaskOutcome, VerificationRecord, VerificationRecordState,
+            VerificationReport, VerificationStatus,
+        };
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let rec = SessionRecord::new("/repo", "verify connection", "glm/5", now());
+        let sid = SessionId::new(rec.id.clone());
+        SessionRepository::new(&db).create(&rec).await.unwrap();
+        persist(
+            &db,
+            &sid,
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Completed),
+                warnings: Vec::new(),
+                verification: Some(VerificationReport::new(
+                    VerificationStatus::Unverified,
+                    vec![VerificationRecord {
+                        requirement_id: "R2".into(),
+                        requirement_text: Some("Database connection".into()),
+                        kind: "deliverable".into(),
+                        state: VerificationRecordState::Unverified,
+                        detail: "Internal diagnostic".into(),
+                        call_id: None,
+                        command: None,
+                        exit_code: None,
+                        workspace_version: 0,
+                        model_step: 0,
+                    }],
+                )),
+            },
+        )
+        .await;
+        let row = db
+            .load_last_by_type(&sid, "task_finished", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = EngineEvent::from_payload(&row.payload).unwrap();
+        let trace = project_event(&row, &event).unwrap();
+        assert!(trace.fields.iter().any(|field| {
+            field.key == "R2" && field.value == "Database connection · Unverified"
+        }));
     }
 
     #[tokio::test]

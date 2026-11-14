@@ -340,6 +340,14 @@ pub enum AgentEvent {
     /// Full process-evidence ledger snapshot after a mutation/verify/receipt/
     /// intercept change. SoT for resume of Delivery gates (last snapshot wins).
     EvidenceLedgerUpdated { ledger: EvidenceLedger },
+    /// The registered acceptance checks applicable to an admitted command.
+    RegisteredCheckStarted {
+        call_id: String,
+        fingerprint: String,
+        registrations: Vec<String>,
+        order: u64,
+        mutation_ops: u64,
+    },
     /// Cross-round progress / closeout ledger (resume + engine continue).
     ProgressUpdated { ledger: ProgressLedger },
     /// The harness started an advisory (tool-free) model call during closeout —
@@ -403,6 +411,7 @@ pub enum AgentEvent {
         stop: StopReason,
         model_steps: u32,
         modified_files: Vec<String>,
+        verification: Option<leveler_lifecycle::VerificationReport>,
         /// The turn's transcript boundary (exclusive next ordinal) when the
         /// delivery was accepted. It binds the answer to the exact message
         /// prefix the model produced, so recovery never has to compare answer
@@ -1531,7 +1540,7 @@ pub struct Executor {
     /// Verification facts this goal already proved in earlier windows
     /// (resume / retry). The completion gate reads one task-wide record, not
     /// only the commands that happened to run after this window opened.
-    seeded_verification_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+    seeded_verification: crate::executor::goal_verification::VerificationFacts,
     /// Clarification answers the user actually gave in this session. The
     /// requirement gate may quote them; every other tool result stays
     /// untrusted agent-visible output.
@@ -1678,7 +1687,7 @@ impl Executor {
             sub_agent_policies: None,
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
-            seeded_verification_runs: Vec::new(),
+            seeded_verification: Default::default(),
             seeded_clarification_answers: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
@@ -1769,11 +1778,11 @@ impl Executor {
     /// Seed the verification facts this goal already proved in earlier
     /// windows, so a resumed or retried goal is judged on the task's record
     /// rather than on this window alone.
-    pub(crate) fn with_verification_runs(
+    pub(crate) fn with_verification_facts(
         mut self,
-        runs: Vec<crate::executor::goal_verification::VerificationRun>,
+        verification: crate::executor::goal_verification::VerificationFacts,
     ) -> Self {
-        self.seeded_verification_runs = runs;
+        self.seeded_verification = verification;
         self
     }
 
@@ -2311,7 +2320,7 @@ impl Executor {
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             // A child's commands are its own; they never prove the parent's goal.
-            seeded_verification_runs: Vec::new(),
+            seeded_verification: Default::default(),
             seeded_clarification_answers: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),

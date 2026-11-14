@@ -30,12 +30,14 @@ impl From<AgentEvent> for EngineEvent {
                 model_steps,
                 modified_files,
                 transcript_ordinal,
+                verification,
             } => EngineEvent::DeliveryCommitted {
                 text,
                 stop,
                 model_steps,
                 modified_files,
                 transcript_ordinal,
+                verification,
             },
             A::ToolCall {
                 id,
@@ -185,6 +187,19 @@ impl From<AgentEvent> for EngineEvent {
                 EngineEvent::DelegationStage { action, detail }
             }
             A::EvidenceLedgerUpdated { ledger } => EngineEvent::EvidenceLedgerUpdated { ledger },
+            A::RegisteredCheckStarted {
+                call_id,
+                fingerprint,
+                registrations,
+                order,
+                mutation_ops,
+            } => EngineEvent::RegisteredCheckStarted {
+                call_id,
+                fingerprint,
+                registrations,
+                order,
+                mutation_ops,
+            },
             A::ProgressUpdated { ledger } => EngineEvent::ProgressUpdated { ledger },
             A::ContextSnapshot {
                 messages,

@@ -222,7 +222,11 @@ export function AgentRunBlock({
             {copyText ? <CopyButton text={copyText} className="copy-btn-compact" /> : null}
           </span>
         </div>
-        {p.detail && <div className="rs-detail">原因：{p.detail}</div>}
+        {p.detail && (
+          <div className="rs-detail">
+            {lastTurn.outcome === 'completed_partially_unverified' ? '未验证：' : '原因：'}{p.detail}
+          </div>
+        )}
         {showFacts && truth && (
           <div className="rs-facts">
             {truth.facts.map((f) => (

@@ -167,6 +167,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let turn_ended = matches!(
                 event,
                 RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
@@ -181,6 +182,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::ToolCallStarted { .. }
                     | RuntimeEvent::ToolCallCompleted { .. }
                     | RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
                     | RuntimeEvent::TurnPaused { .. }
@@ -235,6 +237,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     matches!(
                         turn.status,
                         crate::transcript::TurnEndStatus::Completed
+                            | crate::transcript::TurnEndStatus::CompletedPartiallyUnverified
                             | crate::transcript::TurnEndStatus::CompletedWithWarnings
                             | crate::transcript::TurnEndStatus::Answered
                             | crate::transcript::TurnEndStatus::AnsweredUnregistered

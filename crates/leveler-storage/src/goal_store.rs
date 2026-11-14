@@ -20,9 +20,9 @@ use async_trait::async_trait;
 use leveler_core::{GoalId, OwnershipToken, TaskId, Timestamp, TurnId};
 use leveler_lifecycle::{
     AppliedRequirementEvent, IntentProjection, PauseBoundary, RequirementItem, RequirementKind,
-    RequirementSeed, ScopeDeclaration, ScopeError, ScopeOperationKind, ScopeProjection,
-    UserIntentDeclaration, UserIntentOperation, apply_scope_declaration, fold_scope_events,
-    initial_scope,
+    RequirementSeed, RequirementVerification, ScopeDeclaration, ScopeError, ScopeOperationKind,
+    ScopeProjection, UserIntentDeclaration, UserIntentOperation, apply_scope_declaration,
+    fold_scope_events, initial_scope,
 };
 
 use crate::{Database, OwnershipError, StorageError};
@@ -930,11 +930,19 @@ async fn insert_requirement_event(
     event: &AppliedRequirementEvent,
     now: Timestamp,
 ) -> Result<(), StorageError> {
+    let verification = event
+        .verification
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| {
+            StorageError::InvalidData(format!("invalid verification for goal {goal_id}: {error}"))
+        })?;
     sqlx::query(
         "INSERT INTO goal_requirement_events \
          (goal_id, seq, turn_id, operation, requirement_id, supersedes, kind, text, target, \
-          source_quote, check_text, reason, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          source_quote, check_text, verification, reason, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )
     .bind(goal_id)
     .bind(seq)
@@ -947,6 +955,7 @@ async fn insert_requirement_event(
     .bind(event.target.as_deref())
     .bind(&event.source_quote)
     .bind(event.check.as_deref())
+    .bind(verification.as_deref())
     .bind(event.reason.as_deref())
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
@@ -971,11 +980,12 @@ async fn requirement_rows(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
         String,
     );
     let rows: Vec<RequirementRow> = sqlx::query_as(
         "SELECT seq, turn_id, operation, requirement_id, supersedes, kind, text, target, \
-         source_quote, check_text, reason, created_at \
+         source_quote, check_text, verification, reason, created_at \
          FROM goal_requirement_events WHERE goal_id = ?1 ORDER BY seq",
     )
     .bind(goal_id)
@@ -995,6 +1005,7 @@ async fn requirement_rows(
                 target,
                 source_quote,
                 check,
+                verification,
                 reason,
                 created_at,
             )| {
@@ -1013,6 +1024,15 @@ async fn requirement_rows(
                         })
                     })
                     .transpose()?;
+                let verification = verification
+                    .as_deref()
+                    .map(serde_json::from_str::<RequirementVerification>)
+                    .transpose()
+                    .map_err(|_| {
+                        StorageError::InvalidData(format!(
+                            "invalid verification for goal {goal_id}"
+                        ))
+                    })?;
                 Ok(GoalRequirementRecord {
                     seq: seq.max(0) as u32,
                     turn_id,
@@ -1025,6 +1045,7 @@ async fn requirement_rows(
                         target,
                         source_quote,
                         check,
+                        verification,
                         reason,
                     },
                     created_at: parse_ts(&created_at)?,
@@ -2055,6 +2076,7 @@ mod tests {
                     target: None,
                     source_quote: "append Verified.".into(),
                     check: None,
+                    verification: None,
                 }],
                 leveler_core::now(),
             )
@@ -2065,6 +2087,14 @@ mod tests {
             "an invalid initial scope leaves no goal behind"
         );
 
+        let original_check = RequirementVerification {
+            fingerprint: "v1:stage-one".into(),
+            registered_by: "call-commit".into(),
+        };
+        let replacement_check = RequirementVerification {
+            fingerprint: "v1:stage-one-with-tests".into(),
+            registered_by: "call-amend".into(),
+        };
         let goal = store
             .open_scoped(
                 token,
@@ -2077,6 +2107,7 @@ mod tests {
                         target: None,
                         source_quote: "ship stage one".into(),
                         check: None,
+                        verification: Some(original_check.clone()),
                     },
                     RequirementSeed {
                         kind: RequirementKind::Constraint,
@@ -2084,6 +2115,7 @@ mod tests {
                         target: None,
                         source_quote: "do not touch the legacy module".into(),
                         check: None,
+                        verification: None,
                     },
                 ],
                 leveler_core::now(),
@@ -2102,6 +2134,7 @@ mod tests {
             ]
         );
 
+        assert_eq!(items[0].verification.as_ref(), Some(&original_check));
         let turn = TurnId::new("turn-2");
         let declaration = ScopeDeclaration {
             operations: vec![
@@ -2112,6 +2145,7 @@ mod tests {
                     target: None,
                     source_quote: "stage one must also have tests".into(),
                     check: None,
+                    verification: Some(replacement_check.clone()),
                     reason: None,
                 },
                 ScopeOperation::Add {
@@ -2120,6 +2154,7 @@ mod tests {
                     target: None,
                     source_quote: "and stage two".into(),
                     check: None,
+                    verification: None,
                     reason: None,
                 },
             ],
@@ -2149,6 +2184,10 @@ mod tests {
                 ("R4", leveler_lifecycle::RequirementState::Active),
             ]
         );
+
+        assert_eq!(items[0].verification.as_ref(), Some(&original_check));
+        assert_eq!(items[2].verification.as_ref(), Some(&replacement_check));
+        assert!(items[3].verification.is_none());
 
         // An unknown identity is refused and writes nothing.
         let refused = store

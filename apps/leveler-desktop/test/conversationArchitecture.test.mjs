@@ -42,6 +42,15 @@ function executionItems(items) {
   return items.filter(item => item.kind === 'execution').map(item => item.execution);
 }
 
+test('incomplete verification is visible on the receipt without a warning', () => {
+  let s = assistant(state(), 'm1', '已处理。');
+  s = send(s, 'turn_completed_partially_unverified', { requirements: ['数据库连接目标'] });
+  const receipt = conversationItems(s).find(item => item.kind === 'turn_receipt');
+  assert.equal(receipt.terminal.label, '已完成 · 部分未验证');
+  assert.equal(receipt.terminal.tone, 'muted');
+  assert.equal(receipt.terminal.detail, '数据库连接目标');
+});
+
 test('pure chat is user, the answer, and its receipt — no execution card', () => {
   let s = send(state(), 'user_message_added', { message: { id: 'u1', role: 'user', text: '你好' } });
   s = assistant(s, 'm1', '你好，我在。');
