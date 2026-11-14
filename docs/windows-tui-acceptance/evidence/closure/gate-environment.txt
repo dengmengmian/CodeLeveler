@@ -24,6 +24,12 @@ The complete gates therefore ran with these explicit, reversible overrides:
   non-product fixtures under `windows-audit\test-tools` were compiled and
   copied into `tools\git\usr\bin`; they implement only the documented sleep /
   repeat-operand contract. They are test-host tools, not repository code.
+- `cargo fmt --all` from the real long workspace path exceeds the Windows
+  32,767-character command line (290 file arguments, 42,065 characters). The
+  same command passes from a 30-character `git archive HEAD` source copy.
+  A directory junction does not help: cargo resolves it to the long real path.
+  No registry, system policy or user configuration was changed; the copy was
+  removed after the check.
 
 The first workspace run used the agent shell defaults (all cores, no POSIX
 fixtures on PATH, default `~/.leveler` home). Its failures are recorded in

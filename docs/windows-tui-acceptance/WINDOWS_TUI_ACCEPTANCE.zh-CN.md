@@ -286,7 +286,7 @@ refuse non-FullAccess spawn with write_root=... Use FullAccess explicitly...")
 
 **未运行的完整门禁**：完整 `./dev` gate、workspace-wide clippy/all-features、release-grade dogfood、macOS/Linux 真实终端未运行。受影响包的 fmt/check/tests 已通过；`cargo fmt --all` 在本机触发 Windows path-too-long `os error 206`，包级 `cargo fmt -p ... --check` 通过。
 
-> **收口轮更新（见 §9.5）**：workspace fmt 逐包检查、all-features check、clippy、release build 与 `./dev verify` 已执行；`cargo fmt --all` 的 206 根因是 290 个文件参数合计 42,065 字符超过 Windows 32,767 命令行长上限，逐包等价检查通过。workspace 测试在 CI 等价环境中 7481 passed / 51 failed；51 个失败已逐类归因为宿主 Low token、缺失 Python、`/tmp` 不可写或 baseline 既有，不是本次改动路径。完整分类见 §9.5。
+> **收口轮更新（见 §9.5）**：workspace fmt 逐包检查、all-features check、clippy、release build 与 `./dev verify` 已执行；`cargo fmt --all` 在长路径下因 290 个文件参数合计 42,065 字符超过 Windows 32,767 命令行长上限而报 206，使用 `git archive HEAD` 解压到 30 字符短路径后同一命令 **PASS**（junction 无效，cargo 会 canonicalize）。workspace 测试在 CI 等价环境中 7481 passed / 51 failed；51 条失败已逐类归因为宿主 Low token、缺失 Python、`/tmp` 不可写或 baseline 既有，不是本次改动路径。完整分类见 §9.5。
 
 ## 8. 复现与证据索引
 
@@ -424,7 +424,7 @@ windows-audit\scripts\run-tui.cmd <repo>
 | 门禁 | 命令 | 结果 |
 | --- | --- | --- |
 | workspace 格式 | 逐包 `cargo fmt -p <pkg> -- --check`（35 包） | **PASS** |
-| `cargo fmt --all` | 同机复现 | **BLOCKED by host**：290 个源文件参数合计 42,065 字符，超过 Windows 32,767 命令行长上限（os error 206）；逐包等价检查通过 |
+| `cargo fmt --all` | 同机复现 + 短路径工作区 | **PASS（短路径）**：长真实路径下 290 个源文件参数合计 42,065 字符，超过 Windows 32,767 命令行长上限（os error 206）；`git archive HEAD` 解压到 30 字符路径后同一命令 exit 0。junction 无效（cargo 会 canonicalize 回长路径）；逐包检查也通过 |
 | all-features 编译 | `cargo check --workspace --all-features --locked` | **PASS**（1m18s） |
 | Workspace 测试 | CI 等价环境 + `RUST_TEST_THREADS=2` | **7481 passed / 51 failed / 97 ignored**；51 条失败记录对应 50 个 distinct tests（`parallel` 父用例会以子进程重跑同一 binary），全部归类为宿主/环境或 baseline 既有，见下表 |
 | Clippy | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | **PASS**（2m47s；先修复 `display_path` 既有 `needless_return`） |

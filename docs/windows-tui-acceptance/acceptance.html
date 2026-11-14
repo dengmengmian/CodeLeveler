@@ -430,7 +430,7 @@
   <table>
     <tr><th>门禁</th><th>结果</th></tr>
     <tr><td>workspace 格式（35 包逐包）</td><td class="ok">PASS</td></tr>
-    <tr><td><code>cargo fmt --all</code></td><td class="warn">BLOCKED by host：290 文件参数 42,065 字符 &gt; Windows 32,767；逐包等价通过</td></tr>
+    <tr><td><code>cargo fmt --all</code></td><td class="ok">PASS via 30-char short-path copy；长真实路径 42,065 字符 &gt; Windows 32,767（os error 206）；junction 会 canonicalize，无效</td></tr>
     <tr><td><code>cargo check --workspace --all-features</code></td><td class="ok">PASS（1m18s）</td></tr>
     <tr><td>workspace 测试（CI 等价、2 threads）</td><td class="warn">7481 passed / 51 failed / 97 ignored；51 条记录对应 50 个 distinct tests（app parallel 父子各一条），全部归类为宿主 Low token、缺失 Python、<code>/tmp</code> 或 baseline 既有</td></tr>
     <tr><td>Clippy <code>-D warnings</code></td><td class="ok">PASS（先修复既有 needless_return）</td></tr>
@@ -468,7 +468,7 @@
     <p><strong>Windows 10 核心功能与权限契约：</strong>PASS（Assisted 有/无 launcher 两条真实路径、FullAccess、切换、后台与取消）；Medium token 安全 canary 与零写 child 边界未在本机证明。</p>
     <p><strong>输出编码专项：</strong>PASS（Windows 10）；macOS/Linux 真实终端 NOT VERIFIED。</p>
     <p><strong>最终候选业务 Dogfood：</strong>PASS；唯一警告是中文总结无机械检查。</p>
-    <p><strong>完整工程门禁：</strong>fmt 逐包、check、clippy、release build PASS；workspace 测试 7481/51，51 个均归类为宿主/环境或 baseline；dev verify 3 个 lib target 受同一环境阻塞；release lab 未运行。</p>
+    <p><strong>完整工程门禁：</strong>fmt（逐包 + 30 字符短路径 <code>--all</code>）、check、clippy、release build PASS；workspace 测试 7481/51（50 distinct），50 个均归类为宿主/环境或 baseline；dev verify 3 个 lib target 受同一环境阻塞；release lab 未运行。</p>
     <p><strong>Windows 11 / 标准用户 / macOS/Linux：</strong>NOT VERIFIED。</p>
     <p><strong>合并 / 发布：</strong>代码与受影响测试满足合并进入 CI 的条件；正式发布条件未满足（未验证环境 + 外部实验室未运行）。未 push、未打 tag、未发布。</p>
   </div>
