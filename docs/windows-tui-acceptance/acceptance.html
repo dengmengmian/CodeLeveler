@@ -366,6 +366,7 @@
     <li>真实模型单次 dogfood，存在模型/温度/网络波动；运行时的警告是证据纪律，不是兜底。</li>
     <li>截图右下角 Windows 激活水印是环境 artifact，不是 TUI 内容。</li>
     <li>未 push、未打 tag、未发布；无远端变更。</li>
+    <li>未运行完整 <code>./dev</code> gate、workspace-wide clippy/all-features、release-grade dogfood、macOS/Linux 真实终端；受影响包 fmt/check/tests 已通过。本机 <code>cargo fmt --all</code> 触发 Windows path-too-long <code>os error 206</code>，包级 fmt 通过。</li>
   </ul>
 </section>
 

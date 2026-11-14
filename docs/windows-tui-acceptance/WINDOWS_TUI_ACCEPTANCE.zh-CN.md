@@ -279,6 +279,8 @@ refuse non-FullAccess spawn with write_root=... Use FullAccess explicitly...")
 9. **Windows 激活水印**：截图右下角水印为环境 artifact，不是 TUI 内容。
 10. **版本身份**：最终 `--version` 以提交后重建为准；候选 ZIP/哈希与提交对应关系见上表。
 
+**未运行的完整门禁**：完整 `./dev` gate、workspace-wide clippy/all-features、release-grade dogfood、macOS/Linux 真实终端未运行。受影响包的 fmt/check/tests 已通过；`cargo fmt --all` 在本机触发 Windows path-too-long `os error 206`，包级 `cargo fmt -p ... --check` 通过。
+
 ## 8. 复现与证据索引
 
 启动测试 TUI：
