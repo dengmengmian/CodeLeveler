@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = PathBuf::from(format!("/tmp/lvl-memory-{}-{n}-{name}", std::process::id()));
+    // The product refuses a relative memory root, and "/tmp" has no drive on
+    // Windows: the scratch home must come from the platform's own temp root.
+    let path = std::env::temp_dir().join(format!("lvl-memory-{}-{n}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(path.join("home/leveler")).unwrap();
     std::fs::create_dir_all(path.join("repo")).unwrap();
@@ -87,9 +89,13 @@ fn status_projects_the_configured_rollout() {
     let root = scratch("status");
     let status = json(&leveler(&root, &["memory", "status", "--json"]));
     assert_eq!(status["rollout"], "record_only", "{status}");
+    // Path equality, not string equality: the product may render the same
+    // directory with the platform's separator while `Path::join` keeps the
+    // separator written here.
+    let expected_root = root.join("home/leveler/memory/global");
     assert_eq!(
-        status["global"]["root"].as_str(),
-        Some(root.join("home/leveler/memory/global").to_str().unwrap()),
+        status["global"]["root"].as_str().map(Path::new),
+        Some(expected_root.as_path()),
         "the CLI reads the same home the agent does: {status}"
     );
     assert!(

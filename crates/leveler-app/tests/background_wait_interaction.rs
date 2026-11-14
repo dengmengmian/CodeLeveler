@@ -244,6 +244,63 @@ impl Fixture {
         }
     }
 
+    /// Wait until every input in `ids` is durably delivered to the model, and
+    /// fail if the turn ends first.
+    ///
+    /// `InputSettled(Delivered)` is written in the same transaction that
+    /// appends the input to the round it will be sent in, so it is the
+    /// product's own boundary for "the text entered the model's context" —
+    /// not an optimistic client row. A terminal event before both settles
+    /// means one message was left for another turn, which is the defect this
+    /// fixture exists to refuse.
+    async fn wait_for_inputs_delivered(
+        &self,
+        rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+        ids: &[&str],
+    ) {
+        use leveler_client_protocol::UiInputState;
+        use tokio::sync::broadcast::error::RecvError;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut delivered: Vec<&str> = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Ok(RuntimeEvent::InputSettled {
+                    message_id,
+                    state: UiInputState::Delivered,
+                    ..
+                })) => {
+                    if let Some(id) = ids.iter().find(|id| **id == message_id.as_str())
+                        && !delivered.contains(id)
+                    {
+                        delivered.push(*id);
+                    }
+                    if delivered.len() == ids.len() {
+                        return;
+                    }
+                }
+                Ok(Ok(RuntimeEvent::TurnCompleted))
+                | Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { .. }))
+                | Ok(Ok(RuntimeEvent::TurnAnswered))
+                | Ok(Ok(RuntimeEvent::TurnPaused { .. }))
+                | Ok(Ok(RuntimeEvent::TurnTruncated { .. }))
+                | Ok(Ok(RuntimeEvent::TurnIncomplete { .. }))
+                | Ok(Ok(RuntimeEvent::TurnBlocked { .. }))
+                | Ok(Ok(RuntimeEvent::TurnFailed { .. }))
+                | Ok(Ok(RuntimeEvent::TurnCancelled))
+                | Ok(Ok(RuntimeEvent::TaskCancelled)) => panic!(
+                    "the turn ended before every input was delivered: {delivered:?} of {ids:?}"
+                ),
+                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
+                Ok(Err(RecvError::Closed)) => {
+                    panic!("the event stream closed before every input was delivered: {ids:?}")
+                }
+                Err(_) => panic!("inputs never reached a model request: {delivered:?} of {ids:?}"),
+            }
+        }
+    }
+
     async fn wait_for_turn_end(&self, rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -346,9 +403,15 @@ async fn a_steer_during_a_background_wait_is_answered_without_ending_the_task() 
     f.app.background_tasks().kill(&task).await.ok();
 }
 
-/// Two messages in a row while the wait runs: both are delivered, in order, to
-/// one turn — the second never replaces the first, and neither opens a second
-/// turn.
+/// Two messages in a row while the wait runs: both are delivered, in order,
+/// during one turn — the second never replaces the first, and neither opens a
+/// second turn.
+///
+/// The turn cannot answer on its own: every scripted round reads the task
+/// again, and the test releases the final answer only after both inputs are
+/// durably delivered. A steer therefore cannot race the end of the turn here,
+/// and batching into one request is not assumed — the contract is delivery in
+/// the same turn, at the round that draws the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_steers_during_a_wait_both_reach_the_same_turn() {
     let f = fixture().await;
@@ -360,8 +423,16 @@ async fn two_steers_during_a_wait_both_reach_the_same_turn() {
             serde_json::json!({ "task_id": task, "timeout_seconds": 600 }),
         ))
         .await;
-    f.server.push(text("第一条追问的答复。")).await;
-    f.server.push(text("第二条追问的答复。")).await;
+    // The last response repeats, so the turn keeps taking rounds until the
+    // test releases it: an input admitted between two rounds is drained by a
+    // later round of this same turn instead of meeting a turn that ended.
+    f.server
+        .push(tool_call(
+            "call-get",
+            "get_task",
+            serde_json::json!({ "task_id": task }),
+        ))
+        .await;
 
     let mut rx = f.client.subscribe();
     f.client
@@ -373,29 +444,40 @@ async fn two_steers_during_a_wait_both_reach_the_same_turn() {
         .await
         .unwrap();
     f.wait_for_tool_call(&mut rx, "wait_task").await;
-    for message in ["第一条：进展如何？", "第二条：先别重启服务。"] {
+    let messages = [
+        ("steer-1", "第一条：进展如何？"),
+        ("steer-2", "第二条：先别重启服务。"),
+    ];
+    for (id, message) in messages {
         f.client
             .send(ClientCommand::SteerCurrentTurn {
                 session_id: f.session.clone(),
                 content: message.into(),
-                message_id: None,
+                message_id: Some(leveler_client_protocol::MessageId::new(id)),
             })
             .await
             .unwrap();
     }
+    f.wait_for_inputs_delivered(&mut rx, &["steer-1", "steer-2"])
+        .await;
+    f.server.push(text("两条追问都已收到。")).await;
     f.wait_for_turn_end(&mut rx).await;
 
     let bodies = f.server.request_bodies().await;
-    let delivered: Vec<&String> = bodies
-        .iter()
-        .filter(|body| body.contains("第一条：进展如何") || body.contains("第二条：先别重启服务"))
-        .collect();
+    let position = |needle: &str| bodies.iter().position(|body| body.contains(needle));
+    let first = position(messages[0].1);
+    let second = position(messages[1].1);
     assert!(
-        delivered
-            .last()
-            .is_some_and(|body| body.contains("第一条") && body.contains("第二条")),
-        "both messages reach one model request: {}",
-        delivered.len()
+        first.is_some(),
+        "the first message never reached a model request; bodies={bodies:?}"
+    );
+    assert!(
+        second.is_some(),
+        "the second message never reached a model request; bodies={bodies:?}"
+    );
+    assert!(
+        first.unwrap() <= second.unwrap(),
+        "the messages keep their order: {first:?} then {second:?}"
     );
     let snapshots = f.app.background_tasks().try_all_snapshots().await.unwrap();
     assert_eq!(snapshots.len(), 1, "no duplicate task was started");
