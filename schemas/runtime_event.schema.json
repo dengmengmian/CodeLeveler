@@ -9724,6 +9724,7 @@
         "automatic_dream_enabled",
         "batch_dream_enabled",
         "capture_enabled",
+        "config_path",
         "enabled",
         "global",
         "manual_dream_enabled",
@@ -9743,6 +9744,10 @@
         },
         "capture_enabled": {
           "type": "boolean"
+        },
+        "config_path": {
+          "description": "The global config file this runtime loaded and watches. The page uses it when it explains how to change the rollout, so the instruction names the file that will actually take effect.",
+          "type": "string"
         },
         "enabled": {
           "description": "Memory is on for this session. False when the configured rollout is `off`, or when the session toggle paused it; `rollout` distinguishes the two.",

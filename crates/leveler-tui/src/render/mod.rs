@@ -1341,7 +1341,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
     state.theme.paint_canvas(frame, area);
 
-    if state.active_screen == Screen::Conversation {
+    if state.active_screen == Screen::Conversation || state.active_screen == Screen::Memory {
         // The side thread is a surface of its own, not a card over the main
         // workbench: it owns the viewport and the composer while focused.
         if state.surface == crate::btw::SurfaceFocus::Btw {
@@ -1355,6 +1355,13 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
             crate::update::render_panel(frame, area, view, &state.theme, state.t());
         }
         screens::render_history_search(frame, area, state);
+        // Memory is an observational overlay over the conversation: the
+        // transcript and composer stay where they are, and an interrupting
+        // runtime overlay (approval/clarification) draws above it once the
+        // reducer gives that overlay the keys.
+        if state.active_screen == Screen::Memory && state.overlay.is_none() {
+            crate::memory::render_overlay(frame, area, state);
+        }
         return;
     }
 
@@ -1366,6 +1373,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     // conversation.
     match state.active_screen {
         Screen::Conversation => unreachable!(),
+        Screen::Memory => unreachable!("memory renders as an overlay over the conversation"),
         Screen::Tools => render_tools_screen(frame, area, state),
         Screen::Diff => render_diff_screen(frame, area, state),
         Screen::Sessions => render_sessions_screen(frame, area, state),
@@ -1382,7 +1390,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Context => crate::context::render_stats_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
         Screen::Schedules => crate::schedules::render_screen(frame, area, state),
-        Screen::Memory => crate::memory::render_screen(frame, area, state),
         Screen::Output => render_output_screen(frame, area, state),
     }
     if let Some(overlay) = &state.overlay {
