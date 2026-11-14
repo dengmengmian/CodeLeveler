@@ -1542,6 +1542,17 @@ mod history_tests {
         assert_eq!(c.text(), "", "every grapheme and every token can come out");
     }
 
+    #[test]
+    fn paste_keeps_a_multiline_emoji_payload_intact() {
+        // The Windows Alt+V path reads the OS clipboard as Unicode and feeds
+        // this same insertion path. Newlines stay buffer newlines and the
+        // non-BMP payload is not narrowed or split.
+        let mut c = Composer::new();
+        c.insert_paste("第一行 😀\n第二行 👨‍👩‍👧‍👦");
+        assert_eq!(c.text(), "第一行 😀\n第二行 👨‍👩‍👧‍👦");
+        assert_eq!(c.cursor(), c.len());
+    }
+
     /// The composer buffer is painted as terminal cells verbatim, so it must
     /// never hold a tab or a control character: the terminal would expand or
     /// interpret it while the renderer counted one column, and everything

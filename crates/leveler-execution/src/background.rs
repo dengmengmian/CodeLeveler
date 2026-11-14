@@ -15,6 +15,7 @@ use crate::command::{
     CommandRunner, ManagedProcess, OutputChunk, OutputStream, ProcessHandoff, ProcessIdentity,
     ProcessRequest,
 };
+use crate::encoding::decode_output;
 use crate::snapshot::SnapshotId;
 
 /// Pre-spawn workspace snapshot and write authority, used to settle a
@@ -3643,7 +3644,7 @@ async fn append_log(
     stream: BackgroundOutputStream,
     bytes: &[u8],
 ) -> Option<(Option<String>, String)> {
-    let raw = String::from_utf8_lossy(bytes);
+    let raw = decode_output(bytes);
     append_text_log(reg, id, stream, &raw).await
 }
 

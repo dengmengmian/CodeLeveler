@@ -708,12 +708,21 @@ pub(crate) fn home_collapsed_repo(state: &AppState) -> String {
     let Some(repo) = state.repository.as_deref() else {
         return "—".to_string();
     };
+    let repo = leveler_core::path::display_path(std::path::Path::new(repo));
     match leveler_core::environment().var_os("HOME") {
-        Some(h) => match repo.strip_prefix(h.to_string_lossy().as_ref()) {
-            Some(rest) => format!("~{rest}"),
-            None => repo.to_string(),
-        },
-        None => repo.to_string(),
+        Some(h) => {
+            let home = leveler_core::path::display_path(std::path::Path::new(&h));
+            if repo == home {
+                return "~".to_string();
+            }
+            match repo.strip_prefix(home.as_ref()) {
+                Some(rest) if rest.starts_with('\\') || rest.starts_with('/') => {
+                    format!("~{rest}")
+                }
+                _ => repo.into_owned(),
+            }
+        }
+        None => repo.into_owned(),
     }
 }
 

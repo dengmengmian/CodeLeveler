@@ -4,7 +4,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::brand::{BrandMarkSize, BrandStyles, level_mark, level_mark_width, paint_mark_row};
 use crate::i18n::{Locale, UiText};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -182,26 +181,13 @@ fn layout(
         && height >= 16
         && mascot_h >= 5
         && mascot_w >= 16;
-    let mark_size = if inner >= 58 {
-        BrandMarkSize::Master
-    } else if inner >= 46 {
-        BrandMarkSize::Compact
-    } else {
-        BrandMarkSize::Micro
-    };
-    let mark_rows = level_mark(mark_size);
-    let mark_w = level_mark_width(mark_size);
-
-    let mut show_mark = !use_mascot && bordered && inner >= mark_w + 28;
-    let hero_for = |use_mascot: bool, show_mark: bool| {
+    let hero_for = |use_mascot: bool| {
         if use_mascot {
             mascot_h
-        } else if show_mark {
-            mark_rows.len().max(5)
-        } else if height < 12 {
-            3
         } else {
-            4
+            // Without the native mascot the hero is text only: never reserve
+            // a column or a block-art substitute for the illustration.
+            3
         }
     };
     // Vertical budget. The card is sized to the viewport the caller published
@@ -226,12 +212,7 @@ fn layout(
             + usize::from(blank)
             + usize::from(bordered) * 2
     };
-    while planned_rows(
-        hero_for(use_mascot, show_mark),
-        spacer_after_hero,
-        untrusted_blank,
-    ) > height
-    {
+    while planned_rows(hero_for(use_mascot), spacer_after_hero, untrusted_blank) > height {
         if spacer_after_hero {
             spacer_after_hero = false;
         } else if untrusted_blank {
@@ -240,35 +221,19 @@ fn layout(
             // The illustration is decoration; a slot that cannot be drawn
             // must not leave an empty column beside the text.
             use_mascot = false;
-        } else if show_mark {
-            // The illustration is decoration; the notice is not.
-            show_mark = false;
         } else {
             // Nothing droppable is left: the content genuinely needs more room
             // than the viewport offers, and the reader scrolls.
             break;
         }
     }
-    let art_w = if use_mascot {
-        mascot_w
-    } else if show_mark {
-        mark_w
-    } else {
-        0
-    };
+    let art_w = if use_mascot { mascot_w } else { 0 };
     let gap = if art_w > 0 { 4 } else { 0 };
     let text_w = inner.saturating_sub(art_w + gap);
-    let hero_rows = hero_for(use_mascot, show_mark);
+    let hero_rows = hero_for(use_mascot);
     let text_top = hero_rows.saturating_sub(5) / 2;
     for row in 0..hero_rows {
-        let mut spans = if show_mark {
-            mark_rows
-                .get(row)
-                .map(|r| paint_mark_row(r, BrandStyles::from_theme(theme)))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
         let used: usize = spans.iter().map(|s| disp_w(s.content.as_ref())).sum();
         if art_w > 0 {
             spans.push(Span::raw(" ".repeat(art_w.saturating_sub(used) + gap)));
@@ -482,10 +447,10 @@ pub(crate) fn render_native_image(
         &mut image.protocol,
     );
     if let Some(Err(error)) = image.protocol.last_encoding_result() {
-        tracing::warn!(%error,"welcome PNG encoding failed; using terminal logo");
+        tracing::warn!(%error,"welcome PNG encoding failed; hiding the image");
         image.mark_failed();
         // Clear skipped protocol cells as well as symbols, then immediately
-        // render the logo fallback in the same frame.
+        // render the text-only welcome in the same frame.
         frame.render_widget(ratatui::widgets::Clear, content);
         let mut lines = splash_lines(
             state,
@@ -676,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn native_png_uses_image_widget_and_unsupported_uses_terminal_logo() {
+    fn native_png_uses_image_widget_and_unsupported_hides_art() {
         use ratatui::{Terminal, backend::TestBackend};
         use ratatui_image::picker::ProtocolType;
         let mut s = state(Locale::Zh);
@@ -696,8 +661,11 @@ mod tests {
         assert!(!paint(&s, 100, 30).contains('▀'));
         s.welcome_image = None;
         let text = paint(&s, 100, 30);
-        assert!(text.contains('█'));
+        // Without a native image protocol the illustration is hidden. A
+        // block-art / monochrome logo is not a substitute for the mascot.
+        assert!(!text.contains('█'));
         assert!(!text.contains('▀'));
+        assert!(text.contains("CodeLeveler"));
         s.welcome_image = Some(NativeMascot::new(ProtocolType::Iterm2, (10, 20)).unwrap());
         s.theme = Theme::no_color();
         assert!(layout(&s, 100, 30, &s.theme, s.t()).image.is_none());
@@ -924,6 +892,8 @@ mod tests {
         assert!(layout.image.is_none());
         let text = joined(&layout.lines);
         assert!(text.contains("CodeLeveler"));
+        assert!(!text.contains('█'));
+        assert!(!text.contains('▀'));
         for index in 0..3 {
             let label = action_label(Locale::Zh, index);
             assert!(text.contains(label), "{label}");

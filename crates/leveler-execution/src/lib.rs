@@ -20,6 +20,7 @@ pub mod checkpoint;
 mod clarify;
 pub mod command;
 pub mod credential;
+pub mod encoding;
 pub mod execution_host;
 pub mod git_effects;
 pub mod git_isolation;
@@ -33,6 +34,7 @@ mod pty;
 pub mod resource_identity;
 pub mod risk;
 mod shell_ast;
+pub use encoding::decode_output;
 pub use shell_ast::{
     ExecutedCommands, executed_commands, literal_command_words, literal_program_names,
     proven_executed_commands,

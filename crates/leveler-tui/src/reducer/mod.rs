@@ -2000,6 +2000,32 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         return activate_welcome_action(state, digit as usize - '1' as usize);
     }
 
+    // Windows Terminal handles Ctrl+V/Shift+Insert itself. In a native console
+    // app that path turns every newline into Enter and replaces non-BMP text
+    // with '?', so multi-line or emoji pastes cannot reach the composer as one
+    // payload. Alt+V is passed through and reads the real Unicode clipboard.
+    if cfg!(windows)
+        && alt
+        && !ctrl
+        && key.code == KeyCode::Char('v')
+        && state.active_screen == Screen::Conversation
+        && state.workbench_focus == WorkbenchFocus::Input
+        && state.history_search.is_none()
+        && state.update.is_none()
+        && state.overlay.is_none()
+    {
+        state.disarm_ctrlc();
+        clear_quit_confirm_notification(state);
+        if let Some(text) = read_clipboard_text()
+            && !text.is_empty()
+        {
+            let mut effects = shell::insert_text(state, &text, true);
+            effects.extend(request_file_candidates(state));
+            return effects;
+        }
+        return Vec::new();
+    }
+
     if !btw && let Some(mut search) = state.history_search.take() {
         if is_ctrl_c(&key) {
             state.disarm_ctrlc();
@@ -2970,6 +2996,14 @@ fn should_disarm_ctrlc(key: &KeyEvent) -> bool {
         KeyCode::Char(c) if c.is_control() => false,
         _ => true,
     }
+}
+
+/// Read Unicode text from the local clipboard for the Windows-only Alt+V
+/// paste path. `None` means the clipboard has no readable text (for example,
+/// it holds an image); the caller then consumes the key without inserting.
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok()
 }
 
 fn clear_quit_confirm_notification(state: &mut AppState) {

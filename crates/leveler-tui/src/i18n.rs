@@ -548,6 +548,7 @@ pub struct UiText {
     /// Entering it changes what Enter does — the line runs on the user's own
     /// machine — so the mode has to be legible while it is on.
     pub hint_files: &'static str,
+    pub hint_paste_clipboard: &'static str,
     pub hint_permission: &'static str,
     pub hint_shortcuts: &'static str,
     /// "轮次 {}/{}" / "turn {}/{}"
@@ -1899,6 +1900,7 @@ static ZH: UiText = UiText {
     hint_commands: "命令",
     hint_user_shell: "Shell",
     hint_files: "文件",
+    hint_paste_clipboard: "Alt+V 粘贴",
     hint_permission: "权限",
     hint_shortcuts: "快捷键",
     turn_nav: "轮次 {}/{}",
@@ -2963,6 +2965,7 @@ static EN: UiText = UiText {
     hint_commands: "commands",
     hint_user_shell: "Shell",
     hint_files: "files",
+    hint_paste_clipboard: "Alt+V paste",
     hint_permission: "permission",
     hint_shortcuts: "shortcuts",
     turn_nav: "turn {}/{}",

@@ -19,10 +19,13 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
         "  repo:    {}",
         layout
             .primary_workspace()
-            .map(|p| p.display().to_string())
+            .map(|p| leveler_core::path::display_path(p).into_owned())
             .unwrap_or_else(|| "No Workspace".to_string())
     );
-    println!("  config:  {}", layout.config_dir.display());
+    println!(
+        "  config:  {}",
+        leveler_core::path::display_path(&layout.config_dir)
+    );
     println!();
 
     let mut results = leveler_app::doctor::run(&config);
@@ -51,7 +54,7 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
             Line::warn(&format!("{} recent crash record(s):", crashes.len()))
         );
         for path in &crashes {
-            println!("    {}", path.display());
+            println!("    {}", leveler_core::path::display_path(path));
         }
         println!("  Local only — nothing was sent anywhere.");
     }
