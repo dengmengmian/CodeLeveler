@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
+#[cfg(unix)]
+use leveler_client_protocol::RuntimeEvent;
+use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
 #[cfg(unix)]
 use leveler_execution::BackgroundTaskStatus;
 use leveler_execution::{AutoApprove, PermissionProfile};
