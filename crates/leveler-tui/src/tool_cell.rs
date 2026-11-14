@@ -151,6 +151,8 @@ fn tool_argument_lines(
 }
 
 fn compact_path_for_summary(path: &str) -> String {
+    let displayed = leveler_core::path::display_path(std::path::Path::new(path));
+    let path = displayed.as_ref();
     if path.is_empty() || !path.starts_with('/') {
         return path.to_string();
     }
@@ -679,10 +681,14 @@ fn compact_home_in_text(text: &str) -> String {
         return text.to_string();
     };
     let hs = home.to_string_lossy();
-    if hs.is_empty() || !text.contains(hs.as_ref()) {
+    if hs.is_empty() {
         return text.to_string();
     }
-    text.replace(hs.as_ref(), "~")
+    // Replace the verbatim spelling first: replacing the plain prefix inside
+    // `\\?\C:\...` would leave the meaningless `\\?\~`.
+    let display = leveler_core::path::display_path(std::path::Path::new(&home));
+    let verbatim = format!(r"\\?\{}", display);
+    text.replace(&verbatim, "~").replace(hs.as_ref(), "~")
 }
 
 fn looks_like_json_object(s: &str) -> bool {

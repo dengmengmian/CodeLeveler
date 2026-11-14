@@ -9,6 +9,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::WriteScope;
+use crate::encoding::decode_output;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -2584,7 +2585,7 @@ async fn read_capped(
                     if tx
                         .try_send(OutputChunk {
                             stream: *stream,
-                            text: String::from_utf8_lossy(&buf[..n]).into_owned(),
+                            text: decode_output(&buf[..n]),
                         })
                         .is_err()
                     {
@@ -2610,7 +2611,7 @@ async fn read_capped(
     }
     if dropped == 0 {
         head.extend(tail);
-        let mut text = String::from_utf8_lossy(&head).into_owned();
+        let mut text = decode_output(&head);
         if live_dropped > 0 {
             text.push_str(&format!("\n[live output omitted: {live_dropped} bytes]\n"));
         }
@@ -2618,7 +2619,7 @@ async fn read_capped(
     }
     let mut text = String::from_utf8_lossy(&head).into_owned();
     text.push_str(&format!("\n…[{dropped} bytes dropped]…\n"));
-    text.push_str(&String::from_utf8_lossy(tail.make_contiguous()));
+    text.push_str(&decode_output(tail.make_contiguous()));
     if live_dropped > 0 {
         text.push_str(&format!("\n[live output omitted: {live_dropped} bytes]\n"));
     }

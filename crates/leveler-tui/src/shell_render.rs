@@ -118,9 +118,20 @@ pub fn copy_text(raw: &str) -> String {
 /// file here is a real error (pruned or removed), never a cue to copy a
 /// partial tail instead.
 pub fn read_complete_capture(directory: &std::path::Path) -> Result<String, String> {
-    let path = directory.join("combined.log");
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("完整输出不可用 ({}): {error}", path.display()))?;
+    // The app publishes a decoded copy beside the raw capture. Prefer it so a
+    // legacy console code page (for example GBK) is not shown as `◆`.
+    let decoded = directory.join("combined.utf8.log");
+    let path = if decoded.is_file() {
+        decoded
+    } else {
+        directory.join("combined.log")
+    };
+    let bytes = std::fs::read(&path).map_err(|error| {
+        format!(
+            "完整输出不可用 ({}): {error}",
+            leveler_core::path::display_path(&path)
+        )
+    })?;
     Ok(copy_text(&String::from_utf8_lossy(&bytes)))
 }
 

@@ -13,6 +13,7 @@ pub mod environment;
 pub mod home;
 pub mod ids;
 pub mod ownership;
+pub mod path;
 pub mod resource_grant;
 pub mod secret;
 pub mod test_crash;
