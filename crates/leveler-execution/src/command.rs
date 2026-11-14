@@ -9,7 +9,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::WriteScope;
-use crate::encoding::decode_output;
+use crate::encoding::{OutputDecoder, decode_output};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -2559,6 +2559,9 @@ async fn read_capped(
     let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut dropped: u64 = 0;
     let mut live_dropped: u64 = 0;
+    // Read boundaries land inside multi-byte characters; the live channel must
+    // see the same characters the final capture decodes.
+    let mut live_decoder = OutputDecoder::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
         // Stop reading once the drain deadline fires: after the child itself
@@ -2585,7 +2588,7 @@ async fn read_capped(
                     if tx
                         .try_send(OutputChunk {
                             stream: *stream,
-                            text: decode_output(&buf[..n]),
+                            text: live_decoder.push(&buf[..n]),
                         })
                         .is_err()
                     {
@@ -2606,6 +2609,20 @@ async fn read_capped(
             }
         }
     }
+    if let Some((stream, tx)) = &chunks {
+        let pending = live_decoder.pending_len() as u64;
+        let rest = live_decoder.finish();
+        if !rest.is_empty()
+            && tx
+                .try_send(OutputChunk {
+                    stream: *stream,
+                    text: rest,
+                })
+                .is_err()
+        {
+            live_dropped = live_dropped.saturating_add(pending);
+        }
+    }
     if let Some(tee) = tee {
         tee.finish();
     }
@@ -2617,7 +2634,10 @@ async fn read_capped(
         }
         return (text, live_dropped, live_dropped);
     }
-    let mut text = String::from_utf8_lossy(&head).into_owned();
+    // The head is a complete prefix of the capture, so it carries the same
+    // legacy encoding as the rest of the stream. Decoding it as UTF-8 lossily
+    // would garble a GBK result exactly where the user lost the middle.
+    let mut text = decode_output(&head);
     text.push_str(&format!("\n…[{dropped} bytes dropped]…\n"));
     text.push_str(&decode_output(tail.make_contiguous()));
     if live_dropped > 0 {
@@ -2630,6 +2650,196 @@ async fn read_capped(
 
 #[cfg(test)]
 mod tests {
+    /// Run one real program and collect its live chunks next to the final
+    /// capture, so the two presentations can be compared.
+    #[cfg(windows)]
+    async fn run_streaming_text(
+        program: &str,
+        args: Vec<String>,
+        cwd: &std::path::Path,
+    ) -> (super::ProcessOutput, String) {
+        let mut request = super::ProcessRequest::new(program, args, cwd.to_path_buf());
+        // Small enough that the large-output fixture really truncates.
+        request.max_output_bytes = 64 * 1024;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::OutputChunk>(64);
+        let collector = tokio::spawn(async move {
+            let mut live = String::new();
+            while let Some(chunk) = rx.recv().await {
+                live.push_str(&chunk.text);
+            }
+            live
+        });
+        let environment = leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        );
+        let output = super::CommandRunner::with_environment(std::sync::Arc::new(environment))
+            .run_streaming(request, tokio_util::sync::CancellationToken::new(), tx)
+            .await
+            .expect("the fixture program runs");
+        (output, collector.await.unwrap())
+    }
+
+    /// A truncated GBK capture must not garble the retained head: the head is
+    /// decoded as the stream's encoding, not as lossy UTF-8.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_truncated_gbk_capture_decodes_its_head_and_tail() {
+        use tokio::io::AsyncWriteExt;
+        // The fixture is only meaningful where the host's legacy code page is
+        // the one the bytes were written in.
+        if crate::encoding::decode_output(&[0xD6, 0xD0]) != "中" {
+            eprintln!("skipping: the host code page is not GBK");
+            return;
+        }
+        // "中文中文中文" in code page 936.
+        let bytes = [
+            0xD6u8, 0xD0, 0xCE, 0xC4, 0xD6, 0xD0, 0xCE, 0xC4, 0xD6, 0xD0, 0xCE, 0xC4,
+        ];
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(&bytes).await.unwrap();
+        drop(writer);
+        let mut pipe = Some(reader);
+        let (text, dropped, _) = super::read_capped(
+            &mut pipe,
+            8,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(dropped, 4);
+        assert_eq!(text, "中文\n…[4 bytes dropped]…\n中文");
+    }
+
+    /// `cmd`'s `type` copies a file byte-for-byte, so the fixture controls the
+    /// child's encoding independently of the host console code page.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_real_cmd_stream_decodes_utf8_and_gbk_in_streaming_and_final_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let utf8 = dir.path().join("utf8.txt");
+        std::fs::write(&utf8, "中文".as_bytes()).unwrap();
+        let (output, live) = run_streaming_text(
+            "cmd",
+            vec!["/C".into(), format!("type \"{}\"", utf8.display())],
+            dir.path(),
+        )
+        .await;
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "中文");
+        assert_eq!(live, output.stdout, "streaming and final agree");
+
+        // The GBK fixture is only meaningful where the host decodes GBK.
+        if super::decode_output(&[0xD6, 0xD0]) != "中" {
+            eprintln!("not applicable: the host code page is not GBK");
+            return;
+        }
+        let gbk = dir.path().join("gbk.txt");
+        std::fs::write(&gbk, [0xD6u8, 0xD0, 0xCE, 0xC4]).unwrap();
+        let (output, live) = run_streaming_text(
+            "cmd",
+            vec!["/C".into(), format!("type \"{}\"", gbk.display())],
+            dir.path(),
+        )
+        .await;
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "中文");
+        assert_eq!(
+            live, output.stdout,
+            "the live view sees the same characters as the final capture"
+        );
+    }
+
+    /// PowerShell writes one byte at a time with a flush between bytes, which
+    /// forces the read boundary through the middle of a GBK character.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_multibyte_character_split_across_pipe_reads_stays_one_character() {
+        if super::decode_output(&[0xD6, 0xD0]) != "中" {
+            eprintln!("not applicable: the host code page is not GBK");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = "$o=[Console]::OpenStandardOutput(); \
+                      $b=[Text.Encoding]::GetEncoding(936).GetBytes([string]([char]0x4E2D)+[char]0x6587); \
+                      foreach($x in $b){$o.WriteByte($x);$o.Flush();Start-Sleep -Milliseconds 120}";
+        let (output, live) = run_streaming_text(
+            "powershell",
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+            dir.path(),
+        )
+        .await;
+        assert_eq!(output.exit_code, Some(0), "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "中文");
+        assert_eq!(
+            live, "中文",
+            "no replacement glyph appears at a read boundary"
+        );
+    }
+
+    /// Malformed bytes do not consume the text that follows them.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_malformed_byte_does_not_swallow_following_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.bin");
+        std::fs::write(&bad, [b'A', 0xFF, b'B']).unwrap();
+        let (output, live) = run_streaming_text(
+            "cmd",
+            vec!["/C".into(), format!("type \"{}\"", bad.display())],
+            dir.path(),
+        )
+        .await;
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.starts_with('A') && output.stdout.ends_with('B'));
+        assert_eq!(live, output.stdout);
+    }
+
+    /// A large legacy-encoded capture keeps its head and tail readable rather
+    /// than turning the retained prefix into replacement glyphs.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_large_gbk_capture_keeps_head_and_tail_readable() {
+        if super::decode_output(&[0xD6, 0xD0]) != "中" {
+            eprintln!("not applicable: the host code page is not GBK");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-gbk.txt");
+        let mut bytes = Vec::with_capacity(2 * 1024 * 1024);
+        for _ in 0..(512 * 1024) {
+            bytes.extend_from_slice(&[0xD6, 0xD0]);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let (output, live) = run_streaming_text(
+            "cmd",
+            vec!["/C".into(), format!("type \"{}\"", path.display())],
+            dir.path(),
+        )
+        .await;
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.truncated, "the retained result is capped");
+        assert!(
+            output.stdout.starts_with('中') && output.stdout.ends_with('中'),
+            "the head and tail decode as GBK, not lossy UTF-8"
+        );
+        assert!(
+            !output.stdout.contains('\u{FFFD}'),
+            "the retained prefix is not replacement glyphs"
+        );
+        assert!(
+            live.contains('中'),
+            "the live stream is readable across the whole run"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unrestricted_execution_preserves_credentials_and_ignores_scoped_restrictions() {

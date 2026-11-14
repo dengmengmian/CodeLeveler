@@ -13,7 +13,7 @@ use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::{
-    OwnershipStore, SessionInputRepository, TaskOwner, TaskStore, TurnRepository,
+    OwnershipStore, SessionInputRepository, SessionRepository, TaskOwner, TaskStore, TurnRepository,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -455,6 +455,34 @@ async fn two_windows() -> Windows {
     windows_with(PermissionProfile::Assisted).await
 }
 
+/// Whether this host can actually confine a non-FullAccess write scope.
+///
+/// A Windows host without the installed `leveler-confine.exe` launcher reports
+/// `write=unsupported`; the runtime then refuses a confined spawn instead of
+/// silently running it unconfined. The product never upgrades the profile on
+/// its own — a test that needs a shell there must ask for FullAccess exactly
+/// as the user does.
+fn sandbox_write_available() -> bool {
+    matches!(
+        leveler_execution::probe_sandbox_capabilities().write,
+        leveler_execution::FsCapability::WriteRestricted | leveler_execution::FsCapability::FullFs
+    )
+}
+
+/// The profile a user-shell ownership scenario can run under on this host.
+///
+/// On a host with the write backend this is the product default, Assisted.
+/// Where the backend is absent, the scenario explicitly requests FullAccess;
+/// `an_assisted_user_shell_matches_the_write_backend_capability` separately
+/// proves Assisted is refused rather than upgraded.
+fn user_shell_profile() -> PermissionProfile {
+    if sandbox_write_available() {
+        PermissionProfile::Assisted
+    } else {
+        PermissionProfile::FullAccess
+    }
+}
+
 async fn windows_with(profile: PermissionProfile) -> Windows {
     let gate = Gate::start().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -478,7 +506,14 @@ async fn windows_with(profile: PermissionProfile) -> Windows {
             // answer ends the turn.
             .with_collaboration(leveler_agent::CollaborationMode::Chat),
     ));
-    let session = a.app.create_session(&model, "shared").await.unwrap();
+    // The session row is the authority the runtime reads. Create it with the
+    // profile this scenario runs under; a client default alone cannot widen a
+    // session the user created as Assisted.
+    let session = a
+        .app
+        .create_session_with_mode(&model, "shared", profile)
+        .await
+        .unwrap();
     let b = window(Arc::new(
         Application::assemble(layout(tmp.path()))
             .unwrap()
@@ -841,15 +876,40 @@ async fn shell_event(
     .expect("the user shell event arrives")
 }
 
+/// Drain one user shell's stderr and terminal fact. The started fact and any
+/// stdout are not what these permission tests assert.
+async fn shell_terminal(
+    events: &mut tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent>,
+) -> (String, Option<i32>, String) {
+    use leveler_client_protocol::RuntimeEvent;
+    let mut reason = String::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await.expect("session stream stays open") {
+                RuntimeEvent::UserShellOutput { stream, chunk, .. } if stream == "stderr" => {
+                    reason.push_str(&chunk)
+                }
+                RuntimeEvent::UserShellExited {
+                    status, exit_code, ..
+                } => return (status, exit_code, reason),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the shell reaches a terminal fact")
+}
+
 /// U1/U4: a user shell is execution too. While it runs, a sibling window is
 /// refused and nothing moves; once it is cancelled, the window stays open and
 /// the sibling runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_running_user_shell_holds_the_session_until_it_ends() {
     use leveler_client_protocol::RuntimeEvent;
-    let w = two_windows().await;
+    let w = windows_with(user_shell_profile()).await;
     let mut events = w.a.client.subscribe_session(&w.session);
-    w.a.shell(&w.session, "sleep 30").await;
+    w.a.shell(&w.session, &leveler_test_support::sleep_shell_line(30))
+        .await;
     let RuntimeEvent::UserShellStarted { execution_id, .. } = shell_event(&mut events, true).await
     else {
         unreachable!()
@@ -887,7 +947,7 @@ async fn a_running_user_shell_holds_the_session_until_it_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finished_user_shell_releases_the_session() {
     use leveler_client_protocol::RuntimeEvent;
-    let w = two_windows().await;
+    let w = windows_with(user_shell_profile()).await;
     let mut events = w.a.client.subscribe_session(&w.session);
     for (epoch, (command, expected)) in [("echo done", "success"), ("exit 3", "failed")]
         .into_iter()
@@ -907,6 +967,254 @@ async fn a_finished_user_shell_releases_the_session() {
     let owner = w.owner().await;
     assert_eq!(owner.boot, Some(w.b.boot()));
     assert_eq!(owner.epoch.get(), 3);
+}
+
+/// Assisted follows the host's real write capability: it runs when the
+/// launcher can confine the write root, and refuses (never downgrades) when it
+/// cannot. Both branches keep the session's profile and its lease honest.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_assisted_user_shell_matches_the_write_backend_capability() {
+    let w = two_windows().await;
+    let mut events = w.a.client.subscribe_session(&w.session);
+    let marker = w._tmp.path().join("assisted-shell-marker.txt");
+    let command = format!("echo ran > \"{}\"", marker.display());
+    w.a.shell(&w.session, &command).await;
+
+    let (status, exit_code, reason) = shell_terminal(&mut events).await;
+
+    if sandbox_write_available() {
+        assert_eq!(status, "success", "{reason}");
+        assert!(
+            marker.exists(),
+            "a supported backend really runs the Assisted command"
+        );
+    } else {
+        assert_eq!(status, "failed", "{reason}");
+        assert_eq!(exit_code, None, "nothing was spawned");
+        assert!(
+            reason.contains("Windows FS sandbox is not available"),
+            "the refusal names the missing capability: {reason}"
+        );
+        assert!(
+            reason.contains("FullAccess"),
+            "the refusal tells the user the explicit way forward: {reason}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused profile must not start a child that can touch the workspace"
+        );
+    }
+
+    let db = w.a.app.open_database().await.unwrap();
+    let (mode, ..) = SessionRepository::new(&db)
+        .execution(&w.session)
+        .await
+        .unwrap()
+        .expect("the session row exists");
+    assert_eq!(
+        mode, "assisted",
+        "the runtime must not rewrite the profile to make the command run"
+    );
+    assert_eq!(
+        w.owner().await.boot,
+        None,
+        "a terminal shell does not hold the session's execution lease"
+    );
+}
+
+/// The explicit user switch is the recovery path: after an Assisted refusal,
+/// choosing FullAccess must make the next invocation real, without restarting
+/// the session or rewriting history.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switching_to_full_access_makes_a_refused_shell_runnable() {
+    let w = two_windows().await;
+    let mut events = w.a.client.subscribe_session(&w.session);
+    let first_marker = w._tmp.path().join("assisted-first-marker.txt");
+    let first = format!("echo first > \"{}\"", first_marker.display());
+    w.a.shell(&w.session, &first).await;
+    let (first_status, _, first_reason) = shell_terminal(&mut events).await;
+    if sandbox_write_available() {
+        assert_eq!(first_status, "success", "{first_reason}");
+    } else {
+        assert_eq!(first_status, "failed", "{first_reason}");
+        assert!(
+            first_reason.contains("FullAccess"),
+            "the refusal names the recovery: {first_reason}"
+        );
+    }
+
+    // The profile switch is an observed setting: it carries the snapshot
+    // version the client saw. A refused version is retried against a fresh
+    // observation, never against the stale envelope.
+    let mut switched = false;
+    for _ in 0..8 {
+        let observed = w.a.client.snapshot(&w.session).await.unwrap();
+        let envelope = leveler_client_protocol::CommandEnvelope {
+            command_id: leveler_core::CommandId::generate(),
+            session_id: w.session.clone(),
+            expected_version: Some(observed.last_sequence.unwrap_or(0)),
+            issued_at: leveler_core::now().to_rfc3339(),
+            command: ClientCommand::SetPermissionProfile {
+                session_id: w.session.clone(),
+                mode: leveler_client_protocol::PermissionProfile::FullAccess,
+            },
+        };
+        match w.a.client.deliver(envelope).await {
+            Ok(()) => {
+                switched = true;
+                break;
+            }
+            Err(ClientError::Runtime(message)) if message.starts_with("version conflict:") => {}
+            Err(error) => panic!("profile switch failed: {error}"),
+        }
+    }
+    assert!(switched, "the profile switch was never accepted");
+    let db = w.a.app.open_database().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (mode, ..) = SessionRepository::new(&db)
+            .execution(&w.session)
+            .await
+            .unwrap()
+            .expect("the session row exists");
+        if mode == "full_access" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the switch was not persisted: {mode}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let second_marker = w._tmp.path().join("full-access-second-marker.txt");
+    let second = format!("echo second > \"{}\"", second_marker.display());
+    w.a.shell(&w.session, &second).await;
+    let (status, exit_code, reason) = shell_terminal(&mut events).await;
+    assert_eq!(status, "success", "{reason}");
+    assert_eq!(exit_code, Some(0));
+    assert!(
+        second_marker.exists(),
+        "the explicitly chosen FullAccess really runs the command"
+    );
+}
+
+/// The explicit FullAccess path is always available and is the only execution
+/// a Windows host without a write backend can offer. It must still be real:
+/// ownership while it runs, a live process handed to the background registry,
+/// and cancellation through that registry.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_access_user_shell_moves_to_the_background_and_stops() {
+    use leveler_client_protocol::RuntimeEvent;
+    let w = windows_with(PermissionProfile::FullAccess).await;
+    let mut events = w.a.client.subscribe_session(&w.session);
+    w.a.shell(&w.session, &leveler_test_support::sleep_shell_line(30))
+        .await;
+    let execution_id = match shell_event(&mut events, true).await {
+        RuntimeEvent::UserShellStarted { execution_id, .. } => execution_id,
+        _ => unreachable!(),
+    };
+    // The started fact precedes the spawn; wait until the process is really
+    // running before transferring it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = w.a.client.snapshot(&w.session).await.unwrap();
+        let shell = snapshot
+            .user_shells
+            .iter()
+            .find(|shell| shell.id == execution_id)
+            .expect("the shell is recorded");
+        if shell.status == "running" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the shell never started: {:?}",
+            shell.output_tail
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    w.a.client
+        .send(ClientCommand::BackgroundUserShell {
+            session_id: w.session.clone(),
+            execution_id: execution_id.clone(),
+        })
+        .await
+        .unwrap();
+    let task_id = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let RuntimeEvent::UserShellBackgrounded { task_id, .. } =
+                events.recv().await.unwrap()
+            {
+                return task_id;
+            }
+        }
+    })
+    .await
+    .expect("the running shell is handed to the background registry");
+
+    let snapshot = w.a.client.snapshot(&w.session).await.unwrap();
+    let shell = snapshot
+        .user_shells
+        .iter()
+        .find(|shell| shell.id == execution_id)
+        .expect("the shell record survives the transfer");
+    assert_eq!(shell.status, "background");
+    assert_eq!(shell.task_id.as_deref(), Some(task_id.as_str()));
+    assert!(
+        snapshot
+            .active_background_tasks
+            .iter()
+            .any(|task| task.task_id == task_id),
+        "the registry owns the transferred process"
+    );
+
+    w.a.client
+        .send(ClientCommand::CancelBackgroundTask {
+            session_id: w.session.clone(),
+            task_id: task_id.clone(),
+        })
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let RuntimeEvent::BackgroundTaskExited {
+                task_id: exited, ..
+            } = events.recv().await.unwrap()
+                && exited == task_id
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "the background task reaches a terminal fact"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = w.a.client.snapshot(&w.session).await.unwrap();
+        let shell = snapshot
+            .user_shells
+            .iter()
+            .find(|shell| shell.id == execution_id)
+            .expect("the terminal shell record");
+        if shell.status == "cancelled" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stopped shell never reached cancelled: {}",
+            shell.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// R1/R2: recovering a dead boot's turn is finite work. The recovering window

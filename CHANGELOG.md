@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- Windows child-process output is decoded incrementally: a multi-byte character split across pipe reads stays one character, background logs use the same decoder, and a truncated GBK result no longer turns its retained head into replacement glyphs. The TUI full-output pager prefers the UTF-8 presentation copy beside the raw capture; the raw stdout/stderr capture files remain byte-exact.
+- A user shell that fails before it spawns (for example an Assisted command on a Windows host without `leveler-confine.exe`) shows the host's refusal in the live view, not only in the reconnected record.
+
 ## [1.0.26] - 2026-11-12
 
 - Continuation, pause, amendment, cancellation and questions are decided by the model in the running turn, not by a wording pattern. The model declares the meaning with `declare_intent`, quoting the newest user message verbatim; the runtime checks that the quote really came from that message, which goal it targets (and refuses to guess when several are running and none is named), the legal ordered operations, and the plan step a boundary names by stable id. Any language, phrasing or compound instruction ("继续执行，但第三阶段完成后暂停") uses the same path, and no extra classification call is made.
