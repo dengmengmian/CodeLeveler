@@ -1,0 +1,80 @@
+﻿
+== cargo test ==
+cargo :    Compiling billing v0.1.0 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audi
+t\dogfood\最终 账单)
+At line:1 char:986
++ ... t ==" | Out-File -Encoding utf8 -Append $log; cargo test 2>&1 | Out-F ...
++                                                   ~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling bi...\dogfood\最终 账单):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.02s
+     Running unittests src\lib.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\
+deps\billing-825c8aed1dec8a00.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\billing_cli.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.t
+arget\debug\deps\billing_cli-55c89ba3e6be4d0a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\billing_contract.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\d
+ebug\deps\billing_contract-d9b41aa0bf27a001.exe)
+
+running 4 tests
+test a_percentage_discount_rounds_half_up_to_the_nearest_cent ... ok
+test the_csv_reader_accepts_a_bom_and_skips_blank_lines ... ok
+test an_out_of_range_discount_is_rejected_with_the_row_number ... ok
+test the_report_groups_totals_by_category_and_sums_the_grand_total ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests billing
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+TEST_EXIT=0
+== cargo run billing_cli ==
+图书: 3598 分
+文具: 1500 分
+食品: 1020 分
+合计: 6118 分
+CLI_EXIT=0
+== missing file ==
+cargo : 错误: 无法读取 数据 缺失.csv: 系统找不到指定的文件。 (os error 2)
+At line:1 char:1395
++ ... ppend $log; cargo run -q --bin billing_cli -- "数据 缺失.csv" 2>&1 | Out- ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (错误: 无法读取 数据 缺失....件。 (os error 2):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+MISSING_EXIT=1
+== git diff --stat ==
+git : warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+At line:1 char:1619
++ ...  | Out-File -Encoding utf8 -Append $log; git diff --stat 2>&1 | Out-F ...
++                                              ~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'src/bin/billing_cli.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/csv.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/discount.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/report.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '说明 文档.md', LF will be replaced by CRLF the next time Git touches it
+ README.md                                          | 36 +++++++++++++--
+ src/bin/billing_cli.rs                             | 38 ++++++++++++++--
+ src/csv.rs                                         | 15 ++++--
+ src/discount.rs                                    |  9 ++--
+ src/report.rs                                      | 21 +++++++--
+ ...57\264\346\230\216 \346\226\207\346\241\243.md" | 53 ++++++++++++++++++----
+ 6 files changed, 144 insertions(+), 28 deletions(-)
+== test file diff ==
+TEST_DIFF_LINES=0

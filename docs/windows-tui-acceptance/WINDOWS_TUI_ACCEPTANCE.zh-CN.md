@@ -2,9 +2,10 @@
 
 日期：2026-11-14  
 分支：`windows/tui-quality`  
-代码提交：`b1f002d`（基线 `99fef72`，`1.0.26`）  
-最终候选：`windows-audit/candidate/final/`  
-结论：**Windows 10 已测试环境通过；Windows 11 未验证；非提升会话已测试；标准用户、macOS/Linux 真实终端未验证。**
+代码提交：`b1f002d`（专项基线 `99fef72`，`1.0.26`）  
+收口提交：`5a4fc17`（最终候选，见 §9）  
+最终候选：`windows-audit/candidate/closure/`（历史候选 `candidate/final/` 保留）  
+结论：**Windows 10 已测试环境通过；Windows 11 未验证；标准用户、macOS/Linux 真实终端未验证。收口轮见 §9。**
 
 ## 1. 结论摘要
 
@@ -239,9 +240,13 @@ refuse non-FullAccess spawn with write_root=... Use FullAccess explicitly...")
 
 运行时的拒绝是正确行为（不静默降权）；TUI 的 FullAccess 用户 shell 与 dogfood 已通过。该失败路径在未改动的 sandbox capability/测试配置中触发，不是本次 TUI/编码 diff 的直接路径；未在基线复跑，未修改产品权限模型或测试断言。报告把它列为 Windows 测试套件平台缺口，而不是 TUI 回归通过项。
 
+> **收口轮更新（见 §9.1）**：该失败已在该测试环境真实原因上复现并分类——测试环境未构建 `leveler-confine.exe`，且用例使用了 Windows 不存在的 `sleep 30`。CI 的 Windows job 会先构建 launcher；在同样前置条件下，`execution_ownership` 12/12（随后新增切换用例后 13/13）与 `user_shell` 15/15 通过。测试契约已按真实主机能力补齐，没有 skip、删除断言或统一切换 FullAccess。
+
 ## 6. 最终候选与性能
 
 候选包目录：`windows-audit/candidate/final/`（审计工作区，不提交仓库）。
+
+> 收口轮已重建新候选 `1.0.26 (5a4fc17480a6)`，见 §9.5/§9.8；本节保留 `b1f002d` 历史候选与性能对照，不改写当时事实。
 
 | 项 | 值 |
 | --- | --- |
@@ -281,6 +286,8 @@ refuse non-FullAccess spawn with write_root=... Use FullAccess explicitly...")
 
 **未运行的完整门禁**：完整 `./dev` gate、workspace-wide clippy/all-features、release-grade dogfood、macOS/Linux 真实终端未运行。受影响包的 fmt/check/tests 已通过；`cargo fmt --all` 在本机触发 Windows path-too-long `os error 206`，包级 `cargo fmt -p ... --check` 通过。
 
+> **收口轮更新（见 §9.5）**：workspace fmt 逐包检查、all-features check、clippy、release build 与 `./dev verify` 已执行；`cargo fmt --all` 的 206 根因是 290 个文件参数合计 42,065 字符超过 Windows 32,767 命令行长上限，逐包等价检查通过。workspace 测试在 CI 等价环境中 7481 passed / 51 failed；51 个失败已逐类归因为宿主 Low token、缺失 Python、`/tmp` 不可写或 baseline 既有，不是本次改动路径。完整分类见 §9.5。
+
 ## 8. 复现与证据索引
 
 启动测试 TUI：
@@ -300,5 +307,209 @@ windows-audit\scripts\run-tui.cmd <repo>
 - 中文路径 cargo 对照：`evidence/logs/d-default-target.log`、`d-nospace-target.log`
 - 环境：`evidence/env/environment.txt`
 - 性能：`evidence/perf/`
+- 收口轮（权限基线、编码、门禁、最终候选 Dogfood、连续运行）：`evidence/closure/`
 
 所有截图为真实 Windows 窗口捕获，未使用 mock、脚本伪造或合成 UI。模型输出与运行时警告保留原文；独立验证结果见第 4 节。
+
+## 9. 最终收口（2026-11-14）
+
+> 本节记录对 `windows/tui-quality` 专项的最后一轮工程收口。第 1–8 节的事实与证据保留不动；本节只补充新执行的基线复现、权限契约、编码回归、最终候选 Dogfood、完整门禁和剩余边界。
+
+### 9.1 两个 app 集成测试：基线复现与真实原因
+
+基线（`b1f002d`，未改动工作区）在**未构建 `leveler-confine.exe` 的测试环境**中复现：
+
+| 测试 | 结果 | 观测 |
+| --- | --- | --- |
+| `cargo test -p leveler-app --test execution_ownership user_shell` | 2 failed | `echo done` 返回 `failed`；`sleep 30` 返回 `failed`；运行时拒绝非 FullAccess spawn |
+| `cargo test -p leveler-app --test user_shell` | 8 failed | 同一拒绝原因；`snapshot` 中的 `output_tail` 明确写出 `Windows FS sandbox is not available (capability write=unsupported)` |
+
+根因不是 TUI/编码回归，而是**测试前置条件缺失**：
+
+- Windows 上 `probe_sandbox_capabilities().write` 只有在 `leveler-confine.exe` 可解析时才是 `WriteRestricted`。
+- 测试二进制位于 `.target/debug/deps`；`launcher_path()` 会检查其父目录 `.target/debug`。CI 的 Windows job 在测试前执行 `cargo build -p leveler-win-confine --all-features`，所以 CI 能找到 launcher；本机基线没有构建它。
+- 第二个平台缺口是测试命令本身：`sleep 30` 在 Windows 上不是程序。改用 `leveler_test_support::sleep_shell_line(30)`（Windows 为 `ping -n 31 127.0.0.1`）。
+- 测试使用 `PermissionProfile::Assisted` 创建会话，但 `Application::create_session` 持久化的是默认 Assisted；客户端默认值不能替代会话行。测试现在按场景使用 `create_session_with_mode`。
+
+构建 debug launcher 后（CI 等价条件）：
+
+| 测试 | 结果 |
+| --- | --- |
+| `execution_ownership`（Assisted，launcher 存在） | **12 passed**（CI 等价环境完整运行 13 passed，含新增切换用例） |
+| `user_shell`（Assisted，launcher 存在） | **15 passed** |
+
+在不支持写入后端的 Windows 环境中（临时移除 launcher），新增的契约测试断言：
+
+- 拒绝是终态 `failed`，`exit_code=None`；
+- 实时 stderr 明确包含缺失能力和 `FullAccess` 出路；
+- 命令的副作用文件不存在（没有子进程启动）；
+- 会话持久化模式仍是 `assisted`（没有静默降权）；
+- 会话执行租约已释放。
+
+证据：`evidence/closure/baseline-app-execution-ownership-user-shell.log`、`baseline-app-user-shell-suite.log`、`assisted-debug-launcher-*.log`、`unsupported-backend-refusal.log`、`unsupported-backend-switch.log`。
+
+### 9.2 Windows 权限契约
+
+| 项 | 结论 | 证据 |
+| --- | --- | --- |
+| 首次启动默认 | TUI 状态与新建会话均为 `Assisted`（产品默认） | `leveler-tui/src/state.rs`；`create_session` |
+| 权限选择界面 | 三档：请求批准 / 替我审批 / 完全访问 | 现有 overlay，未改动 |
+| 能力提示 | 权限 picker 不预读 OS 能力；`doctor` 报告 `write=Unsupported` 并给 Warn | `doctor` 输出 |
+| 不支持时 | 运行时明确拒绝，不静默降权；错误现在同时进入实时视图与重连记录 | `interactive.rs`；契约测试 |
+| 用户切换 | 显式 `SetPermissionProfile` 后可重试成功；切换带 observed version | `switching_to_full_access_makes_a_refused_shell_runnable` |
+| FullAccess | 用户明确选择时无审批、无 sandbox 限制；用户 Shell、ownership、取消、转后台均正常 | `a_full_access_user_shell_moves_to_the_background_and_stops` |
+| Assisted（有 launcher） | 真实低完整性写入限制；命令、ownership、取消正常 | `an_assisted_user_shell_matches_the_write_backend_capability` 的 supported 分支 |
+
+**权限测试契约**（`execution_ownership.rs`）：
+
+- `an_assisted_user_shell_matches_the_write_backend_capability`：同一测试在两种真实主机能力下都运行，不断言固定结果，而是断言**能力与结果一致**。
+- `switching_to_full_access_makes_a_refused_shell_runnable`：拒绝后由用户显式切换，下一次调用真实执行。
+- 其余 U1/U2/U3/U4 ownership 用例按 `user_shell_profile()` 选择：有后端用 Assisted，无后端显式 FullAccess；没有删除断言或统一切换掩盖失败。
+
+### 9.3 输出编码专项回归
+
+实现：`leveler-execution::encoding::OutputDecoder`。
+
+- 每次读取先尝试合法 UTF-8；合法即原样输出。
+- Windows 上非法 UTF-8 使用 `GetConsoleOutputCP()`；当其为 0/65001 时回退 `GetOEMCP()`；`MultiByteToWideChar` 两阶段解码。
+- 跨分片：UTF-8 尾部不完整序列最多保留 3 字节；DBCS 尾随 lead byte 保留 1 字节，并用 `MB_ERR_INVALID_CHARS` 验证前缀；EOF 时 `finish()` 给出最终结果。
+- 接入：模型工具实时/最终输出（`command.rs`）、后台日志（`background.rs`）、用户 Shell 实时输出（同一 reader）、用户 Shell 捕获 tail/decoded copy（`user_shell.rs`）、TUI 完整输出 pager（`output_view.rs` 优先 `combined.utf8.log`）。
+
+覆盖与结果：
+
+| 场景 | 结果 | 证据 |
+| --- | --- | --- |
+| 合法 UTF-8 原样 | PASS | `valid_utf8_is_unchanged`；`a_real_cmd_stream...` |
+| CP936 中文（cmd `type` 原字节） | PASS | `gbk_bytes_decode_to_chinese`；`a_real_cmd_stream...` |
+| 宿主 CP 65001 / 子进程 GBK | PASS（回退 OEM 936） | 同上；真实 Windows 控制台 |
+| PowerShell 原生字节、跨分片 | PASS | `a_multibyte_character_split_across_pipe_reads_stays_one_character` |
+| 分片 UTF-8 | PASS | `a_utf8_character_split_across_reads_reassembles` |
+| 非法/不完整字节 | PASS（不吞后续文本） | `a_malformed_gbk_byte...`、`an_incomplete_gbk_character...`、`a_malformed_byte_does_not_swallow_following_output` |
+| 长输出/截断头尾 | PASS | `a_large_gbk_capture_keeps_head_and_tail_readable`；截断 head 修复 |
+| 后台日志 | PASS | `a_background_user_shell_log_decodes_gbk` |
+| 用户 Shell 原始捕获 + 解码副本 | PASS | `a_gbk_capture_is_decoded_for_display_and_byte_exact_on_disk` |
+| TUI 完整输出 | PASS | `capture_prefers_the_decoded_presentation_copy` |
+| macOS/Linux 真实终端 | **NOT VERIFIED**（本机无宿主） | 非 Windows 分支保留 lossy，分片逻辑有跨平台单测 |
+
+保存语义：原始 `stdout.log` / `stderr.log` / `combined.log` 保持逐字节精确；`combined.utf8.log` 只是展示副本。现有 `a_capped_shell_keeps_the_complete_stream_on_disk` 继续覆盖完整原始捕获。
+
+### 9.4 最终候选真实业务 Dogfood
+
+**此前 A–D 的身份核查**：四组 meta 均记录 `windows-audit/candidate/debug/leveler.exe`；该二进制 `--version` 为 `1.0.26 (99fef72af5a9-dirty) UNTRUSTED`，SHA-256 `788E...`。因此 A–D **不是** b1f002d 最终候选，不能作为最终候选业务验收证据；它们保留为专项过程证据。
+
+**inventory “已完成，但有警告” 核查**：截图 `b-17-complete.png` 的运行时原文为：
+
+- R4 `[tests]`：`cargo test` exit 0，但运行时没有结构化测试结果，所以测试覆盖仍未验证；
+- R5 `[deliverable]`：`cargo fmt --check` 只有模型自述，没有机械检查；
+- R8 `[content]`：中文总结未进入运行时证据。
+
+这是**验证缺口/正常警告**，不是交付缺口：独立 `cargo test` 6 passed，serial 6 passed，测试文件未修改。
+
+**新最终候选 Dogfood**（使用收口后的 release 候选 `1.0.26 (5a4fc17480a6)`）：
+
+- 业务夹具：`windows-audit/dogfood/最终 账单`（中文+空格路径），多文件 Rust 项目，4 个失败契约测试；基线 `cargo test` 0 passed / 4 failed，CLI 输出 `合计: 1234 分`（固定 demo 值）。
+- 真实 TUI（Windows Terminal，120×30，FullAccess 由 CLI 显式指定，真实 provider/model `deepseek/deepseek-v4.1-flash-1017`）。
+- Session `21411d1e-e2ad-44c3-bf56-96fd2a3b36c3`，Goal `96fcfe6a-2957-4f63-a6e9-ce962331e488`。
+- 结果：3 m 47 s（TUI），23 轮，61 次工具，921,437 tokens（TUI）/ 924,853（session）；9 步 Plan。
+- 覆盖：多文件修改（6 个文件，144 insertions / 28 deletions）、中文/空格路径、`cargo test` stdout/stderr、Plan（1/8 → 6/8 → 9 步）、运行中 Steer、后台任务、独立业务测试、完成交付、回顾稳定展示。
+- Steer 原文“请在「说明 文档.md」中明确记录 CSV 支持 BOM 和空行；最终总结里列出每个类别金额与总计；仍然不要修改测试文件”，TUI 显示“已进入当前任务”，最终文档确实写入 BOM/空行说明与金额表。
+- 最终状态：**已完成，但有警告**。唯一警告是 R12 `[deliverable]`“用中文总结每个类别的金额、总计和测试结果”没有机械检查；这是运行时的证据纪律，不是交付失败。`※ 回顾` 显示“修复四模块与文档，测试 4/4 通过，合计 6118 分”。
+- 后台任务：`!` 用户 Shell 成功转后台并产生真实终态；该 `ping` 命令在 agent harness 的网络沙箱中报告“传输失败”并 exit 1，产品如实显示失败（不是伪造成功）。连续运行中用不依赖网络的 `powershell Start-Sleep` 后台任务验证了自然完成/成功路径。
+- 独立验证：`cargo test` 4 passed / 0 failed，exit 0；`cargo run --bin billing_cli -- "数据 示例.csv"` 输出 `图书: 3598 分 / 文具: 1500 分 / 食品: 1020 分 / 合计: 6118 分`，exit 0；缺失文件 stderr + exit 1；`git diff --stat` 6 files changed；`tests/billing_contract.rs` diff 0 行。
+- 观察（非缺陷）：`git diff --stat` 把中文文件名显示为八进制转义（Git `core.quotepath` 默认行为），模型正确解释为“说明 文档.md”；不是 CodeLeveler 解码问题。
+- 结果：**PASS（业务交付与独立验证）**，证据见 `evidence/closure/dogfood-final/`。
+
+### 9.5 工程质量门禁
+
+| 门禁 | 命令 | 结果 |
+| --- | --- | --- |
+| workspace 格式 | 逐包 `cargo fmt -p <pkg> -- --check`（35 包） | **PASS** |
+| `cargo fmt --all` | 同机复现 | **BLOCKED by host**：290 个源文件参数合计 42,065 字符，超过 Windows 32,767 命令行长上限（os error 206）；逐包等价检查通过 |
+| all-features 编译 | `cargo check --workspace --all-features --locked` | **PASS**（1m18s） |
+| Workspace 测试 | CI 等价环境 + `RUST_TEST_THREADS=2` | **7481 passed / 51 failed / 97 ignored**；51 条失败记录对应 50 个 distinct tests（`parallel` 父用例会以子进程重跑同一 binary），全部归类为宿主/环境或 baseline 既有，见下表 |
+| Clippy | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | **PASS**（2m47s；先修复 `display_path` 既有 `needless_return`） |
+| 仓库 dev gate | `cargo run -p xtask -- verify`（已 staged 受影响包） | **FAIL**：3 个 lib target 的失败与上表同一环境/baseline 簇；受影响集成测试均通过 |
+| Windows release build | `cargo build --release --locked -p leveler-cli -p leveler-win-confine` | **PASS**（14m32s，干净树，`1.0.26 (5a4fc17480a6)`；无 `-dirty`） |
+| Windows security canaries | `cargo test -p leveler-tools windows_` / `-p leveler-execution windows_` | **BLOCKED**：测试子进程为 Low integrity，ACL/低完整性 canary 需要 Medium |
+| Release lab | `./dev release` | **NOT RUN**：本 checkout 没有外部实验室 `eval/` |
+
+51 条失败记录（50 个 distinct tests；app parallel 父子进程各一条）的分类：
+
+| 数量 | 位置 | 原因 | 对照 |
+| --- | --- | --- | --- |
+| 1 | `leveler-agent multi_agent_test` | Zero-scope child 的 MiC 边界在测试进程本身为 Low 时不可证明 | baseline `b1f002d` 同样失败；`child-token-integrity.txt` |
+| 1 | `leveler-app --lib parallel` | 子进程 SQLite 无法打开临时 DB | baseline `b1f002d` 同样失败 |
+| 3 | `leveler-cli parallel_collaboration_entry` | 同上 SQLite 临时 DB | 环境 |
+| 2 | `leveler-cli eval_isolation` | 同上 SQLite 临时 DB | 环境 |
+| 11 | `leveler-cli cli_surface_contract` | 测试写死 `/tmp`；Low 子进程不能写 Medium `C:\tmp` | 环境 |
+| 8 + 5 | `leveler-cli schedule_show_projection` / `schedule_update_grant` | 同一 `/tmp` | 环境 |
+| 11 | `leveler-execution --lib` | ACL/低完整性 canary 与 zero-scope 写入测试需要 Medium token | `child-token-integrity.txt` |
+| 3 | `leveler-tui --lib` | 测试使用 `HOME` 构造 POSIX 路径；本次为完成 HOME 补全测试设置 Windows HOME | 同一二进制 `HOME` 未设置时 **1631 passed / 0 failed** |
+| 1 | `leveler-tui shell_completion_paths` | 测试 HOME 为空目录，`~/` 无可列内容 | 填充 HOME 后 **17 passed** |
+| 4 | `leveler-web --lib` | fixture 调用 `python3`；本机只有 Store 别名 stub | 环境 |
+
+受影响范围（本次新增/修改）的实际结果：`execution_ownership` **13 passed**、`user_shell` **15 passed**、`leveler-tui --lib` 在未设置 HOME 时 **1631 passed**、`snapshots` 修正后通过、`leveler-tools --lib` **394 passed**、`leveler-agent task_commit_test` 在修正 `NoDefaultCurrentDirectoryInExePath` 后通过（整包 74 tests 中仅 multi-agent 环境用例仍失败）。
+
+测试环境说明：Claude Code 的子进程以 **Low integrity** 运行；`%USERPROFILE%`、`C:\tmp` 等 Medium 路径不可写。为此使用工作区内的 `TMP/TEMP/LEVELER_HOME/HOME`，并补齐 MinGit 缺少的 `sleep`/`yes` 测试夹具。该限制与产品权限模型无关；不得把因环境失败的测试标为通过。
+
+### 9.6 连续运行与资源
+
+在 Windows Terminal、120×30、FullAccess 候选下连续运行约 **11 分钟**，两次进程（中途 Ctrl+C 退出后按 session 恢复）共 63 个 10 秒采样：
+
+| 阶段 | 时长 | 样本 | WS MB | Private MB | 线程 / 句柄 |
+| --- | --- | --- | --- | --- | --- |
+| 首进程（19:45:28–19:49:09） | ~3m40s | 23 | 26.7–33.1 | 11.6–16.0 | 20–21 / 185–193 |
+| 恢复进程（19:49:32–19:56:03） | ~6m30s | 40 | 27.6–29.1 | 11.3–12.7 | 22 / 193–197 |
+
+- 长输出：`for /L %i in (1,1,3000)` 输出 3000 行，滚动后显示“上方还有 5056 行”，Home/End 回到底部，无残影。
+- Resize：窗口像素 1752×936 → 1200×700 → 1600×900 → 1752×936；TUI 重排、footer 截断不溢出。ConPTY 下 `console-size.ps1` 读不到 cells（`console=x`），因此记录的是真实窗口像素与截图，不声称精确 cols/rows。
+- 输入响应：tick-1…tick-5 每次即时执行；`!echo` 成功路径稳定。
+- 后台状态：ping 失败任务与 PowerShell sleep 成功任务均正确结算；后台失败计数保留。
+- Session 生命周期：`/new` 创建 `ebbf5edc-770f-4119-8630-344b6f0a1757`；退出后 `--session ebbf5edc...` 恢复，transcript 与输出完整。
+- 内存无单调增长信号；恢复进程空闲 6.5 分钟 CPU 增量 0.5 s。样本量小，用于发现数量级/泄漏信号，不作统计结论。
+- 证据：`evidence/closure/continuous/`（截图、CSV、resize 日志、launch.json）。
+
+### 9.7 未验证环境
+
+- Windows 11：**NOT VERIFIED**（无实机）。
+- 标准用户账户：**NOT VERIFIED**。`net user` 只有 Administrator / CSDN / DefaultAccount / Guest / WDAGUtilityAccount；当前会话为 Medium、`admin=False`、Administrators deny-only。创建标准用户需要管理员/系统授权，本轮未执行。
+- macOS/Linux 真实终端：**NOT VERIFIED**（无宿主，WSL 未安装）。
+- 其他宿主（VS Code、Tabby、ConEmu、SSH/PTY）：NOT VERIFIED。
+- Python 依赖的 web fixture 测试：**BLOCKED**（本机只有 Windows Store `python3` 别名 stub，无真实 Python）。
+- 需要 Medium token 的 ACL / 低完整性 canary：**BLOCKED**（agent shell 的子进程为 Low integrity，见 `child-token-integrity.txt`）。
+- `/tmp` 路径测试：**BLOCKED**（Low 子进程不能写 Medium `C:\tmp`）。
+
+### 9.8 剩余问题与发布判断
+
+**P0：无。**
+
+**P1（发布证据缺口 / 未验证）：**
+
+1. **Windows 11、标准用户、macOS/Linux 真实终端仍为 NOT VERIFIED。** Windows 10 的 TUI/宿主/权限结论不得外推。标准用户需要管理员创建账户；本轮未获得授权，也未修改系统。
+2. **Windows 零写权限 child 的 shell mutation 边界未能机械证明。** `multi_agent_test::an_unclaimed_child_cannot_mutate_through_a_shell_command` 在 baseline 与本轮都失败；原因是 agent shell 的子进程为 Low integrity，测试工作区也是 Low，MiC write-up 边界不存在。正常 Medium 用户会话下该属性应由 `leveler-confine` 的低完整性 token 建立，但本轮没有 Medium 测试环境，不能声称已验证。需要 CI/普通宿主补跑该 canary。
+3. **需要 Medium token 的 ACL / 低完整性 security canaries 未运行**（`windows_acl`、`windows_confine::windows_canaries`）。本机子进程 Low，无法设置/恢复标签。这是 Windows 安全门禁的明确缺口，不能标记通过。
+
+**P2（宿主/展示/测试限制，不影响本次交付结论）：**
+
+- 权限 picker 不预读 OS 能力；缺少 launcher 时不会提前提示，但 `doctor` 报 Warn，运行时拒绝已进入实时视图。
+- ConHost 默认字体缺 `⑂`；U+00B7 在长样式行按宽字形绘制（已修可复现案例，不声称修复所有宿主字体问题）。
+- Windows Terminal 原生 Ctrl+V 丢换行/非 BMP emoji；Alt+V 是应用层替代。
+- Git `core.quotepath` 把中文路径显示为八进制转义；模型在 dogfood 中正确解释，不是解码失败。
+- 中文/空格仓库在默认 target dir 下 MinGW ld 失败；使用无空格 target dir 通过（工具链限制）。
+- ConPTY 下外部 `console-size.ps1` 读不到 cells；连续运行 resize 以真实窗口像素与截图记录，未声称精确 cols/rows。
+- release build 有既有 `unused exited`（debug_assertions 外）警告；clippy dev all-targets 通过。
+- 测试 teardown 偶发 “Tokio context is being shutdown” 噪声；不影响断言结果。
+- 完整 `cargo fmt --all` 在本机受 Windows 命令行长限制阻塞；逐包检查通过。
+
+**合并条件：**
+
+- 此分支在 Windows 10 测试范围内满足合并的代码质量条件：**受影响测试全部通过、clippy 通过、workspace check 通过、候选构建干净**。
+- 但 P1 中的未验证环境/安全 canary 必须由 CI（Linux/macOS/Windows 正常 Medium 宿主）或外部实验室补足；在这些证据出现前，不应把本分支的通过范围外推为全平台合并/发布资格。
+- 从本机证据看，**可以合并到主分支进入 CI 验证**（代码改动与测试契约完整）；**不满足正式发布条件**（Windows 11、标准用户、macOS/Linux 未验证，release lab 未运行）。
+
+**最终状态：**
+
+- 代码提交：`5a4fc17480a63e14b29fa785778fcde92ca3b940`
+- 候选：`1.0.26 (5a4fc17480a6)`，`leveler.exe` SHA-256 `CA1283E9...0800B9`，`leveler-confine.exe` `F7FB...845F`，ZIP `59AB...048E`
+- 工作区：代码提交后干净；本轮文档/证据提交另记。
+- 未 push、未打 tag、未发布；无远端变更。
