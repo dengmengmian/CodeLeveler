@@ -1,0 +1,8 @@
+请修复当前 Rust 项目「最终 账单」，先创建一个执行计划，然后逐步完成并每步更新计划：
+1. src/discount.rs：折扣金额按分四舍五入（half up），例如 3998 的 10% 折扣为 400，折后 3598。
+2. src/csv.rs：跳过 UTF-8 BOM 与空行；折扣越界时返回包含 1-based 行号的错误。
+3. src/report.rs：实现 summarize，按类别汇总折后金额（BTreeMap）并给出 grand_total。
+4. src/bin/billing_cli.rs：读取命令行第一个参数指定的 CSV；按类别名排序，每行输出「类别: 金额 分」，最后输出「合计: 金额 分」；文件缺失或格式错误写 stderr，并以非零退出码结束。
+5. 更新 README.md 与「说明 文档.md」，勾选 TODO 并写真实用法。
+要求：不要修改 tests/billing_contract.rs 的断言；至少修改 5 个文件；运行 cargo test 和 cargo run --bin billing_cli -- "数据 示例.csv"，最后展示 git diff --stat，并用中文总结每个类别的金额和测试结果。
+CSV 文件是中文名且仓库路径含空格，请使用真实路径。

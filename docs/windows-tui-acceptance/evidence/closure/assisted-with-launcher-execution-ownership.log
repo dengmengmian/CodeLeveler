@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running tests\execution_ownership.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\execution_ownership-8985f1bb3421274b.exe)
+
+running 4 tests
+not applicable: this host has a write backend
+test an_unavailable_write_backend_refuses_an_assisted_user_shell ... ok
+
+thread 'tokio-rt-worker' panicked at C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tokio-1.54.1\src\runtime\time\entry.rs:534:9:
+A Tokio 1.x context was found, but it is being shutdown.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_running_user_shell_holds_the_session_until_it_ends ... ok
+
+thread 'tokio-rt-worker' panicked at C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tokio-1.54.1\src\runtime\time\entry.rs:534:9:
+A Tokio 1.x context was found, but it is being shutdown.
+test a_finished_user_shell_releases_the_session ... ok
+test a_full_access_user_shell_moves_to_the_background_and_stops ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.66s
+
+EXIT_CODE=0

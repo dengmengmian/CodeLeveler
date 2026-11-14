@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running tests\execution_ownership.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\execution_ownership-8985f1bb3421274b.exe)
+
+running 1 test
+test an_assisted_user_shell_matches_the_write_backend_capability ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.20s
+
+EXIT_CODE=0

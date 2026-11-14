@@ -101,14 +101,15 @@ struct Harness {
 
 async fn harness(server: &MockServer) -> Harness {
     let (tmp, app) = app_with_repo(server).await;
+    let mode = shell_profile();
     let session_id = app
-        .create_session(&ModelRef::new("mock", "m"), "user shell test")
+        .create_session_with_mode(&ModelRef::new("mock", "m"), "user shell test", mode)
         .await
         .unwrap();
     let client = InProcessRuntimeClient::new_with_options(
         std::sync::Arc::new(app),
         ModelRef::new("mock", "m"),
-        leveler_execution::PermissionProfile::Assisted,
+        mode,
         /* sandbox */ false,
         /* auto_approve */ true,
     );
@@ -118,6 +119,24 @@ async fn harness(server: &MockServer) -> Harness {
         client,
         session_id,
         events,
+    }
+}
+
+/// The profile a shell-driving scenario can run under on this host.
+///
+/// On a host with a write backend this is the product default, Assisted. A
+/// Windows host without `leveler-confine.exe` reports `write=unsupported`; the
+/// runtime then refuses a confined spawn instead of downgrading it, so these
+/// non-permission scenarios ask for FullAccess explicitly. The separate
+/// refusal test in `execution_ownership` owns the Assisted contract.
+fn shell_profile() -> leveler_execution::PermissionProfile {
+    if matches!(
+        leveler_execution::probe_sandbox_capabilities().write,
+        leveler_execution::FsCapability::WriteRestricted | leveler_execution::FsCapability::FullFs
+    ) {
+        leveler_execution::PermissionProfile::Assisted
+    } else {
+        leveler_execution::PermissionProfile::FullAccess
     }
 }
 
@@ -296,7 +315,10 @@ async fn cancel_stops_exactly_the_named_execution() {
     let server = MockServer::start(vec![sse_text("unused")]).await;
     let mut h = harness(&server).await;
     h.client
-        .send(run_shell(&h, "echo begin; sleep 30"))
+        .send(run_shell(
+            &h,
+            &format!("echo begin; {}", leveler_test_support::sleep_shell_line(30)),
+        ))
         .await
         .unwrap();
     // Wait for the started event to learn the execution id.
@@ -1175,7 +1197,10 @@ async fn a_finished_shell_cannot_be_backgrounded_and_no_task_is_created() {
 async fn a_second_shell_can_run_after_the_first_moves_to_background() {
     let server = MockServer::start(vec![sse_text("unused")]).await;
     let mut h = harness(&server).await;
-    h.client.send(run_shell(&h, "sleep 30")).await.unwrap();
+    h.client
+        .send(run_shell(&h, &leveler_test_support::sleep_shell_line(30)))
+        .await
+        .unwrap();
     let execution_id = match wait_event(
         &mut h,
         |ev| matches!(ev, RuntimeEvent::UserShellStarted { .. }),
@@ -1247,12 +1272,147 @@ fn client_for(
     let client = InProcessRuntimeClient::new_with_options(
         app,
         ModelRef::new("mock", "m"),
-        leveler_execution::PermissionProfile::Assisted,
+        shell_profile(),
         /* sandbox */ false,
         /* auto_approve */ true,
     );
     let events = client.subscribe_session(session_id);
     (client, events)
+}
+
+/// A legacy console capture must be readable in the live view, the retained
+/// tail and the decoded presentation copy, while the raw capture keeps the
+/// exact bytes the child wrote.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gbk_capture_is_decoded_for_display_and_byte_exact_on_disk() {
+    if leveler_execution::decode_output(&[0xD6, 0xD0]) != "中" {
+        eprintln!("not applicable: the host code page is not GBK");
+        return;
+    }
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let (tmp, app) = app_with_repo(&server).await;
+    let app = std::sync::Arc::new(app);
+    let session_id = app
+        .create_session_with_mode(&ModelRef::new("mock", "m"), "gbk capture", shell_profile())
+        .await
+        .unwrap();
+    let (client, mut events) = client_for(app, &session_id);
+    let gbk = tmp.path().join("数据 示例.txt");
+    std::fs::write(&gbk, [0xD6u8, 0xD0, 0xCE, 0xC4]).unwrap();
+    client
+        .send(ClientCommand::RunUserShell {
+            session_id: session_id.clone(),
+            command: format!("type \"{}\"", gbk.display()),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let ev = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            events.recv(),
+        )
+        .await
+        .expect("terminal before deadline")
+        .expect("stream open");
+        if matches!(ev, RuntimeEvent::UserShellExited { .. }) {
+            break;
+        }
+    }
+    let snapshot = client.snapshot(&session_id).await.unwrap();
+    let shell = snapshot
+        .user_shells
+        .last()
+        .expect("the terminal shell record");
+    assert_eq!(shell.status, "success");
+    assert_eq!(shell.output_tail, "中文", "the retained tail is decoded");
+    let directory = shell.full_output.clone().expect("the complete capture");
+    let directory = std::path::PathBuf::from(directory);
+    assert_eq!(
+        std::fs::read(directory.join("combined.log")).unwrap(),
+        [0xD6u8, 0xD0, 0xCE, 0xC4],
+        "the raw capture stays byte-exact"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("combined.utf8.log")).unwrap(),
+        "中文",
+        "the presentation copy is what the viewer reads"
+    );
+}
+
+/// A transferred shell keeps the decoded log too: the background registry is a
+/// third presentation of the same bytes as the live view and the capture.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_user_shell_log_decodes_gbk() {
+    if leveler_execution::decode_output(&[0xD6, 0xD0]) != "中" {
+        eprintln!("not applicable: the host code page is not GBK");
+        return;
+    }
+    let server = MockServer::start(vec![sse_text("unused")]).await;
+    let mut h = harness(&server).await;
+    let gbk = h._tmp.path().join("background-数据.txt");
+    std::fs::write(&gbk, [0xD6u8, 0xD0, 0xCE, 0xC4]).unwrap();
+    let command = format!(
+        "type \"{}\" & {}",
+        gbk.display(),
+        leveler_test_support::sleep_shell_line(30)
+    );
+    h.client.send(run_shell(&h, &command)).await.unwrap();
+    let execution_id = match wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellStarted { .. }),
+        10,
+    )
+    .await
+    {
+        RuntimeEvent::UserShellStarted { execution_id, .. } => execution_id,
+        _ => unreachable!(),
+    };
+    wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellOutput { chunk, .. } if chunk.contains("中文")),
+        10,
+    )
+    .await;
+    h.client
+        .send(ClientCommand::BackgroundUserShell {
+            session_id: h.session_id.clone(),
+            execution_id,
+        })
+        .await
+        .unwrap();
+    let task_id = match wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::UserShellBackgrounded { .. }),
+        10,
+    )
+    .await
+    {
+        RuntimeEvent::UserShellBackgrounded { task_id, .. } => task_id,
+        _ => unreachable!(),
+    };
+    h.client
+        .send(ClientCommand::CancelBackgroundTask {
+            session_id: h.session_id.clone(),
+            task_id: task_id.clone(),
+        })
+        .await
+        .unwrap();
+    let exited = wait_event(
+        &mut h,
+        |ev| matches!(ev, RuntimeEvent::BackgroundTaskExited { task_id: id, .. } if id == &task_id),
+        10,
+    )
+    .await;
+    let RuntimeEvent::BackgroundTaskExited { output, .. } = exited else {
+        unreachable!()
+    };
+    assert!(
+        output.contains("中文"),
+        "the background log is decoded, not lossy UTF-8: {output:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1262,7 +1422,7 @@ async fn a_cold_runtime_restores_terminal_shell_history_with_output() {
     let layout = layout_for(tmp.path());
     let app = std::sync::Arc::new(app);
     let session_id = app
-        .create_session(&ModelRef::new("mock", "m"), "cold shell")
+        .create_session_with_mode(&ModelRef::new("mock", "m"), "cold shell", shell_profile())
         .await
         .unwrap();
     let (client, mut events) = client_for(app.clone(), &session_id);
@@ -1623,7 +1783,7 @@ async fn a_second_runtime_does_not_claim_another_runtimes_background_process() {
     let (_tmp, app) = app_with_repo(&server).await;
     let app = std::sync::Arc::new(app);
     let session_id = app
-        .create_session(&ModelRef::new("mock", "m"), "reconnect bg")
+        .create_session_with_mode(&ModelRef::new("mock", "m"), "reconnect bg", shell_profile())
         .await
         .unwrap();
     let (client, mut events) = client_for(app.clone(), &session_id);

@@ -1,0 +1,57 @@
+   Compiling billing v0.1.0 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\dogfood\最终 账单)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.19s
+     Running unittests src\lib.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\target\billing\debug\deps\billing-825c8aed1dec8a00.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\billing_cli.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\target\billing\debug\deps\billing_cli-55c89ba3e6be4d0a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\billing_contract.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\target\billing\debug\deps\billing_contract-d9b41aa0bf27a001.exe)
+
+running 4 tests
+test the_report_groups_totals_by_category_and_sums_the_grand_total ... FAILED
+test the_csv_reader_accepts_a_bom_and_skips_blank_lines ... FAILED
+test an_out_of_range_discount_is_rejected_with_the_row_number ... FAILED
+test a_percentage_discount_rounds_half_up_to_the_nearest_cent ... FAILED
+
+failures:
+
+---- the_report_groups_totals_by_category_and_sums_the_grand_total stdout ----
+
+thread 'the_report_groups_totals_by_category_and_sums_the_grand_total' panicked at tests\billing_contract.rs:29:34:
+parse: "第 1 行单价无效: invalid digit found in string"
+
+---- the_csv_reader_accepts_a_bom_and_skips_blank_lines stdout ----
+
+thread 'the_csv_reader_accepts_a_bom_and_skips_blank_lines' panicked at tests\billing_contract.rs:18:34:
+the real export parses: "第 1 行单价无效: invalid digit found in string"
+
+---- an_out_of_range_discount_is_rejected_with_the_row_number stdout ----
+
+thread 'an_out_of_range_discount_is_rejected_with_the_row_number' panicked at tests\billing_contract.rs:40:5:
+折扣必须在 0 到 100 之间，收到 150
+
+---- a_percentage_discount_rounds_half_up_to_the_nearest_cent stdout ----
+
+thread 'a_percentage_discount_rounds_half_up_to_the_nearest_cent' panicked at tests\billing_contract.rs:8:5:
+assertion `left == right` failed
+  left: 3599
+ right: 3598
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_percentage_discount_rounds_half_up_to_the_nearest_cent
+    an_out_of_range_discount_is_rejected_with_the_row_number
+    the_csv_reader_accepts_a_bom_and_skips_blank_lines
+    the_report_groups_totals_by_category_and_sums_the_grand_total
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test billing_contract`

@@ -1,0 +1,7 @@
+﻿captured_at=2026-11-14T17:27:43.9068725+08:00
+test=leveler-execution command::tests::runs_and_captures_stdout
+result=passed after PATH included tools\git\usr\bin
+test=leveler-tools tools::apply_patch::tests::adds_a_file
+result=passed after LEVELER_HOME was writable
+first_run_failure=program not found (echo)
+first_run_failure=lock ...\.leveler\run\locks\... Access denied (os error 5)

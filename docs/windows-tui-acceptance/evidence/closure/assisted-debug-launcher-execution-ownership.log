@@ -1,0 +1,21 @@
+   Compiling leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.91s
+     Running tests\execution_ownership.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\execution_ownership-8985f1bb3421274b.exe)
+
+running 12 tests
+test an_unavailable_write_backend_refuses_an_assisted_user_shell ... ok
+test recovery_leaves_a_dead_boots_session_to_whoever_runs_next ... ok
+test acknowledging_a_crash_window_leaves_the_session_to_whoever_runs_next ... ok
+test an_execution_awaiting_approval_keeps_the_session ... ok
+test a_finished_user_shell_releases_the_session ... ok
+test a_running_user_shell_holds_the_session_until_it_ends ... ok
+test a_failed_execution_releases_the_session ... ok
+test a_full_access_user_shell_moves_to_the_background_and_stops ... ok
+test an_interrupted_execution_releases_the_session ... ok
+test a_new_turn_preempts_an_in_flight_prompt_prediction ... ok
+test ownership_follows_the_running_execution_between_windows ... ok
+test a_crash_gated_turn_does_not_re_promote_journaled_input ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.13s
+
+EXIT_CODE=0

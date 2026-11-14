@@ -1,0 +1,52 @@
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling leveler-model v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-model)
+   Compiling leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+   Compiling leveler-project v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-project)
+   Compiling leveler-browser v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-browser)
+   Compiling leveler-storage v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-storage)
+   Compiling leveler-foreign-session v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-foreign-session)
+   Compiling leveler-skills v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-skills)
+   Compiling leveler-test-support v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-test-support)
+   Compiling leveler-lsp v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-lsp)
+   Compiling leveler-context v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-context)
+   Compiling leveler-client-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-client-protocol)
+   Compiling leveler-agent-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent-core)
+   Compiling leveler-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-protocol)
+   Compiling leveler-provider v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-provider)
+   Compiling leveler-native v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-native)
+   Compiling leveler-vcs v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-vcs)
+   Compiling leveler-engine v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-engine)
+   Compiling leveler-tools v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tools)
+   Compiling leveler-local-transport v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-local-transport)
+   Compiling leveler-schedule v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-schedule)
+   Compiling leveler-agent v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent)
+   Compiling leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.38s
+     Running tests\execution_ownership.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\execution_ownership-8985f1bb3421274b.exe)
+
+running 2 tests
+
+thread 'a_finished_user_shell_releases_the_session' panicked at crates\leveler-app\tests\execution_ownership.rs:901:9:
+assertion `left == right` failed: echo done
+  left: "failed"
+ right: "success"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_finished_user_shell_releases_the_session ... FAILED
+
+thread 'a_running_user_shell_holds_the_session_until_it_ends' panicked at crates\leveler-app\tests\execution_ownership.rs:861:5:
+Ok(())
+
+thread 'tokio-rt-worker' panicked at C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tokio-1.54.1\src\runtime\time\entry.rs:534:9:
+A Tokio 1.x context was found, but it is being shutdown.
+test a_running_user_shell_holds_the_session_until_it_ends ... FAILED
+
+failures:
+
+failures:
+    a_finished_user_shell_releases_the_session
+    a_running_user_shell_holds_the_session_until_it_ends
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.35s
+
+error: test failed, to rerun pass `-p leveler-app --test execution_ownership`
+EXIT_CODE=101

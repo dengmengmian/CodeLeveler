@@ -1,0 +1,86 @@
+   Compiling leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.34s
+     Running tests\user_shell.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\user_shell-0ded28572101947a.exe)
+
+running 13 tests
+test shell_runs_in_the_repository_root ... FAILED
+test hard_gate_user_shell_makes_zero_model_requests ... FAILED
+test a_delivered_run_user_shell_rejects_a_busy_session_with_an_error ... FAILED
+test cancel_stops_exactly_the_named_execution ... FAILED
+test a_terminal_fact_wins_over_a_late_backgrounded_fact_in_cold_restore ... ok
+test busy_agent_turn_rejects_a_user_shell_without_side_effects ... ok
+test a_cold_runtime_restores_terminal_shell_history_with_output ... FAILED
+test the_session_is_free_the_moment_the_shell_reports_exit ... ok
+test a_finished_shell_cannot_be_backgrounded_and_no_task_is_created ... ok
+test hard_gate_shell_output_never_enters_model_context ... ok
+test snapshot_restores_active_shell_with_elapsed ... FAILED
+test a_second_runtime_does_not_claim_another_runtimes_background_process ... FAILED
+test a_second_shell_can_run_after_the_first_moves_to_background ... FAILED
+
+failures:
+
+---- shell_runs_in_the_repository_root stdout ----
+
+thread 'shell_runs_in_the_repository_root' panicked at crates\leveler-app\tests\user_shell.rs:289:10:
+pwd printed a real path: Os { code: 3, kind: NotFound, message: "系统找不到指定的路径。" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- hard_gate_user_shell_makes_zero_model_requests stdout ----
+
+thread 'hard_gate_user_shell_makes_zero_model_requests' panicked at crates\leveler-app\tests\user_shell.rs:162:5:
+assertion failed: events.iter().any(|e|
+        matches!(e, RuntimeEvent::UserShellOutput { stream, chunk, .. } if
+            stream == "stdout" && chunk.contains("hello")))
+
+---- a_delivered_run_user_shell_rejects_a_busy_session_with_an_error stdout ----
+
+thread 'a_delivered_run_user_shell_rejects_a_busy_session_with_an_error' panicked at crates\leveler-app\tests\user_shell.rs:441:10:
+a busy session must not acknowledge a scheduled delivery: ()
+
+thread 'tokio-rt-worker' panicked at C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tokio-1.54.1\src\runtime\time\entry.rs:534:9:
+A Tokio 1.x context was found, but it is being shutdown.
+
+---- cancel_stops_exactly_the_named_execution stdout ----
+
+thread 'cancel_stops_exactly_the_named_execution' panicked at crates\leveler-app\tests\user_shell.rs:339:5:
+assertion `left == right` failed
+  left: "failed"
+ right: "cancelled"
+
+---- a_cold_runtime_restores_terminal_shell_history_with_output stdout ----
+
+thread 'a_cold_runtime_restores_terminal_shell_history_with_output' panicked at crates\leveler-app\tests\user_shell.rs:1307:5:
+assertion `left == right` failed
+  left: "failed"
+ right: "success"
+
+---- snapshot_restores_active_shell_with_elapsed stdout ----
+
+thread 'snapshot_restores_active_shell_with_elapsed' panicked at crates\leveler-app\tests\user_shell.rs:508:13:
+no running user shell in the snapshot; it held: [UiUserShell { id: UserShellId("ush-60293d2a-c540-494c-bf30-fad5b9be3119"), origin_command_id: None, command: "ping -n 6 127.0.0.1", cwd: "C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\tmp\\.tmpZbLOxS", status: "failed", elapsed_secs: 0, exit_code: None, output_tail: "Windows FS sandbox is not available (capability write=unsupported); refuse non-FullAccess spawn with write_root=\"C:\\\\Users\\\\CSDN.CB21111707\\\\Documents\\\\deepseek-harness\\\\default-workspace\\\\tmp\\\\.tmpZbLOxS\". Use FullAccess explicitly, or ensure Job/AppContainer backend is available\n", output_truncated: false, full_output: None, task_id: None }]
+
+---- a_second_runtime_does_not_claim_another_runtimes_background_process stdout ----
+
+thread 'a_second_runtime_does_not_claim_another_runtimes_background_process' panicked at crates\leveler-app\tests\user_shell.rs:1656:14:
+backgrounded: Elapsed(())
+
+---- a_second_shell_can_run_after_the_first_moves_to_background stdout ----
+
+thread 'a_second_shell_can_run_after_the_first_moves_to_background' panicked at crates\leveler-app\tests\user_shell.rs:833:14:
+event before deadline: Elapsed(())
+
+
+failures:
+    a_cold_runtime_restores_terminal_shell_history_with_output
+    a_delivered_run_user_shell_rejects_a_busy_session_with_an_error
+    a_second_runtime_does_not_claim_another_runtimes_background_process
+    a_second_shell_can_run_after_the_first_moves_to_background
+    cancel_stops_exactly_the_named_execution
+    hard_gate_user_shell_makes_zero_model_requests
+    shell_runs_in_the_repository_root
+    snapshot_restores_active_shell_with_elapsed
+
+test result: FAILED. 5 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.40s
+
+error: test failed, to rerun pass `-p leveler-app --test user_shell`
+EXIT_CODE=101

@@ -115,10 +115,22 @@ impl Capture {
         if !meta.file_type().is_file() || meta.file_type().is_symlink() {
             return Err(unavailable());
         }
-        let bytes = meta.len();
+        // The runtime publishes a UTF-8 presentation copy beside the raw
+        // capture; the raw file stays the authority, this only chooses what
+        // the viewer decodes. A legacy console code page would otherwise be
+        // shown as replacement glyphs here even though the inline output and
+        // the copy command read the decoded copy.
+        let decoded = canonical.join("combined.utf8.log");
+        let presentation = match std::fs::symlink_metadata(&decoded) {
+            Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => decoded,
+            _ => combined,
+        };
+        let bytes = std::fs::metadata(&presentation)
+            .map_err(|_| unavailable())?
+            .len();
         Ok(Self {
             directory: canonical,
-            combined,
+            combined: presentation,
             bytes,
         })
     }
@@ -1156,6 +1168,28 @@ mod tests {
         write_complete_capture(&captured, "hi\n");
         assert!(Capture::open(&captured, Some(&allowed)).is_err());
         assert!(Capture::open(&captured, None).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capture_prefers_the_decoded_presentation_copy() {
+        let root =
+            std::env::temp_dir().join(format!("leveler-output-decoded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let captured = root.join("capture");
+        std::fs::create_dir_all(&captured).unwrap();
+        write_complete_capture(&captured, "");
+        // A GBK console capture and the runtime's UTF-8 presentation copy.
+        std::fs::write(captured.join("combined.log"), [0xD6u8, 0xD0, 0xCE, 0xC4]).unwrap();
+        std::fs::write(captured.join("combined.utf8.log"), "中文\n").unwrap();
+        let capture = Capture::open(&captured, None).unwrap();
+        let source = capture.source();
+        let index = OutputIndex::build(&source, 80).unwrap();
+        let rows = index.rows(&source, 0, 1).unwrap();
+        assert_eq!(
+            rows[0].display, "中文",
+            "the viewer reads the decoded copy instead of lossy-decoding raw bytes"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

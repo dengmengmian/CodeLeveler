@@ -20,7 +20,7 @@ pub fn display_path(path: &Path) -> Cow<'_, str> {
         if let Some(raw) = path.to_str() {
             return simplify_verbatim(raw);
         }
-        return Cow::Owned(simplify_verbatim(&path.to_string_lossy()).into_owned());
+        Cow::Owned(simplify_verbatim(&path.to_string_lossy()).into_owned())
     }
     #[cfg(not(windows))]
     {
