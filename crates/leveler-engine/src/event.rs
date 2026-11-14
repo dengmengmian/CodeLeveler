@@ -596,6 +596,16 @@ pub enum EngineEvent {
         output: String,
         #[serde(default)]
         output_truncated: bool,
+        /// The workspace paths this execution's settlement observed changing in
+        /// its admitted write scope, relative to the workspace root.
+        ///
+        /// `None` means the runtime could not establish a change set (no
+        /// baseline, a failed diff, or a record written before this field
+        /// existed). It is never "no change": `Some([])` is that observation.
+        /// The set is an observation window, not per-file attribution — a
+        /// concurrent writer can appear in it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified: Option<Vec<String>>,
     },
     /// The harness started an advisory (tool-free) model call during closeout —
     /// a completeness audit or a compaction summary. Transient UI hint only, so a

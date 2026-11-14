@@ -217,9 +217,23 @@ straddles a change is still a real execution with its real exit status, but it
 cannot establish the current version; the gate refuses it and asks for a rerun.
 A record written before start versions were captured keeps its real exit status
 and cannot claim version consistency — the model must run the command again.
-The mutation counter covers changes the runtime observed through tool calls;
-it is not a filesystem monitor, so an edit made outside the agent's tools does
-not advance it.
+The mutation counter covers changes the runtime observed through tool calls
+and through background executions it owns; it is not a filesystem monitor, so
+an edit made outside those observations does not advance it.
+
+A background execution's own changes advance the counter exactly once,
+whichever route reads its terminal result: the auto-delivered notice,
+`wait_task`, or `get_task`. The settlement diff — the paths changed in the
+task's admitted write scope — is part of the durable terminal fact, so a
+restart does not lose it. A failed or stopped task that changed files still
+advances the counter; a task that changed nothing does not. While a
+write-capable task is still running, a completion attempt diffs the current
+tree against that task's own launch baseline and accounts any observed change
+once: that is a real observation, not an assumption that every active task
+wrote. An unknown change set (no baseline, or a failed diff) is never read as
+"unchanged"; it contributes no observation. The diff is a window over the
+task's write scope, not per-file authorship, so a concurrent writer can appear
+in it.
 
 An accepted completion persists a `VerificationReport` on the task terminal
 (`TaskFinished.verification`, and the same report on `TaskReport`):

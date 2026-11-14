@@ -896,26 +896,49 @@ impl Tool for GetTaskTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
         let reg = &self.tasks;
+        let authority = task_resource_authority(
+            &self.tasks,
+            input.task_id.trim(),
+            &context,
+            leveler_core::Capability::BackgroundTaskObserve,
+        )
+        .await;
         match reg
-            .get_authorized(
-                input.task_id.trim(),
-                context.session_scope(),
-                task_resource_authority(
-                    &self.tasks,
-                    input.task_id.trim(),
-                    &context,
-                    leveler_core::Capability::BackgroundTaskObserve,
-                )
-                .await,
-            )
+            .get_authorized(input.task_id.trim(), context.session_scope(), authority)
             .await
         {
-            Ok(snap) => Ok(
-                ToolOutput::ok(format_snap(&snap)).with_metadata(serde_json::json!({
+            Ok(snap) => {
+                // The terminal settlement's change set is a fact every reader
+                // shares; reading it here must not consume the one-time
+                // `wait_task` report. A non-terminal or unsettled task has no
+                // set, and `None` stays unknown rather than becoming empty.
+                let modified = match reg
+                    .settlement_changes_for(
+                        input.task_id.trim(),
+                        context.session_scope(),
+                        authority,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            task = %snap.id,
+                            "could not read the background task's settlement change set"
+                        );
+                        None
+                    }
+                };
+                let mut metadata = serde_json::json!({
                     "background_result": background_result(&snap),
                     "terminal_task_id": snap.status.is_terminal().then_some(&snap.id),
-                })),
-            ),
+                });
+                if let Some(modified) = modified {
+                    metadata["modified_files"] = serde_json::json!(modified);
+                }
+                Ok(ToolOutput::ok(format_snap(&snap)).with_metadata(metadata))
+            }
             Err(error) => Ok(ToolOutput::error(error)),
         }
     }
@@ -3079,6 +3102,92 @@ mod tests {
             Some(3),
             "the exit code has to reach the caller, not just the word 'failed': {:?}",
             wait.metadata
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_reports_the_terminal_change_set_without_consuming_it() {
+        // The auto-delivery path and `wait_task` must read the same observed
+        // change set. `get_task` is the third reader: it may report the set,
+        // but it must not consume the one-time report the waiter delivers.
+        let dir = scratch_repo();
+        std::fs::write(dir.path().join("keep.txt"), "original\n").unwrap();
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-qm", "init"]);
+
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let start = RunCommandTool::new(commands.clone())
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "echo new > created.txt"],
+                    "background": true,
+                }),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!start.is_error, "spawn should succeed: {}", start.content);
+        let task_id = start
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("task_id: "))
+            .expect("task_id in spawn output")
+            .to_string();
+        reg.wait(
+            &task_id,
+            Some(Duration::from_secs(10)),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let get = GetTaskTool::new(reg.clone())
+            .execute(
+                serde_json::json!({"task_id": task_id}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let get_modified: Vec<String> = get
+            .metadata
+            .get("modified_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            get_modified.contains(&"created.txt".to_string()),
+            "get_task must report the settlement's change set: {:?}",
+            get.metadata
+        );
+
+        let wait = WaitTaskTool::new(reg.clone())
+            .execute(
+                serde_json::json!({"task_id": task_id, "timeout_seconds": 10}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let wait_modified: Vec<String> = wait
+            .metadata
+            .get("modified_files")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            wait_modified, get_modified,
+            "both readers must report the same execution fact"
         );
     }
 

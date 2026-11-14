@@ -2828,6 +2828,124 @@ impl BackgroundTaskRegistry {
         Some(settlement)
     }
 
+    /// Commit the settlement of a terminal hosted task whose owning runtime
+    /// died before it observed the exit. Idempotent: an existing settlement is
+    /// returned unchanged.
+    ///
+    /// Hosted tasks settle through the semantic journal because the process
+    /// outlives the runtime that admitted it. Local tasks settle in their own
+    /// reaper, so they have no journal entry to reconcile.
+    pub async fn reconcile_settlement(&self, id: &str) -> Result<BackgroundSettlement, String> {
+        if !id.starts_with("host-") {
+            return Err(format!(
+                "task `{id}` is not hosted; it settles in its reaper"
+            ));
+        }
+        self.journal()?.reconcile(id).await
+    }
+
+    /// The workspace paths this still-running task has changed since its spawn
+    /// baseline, without stopping it or consuming any terminal settlement.
+    ///
+    /// `Ok(None)` means the runtime cannot establish a set: the task is not
+    /// active, it had no mutation baseline (read-only or unaccounted), or the
+    /// task record has no baseline yet. `Some(vec![])` is an observed empty
+    /// set. A diff failure is an error, not an empty set.
+    pub async fn live_changes_for(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+    ) -> Result<Option<Vec<String>>, String> {
+        if id.starts_with("host-") {
+            let record = self.journal()?.read(id)?;
+            if !unrestricted && record.owner != owner {
+                return Err("background task is not owned by this session".into());
+            }
+            let Some(baseline) = record.baseline.as_ref() else {
+                return Ok(None);
+            };
+            return crate::snapshot::WorkspaceSnapshot::changed_since_for_scope(
+                &baseline.workspace_root,
+                &baseline.snapshot,
+                &baseline.write_scope,
+            )
+            .await
+            .map(Some)
+            .map_err(|error| {
+                format!("could not diff the workspace while task `{id}` runs: {error}")
+            });
+        }
+        let baseline = {
+            let st = self.inner.lock().await;
+            let task = st
+                .tasks
+                .get(id)
+                .ok_or_else(|| format!("unknown task `{id}`"))?;
+            if !unrestricted {
+                check_owner(task, owner)?;
+            }
+            if !task.status.is_active() {
+                return Ok(None);
+            }
+            task.mutation_baseline.clone()
+        };
+        let Some(baseline) = baseline else {
+            return Ok(None);
+        };
+        crate::snapshot::WorkspaceSnapshot::changed_since_for_scope(
+            &baseline.workspace_root,
+            &baseline.snapshot,
+            &baseline.write_scope,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| format!("could not diff the workspace while task `{id}` runs: {error}"))
+    }
+
+    /// The workspace paths a terminal task's settlement observed changing in
+    /// its admitted namespace, WITHOUT consuming the one-time report a
+    /// `wait_task` reader receives.
+    ///
+    /// `Ok(None)` means the runtime could not establish a change set: the task
+    /// is not terminal or not settled, no mutation baseline existed, or the
+    /// diff failed. A caller must keep that uncertainty — it is not the same
+    /// fact as `Some(vec![])`, which is an observed empty change set.
+    pub async fn settlement_changes_for(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+    ) -> Result<Option<Vec<String>>, String> {
+        if id.starts_with("host-") {
+            let record = self.journal()?.read(id)?;
+            if !unrestricted && record.owner != owner {
+                return Err("background task is not owned by this session".into());
+            }
+            // A task admitted without a baseline has no change set at all; the
+            // journal's empty `modified` plus its note means UNKNOWN, not "no
+            // change". Only a diffed baseline yields a reportable set.
+            if record.baseline.is_none() {
+                return Ok(None);
+            }
+            return Ok(record.settlement.map(|settlement| settlement.modified));
+        }
+        let st = self.inner.lock().await;
+        let task = st
+            .tasks
+            .get(id)
+            .ok_or_else(|| format!("unknown task `{id}`"))?;
+        if !unrestricted {
+            check_owner(task, owner)?;
+        }
+        // A failed diff is recorded as an empty list plus a note; it is not an
+        // observation that the workspace stayed unchanged.
+        match task.settlement.as_ref() {
+            Some(settlement) if settlement.note.is_none() => Ok(Some(settlement.modified.clone())),
+            _ => Ok(None),
+        }
+    }
+
     pub async fn wait(
         &self,
         id: &str,
@@ -4902,6 +5020,94 @@ mod tests {
         assert!(
             reg.take_settlement(&id).await.is_none(),
             "a settlement is reported exactly once"
+        );
+    }
+
+    /// A settlement's change set can be read by every result consumer without
+    /// consuming the one-time report, and a task admitted without a baseline
+    /// is UNKNOWN — never an observed empty set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settlement_changes_are_readable_without_consuming_the_report() {
+        use crate::snapshot::WorkspaceSnapshot;
+
+        let dir = leveler_test_support::git::scratch_repo();
+        std::fs::write(dir.path().join("a"), "x\n").expect("seed file");
+        leveler_test_support::git::run(dir.path(), &["add", "-A"]);
+        leveler_test_support::git::run(dir.path(), &["commit", "-qm", "i"]);
+        let snap = WorkspaceSnapshot::capture(dir.path())
+            .await
+            .expect("capture")
+            .expect("git repo");
+        let baseline = MutationBaseline {
+            snapshot: snap,
+            workspace_root: dir.path().to_path_buf(),
+            write_scope: crate::WriteScope::WorkspaceWithGit {
+                root: dir.path().to_path_buf(),
+            },
+        };
+
+        let reg = host_registry();
+        let id = reg
+            .spawn_owned(
+                ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), "printf y > changed.txt".into()],
+                    dir.path().to_path_buf(),
+                ),
+                Some(baseline),
+                Some("owner"),
+            )
+            .await
+            .expect("spawn");
+        reg.wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .expect("terminal");
+        let first = reg
+            .settlement_changes_for(&id, "owner", false)
+            .await
+            .expect("readable")
+            .expect("a diffed baseline is a known set");
+        assert!(first.iter().any(|path| path == "changed.txt"), "{first:?}");
+        assert_eq!(
+            reg.settlement_changes_for(&id, "owner", false)
+                .await
+                .expect("readable again"),
+            Some(first.clone()),
+            "every reader sees the same observation"
+        );
+        let taken = reg
+            .take_settlement(&id)
+            .await
+            .expect("the waiter's report is still available");
+        assert_eq!(taken.modified, first);
+        assert!(
+            reg.take_settlement(&id).await.is_none(),
+            "the report itself is still delivered exactly once"
+        );
+
+        // No baseline: the change set is unknown, not empty.
+        let id = reg
+            .spawn_owned(
+                ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), "exit 0".into()],
+                    dir.path().to_path_buf(),
+                ),
+                None,
+                Some("owner"),
+            )
+            .await
+            .expect("spawn");
+        reg.wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .expect("terminal");
+        assert_eq!(
+            reg.settlement_changes_for(&id, "owner", false)
+                .await
+                .expect("readable"),
+            None,
+            "an unobserved change set must stay unknown"
         );
     }
 

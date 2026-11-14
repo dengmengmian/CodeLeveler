@@ -1389,6 +1389,7 @@ mod tests {
                 status: Some(leveler_execution::BackgroundTaskStatus::Exited),
                 output: String::new(),
                 output_truncated: false,
+                modified: None,
             };
 
         log.append(Some(&turn), start("call-old", "bg-1"), &mut sink)

@@ -1072,6 +1072,52 @@ pub(crate) async fn persist_background_task_finished(
         task.log.len().saturating_sub(OUTPUT_TAIL_BYTES),
     );
     let task_id = &task.id;
+    // The observed change set belongs to the terminal execution fact, not to
+    // whichever route later reads the result. Persisting it here is what lets
+    // an auto-delivered notice and a `wait_task` read account the same
+    // workspace change, including after this runtime is gone.
+    let registry = app.background_tasks();
+    let mut modified = match registry
+        .settlement_changes_for(task_id, session_id.as_str(), false)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                task = task_id,
+                "could not read the background task's settlement change set"
+            );
+            None
+        }
+    };
+    if modified.is_none() && task_id.starts_with("host-") {
+        // The owning runtime may have died before it observed the exit, so the
+        // journal settlement was never committed. The archived terminal fact
+        // proves the exit; reconcile is idempotent and keeps the change set
+        // durable with that fact.
+        if let Err(error) = registry.reconcile_settlement(task_id).await {
+            tracing::warn!(
+                %error,
+                task = task_id,
+                "could not reconcile the hosted task settlement"
+            );
+        }
+        modified = match registry
+            .settlement_changes_for(task_id, session_id.as_str(), false)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    task = task_id,
+                    "could not read the background task's settlement change set after reconcile"
+                );
+                None
+            }
+        };
+    }
     // The start must be durable before the result. A task handed off from a
     // foreground call can exit before the live start row reaches the log, and
     // a lifecycle replayed from the log must still pair this result with what
@@ -1098,6 +1144,7 @@ pub(crate) async fn persist_background_task_finished(
         status: Some(task.status),
         output: task.log[output_start..].to_owned(),
         output_truncated: task.log_truncated || output_start != 0,
+        modified,
     };
     // The result belongs to the call that started it, not to whichever turn
     // happens to be open now; the goal reader scopes by call identity.

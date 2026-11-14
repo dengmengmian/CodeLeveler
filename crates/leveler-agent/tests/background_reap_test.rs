@@ -237,6 +237,33 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     }
 }
 
+/// One assistant message with several calls, processed in order. A terminal
+/// lifecycle read and a completion in the SAME batch must still account the
+/// task's write before the completion is judged.
+#[cfg(unix)]
+fn tool_calls(calls: &[(&str, &str, serde_json::Value)]) -> ModelResponse {
+    ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: calls
+                .iter()
+                .map(|(id, name, args)| ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new(*id),
+                        name: name.to_string(),
+                        arguments: args.clone(),
+                    },
+                })
+                .collect(),
+            route: None,
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    }
+}
+
 /// A model turn that backgrounds a long-lived process. The requirement is "a
 /// process that stays alive", not `sleep` — Windows has no such program.
 fn spawn_sleep_server() -> ModelResponse {
@@ -481,6 +508,724 @@ async fn auto_delivered_background_result_is_citable_without_a_rerun() {
     );
 }
 
+/// One background execution is ONE mutation fact. Reading its terminal result
+/// again through `wait_task` and `get_task` must not advance the workspace
+/// version a second time, or evidence that really ran on the current tree
+/// would expire for no reason.
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_background_reads_do_not_account_the_same_change_twice() {
+    let h = harness_waiting_for_background(vec![
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "bg-write",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "printf 'pub fn changed() {}\\n' > src/lib.rs"],
+                "background": true
+            }),
+        ),
+        text("后台修改已执行，等待结果送达。"),
+        // The pre-change pass is refused once (this also proves the
+        // auto-delivered settlement really advanced the version).
+        tool_call(
+            "stale-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": false
+            }),
+        ),
+        // A real rerun on the current tree is the new evidence.
+        tool_call(
+            "check-after",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        // Each of these observes the SAME terminal execution, AFTER the fresh
+        // evidence exists. The id is the harness's first local task in a
+        // fresh registry.
+        tool_call(
+            "wait-same",
+            "wait_task",
+            serde_json::json!({ "task_id": "bg-1" }),
+        ),
+        tool_call(
+            "get-same-1",
+            "get_task",
+            serde_json::json!({ "task_id": "bg-1" }),
+        ),
+        tool_call(
+            "get-same-2",
+            "get_task",
+            serde_json::json!({ "task_id": "bg-1" }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("同一后台执行只记一次变更，重新验证后完成。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "后台修改一次，读取多次，最后用当前工作区的测试证据完成".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(12),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve after the current-version rerun");
+
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "only the pre-change pass may be refused; repeated reads must not expire the \
+         current-version rerun: {intercepted:?}"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the fresh rerun must close the goal: {report:?}"
+    );
+    let verification = report
+        .verification
+        .as_ref()
+        .unwrap_or_else(|| panic!("the rerun must produce evidence: {intercepted:?}"));
+    assert!(
+        verification
+            .notes
+            .iter()
+            .any(|note| note.contains("no owed requirement")),
+        "the accepted citation is downgraded only by the no-requirement rule: {verification:?}"
+    );
+}
+
+/// A failed background command that already wrote the source is still a real
+/// workspace mutation: its failure is not a reason to keep a stale pass
+/// current.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_background_write_expires_the_verification_it_followed() {
+    let h = harness_waiting_for_background(vec![
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "bg-failing-write",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": [
+                    "-c",
+                    "printf 'pub fn changed() {}\\n' > src/lib.rs; exit 3"
+                ],
+                "background": true
+            }),
+        ),
+        text("后台命令失败，等待结果送达。"),
+        tool_call(
+            "stale-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": false
+            }),
+        ),
+        tool_call(
+            "check-after",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("后台命令失败但确实修改了源码，重新验证后完成。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "后台失败也要按真实文件修改失效旧证据".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(10),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve after the current-version rerun");
+
+    assert!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("changed"),
+        "the failed background command must still have written the source"
+    );
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the pre-change pass must be refused exactly once: {intercepted:?}"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the rerun must permit completion: {report:?}"
+    );
+}
+
+/// A write-capable task that has ALREADY changed the tree but has not exited
+/// yet has no settlement. A completion must observe the tree against the
+/// task's own launch baseline rather than accept an older pass as current.
+/// The observation is the real diff, not an assumption that every running
+/// task wrote something: the same task with no change leaves evidence valid.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_running_background_write_expires_the_verification_it_followed() {
+    let h = harness(vec![
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "bg-write-running",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": [
+                    "-c",
+                    "printf 'pub fn changed() {}\\n' > src/lib.rs; echo READY; exec sleep 60"
+                ],
+                "background": true
+            }),
+        ),
+        // A readiness wait returns while the task keeps running: this is a
+        // deterministic barrier on the task's own output, not a sleep.
+        tool_call(
+            "wait-ready",
+            "wait_task",
+            serde_json::json!({
+                "task_id": "bg-1",
+                "until": "match",
+                "pattern": "READY",
+                "timeout_seconds": 10
+            }),
+        ),
+        tool_call(
+            "stale-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": false
+            }),
+        ),
+        tool_call(
+            "check-after",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("后台任务仍在运行但已经改动源码，重新验证后完成。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "运行中的后台任务已经修改源码时，旧测试证据不能直接完成".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(10),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve after the current-version rerun");
+
+    assert!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("changed"),
+        "the running background process must already have written the source"
+    );
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the pre-change pass must be refused exactly once: {intercepted:?}"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the goal may complete while the task still runs, once the current tree is verified: \
+         {report:?}"
+    );
+
+    // The goal terminal reaps its Goal-lifetime task; the test's own registry
+    // owns it, so make sure nothing is left for the next test.
+    h.registry.kill_scope(SESSION_SCOPE).await;
+}
+
+/// The converse of the running-write case: an active task that has changed
+/// nothing must not invalidate a current pass. A running task is not itself a
+/// workspace mutation.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_running_background_read_does_not_expire_current_evidence() {
+    let h = harness(vec![
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "bg-idle-running",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "echo READY; exec sleep 60"],
+                "background": true
+            }),
+        ),
+        tool_call(
+            "wait-ready",
+            "wait_task",
+            serde_json::json!({
+                "task_id": "bg-1",
+                "until": "match",
+                "pattern": "READY",
+                "timeout_seconds": 10
+            }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("后台任务仍在运行但没有修改工作区，测试证据保持有效。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "后台只读任务运行期间，当前测试证据仍然有效".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(8),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve on the current pass");
+
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert!(
+        refusals.is_empty(),
+        "a running task that changed nothing must not expire current evidence: {intercepted:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Completed);
+    let verification = report.verification.as_ref().expect("the cited pass");
+    assert!(
+        verification
+            .notes
+            .iter()
+            .all(|note| !note.contains("expired")),
+        "no freshness boundary may be invented: {verification:?}"
+    );
+
+    h.registry.kill_scope(SESSION_SCOPE).await;
+}
+
+/// A stopped task that already wrote the workspace is still a real mutation.
+/// The cancel is not a reason to ignore what the process changed, and the
+/// later auto-delivery of the same terminal fact must not count it again.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stopped_background_write_expires_the_verification_it_followed() {
+    let h = harness(vec![
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "bg-write-stoppable",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": [
+                    "-c",
+                    "printf 'pub fn changed() {}\\n' > src/lib.rs; echo READY; exec sleep 60"
+                ],
+                "background": true
+            }),
+        ),
+        tool_call(
+            "wait-ready",
+            "wait_task",
+            serde_json::json!({
+                "task_id": "bg-1",
+                "until": "match",
+                "pattern": "READY",
+                "timeout_seconds": 10
+            }),
+        ),
+        tool_call(
+            "stop-task",
+            "kill_task",
+            serde_json::json!({ "task_id": "bg-1" }),
+        ),
+        tool_call(
+            "wait-stopped",
+            "wait_task",
+            serde_json::json!({ "task_id": "bg-1", "timeout_seconds": 10 }),
+        ),
+        tool_call(
+            "stale-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": false
+            }),
+        ),
+        tool_call(
+            "check-after",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("被停止的后台任务已经修改源码，旧证据失效，重新验证后完成。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "被停止的后台任务已经修改源码时，旧测试证据不能完成".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(12),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve after the current-version rerun");
+
+    assert!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("changed"),
+        "the stopped process must already have written the source"
+    );
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the pre-change pass must be refused exactly once: {intercepted:?}"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the rerun must permit completion: {report:?}"
+    );
+}
+
+/// A terminal wait and a completion can arrive in ONE assistant batch. The
+/// wait's settlement must advance the version before the completion is judged,
+/// even though no later request admission could deliver it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_same_batch_terminal_wait_accounts_before_the_completion() {
+    let h = harness(vec![
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "bg-write-batch",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": [
+                    "-c",
+                    "printf 'pub fn changed() {}\\n' > src/lib.rs; echo READY; exec sleep 60"
+                ],
+                "background": true
+            }),
+        ),
+        tool_call(
+            "wait-ready",
+            "wait_task",
+            serde_json::json!({
+                "task_id": "bg-1",
+                "until": "match",
+                "pattern": "READY",
+                "timeout_seconds": 10
+            }),
+        ),
+        tool_calls(&[
+            (
+                "stop-in-batch",
+                "kill_task",
+                serde_json::json!({ "task_id": "bg-1" }),
+            ),
+            (
+                "wait-stopped-in-batch",
+                "wait_task",
+                serde_json::json!({ "task_id": "bg-1", "timeout_seconds": 10 }),
+            ),
+            (
+                "stale-complete",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                    "deliver_answer": false
+                }),
+            ),
+        ]),
+        tool_call(
+            "check-after",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("同一批次内先结算后台写入，再判定完成。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "同一批次内停止后台任务并完成时，旧测试证据必须失效".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(10),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve after the current-version rerun");
+
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the same-batch completion must see the terminal settlement: {intercepted:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Completed);
+}
+
 fn spec(h: &Harness, goal: &str) -> TaskSpec {
     TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
@@ -495,6 +1240,149 @@ fn spec(h: &Harness, goal: &str) -> TaskSpec {
             sandbox: false,
         },
     }
+}
+
+/// The auto-delivered notice and an active `wait_task` read are two
+/// observations of ONE background execution. The workspace change that
+/// execution really made must advance the mutation version in both routes —
+/// not only when the model polls. Otherwise a task that writes the source
+/// after a passing check can leave the stale pass looking current.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_auto_delivered_background_write_expires_the_verification_it_followed() {
+    let h = harness_waiting_for_background(vec![
+        // 1. A real foreground check passes on the current tree.
+        tool_call(
+            "check-before",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        // 2. A real background command changes the source after that pass.
+        tool_call(
+            "bg-write",
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "printf 'pub fn changed() {}\\n' > src/lib.rs"],
+                "background": true
+            }),
+        ),
+        // The mock waits for the real task to exit before producing this, so
+        // the next admission — not a sleep in the test — delivers the result.
+        text("后台修改已执行，等待结果送达。"),
+        // 3. Citing the pre-change pass must not close the goal.
+        tool_call(
+            "stale-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": false
+            }),
+        ),
+        // 4. Re-running on the current tree is the honest repair.
+        tool_call(
+            "check-after",
+            "run_command",
+            serde_json::json!({ "program": "sh", "args": ["run-tests.sh"] }),
+        ),
+        tool_call(
+            "fresh-complete",
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "verification": { "status": "passed", "detail": "sh run-tests.sh" },
+                "deliver_answer": true
+            }),
+        ),
+        text("后台写入已计入工作区版本，重新验证后完成。"),
+    ])
+    .await;
+    std::fs::write(h.dir.path().join("run-tests.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    // The gateway is a git workspace, which is what gives the background task
+    // a mutation baseline and lets its settlement report the files it changed.
+    leveler_test_support::git::init_repo(h.dir.path());
+    leveler_test_support::git::run(h.dir.path(), &["add", "-A"]);
+    leveler_test_support::git::run(h.dir.path(), &["commit", "-qm", "seed"]);
+
+    let s = TaskSpec {
+        runtime: leveler_agent::coding::RuntimeTaskSpec {
+            goal: "先验证，再让后台任务修改源码，最终用当前工作区的有效测试证据完成".into(),
+            kind: ExecutionKind::Direct,
+            continuation: ContinuationPolicy::bounded(10),
+            limits: StepLimits::default(),
+        },
+        coding: leveler_agent::coding::CodingTaskSpec {
+            repository: Some(h.dir.path().to_path_buf()),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+        },
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut intercepted = Vec::new();
+    let report = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the goal should resolve after the current-version rerun");
+
+    assert!(
+        std::fs::read_to_string(h.dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("changed"),
+        "the background process must really have written the source"
+    );
+    let refusals: Vec<&String> = intercepted
+        .iter()
+        .filter(|line| line.starts_with("verification_refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the pre-change pass must be refused exactly once: {intercepted:?}"
+    );
+    assert!(
+        refusals[0].contains("sh run-tests.sh")
+            && (refusals[0].contains("verification expired")
+                || refusals[0].contains("before the most recent file change")),
+        "the refusal must name the stale command and its freshness: {}",
+        refusals[0]
+    );
+    let verification = report
+        .verification
+        .as_ref()
+        .unwrap_or_else(|| panic!("the rerun must produce evidence: {intercepted:?}"));
+    // This harness declares no owed requirement, so the requirement-coverage
+    // rule downgrades a matched citation (the same rule the existing
+    // auto-delivery test pins). The freshness contract is the refusal count:
+    // only the pre-change pass was refused, and the rerun was accepted.
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Unverified,
+        "the accepted rerun is downgraded only by the no-requirement rule: {verification:?}"
+    );
+    assert!(
+        verification
+            .notes
+            .iter()
+            .any(|note| note.contains("no owed requirement")),
+        "the downgrade must be the no-requirement rule, not a missing check: {verification:?}"
+    );
+    assert_eq!(
+        report.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "the goal must complete on the current-version rerun: {report:?}"
+    );
 }
 
 /// Wait for the reaped task to reach a terminal status. `kill_scope` signals

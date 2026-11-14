@@ -1435,6 +1435,147 @@ impl<'a> Drive<'a> {
         }
     }
 
+    /// Observe what still-running write-capable tasks have ALREADY changed.
+    ///
+    /// A running task has no settlement yet, so a completion citing an older
+    /// pass cannot otherwise know whether the tree moved. The diff against the
+    /// task's own spawn baseline is a real observation — not an assumption
+    /// that every active task wrote something. It is accounted once per
+    /// execution. The model's own edits that fall in the same window can make
+    /// this conservative; that is bounded, because after one re-verification
+    /// the fresh evidence is current and the task-keyed note is not repeated.
+    async fn account_active_background_changes(&mut self) {
+        let (Some(registry), Some(owner)) = (
+            self.executor.background_tasks.clone(),
+            self.executor.tool_context.session_scope.clone(),
+        ) else {
+            return;
+        };
+        let owner = owner.as_ref();
+        for task in registry.active_snapshots_for_scope(owner).await {
+            if !self.background_result_belongs(&task.id, task.goal_id.as_ref()) {
+                continue;
+            }
+            let key = format!("background-live:{}", task.id);
+            if self
+                .ledger
+                .mutations
+                .iter()
+                .any(|record| record.tool == "background_task_live" && record.tool_call_id == key)
+            {
+                continue;
+            }
+            match registry.live_changes_for(&task.id, owner, false).await {
+                Ok(Some(paths)) if !paths.is_empty() => {
+                    let touched = workspace_mutations(
+                        self.executor.tool_context.execution.workspace.as_deref(),
+                        paths,
+                    );
+                    if touched.is_empty() {
+                        continue;
+                    }
+                    note_tool_side_effects(
+                        &mut self.ledger,
+                        &key,
+                        "background_task_live",
+                        touched.clone(),
+                        &self.plan_state,
+                        &mut *self.observer,
+                    );
+                    for path in touched {
+                        push_unique_path(&mut self.modified_files, &path);
+                        push_unique_path(&mut self.scoped_paths, &path);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // The diff could not be computed. The task's change set
+                    // stays unknown; it is never recorded as "no change".
+                    tracing::warn!(
+                        task = %task.id,
+                        %error,
+                        "could not observe a running background task's workspace changes"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a terminal background fact belongs to this drive's work.
+    ///
+    /// A task this drive started is certainly its execution. A task from an
+    /// earlier drive belongs only when its durable goal attribution names the
+    /// goal this drive serves.
+    fn background_result_belongs(
+        &self,
+        task_id: &str,
+        goal_id: Option<&leveler_core::GoalId>,
+    ) -> bool {
+        self.pending_commands
+            .iter()
+            .any(|pending| pending.task_id.as_deref() == Some(task_id))
+            || goal_id.is_some_and(|owner| {
+                self.executor
+                    .goal_binder()
+                    .and_then(|binder| binder.bound())
+                    .as_ref()
+                    == Some(owner)
+            })
+    }
+
+    /// Account the workspace change one background execution really made.
+    ///
+    /// The observation belongs to the task execution, not to the route that
+    /// read its result: the auto-delivered notice, a `wait_task` read and a
+    /// `get_task` read all land here. The ledger's own durable mutation record
+    /// (the task id with a runtime-owned tool label) is the idempotency fact,
+    /// so a repeated read — or a replay that re-observes the same terminal
+    /// fact — cannot advance the version twice.
+    ///
+    /// `None` is "unknown", never "unchanged"; only an observed set is
+    /// accounted. The settlement diff is an observation window over the task's
+    /// admitted namespace, not per-file authorship: a concurrent writer may
+    /// appear in it, which keeps this rule conservative.
+    fn account_background_changes(&mut self, task_id: &str, modified: Option<&[String]>) {
+        let Some(modified) = modified else {
+            return;
+        };
+        if modified.is_empty() {
+            return;
+        }
+        let key = format!("background:{task_id}");
+        // Field-pair identity: a model-chosen tool call id that happens to
+        // spell the key cannot suppress this note, because its `tool` is the
+        // real tool name, not this runtime-owned label.
+        if self
+            .ledger
+            .mutations
+            .iter()
+            .any(|record| record.tool == "background_task" && record.tool_call_id == key)
+        {
+            return;
+        }
+        let touched = workspace_mutations(
+            self.executor.tool_context.execution.workspace.as_deref(),
+            modified.to_vec(),
+        );
+        if touched.is_empty() {
+            return;
+        }
+        note_tool_side_effects(
+            &mut self.ledger,
+            &key,
+            "background_task",
+            touched.clone(),
+            &self.plan_state,
+            &mut *self.observer,
+        );
+        for path in touched {
+            push_unique_path(&mut self.modified_files, &path);
+            push_unique_path(&mut self.scoped_paths, &path);
+        }
+    }
+
     /// Register a terminal background result when it belongs to this drive.
     ///
     /// A task this drive started (its pending start is still recorded) is
@@ -1453,23 +1594,20 @@ impl<'a> Drive<'a> {
         ok: bool,
         exit_code: Option<i32>,
         evidence: bool,
+        modified: Option<&[String]>,
         model_step: u32,
     ) -> bool {
+        // The workspace change is a real fact even when this result is not
+        // evidence for this goal (another goal's task still changed the shared
+        // tree). Account it before the ownership filter, once per execution.
+        self.account_background_changes(task_id, modified);
         let started = self
             .pending_commands
             .iter()
             .rev()
             .find(|pending| pending.task_id.as_deref() == Some(task_id))
             .cloned();
-        let belongs = started.is_some()
-            || goal_id.is_some_and(|owner| {
-                self.executor
-                    .goal_binder()
-                    .and_then(|binder| binder.bound())
-                    .as_ref()
-                    == Some(owner)
-            });
-        if !belongs {
+        if !self.background_result_belongs(task_id, goal_id) {
             return false;
         }
         let label = started
@@ -1507,11 +1645,12 @@ impl<'a> Drive<'a> {
         model_steps: u32,
     ) -> Result<(), AgentError> {
         let (Some(registry), Some(owner)) = (
-            self.executor.background_tasks.as_ref(),
-            self.executor.tool_context.session_scope.as_deref(),
+            self.executor.background_tasks.clone(),
+            self.executor.tool_context.session_scope.clone(),
         ) else {
             return Ok(());
         };
+        let owner = owner.as_ref();
         if self.executor.depth != 0 || self.executor.tool_context.writer_scope() != "parent" {
             return Ok(());
         }
@@ -1538,11 +1677,20 @@ impl<'a> Drive<'a> {
                 status,
                 output,
                 output_truncated,
+                modified,
                 ..
             } = event
             else {
                 continue;
             };
+            // The observed change set is a workspace fact even when this
+            // notice was already committed to the transcript but never read.
+            // A crash between the delivery commit and its ledger note must not
+            // lose the mutation, so account before the delivered check; the
+            // ledger's task-keyed record keeps it idempotent.
+            if self.background_result_belongs(&task_id, goal_id.as_ref()) {
+                self.account_background_changes(&task_id, modified.as_deref());
+            }
             if delivered.contains(&task_id) || !admitted.insert(task_id.clone()) {
                 continue;
             }
@@ -1562,6 +1710,7 @@ impl<'a> Drive<'a> {
                 // start but is not a pass and is not a failed check.
                 status
                     .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited),
+                modified.as_deref(),
                 model_steps,
             );
             results.push(background_task_result_message(
@@ -1587,6 +1736,23 @@ impl<'a> Drive<'a> {
                 .await
             {
                 admitted.insert(task.id.clone());
+                // The registry's settlement is the same observation the
+                // durable event records. Reading it without consuming the
+                // one-time `wait_task` report keeps both routes identical.
+                let modified = match registry
+                    .settlement_changes_for(&task.id, owner, false)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            task = %task.id,
+                            "could not read the background task's settlement change set"
+                        );
+                        None
+                    }
+                };
                 self.register_background_result(
                     &task.id,
                     task.origin_call_id.as_deref(),
@@ -1596,6 +1762,7 @@ impl<'a> Drive<'a> {
                         && task.exit_code == Some(0),
                     task.exit_code,
                     task.status == leveler_execution::BackgroundTaskStatus::Exited,
+                    modified.as_deref(),
                     model_steps,
                 );
                 results.push(background_task_result_message(
@@ -3107,10 +3274,15 @@ impl Drive<'_> {
                         self.modified_files.push(f.clone());
                     }
                 }
-                if !is_error && !job_files.is_empty() {
+                let facts = super::dispatch::extract_command_facts(&metadata);
+                if !is_error
+                    && !job_files.is_empty()
+                    && facts.background_result.is_none()
+                    && facts.terminal_task_id.is_none()
+                {
                     let touched = workspace_mutations(
                         executor.tool_context.execution.workspace.as_deref(),
-                        job_files,
+                        job_files.clone(),
                     );
                     if !touched.is_empty() {
                         note_tool_side_effects(
@@ -3123,12 +3295,30 @@ impl Drive<'_> {
                         );
                     }
                 }
+                if let Some(task_id) = facts.terminal_task_id.as_deref() {
+                    self.account_background_changes(task_id, Some(&job_files));
+                }
                 if let Some(part) = extract_image(&metadata) {
                     pending_images.push(part);
                 }
-                let facts = super::dispatch::extract_command_facts(&metadata);
                 if let Some(task_id) = facts.terminal_task_id.as_ref() {
                     observed_terminal_tasks.push(task_id.clone());
+                }
+                if let Some(result) = facts.background_result.as_ref() {
+                    self.register_background_result(
+                        &result.task_id,
+                        result.start_call_id.as_deref(),
+                        result.goal_id.as_ref(),
+                        super::goal_verification::background_command_label(
+                            &result.program,
+                            &result.args,
+                        ),
+                        result.ok,
+                        result.exit_code,
+                        true,
+                        Some(&job_files),
+                        self.model_steps,
+                    );
                 }
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: facts.exit_code,
@@ -5238,6 +5428,15 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
+                // A completion judges the tree as it is now. A still-running
+                // write-capable task has no settlement yet, so observe what it
+                // has already changed before accepting an older pass as
+                // current evidence.
+                if reason == StopReason::Completed {
+                    // Boxed: this observation has its own state and must not
+                    // enlarge the long-lived drive future's stack frame.
+                    Box::pin(self.account_active_background_changes()).await;
+                }
                 // A structured "only the user can decide" block is not an
                 // external obstruction. While the question tool is actually
                 // advertised, redirect the model to ask instead of letting a
@@ -6897,7 +7096,14 @@ impl AgentHarness for Drive<'_> {
 
             // Any tool that newly modified files records a mutation (not
             // only apply_patch/replace by name). Paths are this call only.
-            if !is_error && call_mutated {
+            // A lifecycle read's `modified_files` are the background task's
+            // settlement, not this poll's writes (a stopped task has no
+            // `background_result`, so `terminal_task_id` is the other marker);
+            // the task-keyed note below owns that accounting, and charging it
+            // here too would count one execution twice.
+            let observed_terminal_background = command_facts.background_result.is_some()
+                || command_facts.terminal_task_id.is_some();
+            if !is_error && call_mutated && !observed_terminal_background {
                 let mut touched = newly_modified;
                 for path in &call_files {
                     if !touched.iter().any(|p| p == path) {
@@ -6918,6 +7124,14 @@ impl AgentHarness for Drive<'_> {
                         &mut *self.observer,
                     );
                 }
+            }
+            // A terminal lifecycle read's observed change set belongs to the
+            // task, not to the polling call. Account it under the execution
+            // identity so a stopped task (which has no `background_result`)
+            // and the later auto-delivery of the same task cannot both
+            // advance the version.
+            if let Some(task_id) = command_facts.terminal_task_id.as_deref() {
+                self.account_background_changes(task_id, Some(&call_files));
             }
             (self.observer)(AgentEvent::ToolResult {
                 exit_code: command_facts.exit_code,
@@ -7021,6 +7235,7 @@ impl AgentHarness for Drive<'_> {
                     // itself produced one (a natural exit or a child failure);
                     // a stopped task has no result to report.
                     true,
+                    Some(&call_files),
                     model_steps,
                 );
             }

@@ -179,6 +179,40 @@ impl Fixture {
         .expect("append start event");
     }
 
+    /// Spawn with the mutation baseline a real command call takes. The
+    /// settlement diff is what makes this task's writes observable.
+    async fn spawn_with_baseline(&self, call_id: &str, script: &str) -> String {
+        let root = self.repo.clone();
+        let scope = leveler_execution::WriteScope::WorkspaceWithGit { root: root.clone() };
+        let snapshot = leveler_execution::WorkspaceSnapshot::capture_for_scope(&root, &scope)
+            .await
+            .expect("capture the pre-spawn workspace")
+            .expect("the fixture repo is a git workspace");
+        self.app
+            .background_tasks()
+            .spawn_with_origin(
+                leveler_execution::ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), script.to_string()],
+                    self.repo.clone(),
+                ),
+                Some(leveler_execution::MutationBaseline {
+                    snapshot,
+                    workspace_root: root,
+                    write_scope: scope,
+                }),
+                Some(self.session.as_str()),
+                "parent",
+                leveler_execution::BackgroundTaskLifetime::Goal,
+                leveler_execution::BackgroundTaskOrigin {
+                    call_id: Some(call_id.to_string()),
+                    goal_id: None,
+                },
+            )
+            .await
+            .expect("spawn")
+    }
+
     async fn spawn(&self, call_id: Option<&str>, script: &str) -> String {
         self.app
             .background_tasks()
@@ -269,6 +303,100 @@ async fn a_finished_background_command_becomes_durable_evidence() {
             assert_eq!(args[1], "printf 'running tests\\n'; exit 0");
             assert!(!is_error, "a zero exit is a pass");
             assert_eq!(*exit_code, Some(0));
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+}
+
+/// The observed change set is part of the terminal execution fact. A result
+/// consumed by an auto-delivered notice and one consumed by `wait_task` must
+/// carry the same workspace evidence, and a runtime that dies before either
+/// still leaves that observation behind.
+#[tokio::test]
+async fn a_background_write_is_durable_in_its_terminal_fact() {
+    let f = fixture().await;
+    leveler_test_support::git::init_repo(&f.repo);
+    std::fs::write(f.repo.join("seed.txt"), "seed\n").unwrap();
+    leveler_test_support::git::run(&f.repo, &["add", "-A"]);
+    leveler_test_support::git::run(&f.repo, &["commit", "-qm", "seed"]);
+    let mut events = f.runtime.subscribe_session(&f.session);
+    f.record_starting_call("call-bg-write", "sh", &["-c", "true"])
+        .await;
+    let id = f
+        .spawn_with_baseline("call-bg-write", "printf 'written\\n' > written.txt; exit 0")
+        .await;
+    f.wait_for_events(&mut events).await;
+
+    let recorded = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows = f.result_events().await;
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the durable result is written");
+
+    assert!(
+        f.repo.join("written.txt").is_file(),
+        "the background process must really have written the workspace"
+    );
+    match &recorded[0] {
+        leveler_engine::EngineEvent::BackgroundTaskFinished {
+            task_id,
+            exit_code,
+            modified,
+            ..
+        } => {
+            assert_eq!(task_id, &id);
+            assert_eq!(*exit_code, Some(0));
+            let modified = modified
+                .as_ref()
+                .expect("the observed change set must be durable, not unknown");
+            assert!(
+                modified.iter().any(|path| path == "written.txt"),
+                "the terminal fact must name the file the task changed: {modified:?}"
+            );
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+}
+
+/// A task that really ran and changed nothing reports an observed empty set.
+/// "Unknown" (no baseline, failed diff) is a different fact and must not be
+/// written as "unchanged".
+#[tokio::test]
+async fn a_background_result_without_a_change_is_an_observed_empty_set() {
+    let f = fixture().await;
+    leveler_test_support::git::init_repo(&f.repo);
+    std::fs::write(f.repo.join("seed.txt"), "seed\n").unwrap();
+    leveler_test_support::git::run(&f.repo, &["add", "-A"]);
+    leveler_test_support::git::run(&f.repo, &["commit", "-qm", "seed"]);
+    let mut events = f.runtime.subscribe_session(&f.session);
+    let _ = f.spawn_with_baseline("call-bg-readonly", "exit 0").await;
+    f.wait_for_events(&mut events).await;
+
+    let recorded = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows = f.result_events().await;
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the durable result is written");
+
+    match &recorded[0] {
+        leveler_engine::EngineEvent::BackgroundTaskFinished { modified, .. } => {
+            assert_eq!(
+                modified.as_deref(),
+                Some([].as_slice()),
+                "a diffed baseline with no change is an observed empty set, not unknown"
+            );
         }
         other => panic!("unexpected event {other:?}"),
     }
@@ -448,6 +576,7 @@ async fn background_fact_append_is_fenced_and_idempotent() {
         status: Some(leveler_execution::BackgroundTaskStatus::Exited),
         output: "from the owning boot".into(),
         output_truncated: false,
+        modified: None,
     }
     .to_row()
     .unwrap();
@@ -570,6 +699,7 @@ impl Fixture {
             status: Some(status),
             output: String::new(),
             output_truncated: false,
+            modified: None,
         };
         let (event_type, payload) = event.to_row().unwrap();
         db.append(

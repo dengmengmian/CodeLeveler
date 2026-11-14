@@ -1769,6 +1769,7 @@ mod goal_verification_replay_tests {
             status: Some(leveler_execution::BackgroundTaskStatus::Exited),
             output: String::new(),
             output_truncated: false,
+            modified: None,
         })
         .await;
         (stores, session, goal)
