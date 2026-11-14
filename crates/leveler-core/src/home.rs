@@ -11,6 +11,7 @@
 //! ```text
 //! <root>/
 //! ├── config.toml                 global user config
+//! ├── memory/                     cross-session memory store
 //! ├── state/   projects/<id>/ · remote/ · web/     durable state
 //! ├── run/     sockets/ · locks/ · sandboxes/       ephemeral runtime coordination
 //! ├── cache/   tools/                               disposable, rebuildable
@@ -79,6 +80,14 @@ impl LevelerHome {
     /// Durable-state root: `state/`.
     pub fn state_dir(&self) -> PathBuf {
         self.root.join("state")
+    }
+
+    /// Cross-session memory store root: `memory/`.
+    ///
+    /// A sibling of `state/`. It holds only topic/inbox Markdown, the generated
+    /// `MEMORY.md`, and the memory SQLite state.
+    pub fn memory_dir(&self) -> PathBuf {
+        self.root.join("memory")
     }
 
     /// Global schedule definitions, occurrences and run history. User-global
@@ -230,6 +239,7 @@ mod tests {
             h.project_state_dir("proj-abc"),
             PathBuf::from("/home/u/.leveler/state/projects/proj-abc")
         );
+        assert_eq!(h.memory_dir(), PathBuf::from("/home/u/.leveler/memory"));
         assert_eq!(
             h.web_projects_registry(),
             PathBuf::from("/home/u/.leveler/state/web/projects.json")
@@ -252,10 +262,11 @@ mod tests {
             h.daemon_log("proj-abc"),
             PathBuf::from("/home/u/.leveler/logs/daemon/proj-abc.log")
         );
-        // Every canonical entry is one of the six top-level namespaces.
+        // Every canonical entry is one of the top-level namespaces.
         for p in [
             h.config_file(),
             h.state_dir(),
+            h.memory_dir(),
             h.run_dir(),
             h.cache_dir(),
             h.runtimes_dir(),
@@ -326,6 +337,7 @@ mod tests {
             h.agents_dir(),
             h.skills_dir(),
             h.state_dir(),
+            h.memory_dir(),
             h.projects_dir(),
             h.project_state_dir("p"),
             h.web_state_dir(),

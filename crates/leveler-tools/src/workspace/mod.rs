@@ -66,6 +66,12 @@ pub(crate) fn path_approval_reason(
     if context.policy.unrestricted_execution() {
         return None;
     }
+    // Memory files are governed by their own policy, not by the workspace
+    // write scope. Asking for workspace consent here would prompt for a path
+    // the execution layer is about to handle itself.
+    if crate::memory_access::owns_path(context, path) {
+        return None;
+    }
     let workspace = context.execution_workspace().ok()?;
     if write {
         if let Some(reason) = context.write_path_denied(path) {

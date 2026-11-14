@@ -469,6 +469,11 @@ pub enum ModelCallKind {
     /// A bounded harness-initiated call that is not a main-loop round, and not
     /// one of the named product affordances above.
     Advisory,
+    /// Automatic memory capture extracting durable observations from a
+    /// settled turn range.
+    MemoryCapture,
+    /// Memory Dream consolidating captured observations into topics.
+    MemoryDream,
 }
 
 impl ModelCallKind {
@@ -483,6 +488,8 @@ impl ModelCallKind {
             Self::SideQuestion => "side_question",
             Self::ProviderProbe => "provider_probe",
             Self::Advisory => "advisory",
+            Self::MemoryCapture => "memory_capture",
+            Self::MemoryDream => "memory_dream",
         }
     }
 
@@ -505,7 +512,9 @@ impl ModelCallKind {
             Self::PromptSuggestion
             | Self::AwaySummary
             | Self::SemanticRecap
-            | Self::ProviderProbe => Some(ReasoningEffort::Low),
+            | Self::ProviderProbe
+            | Self::MemoryCapture
+            | Self::MemoryDream => Some(ReasoningEffort::Low),
         }
     }
 }
@@ -595,6 +604,8 @@ mod call_kind_policy_tests {
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
             ModelCallKind::ProviderProbe,
+            ModelCallKind::MemoryCapture,
+            ModelCallKind::MemoryDream,
             ModelCallKind::Compaction,
         ] {
             let effort = kind
@@ -611,6 +622,8 @@ mod call_kind_policy_tests {
             ModelCallKind::AwaySummary,
             ModelCallKind::SemanticRecap,
             ModelCallKind::ProviderProbe,
+            ModelCallKind::MemoryCapture,
+            ModelCallKind::MemoryDream,
         ] {
             assert_eq!(
                 kind.default_reasoning_effort(),
@@ -649,6 +662,8 @@ mod call_kind_policy_tests {
             ModelCallKind::SideQuestion,
             ModelCallKind::ProviderProbe,
             ModelCallKind::Advisory,
+            ModelCallKind::MemoryCapture,
+            ModelCallKind::MemoryDream,
         ] {
             assert_eq!(
                 leveler_storage::ModelCallKind::from_stored(kind.as_str()),
@@ -663,6 +678,10 @@ mod call_kind_policy_tests {
                     ModelCallKind::SideQuestion => leveler_storage::ModelCallKind::SideQuestion,
                     ModelCallKind::ProviderProbe => leveler_storage::ModelCallKind::ProviderProbe,
                     ModelCallKind::Advisory => leveler_storage::ModelCallKind::Advisory,
+                    ModelCallKind::MemoryCapture => {
+                        leveler_storage::ModelCallKind::MemoryCapture
+                    }
+                    ModelCallKind::MemoryDream => leveler_storage::ModelCallKind::MemoryDream,
                 },
                 "{kind:?}"
             );

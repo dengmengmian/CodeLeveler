@@ -9,6 +9,7 @@
 pub mod answer_effect;
 pub mod capabilities;
 pub mod mcp;
+pub(crate) mod memory_access;
 pub(crate) mod network;
 pub mod recoverable;
 pub mod registry;

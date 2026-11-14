@@ -7,6 +7,20 @@
 - Windows child-process output is decoded incrementally: a multi-byte character split across pipe reads stays one character, background logs use the same decoder, and a truncated GBK result no longer turns its retained head into replacement glyphs. The TUI full-output pager prefers the UTF-8 presentation copy beside the raw capture; the raw stdout/stderr capture files remain byte-exact.
 - A user shell that fails before it spawns (for example an Assisted command on a Windows host without `leveler-confine.exe`) shows the host's refusal in the live view, not only in the reconnected record.
 
+## [1.0.27] - 2026-11-14
+
+- Cross-session memory is available as an opt-in capability. `[memory].rollout` is `off` (the default), `record_only`, `shadow` or `active`; only `active` exposes memory to the model. Everything lives under `<LevelerHome>/memory/`; a workspace is identified by its git remote, and a temporary working directory has no workspace scope.
+- Capture runs as durable background work after each settled turn. The extraction call uses a forced tool call and writes structured observations as Markdown files plus a SQLite ledger row; the turn itself is never blocked and committing an outcome is idempotent. A normal quit releases an in-flight job as retryable without charging the bounded retry budget, and startup scans for claimable jobs so a cancelled capture resumes without a new turn. Paused sessions and a global `off` rollout record skipped turns instead of backfilling them on re-enable.
+- Dream consolidates pending observations into Markdown topics. A durable six-hour lease serializes it across processes and an owner whose PID is gone is treated as expired. Automatic Dream runs after capture settles; `/dream` runs one pass; `D` on the memory page runs a bounded batch.
+- Each turn's system context can carry a bounded `## Cross-session memory` index of topic paths and one-line descriptions. The agent reads a topic with the ordinary `read_file` tool; there is no retrieval API and no vector database.
+- `/memory` opens the management page (both scopes, read, filter, refresh, pause and Dream keys), and `leveler memory status|show|remember|forget` covers the CLI. Forget binds to the BLAKE3 hash printed by `memory show`: a tombstone is written before the file is removed, the path is excluded from the index, capture and consolidation, and the retained archive is invisible to the agent's file tools.
+- A `blocked` goal resolution is refused once while the model's own latest explicit plan still lists steps it never marked completed. The refusal names the open steps and structured exits; a confirmed block is accepted with the conflict kept in its receipt. The check is bounded once per drive, never rewrites a block into a completion, and never completes pending steps on the model's behalf.
+- `shell_command` names input mistakes instead of ignoring them: `program`, `args` or `command` used beside or instead of `cmd` and a wrong-typed `cmd` are refused by the schema, and a refused call never executes. `reason` and the documented `workdir` alias keep working.
+- Plan progress has a dedicated TUI status row and updates in place.
+- Sub-agent run futures are boxed, so nesting no longer adds a full stack frame per level.
+- A completion claim the runtime refused for a named reason is recorded with that detail and is not booked as a runtime gate failure in evaluation.
+- Dependencies: `quinn-udp` 0.5.16 closes RUSTSEC-2026-0538. Added GitHub issue forms.
+
 ## [1.0.26] - 2026-11-12
 
 - Continuation, pause, amendment, cancellation and questions are decided by the model in the running turn, not by a wording pattern. The model declares the meaning with `declare_intent`, quoting the newest user message verbatim; the runtime checks that the quote really came from that message, which goal it targets (and refuses to guess when several are running and none is named), the legal ordered operations, and the plan step a boundary names by stable id. Any language, phrasing or compound instruction ("继续执行，但第三阶段完成后暂停") uses the same path, and no extra classification call is made.

@@ -1,0 +1,10 @@
+This crate contains code derived from an Apache-2.0 licensed implementation
+reviewed at commit 2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8.
+
+Original copyright: Copyright 2023-2026 SpaceXAI
+License: Apache License, Version 2.0 (see the repository's LICENSE-APACHE)
+
+CodeLeveler changed the crate layout, public and internal names, storage paths,
+configuration keys, model prompts and host integration, and ported the durable
+semantics onto CodeLeveler's runtime. User-facing surfaces (CLI, TUI, docs) were
+written for CodeLeveler. See docs/MEMORY.md for the product behavior.
