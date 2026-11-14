@@ -34,6 +34,7 @@ leveler-client-protocol = { workspace = true }
 leveler-local-transport = { workspace = true }
 leveler-schedule = { workspace = true }
 leveler-media = { workspace = true }
+leveler-memory = { workspace = true }
 arboard = "3"
 serde = { workspace = true }
 schemars = { workspace = true }

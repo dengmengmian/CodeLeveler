@@ -355,6 +355,12 @@ pub struct CaseResult {
     /// `update_goal` refusals by the runtime, by stable reason key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub goal_interceptions: Vec<String>,
+    /// Every distinct refusal with the runtime's exact detail, in first-seen
+    /// order. `goal_interceptions` is the kind summary; this is the evidence
+    /// that lets a failed completion be diagnosed after the ephemeral home is
+    /// gone. Absent on baselines written before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goal_interception_details: Vec<GoalInterceptionDetail>,
 
     // ── Model time (per-round ledger, not wall clock) ───────────────────────
     /// Summed provider latency of this run's main-agent model rounds (ms) —
@@ -1265,8 +1271,12 @@ impl Ablation {
 /// end there too).
 ///
 /// When the expectation passes but the runtime says the task did not
-/// complete, the MODEL solved the task and the RUNTIME's verification gate
-/// was wrong — [`FailureCategory::Runtime`], never booked against the model.
+/// complete, `Runtime` is booked only if the runtime never emitted a
+/// structured completion refusal: with no interception the run ended without
+/// the gate naming a reason, so the gate is the prime suspect. A run that
+/// carries `goal_interceptions` was told exactly why its claim was refused
+/// (`invalid_status`, `requirements_refused`, …) and stopped anyway; that is
+/// a trajectory failure, and [`classify_failure`] decides.
 ///
 /// Returns `None` when the case passed.
 pub fn attribute_failure(
@@ -1281,7 +1291,7 @@ pub fn attribute_failure(
     if let Some(cause) = infrastructure_cause {
         return Some(cause);
     }
-    if expect_passed && !completed {
+    if expect_passed && !completed && signals.goal_interceptions.is_empty() {
         return Some(FailureCategory::Runtime);
     }
     Some(classify_failure(signals))
@@ -1294,6 +1304,17 @@ pub fn attribute_failure(
 pub enum FailureSource {
     Auto,
     Manual,
+}
+
+/// One `update_goal` refusal exactly as the runtime emitted it.
+///
+/// `kind` is the stable reason key attribution consumes. `detail` is the same
+/// structured refusal text the model received; it is diagnostic evidence only
+/// — attribution never parses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalInterceptionDetail {
+    pub kind: String,
+    pub detail: String,
 }
 
 /// A trajectory summary the harness derives from the agent's event stream,
@@ -1437,6 +1458,9 @@ pub struct TrajectorySignals {
     /// `update_goal` resolutions the runtime refused, by stable reason key
     /// (`plan_unreconciled`, `outstanding_children`, `invalid_status`).
     pub goal_interceptions: Vec<String>,
+    /// Every distinct refusal with the exact reason the model received.
+    /// [`Self::goal_interceptions`] is this list's deduped kind summary.
+    pub goal_interception_details: Vec<GoalInterceptionDetail>,
     /// Reads that returned bytes the run had already seen for the same path and
     /// range, with no successful edit since. See
     /// [`CaseResult::redundant_reads`] for why this is a lower bound.
@@ -1693,6 +1717,7 @@ mod tests {
             runtime_forced_continuations: 0,
             runtime_injection_kinds: Vec::new(),
             goal_interceptions: Vec::new(),
+            goal_interception_details: Vec::new(),
             model_time_ms: 0,
             model_time_before_first_edit_ms: None,
             reasoning_tokens_before_first_edit: None,
@@ -1996,6 +2021,35 @@ mod tests {
             ),
             Some(FailureCategory::Environment),
             "completed but expectation failed → the model's own verdict was wrong"
+        );
+    }
+
+    /// L3 `cap-error-handling` (2026-11-12): the model fixed the code (the
+    /// independent expectation passed) but its `update_goal` claims were
+    /// refused — an invalid status, then `content` requirements recorded as
+    /// prose instead of a line of the target file — and it stopped without a
+    /// valid completion. Those refusals are the runtime enforcing the
+    /// structured protocol, not a gate defect, so `expect_passed &&
+    /// !completed` alone must not be booked as `Runtime`.
+    #[test]
+    fn a_refused_completion_claim_is_not_a_runtime_gate_failure() {
+        let refused_after_fix = TrajectorySignals {
+            tool_calls: 10,
+            edit_attempts: 1,
+            edit_failures: 0,
+            touched_relevant_files: true,
+            verification_ran: true,
+            goal_interceptions: vec![
+                "invalid_status".to_string(),
+                "requirements_refused".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            attribute_failure(false, true, None, &refused_after_fix),
+            Some(FailureCategory::Understanding),
+            "the model's own claim was refused; the trajectory decides, not the gate"
         );
     }
 
@@ -2433,6 +2487,7 @@ mod tests {
             runtime_forced_continuations: 0,
             runtime_injection_kinds: Vec::new(),
             goal_interceptions: Vec::new(),
+            goal_interception_details: Vec::new(),
             model_time_ms: 0,
             model_time_before_first_edit_ms: None,
             reasoning_tokens_before_first_edit: None,
@@ -2785,6 +2840,7 @@ expect: { program: cargo, args: [test] }
                 runtime_forced_continuations: 0,
                 runtime_injection_kinds: Vec::new(),
                 goal_interceptions: Vec::new(),
+                goal_interception_details: Vec::new(),
                 model_time_ms: 0,
                 model_time_before_first_edit_ms: None,
                 reasoning_tokens_before_first_edit: None,
@@ -2856,6 +2912,7 @@ expect: { program: cargo, args: [test] }
                 runtime_forced_continuations: 0,
                 runtime_injection_kinds: Vec::new(),
                 goal_interceptions: Vec::new(),
+                goal_interception_details: Vec::new(),
                 model_time_ms: 0,
                 model_time_before_first_edit_ms: None,
                 reasoning_tokens_before_first_edit: None,

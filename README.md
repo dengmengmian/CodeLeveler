@@ -80,6 +80,7 @@ leveler update
 ## User guides
 
 - [Everyday use](docs/USAGE.md)
+- [Cross-session memory](docs/MEMORY.md)
 - [Custom agents](docs/AGENT_EXTENSIBILITY.md)
 - [Latest release](docs/RELEASE.md)
 - [Version history](CHANGELOG.md)

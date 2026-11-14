@@ -49,6 +49,7 @@ mod global_tasks;
 mod goal_command;
 mod goals;
 mod media;
+mod memory;
 mod observability;
 mod origin;
 mod progress;
@@ -99,6 +100,10 @@ pub use global_tasks::{
 };
 pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
+pub use memory::{
+    UiMemoryActionResult, UiMemoryActivity, UiMemoryFile, UiMemoryFileContent, UiMemoryScope,
+    UiMemorySession, UiMemoryStatus,
+};
 pub use observability::{
     OBSERVABILITY_REQUESTS_MAX, OBSERVABILITY_WINDOW_MAX, ObservationClass, UiAgentObservation,
     UiEventRelation, UiLaneAccounting, UiObservabilityLoaded, UiObservationField, UiObservationRow,

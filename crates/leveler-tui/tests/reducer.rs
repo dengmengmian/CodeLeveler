@@ -3561,7 +3561,9 @@ fn slash_new_starts_a_fresh_session() {
 /// Ctrl+X Ctrl+E, Ctrl+T, Ctrl+C. `/skill` is not listed here: it is now the
 /// prefix of the `/skills` inspector, so Enter completes it rather than
 /// reporting it unknown. `/doctor` is no longer closed either: it opens the
-/// local terminal diagnostics screen.
+/// local terminal diagnostics screen. The Memory 2.0 management verbs are
+/// still closed, but `/memory` and `/remember` are live commands of the native
+/// memory surface, so they are not "unknown".
 #[test]
 fn closed_commands_are_unknown_and_send_nothing() {
     for command in [
@@ -3573,15 +3575,6 @@ fn closed_commands_are_unknown_and_send_nothing() {
         "/tools",
         "/quit",
         "/q",
-        "/remember 终端输出保持紧凑",
-        "/memory",
-        "/memory list",
-        "/memory status",
-        "/memory review",
-        "/memory accept old-id",
-        "/memory reject old-id",
-        "/memory forget old-id",
-        "/memory remember note",
         "/forget old-id",
         "/consolidate_memory",
     ] {
@@ -3599,6 +3592,69 @@ fn closed_commands_are_unknown_and_send_nothing() {
         assert_eq!(s.active_screen, Screen::Conversation, "{command}");
         assert_eq!(s.composer.text(), command, "{command} draft is kept");
     }
+}
+
+/// The memory surface's four slash commands each name one runtime action.
+/// `/memory` opens the page and asks for its counters; `/remember`, `/dream`
+/// and `/flush` ask for exactly that action and create no model turn.
+#[test]
+fn memory_slash_commands_route_to_the_memory_surface() {
+    let mut s = opened();
+    s.composer.replace("/memory");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Memory);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert!(
+        matches!(
+            &effects[0],
+            Effect::Send(ClientCommand::QueryMemory { session_id, query_id })
+                if session_id == &s.session_id && query_id.is_some()
+        ),
+        "{effects:?}"
+    );
+
+    let mut s = opened();
+    s.composer.replace("/remember Prefer terse answers");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(s.memory.action_query.is_some(), "the action is in flight");
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    match &effects[0] {
+        Effect::Send(ClientCommand::RememberMemory {
+            content, query_id, ..
+        }) => {
+            assert_eq!(content, "Prefer terse answers");
+            assert!(query_id.is_some());
+        }
+        other => panic!("expected RememberMemory, got {other:?}"),
+    }
+
+    let mut s = opened();
+    s.composer.replace("/dream");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    match &effects[0] {
+        Effect::Send(ClientCommand::RunMemoryDream { batch, .. }) => assert!(!batch),
+        other => panic!("expected RunMemoryDream, got {other:?}"),
+    }
+
+    let mut s = opened();
+    s.composer.replace("/dream batch");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    match &effects[0] {
+        Effect::Send(ClientCommand::RunMemoryDream { batch, .. }) => assert!(batch),
+        other => panic!("expected batch RunMemoryDream, got {other:?}"),
+    }
+
+    let mut s = opened();
+    s.composer.replace("/flush");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert!(
+        matches!(
+            &effects[0],
+            Effect::Send(ClientCommand::FlushMemory { query_id, .. }) if query_id.is_some()
+        ),
+        "{effects:?}"
+    );
 }
 
 #[test]

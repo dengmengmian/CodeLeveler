@@ -68,9 +68,12 @@ impl Drop for RuntimeBootLease {
     }
 }
 
-/// Whether `boot` still has a live holder. Taking its lock succeeds only when
-/// no process holds it; the probe's own lock is released at once, which is
-/// harmless because an ended boot never comes back. A probe that fails for
+/// Whether `boot` still has a live holder. The lease holds the file
+/// exclusively; a probe asks for a SHARED lock, which succeeds only when no
+/// exclusive holder exists and is compatible with every other probe. Taking an
+/// exclusive probe lock instead would let two concurrent projections mistake
+/// each other for a live boot. The probe's own lock is released at once, which
+/// is harmless because an ended boot never comes back. A probe that fails for
 /// any other reason proves nothing: `Unknown`, never `Dead`.
 pub fn boot_liveness(state_dir: &Path, boot: &BootId) -> BootLiveness {
     let probe = || -> io::Result<BootLiveness> {
@@ -82,7 +85,10 @@ pub fn boot_liveness(state_dir: &Path, boot: &BootId) -> BootLiveness {
             }
             Err(error) => return Err(error),
         };
-        match file.try_lock_exclusive() {
+        // The std inherent `File::try_lock_shared` takes precedence over the
+        // fs2 trait method and reports a different error type; name the trait
+        // method the lease itself uses so probe and lease share one lock.
+        match FileExt::try_lock_shared(&file) {
             Ok(()) => Ok(BootLiveness::Dead),
             Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 Ok(BootLiveness::Alive)
@@ -155,6 +161,26 @@ mod tests {
         // the OS releasing it by replacing the file with an unlocked one.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"").unwrap();
+        assert_eq!(boot_liveness(dir.path(), &id), BootLiveness::Dead);
+    }
+
+    /// Two projections can probe the same boot at once. A probe holds its own
+    /// lock only for the instant it reads the file; it must never be mistaken
+    /// for the live lease it is looking for.
+    #[test]
+    fn a_concurrent_probe_does_not_look_like_a_live_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = BootId::generate();
+        let path = lock_path(dir.path(), &id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        FileExt::try_lock_shared(&file).unwrap();
         assert_eq!(boot_liveness(dir.path(), &id), BootLiveness::Dead);
     }
 

@@ -74,6 +74,54 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
+        // Memory files are persisted by the host policy, which owns their
+        // containment, read-before-write snapshot, and manifest refresh. The
+        // workspace editor never sees them.
+        let memory_path = std::path::PathBuf::from(&input.path);
+        let is_memory = match crate::memory_access::preflight_write(
+            &context,
+            &memory_path,
+            input.content.as_bytes(),
+        )
+        .await
+        {
+            Ok(is_memory) => is_memory,
+            Err(reason) => return Ok(ToolOutput::error(reason)),
+        };
+        if is_memory {
+            let written =
+                crate::memory_access::write_file(&context, &memory_path, input.content.as_bytes())
+                    .await;
+            return match written {
+                Ok(leveler_memory::MemoryWrite::Written { previous_content }) => {
+                    let verb = if previous_content.is_some() {
+                        "Replaced"
+                    } else {
+                        "Created"
+                    };
+                    let lines = input.content.lines().count();
+                    let mut meta = serde_json::json!({ "modified_files": [input.path.clone()] });
+                    if let Some(previous) = previous_content {
+                        let previous = String::from_utf8_lossy(&previous);
+                        let hunks =
+                            super::applied_diff::whole_file_hunks(&previous, &input.content);
+                        if let Some(diff) = super::applied_diff::unified_diff(&input.path, &hunks) {
+                            meta["applied_diff"] = serde_json::Value::String(diff);
+                        }
+                    }
+                    Ok(
+                        ToolOutput::ok(format!("{verb} {} ({lines} lines)", input.path))
+                            .with_metadata(meta),
+                    )
+                }
+                Ok(leveler_memory::MemoryWrite::Outside) => Ok(ToolOutput::error(
+                    "the memory policy accepted this path but did not persist it; \
+                     nothing was written",
+                )),
+                Err(reason) => Ok(ToolOutput::error(reason)),
+            };
+        }
+
         if let Some(denied) = context.write_path_denied(&input.path) {
             return Ok(ToolOutput::error(denied));
         }

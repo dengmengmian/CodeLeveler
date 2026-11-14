@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use leveler_agent::AgentEvent;
 use leveler_engine::EngineEvent;
-use leveler_eval::TrajectorySignals;
+use leveler_eval::{GoalInterceptionDetail, TrajectorySignals};
 
 /// Programs whose successful run counts as verification evidence. Mirrors the
 /// executor's verification-class heuristic; kept local so the harness has no
@@ -137,8 +137,8 @@ pub(crate) struct SignalCollector {
     injected_rounds: HashSet<u32>,
     forced_continuations: u32,
     injection_kinds: Vec<String>,
-    /// Stable `update_goal` refusal reasons observed.
-    goal_interceptions: Vec<String>,
+    /// Distinct `update_goal` refusals with the runtime's exact detail.
+    goal_interception_details: Vec<GoalInterceptionDetail>,
 }
 
 impl SignalCollector {
@@ -194,7 +194,7 @@ impl SignalCollector {
             injected_rounds: HashSet::new(),
             forced_continuations: 0,
             injection_kinds: Vec::new(),
-            goal_interceptions: Vec::new(),
+            goal_interception_details: Vec::new(),
         }
     }
 
@@ -497,9 +497,13 @@ impl SignalCollector {
                     self.injection_kinds.push(kind.clone());
                 }
             }
-            AgentEvent::GoalIntercepted { kind, .. } => {
-                if !self.goal_interceptions.iter().any(|k| k == kind) {
-                    self.goal_interceptions.push(kind.clone());
+            AgentEvent::GoalIntercepted { kind, detail } => {
+                let record = GoalInterceptionDetail {
+                    kind: kind.clone(),
+                    detail: detail.clone(),
+                };
+                if !self.goal_interception_details.contains(&record) {
+                    self.goal_interception_details.push(record);
                 }
             }
             _ => {}
@@ -575,7 +579,14 @@ impl SignalCollector {
         self.signals.runtime_injected_rounds = self.injected_rounds.len() as u32;
         self.signals.runtime_forced_continuations = self.forced_continuations;
         self.signals.runtime_injection_kinds = self.injection_kinds;
-        self.signals.goal_interceptions = self.goal_interceptions;
+        let mut goal_interceptions = Vec::new();
+        for record in &self.goal_interception_details {
+            if !goal_interceptions.contains(&record.kind) {
+                goal_interceptions.push(record.kind.clone());
+            }
+        }
+        self.signals.goal_interceptions = goal_interceptions;
+        self.signals.goal_interception_details = self.goal_interception_details;
         self.signals
     }
 
@@ -1581,6 +1592,20 @@ mod tests {
             kind: "invalid_status".into(),
             detail: "no status".into(),
         });
+        // An identical refusal is one record; the same kind with a different
+        // reason keeps both details while the kind summary stays deduped.
+        c.observe_agent(&AgentEvent::GoalIntercepted {
+            kind: "invalid_status".into(),
+            detail: "no status".into(),
+        });
+        c.observe_agent(&AgentEvent::GoalIntercepted {
+            kind: "requirements_refused".into(),
+            detail: "R1 does not appear as a line of src/lib.rs".into(),
+        });
+        c.observe_agent(&AgentEvent::GoalIntercepted {
+            kind: "requirements_refused".into(),
+            detail: "R2 does not appear as a line of src/lib.rs".into(),
+        });
         let s = c.finish(false);
 
         assert_eq!(s.runtime_injected_rounds, 2, "steps 2 and 4, not messages");
@@ -1597,7 +1622,29 @@ mod tests {
             s.goal_interceptions,
             vec![
                 "plan_unreconciled".to_string(),
-                "invalid_status".to_string()
+                "invalid_status".to_string(),
+                "requirements_refused".to_string()
+            ]
+        );
+        assert_eq!(
+            s.goal_interception_details,
+            vec![
+                leveler_eval::GoalInterceptionDetail {
+                    kind: "plan_unreconciled".into(),
+                    detail: "tool work after the last plan declaration".into(),
+                },
+                leveler_eval::GoalInterceptionDetail {
+                    kind: "invalid_status".into(),
+                    detail: "no status".into(),
+                },
+                leveler_eval::GoalInterceptionDetail {
+                    kind: "requirements_refused".into(),
+                    detail: "R1 does not appear as a line of src/lib.rs".into(),
+                },
+                leveler_eval::GoalInterceptionDetail {
+                    kind: "requirements_refused".into(),
+                    detail: "R2 does not appear as a line of src/lib.rs".into(),
+                },
             ]
         );
     }

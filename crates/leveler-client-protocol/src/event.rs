@@ -978,6 +978,31 @@ pub enum RuntimeEvent {
         query_id: Option<CommandId>,
         report: Box<crate::UiUsageReport>,
     },
+    /// Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection
+    /// of both memory scopes. The file list carries no contents; a page asks
+    /// for one file at a time with `ReadMemoryFile`.
+    MemoryLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        status: Box<crate::UiMemoryStatus>,
+    },
+    /// Result of [`crate::ClientCommand::ReadMemoryFile`]. `content.error` is
+    /// set when the path was refused or the read failed, so an empty preview
+    /// can never be mistaken for an empty file.
+    MemoryFileLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        file: crate::UiMemoryFileContent,
+    },
+    /// Result of a memory management command (`RememberMemory`,
+    /// `RunMemoryDream`, `FlushMemory`, `ToggleMemory`, `ForgetMemory`). One
+    /// settled outcome per command; the UI shows `message` and, for an ok
+    /// result, refreshes with `QueryMemory`.
+    MemoryActionFinished {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        result: crate::UiMemoryActionResult,
+    },
     /// Result of [`crate::ClientCommand::ReloadConfig`], and the notification
     /// of an automatically applied generation. `outcome` is one of
     /// `applied` / `unchanged` / `failed`.

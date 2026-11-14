@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
+#[cfg(unix)]
+use leveler_client_protocol::RuntimeEvent;
 use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
 #[cfg(unix)]
 use leveler_execution::BackgroundTaskStatus;
@@ -303,6 +305,43 @@ async fn settled(f: &Fixture, min_turns: usize) {
             "the turn did not settle in time: {turns:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait for the turn's terminal event.
+///
+/// A stopped turn ROW is committed inside the engine, before the runtime
+/// releases the turn's admission. The terminal event is published inside
+/// `ActiveTurns::finish_with`, the same lock that removes the admission, so a
+/// command sent after this event is ordered after the session accepts a new
+/// turn. Sequencing a `/goal` on the row alone can land in the gap and be
+/// treated as a steer into the turn that is already exiting.
+#[cfg(unix)]
+async fn wait_for_turn_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::TurnCompleted))
+            | Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { .. }))
+            | Ok(Ok(RuntimeEvent::TurnAnswered))
+            | Ok(Ok(RuntimeEvent::TurnPaused { .. }))
+            | Ok(Ok(RuntimeEvent::TurnTruncated { .. }))
+            | Ok(Ok(RuntimeEvent::TurnIncomplete { .. }))
+            | Ok(Ok(RuntimeEvent::TurnBlocked { .. }))
+            | Ok(Ok(RuntimeEvent::TurnFailed { .. }))
+            | Ok(Ok(RuntimeEvent::TurnCancelled))
+            | Ok(Ok(RuntimeEvent::TaskCancelled)) => return,
+            // A yielded WINDOW is not a turn end: the logical turn keeps its
+            // admission for the next window.
+            Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
+            Ok(Err(RecvError::Closed)) => {
+                panic!("the event stream closed before the turn ended")
+            }
+            Err(_) => panic!("the turn never ended"),
+        }
     }
 }
 
@@ -1275,6 +1314,9 @@ async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
     // ONE client: `active` (which window is running) lives on the client, so a
     // snapshot must come from the same runtime that admitted the turn.
     let runtime = client(&f);
+    // Subscribed before the first turn: the terminal event is the runtime's
+    // own "this turn no longer holds the session" boundary.
+    let mut events = runtime.subscribe();
 
     // ── goal A: committed, paused at the user's own boundary ───────────────
     runtime
@@ -1286,10 +1328,15 @@ async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
         .await
         .unwrap();
     settled(&f, 1).await;
-    // The turn row turns terminal inside `run_turn`; the conclusion that
-    // writes this window's goal facts — including the pause — runs after it
-    // (the same ordering `wait_for_goals` documents). Wait for the durable
-    // fact this assertion is about, not only for the turn row.
+    // The turn row stops running inside the engine; the admission is released
+    // when the runtime publishes the terminal event. Wait for that boundary —
+    // not the row — before submitting `/goal B`, or the command can be taken
+    // as a steer into the turn that is already exiting.
+    wait_for_turn_terminal(&mut events).await;
+    // The conclusion that writes this window's goal facts — including the
+    // pause — runs after the turn row turns terminal (the same ordering
+    // `wait_for_goals` documents). Wait for the durable fact this assertion
+    // is about, not only for the turn row.
     wait_for_goals(&f, |goals| {
         goals.len() == 1 && goals[0].user_paused_at.is_some()
     })
@@ -1321,9 +1368,12 @@ async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
         .await
         .unwrap();
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = None;
     let mut live = None;
-    for _ in 0..200 {
+    while tokio::time::Instant::now() < deadline {
         let snapshot = runtime.snapshot(&f.session).await.unwrap();
+        last = snapshot.execution_task.clone();
         if let Some(task) = snapshot.execution_task
             && task.running
             && task.goal_id != goal_a.as_str()
@@ -1333,7 +1383,9 @@ async fn a_running_second_goal_is_the_projected_goal_while_it_executes() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let live = live.expect("goal B must be projected while it executes");
+    let live = live.unwrap_or_else(|| {
+        panic!("goal B must be projected while it executes; last execution_task: {last:?}")
+    });
     let goals_now = goals(&f).await;
     let goal_b = goals_now
         .iter()

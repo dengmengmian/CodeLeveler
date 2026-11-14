@@ -71,7 +71,7 @@ pub use terminal_repo::TerminalRepository;
 pub use terminal_store::{
     GoalTerminalUpdate, MemoryTerminalStore, TaskTerminalCommit, TerminalStore,
 };
-pub use turn_repo::{TurnRecord, TurnRepository};
+pub use turn_repo::{MemoryCaptureDisposition, TurnRecord, TurnRepository};
 pub use turn_store::{MemoryTurnStore, TurnStore};
 
 /// Redact secrets in a durable JSON payload without touching its structure,

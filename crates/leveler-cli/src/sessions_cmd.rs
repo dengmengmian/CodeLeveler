@@ -83,6 +83,8 @@ fn summarize_usage_by_kind(requests: &[leveler_storage::ModelRequestRecord]) -> 
             ModelCallKind::SideQuestion => "side_question",
             ModelCallKind::ProviderProbe => "provider_probe",
             ModelCallKind::Advisory => "advisory",
+            ModelCallKind::MemoryCapture => "memory_capture",
+            ModelCallKind::MemoryDream => "memory_dream",
         };
         let lane = lanes.entry(kind).or_insert_with(|| KindUsage {
             kind: kind.to_string(),

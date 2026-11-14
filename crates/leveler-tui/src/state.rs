@@ -390,6 +390,9 @@ pub struct AppState {
     /// page owns no definitions, runs or grants; it only holds their last
     /// authoritative projection and the query ids it is waiting on.
     pub schedule: crate::schedules::ScheduleState,
+    /// `/memory`: a view over the runtime's memory API. Presentation only; the
+    /// store, capture queue and tombstones stay with the runtime.
+    pub memory: crate::memory::MemoryState,
 
     /// Active plan from the current run, if any. Terminal plans move into the
     /// transcript and never remain in this slot.
@@ -789,6 +792,7 @@ impl AppState {
             context: crate::context::ContextView::default(),
             clean: crate::clean::CleanState::default(),
             schedule: crate::schedules::ScheduleState::default(),
+            memory: crate::memory::MemoryState::default(),
             plan: None,
             project_rule_sources: Vec::new(),
             turn_diff_files: None,
