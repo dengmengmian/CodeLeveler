@@ -1,0 +1,19 @@
+captured_at=2026-11-14T14:57:09.8039549+08:00
+os=Microsoft Windows 10 教育版 10.0.19045 build=19045 arch=64 位
+computer=LENOVO 20UFA008CD
+windows_terminal=1.25.3131.0
+conhost_file_version=10.0.19041.4522 (WinBuild.160101.0800)
+powershell=5.1.19041.5486
+cmd= Microsoft Windows [Version 10.0.19045.5487]
+rustc=rustc 1.90.0 (1159e78c4 2025-09-14)
+cargo=cargo 1.90.0 (840b83a10 2025-07-30)
+mingw_gcc=gcc.exe (x86_64-posix-seh-rev1, Built by MinGW-Builds project) 16.2.0
+console_cp=65001 oem_cp=936 acp=936 chcp=Active code page: 65001
+screen=1920x1080 physical dpi=144 (DPI-aware probe)
+admin=False (non-elevated token) integrity=Mandatory Label\Medium Mandatory Level Label S-1-16-8192 
+branch=windows/tui-quality
+commit=b1f002d75863e0e9ce6efc6f12578346fffe9833
+provider_model=deepseek/deepseek-v4.1-flash-1017 (OpenAI-compatible relay; key not recorded)
+tested_sizes=80x24,100x30,120x30,130x30,133x33(maximized)
+not_verified=Windows 11; non-admin; macOS/Linux real terminals; other fonts/terminal hosts
+admin_group=BUILTIN\Administrators Alias S-1-5-32-544 Group used for deny only 

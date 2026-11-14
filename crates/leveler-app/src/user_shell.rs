@@ -82,7 +82,32 @@ pub(crate) fn complete_output_directory(directory: &Path) -> Option<String> {
             return None;
         }
     }
+    // The terminal reads the full output lazily from the directory. Keep the
+    // raw sidecars authoritative, but publish a decoded copy so a GBK console
+    // capture is not rendered as replacement glyphs by the TUI.
+    write_decoded_capture(directory);
     Some(directory.display().to_string())
+}
+
+/// Publish a UTF-8 presentation copy of `combined.log` next to the raw bytes.
+///
+/// The raw capture stays the authority for exact recovery; this copy exists
+/// only because the TUI reads full output without access to the process
+/// code-page boundary. A failure here is not fatal: the TUI falls back to the
+/// raw sidecar with its original lossy behavior.
+fn write_decoded_capture(directory: &Path) {
+    let decoded = directory.join("combined.utf8.log");
+    if decoded.is_file() {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(directory.join("combined.log")) else {
+        return;
+    };
+    let text = leveler_execution::decode_output(&bytes);
+    let tmp = directory.join(format!("combined.utf8.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, text.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &decoded);
+    }
 }
 
 /// The last `cap` bytes of a COMPLETE combined capture.
@@ -108,7 +133,7 @@ pub(crate) fn complete_capture_tail(directory: &Path, cap: usize) -> Option<(Str
     }
     // The cut can land inside a multi-byte character. Drop the partial one
     // instead of rendering a replacement glyph at the head of the record.
-    let text = String::from_utf8_lossy(&bytes);
+    let text = leveler_execution::decode_output(&bytes);
     let text = text.strip_prefix('\u{FFFD}').unwrap_or(&text).to_string();
     Some((text, start > 0))
 }

@@ -1,0 +1,23 @@
+{
+    "name":  "final-dogfood",
+    "host":  "wt-cmd",
+    "title":  "CL-final-dogfood - C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\scripts\\run-tui.cmd",
+    "launched_at":  "2026-11-14T19:39:06.4616582+08:00",
+    "window_pid":  17300,
+    "hwnd":  6622696,
+    "leveler_pid":  16948,
+    "startup_ms":  1397,
+    "console_size":  "120x30",
+    "meta":  "repo=C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\dogfood\\×îÖÕ ÕËµ¥\r\nbin=C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\candidate\\closure\\leveler.exe\r\npermission=full-access\r\nwt_session=095f146d-fcf6-4624-9082-02a416efa5f4\r\nterm=\r\nterm_program=\r\ncols=120\r\nrows=30",
+    "capture":  {
+                    "pid":  17300,
+                    "title":  "¡ð CodeLeveler",
+                    "hwnd":  6622696,
+                    "left":  0,
+                    "top":  0,
+                    "width":  1752,
+                    "height":  936,
+                    "bytes":  135372,
+                    "path":  "C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\CodeLeveler\\docs\\windows-tui-acceptance\\evidence\\closure\\dogfood-final\\screenshots\\00-launch.png"
+                }
+}

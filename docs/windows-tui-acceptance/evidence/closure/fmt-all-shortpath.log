@@ -1,0 +1,4 @@
+﻿command=cargo fmt --all -- --check
+workspace=C:\Users\CSDN.CB21111707\clsrc (30-char source copy of git archive HEAD)
+result=exit 0; no rustfmt output
+note=the long real workspace path fails with os error 206 (command line too long); a junction does not help because cargo canonicalizes it

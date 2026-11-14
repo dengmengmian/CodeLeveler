@@ -1,0 +1,52 @@
+    Checking leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+    Checking tokio-util v0.7.18
+    Checking process-wrap v8.2.1
+    Checking hyper v1.10.1
+    Checking tower v0.5.3
+    Checking tokio-rustls v0.26.4
+    Checking async-compression v0.4.42
+    Checking tokio-stream v0.1.18
+    Checking tokio-tungstenite v0.26.2
+    Checking leveler-win-local-ipc v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-win-local-ipc)
+    Checking tokio-tungstenite v0.29.0
+    Checking leveler-eval v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-eval)
+    Checking sqlx-core v0.8.6
+    Checking tower-http v0.6.11
+    Checking hyper-util v0.1.20
+    Checking leveler-model v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-model)
+    Checking leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+    Checking leveler-project v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-project)
+    Checking leveler-foreign-session v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-foreign-session)
+    Checking leveler-skills v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-skills)
+    Checking leveler-test-support v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-test-support)
+    Checking leveler-lsp v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-lsp)
+    Checking hyper-rustls v0.27.9
+    Checking axum v0.8.9
+    Checking reqwest v0.12.28
+    Checking reqwest v0.13.5
+    Checking sqlx-sqlite v0.8.6
+    Checking rmcp v3.9.0
+    Checking leveler-browser v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-browser)
+    Checking jsonschema v0.26.2
+    Checking leveler-update v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-update)
+    Checking sqlx v0.8.6
+    Checking leveler-storage v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-storage)
+    Checking leveler-context v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-context)
+    Checking leveler-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-protocol)
+    Checking leveler-client-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-client-protocol)
+    Checking leveler-agent-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent-core)
+    Checking leveler-provider v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-provider)
+    Checking leveler-native v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-native)
+    Checking leveler-vcs v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-vcs)
+    Checking leveler-engine v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-engine)
+    Checking leveler-tools v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tools)
+    Checking leveler-local-transport v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-local-transport)
+    Checking leveler-tui v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tui)
+    Checking leveler-schedule v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-schedule)
+    Checking leveler-agent v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent)
+    Checking leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+    Checking leveler-runtime-host v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-runtime-host)
+    Checking leveler-web v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-web)
+    Checking leveler-cli v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 47s
+EXIT_CODE=0

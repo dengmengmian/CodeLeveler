@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- Windows child-process output is decoded incrementally: a multi-byte character split across pipe reads stays one character, background logs use the same decoder, and a truncated GBK result no longer turns its retained head into replacement glyphs. The TUI full-output pager prefers the UTF-8 presentation copy beside the raw capture; the raw stdout/stderr capture files remain byte-exact.
+- A user shell that fails before it spawns (for example an Assisted command on a Windows host without `leveler-confine.exe`) shows the host's refusal in the live view, not only in the reconnected record.
+
 ## [1.0.27] - 2026-11-14
 
 - Cross-session memory is available as an opt-in capability. `[memory].rollout` is `off` (the default), `record_only`, `shadow` or `active`; only `active` exposes memory to the model. Everything lives under `<LevelerHome>/memory/`; a workspace is identified by its git remote, and a temporary working directory has no workspace scope.

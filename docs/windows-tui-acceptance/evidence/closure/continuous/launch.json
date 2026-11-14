@@ -1,0 +1,23 @@
+{
+    "name":  "continuous",
+    "host":  "wt-cmd",
+    "title":  "CL-continuous - C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\scripts\\run-tui.cmd",
+    "launched_at":  "2026-11-14T19:45:22.9210122+08:00",
+    "window_pid":  17300,
+    "hwnd":  2493486,
+    "leveler_pid":  16340,
+    "startup_ms":  1397,
+    "console_size":  "120x30",
+    "meta":  "repo=C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\continuous\r\nbin=C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\candidate\\closure\\leveler.exe\r\npermission=full-access\r\nwt_session=7ef85f5b-8004-41cb-b1d8-c9745319e11f\r\nterm=\r\nterm_program=\r\ncols=120\r\nrows=30",
+    "capture":  {
+                    "pid":  17300,
+                    "title":  "¡ð CodeLeveler",
+                    "hwnd":  2493486,
+                    "left":  0,
+                    "top":  0,
+                    "width":  1752,
+                    "height":  936,
+                    "bytes":  135699,
+                    "path":  "C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\CodeLeveler\\docs\\windows-tui-acceptance\\evidence\\closure\\continuous\\c00-launch.png"
+                }
+}

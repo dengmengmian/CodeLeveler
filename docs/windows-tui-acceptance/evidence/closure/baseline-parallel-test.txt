@@ -1,0 +1,7 @@
+﻿captured_at=2026-11-14T18:13:02.6934290+08:00
+test=leveler-app --lib parallel::tests::candidate_failure
+baseline_check=git stash of closure changes; same test at b1f002d
+baseline_result=FAILED: candidate_failure_child panics: storage error: database error: (code: 14) unable to open database file
+current_result=FAILED identically
+changed_parallel_rs=
+conclusion=pre-existing Windows test failure, not introduced by the closure changes

@@ -1,0 +1,8 @@
+﻿captured_at=2026-11-14T18:36:04.3531641+08:00
+test=leveler-agent multi_agent_test::an_unclaimed_child_cannot_mutate_through_a_shell_command
+baseline_check=git stash of closure changes; same test at b1f002d
+baseline_result=FAILED: victim directory was removed
+current_result=FAILED identically
+changed_agent_multi_agent_test=
+changed_agent_src=
+conclusion=pre-existing Windows failure; not introduced by the closure changes; product permission finding remains open

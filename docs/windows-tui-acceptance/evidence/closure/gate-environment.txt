@@ -1,0 +1,42 @@
+# Gate environment (this machine, 2026-11-14)
+
+The Claude Code agent shell is sandboxed: writes outside the primary workspace
+and to `%USERPROFILE%` are denied. That is not a Windows product restriction.
+The complete gates therefore ran with these explicit, reversible overrides:
+
+- `TMP` / `TEMP` = `...\deepseek-harness\default-workspace\tmp`
+- `LEVELER_HOME` = `...\deepseek-harness\default-workspace\tmp\leveler-home`
+- `PATH` = `...\default-workspace\tools\git\usr\bin` prepended, because the
+  repository's Windows process tests spawn POSIX fixtures (`echo`, `sh`,
+  `sleep`, `true`) directly; Git for Windows ships them there.
+- `RUST_TEST_THREADS=2` for the workspace run, the same setting the CI Windows
+  job uses.
+- `CARGO_TARGET_DIR` = `...\deepseek-harness\default-workspace\.target`
+- `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase) unset. The shared build shell
+  exports a local relay proxy; a provider test that expects a refused loopback
+  connection was receiving the proxy's 502 instead. CI has no such proxy.
+- `NoDefaultCurrentDirectoryInExePath` unset. The agent shell exports `1`;
+  `cmd /c run-tests.cmd` then refuses to search the current directory, which
+  broke the agent's goal tests. A normal Windows user session does not set it.
+- `HOME` = `...\tmp\test-home`, so TUI completion tests that create a probe
+  under `~` write inside the sandbox-writable workspace.
+- The local MinGit installation lacks `sleep.exe` and `yes.exe`. Two tiny
+  non-product fixtures under `windows-audit\test-tools` were compiled and
+  copied into `tools\git\usr\bin`; they implement only the documented sleep /
+  repeat-operand contract. They are test-host tools, not repository code.
+- `cargo fmt --all` from the real long workspace path exceeds the Windows
+  32,767-character command line (290 file arguments, 42,065 characters). The
+  same command passes from a 30-character `git archive HEAD` source copy.
+  A directory junction does not help: cargo resolves it to the long real path.
+  No registry, system policy or user configuration was changed; the copy was
+  removed after the check.
+
+The first workspace run used the agent shell defaults (all cores, no POSIX
+fixtures on PATH, default `~/.leveler` home). Its failures are recorded in
+`workspace-tests-all-features.log` and were classified as environment, not
+product: direct `echo` was not found, and lock files under
+`C:\Users\<user>\.leveler\run\locks` were denied by the agent sandbox. The
+targeted reruns in `targeted-env-fix.log` prove both causes.
+
+No registry, system policy, user account, code page, font or terminal setting
+was changed.

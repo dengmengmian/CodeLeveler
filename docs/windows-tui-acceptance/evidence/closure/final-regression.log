@@ -1,0 +1,228 @@
+﻿
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling once_cell v1.21.4
+   Compiling memchr v2.8.2
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling windows-sys v0.52.0
+   Compiling serde_json v1.0.150
+   Compiling syn v2.0.118
+   Compiling tempfile v3.27.0
+   Compiling serde_derive v1.0.228
+   Compiling serde v1.0.228
+   Compiling chrono v0.4.45
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.69s
+     Running unittests src\lib.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\leveler_core-80b55ed3ac1ceb54.exe)
+
+running 5 tests
+test path::tests::device_and_incomplete_paths_keep_the_prefix ... ok
+test path::tests::display_path_keeps_non_verbatim_input_identical ... ok
+test path::tests::ordinary_paths_are_untouched ... ok
+test path::tests::verbatim_drive_paths_lose_only_the_prefix ... ok
+test path::tests::verbatim_unc_paths_become_plain_unc_paths ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 93 filtered out; finished in 0.00s
+
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling leveler-test-support v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-test-support)
+   Compiling leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.00s
+     Running unittests src\lib.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\leveler_execution-a9df51302842cb11.exe)
+
+running 6 tests
+test encoding::tests::valid_utf8_is_unchanged ... ok
+test encoding::tests::a_utf8_character_split_across_reads_reassembles ... ok
+test encoding::tests::a_gbk_lead_byte_is_held_until_its_trail_arrives ... ok
+test encoding::tests::an_incomplete_gbk_character_is_resolved_at_finish ... ok
+test encoding::tests::a_malformed_gbk_byte_is_not_deferred_as_a_partial_character ... ok
+test encoding::tests::gbk_bytes_decode_to_chinese ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 307 filtered out; finished in 0.00s
+
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling ring v0.17.14
+   Compiling leveler-model v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-model)
+   Compiling leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+   Compiling leveler-project v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-project)
+   Compiling leveler-storage v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-storage)
+   Compiling leveler-skills v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-skills)
+   Compiling leveler-foreign-session v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-foreign-session)
+   Compiling leveler-test-support v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-test-support)
+   Compiling leveler-lsp v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-lsp)
+   Compiling rustls v0.23.46
+   Compiling leveler-context v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-context)
+   Compiling leveler-client-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-client-protocol)
+   Compiling leveler-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-protocol)
+   Compiling leveler-agent-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent-core)
+   Compiling leveler-native v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-native)
+   Compiling leveler-vcs v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-vcs)
+   Compiling leveler-engine v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-engine)
+   Compiling rustls-webpki v0.103.16
+   Compiling leveler-local-transport v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-local-transport)
+   Compiling leveler-schedule v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-schedule)
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling reqwest v0.13.5
+   Compiling rmcp v3.9.0
+   Compiling jsonschema v0.26.2
+   Compiling leveler-browser v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-browser)
+   Compiling leveler-provider v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-provider)
+   Compiling leveler-tools v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tools)
+   Compiling leveler-agent v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent)
+   Compiling leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 54.95s
+     Running tests\execution_ownership.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\execution_ownership-8985f1bb3421274b.exe)
+
+running 13 tests
+test an_assisted_user_shell_matches_the_write_backend_capability ... ok
+test recovery_leaves_a_dead_boots_session_to_whoever_runs_next ... ok
+test acknowledging_a_crash_window_leaves_the_session_to_whoever_runs_next ... ok
+test an_execution_awaiting_approval_keeps_the_session ... ok
+test a_finished_user_shell_releases_the_session ... ok
+test a_running_user_shell_holds_the_session_until_it_ends ... ok
+test a_failed_execution_releases_the_session ... ok
+test an_interrupted_execution_releases_the_session ... ok
+test a_full_access_user_shell_moves_to_the_background_and_stops ... ok
+test a_new_turn_preempts_an_in_flight_prompt_prediction ... ok
+test switching_to_full_access_makes_a_refused_shell_runnable ... ok
+test ownership_follows_the_running_execution_between_windows ... ok
+test a_crash_gated_turn_does_not_re_promote_journaled_input ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.15s
+
+   Compiling leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.65s
+     Running tests\user_shell.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\user_shell-0ded28572101947a.exe)
+
+running 15 tests
+test a_terminal_fact_wins_over_a_late_backgrounded_fact_in_cold_restore ... ok
+test hard_gate_user_shell_makes_zero_model_requests ... ok
+test cancel_stops_exactly_the_named_execution ... ok
+test busy_agent_turn_rejects_a_user_shell_without_side_effects ... ok
+test a_delivered_run_user_shell_rejects_a_busy_session_with_an_error ... ok
+test a_gbk_capture_is_decoded_for_display_and_byte_exact_on_disk ... ok
+test a_background_user_shell_log_decodes_gbk ... ok
+test a_second_shell_can_run_after_the_first_moves_to_background ... ok
+test shell_runs_in_the_repository_root ... ok
+test a_second_runtime_does_not_claim_another_runtimes_background_process ... ok
+test a_cold_runtime_restores_terminal_shell_history_with_output ... ok
+test a_finished_shell_cannot_be_backgrounded_and_no_task_is_created ... ok
+test hard_gate_shell_output_never_enters_model_context ... ok
+test the_session_is_free_the_moment_the_shell_reports_exit ... ok
+test snapshot_restores_active_shell_with_elapsed ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.78s
+
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling ring v0.17.14
+   Compiling leveler-model v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-model)
+   Compiling leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+   Compiling leveler-project v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-project)
+   Compiling leveler-skills v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-skills)
+   Compiling leveler-foreign-session v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-foreign-session)
+   Compiling leveler-lsp v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-lsp)
+   Compiling leveler-context v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-context)
+   Compiling leveler-client-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-client-protocol)
+   Compiling rustls-webpki v0.103.16
+   Compiling leveler-native v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-native)
+   Compiling leveler-vcs v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-vcs)
+   Compiling rustls v0.23.46
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling reqwest v0.13.5
+   Compiling rmcp v3.9.0
+   Compiling jsonschema v0.26.2
+   Compiling leveler-browser v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-browser)
+   Compiling leveler-update v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-update)
+   Compiling leveler-tools v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tools)
+   Compiling leveler-tui v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 50.28s
+     Running unittests src\lib.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\leveler_tui-cb6c2983b07797ef.exe)
+
+running 18 tests
+test output_view::tests::empty_source_has_no_rows ... ok
+test output_view::tests::a_trailing_newline_does_not_add_an_empty_row ... ok
+test output_view::tests::index_maps_lines_and_rows ... ok
+test output_view::tests::carriage_return_overwrites_before_indexing ... ok
+test output_view::tests::selection_keeps_source_blank_lines ... ok
+test output_view::tests::selection_preserves_tabs_inside_a_soft_wrap ... ok
+test output_view::tests::source_copy_rejoins_soft_wraps_without_newlines ... ok
+test output_view::tests::emoji_cjk_and_combining_marks_survive_display_and_copy ... ok
+test output_view::tests::tab_expands_for_display_and_survives_copy ... ok
+test output_view::tests::wrapping_counts_wide_and_narrow_glyphs ... ok
+test output_view::tests::row_counts_match_the_rows_actually_painted ... ok
+test output_view::tests::invalid_utf8_is_replaced_not_split ... ok
+test output_view::tests::the_view_follows_the_end_until_the_reader_scrolls_back ... ok
+test output_view::tests::a_reflow_keeps_the_reader_on_the_same_logical_line ... ok
+test output_view::tests::capture_prefers_the_decoded_presentation_copy ... ok
+test output_view::tests::capture_rejects_a_foreign_root ... ok
+test output_view::tests::visible_never_returns_more_than_the_viewport_asked_for ... ok
+test output_view::tests::indexing_never_builds_rows_for_the_whole_source ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1636 filtered out; finished in 0.43s
+
+   Compiling leveler-tui v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.38s
+     Running tests\snapshots.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\snapshots-825db524a9db6a0f.exe)
+
+running 51 tests
+test a_short_conversation_starts_at_the_viewport_top ... ok
+test a_running_turn_shows_how_to_interrupt_it ... ok
+test completed_turn_omits_recap_and_does_not_guess_input_suggestion ... ok
+test compact_goal_recap_renders_in_history ... ok
+test a_silent_tool_group_leaves_no_hole ... ok
+test an_untouched_composer_points_at_the_openers ... ok
+test context_chip_appears_on_footer_after_usage_update ... ok
+test command_result_renders_as_important_activity_not_file_list ... ok
+test chrome_follows_the_locale_while_the_model_id_does_not ... ok
+test a_plan_transition_repaints_on_the_same_frame ... ok
+test conversation_messages_use_prompt_and_bullet_without_role_labels ... ok
+test diff_screen_hint_follows_the_locale ... ok
+test empty_session_shows_splash_with_logo ... ok
+test diff_screen_chrome_follows_the_locale ... ok
+test expanded_goal_recap_presents_structured_truth ... ok
+test diagnostic_grid_headers_stay_english_in_both_locales ... ok
+test footer_chip_names_the_axis_the_runtime_recorded ... ok
+test footer_shows_cache_hit_rate_when_provider_reports_it ... ok
+test a_narrow_terminal_keeps_the_answer_and_the_composer ... ok
+test goal_recap_and_plan_dock_do_not_mix ... ok
+test list_files_scan_stays_out_of_conversation ... ok
+test renders_completion_block ... ok
+test recap_does_not_render_raw_markdown_markers ... ok
+test ok_tool_output_folds_then_expands_with_ctrl_o ... ok
+test key_notation_is_identical_in_both_locales ... ok
+test ignored_in_repo_config_is_visible_on_screen ... ok
+test renders_approval_overlay_with_deny_visible ... ok
+test protocol_words_quoted_inside_prose_survive_translation ... ok
+test running_command_renders_as_progress_activity ... ok
+test help_screen_key_descriptions_follow_the_locale ... ok
+test sessions_screen_follows_the_locale ... ok
+test second_render_reflects_new_content_not_a_stale_cache ... ok
+test showing_and_hiding_the_hints_keeps_the_conversation_the_same_height ... ok
+test no_rendered_line_exceeds_the_terminal_width ... ok
+test shows_typed_and_streamed_text ... ok
+test renders_failed_tool_inline_and_tools_screen ... ok
+test the_approval_overlay_sits_where_the_composer_was ... ok
+test the_hints_get_out_of_the_way_once_you_type ... ok
+test the_goal_mode_chip_clears_when_the_runtime_returns_to_chat ... ok
+test token_usage_does_not_spam_input_or_footer ... ok
+test the_splash_sits_in_the_middle_of_an_empty_session ... ok
+test tools_screen_filter_label_follows_the_locale ... ok
+test tiny_terminal_does_not_panic ... ok
+test trace_chrome_follows_the_locale ... ok
+test trace_empty_states_follow_the_locale ... ok
+test renders_welcome_header_and_composer_at_standard_sizes ... ok
+test trace_tab_and_filter_labels_follow_the_locale ... ok
+test trace_raw_protocol_values_are_identical_in_both_locales ... ok
+test splash_render_review_sizes ... ok
+test renders_plan_chrome_and_diff_screen ... ok
+test completed_markdown_message_is_rendered_not_raw ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+EXIT=0
+FMT_EXIT=0

@@ -54,7 +54,7 @@ pub fn listing_note(registry: &SkillRegistry, t: &crate::i18n::UiText) -> String
         for problem in registry.problems() {
             lines.push(format!(
                 "  {}: {}",
-                problem.location.display(),
+                leveler_core::path::display_path(&problem.location),
                 problem.error
             ));
         }
@@ -81,7 +81,11 @@ pub fn detail_note(registry: &SkillRegistry, name: &str, t: &crate::i18n::UiText
         lines.push(format!("  {description}"));
     }
     if let Some(location) = &entry.location {
-        lines.push(format!("  {}: {}", t.agents_location, location.display()));
+        lines.push(format!(
+            "  {}: {}",
+            t.agents_location,
+            leveler_core::path::display_path(location)
+        ));
     } else {
         lines.push(format!("  {}: (built-in)", t.agents_location));
     }

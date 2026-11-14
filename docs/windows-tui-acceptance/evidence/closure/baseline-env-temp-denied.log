@@ -1,0 +1,50 @@
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling leveler-model v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-model)
+   Compiling leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+   Compiling leveler-project v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-project)
+   Compiling leveler-skills v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-skills)
+   Compiling leveler-storage v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-storage)
+   Compiling leveler-foreign-session v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-foreign-session)
+   Compiling leveler-browser v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-browser)
+   Compiling leveler-test-support v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-test-support)
+   Compiling leveler-lsp v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-lsp)
+   Compiling leveler-context v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-context)
+   Compiling leveler-client-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-client-protocol)
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustctrixap"
+
+error: could not compile `leveler-core` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcI6j0S3"
+
+error: could not compile `leveler-test-support` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustc6454On"
+
+error: could not compile `leveler-skills` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcMYsl4y"
+
+error: could not compile `leveler-foreign-session` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcfbTDMo"
+
+error: could not compile `leveler-project` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcY4xB1S"
+
+error: could not compile `leveler-lsp` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustc5w7KWJ"
+
+error: could not compile `leveler-browser` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustc5J1c7E"
+
+error: could not compile `leveler-model` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustccYGPCI"
+
+error: could not compile `leveler-context` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcdIAWYN"
+
+error: could not compile `leveler-storage` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcvXI9Ls"
+
+error: could not compile `leveler-execution` (lib) due to 1 previous error
+error: couldn't create a temp dir: 拒绝访问。 (os error 5) at path "C:\\Users\\CSDN~1.CB2\\AppData\\Local\\Temp\\rustcRHH22K"
+
+error: could not compile `leveler-client-protocol` (lib) due to 1 previous error
+EXIT_CODE=101

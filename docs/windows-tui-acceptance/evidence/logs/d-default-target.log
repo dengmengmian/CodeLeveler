@@ -1,0 +1,209 @@
+﻿cargo :    Compiling greeter v0.1.0 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audi
+t\dogfood\中文 项目)
+At line:1 char:754
++ ... $repo; Write-Output '--- default target ---'; cargo test 2>&1 | Tee-O ...
++                                                   ~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling gr...\dogfood\中文 项目):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error: linking with `x86_64-w64-mingw32-gcc` failed: exit code: 1
+  |
+  = note: "x86_64-w64-mingw32-gcc" "-fno-use-linker-plugin" "-Wl,--dynamicbase" "-Wl,--disable-auto-image-base" "-m64" 
+"-Wl,--high-entropy-va" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\rsbegin.o" "C:\\Users\\CSDN.CB21111707\\D
+ocuments\\deepseek-harness\\default-workspace\\tmp\\rustcNSGjCi\\symbols.o" "<13 object files omitted>" "-Wl,-Bstatic" 
+"<sysroot>\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib/{libtest-*,libgetopts-*,libunicode_width-*,librustc_std_workspace_
+std-*}.rlib" "C:\\Users\\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\dogfood\\中文 项目
+\\target\\debug\\deps/libgreeter-a99683b4ef664140.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib/{libstd-*,
+libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libwindows_targets-*,librustc_demangle-*,libstd_det
+ect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,libcfg_if-*,liblibc-*,libr
+ustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-Wl,-Bdynamic" "-lkernel32" "-lkernel32" 
+"-lkernel32" "-lkernel32" "-lntdll" "-luserenv" "-lws2_32" "-ldbghelp" "-lgcc_eh" "-l:libpthread.a" "-lmsvcrt" "-lmingw
+ex" "-lmingw32" "-lgcc" "-lmsvcrt" "-lmingwex" "-luser32" "-lkernel32" "-Wl,--nxcompat" "-o" "C:\\Users\\CSDN.CB2111170
+7\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\dogfood\\中文 项目\\target\\debug\\deps\\formal-bf3ca5e53
+1f81317.exe" "-Wl,--gc-sections" "-no-pie" "-nodefaultlibs" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\rsend
+.o"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.04jmnra8wwesy70qv3zu8j26c.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.2bj5k431t989ps3nanvocxl7d.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.2cmmyf5srbe12gt7khkzbvwpd.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.57fseovv75sj2398juyrtyoa0.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.5j9wj08tnu27ehum1yqzmavmo.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.9r3uc269xj9wpbbpnzo1s1ig7.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.c3t1arxvl6wbskgcejruu8t2k.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.dikn4jow2xieqgcuqe6pu7d49.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.eazrjvpfjuz7ibdt1zs0uod54.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.een8vpah368rk7lmfwitlg616.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.eqi5c5tcrhpbhlqm8wsdmgvpx.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.ezetfukvyjzqk8tert7tnfcsq.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\formal-bf3ca5e531f81317.1oqcn6nyfr7zfe7b3p17c21kc.0
+jxdfmn.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\libgreeter-a99683b4ef664140.rlib: No such file or d
+irectory␍
+          collect2.exe: error: ld returned 1 exit status
+          
+
+error: could not compile `greeter` (test "formal") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: linking with `x86_64-w64-mingw32-gcc` failed: exit code: 1
+  |
+  = note: "x86_64-w64-mingw32-gcc" "-fno-use-linker-plugin" "-Wl,--dynamicbase" "-Wl,--disable-auto-image-base" "-m64" 
+"-Wl,--high-entropy-va" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\rsbegin.o" "C:\\Users\\CSDN.CB21111707\\D
+ocuments\\deepseek-harness\\default-workspace\\tmp\\rustc9WixkW\\symbols.o" "<26 object files omitted>" "-Wl,-Bstatic" 
+"<sysroot>\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib/{libtest-*,libgetopts-*,libunicode_width-*,librustc_std_workspace_
+std-*,libstd-*,libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libwindows_targets-*,librustc_demang
+le-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,libcfg_if-*
+,liblibc-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-Wl,-Bdynamic" "-lkernel32
+" "-lkernel32" "-lkernel32" "-lkernel32" "-lntdll" "-luserenv" "-lws2_32" "-ldbghelp" "-lgcc_eh" "-l:libpthread.a" "-lm
+svcrt" "-lmingwex" "-lmingw32" "-lgcc" "-lmsvcrt" "-lmingwex" "-luser32" "-lkernel32" "-Wl,--nxcompat" "-o" "C:\\Users\
+\CSDN.CB21111707\\Documents\\deepseek-harness\\default-workspace\\windows-audit\\dogfood\\中文 项目\\target\\debug\\deps\\g
+reeter-3dc708d8263b1642.exe" "-Wl,--gc-sections" "-no-pie" "-nodefaultlibs" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows
+-gnu\\lib\\rsend.o"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.00uip6a4s2x9i1r3z770o08y2.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.1m2m94u5d5lka2rwj94dpfbjf.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.1yddo2fg06orl8byeb825a67x.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.2ilgahg2l9tkgqb0fk3eem4d2.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.2zkwdaibnuiv5pa0pe17lkq5e.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.3gyj0cxqrr5fxhkbh0dpe1cbx.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.3lip698k99izl1egxog91h4db.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.40gfwdzbksjy1vwze80kycnqr.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.5etpyxig5wamzf34yla9zisco.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.6ajd01f56m0ztzgvhkpkjjq8e.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.7mh0r671ftlk0d4qk2pzqtjz0.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.8g8oinmvw3g3p89apvuov4os1.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.90037vw9d0en7xlmpy438y5jh.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.a9u2qmi31bi3n4y50xxd2f2yn.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.acnviun1cnfqmjyywtojcmihp.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.any0ycmuw1ionytx27k9bj77x.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.bs6n1uzeg4ci9zsv0s2vqc797.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.c212l5ek4tav3wg7sebabypet.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.c4tuuhk8fj4g3q380mh0jtnic.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.cnaiix5u8i3rlpycykt389ip7.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.cpthwhb74m2t3qnn5dn1jrphy.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.e5gwt2k2dvsqnowchnpzjwu6o.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.eenp4hj9ro38gm308qddzmfmt.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.egezt124qudlvqw1cfxynct1g.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.f3e1ia3uo2nxtrwvo3ad8udrk.
+0m8ohel.rcgu.o: No such file or directory␍
+          C:/Users/CSDN.CB21111707/Documents/deepseek-harness/default-workspace/tools/mingw64/bin/../lib/gcc/x86_64-w64
+-mingw32/16.2.0/../../../../x86_64-w64-mingw32/bin/ld.exe: cannot find C:\Users\CSDN.CB21111707\Documents\deepseek-harn
+ess\default-workspace\windows-audit\dogfood\中文 项目\target\debug\deps\greeter-3dc708d8263b1642.52wgvkg7f9wqkqivj094ivbo3.
+0m8ohel.rcgu.o: No such file or directory␍
+          collect2.exe: error: ld returned 1 exit status
+          
+
+error: could not compile `greeter` (lib test) due to 1 previous error

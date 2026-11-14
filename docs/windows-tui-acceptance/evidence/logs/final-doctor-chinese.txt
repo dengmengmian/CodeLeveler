@@ -1,0 +1,35 @@
+leveler doctor
+  repo:    C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\dogfood\中文 项目
+  config:  C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\dogfood\中文 项目\configs
+
+  ✗ git                    not found on PATH (required)
+  ! rg                     not found on PATH (optional; falls back to built-in)
+  ! cargo                  not found on PATH (optional)
+  ! go                     not found on PATH (optional)
+  ! node                   not found on PATH (optional)
+  ✓ config: providers      1 loaded
+  ✓ config: models         1 loaded
+  ! thinking: deepseek/deepseek-v4.1-flash-1017 thinking = "high" has no effect: this model does not reason.                          Set this model's thinking to "auto" to use its native behavior.
+  ✓ config: global         ok (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\home\config.toml)
+  ✓ api key: deepseek      set via config (api_key)
+  ✓ sandbox                process_tree=Job read=PreflightOnly write=WriteRestricted network_deny=false backend=LowIntegrity
+  ✓ agents                 0 project, 0 user, 7 built-in
+
+Terminal observations
+TERM (environment reported): unknown
+COLORTERM (environment reported): unknown
+NO_COLOR (theme setting): true
+Observed terminal color capability: unknown; not probed
+stdout TTY: false
+SSH detected: false
+tmux detected: false
+Native clipboard: not probed
+OSC 52: unavailable (delivery is not verified)
+tmux buffer: not detected
+tmux clipboard forwarding / DCS passthrough: unknown
+OSC 52 payload limit: 65536 bytes
+Newline bindings: Ctrl+J / Alt+Enter / Ctrl+Enter
+Shift+Enter: not bound; terminal extended-key delivery is unknown
+No clipboard read/write or configuration changes were performed.
+
+! Some checks failed. See details above.

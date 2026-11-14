@@ -1,0 +1,25 @@
+﻿captured_at=2026-11-14T18:37:39.0663522+08:00
+probe=windows-audit\test-tools\probe.exe (launched by the agent shell)
+
+GROUP INFORMATION
+-----------------
+
+Group Name                          Type             SID          Attributes                                        
+=================================== ================ ============ ==================================================
+Everyone                            Well-known group S-1-1-0      Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\本地帐户和管理员组成员 Well-known group S-1-5-114    Group used for deny only                          
+BUILTIN\Administrators              Alias            S-1-5-32-544 Group used for deny only                          
+BUILTIN\Users                       Alias            S-1-5-32-545 Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\INTERACTIVE            Well-known group S-1-5-4      Mandatory group, Enabled by default, Enabled group
+CONSOLE LOGON                       Well-known group S-1-2-1      Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\Authenticated Users    Well-known group S-1-5-11     Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\This Organization      Well-known group S-1-5-15     Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\本地帐户               Well-known group S-1-5-113    Mandatory group, Enabled by default, Enabled group
+LOCAL                               Well-known group S-1-2-0      Mandatory group, Enabled by default, Enabled group
+NT AUTHORITY\NTLM Authentication    Well-known group S-1-5-64-10  Mandatory group, Enabled by default, Enabled group
+Mandatory Label\Low Mandatory Level Label            S-1-16-4096                                                    
+
+cmd: CSDN 
+cb21111707\csdn
+
+

@@ -1,0 +1,38 @@
+   Compiling leveler-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-core)
+   Compiling leveler-model v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-model)
+   Compiling leveler-execution v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-execution)
+   Compiling leveler-skills v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-skills)
+   Compiling leveler-project v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-project)
+   Compiling leveler-foreign-session v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-foreign-session)
+   Compiling leveler-storage v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-storage)
+   Compiling leveler-browser v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-browser)
+   Compiling leveler-update v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-update)
+   Compiling leveler-lsp v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-lsp)
+warning: unused variable: `exited`
+    --> crates\leveler-execution\src\execution_host.rs:2184:29
+     |
+2184 |                         let exited = matches!(&event, crate::BackgroundTaskEvent::Exited { .. });
+     |                             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_exited`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+   Compiling leveler-context v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-context)
+   Compiling leveler-client-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-client-protocol)
+   Compiling leveler-protocol v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-protocol)
+   Compiling leveler-agent-core v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent-core)
+   Compiling leveler-provider v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-provider)
+   Compiling leveler-vcs v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-vcs)
+   Compiling leveler-native v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-native)
+   Compiling leveler-engine v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-engine)
+   Compiling leveler-tools v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tools)
+   Compiling leveler-local-transport v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-local-transport)
+   Compiling leveler-tui v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-tui)
+   Compiling leveler-schedule v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-schedule)
+   Compiling leveler-agent v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-agent)
+warning: `leveler-execution` (lib) generated 1 warning
+   Compiling leveler-app v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-app)
+   Compiling leveler-runtime-host v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-runtime-host)
+   Compiling leveler-web v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-web)
+   Compiling leveler-cli v1.0.26 (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\CodeLeveler\crates\leveler-cli)
+    Finished `release` profile [optimized] target(s) in 14m 32s
+EXIT_CODE=0

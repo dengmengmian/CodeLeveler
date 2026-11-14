@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running tests\user_shell.rs (C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\.target\debug\deps\user_shell-0ded28572101947a.exe)
+
+running 15 tests
+test hard_gate_user_shell_makes_zero_model_requests ... ok
+test a_terminal_fact_wins_over_a_late_backgrounded_fact_in_cold_restore ... ok
+test cancel_stops_exactly_the_named_execution ... ok
+test a_gbk_capture_is_decoded_for_display_and_byte_exact_on_disk ... ok
+test a_delivered_run_user_shell_rejects_a_busy_session_with_an_error ... ok
+test a_second_runtime_does_not_claim_another_runtimes_background_process ... ok
+test a_second_shell_can_run_after_the_first_moves_to_background ... ok
+test a_background_user_shell_log_decodes_gbk ... ok
+test busy_agent_turn_rejects_a_user_shell_without_side_effects ... ok
+test a_cold_runtime_restores_terminal_shell_history_with_output ... ok
+test shell_runs_in_the_repository_root ... ok
+test a_finished_shell_cannot_be_backgrounded_and_no_task_is_created ... ok
+test the_session_is_free_the_moment_the_shell_reports_exit ... ok
+test hard_gate_shell_output_never_enters_model_context ... ok
+test snapshot_restores_active_shell_with_elapsed ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.26s
+
+EXIT_CODE=0

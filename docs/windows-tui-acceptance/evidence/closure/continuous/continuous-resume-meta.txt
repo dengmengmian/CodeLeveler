@@ -1,0 +1,8 @@
+repo=C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\continuous
+bin=C:\Users\CSDN.CB21111707\Documents\deepseek-harness\default-workspace\windows-audit\candidate\closure\leveler.exe
+permission=full-access
+wt_session=e5935735-034f-4496-a226-ed6e68360b26
+term=
+term_program=
+cols=120
+rows=30

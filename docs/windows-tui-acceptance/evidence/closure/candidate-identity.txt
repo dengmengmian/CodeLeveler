@@ -1,0 +1,14 @@
+﻿captured_at=2026-11-14T19:56:39.4334605+08:00
+version=1.0.26 (5a4fc17480a6)
+leveler.exe size=65724416
+leveler.exe sha256=CA1283E915EB83C857EF739942F55469040CDB26B64E5DCCD0D6D6D2340800B9
+leveler-confine.exe size=322560
+leveler-confine.exe sha256=F7FBFFC81FCF2FD435332EFEDA864F9603E1B1682C1BEE2E78E33CDE7E61845F
+zip=leveler-1.0.26-windows-x64.zip
+zip size=28733642
+zip sha256=59ABAF4BA76F54D50C5561F280D3AE911CCAF88444C2972EFF70C90C430B048E
+build_commit=5a4fc17480a63e14b29fa785778fcde92ca3b940
+build_profile=release
+build_time_seconds=872
+dirty=false
+doctor_sandbox=process_tree=Job read=PreflightOnly write=WriteRestricted network_deny=false backend=LowIntegrity
