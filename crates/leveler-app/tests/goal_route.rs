@@ -314,6 +314,7 @@ async fn settled(f: &Fixture, min_turns: usize) {
 /// command sent after this event is ordered after the session accepts a new
 /// turn. Sequencing a `/goal` on the row alone can land in the gap and be
 /// treated as a steer into the turn that is already exiting.
+#[cfg(unix)]
 async fn wait_for_turn_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
     use tokio::sync::broadcast::error::RecvError;
 
