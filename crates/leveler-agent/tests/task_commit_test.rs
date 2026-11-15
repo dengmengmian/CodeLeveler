@@ -4489,7 +4489,7 @@ async fn registered_requirement_checks_need_a_current_run_after_registration() {
     let (name, script) = if cfg!(windows) {
         (
             "check.cmd",
-            "@echo off\r\nfindstr /x 0 actual-count.txt > nul\r\nexit /b %errorlevel%\r\n",
+            "@echo off\r\nset /p count=<actual-count.txt\r\nif \"%count%\"==\"0\" exit /b 0\r\nexit /b 1\r\n",
         )
     } else {
         (
@@ -6990,6 +6990,8 @@ async fn an_over_long_acceptance_entry_names_its_length_and_limit() {
 ///
 /// The barrier is deterministic: the background script signals that it really
 /// started, the edit waits for that signal, and the test waits for the edit.
+/// The barrier is a POSIX shell script, so the fixture runs on Unix hosts.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_background_test_that_ran_while_the_workspace_changed_cannot_complete_the_goal() {
     const REQUEST: &str = "运行 sh run-tests.sh 验证结果，并在改动完成后再次验证。";
@@ -7131,38 +7133,39 @@ async fn a_background_test_that_ran_while_the_workspace_changed_cannot_complete_
 /// records the window it covered, and adds no warning or extra gate.
 #[tokio::test]
 async fn a_normal_background_verification_completes_as_verified() {
-    const REQUEST: &str = "在后台运行 sh run-tests.sh 验证结果。";
+    let runner = test_runner_label();
+    let request = format!("在后台运行 {runner} 验证结果。");
+    let mut background = test_runner_call();
+    background
+        .as_object_mut()
+        .unwrap()
+        .insert("background".into(), serde_json::json!(true));
     let fx = fixture_with_mode(
         vec![
             Scripted::Tool(
                 "commit_task",
                 serde_json::json!({
-                    "objective": REQUEST,
-                    "acceptance": ["sh run-tests.sh 通过"],
+                    "objective": &request,
+                    "acceptance": [format!("{runner} 通过")],
                     "requirements": [{
                         "kind": "tests",
-                        "text": "sh run-tests.sh 通过",
-                        "target": "sh run-tests.sh",
-                        "source_quote": "在后台运行 sh run-tests.sh"
+                        "text": format!("{runner} 通过"),
+                        "target": runner,
+                        "source_quote": format!("在后台运行 {runner} 验证结果")
                     }]
                 }),
             ),
-            Scripted::Tool(
-                "run_command",
-                serde_json::json!({
-                    "program": "sh", "args": ["run-tests.sh"], "background": true
-                }),
-            ),
+            Scripted::Tool("run_command", background),
             Scripted::WaitLatestBackground,
             Scripted::Tool(
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "后台测试通过",
-                    "verification": {"status": "passed", "detail": "sh run-tests.sh"},
+                    "verification": {"status": "passed", "detail": runner},
                     "requirements": [{
                         "id": "R1", "status": "done",
-                        "evidence": "the background run of sh run-tests.sh exited 0"
+                        "evidence": format!("the background run of {runner} exited 0")
                     }]
                 }),
             ),
@@ -7182,9 +7185,9 @@ async fn a_normal_background_verification_completes_as_verified() {
         .coding
         .chat(
             &fx.session,
-            &spec_for(&fx, REQUEST),
+            &spec_for(&fx, &request),
             vec![ContentPart::Text {
-                text: REQUEST.into(),
+                text: request.clone(),
             }],
             &mut |event| {
                 if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event
