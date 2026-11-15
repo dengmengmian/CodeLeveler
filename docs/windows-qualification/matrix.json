@@ -198,6 +198,13 @@
       "title": "全量 Windows 测试夹具的 POSIX/空环境假设",
       "root_cause": "测试使用 sh/sleep/裸 .cmd、未转义 HOME JSON、空环境快照执行批处理",
       "fix": "改为原生命令/显式 .\\/固定 POSIX 路径/宿主环境快照；目标测试 Green；全量套件见 gates"
+    },
+    {
+      "id": "WIN11-D11",
+      "severity": "P1（未修复）",
+      "title": "非提升会话无法启用 Task Scheduler wakeup",
+      "root_cause": "Windows wakeup 后端使用 schtasks /Create /XML；本机非提升 Medium 会话被拒绝访问，而同账户简单 /Create 成功",
+      "fix": "本次未修复；真机验收 FAIL，见 L6 与 evidence/task-scheduler-acceptance.json"
     }
   ],
   "entries": [
