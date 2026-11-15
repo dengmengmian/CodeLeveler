@@ -1982,17 +1982,18 @@ fn degraded_host_unavailable_runs_local_and_is_never_labelled_durable() {
                 "a degraded task must not be recorded as host-backed"
             );
             let deadline = Instant::now() + Duration::from_secs(20);
-            while !env.repo.join("local-side.log").exists() {
-                assert!(Instant::now() < deadline, "the local command never ran");
+            loop {
+                let log =
+                    std::fs::read_to_string(env.repo.join("local-side.log")).unwrap_or_default();
+                if count_occurrences(&log, &nonce) == 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the local command never recorded its side effect: {log:?}"
+                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            assert_eq!(
-                count_occurrences(
-                    &std::fs::read_to_string(env.repo.join("local-side.log")).unwrap(),
-                    &nonce
-                ),
-                1
-            );
             let stderr = std::fs::read_to_string(env.home.join("degraded-runtime-stderr.txt"))
                 .unwrap_or_default();
             assert!(
