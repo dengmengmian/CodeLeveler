@@ -1177,6 +1177,39 @@ fn a_stage_whose_checks_are_all_reused_is_reported_as_reused() {
 }
 
 #[test]
+fn a_stage_with_every_required_check_reused_names_the_checks_not_a_cache() {
+    // `reused` now means every required check came from recorded evidence, not
+    // that the whole stage was served by a layer cache. The stage line must say
+    // what happened: the lab did run and re-aggregated the checks.
+    let world = World::new();
+    world.set(|script| {
+        for id in [
+            "fmt",
+            "clippy",
+            "release_build",
+            "workspace_tests",
+            "prefix_cache_stability",
+            "feature_coverage_inventory",
+            "tui_tests",
+        ] {
+            script
+                .check_provenance
+                .push((id.to_string(), "REUSED".to_string()));
+        }
+    });
+    let (code, rendered, _) = world.run(&["publish"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("stage 2 automated-tests: REUSED (required checks reused)"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("dogfood cache"),
+        "per-check reuse is not a whole-stage cache hit: {rendered}"
+    );
+}
+
+#[test]
 fn one_fresh_check_makes_the_stage_executed_even_when_the_rest_are_reused() {
     let world = World::new();
     world.set(|script| {
