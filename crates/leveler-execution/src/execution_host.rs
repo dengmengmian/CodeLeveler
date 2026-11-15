@@ -2181,6 +2181,7 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
                 event = events.recv() => match event {
                     Ok(event) => {
                         dirty = true;
+                        #[cfg(debug_assertions)]
                         let exited = matches!(&event, crate::BackgroundTaskEvent::Exited { .. });
                         if matches!(
                             &event,
