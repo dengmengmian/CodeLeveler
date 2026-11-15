@@ -3,7 +3,7 @@
     "version": "1.0.27",
     "short_sha": "4bc08296",
     "code_head": "4bc082963feec78b210d158bdeae3909888b73cc",
-    "report_head": "TBD",
+    "report_head": "527fd14a",
     "baseline": "644d765c6208eba7b59bc0db88559a0445036135",
     "fixes": "0ebfa59d doctor PATHEXT; 4b159c83 TUI DA1; 6edf54ec ACL tests; 0f9a5cbd debug probe; 9936f513 rmdir switches; 8d76717d TUI pager; 9693cc68 Windows test fixtures; 1016b495 live write-root recovery; 3390713d atomic memory replace; 940ae12c endpoint EOF; 4bc08296 native Windows fixtures",
     "os": "Windows 11 26300.9711",

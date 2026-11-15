@@ -8,7 +8,7 @@
 | --- | --- |
 | 基线 `main` | `644d765c6208eba7b59bc0db88559a0445036135`（v1.0.27 之后 4 个提交） |
 | 本次修复提交 | `0ebfa59d` doctor PATHEXT；`4b159c83` TUI DA1；`6edf54ec` ACL 测试能力；`0f9a5cbd` debug-only fault probe；`9936f513` rmdir 开关分类；`8d76717d` TUI pager 路径/引号；`9693cc68` Windows 测试夹具；`1016b495` 写根恢复并发；`3390713d` memory 原子替换；`940ae12c` runtime 端点 EOF；`4bc08296` Windows 原生测试夹具 |
-| 最终候选代码 HEAD | `4bc08296`（报告 HEAD 在提交报告后记录） |
+| 最终候选代码 HEAD | `4bc08296`（产品代码）；报告文档 HEAD `527fd14a` |
 | 版本 | 1.0.27 |
 | 最终候选产物 | 见第 8 节与 `evidence/candidate.sha256` |
 | 安装方式 | 从 ZIP 解压到 `C:\qlab\install\archive` 验证；未覆盖用户已安装的 `C:\Users\code\.local\bin\leveler.exe` |
