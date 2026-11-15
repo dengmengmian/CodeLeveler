@@ -998,10 +998,15 @@ mod exit_taxonomy_tests {
     #[tokio::test]
     async fn exit_zero_is_a_completed_execution() {
         let (dir, ctx) = ws();
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "echo ok & exit /b 0".into()])
+        } else {
+            ("sh", vec!["-c".into(), "echo ok; exit 0".into()])
+        };
         let out = commands()
             .run_foreground(
-                "sh",
-                vec!["-c".into(), "echo ok; exit 0".into()],
+                program,
+                args,
                 Some("."),
                 Some(30),
                 ctx,
@@ -1020,13 +1025,24 @@ mod exit_taxonomy_tests {
     #[tokio::test]
     async fn nonzero_exit_is_completed_with_a_command_failure_visible() {
         let (dir, ctx) = ws();
-        let out = commands()
-            .run_foreground(
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd",
+                vec!["/c".into(), "echo test failed: 1 1>&2 & exit /b 101".into()],
+            )
+        } else {
+            (
                 "sh",
                 vec![
                     "-c".into(),
                     "printf 'test failed: 1\n' >&2; exit 101".into(),
                 ],
+            )
+        };
+        let out = commands()
+            .run_foreground(
+                program,
+                args,
                 Some("."),
                 Some(30),
                 ctx,
@@ -1053,10 +1069,15 @@ mod exit_taxonomy_tests {
     #[tokio::test]
     async fn probe_exit_one_is_a_completed_execution() {
         let (dir, ctx) = ws();
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "exit /b 1".into()])
+        } else {
+            ("sh", vec!["-c".into(), "exit 1".into()])
+        };
         let out = commands()
             .run_foreground(
-                "sh",
-                vec!["-c".into(), "exit 1".into()],
+                program,
+                args,
                 Some("."),
                 Some(30),
                 ctx,
@@ -1103,10 +1124,15 @@ mod exit_taxonomy_tests {
     #[tokio::test]
     async fn timeout_is_an_execution_failure() {
         let (dir, ctx) = ws();
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "ping -n 30 127.0.0.1".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
         let out = commands()
             .run_foreground(
-                "sh",
-                vec!["-c".into(), "sleep 30".into()],
+                program,
+                args,
                 Some("."),
                 Some(1),
                 ctx,
@@ -1129,15 +1155,13 @@ mod exit_taxonomy_tests {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             canceller.cancel();
         });
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "ping -n 30 127.0.0.1".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
         let error = commands()
-            .run_foreground(
-                "sh",
-                vec!["-c".into(), "sleep 30".into()],
-                Some("."),
-                Some(30),
-                ctx,
-                token,
-            )
+            .run_foreground(program, args, Some("."), Some(30), ctx, token)
             .await
             .expect_err("a cancelled command did not run to completion");
         let ToolError::Process(process) = error else {
@@ -1242,10 +1266,21 @@ mod grant_tests {
         let ctx = ToolContext::new(workspace, PermissionProfile::Assisted);
         let outside = base.join("outside.txt");
         let _ = std::fs::remove_file(&outside);
-        let out = commands()
-            .run_foreground(
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd",
+                vec!["/c".into(), format!("echo no > \"{}\"", outside.display())],
+            )
+        } else {
+            (
                 "sh",
                 vec!["-c".into(), format!("echo no > {}", outside.display())],
+            )
+        };
+        let out = commands()
+            .run_foreground(
+                program,
+                args,
                 Some("."),
                 Some(30),
                 ctx,
@@ -1421,10 +1456,15 @@ mod foreground_handoff_tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, reg, commands) = harness(dir.path());
         let started = Instant::now();
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "echo hi".into()])
+        } else {
+            ("sh", vec!["-c".into(), "echo hi".into()])
+        };
         let out = commands
             .run_foreground(
-                "sh",
-                vec!["-c".into(), "echo hi".into()],
+                program,
+                args,
                 Some("."),
                 Some(60),
                 ctx,
@@ -1450,10 +1490,15 @@ mod foreground_handoff_tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, reg, commands) = harness(dir.path());
         let started = Instant::now();
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "ping -n 30 127.0.0.1".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 30".into()])
+        };
         let out = commands
             .run_foreground(
-                "sh",
-                vec!["-c".into(), "sleep 30".into()],
+                program,
+                args,
                 Some("."),
                 Some(2),
                 ctx,
@@ -1518,10 +1563,15 @@ mod foreground_handoff_tests {
     async fn a_handed_off_command_keeps_the_lifetime_the_caller_chose() {
         let dir = scratch_repo();
         let (ctx, reg, commands) = harness(dir.path());
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c".into(), "ping -n 16 127.0.0.1".into()])
+        } else {
+            ("sh", vec!["-c".into(), "sleep 16".into()])
+        };
         let out = commands
             .run_foreground_with_lifetime(
-                "sh",
-                vec!["-c".into(), "sleep 16".into()],
+                program,
+                args,
                 Some("."),
                 None,
                 Some(BackgroundTaskLifetime::Session),
