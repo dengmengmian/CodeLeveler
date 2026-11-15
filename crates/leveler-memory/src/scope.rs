@@ -1238,6 +1238,32 @@ fn persist_replacing_file(path: &Path, contents: &[u8]) -> Result<()> {
         path: parent.to_path_buf(),
         source,
     })?;
+    // A rename over an existing file is atomic but not serialized on Windows:
+    // two writers replacing the same destination concurrently can transiently
+    // fail with ERROR_ACCESS_DENIED. Every manifest writer takes this lock, so
+    // one replace runs at a time and readers still see whole files.
+    let lock_path = path.with_file_name(format!(
+        ".{}.lock",
+        path.file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    reject_symlink(&lock_path, "initialize symlinked memory manifest lock")?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| MemoryScopeError::Io {
+            operation: "open memory manifest lock",
+            path: lock_path.clone(),
+            source,
+        })?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(|source| MemoryScopeError::Io {
+        operation: "lock memory manifest",
+        path: lock_path.clone(),
+        source,
+    })?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).map_err(|source| MemoryScopeError::Io {
             operation: "create temporary memory manifest",
