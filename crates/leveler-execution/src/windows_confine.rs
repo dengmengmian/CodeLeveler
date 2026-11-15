@@ -26,6 +26,7 @@
 //! everywhere; the Win32 calls behind it are Windows-only.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -72,15 +73,32 @@ fn resolve_launcher() -> Option<PathBuf> {
 
 /// A held claim on one write root: how many commands are writing under it, and
 /// the label to put back when the last one finishes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Held {
     count: usize,
     previous: IntegrityLabel,
+    /// The record this lease owns, so recovery can skip a live root even on a
+    /// host whose file locks would not report the conflict in-process.
+    record: Option<PathBuf>,
+    /// Exclusive OS lock on the record's guard file, held until the label is
+    /// back. It is the durable liveness fact recovery needs: a record whose
+    /// guard is locked belongs to a running command, not to a crash.
+    _guard: Option<File>,
 }
 
 fn held() -> &'static Mutex<HashMap<String, Held>> {
     static HELD: OnceLock<Mutex<HashMap<String, Held>>> = OnceLock::new();
     HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether this process still owns the record. Recovery must not treat a live
+/// lease as a crash leftover, whatever the host's advisory-lock semantics are.
+fn record_is_held(record: &Path) -> bool {
+    held()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .values()
+        .any(|entry| entry.record.as_deref() == Some(record))
 }
 
 fn root_key(root: &Path) -> String {
@@ -182,6 +200,43 @@ fn record_path(records: &Path, root: &Path) -> PathBuf {
     records.join(format!("{name}.label"))
 }
 
+/// The sidecar a live lease locks. Its hash matches the record's, so recovery
+/// can ask "is anyone still using the label this record describes?" without
+/// reading the record first. The file is intentionally left behind after the
+/// lease: removing it would let a new lease recreate an unlocked file while a
+/// recovery pass was still opening the old one, which is the race it prevents.
+fn guard_path_for_record(record: &Path) -> PathBuf {
+    let mut name = record
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".guard");
+    record.with_file_name(name)
+}
+
+/// Try to become the only live owner of a record. `None` means another live
+/// lease (in this or another process) holds it; its label must be left alone.
+fn try_lock_guard(path: &Path) -> io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        // Windows reports a held byte-range lock as ERROR_LOCK_VIOLATION (33)
+        // rather than WouldBlock; fs2 surfaces the raw error there. Both mean
+        // the same thing: another live lease owns this record.
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Claim `root`. Returns the record that describes how to put its label back,
 /// or `None` when this root is not one we ever restore.
 ///
@@ -196,32 +251,61 @@ fn acquire_root(root: &Path, records: &Path, restorable: bool) -> io::Result<Opt
         entry.count += 1;
         return Ok(record);
     }
+    // Take the guard before reading the old label or writing the new record.
+    // From here until the last lease ends, recovery cannot mistake this root
+    // for a crash leftover.
+    let guard = match record.as_deref() {
+        Some(record) => {
+            let guard = try_lock_guard(&guard_path_for_record(record))?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "Windows write root for {} is in use by another live CodeLeveler \
+                         process; refusing to relabel it",
+                        root.display()
+                    ),
+                )
+            })?;
+            // `ensure_recovered` ran once per process and may have skipped this
+            // root because another process owned it then. Now that the guard
+            // is ours, any record still here is a crash leftover: put its
+            // label back before lowering the root for this command.
+            recover_one_locked(record)?;
+            Some(guard)
+        }
+        None => None,
+    };
     let previous = leveler_win_confine::integrity_label(root)?;
     if let Some(record) = record.as_deref() {
         write_record(record, &Record::new(root, previous.clone()))?;
     }
     leveler_win_confine::apply_low_integrity_label(root)?;
-    map.insert(key, Held { count: 1, previous });
+    map.insert(
+        key,
+        Held {
+            count: 1,
+            previous,
+            record: record.clone(),
+            _guard: guard,
+        },
+    );
     Ok(record)
 }
 
 fn release_root(root: &Path, record: &Path) -> io::Result<()> {
     let key = root_key(root);
-    let previous = {
-        let mut map = held().lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(entry) = map.get_mut(&key) else {
-            return Ok(());
-        };
-        entry.count -= 1;
-        if entry.count > 0 {
-            return Ok(());
-        }
-        map.remove(&key).map(|entry| entry.previous)
-    };
-    let Some(previous) = previous else {
+    let mut map = held().lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(entry) = map.get_mut(&key) else {
         return Ok(());
     };
-    let restored = leveler_win_confine::restore_integrity_label(root, &previous);
+    entry.count -= 1;
+    if entry.count > 0 {
+        return Ok(());
+    }
+    // Keep the guard (and the map lock) until the label is actually back, so a
+    // new lease cannot relabel the root between this restore and its release.
+    let held = map.remove(&key).expect("the held entry was just checked");
+    let restored = leveler_win_confine::restore_integrity_label(root, &held.previous);
     // Only drop the record once the label is actually back, so a failure here
     // still leaves the next run enough to recover from.
     if restored.is_ok() {
@@ -284,10 +368,79 @@ fn unreadable_records(paths: &[PathBuf]) -> io::Error {
     )
 }
 
+/// Decide what one record needs, without touching a label.
+///
+/// `None` means the record is unreadable or corrupt. A record from the build
+/// that wrote no root path is dropped rather than refused: it cannot name a
+/// directory, so no label could be restored from it.
+fn plan_record(path: &Path, text: &str) -> Option<Recovery> {
+    match Record::decode(text) {
+        Some(entry) => {
+            let gone = matches!(entry.root.try_exists(), Ok(false));
+            Some(if gone {
+                Recovery::Forget {
+                    record: path.to_path_buf(),
+                }
+            } else {
+                Recovery::Restore {
+                    record: path.to_path_buf(),
+                    entry,
+                }
+            })
+        }
+        None if is_record_without_a_root(text) => Some(Recovery::Forget {
+            record: path.to_path_buf(),
+        }),
+        None => None,
+    }
+}
+
+/// Apply one planned recovery step. The record is removed only after the label
+/// is actually back, so an interrupted pass repeats rather than forgets.
+fn apply_recovery(step: Recovery) -> io::Result<()> {
+    match step {
+        Recovery::Forget { record } => {
+            let _ = std::fs::remove_file(record);
+            Ok(())
+        }
+        Recovery::Restore { record, entry } => {
+            match leveler_win_confine::restore_integrity_label(&entry.root, &entry.previous) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&record);
+                    Ok(())
+                }
+                // The root disappeared between planning and restoring: there
+                // is nothing left to put a label on.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let _ = std::fs::remove_file(&record);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+/// Recover one record whose guard this process already owns. Stale records
+/// found at lease time take this path after `ensure_recovered` skipped them
+/// while another process was still alive.
+fn recover_one_locked(record: &Path) -> io::Result<()> {
+    let text = match std::fs::read_to_string(record) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some(step) = plan_record(record, &text) else {
+        return Err(unreadable_records(&[record.to_path_buf()]));
+    };
+    apply_recovery(step)
+}
+
 /// Decide what every leftover record needs, without touching a label.
 ///
 /// Pure enough to test on any host: the Win32 calls are in
 /// [`recover_stale_write_roots`], which applies what this returns.
+#[cfg(test)]
 fn plan_recovery(records: &Path) -> io::Result<Vec<Recovery>> {
     let entries = match std::fs::read_dir(records) {
         Ok(entries) => entries,
@@ -313,24 +466,8 @@ fn plan_recovery(records: &Path) -> io::Result<Vec<Recovery>> {
                 continue;
             }
         };
-        match Record::decode(&text) {
-            Some(entry) => {
-                let gone = matches!(entry.root.try_exists(), Ok(false));
-                plan.push(if gone {
-                    Recovery::Forget { record: path }
-                } else {
-                    Recovery::Restore {
-                        record: path,
-                        entry,
-                    }
-                });
-            }
-            // A record from the build that wrote no root path. It cannot say
-            // which directory it was about, so it is dropped rather than left
-            // to refuse every confined command forever. The build that wrote
-            // it shipped no Windows binary, so the window it covers is one
-            // developer machine deep.
-            None if is_record_without_a_root(&text) => plan.push(Recovery::Forget { record: path }),
+        match plan_record(&path, &text) {
+            Some(step) => plan.push(step),
             None => unreadable.push(path),
         }
     }
@@ -341,6 +478,7 @@ fn plan_recovery(records: &Path) -> io::Result<Vec<Recovery>> {
     Ok(plan)
 }
 
+#[cfg(test)]
 fn record_of(recovery: &Recovery) -> &Path {
     match recovery {
         Recovery::Restore { record, .. } | Recovery::Forget { record } => record,
@@ -369,31 +507,67 @@ fn recover_records(records: &Path) -> io::Result<()> {
     if !cfg!(windows) {
         return Ok(());
     }
-    let plan = plan_recovery(records)?;
-    let mut failures: Vec<String> = Vec::new();
-    for step in plan {
-        match step {
-            Recovery::Forget { record } => {
-                let _ = std::fs::remove_file(record);
-            }
-            Recovery::Restore { record, entry } => {
-                match leveler_win_confine::restore_integrity_label(&entry.root, &entry.previous) {
-                    // The record goes only after the label is back, so an
-                    // interrupted recovery repeats rather than forgets.
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&record);
-                    }
-                    // The root disappeared between planning and restoring:
-                    // there is nothing left to put a label on.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        let _ = std::fs::remove_file(&record);
-                    }
-                    Err(error) => {
-                        failures.push(format!("{}: {error}", entry.root.display()));
-                    }
-                }
-            }
+    let entries = match std::fs::read_dir(records) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "label")
+        {
+            paths.push(path);
         }
+    }
+    paths.sort();
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        // A live lease in this process is never stale, even if the host's
+        // file-lock implementation lets a second handle lock its guard.
+        if record_is_held(&path) {
+            continue;
+        }
+        // Take the guard before reading: a record whose writer still holds it
+        // may be half-written, and reading it now would refuse recovery on a
+        // file that is about to disappear. `None` means a live process owns
+        // the root; leave its label exactly where it is.
+        let _guard = match try_lock_guard(&guard_path_for_record(&path)) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => continue,
+            Err(error) => {
+                failures.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable.push(path);
+                continue;
+            }
+        };
+        let Some(step) = plan_record(&path, &text) else {
+            unreadable.push(path);
+            continue;
+        };
+        let root = match &step {
+            Recovery::Restore { entry, .. } => Some(entry.root.display().to_string()),
+            Recovery::Forget { .. } => None,
+        };
+        if let Err(error) = apply_recovery(step)
+            && let Some(root) = root
+        {
+            failures.push(format!("{root}: {error}"));
+        }
+    }
+    if !unreadable.is_empty() {
+        return Err(unreadable_records(&unreadable));
     }
     if failures.is_empty() {
         return Ok(());
@@ -1058,6 +1232,51 @@ mod windows_canaries {
     const CRASH_FIXTURE_TEST: &str =
         "windows_confine::windows_canaries::windows_crash_fixture_child";
 
+    /// A live lease is not a stale record. Every window that assembles the
+    /// application runs recovery; if recovery restores a label a sibling
+    /// window's confined command is still using, that Low child loses the
+    /// write root underneath it and the command fails with access denied.
+    #[test]
+    fn recovery_leaves_a_live_lease_alone() {
+        if !cfg!(windows) {
+            return;
+        }
+        let home = tempfile::tempdir().expect("home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let environment = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                std::ffi::OsString::from(home.path()),
+            )],
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        );
+        let before = leveler_win_confine::integrity_label(workspace.path()).expect("label before");
+        let lease = super::lease_write_roots(&environment, &[workspace.path().to_path_buf()])
+            .expect("lease the workspace");
+        assert!(
+            leveler_win_confine::integrity_label(workspace.path())
+                .expect("labelled root")
+                .is_low(),
+            "the live lease must lower its root"
+        );
+
+        super::recover_stale_write_roots(&environment).expect("recovery must succeed");
+        assert!(
+            leveler_win_confine::integrity_label(workspace.path())
+                .expect("label after recovery")
+                .is_low(),
+            "recovery must not restore a write root a live lease holds"
+        );
+
+        drop(lease);
+        assert_eq!(
+            leveler_win_confine::integrity_label(workspace.path()).expect("label after release"),
+            before,
+            "the live lease still restores the label when it ends"
+        );
+    }
+
     /// The defect this closes: a run killed with a write root still lowered
     /// leaves the user's directory at Low integrity, and `Drop` never runs. A
     /// later run has to put it back without being told which root to look at.
@@ -1120,6 +1339,17 @@ mod windows_canaries {
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+
+        // A recovery pass in this process must not touch the root the live
+        // child owns: the child's guard is the cross-process liveness fact.
+        super::recover_stale_write_roots(&environment)
+            .expect("recovery must skip a live child's record");
+        assert!(
+            leveler_win_confine::integrity_label(workspace.path())
+                .expect("label while the child is alive")
+                .is_low(),
+            "recovery restored a root another live process is using"
+        );
 
         // Kill it. No unwinding, no destructors, no restore.
         child.kill().expect("kill the fixture child");
