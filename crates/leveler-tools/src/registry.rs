@@ -94,6 +94,10 @@ pub struct ToolRegistry {
     /// language server and the browser), not per-call authority. Tools that
     /// already own a store (`run_command`) keep spilling on their own.
     artifact_store: Option<Arc<leveler_execution::ArtifactStore>>,
+    /// Tool definitions include generated JSON schemas. Building them on every
+    /// model request is both waste and a large synchronous frame inside a deep
+    /// async turn; build once per registry and filter subsets from the cache.
+    definitions_cache: std::sync::OnceLock<Vec<ToolDefinition>>,
 }
 
 impl ToolRegistry {
@@ -114,12 +118,29 @@ impl ToolRegistry {
         ToolRegistry {
             tools: BTreeMap::new(),
             artifact_store: self.artifact_store.clone(),
+            definitions_cache: std::sync::OnceLock::new(),
         }
     }
 
     /// Register a tool. A later registration with the same name replaces it.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        self.definitions_cache.take();
         self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Carry the parent's already-built definitions for exactly the tools a
+    /// subset contains. The subset's first `definitions()` call then filters a
+    /// cached list instead of regenerating every JSON schema.
+    fn inherit_definition_cache(&self, subset: &mut ToolRegistry) {
+        let Some(all) = self.definitions_cache.get() else {
+            return;
+        };
+        let kept: Vec<ToolDefinition> = all
+            .iter()
+            .filter(|definition| subset.tools.contains_key(&definition.name))
+            .cloned()
+            .collect();
+        let _ = subset.definitions_cache.set(kept);
     }
 
     /// Look up a tool by name.
@@ -182,6 +203,7 @@ impl ToolRegistry {
             for tool in self.tools.values() {
                 subset.register(tool.clone());
             }
+            self.inherit_definition_cache(&mut subset);
             return subset;
         }
         for tool in self.tools.values() {
@@ -189,6 +211,7 @@ impl ToolRegistry {
                 subset.register(tool.clone());
             }
         }
+        self.inherit_definition_cache(&mut subset);
         subset
     }
 
@@ -202,6 +225,7 @@ impl ToolRegistry {
         {
             subset.register(tool.clone());
         }
+        self.inherit_definition_cache(&mut subset);
         subset
     }
 
@@ -218,6 +242,7 @@ impl ToolRegistry {
                 subset.register(tool.clone());
             }
         }
+        self.inherit_definition_cache(&mut subset);
         subset
     }
 
@@ -229,6 +254,7 @@ impl ToolRegistry {
                 subset.register(tool.clone());
             }
         }
+        self.inherit_definition_cache(&mut subset);
         subset
     }
 
@@ -242,19 +268,39 @@ impl ToolRegistry {
                 subset.register(tool.clone());
             }
         }
+        self.inherit_definition_cache(&mut subset);
         subset
     }
 
     /// The tool definitions to advertise to the model (sorted by name).
+    ///
+    /// The schemas are generated once per registry. `register` invalidates the
+    /// cache, and a subset inherits its parent's entries, so a permission or
+    /// role projection does not regenerate every schema on every model request.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
+        if let Some(cached) = self.definitions_cache.get() {
+            return cached.clone();
+        }
+        let built: Vec<ToolDefinition> = self
+            .tools
             .values()
             .map(|t| ToolDefinition {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
             })
-            .collect()
+            .collect();
+        let _ = self.definitions_cache.set(built.clone());
+        built
+    }
+
+    /// Build the definitions now, at a caller-chosen point in the stack.
+    ///
+    /// A deep async turn should not be the first place a generated schema is
+    /// built; warming the cache where the host composes the registry keeps the
+    /// per-request path to a clone.
+    pub fn precompute_definitions(&self) {
+        let _ = self.definitions();
     }
 
     /// Normalize and schema-validate the arguments, then dispatch. Invalid
@@ -1390,6 +1436,65 @@ mod dynamic_metadata_tests {
             name: name.to_string(),
             description: format!("runtime-discovered tool {name}"),
         })
+    }
+
+    #[test]
+    fn definitions_are_generated_once_and_register_invalidates_the_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTool {
+            name: String,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn description(&self) -> &str {
+                "counts schema generation"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            fn risk(&self) -> RiskLevel {
+                RiskLevel::Safe
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: ToolContext,
+                _cancellation: CancellationToken,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::ok("counting-ok"))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(1));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingTool {
+            name: "one".to_string(),
+            calls: calls.clone(),
+        }));
+        registry.register(Arc::new(CountingTool {
+            name: "two".to_string(),
+            calls: calls.clone(),
+        }));
+        // Two tools, one generation: one schema build each, then a cache hit.
+        let _ = registry.definitions();
+        let _ = registry.definitions();
+        let after_first_generation = calls.load(Ordering::SeqCst) - 1;
+        assert_eq!(after_first_generation, 2);
+        // A later registration is a new generation; all definitions rebuild.
+        registry.register(Arc::new(CountingTool {
+            name: "three".to_string(),
+            calls: calls.clone(),
+        }));
+        let _ = registry.definitions();
+        let after_second_generation = calls.load(Ordering::SeqCst) - 1;
+        assert_eq!(after_second_generation, 5);
     }
 
     #[test]

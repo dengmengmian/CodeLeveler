@@ -56,8 +56,22 @@ use run_cmds::{
 };
 use sessions_cmd::cmd_sessions;
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+/// Deep asynchronous turns (engine -> turn -> agent -> tools) need more stack
+/// than the 2 MiB default worker thread, especially in debug builds. The same
+/// 8 MiB the Windows main thread reserves is used here for every runtime
+/// worker; a stack overflow is a process abort, not a recoverable error.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> std::process::ExitCode {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()
+        .expect("the tokio runtime must start");
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> std::process::ExitCode {
     let args = Cli::parse();
     let mut values: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     if let Some(home) = args.home.as_ref() {

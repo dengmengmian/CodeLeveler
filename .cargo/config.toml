@@ -3,9 +3,15 @@
 # Cargo applies it only to workspace members; registry crates are unaffected.
 # Prefer the narrow aliases while developing; use the full workspace for DoD.
 
+# libtest runs each test on a spawned thread with the std default stack. The
+# engine's debug-build async chain at sub-agent depth exceeds 2 MiB; reserve
+# the same 8 MiB the CLI runtime and the Windows main thread use, so a deep
+# turn is a test failure only when it is a real one.
+[env]
+RUST_MIN_STACK = "8388608"
+
 # Narrow-scope aliases — prefer these while developing; use full workspace only for DoD.
-[alias]
-# Core security / permissions surface
+[alias]# Core security / permissions surface
 t-exec = "test -p leveler-execution --lib --test classify_adversarial"
 # Agent authorize + executor
 t-agent = "test -p leveler-agent --lib"

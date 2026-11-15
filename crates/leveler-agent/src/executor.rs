@@ -1658,6 +1658,10 @@ impl Executor {
         model: ModelRef,
         model_step_window: u32,
     ) -> Self {
+        // Tool schemas are generated once, here, rather than inside the deep
+        // async turn that first asks for the tool table. The registry is shared
+        // by parent and children, so this is one build for the whole tree.
+        registry.precompute_definitions();
         // Ownership exclusivity must follow the workspace volume's real path
         // identity, not a platform guess: a case-folding volume makes
         // `src/Parser.rs` and `src/parser.rs` one file, and treating them as
