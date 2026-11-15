@@ -268,6 +268,59 @@ impl<'a> EventRepository<'a> {
         Ok(rows)
     }
 
+    /// A bounded page of events after `after_sequence`, optionally restricted
+    /// to one event type. Oldest first; the caller pages by the last sequence
+    /// it received.
+    pub async fn page(
+        &self,
+        session_id: &SessionId,
+        after_sequence: i64,
+        event_type: Option<&str>,
+        turn_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        let rows = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND sequence > ?2 AND (?3 IS NULL OR type = ?3) \
+               AND (?4 IS NULL OR turn_id = ?4) \
+             ORDER BY sequence LIMIT ?5",
+        )
+        .bind(session_id.as_str())
+        .bind(after_sequence)
+        .bind(event_type)
+        .bind(turn_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// Bounded literal text search over one session's stored payloads.
+    ///
+    /// `instr` is a literal substring test: user/model text is never
+    /// interpreted as a SQL pattern. Case-insensitive on ASCII, which is what
+    /// `lower()` provides without a second collation.
+    pub async fn search(
+        &self,
+        session_id: &SessionId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        let rows = sqlx::query_as::<_, EventRecord>(
+            "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, created_at, \
+             schema_version FROM events \
+             WHERE session_id = ?1 AND instr(lower(payload), lower(?2)) > 0 \
+             ORDER BY sequence LIMIT ?3",
+        )
+        .bind(session_id.as_str())
+        .bind(query)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
+    }
+
     /// Inclusive sequence window `[from_seq, to_seq]`.
     pub async fn load_window(
         &self,
@@ -721,6 +774,83 @@ mod tests {
         assert_eq!(
             newer.iter().map(|e| e.sequence).collect::<Vec<_>>(),
             vec![2, 3]
+        );
+    }
+
+    /// The review reader asks for one bounded page; it must never receive the
+    /// whole log, and its type filter must not leak other event families.
+    #[tokio::test]
+    async fn a_page_is_bounded_and_filtered_by_type() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        for (event_type, payload) in [
+            ("tool_call_started", r#"{"name":"read_file"}"#),
+            ("turn_started", "{}"),
+            ("tool_call_started", r#"{"name":"grep"}"#),
+        ] {
+            repo.append(&session, None, event_type, payload, leveler_core::now())
+                .await
+                .unwrap();
+        }
+        let page = repo
+            .page(&session, 0, Some("tool_call_started"), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].sequence, 1);
+        let next = repo
+            .page(
+                &session,
+                page[0].sequence,
+                Some("tool_call_started"),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].sequence, 3);
+        let all = repo.page(&session, 0, None, None, 10).await.unwrap();
+        assert_eq!(
+            all.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// Search is a literal substring test. A model-supplied `%` must match a
+    /// percent sign, not every row.
+    #[tokio::test]
+    async fn search_is_literal_and_bounded() {
+        let (db, session) = db_with_session().await;
+        let repo = EventRepository::new(&db);
+        repo.append(
+            &session,
+            None,
+            "a",
+            r#"{"text":"receipt ledger"}"#,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        repo.append(
+            &session,
+            None,
+            "b",
+            r#"{"text":"100% done"}"#,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let hits = repo.search(&session, "RECEIPT", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].sequence, 1);
+        let percent = repo.search(&session, "%", 10).await.unwrap();
+        assert_eq!(
+            percent
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2]
         );
     }
 

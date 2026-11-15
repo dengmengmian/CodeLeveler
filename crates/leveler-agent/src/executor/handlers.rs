@@ -476,16 +476,68 @@ impl Executor {
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> DelegatedChildResult {
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let parent_wall = reviewer_wall_budget(&self.step_limits, parent_elapsed);
         // R013r: an unbounded reviewer burned the full 100-round turn ceiling
-        // reading a repo it was only asked to judge. The bound now lives on
-        // the role's capability profile; a reviewer that has not concluded by
-        // then returns what it has (INCOMPLETE_PARTIAL keeps its findings)
-        // instead of burning the parent's budget.
+        // reading a repo it was only asked to judge. The bound lives on the
+        // role's capability profile; a reviewer that has not concluded by then
+        // returns what it has (INCOMPLETE_PARTIAL keeps its findings).
         let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
             .max_rounds()
             .unwrap_or(0);
+        self.run_reviewer_child_with_rounds(
+            id,
+            brief,
+            files,
+            parent_elapsed,
+            reviewer_rounds,
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    /// The manual-review entrance to the same child primitive.
+    ///
+    /// A closure reviewer is the tail of someone else's task, so its 20-round
+    /// profile bound is right there. A user-requested review owns its own
+    /// investigation and gets an explicit, finite budget from the caller —
+    /// larger than the closure tail, never unbounded. Everything else (read-
+    /// only registry, lifecycle, event attribution, cancellation, findings)
+    /// is the reviewer contract, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_manual_review_child(
+        &self,
+        id: String,
+        brief: String,
+        files: Vec<String>,
+        max_rounds: u32,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> DelegatedChildResult {
+        self.run_reviewer_child_with_rounds(
+            id,
+            brief,
+            files,
+            std::time::Duration::ZERO,
+            max_rounds,
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_reviewer_child_with_rounds(
+        &self,
+        id: String,
+        brief: String,
+        files: Vec<String>,
+        parent_elapsed: std::time::Duration,
+        reviewer_rounds: u32,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> DelegatedChildResult {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let parent_wall = reviewer_wall_budget(&self.step_limits, parent_elapsed);
         let run = self.run_one_sub_agent_on(
             id,
             AgentRole::Reviewer,
@@ -522,6 +574,7 @@ impl Executor {
             progress: result.progress,
             modified_files: result.modified_files,
             findings: result.findings,
+            review: result.review,
         }
     }
 
@@ -684,6 +737,7 @@ async fn run_prepared_sub_agent(
                 progress: ProgressLedger::default(),
                 modified_files: Vec::new(),
                 findings: Vec::new(),
+                review: None,
             };
         }
     };
@@ -744,6 +798,7 @@ async fn run_prepared_sub_agent(
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
                     findings: Vec::new(),
+                    review: None,
                 };
             }
         }
@@ -784,6 +839,8 @@ async fn run_prepared_sub_agent(
     // `said` above).
     let findings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let findings_obs = findings.clone();
+    let review = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let review_obs = review.clone();
     let activity_id = id.clone();
     let activity_tx = progress.clone();
     let mut capture = move |event: AgentEvent| match &event {
@@ -795,6 +852,9 @@ async fn run_prepared_sub_agent(
         AgentEvent::EvidenceLedgerUpdated { ledger } => {
             if let Ok(mut guard) = findings_obs.lock() {
                 *guard = ledger.findings.clone();
+            }
+            if let Ok(mut guard) = review_obs.lock() {
+                *guard = ledger.review.clone();
             }
         }
         AgentEvent::AssistantText { text, .. } if !text.trim().is_empty() => {
@@ -883,6 +943,7 @@ async fn run_prepared_sub_agent(
     }
     let said_before_stopping = || said.lock().map(|g| g.clone()).unwrap_or_default();
     let reported_findings = findings.lock().map(|g| g.clone()).unwrap_or_default();
+    let reported_review = review.lock().ok().and_then(|g| g.clone());
     match outcome {
         Ok(outcome) => {
             let completed = matches!(
@@ -939,6 +1000,7 @@ async fn run_prepared_sub_agent(
                 progress: outcome.progress,
                 modified_files: outcome.modified_files,
                 findings: reported_findings,
+                review: reported_review.clone(),
             }
         }
         Err(AgentError::Cancelled) => {
@@ -957,6 +1019,7 @@ async fn run_prepared_sub_agent(
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
+                review: reported_review.clone(),
             }
         }
         Err(e) => {
@@ -969,6 +1032,7 @@ async fn run_prepared_sub_agent(
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
+                review: reported_review.clone(),
             }
         }
     }
@@ -994,6 +1058,10 @@ pub struct DelegatedChildResult {
     /// Typed findings the child reported (partial ones survive an abnormal
     /// stop). Still keyed by the CHILD's ids — the consumer adopts them.
     pub findings: Vec<leveler_lifecycle::FindingRecord>,
+    /// The reviewer's structured coverage/limitations/conclusion, when it
+    /// declared one. `None` is the honest "not declared"; it is never derived
+    /// from findings or prose.
+    pub review: Option<leveler_lifecycle::ReviewVerdict>,
 }
 
 /// Spend + structured result from one sub-agent so the parent can roll up
@@ -1009,6 +1077,8 @@ pub(crate) struct SubAgentRunResult {
     pub modified_files: Vec<String>,
     /// Typed findings captured from the child's ledger snapshots.
     pub findings: Vec<leveler_lifecycle::FindingRecord>,
+    /// Structured review declaration captured from the same snapshots.
+    pub review: Option<leveler_lifecycle::ReviewVerdict>,
 }
 
 /// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.

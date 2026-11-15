@@ -2,6 +2,14 @@
 
 [中文](CHANGELOG.zh-CN.md) · [Install and use](README.md)
 
+## [Unreleased]
+
+- `/review` is a manual, read-only, evidence-driven review. It covers the current task's delivery, the working tree, the whole project, a session, a commit, a branch base, or explicit paths. The reviewer runs as an independent child with its own review id, budget, cancellation and durable report; `@model provider/model` selects another configured model and `/review cancel [id]` stops a running review.
+- Review findings may carry a dimension, P0–P3 severity, confidence, evidence, impact, a fix direction and whether it was reproduced. Explorers and workers keep their existing `report_finding` shape. Reviews live in their own table and replay as conversation cards plus a report page; a review never opens a turn, settles a goal or edits source.
+- A reviewer can page through the reviewed session's durable record with the read-only `session_history` tool (turns, events and tool results, messages, model requests, goals, checkpoints). The tool is bound to the reviewed session and is registered only on the review surface.
+- Reviews carry a structured verdict written by `report_review`: conclusion, per-dimension coverage and limitations attributed to the environment, permissions, tool capability or scope. The runtime records the declaration; it never derives it from report prose or finding counts.
+- Automatic review is retired. A legacy `agents.independent_review: required` still loads but no longer starts a review at turn, goal, commit or delivery settlement. Explicit test/eval settings and crash recovery of a review that was already unsettled are unchanged.
+
 ## [1.0.27] - 2026-11-15
 
 - Cross-session memory is on by default. An absent `[memory]` section resolves to `rollout = "active"`; `rollout = "off"` is the explicit opt-out, and `record_only` / `shadow` cover staged rollouts. Only `active` exposes memory to the model. Everything lives under `<LevelerHome>/memory/`; a workspace is identified by its git remote, and a temporary working directory has no workspace scope.

@@ -61,6 +61,283 @@ impl FindingKind {
     }
 }
 
+/// Which kind of review produced a finding. Independent of [`FindingKind`]:
+/// `kind` says what was found, `dimension` says which review lens found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDimension {
+    Code,
+    Business,
+    Security,
+    Architecture,
+    Test,
+    Delivery,
+    Session,
+}
+
+impl ReviewDimension {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "code" => Self::Code,
+            "business" => Self::Business,
+            "security" => Self::Security,
+            "architecture" => Self::Architecture,
+            "test" | "tests" => Self::Test,
+            "delivery" => Self::Delivery,
+            "session" => Self::Session,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Business => "business",
+            Self::Security => "security",
+            Self::Architecture => "architecture",
+            Self::Test => "test",
+            Self::Delivery => "delivery",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// How bad the finding would be if it is real. Separate from confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl FindingSeverity {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "p0" => Self::P0,
+            "p1" => Self::P1,
+            "p2" => Self::P2,
+            "p3" => Self::P3,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::P0 => "p0",
+            Self::P1 => "p1",
+            Self::P2 => "p2",
+            Self::P3 => "p3",
+        }
+    }
+}
+
+/// How sure the reviewer is that the finding is real.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl FindingConfidence {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            "low" => Self::Low,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// How far one review dimension was actually covered.
+///
+/// `NotApplied` means the dimension was outside this review's declared scope;
+/// `NotReviewed` means it was in scope but not examined. Neither is a claim
+/// about correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCoverageStatus {
+    NotApplicable,
+    NotReviewed,
+    Partial,
+    Reviewed,
+}
+
+impl ReviewCoverageStatus {
+    /// Parse a model-authored status. Unknown values are refused, never
+    /// coerced to a reassuring default.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "not_applicable" => Self::NotApplicable,
+            "not_reviewed" => Self::NotReviewed,
+            "partial" => Self::Partial,
+            "reviewed" => Self::Reviewed,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::NotReviewed => "not_reviewed",
+            Self::Partial => "partial",
+            Self::Reviewed => "reviewed",
+        }
+    }
+}
+
+/// The reviewer's own final verdict, kept separate from execution status.
+///
+/// `IssuesFound` does not change the reviewed task's terminal; `NoIssuesFound`
+/// does not prove the object correct. The runtime stores the declaration, it
+/// never derives one from finding counts or report prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewConclusion {
+    IssuesFound,
+    NoIssuesFound,
+    Inconclusive,
+}
+
+impl ReviewConclusion {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "issues_found" => Self::IssuesFound,
+            "no_issues_found" => Self::NoIssuesFound,
+            "inconclusive" => Self::Inconclusive,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IssuesFound => "issues_found",
+            Self::NoIssuesFound => "no_issues_found",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+/// Why a review could not establish something. The kind separates what the
+/// reviewer chose not to cover from what the environment or runtime made
+/// impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLimitationKind {
+    /// The surrounding environment (no database, no network, no production
+    /// configuration) prevented the check.
+    Environment,
+    /// Authority or approval boundaries prevented the check.
+    Permission,
+    /// The review surface itself has no such capability (for example: it holds
+    /// no command tool, so it cannot run tests).
+    ToolCapability,
+    /// The user's requested scope did not include this area.
+    Scope,
+    /// The reviewed object moved after capture.
+    ObjectChanged,
+    Other,
+}
+
+impl ReviewLimitationKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "environment" => Self::Environment,
+            "permission" => Self::Permission,
+            "tool_capability" | "tool" => Self::ToolCapability,
+            "scope" => Self::Scope,
+            "object_changed" => Self::ObjectChanged,
+            "other" => Self::Other,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Permission => "permission",
+            Self::ToolCapability => "tool_capability",
+            Self::Scope => "scope",
+            Self::ObjectChanged => "object_changed",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One declared limitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewLimitation {
+    pub kind: ReviewLimitationKind,
+    pub detail: String,
+}
+
+/// One dimension's declared coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCoverage {
+    pub dimension: ReviewDimension,
+    pub status: ReviewCoverageStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Concrete references (file:line, event sequence, command output) the
+    /// reviewer used. Not a proof of correctness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limitations: Option<String>,
+}
+
+/// The structured part of a review report: what the reviewer claims to have
+/// covered, what stopped it, and its conclusion. Only the `report_review`
+/// tool writes this; the final prose is never parsed for these fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewVerdict {
+    pub conclusion: ReviewConclusion,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<ReviewCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<ReviewLimitation>,
+}
+
+/// Optional review fields on a finding. Every field is defaulted and optional
+/// so an explorer/worker `report_finding` call keeps exactly its old shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<ReviewDimension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<FindingSeverity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<FindingConfidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reproduced: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One durable finding. Identity is `id`, assigned by the ledger that owns the
 /// record (child ids never leak into the parent ledger — adoption re-keys).
 ///
@@ -82,6 +359,10 @@ pub struct FindingRecord {
     pub file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Review fields. Absent on every finding produced before manual review,
+    /// and on ordinary explorer/worker reports.
+    #[serde(flatten, default)]
+    pub details: FindingDetails,
 }
 
 /// How a child's run ended, in the four readings a parent must tell apart.
@@ -212,6 +493,30 @@ mod tests {
             summary: format!("summary {id}"),
             file: None,
             symbol: None,
+            details: FindingDetails::default(),
+        }
+    }
+
+    /// An explorer/worker finding keeps its old wire shape: review-only keys
+    /// (including `reproduced: false`) do not appear at all.
+    #[test]
+    fn ordinary_findings_keep_the_legacy_json_shape() {
+        let json = serde_json::to_string(&rec("f-1", "a1")).unwrap();
+        for key in [
+            "title",
+            "dimension",
+            "severity",
+            "confidence",
+            "line",
+            "evidence",
+            "impact",
+            "recommendation",
+            "reproduced",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "{key} leaked: {json}"
+            );
         }
     }
 
@@ -239,6 +544,52 @@ mod tests {
 
     /// A snapshot written before the lifecycle was deleted still replays: the
     /// dropped fields are ignored, not a decode failure.
+    #[test]
+    fn review_fields_round_trip_and_legacy_records_still_decode() {
+        let rec = FindingRecord {
+            id: "f-1".into(),
+            source_child: "review-1".into(),
+            role: "reviewer".into(),
+            kind: FindingKind::Correctness,
+            summary: "missing owner check".into(),
+            file: Some("src/auth.rs".into()),
+            symbol: None,
+            details: FindingDetails {
+                title: Some("SQL 缺少 owner 校验".into()),
+                dimension: Some(ReviewDimension::Security),
+                severity: Some(FindingSeverity::P1),
+                confidence: Some(FindingConfidence::High),
+                line: Some(42),
+                evidence: Some("src/auth.rs:42".into()),
+                impact: Some("跨租户读取".into()),
+                recommendation: Some("按 owner 过滤".into()),
+                reproduced: true,
+            },
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert_eq!(serde_json::from_str::<FindingRecord>(&json).unwrap(), rec);
+
+        // A pre-review finding has none of the new keys and still decodes.
+        let legacy = r#"{"id":"f-1","kind":"risk","summary":"old"}"#;
+        let decoded: FindingRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.details, FindingDetails::default());
+    }
+
+    #[test]
+    fn review_field_parsers_refuse_unknown_values() {
+        assert_eq!(
+            ReviewDimension::parse("security"),
+            Some(ReviewDimension::Security)
+        );
+        assert_eq!(ReviewDimension::parse("nonsense"), None);
+        assert_eq!(FindingSeverity::parse("P1"), Some(FindingSeverity::P1));
+        assert_eq!(FindingSeverity::parse("p9"), None);
+        assert_eq!(
+            FindingConfidence::parse("low"),
+            Some(FindingConfidence::Low)
+        );
+    }
+
     #[test]
     fn a_legacy_record_with_state_and_blocking_still_decodes() {
         let json = r#"{"id":"f-1","source_child":"a1","role":"reviewer",
@@ -273,5 +624,47 @@ mod tests {
             !p.read_only,
             "absent means not recorded, and false is the floor"
         );
+    }
+
+    #[test]
+    fn a_structured_verdict_roundtrips_without_being_derived_from_prose() {
+        let verdict = ReviewVerdict {
+            conclusion: ReviewConclusion::IssuesFound,
+            coverage: vec![ReviewCoverage {
+                dimension: ReviewDimension::Security,
+                status: ReviewCoverageStatus::Partial,
+                scope: Some("支付模块".into()),
+                evidence_refs: vec!["src/auth.rs:42".into()],
+                limitations: Some("无法访问生产配置".into()),
+            }],
+            limitations: vec![ReviewLimitation {
+                kind: ReviewLimitationKind::ToolCapability,
+                detail: "没有命令工具，不能运行测试".into(),
+            }],
+        };
+        let json = serde_json::to_string(&verdict).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReviewVerdict>(&json).unwrap(),
+            verdict
+        );
+    }
+
+    #[test]
+    fn verdict_parsers_refuse_unknown_values() {
+        assert_eq!(
+            ReviewCoverageStatus::parse("reviewed"),
+            Some(ReviewCoverageStatus::Reviewed)
+        );
+        assert_eq!(ReviewCoverageStatus::parse("all_good"), None);
+        assert_eq!(
+            ReviewConclusion::parse("NO_ISSUES_FOUND"),
+            Some(ReviewConclusion::NoIssuesFound)
+        );
+        assert_eq!(ReviewConclusion::parse("passed"), None);
+        assert_eq!(
+            ReviewLimitationKind::parse("tool"),
+            Some(ReviewLimitationKind::ToolCapability)
+        );
+        assert_eq!(ReviewLimitationKind::parse("vibes"), None);
     }
 }

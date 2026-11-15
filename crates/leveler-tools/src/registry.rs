@@ -16,6 +16,10 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 /// source for "may run without a plan / read-only subset" decisions — the
 /// R006 incident came from a second, narrower copy of this list drifting
 /// (git_status missing) and the plan gate refusing a read-only tool.
+///
+/// `session_history` is composed by the APPLICATION and registered only on a
+/// manual review surface; listing it here is what keeps it alive through the
+/// reviewer's read-only projection.
 pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "blast_radius",
     "computer_observe",
@@ -35,6 +39,7 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "read_file",
     "read_project_rules",
     "read_symbol",
+    "session_history",
     "update_plan",
     "view_image",
 ];

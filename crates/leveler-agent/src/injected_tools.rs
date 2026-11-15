@@ -919,7 +919,10 @@ pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
             when the run stops early.\n\n\
             Arguments: `kind` (required: relevant_file, relevant_symbol, \
             dependency, callsite, risk, test, config, observation, correctness), \
-            `summary` (required text), optional `file`, optional `symbol`."
+            `summary` (required text), optional `file`, optional `symbol`. \
+            Reviewers may also supply `title`, `dimension`, `severity`, \
+            `confidence`, `line`, `evidence`, `impact`, `recommendation` and \
+            `reproduced`; ordinary explorers/workers can omit them."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -938,9 +941,130 @@ pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
                     "description": "One specific, evidence-backed sentence."
                 },
                 "file": { "type": "string", "description": "The file it concerns, if any." },
-                "symbol": { "type": "string", "description": "The symbol it concerns, if any." }
+                "symbol": { "type": "string", "description": "The symbol it concerns, if any." },
+                "title": {
+                    "type": "string",
+                    "description": "Review only: a one-line title. Defaults to summary."
+                },
+                "dimension": {
+                    "type": "string",
+                    "enum": ["code", "business", "security", "architecture", "test", "delivery", "session"],
+                    "description": "Review only: which review lens found this."
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["p0", "p1", "p2", "p3"],
+                    "description": "Review only: impact if real. p0 is critical."
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "Review only: confidence that the finding is real."
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Review only: 1-based line in `file`."
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Review only: the concrete code path, output or test that shows it."
+                },
+                "impact": {
+                    "type": "string",
+                    "description": "Review only: what goes wrong, for whom, under which input/timing."
+                },
+                "recommendation": {
+                    "type": "string",
+                    "description": "Review only: the direction of a fix."
+                },
+                "reproduced": {
+                    "type": "boolean",
+                    "description": "Review only: whether the reviewer actually reproduced it."
+                }
             },
             "required": ["kind", "summary"]
+        }),
+    }
+}
+
+/// The tool a REVIEWER calls to declare its coverage, limitations and
+/// conclusion as data.
+pub(crate) const REPORT_REVIEW_TOOL: &str = "report_review";
+
+pub(crate) fn report_review_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_REVIEW_TOOL.to_string(),
+        description: "Declare the review's structured result. Call it once, after \
+            the investigation and before the final message. It records what you \
+            actually covered, what stopped you, and your conclusion; the runtime \
+            stores these as data and never parses your final prose for them.\n\n\
+            `conclusion` is your verdict: issues_found, no_issues_found or \
+            inconclusive. It is independent of the execution status: a completed \
+            review may be inconclusive, and a review with no findings is not \
+            automatically no_issues_found.\n\n\
+            `coverage` lists one entry per dimension you actually examined. Omit \
+            dimensions outside the requested scope; do not claim `reviewed` for a \
+            dimension you only skimmed. `limitations` states what you could not \
+            establish and why (`environment`, `permission`, `tool_capability`, \
+            `scope`, `other`)."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "conclusion": {
+                    "type": "string",
+                    "enum": ["issues_found", "no_issues_found", "inconclusive"],
+                    "description": "The reviewer's verdict for this declared scope."
+                },
+                "coverage": {
+                    "type": "array",
+                    "description": "One entry per dimension actually examined.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "dimension": {
+                                "type": "string",
+                                "enum": ["code", "business", "security", "architecture", "test", "delivery", "session"]
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["not_applicable", "not_reviewed", "partial", "reviewed"]
+                            },
+                            "scope": {
+                                "type": "string",
+                                "description": "The concrete area or files this dimension covered."
+                            },
+                            "evidence_refs": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "File:line, event sequence or command evidence you used."
+                            },
+                            "limitations": {
+                                "type": "string",
+                                "description": "What this dimension could not cover."
+                            }
+                        },
+                        "required": ["dimension", "status"]
+                    }
+                },
+                "limitations": {
+                    "type": "array",
+                    "description": "Review-wide limits on what could be established.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["environment", "permission", "tool_capability", "scope", "other"]
+                            },
+                            "detail": { "type": "string" }
+                        },
+                        "required": ["kind", "detail"]
+                    }
+                }
+            },
+            "required": ["conclusion"]
         }),
     }
 }

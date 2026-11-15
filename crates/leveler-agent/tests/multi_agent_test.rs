@@ -4121,6 +4121,7 @@ async fn an_unjudged_finding_does_not_refuse_completion() {
             summary: "login() accepts any password".into(),
             file: Some("src/auth.rs".into()),
             symbol: None,
+            details: Default::default(),
         },
     );
 

@@ -221,6 +221,24 @@ impl Executor {
                 call,
             });
         }
+        // A reviewer seat is structurally read-only: FullAccess removes
+        // ASK/DENY for the user's own actions, but it must not hand a manual
+        // reviewer a tool the seat does not hold. Checked BEFORE approval and
+        // before the Full shortcut, so no approval path can widen this seat.
+        if self.depth > 0
+            && self.agent_role == crate::sub_agent::AgentRole::Reviewer
+            && self.tool(&call.name).is_some()
+            && self.projected_tool_registry().get(&call.name).is_none()
+        {
+            return Err(AdmitError::Refused {
+                reason: format!(
+                    "`{}` is not part of a read-only review seat; the reviewer may only \
+                     read, search and report",
+                    call.name
+                ),
+                call,
+            });
+        }
         if !ctx.policy.unrestricted_execution()
             && self
                 .capabilities
@@ -1504,6 +1522,7 @@ mod authorize_tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::sub_agent::AgentRole;
     use leveler_core::ToolCallId;
     use leveler_execution::{Approver, PermissionProfile, Workspace};
     use leveler_model::{
@@ -3715,5 +3734,52 @@ mod authorize_tests {
                 "an explicit URL with a stored credential must ask before it uses it: {other:?}"
             ),
         }
+    }
+
+    /// A reviewer seat stays read-only in EVERY permission mode. FullAccess
+    /// removes ASK/DENY; it must not re-admit a write or command tool the seat
+    /// does not hold.
+    #[tokio::test]
+    async fn a_reviewer_seat_refuses_tools_outside_its_projection_under_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            ToolContext::new(
+                Workspace::new(dir.path()).unwrap(),
+                PermissionProfile::Assisted,
+            ),
+            ModelRef::new("mock", "m"),
+            0,
+        );
+        parent
+            .tool_context
+            .policy
+            .permission_profile()
+            .set(PermissionProfile::FullAccess);
+        let child = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        let mut approved = HashSet::new();
+        for name in ["write_file", "apply_patch", "run_command"] {
+            let refused = child
+                .admit(
+                    call(name, serde_json::json!({})),
+                    child.tool_context.clone(),
+                    false,
+                    &mut approved,
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(refused.is_err(), "{name} must be refused on a review seat");
+        }
+        let read = child
+            .admit(
+                call("read_file", serde_json::json!({"path": "x"})),
+                child.tool_context.clone(),
+                false,
+                &mut approved,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(read.is_ok(), "a read tool is still part of the seat");
     }
 }

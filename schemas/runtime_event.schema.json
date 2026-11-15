@@ -2168,6 +2168,158 @@
       }
     },
     {
+      "description": "A manual review was admitted and is now running. The summary is the durable row's projection at start; later progress and the terminal update the same card by `id`.",
+      "type": "object",
+      "required": [
+        "review",
+        "type"
+      ],
+      "properties": {
+        "review": {
+          "$ref": "#/definitions/UiReviewSummary"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "review_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Live activity for one running review. Transient: the durable report is the authority once it settles.",
+      "type": "object",
+      "required": [
+        "active",
+        "cached_input_tokens",
+        "input_tokens",
+        "output_tokens",
+        "review_id",
+        "type"
+      ],
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "cached_input_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "elapsed_ms": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "review_id": {
+          "type": "string"
+        },
+        "tool": {
+          "description": "The most recent tool the reviewer used, when there was one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "review_progress"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A manual review settled. `Completed` means the reviewer reached a clean end — not that no defects exist.",
+      "type": "object",
+      "required": [
+        "review",
+        "type"
+      ],
+      "properties": {
+        "review": {
+          "$ref": "#/definitions/UiReviewSummary"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "review_finished"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::QueryReviewReport`]. The report is the durable row, not a reconstruction from the live event stream.",
+      "type": "object",
+      "required": [
+        "report",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "report": {
+          "$ref": "#/definitions/UiReviewReport"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "review_report_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::ListReviews`], newest first.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiReviewSummary"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "review_history_loaded"
+          ]
+        }
+      }
+    },
+    {
       "description": "A transient notification for the status line.",
       "type": "object",
       "required": [
@@ -6144,6 +6296,158 @@
               "type": "string",
               "enum": [
                 "agent_mutated"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A manual review was admitted and is now running. The summary is the durable row's projection at start; later progress and the terminal update the same card by `id`.",
+          "type": "object",
+          "required": [
+            "review",
+            "type"
+          ],
+          "properties": {
+            "review": {
+              "$ref": "#/definitions/UiReviewSummary"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "review_started"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Live activity for one running review. Transient: the durable report is the authority once it settles.",
+          "type": "object",
+          "required": [
+            "active",
+            "cached_input_tokens",
+            "input_tokens",
+            "output_tokens",
+            "review_id",
+            "type"
+          ],
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "cached_input_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "elapsed_ms": {
+              "default": 0,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "input_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "output_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "review_id": {
+              "type": "string"
+            },
+            "tool": {
+              "description": "The most recent tool the reviewer used, when there was one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "review_progress"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A manual review settled. `Completed` means the reviewer reached a clean end — not that no defects exist.",
+          "type": "object",
+          "required": [
+            "review",
+            "type"
+          ],
+          "properties": {
+            "review": {
+              "$ref": "#/definitions/UiReviewSummary"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "review_finished"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::QueryReviewReport`]. The report is the durable row, not a reconstruction from the live event stream.",
+          "type": "object",
+          "required": [
+            "report",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "report": {
+              "$ref": "#/definitions/UiReviewReport"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "review_report_loaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::ListReviews`], newest first.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reviews": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/UiReviewSummary"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "review_history_loaded"
               ]
             }
           }
@@ -10330,6 +10634,669 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
+        }
+      }
+    },
+    "UiReviewConclusion": {
+      "description": "The reviewer's own verdict, independent of execution status and counts.",
+      "type": "string",
+      "enum": [
+        "issues_found",
+        "no_issues_found",
+        "inconclusive"
+      ]
+    },
+    "UiReviewConfidence": {
+      "description": "How sure the reviewer is that the finding is real, distinct from how bad it would be if it were real.",
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "UiReviewCounts": {
+      "description": "Counts by severity. `unclassified` is an explicit bucket: a finding without a declared severity is not silently promoted to P2.",
+      "type": "object",
+      "required": [
+        "p0",
+        "p1",
+        "p2",
+        "p3",
+        "unclassified"
+      ],
+      "properties": {
+        "p0": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "p1": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "p2": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "p3": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "unclassified": {
+          "description": "Findings recorded without a severity (usually a non-review child).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiReviewCoverage": {
+      "description": "One dimension's declared coverage.",
+      "type": "object",
+      "required": [
+        "dimension",
+        "status"
+      ],
+      "properties": {
+        "dimension": {
+          "$ref": "#/definitions/UiReviewDimension"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limitations": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/UiReviewCoverageStatus"
+        }
+      }
+    },
+    "UiReviewCoverageStatus": {
+      "description": "How far one dimension was actually covered. `Reviewed` is the reviewer's declaration about its own scope, not a correctness proof.",
+      "type": "string",
+      "enum": [
+        "not_applicable",
+        "not_reviewed",
+        "partial",
+        "reviewed"
+      ]
+    },
+    "UiReviewDimension": {
+      "description": "Review dimensions. A finding may belong to one dimension; the report also states which dimensions were covered and which were not.",
+      "type": "string",
+      "enum": [
+        "code",
+        "business",
+        "security",
+        "architecture",
+        "test",
+        "delivery",
+        "session"
+      ]
+    },
+    "UiReviewFinding": {
+      "description": "One finding in the client-facing report. Stable `id` is the review ledger's own sequence; the report never re-keys another agent's records.",
+      "type": "object",
+      "required": [
+        "id",
+        "summary",
+        "title"
+      ],
+      "properties": {
+        "confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiReviewConfidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dimension": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiReviewDimension"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "impact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "The `report_finding` kind (`correctness`, `risk`, …).",
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "recommendation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reproduced": {
+          "description": "Whether the reviewer reproduced the problem, as opposed to reasoning from the code alone. `false` is not a claim that it is wrong.",
+          "default": false,
+          "type": "boolean"
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiReviewSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "One-line title. Falls back to `summary` when the reviewer supplied none.",
+          "type": "string"
+        }
+      }
+    },
+    "UiReviewLimitation": {
+      "description": "One limitation, attributed to whoever observed it.",
+      "type": "object",
+      "required": [
+        "detail",
+        "kind",
+        "source"
+      ],
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/UiReviewLimitationKind"
+        },
+        "source": {
+          "$ref": "#/definitions/UiReviewLimitationSource"
+        }
+      }
+    },
+    "UiReviewLimitationKind": {
+      "description": "What stopped the review from establishing something.",
+      "type": "string",
+      "enum": [
+        "environment",
+        "permission",
+        "tool_capability",
+        "scope",
+        "object_changed",
+        "other"
+      ]
+    },
+    "UiReviewLimitationSource": {
+      "description": "Where a limitation came from. `Runtime` is a mechanical fact the runtime observed; `Reviewer` is the model's own statement.",
+      "type": "string",
+      "enum": [
+        "reviewer",
+        "runtime"
+      ]
+    },
+    "UiReviewObject": {
+      "description": "The concrete object a review was performed against. Captured before the reviewer starts and re-checked when it ends, so a report can say whether the workspace moved under it.",
+      "type": "object",
+      "properties": {
+        "captured_at": {
+          "description": "RFC 3339 capture time.",
+          "type": "string"
+        },
+        "dirty": {
+          "description": "Whether the worktree had uncommitted changes when captured.",
+          "default": false,
+          "type": "boolean"
+        },
+        "files": {
+          "description": "Files the requested scope resolved to, repository-relative and capped.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fingerprint": {
+          "description": "SHA-256 over the scope, revision, diff, workspace HEAD/status and a bounded sample of untracked files. Used only to detect movement; it is not an identity of the whole repository and a file's middle beyond the sample is not hashed.",
+          "type": "string"
+        },
+        "head": {
+          "description": "`git rev-parse HEAD` at capture time, when the workspace is a Git repo.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "The commit/branch the request named, when it named one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "untracked": {
+          "description": "New files not tracked by Git at capture time.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workspace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UiReviewReport": {
+      "description": "The full report behind a summary card.",
+      "type": "object",
+      "required": [
+        "findings",
+        "object",
+        "report",
+        "summary"
+      ],
+      "properties": {
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiReviewFinding"
+          }
+        },
+        "object": {
+          "$ref": "#/definitions/UiReviewObject"
+        },
+        "report": {
+          "description": "The reviewer's final report, verbatim. The runtime does not parse it for control flow; coverage, limitations and the conclusion are the reviewer's own statements and are rendered as written.",
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/definitions/UiReviewSummary"
+        },
+        "verdict": {
+          "description": "Structured coverage, limitations and conclusion. Absent fields are \"not declared\"; the runtime never derives them from the prose below.",
+          "default": {},
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiReviewVerdict"
+            }
+          ]
+        }
+      }
+    },
+    "UiReviewScope": {
+      "description": "What the review is about. The runtime resolves this into concrete files, a diff and an object identity before the reviewer starts.",
+      "oneOf": [
+        {
+          "description": "The current task's delivery in this session: its user objective, the files its latest settled delivery touched, and its final claim.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "current_task"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Uncommitted changes in the session workspace.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "workspace"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The whole project: the reviewer reads the repository itself.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "project"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The current session, or another stored session named by id.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "session"
+              ]
+            },
+            "session_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SessionId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "One commit, reviewed from `git show`.",
+          "type": "object",
+          "required": [
+            "kind",
+            "rev"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "commit"
+              ]
+            },
+            "rev": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "The current branch relative to `base` (`git diff base...HEAD`).",
+          "type": "object",
+          "required": [
+            "base",
+            "kind"
+          ],
+          "properties": {
+            "base": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "branch"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Explicit files, directories or modules.",
+          "type": "object",
+          "required": [
+            "kind",
+            "paths"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "paths"
+              ]
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "UiReviewSeverity": {
+      "description": "Finding severity. P0 is a confirmed critical defect; P3 is a low-impact observation worth recording.",
+      "type": "string",
+      "enum": [
+        "p0",
+        "p1",
+        "p2",
+        "p3"
+      ]
+    },
+    "UiReviewStatus": {
+      "description": "Lifecycle of one manual review. `Completed` says the reviewer reached a clean end; it never means the object is defect-free.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "completed",
+            "cancelled",
+            "failed"
+          ]
+        },
+        {
+          "description": "The reviewer stopped on a budget or an abnormal stop before finishing. Findings it had established survive.",
+          "type": "string",
+          "enum": [
+            "incomplete"
+          ]
+        }
+      ]
+    },
+    "UiReviewSummary": {
+      "description": "The summary a conversation card and history list carry.",
+      "type": "object",
+      "required": [
+        "counts",
+        "created_at",
+        "focus",
+        "id",
+        "model",
+        "scope",
+        "session_id",
+        "status"
+      ],
+      "properties": {
+        "conclusion": {
+          "description": "The reviewer's own verdict, when it declared one. Absent is \"not declared\", never \"no issues\".",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiReviewConclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "counts": {
+          "$ref": "#/definitions/UiReviewCounts"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "failure": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focus": {
+          "description": "The user's review focus, verbatim.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "model": {
+          "description": "The model that performed the review.",
+          "type": "string"
+        },
+        "modified_source": {
+          "description": "The reviewer changed product files. The read-only seat makes this a contract violation, recorded rather than hidden.",
+          "default": false,
+          "type": "boolean"
+        },
+        "object_changed": {
+          "description": "The object moved between capture and the end of the review. A report that says so is a report about the object as it was, not as it is.",
+          "default": false,
+          "type": "boolean"
+        },
+        "scope": {
+          "$ref": "#/definitions/UiReviewScope"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "status": {
+          "$ref": "#/definitions/UiReviewStatus"
+        },
+        "stop_detail": {
+          "description": "Why a non-completed review stopped (budget, cancellation, abnormal stop), kept separate from `failure`: an incomplete review is not a failed one, and its partial findings are still evidence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usage": {
+          "default": {
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiReviewUsage"
+            }
+          ]
+        }
+      }
+    },
+    "UiReviewUsage": {
+      "description": "Model spend attributed to this review, read from the runtime's durable model-request ledger. Unknown cost stays `None`, never zero.",
+      "type": "object",
+      "properties": {
+        "cached_input_tokens": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cost_usd_micros": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiReviewVerdict": {
+      "description": "Structured coverage, limitations and conclusion. Every collection may be empty; an empty verdict means the reviewer declared nothing.",
+      "type": "object",
+      "properties": {
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiReviewConclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiReviewCoverage"
+          }
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiReviewLimitation"
+          }
         }
       }
     },

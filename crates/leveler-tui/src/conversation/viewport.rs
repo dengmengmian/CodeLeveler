@@ -189,6 +189,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if height == 0 || width == 0 {
         state.conv.rect = None;
         state.conv.scroll_bottom_rect = None;
+        state.review_hits.clear();
         return;
     }
 
@@ -234,6 +235,26 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let follow = state.conv.auto_scroll && !crate::splash::conversation_is_empty(state);
     let scroll =
         crate::conversation::geometry::effective_scroll(state.conv.scroll, follow, total, height);
+
+    // Publish review-card hit rows from the same projection that paints them.
+    // Identity is the durable review id, never a line number a reflow changes.
+    state.review_hits.clear();
+    for (index, item) in state.transcript.items().iter().enumerate() {
+        let TranscriptItem::Review(block) = item else {
+            continue;
+        };
+        let Some(&(start, end)) = item_spans.get(index) else {
+            continue;
+        };
+        for row in start.max(scroll)..end.min(scroll + height) {
+            state.review_hits.push((
+                content.y + (row - scroll) as u16,
+                content.x,
+                content.x + content.width,
+                block.summary.id.clone(),
+            ));
+        }
+    }
 
     // Only the visible window is cloned + highlighted; the rest stays in the Rc.
     let mut lines: Vec<Line> = all

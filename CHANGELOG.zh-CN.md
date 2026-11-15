@@ -2,6 +2,14 @@
 
 [English](CHANGELOG.md) · [安装与使用](README.zh-CN.md)
 
+## [Unreleased]
+
+- `/review` 提供手动、只读、证据驱动的审查，范围可以是当前任务交付、当前工作区、整个项目、指定 Session、Commit、分支基线或指定路径。审查者以独立子 Agent 运行，拥有自己的审查 ID、预算、取消和持久化报告；`@model provider/model` 可为本次审查选择其他已配置模型，`/review cancel [id]` 可停止运行中的审查。
+- Review Finding 可携带维度、P0–P3 严重度、置信度、证据、影响、修复方向和是否复现；Explorer / Worker 仍使用原有 `report_finding` 形状。审查记录独立存储，并以对话摘要卡和报告页回放；审查不开启回合、不结算 Goal、不修改源码。
+- 审查者可用只读工具 `session_history` 按页读取被审查 Session 的持久化记录（回合、事件与工具结果、消息、模型调用、Goal、检查点）。工具绑定在被审查 Session 上，只在审查面注册。
+- 审查通过 `report_review` 写入结构化结论：结论、各维度覆盖和限制（环境、权限、工具能力、审查范围）。运行时只记录声明，不从报告正文或 Finding 数量推导。
+- 自动审查退役。旧的 `agents.independent_review: required` 仍可加载，但不再在回合、Goal、Commit 或交付结束时自动启动审查。显式测试/评估设置，以及已经处于未结算状态的审查的崩溃恢复，保持原语义。
+
 ## [1.0.27] - 2026-11-15
 
 - 跨会话记忆默认开启。未写 `[memory]` 时解析为 `rollout = "active"`，显式 `rollout = "off"` 才关闭；`record_only` / `shadow` 用于分阶段放量。只有 `active` 会把记忆暴露给模型。所有数据位于 `<LevelerHome>/memory/`；工作区身份取自 git remote，临时工作目录没有工作区作用域。

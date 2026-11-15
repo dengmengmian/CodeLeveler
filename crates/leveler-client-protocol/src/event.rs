@@ -849,6 +849,41 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<crate::UiAgentEntry>,
     },
+    /// A manual review was admitted and is now running. The summary is the
+    /// durable row's projection at start; later progress and the terminal
+    /// update the same card by `id`.
+    ReviewStarted { review: crate::UiReviewSummary },
+    /// Live activity for one running review. Transient: the durable report is
+    /// the authority once it settles.
+    ReviewProgress {
+        review_id: String,
+        active: bool,
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+        /// The most recent tool the reviewer used, when there was one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default)]
+        elapsed_ms: u64,
+    },
+    /// A manual review settled. `Completed` means the reviewer reached a clean
+    /// end — not that no defects exist.
+    ReviewFinished { review: crate::UiReviewSummary },
+    /// Result of [`crate::ClientCommand::QueryReviewReport`]. The report is the
+    /// durable row, not a reconstruction from the live event stream.
+    ReviewReportLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        report: Box<crate::UiReviewReport>,
+    },
+    /// Result of [`crate::ClientCommand::ListReviews`], newest first.
+    ReviewHistoryLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reviews: Vec<crate::UiReviewSummary>,
+    },
     /// A transient notification for the status line.
     Notification {
         level: NotificationLevel,
@@ -1920,6 +1955,111 @@ mod tests {
             },
             "sub_agent_activity",
         );
+    }
+
+    #[test]
+    fn review_events_roundtrip() {
+        let summary = crate::UiReviewSummary {
+            id: "review-1".into(),
+            session_id: leveler_core::SessionId::new("s1"),
+            focus: "检查支付模块".into(),
+            scope: crate::UiReviewScope::Workspace,
+            model: "mock/m".into(),
+            status: crate::UiReviewStatus::Running,
+            created_at: "2026-11-16T00:00:00Z".into(),
+            finished_at: None,
+            counts: crate::UiReviewCounts::default(),
+            conclusion: Some(crate::UiReviewConclusion::IssuesFound),
+            object_changed: false,
+            modified_source: false,
+            failure: None,
+            stop_detail: None,
+            usage: crate::UiReviewUsage::default(),
+        };
+        roundtrip(
+            RuntimeEvent::ReviewStarted {
+                review: summary.clone(),
+            },
+            "review_started",
+        );
+        roundtrip(
+            RuntimeEvent::ReviewProgress {
+                review_id: "review-1".into(),
+                active: true,
+                input_tokens: 10,
+                output_tokens: 2,
+                cached_input_tokens: 4,
+                tool: Some("read_file".into()),
+                elapsed_ms: 120,
+            },
+            "review_progress",
+        );
+        roundtrip(
+            RuntimeEvent::ReviewFinished {
+                review: summary.clone(),
+            },
+            "review_finished",
+        );
+        roundtrip(
+            RuntimeEvent::ReviewReportLoaded {
+                query_id: Some(leveler_core::CommandId::new("q1")),
+                report: Box::new(crate::UiReviewReport {
+                    summary,
+                    object: crate::UiReviewObject::default(),
+                    findings: Vec::new(),
+                    verdict: crate::UiReviewVerdict {
+                        conclusion: Some(crate::UiReviewConclusion::IssuesFound),
+                        coverage: vec![crate::UiReviewCoverage {
+                            dimension: crate::UiReviewDimension::Security,
+                            status: crate::UiReviewCoverageStatus::Partial,
+                            scope: Some("支付模块".into()),
+                            evidence_refs: vec!["src/auth.rs:42".into()],
+                            limitations: Some("无法访问生产配置".into()),
+                        }],
+                        limitations: vec![crate::UiReviewLimitation {
+                            source: crate::UiReviewLimitationSource::Runtime,
+                            kind: crate::UiReviewLimitationKind::ToolCapability,
+                            detail: "没有命令工具".into(),
+                        }],
+                    },
+                    report: "无问题".into(),
+                }),
+            },
+            "review_report_loaded",
+        );
+        roundtrip(
+            RuntimeEvent::ReviewHistoryLoaded {
+                query_id: None,
+                reviews: Vec::new(),
+            },
+            "review_history_loaded",
+        );
+    }
+
+    /// A report stored before the structured verdict existed still decodes:
+    /// absent means "not declared", never a fabricated clean conclusion.
+    #[test]
+    fn a_legacy_review_report_without_verdict_still_decodes() {
+        let json = r#"{
+            "summary": {
+                "id": "review-1",
+                "session_id": "s1",
+                "focus": "旧审查",
+                "scope": {"kind": "workspace"},
+                "model": "mock/m",
+                "status": "completed",
+                "created_at": "2026-11-16T00:00:00Z",
+                "finished_at": "2026-11-16T00:01:00Z",
+                "counts": {"p0":0,"p1":0,"p2":0,"p3":0,"unclassified":0}
+            },
+            "object": {},
+            "findings": [],
+            "report": "旧报告"
+        }"#;
+        let report: crate::UiReviewReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.verdict, crate::UiReviewVerdict::default());
+        assert_eq!(report.summary.conclusion, None);
+        assert_eq!(report.report, "旧报告");
     }
 
     #[test]

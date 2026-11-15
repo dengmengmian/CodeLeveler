@@ -323,6 +323,15 @@ pub struct GoalRecapBlock {
     pub expanded: bool,
 }
 
+/// One manual review in the conversation. The card is a bounded summary; the
+/// report itself is a separate page read from the durable review row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewBlock {
+    pub summary: leveler_client_protocol::UiReviewSummary,
+    /// The reviewer's current tool, while it runs. Presentation only.
+    pub live_tool: Option<String>,
+}
+
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
 /// from running → done in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -574,6 +583,9 @@ pub enum TranscriptItem {
     Recap(RecapBlock),
     /// Durable goal checkpoint presentation (`✽ 阶段回顾`), click-expandable.
     GoalRecap(GoalRecapBlock),
+    /// A manual review's conversation card (`/review`). The card carries a
+    /// summary; the full report opens as a page from its ↗.
+    Review(ReviewBlock),
 }
 
 /// Whether this item is a reasoning block still streaming. The ONE definition
@@ -937,6 +949,70 @@ impl TranscriptState {
             recap,
             expanded: false,
         }));
+    }
+
+    /// Insert or update one review card. Identity is the durable review id:
+    /// a live `ReviewStarted`, a reconnect's history list and a repeated
+    /// terminal all converge on the same block.
+    pub fn upsert_review(&mut self, summary: leveler_client_protocol::UiReviewSummary) {
+        self.bump();
+        if let Some(block) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == summary.id => Some(block),
+            _ => None,
+        }) {
+            block.summary = summary;
+            block.live_tool = None;
+            return;
+        }
+        self.close_tool_group();
+        self.items.push(TranscriptItem::Review(ReviewBlock {
+            summary,
+            live_tool: None,
+        }));
+    }
+
+    /// Update a running review's transient tool label without touching its
+    /// durable state.
+    pub fn note_review_progress(
+        &mut self,
+        review_id: &str,
+        tool: Option<String>,
+        status: Option<leveler_client_protocol::UiReviewStatus>,
+    ) {
+        let Some(block) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == review_id => Some(block),
+            _ => None,
+        }) else {
+            return;
+        };
+        if let Some(tool) = tool {
+            block.live_tool = Some(tool);
+        }
+        if let Some(status) = status {
+            block.summary.status = status;
+        }
+        self.bump();
+    }
+
+    /// Append a page of stored review cards. The runtime lists newest first;
+    /// history is conversation order, so this walks backwards. Existing ids
+    /// are updated in place, never duplicated.
+    pub fn push_review_history(
+        &mut self,
+        mut summaries: Vec<leveler_client_protocol::UiReviewSummary>,
+    ) {
+        summaries.reverse();
+        for summary in summaries {
+            self.upsert_review(summary);
+        }
+    }
+
+    /// The review card with this id, if the conversation holds one.
+    pub fn review(&self, id: &str) -> Option<&ReviewBlock> {
+        self.items.iter().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == id => Some(block),
+            _ => None,
+        })
     }
 
     /// Return a recap when a successful terminal `update_goal` supplied a

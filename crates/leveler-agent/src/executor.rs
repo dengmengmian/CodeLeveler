@@ -1957,6 +1957,20 @@ impl Executor {
     /// Project permissions without discarding actual handles. A profile switch
     /// can expose those same handles on the next call, including in children.
     fn projected_tool_registry(&self) -> ToolRegistry {
+        // A manual-review seat is harness-owned and structurally read-only.
+        // Unlike an explorer (whose Full handles stay recoverable by product
+        // contract), a reviewer must not gain a write/command/spawn handle by
+        // switching the session to Full: review may read and report, nothing
+        // else. Kept here so advertisement, role admission and `capability`
+        // disclosure all read the same projection.
+        if self.depth > 0 && self.agent_role == AgentRole::Reviewer {
+            let registry = crate::sub_agent::ChildProfile::resolve(self.agent_role)
+                .apply_to_registry(&self.registry);
+            return match &self.agent_tool_allowlist {
+                Some(names) => registry.named_subset(names),
+                None => registry,
+            };
+        }
         if self.tool_context.policy.unrestricted_execution() {
             return self.registry.named_subset(&[]);
         }
@@ -2718,7 +2732,10 @@ impl Executor {
                 "\n\nYou are a REVIEWER sub-agent. You have read-only tools and CANNOT modify \
                  files or run commands. The task states the change to judge. `report_finding` \
                  records a finding for the parent. kind `correctness` records a defect in the \
-                 change; other kinds record observations.",
+                 change; other kinds record observations. When the task asks for a structured \
+                 review, supply the optional fields `title`, `dimension`, `severity`, \
+                 `confidence`, `line`, `evidence`, `impact`, `recommendation` and \
+                 `reproduced`. A clean result is a result.",
             ),
             AgentRole::Default => {}
         }
@@ -4063,6 +4080,58 @@ mod ownership_authority_tests {
         assert_eq!(
             parent.ownership.owned_by("child-1"),
             vec!["src/a.rs".to_string()]
+        );
+    }
+
+    /// A reviewer's advertised surface is the read-only subset even under
+    /// FullAccess: the permission mode governs how the tools it DOES hold are
+    /// authorized, not which capability class the seat belongs to.
+    #[test]
+    fn a_reviewer_child_never_advertises_writes_or_commands_under_full_access() {
+        let parent = executor();
+        parent
+            .tool_context
+            .policy
+            .permission_profile()
+            .set(leveler_execution::PermissionProfile::FullAccess);
+        let child = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        let names: Vec<String> = child
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for forbidden in [
+            "apply_patch",
+            "write_file",
+            "run_command",
+            "shell_command",
+            "spawn_agent",
+            "kill_task",
+            "wait_task",
+            "save_agent",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "{forbidden} must not be advertised on a review seat: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "read_file"),
+            "the reviewer keeps its read tools: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "report_review"),
+            "a reviewer declares its structured verdict: {names:?}"
+        );
+        let explorer = parent.child_for_role_on(AgentRole::Explorer, Vec::new(), None);
+        let explorer_names: Vec<String> = explorer
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            !explorer_names.iter().any(|name| name == "report_review"),
+            "an explorer has no review verdict to declare: {explorer_names:?}"
         );
     }
 

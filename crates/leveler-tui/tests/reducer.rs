@@ -13432,3 +13432,318 @@ fn a_live_entry_with_an_ambiguous_durable_id_is_a_conflict() {
     assert_eq!(chrome.outcome(), BackgroundOutcome::Conflict);
     assert!(!chrome.is_running());
 }
+
+// ── Manual review (/review) ──────────────────────────────────────────────────
+
+fn review_summary(
+    id: &str,
+    status: leveler_client_protocol::UiReviewStatus,
+) -> leveler_client_protocol::UiReviewSummary {
+    leveler_client_protocol::UiReviewSummary {
+        id: id.into(),
+        session_id: SessionId::new("s1"),
+        focus: "检查支付模块".into(),
+        scope: leveler_client_protocol::UiReviewScope::Workspace,
+        model: "mock/m".into(),
+        status,
+        created_at: "2026-11-16T00:00:00Z".into(),
+        finished_at: None,
+        counts: leveler_client_protocol::UiReviewCounts::default(),
+        conclusion: None,
+        object_changed: false,
+        modified_source: false,
+        failure: None,
+        stop_detail: None,
+        usage: leveler_client_protocol::UiReviewUsage::default(),
+    }
+}
+
+#[test]
+fn a_bare_review_opens_the_scope_picker_instead_of_starting_a_review() {
+    let mut s = state();
+    s.composer.replace("/review");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(matches!(s.overlay, Some(Overlay::ReviewScopePicker(_))));
+}
+
+#[test]
+fn review_focus_is_carried_verbatim_with_the_default_scope() {
+    let mut s = state();
+    s.composer.replace("/review 检查刚才的业务实现是否正确");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
+        panic!("expected one RunReview, got {effects:?}");
+    };
+    assert_eq!(focus, "检查刚才的业务实现是否正确");
+    assert_eq!(*scope, leveler_client_protocol::UiReviewScope::CurrentTask);
+}
+
+#[test]
+fn review_scope_directives_are_structured_client_commands() {
+    let mut s = state();
+    s.composer
+        .replace("/review @commit abc123 检查这次提交的授权");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
+        panic!("expected one RunReview, got {effects:?}");
+    };
+    assert_eq!(focus, "检查这次提交的授权");
+    assert_eq!(
+        *scope,
+        leveler_client_protocol::UiReviewScope::Commit {
+            rev: "abc123".into()
+        }
+    );
+
+    let mut s = state();
+    s.composer
+        .replace("/review @path src/a.rs,src/b.rs 检查边界");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [Effect::Send(ClientCommand::RunReview { scope, .. })] = &effects[..] else {
+        panic!("expected one RunReview, got {effects:?}");
+    };
+    assert_eq!(
+        *scope,
+        leveler_client_protocol::UiReviewScope::Paths {
+            paths: vec!["src/a.rs".into(), "src/b.rs".into()]
+        }
+    );
+}
+
+#[test]
+fn a_targetless_commit_review_is_refused_before_it_can_lie() {
+    let mut s = state();
+    s.composer.replace("/review @commit");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("用法")),
+        "{:?}",
+        s.notification
+    );
+}
+
+#[test]
+fn a_review_card_updates_in_place_instead_of_duplicating() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Review(_)))
+            .count(),
+        1
+    );
+    let mut finished = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    finished.counts = leveler_client_protocol::UiReviewCounts {
+        p2: 1,
+        ..Default::default()
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished { review: finished }),
+    );
+    let cards: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Review(block) => Some(block),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(
+        cards[0].summary.status,
+        leveler_client_protocol::UiReviewStatus::Completed
+    );
+    assert_eq!(cards[0].summary.counts.p2, 1);
+}
+
+#[test]
+fn review_history_is_idempotent_by_durable_id() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![review_summary(
+                "review-1",
+                leveler_client_protocol::UiReviewStatus::Completed,
+            )],
+        }),
+    );
+    let cards = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::Review(_)))
+        .count();
+    assert_eq!(cards, 1, "history must update the live card, not add one");
+}
+
+#[test]
+fn review_cancel_targets_the_running_review_by_durable_id() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary(
+                "review-running",
+                leveler_client_protocol::UiReviewStatus::Running,
+            ),
+        }),
+    );
+    s.composer.replace("/review cancel");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [
+        Effect::Send(ClientCommand::CancelReview {
+            review_id,
+            session_id: _,
+        }),
+    ] = &effects[..]
+    else {
+        panic!("expected one CancelReview, got {effects:?}");
+    };
+    assert_eq!(review_id, "review-running");
+}
+
+#[test]
+fn a_settled_review_card_renders_counts_and_the_report_entry() {
+    let mut s = state();
+    let mut summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    summary.counts = leveler_client_protocol::UiReviewCounts {
+        p1: 2,
+        p3: 1,
+        ..Default::default()
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished { review: summary }),
+    );
+    let screen = rendered(&mut s, 110, 30);
+    assert!(screen.contains("审查完成"), "{screen}");
+    assert!(screen.contains("P1 2"), "{screen}");
+    assert!(screen.contains("查看报告"), "{screen}");
+    assert!(screen.contains("未修改源码"), "{screen}");
+}
+
+#[test]
+fn the_report_page_renders_findings_and_the_reviewer_report() {
+    let mut s = state();
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    s.review_report = Some(leveler_client_protocol::UiReviewReport {
+        summary,
+        object: leveler_client_protocol::UiReviewObject {
+            workspace: Some("/repo".into()),
+            head: Some("abc123".into()),
+            dirty: true,
+            ..Default::default()
+        },
+        findings: vec![leveler_client_protocol::UiReviewFinding {
+            id: "f-1".into(),
+            title: "缺少 owner 过滤".into(),
+            summary: "读取账单时没有按 owner 过滤".into(),
+            dimension: Some(leveler_client_protocol::UiReviewDimension::Security),
+            severity: Some(leveler_client_protocol::UiReviewSeverity::P1),
+            confidence: Some(leveler_client_protocol::UiReviewConfidence::High),
+            kind: "correctness".into(),
+            file: Some("src/billing.rs".into()),
+            line: Some(42),
+            symbol: None,
+            evidence: Some("src/billing.rs:42".into()),
+            impact: Some("跨租户读取".into()),
+            recommendation: Some("按 owner 过滤".into()),
+            reproduced: false,
+        }],
+        verdict: leveler_client_protocol::UiReviewVerdict {
+            conclusion: Some(leveler_client_protocol::UiReviewConclusion::IssuesFound),
+            coverage: vec![leveler_client_protocol::UiReviewCoverage {
+                dimension: leveler_client_protocol::UiReviewDimension::Security,
+                status: leveler_client_protocol::UiReviewCoverageStatus::Partial,
+                scope: Some("账单读取".into()),
+                evidence_refs: vec!["src/billing.rs:42".into()],
+                limitations: Some("没有真实数据库".into()),
+            }],
+            limitations: vec![leveler_client_protocol::UiReviewLimitation {
+                source: leveler_client_protocol::UiReviewLimitationSource::Runtime,
+                kind: leveler_client_protocol::UiReviewLimitationKind::ToolCapability,
+                detail: "审查者没有命令工具".into(),
+            }],
+        },
+        report: "审查完成：发现一个越权读取问题。".into(),
+    });
+    s.active_screen = Screen::Review;
+    let screen = rendered(&mut s, 110, 60);
+    assert!(screen.contains("审查报告"), "{screen}");
+    assert!(screen.contains("结论"), "{screen}");
+    assert!(screen.contains("发现问题"), "{screen}");
+    assert!(screen.contains("覆盖"), "{screen}");
+    assert!(screen.contains("安全: 部分审查"), "{screen}");
+    assert!(screen.contains("限制"), "{screen}");
+    assert!(screen.contains("运行时/工具能力"), "{screen}");
+    assert!(screen.contains("缺少 owner 过滤"), "{screen}");
+    assert!(screen.contains("src/billing.rs:42"), "{screen}");
+    assert!(screen.contains("跨租户读取"), "{screen}");
+    assert!(
+        screen.contains("审查完成：发现一个越权读取问题。"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_session_review_does_not_eat_its_focus_as_a_session_id() {
+    let mut s = state();
+    s.composer
+        .replace("/review @session 分析 Agent 为什么提前停止");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
+        panic!("expected one RunReview, got {effects:?}");
+    };
+    assert_eq!(focus, "分析 Agent 为什么提前停止");
+    assert_eq!(
+        *scope,
+        leveler_client_protocol::UiReviewScope::Session { session_id: None }
+    );
+
+    let mut s = state();
+    s.composer
+        .replace("/review @session 2df684d7-ba79-479a-8610-e0641c6b3e43 分析为什么提前停止");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
+        panic!("expected one RunReview, got {effects:?}");
+    };
+    assert_eq!(focus, "分析为什么提前停止");
+    assert_eq!(
+        *scope,
+        leveler_client_protocol::UiReviewScope::Session {
+            session_id: Some(SessionId::new("2df684d7-ba79-479a-8610-e0641c6b3e43"))
+        }
+    );
+}

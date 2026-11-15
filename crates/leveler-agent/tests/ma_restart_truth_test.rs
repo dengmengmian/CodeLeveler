@@ -621,6 +621,7 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
         summary: "parser drops trailing comments".into(),
         file: None,
         symbol: None,
+        details: Default::default(),
     });
     append_event(
         &db,

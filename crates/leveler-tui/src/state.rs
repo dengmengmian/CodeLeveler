@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use leveler_client_protocol::{
     AttachmentRef, ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile,
     RuntimeStatus, SessionId, UiApprovalRequest, UiCheckpoint, UiClarificationRequest, UiDiff,
-    UiPlan, UiSessionSummary,
+    UiPlan, UiReviewReport, UiSessionSummary,
 };
 
 use crate::composer::Composer;
@@ -397,6 +397,15 @@ pub struct AppState {
     /// Active plan from the current run, if any. Terminal plans move into the
     /// transcript and never remain in this slot.
     pub plan: Option<UiPlan>,
+    /// The report page's loaded review, if any. The durable review row is the
+    /// authority; this is only the last response this client received.
+    pub review_report: Option<UiReviewReport>,
+    /// Correlation id of the report query in flight.
+    pub review_query: Option<CommandId>,
+    /// Correlation id of the review-history query in flight.
+    pub review_history_query: Option<CommandId>,
+    /// Last-painted review card hit regions: (row, x_start, x_end, review id).
+    pub review_hits: Vec<(u16, u16, u16, String)>,
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
     /// How many files the diff reported during the current turn named. `diff`
@@ -784,6 +793,10 @@ impl AppState {
             schedule: crate::schedules::ScheduleState::default(),
             memory: crate::memory::MemoryState::default(),
             plan: None,
+            review_report: None,
+            review_query: None,
+            review_history_query: None,
+            review_hits: Vec::new(),
             project_rule_sources: Vec::new(),
             turn_diff_files: None,
             history_query: None,

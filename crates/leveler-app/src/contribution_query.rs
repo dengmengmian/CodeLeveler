@@ -126,6 +126,7 @@ mod tests {
             summary: format!("summary {id}"),
             file: Some("src/auth.rs".into()),
             symbol: None,
+            details: Default::default(),
         }
     }
 

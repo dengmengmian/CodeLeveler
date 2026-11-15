@@ -1237,6 +1237,38 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .replace("{to}", &to_tokens.to_string()),
             });
         }
+        RuntimeEvent::ReviewStarted { review } => {
+            state.transcript.upsert_review(review);
+        }
+        RuntimeEvent::ReviewProgress {
+            review_id, tool, ..
+        } => {
+            // The card's status stays `running`; the live tool is transient.
+            state
+                .transcript
+                .note_review_progress(&review_id, tool, None);
+        }
+        RuntimeEvent::ReviewFinished { review } => {
+            state.transcript.upsert_review(review);
+        }
+        RuntimeEvent::ReviewReportLoaded { query_id, report } => {
+            let ours = query_id.is_some() && query_id == state.review_query;
+            if !ours {
+                return;
+            }
+            state.review_query = None;
+            state.review_report = Some(*report);
+            state.active_screen = crate::screen::Screen::Review;
+            state.screen_scroll = 0;
+        }
+        RuntimeEvent::ReviewHistoryLoaded { query_id, reviews } => {
+            let ours = query_id.is_some() && query_id == state.review_history_query;
+            if !ours {
+                return;
+            }
+            state.review_history_query = None;
+            state.transcript.push_review_history(reviews);
+        }
         RuntimeEvent::Notification { level, message } => {
             // Errors stick until Esc / next turn; also land in the transcript so
             // a glance away cannot lose them to the status TTL.
@@ -2577,6 +2609,16 @@ fn apply_session_with(
         state.completion.reset_on_edit();
         // A committed task belongs to the session that committed it.
         state.execution_task_active = false;
+        // A review report and its query belong to the session that requested
+        // it. Opening another session must never show the old report.
+        state.review_report = None;
+        state.review_query = None;
+        state.review_history_query = None;
+        state.review_hits.clear();
+        if state.active_screen == crate::screen::Screen::Review {
+            state.active_screen = crate::screen::Screen::Conversation;
+            state.screen_scroll = 0;
+        }
     }
     // Snapshot is runtime truth. A pending Shift+Tab from the previous
     // connection must not keep driving the cycle, and a next-step ghost from

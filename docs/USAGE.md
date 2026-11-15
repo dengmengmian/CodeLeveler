@@ -127,6 +127,32 @@ Or `leveler mcp add devorder --url http://127.0.0.1:8081/mcp --header X-API-Key=
 
 `leveler mcp list` prints the transport, the URL, and header names. `leveler doctor` warns when a referenced variable is unset. The Tools view shows a call after it runs; connection state is in the log (`MCP server connected`, including the negotiated protocol version and tool count).
 
+## Review
+
+`/review` starts a manual, read-only review. It is the only entry: an ordinary message, a completed turn, a commit or a delivery never starts one. A review has its own id, budget, cancellation and durable report; it opens no turn and changes no source.
+
+Bare `/review` opens a scope picker. The default is the current task (its accepted delivery and the files that delivery changed, never every file another session touched). Add the user's own focus after the command:
+
+```
+/review 检查支付模块的安全边界
+/review @workspace 检查当前未提交改动
+/review @project 检查整个项目
+/review @session <session-id> 分析这次执行过程
+/review @commit <rev> 检查这次提交
+/review @branch <base> 检查当前分支相对 base 的提交
+/review @path src/a.rs,src/b.rs 检查这两个文件的边界
+/review @model provider/model 检查...      # this review only
+/review cancel [review-id]                 # stop a running review
+```
+
+The reviewer reads the objective, the user's own adjustments, the requested object and, where possible, its diff. For a session or an execution question it can also page through the reviewed session's durable record with the read-only `session_history` tool: turns and their terminal states, events and tool results, user/assistant messages, every model request's tokens and latency, goals and requirement changes, and checkpoints. The tool is bound to the reviewed session — the model cannot name another one — and ordinary agents never see it.
+
+It records findings with an optional dimension (code, business, security, architecture, test, delivery, session), P0–P3 severity, confidence, evidence, impact, a fix direction and whether it reproduced them. It also declares a structured verdict through `report_review`: a conclusion (issues found / none found / inconclusive), per-dimension coverage (reviewed, partial, not reviewed, not applicable), and limitations attributed to the environment, permissions, tool capability or the requested scope. The runtime records what was declared; it never derives these from the report prose or finding counts. A finding is information: it never blocks a goal or changes a turn's terminal.
+
+When it settles, the conversation shows a card (`P0/P1/P2/P3`, finding count, whether source was modified). Click the card — or its `查看报告 ↗` — to open the report page; the report is read from the durable review row, so reopening a session shows the same card and report. A review object that changed while the review ran says so instead of presenting a stale report as current.
+
+`Completed` means the reviewer reached a clean end, not that no defects exist. A declared coverage of `reviewed` is the reviewer's statement about its own scope, not a runtime proof. `No findings` is not proof of correctness or security. An incomplete or cancelled review keeps whatever it had already established and says what stopped it.
+
 ## Troubleshooting
 
 Run `leveler doctor` to check models, terminal support, and system capabilities. Use `leveler trace` to inspect session records. Check for private content before sharing them.

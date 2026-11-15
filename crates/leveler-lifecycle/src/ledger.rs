@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::findings::{FindingKind, FindingRecord};
+use crate::findings::{FindingKind, FindingRecord, ReviewVerdict};
 use crate::plan::PlanState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +53,13 @@ pub struct EvidenceLedger {
     /// Monotonic id source for findings owned by THIS ledger.
     #[serde(default)]
     pub next_finding_seq: u64,
+    /// The reviewer's structured coverage, limitations and conclusion.
+    ///
+    /// Written only by the `report_review` tool. `None` means the reviewer did
+    /// not declare one — it is never inferred from findings or final prose.
+    /// Serde-default so every pre-review ledger snapshot still replays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewVerdict>,
 }
 
 impl EvidenceLedger {
@@ -104,6 +111,26 @@ impl EvidenceLedger {
         file: Option<String>,
         symbol: Option<String>,
     ) -> String {
+        self.record_finding_with(
+            kind,
+            summary,
+            file,
+            symbol,
+            crate::findings::FindingDetails::default(),
+        )
+    }
+
+    /// [`Self::record_finding`] with the optional review fields. Ordinary
+    /// explorer/worker calls pass [`crate::FindingDetails::default`], which
+    /// serializes to exactly the old shape.
+    pub fn record_finding_with(
+        &mut self,
+        kind: FindingKind,
+        summary: impl Into<String>,
+        file: Option<String>,
+        symbol: Option<String>,
+        details: crate::findings::FindingDetails,
+    ) -> String {
         self.next_finding_seq = self.next_finding_seq.saturating_add(1);
         let id = format!("f-{}", self.next_finding_seq);
         self.findings.push(FindingRecord {
@@ -114,6 +141,7 @@ impl EvidenceLedger {
             summary: summary.into(),
             file,
             symbol,
+            details,
         });
         id
     }
@@ -135,6 +163,14 @@ impl EvidenceLedger {
     pub fn finding(&self, id: &str) -> Option<&FindingRecord> {
         self.findings.iter().find(|f| f.id == id)
     }
+
+    /// Store the reviewer's structured declaration. A later call replaces the
+    /// earlier one: the ledger holds the reviewer's current statement, not a
+    /// history of drafts.
+    pub fn set_review_verdict(&mut self, verdict: ReviewVerdict) {
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.review = Some(verdict);
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +186,26 @@ mod finding_tests {
         assert_eq!((a.as_str(), b.as_str()), ("f-1", "f-2"));
         assert_eq!(led.findings.len(), 2);
         assert_eq!(led.finding("f-1").unwrap().summary, "r1");
+    }
+
+    /// The verdict is a model declaration carried by the ledger. A snapshot
+    /// written before manual review has no `review` key and must replay.
+    #[test]
+    fn a_review_verdict_is_stored_verbatim_and_absent_by_default() {
+        let mut led = EvidenceLedger::default();
+        assert!(led.review.is_none());
+        let verdict = crate::findings::ReviewVerdict {
+            conclusion: crate::findings::ReviewConclusion::Inconclusive,
+            coverage: Vec::new(),
+            limitations: vec![crate::findings::ReviewLimitation {
+                kind: crate::findings::ReviewLimitationKind::Environment,
+                detail: "no production database".into(),
+            }],
+        };
+        led.set_review_verdict(verdict.clone());
+        assert_eq!(led.review.as_ref(), Some(&verdict));
+        let json = serde_json::to_string(&led).unwrap();
+        assert_eq!(serde_json::from_str::<EvidenceLedger>(&json).unwrap(), led);
     }
 
     /// Adoption re-keys into the parent's own sequence: a child's `f-1` must

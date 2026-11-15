@@ -444,6 +444,36 @@ impl<'a> ModelRequestRepository<'a> {
             .collect())
     }
 
+    /// A bounded page of one session's recorded calls, oldest first.
+    ///
+    /// The on-demand session reader pages by `offset`; the whole ledger is
+    /// still available through [`Self::load_for_session`] for totals.
+    pub async fn page_for_session(
+        &self,
+        session_id: &SessionId,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        let rows = sqlx::query_as::<_, ModelRequestRow>(
+            "SELECT id, provider, model, input_tokens, output_tokens, finish_reason, \
+                    error_kind, latency_ms, retry_count, created_at, kind, provider_request_id, \
+                    cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort, \
+                    reasoning_tokens, attempt_ms, connect_ms, ttft_ms, max_event_gap_ms, \
+                    projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, \
+                    error_detail, turn_id \
+             FROM model_requests WHERE session_id = ?1 \
+             ORDER BY created_at, rowid LIMIT ?2 OFFSET ?3",
+        )
+        .bind(session_id.as_str())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+        .fetch_all(self.db.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| record_from_row(row, session_id.clone()))
+            .collect()
+    }
+
     /// Recorded calls in a window, for usage reporting.
     ///
     /// `session` restricts to one session; `from` is an inclusive lower bound

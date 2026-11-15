@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+mod review;
+mod session_history;
+
 use async_trait::async_trait;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -672,6 +675,10 @@ pub struct InProcessRuntimeClient {
     /// The cancellation handle of every child running in a session's turn,
     /// by child id, so a user can stop one child without stopping the turn.
     child_cancels: ChildCancels,
+    /// Cancellation handles of running MANUAL reviews, by session and review
+    /// id. A review is not a turn: it owns its own token and never enters the
+    /// session's active-turn map.
+    review_cancels: ChildCancels,
     /// The cancellation handle of every tool call executing in a session's
     /// turn, by call id, so a user can stop one command without the turn.
     tool_call_cancels: ChildCancels,
@@ -1814,6 +1821,7 @@ impl InProcessRuntimeClient {
             steering: Arc::new(Mutex::new(HashMap::new())),
             goal_steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
+            review_cancels: Arc::new(Mutex::new(HashMap::new())),
             tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
             tool_call_yields: Arc::new(Mutex::new(HashMap::new())),
             auxiliary_assists: Arc::new(AuxiliaryAssists::default()),
@@ -7370,6 +7378,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     // only replace that one honest failure with a second one.
                     return Ok(());
                 }
+                // Its review rows cascade away with the session; stop the work
+                // first so a deleted conversation does not keep spending.
+                review::cancel_for_session(self, &session_id);
                 self.forget_session(&session_id);
                 crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let _ = self.events.send(RuntimeEvent::SessionList {
@@ -7396,6 +7407,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     self.notify_error(&requester_session_id, format!("删除会话失败: {error}"));
                     return Ok(());
                 }
+                review::cancel_for_session(self, &session_id);
                 self.forget_session(&session_id);
                 crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let event = RuntimeEvent::SessionList {
@@ -7517,6 +7529,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 self.cancel_btw(&session_id);
                 Ok(())
             }
+            ClientCommand::RunReview {
+                session_id,
+                focus,
+                scope,
+                model,
+            } => review::start(self, session_id, focus, scope, model).await,
+            ClientCommand::CancelReview {
+                session_id,
+                review_id,
+            } => review::cancel(self, session_id, review_id).await,
+            ClientCommand::QueryReviewReport {
+                session_id,
+                review_id,
+                query_id,
+            } => review::load_report(self, session_id, review_id, query_id).await,
+            ClientCommand::ListReviews {
+                session_id,
+                query_id,
+            } => review::list(self, session_id, query_id).await,
             ClientCommand::CancelCurrentTurn { session_id } => {
                 // Accepted input that never reached a model is settled with
                 // the task it belonged to; it must not resurrect in a later
