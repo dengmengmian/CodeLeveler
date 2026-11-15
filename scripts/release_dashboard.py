@@ -242,6 +242,52 @@ def qualification_history(record):
     return summary, candidate_rows, attempt_rows
 
 
+def check_ledger(record):
+    """Per-check provenance recorded by the release transaction.
+
+    Returns `(summary, reused_rows)` or None when the release predates the
+    per-check ledger. MISSING means the lab ran the check without an identity;
+    it is valid for that run and never reusable.
+    """
+    stages = dig(record, "state", "stages", default=[]) or []
+    summary = []
+    reused_rows = []
+    total = 0
+    for stage in stages:
+        checks = stage.get("checks") or []
+        if not checks:
+            continue
+        executed = sum(1 for check in checks if check.get("provenance") == "EXECUTED")
+        reused = sum(1 for check in checks if check.get("provenance") == "REUSED")
+        missing = len(checks) - executed - reused
+        total += len(checks)
+        summary.append(
+            (
+                text(stage.get("stage")),
+                esc(text(stage.get("name"))),
+                str(executed),
+                str(reused),
+                str(missing),
+            )
+        )
+        for check in checks:
+            if check.get("provenance") != "REUSED":
+                continue
+            reused_rows.append(
+                (
+                    esc(text(check.get("id"))),
+                    esc(text(check.get("layer"))),
+                    ("badge", text(check.get("status"))),
+                    esc(text(check.get("source_run"))),
+                    "<code>%s</code>" % esc(short(check.get("source_candidate"), 12)),
+                    "<code>%s</code>" % esc(short(check.get("evidence_id"), 16)),
+                )
+            )
+    if not total:
+        return None
+    return summary, reused_rows
+
+
 def stage_rows(record):
     rows = []
     for stage in dig(record, "state", "stages", default=[]) or []:
@@ -830,6 +876,29 @@ def render_version(record):
             "therefore invalidates those stages; this transaction reused no evidence across "
             "candidates. Same-candidate retries reused only already-completed stages, and "
             "every final-candidate stage ran live.</p>"
+        )
+    ledger = check_ledger(record)
+    if ledger:
+        summary, reused_rows = ledger
+        parts.append("<h3>Per-check evidence</h3>")
+        parts.append(
+            table(
+                ["Stage", "Name", "Executed", "Reused", "No identity"],
+                summary,
+            )
+        )
+        if reused_rows:
+            parts.append("<h4>Reused checks</h4>")
+            parts.append(
+                table(
+                    ["Check", "Layer", "Status", "Source run", "Source candidate", "Evidence"],
+                    reused_rows,
+                )
+            )
+        parts.append(
+            '<p class="note">Reused checks keep their original run, candidate and evidence '
+            "id; the current run records a link, never a rewritten PASS. A check with no "
+            "identity is valid for the run that produced it and is never reusable.</p>"
         )
     parts.append("<h3>Dogfood layers</h3>")
     parts.append(
