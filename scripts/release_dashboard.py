@@ -164,6 +164,84 @@ def release_status(record):
     return "PARTIAL"
 
 
+def qualification_history(record):
+    """The transaction's own record: candidate evolution and every attempt.
+
+    Stage fingerprints are candidate-bound, so a new commit re-earns the
+    stages whose inputs changed. This section makes that re-execution, and the
+    absence of cross-candidate reuse, checkable instead of implied.
+    """
+    state = record.get("state") or {}
+    candidates = state.get("candidate_history") or []
+    attempts = state.get("attempts") or []
+    if not candidates and not attempts:
+        return None
+    counts = {}
+    for attempt in attempts:
+        status = str(attempt.get("status", "")).upper()
+        counts[status] = counts.get(status, 0) + 1
+    stage_seconds = 0.0
+    for stage in state.get("stages") or []:
+        try:
+            stage_seconds += float(stage.get("seconds") or 0)
+        except (TypeError, ValueError):
+            pass
+    l3_reused = dig(record, "state", "stages", 2, "cases", "reused", default=0)
+    summary = [
+        ("Release transaction", esc(text(state.get("release_id")))),
+        (
+            "Candidates",
+            "%d (%s &rarr; %s)"
+            % (len(candidates), esc(short(candidates[0])), esc(short(candidates[-1])))
+            if candidates
+            else NOT_VERIFIED,
+        ),
+        ("Resumes", esc(text(state.get("resume_count")))),
+        ("Candidate changes", esc(text(state.get("retry_count")))),
+        (
+            "Attempts",
+            esc(
+                "%d (%d PASS, %d REUSED, %d FAIL, %d PENDING)"
+                % (
+                    len(attempts),
+                    counts.get("PASS", 0),
+                    counts.get("REUSED", 0),
+                    counts.get("FAIL", 0),
+                    counts.get("PENDING", 0),
+                )
+            ),
+        ),
+        ("Transaction wall (all attempts)", esc(human_duration(state.get("duration_seconds")))),
+        ("Final candidate stage wall", esc(human_duration(stage_seconds))),
+        (
+            "Cross-candidate evidence reuse",
+            "none &mdash; stage fingerprints bind the candidate SHA; L3 cases reused=%s"
+            % esc(text(l3_reused)),
+        ),
+    ]
+    candidate_rows = []
+    for index, sha in enumerate(candidates, 1):
+        role = "initial" if index == 1 else ("final" if index == len(candidates) else "fix")
+        candidate_rows.append(
+            (str(index), "<code>%s</code>" % esc(short(sha)), esc(role))
+        )
+    attempt_rows = []
+    for attempt in attempts:
+        status = str(attempt.get("status", "")).upper()
+        if status in ("PASS", "REUSED"):
+            continue
+        attempt_rows.append(
+            (
+                esc(text(attempt.get("at"))),
+                esc(text(attempt.get("stage"))),
+                ("badge", status),
+                "<code>%s</code>" % esc(short(attempt.get("candidate_sha"))),
+                esc(text(attempt.get("reason"), "")[:300]),
+            )
+        )
+    return summary, candidate_rows, attempt_rows
+
+
 def stage_rows(record):
     rows = []
     for stage in dig(record, "state", "stages", default=[]) or []:
@@ -650,7 +728,7 @@ def render_version(record):
     cmp_rows = [
         (
             "Build quality",
-            esc(text(comparison.get("baseline_sha"), NOT_VERIFIED)),
+            NOT_VERIFIED,
             badge(dig(record, "state", "stages", 0, "status", default=NOT_VERIFIED)),
             NOT_VERIFIED,
         ),
@@ -697,6 +775,11 @@ def render_version(record):
         '<p class="note">Comparison status: %s — %s</p>'
         % (badge(comparison.get("status")), esc(text(comparison.get("reason"), "no reason recorded")))
     )
+    if comparison.get("baseline_sha"):
+        parts.append(
+            '<p class="note">Dogfood comparison baseline: <code>%s</code></p>'
+            % esc(text(comparison.get("baseline_sha")))
+        )
 
     # Changes
     parts.append("<h2>Release changes</h2>")
@@ -725,6 +808,29 @@ def render_version(record):
             [(a, esc(b), ("badge", c[0]), esc(d), esc(e)) for a, b, c, d, e in stage_table],
         )
     )
+    history = qualification_history(record)
+    if history:
+        summary, candidate_rows, attempt_rows = history
+        parts.append("<h3>Qualification history</h3>")
+        parts.append(table(["Field", "Value"], summary))
+        parts.append(
+            table(["Order", "Candidate", "Role"], candidate_rows)
+        )
+        if attempt_rows:
+            parts.append("<h4>Failed or not-started attempts</h4>")
+            parts.append(
+                table(
+                    ["At (UTC)", "Stage", "Status", "Candidate", "Reason"],
+                    attempt_rows,
+                )
+            )
+        parts.append(
+            '<p class="note">Stage 1–3 fingerprints include the candidate SHA, rustc, '
+            "release scope, build inputs and the lab definition hash. A candidate change "
+            "therefore invalidates those stages; this transaction reused no evidence across "
+            "candidates. Same-candidate retries reused only already-completed stages, and "
+            "every final-candidate stage ran live.</p>"
+        )
     parts.append("<h3>Dogfood layers</h3>")
     parts.append(
         table(
