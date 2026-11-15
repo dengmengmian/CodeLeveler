@@ -31,6 +31,61 @@ fn default_registry() -> leveler_tools::ToolRegistry {
     registry
 }
 
+/// The exact acceptance command the scripted model runs and cites.
+///
+/// Git Bash's MSYS `sh` cannot initialize its named objects inside the Windows
+/// Low-integrity sandbox, so the Windows fixture uses a native cmd check with
+/// the same contract: it exits non-zero unless all three stage files exist.
+#[cfg(windows)]
+const VERIFY_COMMAND: &str = "cmd /C .\\verify.cmd";
+#[cfg(not(windows))]
+const VERIFY_COMMAND: &str = "sh ./verify.sh";
+
+const VERIFY_UNIX_EXISTS: &str =
+    "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n";
+const VERIFY_WINDOWS_EXISTS: &str = "@echo off\r\n\
+     if not exist stage-1.txt exit 1\r\n\
+     if not exist stage-2.txt exit 1\r\n\
+     if not exist stage-3.txt exit 1\r\n";
+const VERIFY_UNIX_CONTENT: &str = "set -e\ngrep -qx 'stage 1' stage-1.txt\n\
+     grep -qx 'stage 2' stage-2.txt\ngrep -qx 'stage 3' stage-3.txt\n";
+const VERIFY_WINDOWS_CONTENT: &str = "@echo off\r\n\
+     powershell -NoProfile -Command \"$want = @{ 'stage-1.txt' = 'stage 1'; 'stage-2.txt' = 'stage 2'; 'stage-3.txt' = 'stage 3' }; foreach ($k in $want.Keys) { if ((Get-Content -Raw $k).Trim() -ne $want[$k]) { exit 1 } }\"\r\n";
+
+fn write_verify_fixture(dir: &std::path::Path, unix_script: &str, windows_script: &str) {
+    #[cfg(windows)]
+    {
+        let _ = unix_script;
+        std::fs::write(dir.join("verify.cmd"), windows_script).unwrap();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = windows_script;
+        std::fs::write(dir.join("verify.sh"), unix_script).unwrap();
+    }
+}
+
+/// The user-facing phrase the goal text uses. The declared *target* may be the
+/// native Windows equivalent, but the source quote still has to come from the
+/// user's own text.
+const VERIFY_QUOTE: &str = "sh ./verify.sh";
+
+fn verification_tool_call() -> serde_json::Value {
+    if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", ".\\verify.cmd"],
+            "reason": "run the acceptance checks after the last change"
+        })
+    } else {
+        serde_json::json!({
+            "program": "sh",
+            "args": ["./verify.sh"],
+            "reason": "run the acceptance script after the last change"
+        })
+    }
+}
+
 struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -4702,8 +4757,8 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
                     (
                         "command",
                         "run the acceptance script",
-                        "sh ./verify.sh",
-                        "sh ./verify.sh",
+                        VERIFY_COMMAND,
+                        VERIFY_QUOTE,
                     ),
                 ],
             ),
@@ -4737,22 +4792,14 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
                 "write_file",
                 serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
             ),
-            tool_call(
-                "v1",
-                "run_command",
-                serde_json::json!({
-                    "program": "sh",
-                    "args": ["./verify.sh"],
-                    "reason": "run the acceptance script after the last change"
-                }),
-            ),
+            tool_call("v1", "run_command", verification_tool_call()),
             tool_call(
                 "g2",
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all three stages delivered and verified",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "verification": {"status": "passed", "detail": VERIFY_COMMAND},
                     "requirements": [
                         {"id": "R1", "status": "done", "evidence": "created"},
                         {"id": "R2", "status": "done", "evidence": "created"},
@@ -4764,11 +4811,7 @@ async fn a_refused_premature_completion_recovers_within_the_same_run() {
         ],
         PermissionProfile::Assisted,
         |dir| {
-            std::fs::write(
-                dir.join("verify.sh"),
-                "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
-            )
-            .unwrap();
+            write_verify_fixture(dir, VERIFY_UNIX_EXISTS, VERIFY_WINDOWS_EXISTS);
         },
     )
     .await;
@@ -5051,8 +5094,8 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
                     (
                         "command",
                         "run the acceptance script",
-                        "sh ./verify.sh",
-                        "sh ./verify.sh",
+                        VERIFY_COMMAND,
+                        VERIFY_QUOTE,
                     ),
                 ],
             ),
@@ -5102,22 +5145,14 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
                     ]
                 }),
             ),
-            tool_call(
-                "v1",
-                "run_command",
-                serde_json::json!({
-                    "program": "sh",
-                    "args": ["./verify.sh"],
-                    "reason": "run the acceptance script"
-                }),
-            ),
+            tool_call("v1", "run_command", verification_tool_call()),
             tool_call(
                 "g3",
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all three stages delivered and verified",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "verification": {"status": "passed", "detail": VERIFY_COMMAND},
                     "requirements": [
                         {"id": "R1", "status": "done", "evidence": "created"},
                         {"id": "R2", "status": "done", "evidence": "created"},
@@ -5129,11 +5164,7 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
         ],
         PermissionProfile::Assisted,
         |dir| {
-            std::fs::write(
-                dir.join("verify.sh"),
-                "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
-            )
-            .unwrap();
+            write_verify_fixture(dir, VERIFY_UNIX_EXISTS, VERIFY_WINDOWS_EXISTS);
         },
     )
     .await;
@@ -5161,13 +5192,17 @@ async fn a_false_delivery_claim_is_refused_until_the_work_and_check_exist() {
         .unwrap();
 
     assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
-    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert_eq!(
+        refusals.len(),
+        2,
+        "both incomplete completions are refused: {refusals:?}"
+    );
     assert!(
         refusals[0].contains("stage-2.txt") && refusals[0].contains("does not exist"),
         "a claimed artifact that does not exist must be named: {refusals:?}"
     );
     assert!(
-        refusals[1].contains("./verify.sh"),
+        refusals[1].contains(VERIFY_COMMAND),
         "the acceptance script must have run: {refusals:?}"
     );
 }
@@ -5194,22 +5229,14 @@ async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
                 "write_file",
                 serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
             ),
-            tool_call(
-                "v1",
-                "run_command",
-                serde_json::json!({
-                    "program": "sh",
-                    "args": ["./verify.sh"],
-                    "reason": "run the acceptance script"
-                }),
-            ),
+            tool_call("v1", "run_command", verification_tool_call()),
             tool_call(
                 "g1",
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all stages are done",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"}
+                    "verification": {"status": "passed", "detail": VERIFY_COMMAND}
                 }),
             ),
             tool_call(
@@ -5217,40 +5244,28 @@ async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
                 "write_file",
                 serde_json::json!({"path": "stage-2.txt", "content": "stage 2\n"}),
             ),
-            tool_call(
-                "v2",
-                "run_command",
-                serde_json::json!({
-                    "program": "sh",
-                    "args": ["./verify.sh"],
-                    "reason": "re-run the acceptance script after the fix"
-                }),
-            ),
+            tool_call("v2", "run_command", verification_tool_call()),
             tool_call(
                 "g2",
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all three stages delivered and verified",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"}
+                    "verification": {"status": "passed", "detail": VERIFY_COMMAND}
                 }),
             ),
         ],
         PermissionProfile::Assisted,
         |dir| {
-            std::fs::write(
-                dir.join("verify.sh"),
-                "set -e\ngrep -qx 'stage 1' stage-1.txt\n\
-                 grep -qx 'stage 2' stage-2.txt\ngrep -qx 'stage 3' stage-3.txt\n",
-            )
-            .unwrap();
+            write_verify_fixture(dir, VERIFY_UNIX_CONTENT, VERIFY_WINDOWS_CONTENT);
         },
     )
     .await;
     let mut s = spec(&h);
-    s.runtime.goal = "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
-                      最后运行 sh ./verify.sh，全部做完再结束。"
-        .to_string();
+    s.runtime.goal = format!(
+        "完成三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
+         最后运行 {VERIFY_COMMAND}，全部做完再结束。"
+    );
     let session = h.engine.create_task(&s).await.unwrap();
     let mut refusals = Vec::new();
     let report = h
@@ -5273,7 +5288,7 @@ async fn a_failed_acceptance_script_blocks_completion_until_it_really_passes() {
     assert_eq!(report.outcome, TaskOutcome::Completed, "{report:?}");
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     assert!(
-        refusals[0].contains("./verify.sh") && refusals[0].contains("failed"),
+        refusals[0].contains(VERIFY_COMMAND) && refusals[0].contains("failed"),
         "a failed acceptance script is named as the obstruction: {refusals:?}"
     );
     assert_eq!(
@@ -5314,8 +5329,8 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
                 (
                     "command",
                     "run the acceptance script",
-                    "sh ./verify.sh",
-                    "sh ./verify.sh",
+                    VERIFY_COMMAND,
+                    VERIFY_QUOTE,
                 ),
             ],
         ),
@@ -5338,11 +5353,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
         ),
     ];
     let h = harness_with(responses_a, PermissionProfile::Assisted, |dir| {
-        std::fs::write(
-            dir.join("verify.sh"),
-            "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
-        )
-        .unwrap();
+        write_verify_fixture(dir, VERIFY_UNIX_EXISTS, VERIFY_WINDOWS_EXISTS);
     })
     .await;
     let mut s = spec(&h);
@@ -5401,22 +5412,14 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
             "write_file",
             serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
         ),
-        tool_call(
-            "v1",
-            "run_command",
-            serde_json::json!({
-                "program": "sh",
-                "args": ["./verify.sh"],
-                "reason": "run the acceptance script after the restart"
-            }),
-        ),
+        tool_call("v1", "run_command", verification_tool_call()),
         tool_call(
             "g2",
             "update_goal",
             serde_json::json!({
                 "status": "complete",
                 "summary": "all three stages delivered and verified",
-                "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                "verification": {"status": "passed", "detail": VERIFY_COMMAND},
                 "requirements": [
                     {"id": "R1", "status": "done", "evidence": "created"},
                     {"id": "R2", "status": "done", "evidence": "created"},
@@ -5547,8 +5550,8 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
                     (
                         "command",
                         "run the acceptance script",
-                        "sh ./verify.sh",
-                        "sh ./verify.sh",
+                        VERIFY_COMMAND,
+                        VERIFY_QUOTE,
                     ),
                 ],
             ),
@@ -5593,22 +5596,14 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
                 "write_file",
                 serde_json::json!({"path": "stage-3.txt", "content": "stage 3\n"}),
             ),
-            tool_call(
-                "v1",
-                "run_command",
-                serde_json::json!({
-                    "program": "sh",
-                    "args": ["./verify.sh"],
-                    "reason": "run the acceptance script"
-                }),
-            ),
+            tool_call("v1", "run_command", verification_tool_call()),
             tool_call(
                 "g3",
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
                     "summary": "all three stages delivered and verified",
-                    "verification": {"status": "passed", "detail": "sh ./verify.sh"},
+                    "verification": {"status": "passed", "detail": VERIFY_COMMAND},
                     "requirements": [
                         {"id": "R1", "status": "done", "evidence": "created"},
                         {"id": "R2", "status": "done", "evidence": "created"},
@@ -5620,11 +5615,7 @@ async fn a_compacted_context_still_owes_the_users_full_scope() {
         ],
         PermissionProfile::Assisted,
         |dir| {
-            std::fs::write(
-                dir.join("verify.sh"),
-                "set -e\nfor f in stage-1.txt stage-2.txt stage-3.txt; do test -f \"$f\"; done\n",
-            )
-            .unwrap();
+            write_verify_fixture(dir, VERIFY_UNIX_EXISTS, VERIFY_WINDOWS_EXISTS);
         },
         Some(leveler_agent::coding::policy::ExecutionOverrides {
             // A one-percent soft threshold: the fold fires early, in the
