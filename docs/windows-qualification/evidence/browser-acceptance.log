@@ -1,0 +1,60 @@
+   Compiling ring v0.17.14
+   Compiling tokio v1.54.1
+   Compiling simd-adler32 v0.3.9
+   Compiling rustls v0.23.46
+   Compiling tracing v0.1.44
+   Compiling idna v1.1.0
+   Compiling sha1 v0.10.6
+   Compiling leveler-core v1.0.27 (C:\CodeLeveler\crates\leveler-core)
+   Compiling serde_urlencoded v0.7.1
+   Compiling miniz_oxide v0.8.9
+   Compiling tungstenite v0.26.2
+   Compiling url v2.5.8
+   Compiling flate2 v1.1.9
+   Compiling compression-codecs v0.4.38
+   Compiling rustls-webpki v0.103.16
+   Compiling hyper v1.10.1
+   Compiling async-compression v0.4.42
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling process-wrap v8.2.1
+   Compiling tokio-tungstenite v0.26.2
+   Compiling tower-http v0.6.11
+   Compiling hyper-util v0.1.20
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling leveler-browser v1.0.27 (C:\CodeLeveler\crates\leveler-browser)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.30s
+     Running tests\acceptance.rs (target\debug\deps\acceptance-f6b8201184c99fc5.exe)
+
+running 12 tests
+test b1_click_changes_the_page ... PASS b1 edge
+ok
+test b2_fill_and_submit_a_form ... PASS b2 edge
+ok
+test b3_state_survives_navigation ... PASS b3 edge
+ok
+test cancelling_an_operation_ends_it_without_ending_the_session ... PASS cancellation edge (call ended in 308.6428ms, session reusable after 47.5333ms)
+ok
+test inspect_reports_what_the_backend_can_actually_see ... PASS inspect/console edge
+PASS inspect/page_errors edge
+PASS inspect/network edge
+ok
+test killing_the_browser_is_reported_as_a_disconnect ... after kill: browser session disconnected: edge: CDP write: IO error: 远程主机强迫关闭了一个现有的连接。 (os error 10054)
+PASS crash-lifecycle edge
+ok
+test localhost_is_reachable ... PASS localhost edge
+ok
+test only_processes_carrying_the_owned_profile_are_selected ... ok
+test screenshot_returns_a_png ... PASS screenshot edge
+ok
+test shutdown_leaves_no_process_behind ... PASS process-cleanup edge (13 → 0, unrelated process untouched)
+ok
+test tabs_open_list_and_close ... PASS tabs edge
+ok
+test the_public_internet_is_reachable ... PASS public-internet edge
+ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.74s
+

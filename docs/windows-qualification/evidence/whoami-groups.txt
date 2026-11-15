@@ -1,0 +1,18 @@
+
+组信息
+-----------------
+
+组名                                   类型   SID          属性                          
+====================================== ====== ============ ==============================
+Everyone                               已知组 S-1-1-0      必需的组, 启用于默认, 启用的组
+NT AUTHORITY\本地帐户和管理员组成员    已知组 S-1-5-114    只用于拒绝的组                
+BUILTIN\Administrators                 别名   S-1-5-32-544 只用于拒绝的组                
+BUILTIN\Users                          别名   S-1-5-32-545 必需的组, 启用于默认, 启用的组
+NT AUTHORITY\INTERACTIVE               已知组 S-1-5-4      必需的组, 启用于默认, 启用的组
+CONSOLE LOGON                          已知组 S-1-2-1      必需的组, 启用于默认, 启用的组
+NT AUTHORITY\Authenticated Users       已知组 S-1-5-11     必需的组, 启用于默认, 启用的组
+NT AUTHORITY\This Organization         已知组 S-1-5-15     必需的组, 启用于默认, 启用的组
+NT AUTHORITY\本地帐户                  已知组 S-1-5-113    必需的组, 启用于默认, 启用的组
+LOCAL                                  已知组 S-1-2-0      必需的组, 启用于默认, 启用的组
+NT AUTHORITY\NTLM Authentication       已知组 S-1-5-64-10  必需的组, 启用于默认, 启用的组
+Mandatory Label\Medium Mandatory Level 标签   S-1-16-8192                                

@@ -1,0 +1,4 @@
+exit=0
+ended=2026-11-15T18:56:42Z
+elapsed_s=64
+"session_id":"a649e2a7-aa3d-4714-a1d3-67537c50e9e0"

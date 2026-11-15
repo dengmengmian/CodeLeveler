@@ -1,0 +1,7 @@
+    Checking leveler-app v1.0.27 (C:\CodeLeveler\crates\leveler-app)
+    Checking leveler-tui v1.0.27 (C:\CodeLeveler\crates\leveler-tui)
+    Checking leveler-runtime-host v1.0.27 (C:\CodeLeveler\crates\leveler-runtime-host)
+    Checking leveler-schedule v1.0.27 (C:\CodeLeveler\crates\leveler-schedule)
+    Checking leveler-web v1.0.27 (C:\CodeLeveler\crates\leveler-web)
+    Checking leveler-cli v1.0.27 (C:\CodeLeveler\crates\leveler-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 01s

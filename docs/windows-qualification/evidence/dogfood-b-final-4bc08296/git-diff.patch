@@ -1,0 +1,174 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2290839..17971f2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,7 @@
+ //! 库存对账核心逻辑。
+ 
++use std::collections::HashMap;
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct StockRow {
+     pub sku: String,
+@@ -7,9 +9,99 @@ pub struct StockRow {
+     pub quantity: i64,
+ }
+ 
+-/// 解析库存与流水并计算期末库存。当前为未实现的占位。
+-pub fn reconcile(_stock_csv: &str, _movements_csv: &str) -> Result<Vec<StockRow>, String> {
+-    Err("not implemented".to_string())
++/// 按行切分 CSV：兼容 CRLF、UTF-8 BOM 与末尾/中间的空行。
++fn data_lines(csv: &str) -> impl Iterator<Item = &str> + '_ {
++    csv.split('\n')
++        .map(|line| line.strip_suffix('\r').unwrap_or(line))
++        .map(|line| line.strip_prefix('\u{feff}').unwrap_or(line))
++        .filter(|line| !line.trim().is_empty())
++}
++
++/// 以逗号切分一行并去掉字段两侧空白；数据不含带引号的逗号字段。
++fn split_row(line: &str) -> Vec<&str> {
++    line.split(',').map(str::trim).collect()
++}
++
++fn expect_header(line: &str, expected: &[&str], label: &str) -> Result<(), String> {
++    let fields = split_row(line);
++    let matches = fields.len() == expected.len()
++        && fields.iter().zip(expected).all(|(actual, want)| actual == want);
++    if matches {
++        Ok(())
++    } else {
++        Err(format!(
++            "{label}表头应为 {}，实际为 {line}",
++            expected.join(",")
++        ))
++    }
++}
++
++/// 解析库存与流水并计算期末库存。
++///
++/// 规则见 README：同一 SKU 的多条流水累加；流水引用未知 SKU 或期末库存为负
++/// 均返回包含该 SKU 的错误；结果按 SKU 升序排列。
++pub fn reconcile(stock_csv: &str, movements_csv: &str) -> Result<Vec<StockRow>, String> {
++    let stock_lines: Vec<&str> = data_lines(stock_csv).collect();
++    let movement_lines: Vec<&str> = data_lines(movements_csv).collect();
++
++    let mut rows: Vec<StockRow> = Vec::new();
++    let mut position: HashMap<String, usize> = HashMap::new();
++
++    if let Some((header, body)) = stock_lines.split_first() {
++        expect_header(header, &["sku", "name", "quantity"], "库存")?;
++        for line in body {
++            let fields = split_row(line);
++            if fields.len() != 3 {
++                return Err(format!("库存表格式错误，应为 sku,name,quantity：{line}"));
++            }
++            let sku = fields[0];
++            if sku.is_empty() {
++                return Err(format!("库存表存在空 SKU：{line}"));
++            }
++            let quantity: i64 = fields[2]
++                .parse()
++                .map_err(|_| format!("库存表数量不是整数：{line}"))?;
++            if position.contains_key(sku) {
++                return Err(format!("库存表 SKU 重复：{sku}"));
++            }
++            position.insert(sku.to_string(), rows.len());
++            rows.push(StockRow {
++                sku: sku.to_string(),
++                name: fields[1].to_string(),
++                quantity,
++            });
++        }
++    }
++
++    if let Some((header, body)) = movement_lines.split_first() {
++        expect_header(header, &["sku", "delta"], "流水")?;
++        for line in body {
++            let fields = split_row(line);
++            if fields.len() != 2 {
++                return Err(format!("流水表格式错误，应为 sku,delta：{line}"));
++            }
++            let sku = fields[0];
++            let delta: i64 = fields[1]
++                .parse()
++                .map_err(|_| format!("流水表数量不是整数：{line}"))?;
++            match position.get(sku) {
++                Some(&index) => rows[index].quantity += delta,
++                None => return Err(format!("流水引用了库存表中不存在的 SKU：{sku}")),
++            }
++        }
++    }
++
++    for row in &rows {
++        if row.quantity < 0 {
++            return Err(format!(
++                "SKU {} 出现负库存，期末库存为 {}",
++                row.sku, row.quantity
++            ));
++        }
++    }
++
++    rows.sort_by(|a, b| a.sku.cmp(&b.sku));
++    Ok(rows)
+ }
+ 
+ #[cfg(test)]
+@@ -43,4 +135,20 @@ mod tests {
+         assert!(err.contains("SKU-1"), "{err}");
+         assert!(err.contains("负库存") || err.contains("negative"), "{err}");
+     }
++
++    #[test]
++    fn keeps_initial_stock_when_movements_are_empty() {
++        let expected = vec![
++            StockRow { sku: "SKU-1".into(), name: "苹果".into(), quantity: 10 },
++            StockRow { sku: "SKU-2".into(), name: "香蕉".into(), quantity: 4 },
++        ];
++
++        // 只有表头，外加结尾空行。
++        let rows = reconcile(STOCK, "sku,delta\r\n\r\n").unwrap();
++        assert_eq!(rows, expected);
++
++        // 完全没有流水内容。
++        let rows = reconcile(STOCK, "").unwrap();
++        assert_eq!(rows, expected);
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 552aece..eb243b1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,31 @@
++use std::env;
++use std::fs;
++use std::process;
++
+ fn main() {
+-    eprintln!("inventory-reconcile: 尚未实现，请完成 reconcile 与 CLI");
+-    std::process::exit(2);
++    let args: Vec<String> = env::args().collect();
++    let program = args.first().map(String::as_str).unwrap_or("inventory-reconcile");
++    if args.len() != 3 {
++        eprintln!("用法: {program} <stock.csv> <movements.csv>");
++        process::exit(2);
++    }
++
++    if let Err(err) = run(&args[1], &args[2]) {
++        eprintln!("错误: {err}");
++        process::exit(1);
++    }
++}
++
++fn run(stock_path: &str, movements_path: &str) -> Result<(), String> {
++    let stock = fs::read_to_string(stock_path)
++        .map_err(|err| format!("读取 {stock_path} 失败（需为 UTF-8）：{err}"))?;
++    let movements = fs::read_to_string(movements_path)
++        .map_err(|err| format!("读取 {movements_path} 失败（需为 UTF-8）：{err}"))?;
++
++    let rows = inventory_reconcile::reconcile(&stock, &movements)?;
++    println!("sku\tname\tquantity");
++    for row in rows {
++        println!("{}\t{}\t{}", row.sku, row.name, row.quantity);
++    }
++    Ok(())
+ }

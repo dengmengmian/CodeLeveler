@@ -1,0 +1,3 @@
+4bc082963feec78b210d158bdeae3909888b73cc
+FAIL DOGFOOD_ROOT_NOT_FOUND
+no dogfood lab configured, and no unique sibling named dogfood or dogfood-eval
