@@ -461,8 +461,13 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
                     script.reuse_from = Some(value);
                 }
                 let reuse = reuse_document(&script);
+                let suites = ["RC1", "RC2", "RC3", "RC4", "RC5"]
+                    .iter()
+                    .map(|name| format!("\"{name}\":{{\"status\":\"PASS\"}}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let verdict = format!(
-                    "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"blockers\":[]}},\"environment\":{{\"reuse\":{}}}}}",
+                    "{{\"decision\":{{\"decision\":\"{}\",\"exit_code\":{},\"blockers\":[],\"suites\":{{{suites}}}}},\"environment\":{{\"reuse\":{}}}}}",
                     script.rc_decision, script.rc_exit, reuse
                 );
                 std::fs::write(dir.join("rc.json"), &verdict).unwrap();
@@ -1946,6 +1951,45 @@ fn a_reused_rc_run_still_names_its_own_run() {
         Some("20260101-000000-bbbbbbbbbbbb"),
         "the transaction adopts the run this qualification produced"
     );
+}
+
+#[test]
+fn a_reused_rc_suite_is_recorded_as_reused_not_executed() {
+    // rc.json records the suites a run executed under `decision.suites` and the
+    // ones it took from a prior run under `environment.reuse.suites`. The suite
+    // rows themselves carry no `reused_from`, so reading one there labelled
+    // every reused suite EXECUTED and credited this run with work an earlier
+    // run had done.
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    world.crash_stage(3);
+    world.set(|script| script.reuse_suites = vec!["RC1".into(), "RC2".into(), "RC4".into()]);
+    let (code, rendered, _) = world.run(&["publish", "--resume", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    let state = world.state();
+    let checks = state
+        .at("stages")
+        .index(2)
+        .unwrap()
+        .at("checks")
+        .as_arr()
+        .expect("stage 3 ledger");
+    let by_id = |id: &str| {
+        checks
+            .iter()
+            .find(|check| check.path_str("id") == Some(id))
+            .unwrap_or_else(|| panic!("{id} in the stage 3 ledger"))
+    };
+    for id in ["rc:RC1", "rc:RC2", "rc:RC4"] {
+        assert_eq!(by_id(id).path_str("provenance"), Some("REUSED"), "{id}");
+        assert!(
+            by_id(id).path_str("source_run").is_some(),
+            "a reused suite names the run it came from: {id}"
+        );
+    }
+    assert_eq!(by_id("rc:RC3").path_str("provenance"), Some("EXECUTED"));
+    assert_eq!(by_id("rc:RC5").path_str("provenance"), Some("MISSING"));
 }
 
 #[test]

@@ -2335,12 +2335,29 @@ fn run_rc(
     let mut lines = vec![format!("RC qualification: {verdict} (exit {exit})")];
     lines.push(reuse_line(&doc, reuse_from.as_deref()));
     // RC suite evidence is suite-level. Record each suite's origin in the same
-    // ledger; RC5 is derived and carries no independent execution.
+    // ledger; RC5 is derived and carries no independent execution. rc.json
+    // names the suites this run executed under `decision.suites` and the ones
+    // it took from a prior run under `environment.reuse` — the suite rows
+    // themselves carry no `reused_from`.
+    let reuse = doc.at("environment").at("reuse");
+    let reused_suites: Vec<String> = reuse
+        .at("suites")
+        .as_arr()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|name| name.as_str().map(str::to_string))
+        .collect();
+    let reuse_source = reuse
+        .at("reused_from")
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| reuse_from.clone());
+    let own_run = format!("eval/rc/{run_id}");
     let mut rc_checks = Vec::new();
     for (name, suite) in decision.at("suites").as_obj().unwrap_or(&[]) {
         let status = suite.at("status").as_str().unwrap_or("").to_string();
-        let reused_from = suite.at("reused_from").as_str();
-        let provenance = if reused_from.is_some() {
+        let reused = reused_suites.iter().any(|suite| suite == name);
+        let provenance = if reused {
             "REUSED"
         } else if name == "RC5" {
             "MISSING"
@@ -2353,11 +2370,11 @@ fn run_rc(
             status,
             input_sha256: None,
             evidence_id: None,
-            source_run: Some(
-                reused_from
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("eval/rc/{run_id}")),
-            ),
+            source_run: Some(if reused {
+                reuse_source.clone().unwrap_or_else(|| own_run.clone())
+            } else {
+                own_run.clone()
+            }),
             source_candidate: Some(transaction.candidate_sha.clone()),
             provenance: provenance.to_string(),
         });
