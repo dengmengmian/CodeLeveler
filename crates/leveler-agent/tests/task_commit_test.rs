@@ -4374,14 +4374,17 @@ async fn a_failed_declared_test_command_cannot_be_completed() {
         )
         .unwrap();
     } else {
-        use std::os::unix::fs::PermissionsExt;
         let runner = fx.dir.path().join("run-tests.sh");
         std::fs::write(
             &runner,
             "#!/bin/sh\necho 'FAIL: expected 2, observed 1'\nexit 1\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
     std::fs::write(fx.dir.path().join("report.md"), "验收失败\n").unwrap();
     let mut events = Vec::new();
