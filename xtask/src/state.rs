@@ -222,6 +222,60 @@ pub struct StageRecord {
     pub artifacts: Vec<(String, String)>,
     pub cases: Option<Cases>,
     pub run_id: Option<String>,
+    /// The per-check ledger the gate produced for this stage. Each entry is a
+    /// reference to the lab's immutable evidence record, never a second copy of
+    /// its identity. Old state files deserialize with an empty list.
+    pub checks: Vec<CheckRecord>,
+}
+
+/// One check's evidence reference, as the lab recorded it.
+#[derive(Clone, Debug, Default)]
+pub struct CheckRecord {
+    pub id: String,
+    pub layer: String,
+    pub status: String,
+    pub input_sha256: Option<String>,
+    pub evidence_id: Option<String>,
+    pub source_run: Option<String>,
+    pub source_candidate: Option<String>,
+    /// EXECUTED, REUSED or MISSING. MISSING means the lab ran the check but
+    /// recorded no identity, so it is valid for this run and never reusable.
+    pub provenance: String,
+}
+
+impl CheckRecord {
+    pub fn to_json(&self) -> Json {
+        Json::obj(vec![
+            ("id", Json::str(self.id.clone())),
+            ("layer", Json::str(self.layer.clone())),
+            ("status", Json::str(self.status.clone())),
+            ("input_sha256", optional_str(self.input_sha256.as_deref())),
+            ("evidence_id", optional_str(self.evidence_id.as_deref())),
+            ("source_run", optional_str(self.source_run.as_deref())),
+            (
+                "source_candidate",
+                optional_str(self.source_candidate.as_deref()),
+            ),
+            ("provenance", Json::str(self.provenance.clone())),
+        ])
+    }
+
+    pub fn from_json(value: &Json) -> CheckRecord {
+        CheckRecord {
+            id: value.at("id").as_str().unwrap_or("").to_string(),
+            layer: value.at("layer").as_str().unwrap_or("").to_string(),
+            status: value.at("status").as_str().unwrap_or("").to_string(),
+            input_sha256: owned(value.at("input_sha256").as_str()),
+            evidence_id: owned(value.at("evidence_id").as_str()),
+            source_run: owned(value.at("source_run").as_str()),
+            source_candidate: owned(value.at("source_candidate").as_str()),
+            provenance: value
+                .at("provenance")
+                .as_str()
+                .unwrap_or("MISSING")
+                .to_string(),
+        }
+    }
 }
 
 impl StageRecord {
@@ -241,6 +295,7 @@ impl StageRecord {
             artifacts: Vec::new(),
             cases: None,
             run_id: None,
+            checks: Vec::new(),
         }
     }
 
@@ -286,6 +341,12 @@ impl StageRecord {
         ];
         if let Some(cases) = &self.cases {
             pairs.push(("cases", cases.to_json()));
+        }
+        if !self.checks.is_empty() {
+            pairs.push((
+                "checks",
+                Json::Arr(self.checks.iter().map(CheckRecord::to_json).collect()),
+            ));
         }
         Json::obj(pairs)
     }
@@ -335,6 +396,11 @@ impl StageRecord {
                 _ => None,
             },
             run_id: owned(value.at("run_id").as_str()),
+            checks: value
+                .at("checks")
+                .as_arr()
+                .map(|items| items.iter().map(CheckRecord::from_json).collect())
+                .unwrap_or_default(),
         }
     }
 }

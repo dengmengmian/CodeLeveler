@@ -23,7 +23,8 @@ use crate::qualify;
 use crate::report;
 use crate::root::{self, Env, GateOpts, Lab};
 use crate::state::{
-    self, Cases, STAGE_BUILD, STAGE_DOGFOOD, STAGE_PUBLISH, STAGE_TESTS, Status, Transaction,
+    self, Cases, CheckRecord, STAGE_BUILD, STAGE_DOGFOOD, STAGE_PUBLISH, STAGE_TESTS, Status,
+    Transaction,
 };
 use crate::version::{self, Level};
 
@@ -1664,6 +1665,82 @@ fn dogfood_cmd(context: &Context, sha: &str, layers: &str, run_id: Option<&str>)
         .env("DOGFOOD_ROOT", context.lab.root.display().to_string())
 }
 
+/// The per-check references a lab layer document carries.
+///
+/// The lab owns evidence identity and stores it per check. This reads the
+/// references only; it never recomputes a check's hash, so there is one owner
+/// for the identity. L3 case rows carry their own evidence blocks.
+fn check_records_from_doc(doc: &Json, layer: &str) -> Vec<CheckRecord> {
+    let mut records = Vec::new();
+    for check in doc.at("checks").as_arr().unwrap_or(&[]) {
+        let Some(id) = check.at("id").as_str().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let evidence = check.get("evidence");
+        records.push(CheckRecord {
+            id: id.to_string(),
+            layer: layer.to_string(),
+            status: check.at("status").as_str().unwrap_or("").to_string(),
+            input_sha256: evidence
+                .and_then(|value| value.at("input_sha256").as_str())
+                .map(str::to_string),
+            evidence_id: evidence
+                .and_then(|value| value.at("evidence_id").as_str())
+                .map(str::to_string),
+            source_run: evidence
+                .and_then(|value| value.at("source_run").as_str())
+                .map(str::to_string),
+            source_candidate: evidence
+                .and_then(|value| value.at("source_candidate").as_str())
+                .map(str::to_string),
+            provenance: evidence
+                .and_then(|value| value.at("provenance").as_str())
+                .unwrap_or("MISSING")
+                .to_string(),
+        });
+    }
+    if layer == "L3" {
+        for case in doc.at("cases").as_arr().unwrap_or(&[]) {
+            let Some(id) = case.at("id").as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let evidence = case.get("evidence");
+            records.push(CheckRecord {
+                id: format!("l3:{id}"),
+                layer: "L3".to_string(),
+                status: case
+                    .at("status")
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if case.at("passed").as_bool() == Some(true) {
+                            "PASS".to_string()
+                        } else {
+                            "FAIL".to_string()
+                        }
+                    }),
+                input_sha256: evidence
+                    .and_then(|value| value.at("input_sha256").as_str())
+                    .map(str::to_string),
+                evidence_id: evidence
+                    .and_then(|value| value.at("evidence_id").as_str())
+                    .map(str::to_string),
+                source_run: evidence
+                    .and_then(|value| value.at("source_run").as_str())
+                    .map(str::to_string),
+                source_candidate: evidence
+                    .and_then(|value| value.at("source_candidate").as_str())
+                    .map(str::to_string),
+                provenance: evidence
+                    .and_then(|value| value.at("provenance").as_str())
+                    .unwrap_or("MISSING")
+                    .to_string(),
+            });
+        }
+    }
+    records
+}
+
 /// Run one or more dogfood layers and require every check the stage exists for.
 fn run_layers(
     context: &Context,
@@ -1744,6 +1821,7 @@ fn run_layers(
     let run_id = state::bare_run_id(&run_id);
     transaction.dogfood_run_id = Some(run_id.clone());
     let mut reused_any = false;
+    let mut check_records: Vec<CheckRecord> = Vec::new();
     for layer in layers_required {
         let path = state::lab_run_dir(&context.lab.root, state::RELEASE_RUN_KIND, &run_id)
             .join(format!("{layer}.json"));
@@ -1759,6 +1837,7 @@ fn run_layers(
                 format!("{layer}.json is not valid JSON: {err}"),
             )
         })?;
+        check_records.extend(check_records_from_doc(&doc, layer));
         let status = doc.at("status").as_str().unwrap_or("UNKNOWN");
         let reused = doc.get("reused").is_some() && !doc.at("reused").is_null();
         reused_any |= reused;
@@ -1832,6 +1911,43 @@ fn run_layers(
             coverage
         ));
     }
+    if !check_records.is_empty() {
+        let executed = check_records
+            .iter()
+            .filter(|check| check.provenance == "EXECUTED")
+            .count();
+        let reused = check_records
+            .iter()
+            .filter(|check| check.provenance == "REUSED")
+            .count();
+        let missing = check_records.len() - executed - reused;
+        detail.push(format!(
+            "checks: {executed} executed, {reused} reused, {missing} without identity"
+        ));
+        // A stage is reused only when every check it exists for came from
+        // evidence it did not execute. Advisory or extra checks cannot block
+        // that claim; a required check with no identity does.
+        let required: Vec<(&str, &str)> = layers_required
+            .iter()
+            .flat_map(|layer| required_checks(layer).iter().map(move |id| (*layer, *id)))
+            .collect();
+        let required_records: Vec<&CheckRecord> = check_records
+            .iter()
+            .filter(|check| {
+                required
+                    .iter()
+                    .any(|(layer, id)| check.layer == *layer && check.id == *id)
+            })
+            .collect();
+        if !required_records.is_empty()
+            && required_records
+                .iter()
+                .all(|check| check.provenance == "REUSED")
+        {
+            reused_any = true;
+        }
+    }
+    transaction.stage_record_mut(stage).checks = check_records;
     if reused_any {
         transaction.stage_record_mut(stage).reused = true;
     }
@@ -2218,6 +2334,38 @@ fn run_rc(
     }
     let mut lines = vec![format!("RC qualification: {verdict} (exit {exit})")];
     lines.push(reuse_line(&doc, reuse_from.as_deref()));
+    // RC suite evidence is suite-level. Record each suite's origin in the same
+    // ledger; RC5 is derived and carries no independent execution.
+    let mut rc_checks = Vec::new();
+    for (name, suite) in decision.at("suites").as_obj().unwrap_or(&[]) {
+        let status = suite.at("status").as_str().unwrap_or("").to_string();
+        let reused_from = suite.at("reused_from").as_str();
+        let provenance = if reused_from.is_some() {
+            "REUSED"
+        } else if name == "RC5" {
+            "MISSING"
+        } else {
+            "EXECUTED"
+        };
+        rc_checks.push(CheckRecord {
+            id: format!("rc:{name}"),
+            layer: "RC".to_string(),
+            status,
+            input_sha256: None,
+            evidence_id: None,
+            source_run: Some(
+                reused_from
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("eval/rc/{run_id}")),
+            ),
+            source_candidate: Some(transaction.candidate_sha.clone()),
+            provenance: provenance.to_string(),
+        });
+    }
+    transaction
+        .stage_record_mut(STAGE_DOGFOOD)
+        .checks
+        .extend(rc_checks);
     Ok(lines)
 }
 

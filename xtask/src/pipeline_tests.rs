@@ -119,6 +119,11 @@ struct Script {
     /// checks it reports when it reused nothing.
     reuse_suites: Vec<String>,
     reuse_checks: Vec<(String, String)>,
+    /// Per-check evidence provenance the scripted layers carry. An absent id is
+    /// EXECUTED; `omit_check_evidence` removes the block entirely.
+    check_provenance: Vec<(String, String)>,
+    omit_check_evidence: bool,
+    check_source_run: Option<String>,
 }
 
 impl Script {
@@ -167,6 +172,9 @@ impl Script {
             reuse_from: None,
             reuse_suites: Vec::new(),
             reuse_checks: Vec::new(),
+            check_provenance: Vec::new(),
+            omit_check_evidence: false,
+            check_source_run: None,
         }
     }
 
@@ -210,16 +218,39 @@ fn layer_document(script: &Script, layer: &str) -> String {
         _ => &[],
     };
     let mut checks = Vec::new();
+    let input_sha = "a".repeat(64);
+    let source_run = script
+        .check_source_run
+        .clone()
+        .unwrap_or_else(|| RELEASE_RUN.to_string());
+    let evidence_for = |id: &str, dropped: bool| -> String {
+        if script.omit_check_evidence || dropped {
+            return String::new();
+        }
+        let provenance = script
+            .check_provenance
+            .iter()
+            .find(|(check, _)| check == id)
+            .map(|(_, provenance)| provenance.clone())
+            .unwrap_or_else(|| "EXECUTED".to_string());
+        format!(
+            ",\"evidence\":{{\"provenance\":\"{provenance}\",\"input_sha256\":\"{input_sha}\",\"evidence_id\":\"ev-{id}\",\"source_run\":\"{source_run}\",\"source_candidate\":\"{CANDIDATE}\"}}"
+        )
+    };
     for id in required {
         let dropped = script.drop_check.as_deref() == Some(*id);
+        let status = if dropped { "SKIPPED" } else { "PASS" };
         checks.push(format!(
-            "{{\"id\":\"{id}\",\"status\":\"{}\"}}",
-            if dropped { "SKIPPED" } else { "PASS" }
+            "{{\"id\":\"{id}\",\"status\":\"{status}\"{}}}",
+            evidence_for(id, dropped)
         ));
     }
     if layer == "L3" {
         for (id, status) in &script.cases {
-            checks.push(format!("{{\"id\":\"{id}\",\"status\":\"{status}\"}}"));
+            checks.push(format!(
+                "{{\"id\":\"{id}\",\"status\":\"{status}\"{}}}",
+                evidence_for(id, false)
+            ));
         }
     }
     let status = script.status(layer);
@@ -1069,6 +1100,180 @@ fn a_clean_release_runs_all_four_stages_and_verifies_the_published_artifacts() {
     assert!(
         std::fs::read_to_string(world.lab.join(RELEASE_RUN).join("PIPELINE_REPORT.md")).is_ok(),
         "the report is archived next to the dogfood evidence"
+    );
+}
+
+#[test]
+fn per_check_evidence_is_recorded_in_the_stage_ledger() {
+    let world = World::new();
+    let (code, rendered, _) = world.run(&["publish"]);
+    assert_eq!(code, 0, "{rendered}");
+    let state = world.state();
+    let stage2 = state.at("stages").index(1).unwrap();
+    let checks = stage2.at("checks").as_arr().expect("stage 2 ledger");
+    let workspace = checks
+        .iter()
+        .find(|check| check.path_str("id") == Some("workspace_tests"))
+        .expect("workspace_tests is in the ledger");
+    assert_eq!(workspace.path_str("layer"), Some("L1"));
+    assert_eq!(workspace.path_str("status"), Some("PASS"));
+    assert_eq!(workspace.path_str("provenance"), Some("EXECUTED"));
+    assert!(workspace.path_str("input_sha256").is_some());
+    assert!(workspace.path_str("evidence_id").is_some());
+    let detail = stage2
+        .at("detail")
+        .as_arr()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(detail.contains("checks:"), "{detail}");
+    assert!(detail.contains("executed"), "{detail}");
+}
+
+#[test]
+fn a_stage_whose_checks_are_all_reused_is_reported_as_reused() {
+    let world = World::new();
+    world.set(|script| {
+        for id in [
+            "fmt",
+            "clippy",
+            "release_build",
+            "workspace_tests",
+            "prefix_cache_stability",
+            "feature_coverage_inventory",
+            "tui_tests",
+        ] {
+            script
+                .check_provenance
+                .push((id.to_string(), "REUSED".to_string()));
+        }
+    });
+    let (code, rendered, _) = world.run(&["publish"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        rendered.contains("stage 1 build-static: REUSED"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("stage 2 automated-tests: REUSED"),
+        "{rendered}"
+    );
+    let state = world.state();
+    assert_eq!(
+        state.at("stages").index(0).unwrap().at("reused").as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        state.at("stages").index(1).unwrap().at("reused").as_bool(),
+        Some(true)
+    );
+}
+
+#[test]
+fn one_fresh_check_makes_the_stage_executed_even_when_the_rest_are_reused() {
+    let world = World::new();
+    world.set(|script| {
+        for id in [
+            "fmt",
+            "clippy",
+            "release_build",
+            "prefix_cache_stability",
+            "feature_coverage_inventory",
+            "tui_tests",
+        ] {
+            script
+                .check_provenance
+                .push((id.to_string(), "REUSED".to_string()));
+        }
+        script
+            .check_provenance
+            .push(("workspace_tests".to_string(), "EXECUTED".to_string()));
+    });
+    let (code, rendered, _) = world.run(&["publish"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("stage 2 automated-tests: REUSED"),
+        "one fresh check is not a reused stage: {rendered}"
+    );
+    let state = world.state();
+    assert_eq!(
+        state.at("stages").index(1).unwrap().path_str("status"),
+        Some("PASS")
+    );
+    let detail = state
+        .at("stages")
+        .index(1)
+        .unwrap()
+        .at("detail")
+        .as_arr()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(detail.contains("1 executed"), "{detail}");
+    assert!(detail.contains("3 reused"), "{detail}");
+}
+
+#[test]
+fn a_check_without_identity_is_valid_but_never_a_reuse_claim() {
+    let world = World::new();
+    world.set(|script| script.omit_check_evidence = true);
+    let (code, rendered, _) = world.run(&["publish"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("stage 2 automated-tests: REUSED"),
+        "{rendered}"
+    );
+    let state = world.state();
+    let checks = state
+        .at("stages")
+        .index(1)
+        .unwrap()
+        .at("checks")
+        .as_arr()
+        .expect("ledger");
+    assert!(
+        checks
+            .iter()
+            .all(|check| check.path_str("provenance") == Some("MISSING"))
+    );
+}
+
+#[test]
+fn a_changed_gate_definition_reuses_the_checks_it_did_not_touch() {
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    world.set(|script| {
+        for id in [
+            "fmt",
+            "clippy",
+            "release_build",
+            "workspace_tests",
+            "prefix_cache_stability",
+            "feature_coverage_inventory",
+            "tui_tests",
+        ] {
+            script
+                .check_provenance
+                .push((id.to_string(), "REUSED".to_string()));
+        }
+    });
+    std::fs::write(
+        world.lab.join("eval/scripts/release_check.py"),
+        "#!/usr/bin/env python3\n# changed gate, unrelated check\n",
+    )
+    .unwrap();
+    let (code, rendered, _) = world.resume(&["--stop-after", "2"]);
+    assert_eq!(code, 0, "{rendered}");
+    // The stage fingerprint changed, so the gate was invoked again; its
+    // per-check evidence says the checks themselves did not change.
+    assert!(
+        rendered.contains("stage 2 automated-tests: REUSED"),
+        "a definition change must not force the checks it did not touch: {rendered}"
     );
 }
 
