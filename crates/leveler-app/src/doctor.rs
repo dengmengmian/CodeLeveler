@@ -53,13 +53,55 @@ impl CheckResult {
 /// Whether an executable named `name` exists on `PATH`.
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+    find_in_path_in(&path, name)
+}
+
+/// The injectable half of [`find_in_path`], so lookup rules can be tested
+/// without mutating this process's `PATH`.
+fn find_in_path_in(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path) {
+        for candidate in path_candidates(name) {
+            let path = dir.join(&candidate);
+            if path.is_file() {
+                return Some(path);
+            }
         }
     }
     None
+}
+
+/// The file names a `PATH` lookup should try.
+///
+/// Windows executes through `PATHEXT` (`git` resolves to `git.exe`); joining
+/// the bare name silently reports every installed Windows tool as missing.
+fn path_candidates(name: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let extensions =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let extensions: Vec<&str> = extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .collect();
+        let upper = name.to_ascii_uppercase();
+        if extensions
+            .iter()
+            .any(|extension| upper.ends_with(&extension.to_ascii_uppercase()))
+        {
+            return vec![name.to_string()];
+        }
+        let mut candidates: Vec<String> = extensions
+            .iter()
+            .map(|extension| format!("{name}{extension}"))
+            .collect();
+        // Keep the previous exact-name lookup as a fallback.
+        candidates.push(name.to_string());
+        candidates
+    }
+    #[cfg(not(windows))]
+    {
+        vec![name.to_string()]
+    }
 }
 
 /// Run diagnostics against the loaded configuration.
@@ -451,6 +493,32 @@ pub fn has_failure(results: &[CheckResult]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows resolves `git` through `PATHEXT`; a bare `PATH` join reports
+    /// every installed tool as missing.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_lookup_applies_pathext() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("leveler-doctor-probe.exe");
+        std::fs::write(&tool, b"stub").unwrap();
+        let path = dir.path().as_os_str();
+        let found = find_in_path_in(path, "leveler-doctor-probe").expect("found via PATHEXT");
+        assert!(found.is_file());
+        assert_eq!(
+            found
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            "leveler-doctor-probe.exe"
+        );
+        assert_eq!(
+            find_in_path_in(path, "leveler-doctor-probe.exe"),
+            Some(tool)
+        );
+        assert_eq!(find_in_path_in(path, "leveler-doctor-missing"), None);
+    }
 
     /// A retired per-model `instructions` key must produce a visible doctor
     /// warning instead of being silently ignored.
