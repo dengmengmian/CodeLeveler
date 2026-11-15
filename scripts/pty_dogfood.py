@@ -2467,11 +2467,19 @@ def scenario_plan_status(report: Report, provider: str, mock):
         if report.baseline:
             return
         check("aligned", "目标模式" in "".join(p.screen.grid[y + 1]))
-        check("background-and-issue-during-thinking", wait_until(
-            p, lambda _: all(label in "".join(p.screen.grid[y + 1])
-                             for label in ("目标模式 · 思考", "后台 1 ↗", "后台失败 1 ↗")),
-            4,
-        ))
+        def background_recorded(_text):
+            row = "".join(p.screen.grid[y + 1])
+            screen = p.screen.text()
+            return (
+                "目标模式 · 思考" in row
+                and "后台 1 ↗" in row
+                and "后台失败" not in row
+                and "sleep 1; exit 7" in screen
+                and "exit 7" in screen
+            )
+
+        check("background-and-issue-during-thinking",
+              wait_until(p, background_recorded, 4))
         p.key("draft-probe")
         check("draft-while-thinking", p.wait_for("draft-probe", 3) and plan_hit("1/3") == hit)
         p.wheel(up=True, row=max(1, y - 5), col=10, times=2)
