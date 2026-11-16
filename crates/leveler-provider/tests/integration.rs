@@ -1033,3 +1033,29 @@ async fn complete_http_invalid_json_remains_protocol_decode() {
     assert_eq!(server.request_count(), 1);
     assert_eq!(server.request_bodies().await.len(), 1);
 }
+
+/// A failed catalog lookup must not remove an explicitly configured model.
+#[tokio::test]
+async fn malformed_discovery_preserves_manual_model_requests() {
+    let server = MockServer::start(vec![
+        MockResponse::json_ok(r#"{"data":{"unexpected":true}}"#),
+        MockResponse::json_ok(r#"{"id":"r1","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#),
+    ]).await;
+    let config = provider_config(server.base_url());
+    let original = config.clone();
+    let reg = registry(&server);
+    assert!(matches!(
+        leveler_provider::discovery::list_remote_models(&config).await,
+        Err(leveler_provider::discovery::DiscoveryError::Malformed { .. })
+    ));
+    assert_eq!(config, original);
+    let response = reg
+        .generate(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(response.message.text_content(), "answer");
+    assert_eq!(server.request_count(), 2);
+    let bodies = server.request_bodies().await;
+    let request: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    assert_eq!(request["model"], "mock-model");
+}

@@ -78,6 +78,14 @@ pub async fn list_remote_models(config: &ProviderConfig) -> Result<Vec<String>, 
             url: url.clone(),
             detail: e.to_string(),
         })?;
+    // Missing data retains the existing empty-list contract. An explicit
+    // non-array data field is malformed, rather than an empty entitlement list.
+    if body.get("data").is_some_and(|data| !data.is_array()) {
+        return Err(DiscoveryError::Malformed {
+            url,
+            detail: "expected data to be an array".into(),
+        });
+    }
     Ok(parse_model_ids(&body))
 }
 
