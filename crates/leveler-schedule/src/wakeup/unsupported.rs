@@ -20,6 +20,7 @@ pub(super) async fn disable(home: &Path) -> Result<WakeupStatus, WakeupError> {
         registration_path: None,
         registered: false,
         loaded: false,
+        reports_environment: false,
         registration: None,
         last_exit_code: None,
         run_count: None,
