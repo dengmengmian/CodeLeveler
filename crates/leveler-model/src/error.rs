@@ -142,12 +142,15 @@ pub enum Retryability {
     /// [`Retryability::Unknown`] here and is decided by
     /// [`ModelError::is_retryable_by_lifecycle`].
     Safe,
-    /// The request may have reached the provider. Retrying could duplicate
-    /// generation, cost, or a tool call, so it is never automatic: the runtime
-    /// surfaces a recoverable state and a person decides.
+    /// The request may have reached the provider. A blind replay could
+    /// duplicate generation or cost, so this class never enters the transport's
+    /// fast path. The bounded logical lifecycle may still re-request it when
+    /// no answer text was delivered (see
+    /// [`ModelError::is_retryable_by_lifecycle`]).
     Caution,
-    /// Delivery could not be established at all. Never automatic, and reported
-    /// as "unknown" rather than "interrupted".
+    /// Delivery could not be established at all. Never blindly replayable;
+    /// reported as "unknown" rather than "interrupted". The bounded lifecycle
+    /// may still spend one attempt when no answer text was received.
     Unknown,
     /// Retrying the identical request cannot help (auth, invalid request,
     /// decode, truncation).
@@ -401,48 +404,58 @@ impl ModelError {
     /// Deliberately weaker than [`Self::retryability`], which the transport's
     /// cheap pre-delivery fast path also reads. The lifecycle owns recovery for
     /// a whole model request, and the one thing a re-send must never do is
-    /// duplicate answer text or tool calls the caller already received. It may
-    /// recover a reasoning-only interruption or a failure that received nothing
-    /// at all, even when the provider may have generated (and billed) an answer
-    /// that never arrived. That cost is the
-    /// accepted price of a *bounded* recovery, and it is exactly why such a
-    /// failure is not `Safe` and must not be taken by the fast path.
+    /// duplicate answer text the caller already received. It may recover a
+    /// reasoning-only interruption, a request that received nothing at all, or
+    /// a stream cut while the model was still assembling a tool call, even when
+    /// the provider may have generated (and billed) output that never arrived.
+    /// That cost is the accepted price of a *bounded* recovery, and it is
+    /// exactly why such a failure is not `Safe` and must not be taken by the
+    /// fast path.
+    ///
+    /// A partial tool call is safe to discard here because the round never
+    /// returned a [`crate::ModelResponse`]: tool calls are assembled inside the
+    /// stream and dispatched only after the whole round succeeds, so nothing
+    /// from a failed attempt was executed or exposed to the caller.
     ///
     /// This closes the asymmetry that used to end a whole run: a stream cut
     /// after the headers were read was retried, while the same transient
     /// condition one phase earlier — request fully sent, no response headers
-    /// ever returned — was terminal.
+    /// ever returned — was terminal; and a cut while the model was writing
+    /// tool arguments ended the task although no tool had run.
     ///
-    /// Everything else stays terminal: a failure that received answer text or
-    /// tool-call data, a status that is not safely retryable, and every
-    /// non-transient kind whatever the
-    /// delivery truth says — cancellation included.
+    /// Everything else stays terminal: a failure that delivered answer text, a
+    /// status that is not safely retryable, and every non-transient kind
+    /// whatever the delivery truth says — cancellation included.
     pub fn is_retryable_by_lifecycle(&self) -> bool {
         match self.retryability() {
             Retryability::Safe => true,
             // Non-transient: the provider would reject the identical request
             // the same way, whatever delivery proved.
             Retryability::Never => false,
-            // The provider may have done work. Recoverable only when the
-            // evidence says no answer text or tool-call data was received. A
-            // reasoning-only interruption is still billed generation, so it
-            // stays `Caution` rather than becoming blindly safe.
-            Retryability::Caution | Retryability::Unknown => self.received_no_answer_or_tool_data(),
+            // The provider may have done work. Recoverable only when no answer
+            // text reached the caller. A reasoning-only or tool-argument
+            // interruption is still billed generation, so it stays `Caution`
+            // rather than becoming blindly safe.
+            Retryability::Caution | Retryability::Unknown => self.received_no_answer_text(),
         }
     }
 
-    /// Whether the failed attempt received no answer text or tool-call data.
-    /// Reasoning alone may be discarded by the bounded lifecycle; a complete
-    /// HTTP status remains the provider's answer.
+    /// Whether the failed attempt delivered no answer text to the caller.
+    /// Reasoning and uncommitted tool-call fragments may be discarded by the
+    /// bounded lifecycle; a complete HTTP status remains the provider's answer.
     ///
     /// A failure seen *inside* a stream is rewritten by the round to
     /// [`DeliveryState::StreamInterrupted`] with the progress it actually made,
     /// so a `SentNoResponse` reaching here can only mean the response never
     /// started.
-    fn received_no_answer_or_tool_data(&self) -> bool {
+    fn received_no_answer_text(&self) -> bool {
         match self.delivery_state {
             DeliveryState::NotSent | DeliveryState::SentNoResponse => true,
-            DeliveryState::StreamInterrupted { progress } => !progress.text && !progress.tool_args,
+            // Tool-call arguments only matter once a round succeeds: the
+            // executor never receives a call from a failed attempt. Answer text
+            // is different — it may already be on screen, and a replay would
+            // duplicate it.
+            DeliveryState::StreamInterrupted { progress } => !progress.text,
             // A send-boundary transport fault: no response stream exists. A
             // mid-stream fault is never left as `Unknown`.
             DeliveryState::Unknown => self.kind == ModelErrorKind::Transport,
@@ -856,30 +869,46 @@ mod tests {
         }
     }
 
-    /// The other half of the same contract: once output exists, no retry rule
-    /// may replay it — there is no protocol-level stream resume, so a replay
-    /// would duplicate generation, cost and tool calls.
+    /// A stream cut while the model was still writing tool arguments carries
+    /// generated output, so it is not *blindly* replayable — but no tool from a
+    /// failed round ever reaches the executor, so the bounded lifecycle may
+    /// discard the uncommitted attempt and re-request. This is the original
+    /// long-task failure: ~95 rounds of work ended because a partial
+    /// `tool_args` fragment made the whole request terminal.
     #[test]
-    fn a_failure_that_received_output_is_never_recoverable_by_the_lifecycle() {
-        for progress in [
-            StreamProgress {
-                reasoning: true,
-                text: true,
-                tool_args: false,
-            },
-            StreamProgress {
-                reasoning: true,
-                text: false,
-                tool_args: true,
-            },
-        ] {
-            let err = ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
-                .with_delivery_state(DeliveryState::StreamInterrupted { progress });
-            assert!(
-                !err.is_retryable_by_lifecycle(),
-                "{progress:?} must never be replayed"
-            );
-        }
+    fn an_uncommitted_tool_call_interruption_is_recoverable_by_the_lifecycle() {
+        let progress = StreamProgress {
+            reasoning: true,
+            text: false,
+            tool_args: true,
+        };
+        assert!(progress.any(), "tool arguments remain generated output");
+        let error = ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
+            .with_delivery_state(DeliveryState::StreamInterrupted { progress });
+        assert_eq!(error.retryability(), Retryability::Caution);
+        assert!(!error.is_safe_to_retry());
+        assert!(
+            error.is_retryable_by_lifecycle(),
+            "no tool executed, so the bounded lifecycle may re-request"
+        );
+    }
+
+    /// The other half of the same contract: once answer text was delivered, no
+    /// retry rule may replay it — there is no protocol-level stream resume, so
+    /// a replay would duplicate what the user already saw.
+    #[test]
+    fn a_failure_that_delivered_answer_text_is_never_recoverable_by_the_lifecycle() {
+        let progress = StreamProgress {
+            reasoning: true,
+            text: true,
+            tool_args: false,
+        };
+        let err = ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
+            .with_delivery_state(DeliveryState::StreamInterrupted { progress });
+        assert!(
+            !err.is_retryable_by_lifecycle(),
+            "{progress:?} must never be replayed"
+        );
         // A complete status is the provider's own answer to the request.
         assert!(!ModelError::from_status(504, "gateway timeout").is_retryable_by_lifecycle());
     }

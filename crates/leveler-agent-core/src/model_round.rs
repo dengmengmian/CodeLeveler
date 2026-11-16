@@ -166,16 +166,16 @@ impl RetryPolicy {
 ///
 /// The rule itself lives with the delivery truth, in
 /// [`ModelError::is_retryable_by_lifecycle`]: this lifecycle owns recovery for
-/// a whole model request, so it may re-send any transient failure that received
-/// no answer text or tool-call data. Reasoning-only interruptions may also
-/// recover, with their failed attempt settled before retrying. An upstream
-/// that swallowed the request and never returned response headers is such a failure, and
-/// it must not take the task down.
+/// a whole model request, so it may re-send any transient failure that
+/// delivered no answer text. Reasoning-only and tool-argument interruptions
+/// may also recover, with their failed attempt settled before retrying. An
+/// upstream that swallowed the request and never returned response headers is
+/// such a failure, and it must not take the task down.
 ///
-/// Nothing that produced answer text or tool-call data slips through:
-/// [`stream_round`] rewrites every failure seen inside a stream to `StreamInterrupted` with its progress
-/// attached, and a stream that produced text or tool-call arguments is never
-/// replayed.
+/// Delivered answer text blocks a retry — it may already be on screen and
+/// there is no stream-resume protocol. Uncommitted tool-call arguments do not:
+/// [`stream_round`] assembles calls internally and returns them only on
+/// success, so a failed attempt's calls were neither executed nor exposed.
 fn should_retry_round(error: &ModelError) -> bool {
     error.is_retryable_by_lifecycle()
 }
@@ -371,10 +371,12 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             Err(AgentCoreError::Model(e)) => e,
             Err(e) => return Err(e.into()),
         };
-        // Safe delivery failures, pre-stream/send transport failures, and
-        // reasoning-only interruptions may use bounded recovery. Answer text
-        // or tool-call data prevents replay: no stream-resume protocol exists.
-        // Reasoning-only recovery remains `Caution` and settles failed spend.
+        // Safe delivery failures, pre-stream/send transport failures,
+        // reasoning-only interruptions, and cuts while the model was still
+        // writing tool arguments may use bounded recovery. Delivered answer
+        // text prevents replay: it may already be on screen and no
+        // stream-resume protocol exists. Uncommitted tool calls cannot be
+        // duplicated — a failed round never reaches dispatch.
         if !should_retry_round(&error) {
             // The decision is half the evidence here. When the round *does*
             // retry, `model round retrying` records the same fields; without a
@@ -1588,11 +1590,15 @@ mod retry_decision_tests {
             )
             .await;
 
-            if progress.any() {
+            if progress.text {
+                // Delivered answer text may already be on screen; replaying
+                // would duplicate it. The failure must carry the progress.
                 let error = match result {
                     Err(AgentCoreError::Model(e)) => e,
                     other => {
-                        panic!("a stream that delivered output must not be replayed: {other:?}")
+                        panic!(
+                            "a stream that delivered answer text must not be replayed: {other:?}"
+                        )
                     }
                 };
                 assert_eq!(
@@ -1607,19 +1613,29 @@ mod retry_decision_tests {
                         .any(|e| matches!(e, AgentEvent::ModelRetrying { .. }))
                 );
             } else {
+                // Nothing, reasoning, and an uncommitted tool-call fragment
+                // are all recoverable: no answer text was shown and no tool
+                // from a failed round was ever dispatched.
                 assert!(
                     result.is_ok(),
-                    "a stream that produced nothing is recoverable: {result:?}"
+                    "a stream that delivered no answer text is recoverable: {result:?}"
                 );
                 assert_eq!(*calls.lock().unwrap(), 2);
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, AgentEvent::ModelRetrying { .. }))
+                );
             }
         }
     }
 
-    /// A stream cut with a tool call still being described carries output too:
-    /// never replayed.
+    /// A stream cut with a tool call still being described produced no answer
+    /// text and dispatched nothing. The round may discard the uncommitted
+    /// fragment and re-request within its bounded budget; the original long
+    /// task died here after ~95 rounds.
     #[tokio::test]
-    async fn a_stream_cut_with_tool_args_is_never_auto_replayed() {
+    async fn a_stream_cut_with_tool_args_recovers_within_the_budget() {
         let error = ModelError::new(ModelErrorKind::StreamInterrupted, "cut").with_delivery_state(
             DeliveryState::StreamInterrupted {
                 progress: StreamProgress {
@@ -1630,9 +1646,15 @@ mod retry_decision_tests {
             },
         );
         let mut events = Vec::new();
-        let (result, calls) = run(error, 100, &CancellationToken::new(), &mut events).await;
-        assert!(result.is_err());
-        assert_eq!(calls, 1, "an unfinished tool call is never replayed");
+        let (result, calls) = run(error, 1, &CancellationToken::new(), &mut events).await;
+        assert!(result.is_ok(), "the bounded lifecycle re-requests once");
+        assert_eq!(calls, 2, "one failed attempt, one successful one");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ModelRetrying { .. })),
+            "the retry is announced, not silent"
+        );
     }
 
     /// P0-1: a stream that produced nothing carries nothing to duplicate.

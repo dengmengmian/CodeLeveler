@@ -494,9 +494,61 @@ async fn body_read_reasoning_only_recovers_once_and_settles_both_attempts() {
             .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
     );
 }
+/// A cut while the model is writing tool arguments carries no answer text and
+/// dispatched nothing: the round may discard the fragment and re-request. The
+/// failed attempt's call must never surface as a tool event.
 #[tokio::test]
-async fn body_read_partial_tool_arguments_are_not_replayed() {
-    assert_partial_body_is_not_replayed(PartialOutput::ToolArguments).await;
+async fn body_read_partial_tool_arguments_recover_without_dispatching_the_partial_call() {
+    let server = MockServer::start(vec![
+        broken_body(Some(PartialOutput::ToolArguments.frame())),
+        completed_sse(),
+    ])
+    .await;
+    let reg = registry(&server);
+    let mut observer = AttemptObserver::default();
+    let round = leveler_agent_core::run_model_round_observed(
+        &reg,
+        request(),
+        &CancellationToken::new(),
+        &mut observer,
+    )
+    .await
+    .expect("a tool-argument cut with no answer text must recover");
+    let requests = assert_physical_requests(&server, 2).await;
+    assert_eq!(requests[0], requests[1], "retry the same admitted request");
+    assert_eq!(
+        round.message.content,
+        vec![ContentPart::Text {
+            text: "recovered".into()
+        }]
+    );
+    assert_eq!(observer.attempts.len(), 2);
+    let first = observer
+        .attempts
+        .first()
+        .and_then(|attempt| attempt.error.as_ref())
+        .expect("the first attempt is settled as a failure");
+    assert_eq!(
+        first.delivery_state,
+        DeliveryState::StreamInterrupted {
+            progress: PartialOutput::ToolArguments.progress()
+        }
+    );
+    assert!(
+        observer
+            .attempts
+            .get(1)
+            .is_some_and(|attempt| attempt.error.is_none()),
+        "the second attempt is the success"
+    );
+    assert!(
+        !observer
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. })),
+        "the partial call was never dispatched: {:?}",
+        observer.events
+    );
 }
 
 async fn executor_with_responses(
@@ -534,29 +586,52 @@ async fn executor_with_responses(
 }
 
 #[tokio::test]
-async fn body_read_partial_outputs_do_not_inject_tool_json_repair() {
-    for partial in [PartialOutput::Text, PartialOutput::ToolArguments] {
-        let (server, result, events) =
-            executor_with_responses(vec![broken_body(Some(partial.frame())), completed_sse()])
-                .await;
-        assert_physical_requests(&server, 1).await;
-        let error = match result {
-            Err(leveler_agent::AgentError::Model(error)) => error,
-            other => panic!("no repaired/fake success for body failure: {other:?}"),
-        };
-        assert_eq!(error.kind, ModelErrorKind::Transport);
-        assert_eq!(
-            error.delivery_state,
-            DeliveryState::StreamInterrupted {
-                progress: partial.progress()
-            }
-        );
-        assert!(!events.iter().any(|e| matches!(e, leveler_agent::AgentEvent::RuntimeInjection { kind, .. } if kind == "protocol_repair")));
-        assert!(!events.iter().any(|e| matches!(
-            e,
-            leveler_agent::AgentEvent::Finished(_) | leveler_agent::AgentEvent::ToolCall { .. }
-        )));
-    }
+async fn body_read_partial_outputs_never_inject_tool_json_repair() {
+    // Delivered answer text: terminal, no repair, no fake success.
+    let (server, result, events) = executor_with_responses(vec![
+        broken_body(Some(PartialOutput::Text.frame())),
+        completed_sse(),
+    ])
+    .await;
+    assert_physical_requests(&server, 1).await;
+    let error = match result {
+        Err(leveler_agent::AgentError::Model(error)) => error,
+        other => panic!("no repaired/fake success for delivered text: {other:?}"),
+    };
+    assert_eq!(error.kind, ModelErrorKind::Transport);
+    assert_eq!(
+        error.delivery_state,
+        DeliveryState::StreamInterrupted {
+            progress: PartialOutput::Text.progress()
+        }
+    );
+    assert!(!events.iter().any(|e| matches!(e, leveler_agent::AgentEvent::RuntimeInjection { kind, .. } if kind == "protocol_repair")));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        leveler_agent::AgentEvent::Finished(_) | leveler_agent::AgentEvent::ToolCall { .. }
+    )));
+
+    // Tool arguments only: recover with the SAME request, still no repair.
+    let (server, result, events) = executor_with_responses(vec![
+        broken_body(Some(PartialOutput::ToolArguments.frame())),
+        completed_sse(),
+    ])
+    .await;
+    let bodies = assert_physical_requests(&server, 2).await;
+    assert_eq!(
+        bodies[0], bodies[1],
+        "a retry is the same admitted request, not an injected repair"
+    );
+    let outcome = result.expect("tool-argument-only cut recovers");
+    assert_eq!(outcome.stop_reason, leveler_agent::StopReason::Answered);
+    assert_eq!(outcome.final_text, "recovered");
+    assert!(!events.iter().any(|e| matches!(e, leveler_agent::AgentEvent::RuntimeInjection { kind, .. } if kind == "protocol_repair")));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, leveler_agent::AgentEvent::ToolCall { .. })),
+        "the partial attempt's call never ran"
+    );
 }
 
 #[tokio::test]
