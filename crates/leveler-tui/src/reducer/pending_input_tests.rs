@@ -159,6 +159,41 @@ fn pending_steer_detail_can_be_opened_without_changing_the_draft() {
 }
 
 #[test]
+fn clicking_a_pending_steer_control_sends_only_that_action() {
+    use leveler_client_protocol::SteerAction;
+    let mut s = state();
+    s.transcript.push_input(
+        MessageId::new("click-me"),
+        "点击这条追加".into(),
+        crate::transcript::InputDelivery::Pending,
+    );
+    let lines = render(&mut s, 120, 40);
+    let row = row_of(&lines, "立即发送").expect("send control is painted");
+    let column =
+        unicode_width::UnicodeWidthStr::width(lines[row].split("立即发送").next().unwrap_or(""))
+            as u16;
+    let effects = reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: row as u16,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::ManageSteer {
+                action: SteerAction::Prioritize { message_id, revision: 0 },
+                ..
+            })] if message_id.as_str() == "click-me"
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
 fn accepted_edit_reuses_the_composer_and_restores_the_previous_draft() {
     use leveler_client_protocol::SteerAction;
     let mut s = state();

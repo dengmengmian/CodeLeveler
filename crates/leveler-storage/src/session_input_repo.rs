@@ -645,4 +645,173 @@ mod tests {
         assert!(repo.pending(&session_id).await.unwrap().is_empty());
         assert_eq!(repo.all(&session_id).await.unwrap().len(), 1);
     }
+
+    /// An edit lease and a priority request are one row. Acceleration must not
+    /// publish the reserved draft, and withdrawal must not land while the lease
+    /// is still valid.
+    #[tokio::test]
+    async fn an_edit_lease_survives_prioritize_and_refuses_withdrawal() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session_id = session(&db).await;
+        let repo = SessionInputRepository::new(&db);
+        let now = leveler_core::now();
+        let original = "原始追加";
+        let turn = TurnId::new("turn-1");
+        repo.admit("edited", &session_id, Some(&turn), original, now)
+            .await
+            .unwrap();
+        let lease = "b606db24-c8d0-486e-a1c7-be3f65b69d66";
+        let reserved = repo
+            .mutate(
+                &session_id,
+                "edited",
+                0,
+                SessionInputMutation::BeginEdit {
+                    lease_id: lease,
+                    expires_ms: now.timestamp_millis() + 60_000,
+                },
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reserved.editing_at(now));
+
+        let accelerated = repo.prioritize(&session_id, &["edited"]).await.unwrap();
+        assert_eq!(accelerated.len(), 1);
+        assert!(accelerated[0].priority);
+        assert_eq!(accelerated[0].content, original);
+        assert!(accelerated[0].editing_at(now));
+        assert_eq!(accelerated[0].revision, reserved.revision);
+
+        assert!(
+            repo.mutate(
+                &session_id,
+                "edited",
+                reserved.revision,
+                SessionInputMutation::Withdraw,
+                now,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let saved = repo
+            .mutate(
+                &session_id,
+                "edited",
+                reserved.revision,
+                SessionInputMutation::SaveEdit {
+                    lease_id: lease,
+                    content: "保存后的追加",
+                },
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.content, "保存后的追加");
+        assert!(saved.priority);
+        assert!(!saved.editing_at(now));
+        assert_eq!(
+            repo.pending(&session_id).await.unwrap()[0].content,
+            "保存后的追加"
+        );
+    }
+
+    /// Withdrawal and acceleration serialize on the pending row. Either order
+    /// leaves a cancelled instruction that a later consume cannot revive.
+    #[tokio::test]
+    async fn withdrawal_and_prioritize_leave_one_cancelled_row() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session_id = session(&db).await;
+        let repo = SessionInputRepository::new(&db);
+        let now = leveler_core::now();
+        repo.admit("gone", &session_id, None, "撤回这条", now)
+            .await
+            .unwrap();
+        repo.admit("kept", &session_id, None, "留下这条", now)
+            .await
+            .unwrap();
+
+        let accelerated = repo.prioritize(&session_id, &["gone"]).await.unwrap();
+        assert_eq!(accelerated.len(), 1);
+        let withdrawn = repo
+            .mutate(&session_id, "gone", 0, SessionInputMutation::Withdraw, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(withdrawn.state, SessionInputState::Cancelled);
+        assert!(
+            repo.prioritize(&session_id, &["gone"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        repo.mark_consumed(&session_id, "gone", Some(3), now)
+            .await
+            .unwrap();
+        let gone = repo.load(&session_id, "gone").await.unwrap().unwrap();
+        assert_eq!(gone.state, SessionInputState::Cancelled);
+        assert_eq!(gone.ordinal, None);
+
+        let kept = repo.load(&session_id, "kept").await.unwrap().unwrap();
+        assert_eq!(kept.state, SessionInputState::Pending);
+        assert!(!kept.priority);
+    }
+
+    /// A database that stopped at the original input journal still opens.
+    /// Pending rows gain a zero revision and keep their admitting turn.
+    #[tokio::test]
+    async fn a_pre_management_pending_row_survives_the_steer_columns() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session_id = session(&db).await;
+        let now = leveler_core::now();
+        sqlx::query("DROP TABLE session_inputs")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0050_session_inputs.sql"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO session_inputs \
+             (id, session_id, turn_id, content, state, reason, created_at) \
+             VALUES ('old-pending', ?1, 'turn-old', '历史追加', 'pending', '', ?2), \
+                    ('old-consumed', ?1, 'turn-old', '已经交付', 'consumed', '', ?2)",
+        )
+        .bind(session_id.as_str())
+        .bind(now.to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0058_steer_management.sql"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let repo = SessionInputRepository::new(&db);
+        let pending = repo
+            .load(&session_id, "old-pending")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.content, "历史追加");
+        assert_eq!(pending.state, SessionInputState::Pending);
+        assert_eq!(pending.revision, 0);
+        assert!(!pending.priority);
+        assert_eq!(
+            pending.origin_turn_id.as_ref().map(TurnId::as_str),
+            Some("turn-old")
+        );
+        let consumed = repo
+            .load(&session_id, "old-consumed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed.state, SessionInputState::Consumed);
+        assert_eq!(consumed.origin_turn_id, None);
+        assert_eq!(consumed.revision, 0);
+    }
 }
