@@ -7422,20 +7422,65 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let id = message_id
                     .map(|id| id.as_str().to_string())
                     .unwrap_or_else(leveler_core::new_uuid_string);
-                let admission = self.active.steering(&session_id);
+                let publisher = self.events_for(&session_id);
+                let (admission, mut terminal_events) = self
+                    .active
+                    .observe_steering(&session_id, || publisher.subscribe())
+                    .map_or((None, None), |(gate, events)| (Some(gate), Some(events)));
                 let admission_guard = if let Some(gate) = &admission {
                     let guard = gate.admission_closed.lock().await;
-                    if *guard
-                        || !self
-                            .active
-                            .steering(&session_id)
-                            .is_some_and(|live| Arc::ptr_eq(gate, &live))
+                    if *guard {
+                        // Admission already closed. No journal row has been
+                        // written for this text. A confirmed normal terminal
+                        // lets it start fresh, while a failure or cancellation
+                        // leaves it with the caller.
+                        drop(guard);
+                        let mut terminal_events = terminal_events
+                            .take()
+                            .expect("the active admission has its own terminal subscription");
+                        let completed =
+                            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                                while let Ok(event) = terminal_events.recv().await {
+                                    match event {
+                                        RuntimeEvent::TurnAnswered
+                                        | RuntimeEvent::TurnCompleted
+                                        | RuntimeEvent::TurnCompletedPartiallyUnverified {
+                                            ..
+                                        }
+                                        | RuntimeEvent::TurnCompletedWithWarnings { .. } => {
+                                            return true;
+                                        }
+                                        RuntimeEvent::TurnCancelled
+                                        | RuntimeEvent::TaskCancelled
+                                        | RuntimeEvent::TurnFailed { .. }
+                                        | RuntimeEvent::TurnTruncated { .. }
+                                        | RuntimeEvent::TurnIncomplete { .. }
+                                        | RuntimeEvent::TurnBlocked { .. }
+                                        | RuntimeEvent::TurnPaused { .. } => return false,
+                                        _ => {}
+                                    }
+                                }
+                                false
+                            })
+                            .await
+                            .unwrap_or(false);
+                        if !completed {
+                            return Err(ClientError::SteerConflict(
+                                leveler_client_protocol::SteerConflict::Unavailable,
+                            ));
+                        }
+                        None
+                    } else if self
+                        .active
+                        .steering(&session_id)
+                        .is_some_and(|live| Arc::ptr_eq(gate, &live))
                     {
-                        return Err(ClientError::Runtime(
-                            "当前任务已进入收尾，请在任务结束后重新发送".into(),
+                        Some(guard)
+                    } else {
+                        return Err(ClientError::SteerConflict(
+                            leveler_client_protocol::SteerConflict::Unavailable,
                         ));
                     }
-                    Some(guard)
                 } else {
                     None
                 };
@@ -7443,6 +7488,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // same row instead of creating a second instruction.
                 let window = admission
                     .as_ref()
+                    .filter(|_| admission_guard.is_some())
                     .map(|active| {
                         active.window.lock().unwrap().clone().ok_or_else(|| {
                             ClientError::Runtime("当前任务尚未进入可追加指令的执行窗口".into())
@@ -7482,9 +7528,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // executor. Another subscribed client has no optimistic row;
                 // it must see admission before a fast round settles the input.
                 self.emit_input_admitted(&session_id, &id, &text);
-                if let Some(active) = &admission {
+                if let (Some(active), Some(_guard)) = (&admission, admission_guard) {
                     // Keep the reservation until the durable admission is visible to the drive.
-                    let _guard = admission_guard;
                     // A retry of the submission that STARTED this turn is
                     // already its opening message; queueing it again would
                     // deliver the same row twice.

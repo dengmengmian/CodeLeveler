@@ -236,11 +236,22 @@ impl ActiveTurns {
     }
 
     pub(crate) fn steering(&self, session_id: &SessionId) -> Option<Arc<ActiveSteering>> {
+        self.observe_steering(session_id, || ())
+            .map(|(steering, ())| steering)
+    }
+
+    /// Subscribe while this turn still owns the publication boundary.
+    /// `observe` must not read ActiveTurns again.
+    pub(crate) fn observe_steering<T>(
+        &self,
+        session_id: &SessionId,
+        observe: impl FnOnce() -> T,
+    ) -> Option<(Arc<ActiveSteering>, T)> {
         self.active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session_id)
-            .map(|turn| turn.steering.clone())
+            .map(|turn| (turn.steering.clone(), observe()))
     }
 
     /// Record observable progress for a running turn. A no-op when the session
