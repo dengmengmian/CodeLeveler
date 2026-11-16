@@ -139,6 +139,7 @@ pub(super) async fn status(home: &Path) -> Result<WakeupStatus, WakeupError> {
         registration_path: None,
         registered,
         loaded: registered,
+        reports_environment: false,
         registration,
         last_exit_code,
         run_count,

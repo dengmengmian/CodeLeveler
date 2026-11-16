@@ -1,0 +1,35 @@
+leveler doctor
+  repo:    C:\qlab\repos\ascii-tui
+  config:  C:\qlab\repos\ascii-tui\configs
+
+  ✓ git                    C:\Program Files\Git\ucrt64\bin\git.EXE
+  ! rg                     not found on PATH (optional; falls back to built-in)
+  ✓ cargo                  C:\Users\code\.cargo\bin\cargo.EXE
+  ! go                     not found on PATH (optional)
+  ! node                   not found on PATH (optional)
+  ✓ config: providers      1 loaded
+  ✓ config: models         1 loaded
+  ✓ reasoning: taotoken/deepseek-v4.1-flash-1017 supported=[low, high, max] default=high effective=high
+  ✓ config: global         ok (C:\qlab\home-upgrade\config.toml)
+  ✓ api key: taotoken      set via config (api_key)
+  ✓ sandbox                process_tree=Job read=PreflightOnly write=WriteRestricted network_deny=false backend=LowIntegrity
+  ✓ agents                 0 project, 0 user, 7 built-in
+
+Terminal observations
+TERM (environment reported): xterm-256color
+COLORTERM (environment reported): unknown
+NO_COLOR (theme setting): false
+Observed terminal color capability: unknown; not probed
+stdout TTY: false
+SSH detected: false
+tmux detected: false
+Native clipboard: not probed
+OSC 52: unavailable (delivery is not verified)
+tmux buffer: not detected
+tmux clipboard forwarding / DCS passthrough: unknown
+OSC 52 payload limit: 65536 bytes
+Newline bindings: Ctrl+J / Alt+Enter / Ctrl+Enter
+Shift+Enter: not bound; terminal extended-key delivery is unknown
+No clipboard read/write or configuration changes were performed.
+
+✓ Environment looks healthy.

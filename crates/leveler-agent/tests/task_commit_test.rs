@@ -76,7 +76,11 @@ impl Scripted {
 
 fn test_runner_label() -> &'static str {
     if cfg!(windows) {
-        "cmd /c run-tests.cmd"
+        // A builtin command keeps the fixture independent of batch-file
+        // execution, which the Windows background host does not support (see
+        // the qualification report). Foreground workspace scripts are covered
+        // by the verifier fixtures below.
+        "cmd /c exit 0"
     } else {
         "sh run-tests.sh"
     }
@@ -85,7 +89,7 @@ fn test_runner_label() -> &'static str {
 fn test_runner_call() -> serde_json::Value {
     if cfg!(windows) {
         serde_json::json!({
-            "program": "cmd", "args": ["/c", "run-tests.cmd"],
+            "program": "cmd", "args": ["/c", "exit 0"],
             "reason": "run the test suite the user required"
         })
     } else {
@@ -93,6 +97,29 @@ fn test_runner_call() -> serde_json::Value {
             "program": "sh", "args": ["run-tests.sh"],
             "reason": "run the test suite the user required"
         })
+    }
+}
+
+/// `echo` is a cmd builtin on Windows; `run_command` needs an executable.
+fn echo_ready_call() -> serde_json::Value {
+    if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd", "args": ["/C", "echo ready"],
+            "reason": "confirm the workspace state"
+        })
+    } else {
+        serde_json::json!({
+            "program": "echo", "args": ["ready"],
+            "reason": "confirm the workspace state"
+        })
+    }
+}
+
+fn echo_ready_label() -> &'static str {
+    if cfg!(windows) {
+        "cmd /C echo ready"
+    } else {
+        "echo ready"
     }
 }
 
@@ -2915,20 +2942,13 @@ async fn a_passing_command_cannot_verify_an_undeclared_requirement() {
             vec![
                 Scripted::Tool("commit_task", commit),
                 write_stage(),
-                Scripted::Tool(
-                    "run_command",
-                    serde_json::json!({
-                        "program": "echo",
-                        "args": ["ready"],
-                        "reason": "confirm the workspace state"
-                    }),
-                ),
+                Scripted::Tool("run_command", echo_ready_call()),
                 Scripted::Tool(
                     "update_goal",
                     serde_json::json!({
                         "status": "complete",
                         "summary": "文件已创建，echo ready 通过",
-                        "verification": {"status": "passed", "detail": "echo ready"}
+                        "verification": {"status": "passed", "detail": echo_ready_label()}
                     }),
                 ),
             ],
@@ -3563,7 +3583,7 @@ async fn a_read_only_turn_cannot_declare_an_execution_task() {
 fn staged_objective() -> &'static str {
     if cfg!(windows) {
         "完成全部三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
-         最后运行 cmd /c verify.cmd，全部做完再结束。"
+         最后运行 cmd /c .\\verify.cmd，全部做完再结束。"
     } else {
         "完成全部三个阶段：创建 stage-1.txt、stage-2.txt、stage-3.txt，\
          最后运行 sh ./verify.sh，全部做完再结束。"
@@ -3580,7 +3600,7 @@ fn verifier_path() -> &'static str {
 
 fn verifier_label() -> &'static str {
     if cfg!(windows) {
-        "cmd /c verify.cmd"
+        "cmd /c .\\verify.cmd"
     } else {
         "sh ./verify.sh"
     }
@@ -3589,7 +3609,7 @@ fn verifier_label() -> &'static str {
 /// The acceptance item that names the verifier the Objective itself names.
 fn verifier_acceptance() -> &'static str {
     if cfg!(windows) {
-        "cmd /c verify.cmd 通过"
+        "cmd /c .\\verify.cmd 通过"
     } else {
         "sh ./verify.sh 通过"
     }
@@ -3597,7 +3617,7 @@ fn verifier_acceptance() -> &'static str {
 
 fn verifier_call() -> serde_json::Value {
     if cfg!(windows) {
-        serde_json::json!({"program": "cmd", "args": ["/c", "verify.cmd"], "reason": "run the acceptance check"})
+        serde_json::json!({"program": "cmd", "args": ["/c", ".\\verify.cmd"], "reason": "run the acceptance check"})
     } else {
         serde_json::json!({"program": "sh", "args": ["./verify.sh"], "reason": "run the acceptance check"})
     }
@@ -3605,7 +3625,7 @@ fn verifier_call() -> serde_json::Value {
 
 fn checker_label() -> &'static str {
     if cfg!(windows) {
-        "cmd /c check.cmd"
+        "cmd /c .\\check.cmd"
     } else {
         "sh check.sh"
     }
@@ -3613,7 +3633,7 @@ fn checker_label() -> &'static str {
 
 fn checker_call() -> serde_json::Value {
     if cfg!(windows) {
-        serde_json::json!({"program": "cmd", "args": ["/c", "check.cmd"], "reason": "run the build check"})
+        serde_json::json!({"program": "cmd", "args": ["/c", ".\\check.cmd"], "reason": "run the build check"})
     } else {
         serde_json::json!({"program": "sh", "args": ["check.sh"], "reason": "run the build check"})
     }
@@ -4733,9 +4753,9 @@ async fn a_multi_round_chat_with_tools_does_not_upgrade_itself() {
 
 fn staged_pause_objective() -> &'static str {
     if cfg!(windows) {
-        "完成两个阶段：阶段 1 创建 stage-1.txt 并运行 cmd /c verify.cmd 验收；\
+        "完成两个阶段：阶段 1 创建 stage-1.txt 并运行 cmd /c .\\verify.cmd 验收；\
          阶段 1 完成后停下，等待我确认再执行阶段 2；\
-         阶段 2 创建 stage-2.txt 并运行 cmd /c verify.cmd 验收。"
+         阶段 2 创建 stage-2.txt 并运行 cmd /c .\\verify.cmd 验收。"
     } else {
         "完成两个阶段：阶段 1 创建 stage-1.txt 并运行 sh ./verify.sh 验收；\
          阶段 1 完成后停下，等待我确认再执行阶段 2；\
@@ -4745,8 +4765,8 @@ fn staged_pause_objective() -> &'static str {
 
 fn staged_full_objective() -> &'static str {
     if cfg!(windows) {
-        "一次完成两个阶段：阶段 1 创建 stage-1.txt 并运行 cmd /c verify.cmd 验收；\
-         阶段 2 创建 stage-2.txt 并运行 cmd /c verify.cmd 验收。\
+        "一次完成两个阶段：阶段 1 创建 stage-1.txt 并运行 cmd /c .\\verify.cmd 验收；\
+         阶段 2 创建 stage-2.txt 并运行 cmd /c .\\verify.cmd 验收。\
          中间不要停下来等我确认。"
     } else {
         "一次完成两个阶段：阶段 1 创建 stage-1.txt 并运行 sh ./verify.sh 验收；\
@@ -4760,8 +4780,8 @@ fn staged_full_objective() -> &'static str {
 /// runtime can hold the model to an explicit scope without inventing one.
 fn authorized_long_objective() -> &'static str {
     if cfg!(windows) {
-        "分两阶段交付：第一阶段创建 long-1.txt 并运行 cmd /c verify.cmd 验收；\
-         第二阶段创建 long-2.txt 并运行 cmd /c verify.cmd 验收。\
+        "分两阶段交付：第一阶段创建 long-1.txt 并运行 cmd /c .\\verify.cmd 验收；\
+         第二阶段创建 long-2.txt 并运行 cmd /c .\\verify.cmd 验收。\
          全过程不需要逐步确认，也不要中途停下来问我，直到两项都完成并验收。"
     } else {
         "分两阶段交付：第一阶段创建 long-1.txt 并运行 sh ./verify.sh 验收；\

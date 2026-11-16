@@ -250,13 +250,23 @@ fn probe_sixel() -> bool {
     {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_millis(150);
+    // The terminal may answer slower than the initial budget when the host is
+    // busy. Starting a reply earns it its own window: a half-read sequence
+    // would otherwise stay in the input queue and reach the composer as if
+    // the user had typed it.
+    let started_at = Instant::now();
+    let mut deadline = started_at + Duration::from_millis(150);
+    let mut started = false;
     let mut response = String::new();
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
         match poll(left) {
             Ok(true) => match read() {
                 Ok(Event::Key(key)) => {
+                    if !started && is_da1_start(&key) {
+                        started = true;
+                        deadline = Instant::now() + Duration::from_millis(1_000);
+                    }
                     match key.code {
                         KeyCode::Esc => response.push('\x1b'),
                         KeyCode::Char(c) => response.push(c),
@@ -272,7 +282,32 @@ fn probe_sixel() -> bool {
             _ => break,
         }
     }
+    if started && !response.ends_with('c') {
+        // The reply started but did not finish. Consume what is already
+        // queued: it is the solicited terminal response, and delivering its
+        // tail to the composer would read as the user's own typing. The
+        // probe still reports no capability, so the image stays hidden.
+        for _ in 0..256 {
+            match poll(Duration::ZERO) {
+                Ok(true) => {
+                    let _ = read();
+                }
+                _ => break,
+            }
+        }
+    }
     da1_advertises_sixel(&response)
+}
+
+/// The first token of a DA1 reply. Crossterm may consume the leading ESC while
+/// parsing the sequence, so a bare `[` (or `?`) opens it too.
+#[cfg(any(windows, test))]
+fn is_da1_start(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyCode;
+    matches!(
+        key.code,
+        KeyCode::Esc | KeyCode::Char('[') | KeyCode::Char('?')
+    )
 }
 
 #[cfg(not(windows))]
@@ -414,6 +449,21 @@ mod tests {
         assert!(!da1_advertises_sixel("\x1b[?1;2c"));
         assert!(!da1_advertises_sixel("\x1b[?61;42;52c"));
         assert!(!da1_advertises_sixel(""));
+    }
+
+    /// A DA1 reply can be split across reads. Only its own opening tokens may
+    /// claim the extended window and the drain of an unfinished reply; an
+    /// ordinary user key during startup must not.
+    #[test]
+    fn only_a_da1_reply_opener_extended_the_probe() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(is_da1_start(&key(KeyCode::Esc)));
+        assert!(is_da1_start(&key(KeyCode::Char('['))));
+        assert!(is_da1_start(&key(KeyCode::Char('?'))));
+        assert!(!is_da1_start(&key(KeyCode::Char('a'))));
+        assert!(!is_da1_start(&key(KeyCode::Enter)));
+        assert!(!is_da1_start(&key(KeyCode::Backspace)));
     }
 
     #[test]

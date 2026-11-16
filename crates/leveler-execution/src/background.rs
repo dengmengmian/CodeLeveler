@@ -4599,6 +4599,39 @@ mod tests {
         assert_eq!(snap.status, BackgroundTaskStatus::Killed);
     }
 
+    /// A batch script is a normal background workload. `cmd` cannot execute
+    /// one without `SystemRoot` (it exits 1 and prints nothing), so this must
+    /// use the host environment the product installs — the same one that
+    /// makes arbitrary `.cmd`/`.bat` test entry points work for real users.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_background_batch_script_runs_with_the_host_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("run.cmd"),
+            "@echo off\r\necho marker\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let request = ProcessRequest::new(
+            "cmd",
+            vec!["/C".into(), ".\\run.cmd".into()],
+            dir.path().to_path_buf(),
+        );
+        let reg = host_registry();
+        let id = reg.spawn(request, None).await.expect("spawn");
+        let snap = reg
+            .wait(
+                &id,
+                Some(Duration::from_secs(10)),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("wait");
+        assert_eq!(snap.status, BackgroundTaskStatus::Exited, "{snap:?}");
+        assert_eq!(snap.exit_code, Some(0), "{snap:?}");
+        assert!(snap.log.contains("marker"), "{snap:?}");
+    }
+
     #[tokio::test]
     async fn spawn_wait_echo() {
         let reg = BackgroundTaskRegistry::new();
@@ -4925,7 +4958,19 @@ mod tests {
     async fn writer_settlement_keeps_other_writers_alive_and_releases_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         let reg = host_registry();
-        let mut request = ProcessRequest::new("sleep", vec!["30".into()], dir.path().to_path_buf());
+        // `sleep` is not a native Windows program, and MSYS binaries cannot
+        // initialize under the Low-integrity write sandbox. A native command
+        // keeps this a test of writer settlement rather than of the host's
+        // coreutils compatibility.
+        let (program, args) = if cfg!(windows) {
+            (
+                "ping",
+                vec!["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+            )
+        } else {
+            ("sleep", vec!["30".to_string()])
+        };
+        let mut request = ProcessRequest::new(program, args, dir.path().to_path_buf());
         request.write_scope = crate::WriteScope::Workspace {
             root: dir.path().to_path_buf(),
         };

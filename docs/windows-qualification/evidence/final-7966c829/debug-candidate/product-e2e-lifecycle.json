@@ -1,0 +1,50 @@
+﻿{
+    "schema":  "leveler.windows.task-scheduler-product-e2e/1",
+    "stage":  "definition-lifecycle",
+    "finished_at":  "2026-11-16T01:46:21.9583414Z",
+    "binary":  "C:\\CodeLeveler\\target\\debug\\leveler.exe",
+    "home":  "C:\\qlab\\ts-e2e-final\\home",
+    "workspace":  "C:\\qlab\\ts-e2e-final\\工作 空间",
+    "checks":  {
+                   "failing_command":  {
+                                           "passed":  true,
+                                           "detail":  "state=failed exit=7 error=the scheduled action ended with status `failed`"
+                                       },
+                   "cancel_running":  {
+                                          "passed":  true,
+                                          "detail":  "state=cancelled requested=1 error=the scheduled action ended with status `cancelled`"
+                                      },
+                   "update_drops_grant":  {
+                                              "passed":  true,
+                                              "detail":  "grant="
+                                          },
+                   "ungranted_run_blocked":  {
+                                                 "passed":  true,
+                                                 "detail":  "state=blocked error=no unattended authorization exists for this schedule; grant unattended execution explicitly before enabling it"
+                                             },
+                   "regrant":  {
+                                   "passed":  true,
+                                   "detail":  "grant={\"actions\":[\"shell\"],\"definition_id\":\"9a58ef63-f865-4008-8400-ba67d6e84a0f\",\"external_side_effects\":true,\"granted_at\":\"2026-11-16T01:46:18.252336200Z\",\"permission_mode\":\"assisted\",\"requires_regrant\":false,\"version\":3,\"workspace\":\"\\\\\\\\?\\\\C:\\\\qlab\\\\ts-e2e-final\\\\工作 空间\"}"
+                               },
+                   "edited_command_runs":  {
+                                               "passed":  true,
+                                               "detail":  "state=succeeded exit=0 after=True before=False"
+                                           },
+                   "pause_resume":  {
+                                        "passed":  true,
+                                        "detail":  "paused=False resumed=True"
+                                    },
+                   "remove_definition":  {
+                                             "passed":  true,
+                                             "detail":  "exit=0 listed=False orphan_runs=0"
+                                         },
+                   "session_binding":  {
+                                           "passed":  true,
+                                           "detail":  "session=875b7104-ccc2-4ca7-a3cd-d592a12cbf4b"
+                                       }
+               },
+    "failures":  [
+
+                 ],
+    "verdict":  "PASS"
+}

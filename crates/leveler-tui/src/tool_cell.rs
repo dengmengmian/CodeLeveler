@@ -3021,18 +3021,21 @@ mod tests {
 
     #[test]
     fn shell_command_strips_leading_cd_and_compacts_home() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/example".into());
+        // A POSIX working directory proves the shell-line parser; the host's
+        // own HOME may contain backslashes on Windows, which are not valid
+        // JSON when interpolated into the fixture below.
+        let home = "/Users/example";
         let args =
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && make run-admin-local"}}"#);
         let s = tool_summary("shell_command", &args);
         assert_eq!(s, "make run-admin-local");
-        assert!(!s.contains(&home), "must not leak absolute home path: {s}");
+        assert!(!s.contains(home), "must not leak absolute home path: {s}");
         assert!(!s.contains('{'), "{s}");
     }
 
     #[test]
     fn run_command_unwraps_bash_c_and_strips_cd() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/example".into());
+        let home = "/Users/example";
         let args = format!(
             r#"{{"program":"bash","args":["-c","cd {home}/Develop/app/codeleveler && cargo test -q"]}}"#
         );

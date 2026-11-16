@@ -1,0 +1,1 @@
+[2m2026-11-15T15:37:36.530306Z[0m [33m WARN[0m [2mleveler_execution::background[0m[2m:[0m background supervisor unavailable; this task runs without durable recovery [3merror[0m[2m=[0mpersistent Execution Host requires an audited owner-only state directory backend on this platform

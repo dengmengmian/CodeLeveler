@@ -1,0 +1,735 @@
+{
+  "candidate": {
+    "version": "1.0.27",
+    "short_sha": "7966c829",
+    "code_head": "7966c829697356afaef0881755894fff5bd78d59",
+    "report_head": "50e50c67",
+    "baseline": "644d765c6208eba7b59bc0db88559a0445036135",
+    "fixes": "0ebfa59d doctor PATHEXT; 4b159c83 TUI DA1; 6edf54ec ACL tests; 0f9a5cbd debug probe; 9936f513 rmdir switches; 8d76717d TUI pager; 9693cc68 Windows test fixtures; 1016b495 live write-root recovery; 3390713d atomic memory replace; 940ae12c endpoint EOF; 4bc08296 native Windows fixtures; 7966c829 Windows LogonTrigger user binding + doctor environment capability",
+    "os": "Windows 11 26300.9711",
+    "terminal": "Windows Terminal 1.25.3131.0",
+    "artifact_note": "从正式 ZIP 解压到 C:\\qlab\\install\\candidate-7966c829 验收；未覆盖用户已安装的 C:\\Users\\code\\.local\\bin\\leveler.exe。二进制 provenance 为 1.0.27 (03def7aaeecb)，构建工作树干净。",
+    "build_revision": "03def7aaeecb07632a9ab74c47862eb6310799c2"
+  },
+  "summary": {
+    "cards": [
+      [
+        "Candidate",
+        "1.0.27 (7966c829)",
+        "Code HEAD；构建 revision 03def7aa"
+      ],
+      [
+        "Windows 11",
+        "26300.9711",
+        "Home Single Language · zh-CN"
+      ],
+      [
+        "Task Scheduler",
+        "PASS",
+        "P1 已关闭；真实到期触发；doctor PASS"
+      ],
+      [
+        "Security canaries",
+        "PASS",
+        "11 项独立 + CI 同款 windows_ 测试"
+      ],
+      [
+        "Workspace / Clippy",
+        "PASS",
+        "PASS：328 targets，7933 passed / 0 failed（便携 CPython 在 PATH）；Clippy PASS"
+      ],
+      [
+        "TUI 真机矩阵",
+        "PASS（4bc08296）",
+        "本轮未改动 TUI；按影响范围复用上一候选证据"
+      ],
+      [
+        "Dogfood",
+        "PASS（已执行范围）",
+        "A/B/E/MCP 为 4bc08296；当前候选真实定时业务 PASS"
+      ],
+      [
+        "总体判定",
+        "PASS（已执行范围）",
+        "外部宿主/发布门禁 BLOCKED / NOT VERIFIED"
+      ]
+    ],
+    "verdict": "Windows 11 当前候选 1.0.27 (7966c829) 在已执行范围内通过：Task Scheduler P1 已修复并以真实非提升宿主、真实到期唤醒与真实业务副作用关闭；schedule doctor 的 Windows environment 误报同轮修复；最终 Release ZIP 解压二进制的自然到期任务、身份/IL/cwd/输出/会话记录、生命周期、daemon 重启恢复、并发与任务隔离均通过；安全 canary、format、check、Clippy 与 release payload 通过。独立标准用户、ConHost、PS7/VS Code/IME、Release Lab/RC、远端 CI、macOS/Linux 与 Windows 10 当前候选仍为 BLOCKED / NOT VERIFIED，因此整体为“已执行范围 PASS”，不是完整发布资格。"
+  },
+  "environment": [
+    [
+      "OS Caption",
+      "Microsoft Windows 11 家庭中文版"
+    ],
+    [
+      "Build / UBR",
+      "26300.9711"
+    ],
+    [
+      "架构",
+      "x64 / AMD64"
+    ],
+    [
+      "CPU / RAM",
+      "AMD Ryzen 5 PRO 4650U (6C/12T) / 16 GB"
+    ],
+    [
+      "Windows Terminal",
+      "1.25.3131.0"
+    ],
+    [
+      "当前终端宿主",
+      "Windows Terminal（WT_SESSION 存在）"
+    ],
+    [
+      "Console Host 二进制",
+      "10.0.26100.9949（默认委派给 WT）"
+    ],
+    [
+      "PowerShell",
+      "5.1.26100.9711"
+    ],
+    [
+      "PowerShell 7",
+      "未安装"
+    ],
+    [
+      "Git / Git Bash",
+      "2.56.0.windows.4 / bash 5.3.15"
+    ],
+    [
+      "Rust / Cargo",
+      "1.90.0 / 1.90.0 (x86_64-pc-windows-msvc)"
+    ],
+    [
+      "系统 Python",
+      "未安装；测试用便携 CPython 3.12.10"
+    ],
+    [
+      "区域 / 代码页",
+      "zh-CN / CP936"
+    ],
+    [
+      "DPI / 分辨率",
+      "144 (150%) / 1920×1080"
+    ],
+    [
+      "长路径",
+      "LongPathsEnabled=0"
+    ],
+    [
+      "用户",
+      "DESKTOP-6EGC57E\\code；Administrators（过滤 token 中 deny-only）"
+    ],
+    [
+      "提升状态 / IL",
+      "未提升 / Medium (S-1-16-8192)"
+    ],
+    [
+      "独立标准用户",
+      "未准备（需要管理员授权）"
+    ],
+    [
+      "测试路径",
+      "C:\\qlab、C:\\qlab\\repos\\中文 工程、C:\\qlab\\repos\\库存 对账"
+    ],
+    [
+      "VS Code",
+      "未安装"
+    ],
+    [
+      "中文 IME",
+      "Microsoft Pinyin 已安装；未用合成输入驱动组合/候选"
+    ],
+    [
+      "最终候选解压",
+      "C:\\qlab\\install\\candidate-7966c829\\leveler-v1.0.27-x86_64-pc-windows-msvc\\leveler.exe"
+    ]
+  ],
+  "defects": [
+    {
+      "id": "WIN11-D1",
+      "severity": "P1",
+      "title": "doctor 在 Windows 上误报 git/cargo/node 缺失",
+      "root_cause": "find_in_path 只做 dir.join(name)，未按 PATHEXT 解析 .exe",
+      "fix": "按 PATHEXT 生成候选名并保留精确名回退；Windows 单测 Red→Green；真机 doctor 中 git/cargo 变为 ✓，退出 0"
+    },
+    {
+      "id": "WIN11-D2",
+      "severity": "P1",
+      "title": "DA1/Sixel 能力应答尾部泄漏到输入框",
+      "root_cause": "150 ms 固定窗口内未读完应答，剩余字节留在 TUI 输入队列",
+      "fix": "回复开始后给予独立完成窗口；未完成时消费已排队尾部；单测覆盖解析/opener；高负载真机验证"
+    },
+    {
+      "id": "WIN11-D3",
+      "severity": "P2",
+      "title": "windows_acl restore 单测假设 SeRestorePrivilege",
+      "root_cause": "icacls /restore 需要恢复特权；非提升 token 没有；该 coordinator 非出货路径",
+      "fix": "按宿主能力断言：有特权验证成功，无特权验证明确的 Restore 错误；CI canary 0 failed"
+    },
+    {
+      "id": "WIN11-D4",
+      "severity": "P3",
+      "title": "Release 构建 unused variable 警告",
+      "root_cause": "debug-only fault probe 绑定在 release 中未使用",
+      "fix": "绑定与使用同置于 cfg(debug_assertions)；release 构建无该警告"
+    },
+    {
+      "id": "WIN11-D5",
+      "severity": "P1",
+      "title": "TUI /output Pager 在 Windows 上失败",
+      "root_cause": "capture path 是 verbatim \\\\?\\C:\\...；cmd /C 尾部被 Rust argv 引号包裹，路径带字面引号",
+      "fix": "display_path 转普通盘符/UNC；raw_arg 原样传 cmd 尾部；Windows 单测 Red→Green"
+    },
+    {
+      "id": "WIN11-D6",
+      "severity": "P2",
+      "title": "rmdir /S /Q 工作区目录被误要求审批",
+      "root_cause": "删除分类器把 /S、/Q 当成目标路径",
+      "fix": "仅 Windows rmdir/del 识别 / 开关；Unix 前导 / 仍为绝对路径；单测与 loop_test 通过"
+    },
+    {
+      "id": "WIN11-D7",
+      "severity": "P1",
+      "title": "崩溃恢复会恢复仍在活动租约中的写根标签",
+      "root_cause": "recover_stale_write_roots 把同 home 下所有 .label 记录当作崩溃遗留，缺少活动租约的耐久事实",
+      "fix": "每记录 sidecar guard 独占锁 + 进程内 held 跳过；恢复只处理可加锁记录；租约时加锁恢复遗留；新增跨进程/同进程回归测试"
+    },
+    {
+      "id": "WIN11-D8",
+      "severity": "P2",
+      "title": "并发读取时 memory topic 原子替换偶发拒绝访问",
+      "root_cause": "tempfile::persist 的 Windows MoveFileExW 无法替换被读句柄打开的目标",
+      "fix": "overwrite 改用 std::fs::rename（NTFS 原子且可替换读打开目标）；并发测试 100/100 通过"
+    },
+    {
+      "id": "WIN11-D9",
+      "severity": "P2",
+      "title": "Windows named pipe 握手 EOF 被误报为传输错误",
+      "root_cause": "endpoint_unavailable 未包含 UnexpectedEof",
+      "fix": "将 UnexpectedEof 归类为端点不可用；共享单测在 Windows 运行；真机 windows_runtime_host 10/10 通过"
+    },
+    {
+      "id": "WIN11-D10",
+      "severity": "P2",
+      "title": "全量 Windows 测试夹具的 POSIX/空环境假设",
+      "root_cause": "测试使用 sh/sleep/裸 .cmd、未转义 HOME JSON、空环境快照执行批处理",
+      "fix": "改为原生命令/显式 .\\/固定 POSIX 路径/宿主环境快照；目标测试 Green；全量套件见 gates"
+    },
+    {
+      "id": "WIN11-D11",
+      "severity": "P1",
+      "title": "非提升会话无法启用 Task Scheduler wakeup",
+      "root_cause": "<LogonTrigger> 没有 <UserId>，Task Scheduler 将其解释为“所有用户”的登录触发器；非提升用户无权注册该触发器，返回 Access Denied",
+      "fix": "LogonTrigger 绑定与 Principal 相同的当前用户；TDD 先 Red 后 Green；真实注册、按需执行、IgnoreNew、自然到期触发、删除与真实业务副作用均 PASS"
+    },
+    {
+      "id": "WIN11-D12",
+      "severity": "P2",
+      "title": "Windows 注册成功后 schedule doctor 恒失败",
+      "root_cause": "Task Scheduler 记录没有 environment map，doctor 仍把期望的 PATH/HOME/LEVELER_HOME 与空记录比较",
+      "fix": "WakeupStatus 记录平台是否报告 environment（Task Scheduler=false，launchd=true），仅在可比较时比较；CLI 与 manage 两处回归先 Red 后 Green；最终候选真实 doctor healthy=true"
+    }
+  ],
+  "entries": [
+    {
+      "id": "WIN11-01",
+      "description": "干净 Release 构建、正式 ZIP 与产物完整性",
+      "host": "Windows 11 / cargo 1.90",
+      "identity": "code / Medium / n/a",
+      "command": "cargo build --release --locked -p leveler-cli -p leveler-win-confine；package-candidate.ps1",
+      "exit_code": "0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/release-build.log",
+        "evidence/final-7966c829/package.log",
+        "evidence/final-7966c829/candidate.sha256",
+        "evidence/final-7966c829/version.txt"
+      ],
+      "defect": "",
+      "limitation": "构建 revision 03def7aa 含代码提交 7966c829 与仅证据的 docs 提交；无源代码差异"
+    },
+    {
+      "id": "WIN11-02",
+      "description": "全新 home 首次启动与 fail-closed",
+      "host": "WT + PowerShell 5.1",
+      "identity": "code / Medium / Assisted",
+      "command": "leveler init (non-TTY); leveler doctor (empty home)",
+      "exit_code": "0 / 1",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/init-nontty.log",
+        "evidence/doctor-empty-home.txt"
+      ],
+      "defect": "",
+      "limitation": "交互式 init 需要人工 TTY；空 home 无 provider 时 doctor 按设计失败"
+    },
+    {
+      "id": "WIN11-03",
+      "description": "已有配置/会话数据兼容（只读复制）",
+      "host": "WT + PowerShell 5.1",
+      "identity": "code / Medium / n/a",
+      "command": "doctor / config show / memory status / sessions list",
+      "exit_code": "1 / 0 / 0 / 0",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/upgrade-doctor.txt",
+        "evidence/upgrade-memory.txt"
+      ],
+      "defect": "",
+      "limitation": "仓库自带 configs 中 deepseek 模型缺少 provider，doctor 正确报告 2 个失败；未修改用户真实 home；完整 Session Resume 用测试 Session 验证"
+    },
+    {
+      "id": "WIN11-04",
+      "description": "终端宿主矩阵",
+      "host": "WT+CMD / WT+PS5 / WT+PS7 / ConHost / VS Code",
+      "identity": "code / Medium / n/a",
+      "command": "wt + leveler tui",
+      "exit_code": "n/a",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/tui-layout-120x30-clean.png",
+        "evidence/tui-chinese-path.png"
+      ],
+      "defect": "",
+      "limitation": "PS7 未安装；ConHost 被 Windows 11 默认委派阻断；VS Code 未安装"
+    },
+    {
+      "id": "WIN11-05",
+      "description": "历史 Windows 展示问题回归（中文缺字/·/边框/路径/分支/缩放）",
+      "host": "WT 1.25",
+      "identity": "code / Medium / auto",
+      "command": "真实 TUI 截图与缩放",
+      "exit_code": "n/a",
+      "status": "PASS",
+      "evidence": [
+        "evidence/tui-layout-120x30-clean.png",
+        "evidence/tui-chinese-path.png",
+        "evidence/tui-layout-80x24.png"
+      ],
+      "defect": "",
+      "limitation": "系统激活水印会覆盖右下角少量区域"
+    },
+    {
+      "id": "WIN11-06",
+      "description": "Welcome 图片能力：支持显示 / 不支持隐藏 / 超时",
+      "host": "WT 1.25",
+      "identity": "code / Medium / auto",
+      "command": "leveler tui（WT_SESSION 有/无）",
+      "exit_code": "n/a",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/tui-layout-120x30-clean.png",
+        "evidence/tui-image-hidden.png"
+      ],
+      "defect": "",
+      "limitation": "渲染失败/探测超时未注入；能力未知时隐藏行为已验证"
+    },
+    {
+      "id": "WIN11-07",
+      "description": "响应式布局 80×24 / 100×30 / 120×30 / 最大化",
+      "host": "WT 1.25",
+      "identity": "code / Medium / auto",
+      "command": "MoveWindow 到对应网格并截图",
+      "exit_code": "n/a",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/tui-layout-80x24.png",
+        "evidence/tui-layout-100x30.png",
+        "evidence/tui-layout-maximized3.png"
+      ],
+      "defect": "",
+      "limitation": "160×45 在 1080p + 当前字体下不可达；以最大化窗口作为大窗口近似"
+    },
+    {
+      "id": "WIN11-09",
+      "description": "Unicode 文本渲染（中文/emoji/组合/宽度）",
+      "host": "WT 1.25 + TUI",
+      "identity": "code / Medium / auto",
+      "command": "Alt+V 粘贴中文/emoji；单元测试",
+      "exit_code": "n/a",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/tui-altv-multiline.png",
+        "evidence/tui-layout-120x30-clean.png"
+      ],
+      "defect": "",
+      "limitation": "IME 与部分组合字符需人工验证；原生 Ctrl+V 非 BMP 丢失为宿主限制"
+    },
+    {
+      "id": "WIN11-10",
+      "description": "输入、快捷键与粘贴",
+      "host": "WT 1.25 / PS5 / CMD",
+      "identity": "code / Medium / auto/full/ask",
+      "command": "Alt+V、Ctrl+V、Ctrl+Shift+V、Shift+Tab、Ctrl+?、Alt+1/3",
+      "exit_code": "n/a",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/tui-altv-multiline.png",
+        "evidence/tui-ctrlc-paste.png",
+        "evidence/tui-multiline-paste.png",
+        "evidence/tui-permission-full.png"
+      ],
+      "defect": "",
+      "limitation": "原生 Ctrl+V 多行/非 BMP 受 WT 限制；Alt+V 为可靠替代；IME NOT VERIFIED"
+    },
+    {
+      "id": "WIN11-12",
+      "description": "用户身份与 Integrity Level 矩阵",
+      "host": "Windows 11",
+      "identity": "code / Medium / Low child",
+      "command": "whoami /groups; leveler-confine -- whoami",
+      "exit_code": "0",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/whoami-groups.utf8.txt",
+        "evidence/security-canary-manual.log"
+      ],
+      "defect": "",
+      "limitation": "独立标准用户与提升环境未测试/未使用"
+    },
+    {
+      "id": "WIN11-13",
+      "description": "Sandbox launcher 与权限契约",
+      "host": "Windows 11 / WT",
+      "identity": "code / Medium / Assisted",
+      "command": "doctor；缺失 launcher 的 run；leveler-confine exit 23",
+      "exit_code": "0 / 3 / 23",
+      "status": "PASS",
+      "evidence": [
+        "evidence/nolauncher-run.jsonl",
+        "evidence/security-canaries-ci.log"
+      ],
+      "defect": "",
+      "limitation": "launcher 版本不匹配/执行失败未单独注入"
+    },
+    {
+      "id": "WIN11-14",
+      "description": "ACL、低完整性及零写权限安全 canary",
+      "host": "Windows 11",
+      "identity": "code / Medium → Low child",
+      "command": "security-canary.ps1；cargo test windows_",
+      "exit_code": "0 / 0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/security-canary-manual.log",
+        "evidence/security-canaries-ci.log"
+      ],
+      "defect": "",
+      "limitation": "UNC 共享与 AppContainer 路径未测试；ACL coordinator restore 需特权"
+    },
+    {
+      "id": "WIN11-15",
+      "description": "权限模式交互与失败原因",
+      "host": "WT 1.25",
+      "identity": "code / Medium / auto/full/ask",
+      "command": "Shift+Tab；fake-launcher denial JSONL",
+      "exit_code": "n/a",
+      "status": "PASS",
+      "evidence": [
+        "evidence/tui-permission-full.png",
+        "evidence/tui-permission-request.png",
+        "evidence/nolauncher-run.jsonl"
+      ],
+      "defect": "",
+      "limitation": "TUI 审批 Overlay 尚未截图"
+    },
+    {
+      "id": "WIN11-17",
+      "description": "Windows 路径语义（中文/空格/显示/操作）",
+      "host": "WT + TUI / headless",
+      "identity": "code / Medium / auto",
+      "command": "中文+空格工作区；显示路径；dogfood",
+      "exit_code": "0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/tui-chinese-path.png",
+        "evidence/dogfood-a-final/"
+      ],
+      "defect": "",
+      "limitation": "长路径系统开关关闭；未测试 >260 字符路径"
+    },
+    {
+      "id": "WIN11-16",
+      "description": "Shell 与工具执行矩阵",
+      "host": "WT + PS5/CMD + cargo/git",
+      "identity": "code / Medium / auto",
+      "command": "真实 Dogfood A/B/E；canary；测试套件",
+      "exit_code": "0",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/dogfood-a-final/",
+        "evidence/dogfood-b-final/"
+      ],
+      "defect": "",
+      "limitation": "MSYS coreutils 在 Low IL 下失败；原生命令正常"
+    },
+    {
+      "id": "WIN11-24",
+      "description": "后台任务与真实状态结算",
+      "host": "WT + headless",
+      "identity": "code / Medium / auto",
+      "command": "Dogfood B/E 后台 cargo test + wait_task",
+      "exit_code": "0",
+      "status": "PARTIAL",
+      "evidence": [
+        "evidence/dogfood-b-final-4bc08296/",
+        "evidence/dogfood-e-final-4bc08296/"
+      ],
+      "defect": "",
+      "limitation": "后台 cargo test 与 .cmd 均成功；空环境夹具缺 SystemRoot 时 cmd 无法执行批处理（夹具约束）"
+    },
+    {
+      "id": "WIN11-25",
+      "description": "Task Scheduler 非提升注册、自然到期业务任务与 doctor",
+      "host": "Windows 11 / Task Scheduler",
+      "identity": "code / Medium host → Low child",
+      "command": "leveler schedule add/enable/doctor；真实 Task Scheduler 自然 wake",
+      "exit_code": "0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/task-scheduler-root-cause.log",
+        "evidence/final-7966c829/product-e2e-final.json",
+        "evidence/final-7966c829/registration.xml",
+        "evidence/final-7966c829/task-scheduler-com.leveler.schedule.e71f2994c3ec50f8.json",
+        "evidence/final-7966c829/session.txt"
+      ],
+      "defect": "WIN11-D11 / WIN11-D12（本轮修复）",
+      "limitation": "独立标准用户仍 BLOCKED；TUI 未在本轮重新驱动"
+    },
+    {
+      "id": "WIN11-26",
+      "description": "调度生命周期、并发、daemon 重启与无关任务隔离",
+      "host": "Windows 11 / Task Scheduler + runtime",
+      "identity": "code / Medium → Low child",
+      "command": "run-now/cancel/update/grant/pause/resume/remove；双 dispatch；kill serve",
+      "exit_code": "0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/debug-candidate/product-e2e-lifecycle.json",
+        "evidence/final-7966c829/debug-candidate/product-e2e-os-stage-a.json",
+        "evidence/final-7966c829/debug-candidate/product-e2e-os-stage-b1.json",
+        "evidence/final-7966c829/debug-candidate/product-e2e-os-stage-b2.json"
+      ],
+      "defect": "",
+      "limitation": "功能 E2E 使用修复工作树的 debug 构建（代码与 7966c829 相同），不冒充出货字节"
+    },
+    {
+      "id": "WIN11-27",
+      "description": "最终候选安全 canary（独立 11 项 + CI 同款）",
+      "host": "Windows 11 / Medium → Low child",
+      "identity": "code / Medium → Low child",
+      "command": "security-canary.ps1；cargo test windows_",
+      "exit_code": "0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/security-canary-manual.log",
+        "evidence/final-7966c829/security-canaries-ci.log"
+      ],
+      "defect": "",
+      "limitation": "UNC 共享、AppContainer、标准用户路径未验证"
+    }
+  ],
+  "dogfood": [
+    {
+      "id": "DF-A",
+      "task": "订单 CSV 汇总（total_amount + 测试）",
+      "path": "C:\\qlab\repos\\中文 工程",
+      "session": "a649e2a7-aa3d-4714-a1d3-67537c50e9e0",
+      "model": "taotoken/deepseek-v4.1-flash-1017 (high)",
+      "rounds": "7",
+      "tokens": "见 run.jsonl usage",
+      "permission": "assisted",
+      "status": "PASS（4bc08296）",
+      "independent": "cargo test 4 passed / 0 failed / exit 0",
+      "evidence": [
+        "evidence/dogfood-a-final-4bc08296/"
+      ]
+    },
+    {
+      "id": "DF-B",
+      "task": "库存对账 + CLI + 后台测试",
+      "path": "C:\\qlab\repos\\库存 对账",
+      "session": "64c83b40-d507-4bec-add1-f60acbe07cb4",
+      "model": "taotoken/deepseek-v4.1-flash-1017 (high)",
+      "rounds": "12",
+      "tokens": "见 run.jsonl usage",
+      "permission": "assisted",
+      "status": "PASS（4bc08296）",
+      "independent": "cargo test 4/4；cargo run 输出 SKU-1 9 / SKU-2 9 / SKU-3 6",
+      "evidence": [
+        "evidence/dogfood-b-final-4bc08296/"
+      ]
+    },
+    {
+      "id": "DF-E",
+      "task": "README 输出格式 + 修改后重跑测试",
+      "path": "C:\\qlab\repos\\库存 对账",
+      "session": "e675d464-b35c-4de5-affc-19a82c50c036",
+      "model": "taotoken/deepseek-v4.1-flash-1017 (high)",
+      "rounds": "8",
+      "tokens": "见 run.jsonl usage",
+      "permission": "assisted",
+      "status": "PASS（4bc08296）",
+      "independent": "cargo test 4 passed / 0 failed / exit 0",
+      "evidence": [
+        "evidence/dogfood-e-final-4bc08296/"
+      ]
+    },
+    {
+      "id": "DF-MCP",
+      "task": "真实 MCP 工具调用（批准后执行）",
+      "path": "C:\\qlab\repos\\库存 对账",
+      "session": "见 mcp-final.jsonl",
+      "model": "taotoken/deepseek-v4.1-flash-1017 (high)",
+      "rounds": "5",
+      "tokens": "见 mcp-final.jsonl usage",
+      "permission": "assisted",
+      "status": "PASS（4bc08296）",
+      "independent": "fixture 副作用 WIN11-MCP-4BC08296；session_completed Completed",
+      "evidence": [
+        "evidence/mcp-final.jsonl",
+        "evidence/mcp-side-effect-final.log"
+      ]
+    },
+    {
+      "id": "DF-SCHED",
+      "task": "最终候选真实到期定时业务（中文输出、中文/空格工作区）",
+      "path": "C:\\qlab\\ts-final-7966c829\\工作 空间",
+      "session": "14c28394-3ae9-4817-a687-750163e14177",
+      "model": "—（shell action）",
+      "rounds": "—",
+      "tokens": "—",
+      "permission": "assisted",
+      "status": "PASS",
+      "independent": "Task Scheduler 自然 wake；exit 0；due.txt；user_shell_started/finished",
+      "evidence": [
+        "evidence/final-7966c829/product-e2e-final.json",
+        "evidence/final-7966c829/session.txt"
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "gate": "Windows security canaries",
+      "command": "security-canary.ps1；cargo build -p leveler-win-confine；cargo test -p leveler-tools windows_；cargo test -p leveler-execution windows_",
+      "result": "76 passed / 0 failed（3 tools + 73 execution）",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/security-canary-manual.log",
+        "evidence/final-7966c829/security-canaries-ci.log"
+      ]
+    },
+    {
+      "gate": "Release payload",
+      "command": "sh packaging/scripts/check_release_payload.sh",
+      "result": "PASS：所有打包文件存在，平台一致",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/release-payload.log"
+      ]
+    },
+    {
+      "gate": "Release Lab / RC",
+      "command": "./dev pre-release / ./dev release",
+      "result": "BLOCKED：FAIL DOGFOOD_ROOT_NOT_FOUND（无外部 dogfood lab）",
+      "status": "BLOCKED",
+      "evidence": [
+        "evidence/final-7966c829/dev-pre-release.log"
+      ]
+    },
+    {
+      "gate": "Workspace tests",
+      "command": "RUST_TEST_THREADS=2 cargo test --workspace --all-features --locked --no-fail-fast",
+      "result": "PASS：328 targets，7933 passed / 0 failed（便携 CPython 在 PATH）",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/workspace-tests.log"
+      ]
+    },
+    {
+      "gate": "Workspace Clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
+      "result": "PASS：--all-targets --all-features，-D warnings，exit 0（1m14s）",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/clippy.log"
+      ]
+    },
+    {
+      "gate": "Format",
+      "command": "cargo fmt --all -- --check",
+      "result": "PASS：exit 0",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/fmt.txt"
+      ]
+    },
+    {
+      "gate": "dev verify",
+      "command": "./dev verify",
+      "result": "NO_OWNED_CHANGES; version 1.0.27; PASS",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/dev-verify.log"
+      ]
+    },
+    {
+      "gate": "Browser acceptance",
+      "command": "LEVELER_BROWSER_ACCEPTANCE=edge cargo test -p leveler-browser --test acceptance",
+      "result": "12 passed / 0 failed；真实 Edge（当前候选）",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/browser-acceptance.log"
+      ]
+    },
+    {
+      "gate": "Task Scheduler",
+      "command": "LEVELER_TASK_SCHEDULER_ACCEPTANCE=1 cargo test -p leveler-schedule --test task_scheduler_acceptance",
+      "result": "PASS：注册、执行、IgnoreNew、自然触发、删除均 VERIFIED",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/task-scheduler-acceptance.log",
+        "evidence/final-7966c829/task-scheduler-com.leveler.schedule.e71f2994c3ec50f8.json"
+      ]
+    },
+    {
+      "gate": "Workspace check",
+      "command": "cargo check --workspace --all-features --locked",
+      "result": "PASS：exit 0（1m11s）",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/check.log"
+      ]
+    },
+    {
+      "gate": "Release build",
+      "command": "cargo build --release --locked -p leveler-cli -p leveler-win-confine",
+      "result": "PASS：干净工作树，1.0.27 (03def7aaeecb)，15m43s",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/release-build.log"
+      ]
+    },
+    {
+      "gate": "ZIP smoke",
+      "command": "package-candidate.ps1：--version / completions bash / leveler-confine exit 23",
+      "result": "PASS：version 1.0.27 (03def7aaeecb)，completion 6043 bytes，confine exit 23",
+      "status": "PASS",
+      "evidence": [
+        "evidence/final-7966c829/package.log"
+      ]
+    }
+  ],
+  "screenshots": [],
+  "risks": [
+    "P2：Git Bash/MSYS rm/printf/sh 在 Low Integrity 沙箱内无法初始化；原生命令正常。",
+    "P2：本机 NoDefaultCurrentDirectoryInExePath=1，裸脚本名需显式 .\\。",
+    "P2：Windows Terminal 原生 Ctrl+V 多行/非 BMP 是宿主限制；Alt+V 为可靠替代。",
+    "BLOCKED：独立标准用户（本机仅有 code，创建需要管理员授权）、Console Host、Release Lab/RC、远端 CI。",
+    "NOT VERIFIED：PS7、VS Code、IME 组合/候选、Dogfood F（长 Session/Compaction）、Windows 真机旧证据拒绝、macOS/Linux、Windows 10 当前候选。",
+    "旧 dirty 构建的 CLI test binary 曾被 Defender 误报；干净构建通过；未关闭防护、未加排除。",
+    "旧 dirty 构建的 Defender 误报未影响干净构建；未关闭防护、未加排除。"
+  ]
+}

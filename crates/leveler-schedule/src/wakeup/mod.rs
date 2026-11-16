@@ -193,6 +193,10 @@ pub struct WakeupStatus {
     pub registered: bool,
     /// The platform accepted the record into the current session.
     pub loaded: bool,
+    /// Whether the platform's record exposes an environment map that doctor
+    /// can compare with the desired spec. Task Scheduler has no environment
+    /// element; a launchd plist carries one.
+    pub reports_environment: bool,
     pub registration: Option<WakeupRegistration>,
     /// launchd's last exit status, when reported.
     pub last_exit_code: Option<i32>,
@@ -392,6 +396,11 @@ fn decode_utf16le(bytes: &[u8]) -> String {
 
 /// Task Scheduler XML. Pure so the shape can be tested on every host; only
 /// `win_task::enable` executes `schtasks`.
+///
+/// The logon trigger names the same user as the principal. A logon trigger
+/// without a `UserId` applies to every user, and Task Scheduler requires
+/// elevation to register such a task; binding it keeps the registration
+/// unprivileged while preserving the per-user contract.
 #[cfg(any(windows, test))]
 pub(crate) fn task_scheduler_xml(spec: &WakeupSpec, label: &str, user: &str) -> String {
     let arguments = spec
@@ -418,11 +427,12 @@ pub(crate) fn task_scheduler_xml(spec: &WakeupSpec, label: &str, user: &str) -> 
          \x20     <Enabled>true</Enabled>\n\
          \x20   </TimeTrigger>\n\
          \x20   <LogonTrigger>\n\
-         \x20     <Enabled>true</Enabled>\n\
          \x20     <Repetition>\n\
          \x20       <Interval>PT{minutes}M</Interval>\n\
          \x20       <StopAtDurationEnd>false</StopAtDurationEnd>\n\
          \x20     </Repetition>\n\
+         \x20     <Enabled>true</Enabled>\n\
+         \x20     <UserId>{user}</UserId>\n\
          \x20   </LogonTrigger>\n\
          \x20 </Triggers>\n\
          \x20 <Principals>\n\
@@ -545,6 +555,30 @@ mod tests {
         let bare: Vec<u8> = xml.encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(windows_decode_output(&bare), xml);
         assert_eq!(windows_decode_output(b"plain ascii"), "plain ascii");
+    }
+
+    #[cfg(any(windows, test))]
+    #[test]
+    fn a_logon_trigger_is_bound_to_the_registered_user() {
+        let spec = WakeupSpec {
+            home: PathBuf::from(r"C:\Users\A B\.leveler"),
+            executable: PathBuf::from(r"C:\Program Files\Leveler\leveler.exe"),
+            arguments: vec!["schedule".into(), "dispatch".into()],
+            environment: BTreeMap::new(),
+            interval: WAKE_INTERVAL,
+            log_dir: PathBuf::from(r"C:\Users\A B\.leveler\logs\schedule"),
+        };
+        let xml = task_scheduler_xml(&spec, "CodeLeveler-Schedule.abc", r"DOMAIN\user");
+        let logon = xml
+            .split("<LogonTrigger>")
+            .nth(1)
+            .and_then(|rest| rest.split("</LogonTrigger>").next())
+            .expect("the task has a logon trigger");
+        assert!(
+            logon.contains(r"<UserId>DOMAIN\user</UserId>"),
+            "a logon trigger without a UserId applies to every user, and Task \
+             Scheduler denies a non-elevated registration for it: {logon}"
+        );
     }
 
     #[cfg(any(windows, test))]

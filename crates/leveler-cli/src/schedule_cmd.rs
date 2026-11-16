@@ -1641,27 +1641,40 @@ fn doctor_report(
                         ),
                     );
                 }
-                let mismatched: Vec<_> = spec
-                    .environment
-                    .iter()
-                    .filter(|(key, value)| registration.environment.get(*key) != Some(*value))
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                if mismatched.is_empty() {
+                if status.reports_environment {
+                    let mismatched: Vec<_> = spec
+                        .environment
+                        .iter()
+                        .filter(|(key, value)| registration.environment.get(*key) != Some(*value))
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    if mismatched.is_empty() {
+                        push(
+                            "environment",
+                            CheckSeverity::Ok,
+                            format!("{} variable(s) match", spec.environment.len()),
+                        );
+                    } else {
+                        push(
+                            "environment",
+                            CheckSeverity::Fail,
+                            format!(
+                                "registered environment differs for {}; run `leveler \
+                                 schedule enable` to re-register",
+                                mismatched.join(", ")
+                            ),
+                        );
+                    }
+                } else {
+                    // Task Scheduler has no environment element. Comparing an
+                    // always-empty record with the desired map would report a
+                    // failure no re-registration can fix.
                     push(
                         "environment",
                         CheckSeverity::Ok,
-                        format!("{} variable(s) match", spec.environment.len()),
-                    );
-                } else {
-                    push(
-                        "environment",
-                        CheckSeverity::Fail,
-                        format!(
-                            "registered environment differs for {}; run `leveler schedule \
-                             enable` to re-register",
-                            mismatched.join(", ")
-                        ),
+                        "the OS record has no environment map; the job inherits the user \
+                         environment"
+                            .into(),
                     );
                 }
             }
@@ -1732,6 +1745,58 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use leveler_schedule::{ActionKind, UnattendedGrant};
+
+    #[test]
+    fn a_registration_without_an_environment_map_does_not_fail_doctor() {
+        let home = PathBuf::from(r"C:\Users\A B\.leveler");
+        let executable = std::env::current_exe().expect("the test executable");
+        let spec = WakeupSpec {
+            home: home.clone(),
+            executable: executable.clone(),
+            arguments: vec![
+                "schedule".into(),
+                "dispatch".into(),
+                "--source".into(),
+                "os".into(),
+            ],
+            environment: BTreeMap::from([("PATH".to_owned(), r"C:\Windows\System32".to_owned())]),
+            interval: WAKE_INTERVAL,
+            log_dir: home.join("logs"),
+        };
+        let status = WakeupStatus {
+            backend: "task-scheduler",
+            supported: true,
+            label: "com.leveler.schedule.0123456789abcdef".into(),
+            registration_path: None,
+            registered: true,
+            loaded: true,
+            reports_environment: false,
+            registration: Some(wakeup::WakeupRegistration {
+                executable,
+                arguments: spec.arguments.clone(),
+                interval: Some(WAKE_INTERVAL),
+                environment: BTreeMap::new(),
+                working_directory: Some(home),
+            }),
+            last_exit_code: None,
+            run_count: None,
+            detail: None,
+        };
+
+        let report = doctor_report(&status, Some(&spec), 1, 0, None);
+        let environment = report
+            .checks
+            .iter()
+            .find(|check| check.name == "environment")
+            .expect("the doctor reports an environment check");
+        assert_eq!(
+            environment.severity,
+            CheckSeverity::Ok,
+            "Task Scheduler cannot store an environment map, so an empty one must not fail doctor: {}",
+            environment.detail
+        );
+        assert!(report.healthy);
+    }
 
     fn definition_with_grant() -> ScheduleDefinition {
         let action = ScheduleAction::Shell {

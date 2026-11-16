@@ -935,17 +935,27 @@ fn persist_atomically(path: &Path, contents: &[u8], is_new: bool) -> MemoryAcces
             path: path.to_path_buf(),
             source,
         })?;
-    let persisted = if is_new {
-        temporary.persist_noclobber(path)
-    } else {
-        temporary.persist(path)
-    };
-    persisted
-        .map(|_| ())
-        .map_err(|error| MemoryAccessError::Write {
-            path: path.to_path_buf(),
-            source: error.error,
-        })
+    // A no-clobber target is absent by construction; `persist_noclobber` keeps
+    // that guarantee if a concurrent writer creates it first.
+    if is_new {
+        return temporary
+            .persist_noclobber(path)
+            .map(|_| ())
+            .map_err(|error| MemoryAccessError::Write {
+                path: path.to_path_buf(),
+                source: error.error,
+            });
+    }
+    // Overwrite must stay atomic while another reader has the old file open.
+    // On Windows `tempfile::persist` uses `MoveFileExW`, which refuses to
+    // replace a destination open with a read handle; `std::fs::rename` uses the
+    // rename API that can, and is atomic on both Unix and NTFS. The `TempPath`
+    // guard removes the temporary file if the rename fails.
+    let temporary = temporary.into_temp_path();
+    std::fs::rename(temporary, path).map_err(|source| MemoryAccessError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

@@ -1,0 +1,108 @@
+﻿{
+    "schema":  "leveler.windows.task-scheduler-product-e2e/1",
+    "stage":  "natural-os-trigger",
+    "finished_at":  "2026-11-16T01:35:02.9354732Z",
+    "binary":  "C:\\CodeLeveler\\target\\debug\\leveler.exe",
+    "home":  "C:\\qlab\\ts-e2e-final\\home",
+    "workspace":  "C:\\qlab\\ts-e2e-final\\工作 空间",
+    "label":  "com.leveler.schedule.4a3faf4639edac6c",
+    "definition":  "0e8f9066-344f-434f-ba6f-31c8b195cec7",
+    "run":  {
+                "baseline_sequence":  null,
+                "cached_input_tokens":  null,
+                "cancel_issued_at":  null,
+                "cancel_requested_at":  null,
+                "capability_state":  null,
+                "cost_usd_micros":  null,
+                "deadline_at":  "2026-11-16T01:44:02.371Z",
+                "definition_id":  "0e8f9066-344f-434f-ba6f-31c8b195cec7",
+                "delivered_at":  "2026-11-16T01:34:02.370Z",
+                "error":  null,
+                "execution_id":  "ush-82a77fcc-9cdc-4651-b22d-edbddcd3a9ba",
+                "exit_code":  0,
+                "finished_at":  "2026-11-16T01:35:01.740Z",
+                "handed_off_at":  null,
+                "id":  "0e9c8579-845b-4086-85bd-558aa1b5674d",
+                "input_tokens":  null,
+                "native_outcome":  null,
+                "occurrence_id":  "5b639a24-3f88-418e-88ba-03c1fd23e45f",
+                "output_tokens":  null,
+                "permission_state":  null,
+                "provider":  null,
+                "reasoning_tokens":  null,
+                "running_at":  "2026-11-16T01:34:03.029Z",
+                "scheduled_for":  "2026-11-16T01:34:00Z",
+                "session_id":  "467bbe59-775c-40ca-98c9-365870b53d29",
+                "started_at":  "2026-11-16T01:34:01.274Z",
+                "state":  "succeeded",
+                "task_outcome":  null,
+                "task_sequence":  null,
+                "turn_ordinal":  null,
+                "usage_baseline":  null,
+                "usage_requests":  null,
+                "usage_rows_without_cost":  null
+            },
+    "os_wakes":  [
+                     {
+                         "blocked":  0,
+                         "cancelled":  0,
+                         "claimed":  1,
+                         "error":  null,
+                         "failed":  0,
+                         "finished_at":  "2026-11-16T01:34:03.035Z",
+                         "handed_off":  1,
+                         "id":  1,
+                         "missed":  0,
+                         "recovered":  0,
+                         "skipped":  0,
+                         "source":  "os",
+                         "started_at":  "2026-11-16T01:34:01.267Z",
+                         "submitted":  0,
+                         "succeeded":  0,
+                         "unknown":  0,
+                         "waiting_approval":  0
+                     }
+                 ],
+    "checks":  {
+                   "definition_created":  {
+                                              "passed":  true,
+                                              "detail":  "id=0e8f9066-344f-434f-ba6f-31c8b195cec7 at=2026-11-16T01:34:00Z"
+                                          },
+                   "os_registration":  {
+                                           "passed":  true,
+                                           "detail":  "backend=task-scheduler registered=True loaded=True"
+                                       },
+                   "schedule_status":  {
+                                           "passed":  true,
+                                           "detail":  "registered=True definitions=1 next=2026-11-16T01:34:00+00:00"
+                                       },
+                   "schedule_doctor":  {
+                                           "passed":  false,
+                                           "detail":  "exit=1 healthy=False checks=8"
+                                       },
+                   "natural_trigger_file":  {
+                                                "passed":  true,
+                                                "detail":  "content=定时中文完成\r\n"
+                                            },
+                   "natural_trigger_run":  {
+                                               "passed":  true,
+                                               "detail":  "state=succeeded exit=0 error="
+                                           },
+                   "os_wake_recorded":  {
+                                            "passed":  true,
+                                            "detail":  "os_wakes=1 claimed=1"
+                                        },
+                   "run_session_binding":  {
+                                               "passed":  true,
+                                               "detail":  "session=467bbe59-775c-40ca-98c9-365870b53d29"
+                                           },
+                   "scheduler_record":  {
+                                            "passed":  true,
+                                            "detail":  "label=com.leveler.schedule.4a3faf4639edac6c"
+                                        }
+               },
+    "failures":  [
+                     "schedule_doctor: exit=1 healthy=False checks=8"
+                 ],
+    "verdict":  "FAIL"
+}

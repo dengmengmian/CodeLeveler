@@ -1,0 +1,104 @@
+=== TIME ===
+2026-11-15T14:14:43Z
+2026-11-15 22:14:43    
+=== CAPTION ===
+
+
+Caption        : Microsoft Windows 11 家庭版 单语言版
+Version        : 10.0.26300
+BuildNumber    : 26300
+OSArchitecture : 64 位
+LastBootUpTime : 2026/11/15 18:41:43
+
+
+
+=== REGISTRY ===
+
+
+ProductName      : Windows 10 Home Single Language
+DisplayVersion   : 26H2
+CurrentBuild     : 26300
+UBR              : 9711
+EditionID        : CoreSingleLanguage
+InstallationType : Client
+
+
+
+=== CPU/MEM ===
+
+
+Name                      : AMD Ryzen 5 PRO 4650U with Radeon Graphics
+NumberOfCores             : 6
+NumberOfLogicalProcessors : 12
+
+
+
+
+
+Manufacturer        : LENOVO
+Model               : 20UFA008CD
+TotalPhysicalMemory : 16349057024
+
+
+
+=== USER ===
+=== ENV ===
+HOME=C:\Users\code
+OS=Windows_NT
+PROCESSOR_ARCHITECTURE=AMD64
+TEMP=C:\Users\code\AppData\Local\Temp
+TMP=C:\Users\code\AppData\Local\Temp
+USERNAME=code
+USERPROFILE=C:\Users\code
+=== LONG PATHS ===
+0
+=== TERMINAL ===
+
+
+Version : 1.25.3131.0
+
+
+
+
+
+FileVersion    : 10.0.26100.9949 (WinBuild.160101.0800)
+ProductVersion : 10.0.26100.9949
+
+
+
+=== SHELLS ===
+
+Microsoft Windows [版本 10.0.26300.9711]
+5.1.26100.9711
+GNU bash, version 5.3.15(2)-release (x86_64-pc-cygwin)
+git version 2.56.0.windows.4
+rustc 1.90.0 (1159e78c4 2025-09-14)
+binary: rustc
+commit-hash: 1159e78c4747b02ef996e55082b704c09b970588
+commit-date: 2025-09-14
+host: x86_64-pc-windows-msvc
+release: 1.90.0
+cargo 1.90.0 (840b83a10 2025-07-30)
+=== LOCALE ===
+活动代码页: 936
+
+
+Name        : zh-CN
+DisplayName : 中文(简体，中国)
+
+
+
+gb2312
+=== DPI ===
+144
+=== FONTS ===
+CascadiaCode.ttf
+CascadiaMono.ttf
+SimsunExtG.ttf
+consola.ttf
+consolab.ttf
+consolai.ttf
+consolaz.ttf
+msyh.ttc
+msyhbd.ttc
+msyhl.ttc
