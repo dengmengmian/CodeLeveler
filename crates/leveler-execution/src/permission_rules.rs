@@ -56,6 +56,11 @@ pub struct PermissionRulesFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionRuleSet {
     rules: Vec<PermissionRule>,
+    /// A rules file existed but could not be read or parsed. What it would
+    /// have allowed or denied is unknown, so the caller must not read this set
+    /// as "no restrictions" — an empty rule list and a lost rule list are
+    /// different facts.
+    degraded: bool,
 }
 
 /// Result of evaluating rules against one tool call.
@@ -69,7 +74,21 @@ pub enum RuleDecision {
 
 impl PermissionRuleSet {
     pub fn from_rules(rules: Vec<PermissionRule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            degraded: false,
+        }
+    }
+
+    /// Mark this set as missing at least one rule source. The rules collected
+    /// so far remain valid; the absence of the failed source is the fact the
+    /// authorization path must not ignore.
+    pub fn mark_degraded(&mut self) {
+        self.degraded = true;
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
     }
 
     pub fn is_empty(&self) -> bool {
@@ -246,11 +265,35 @@ pub fn load_rules_file(path: &Path) -> Result<PermissionRuleSet, String> {
     Ok(PermissionRuleSet::from_rules(file.rules))
 }
 
-/// Merged rules plus any in-repo rules file that was skipped for lack of trust.
-#[derive(Debug, Clone, Default)]
+/// One rule source that existed but could not be read or parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRuleFile {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Merged rules plus the rule sources that could not be applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergedRules {
     pub rules: PermissionRuleSet,
     pub untrusted: Vec<crate::hooks::UntrustedConfig>,
+    /// Files that exist but could not be read/parsed. Their rules are NOT in
+    /// `rules`; an authorization path that would have relied on them must not
+    /// silently fall through.
+    pub invalid: Vec<InvalidRuleFile>,
+}
+
+fn load_or_report(path: &Path, invalid: &mut Vec<InvalidRuleFile>) -> PermissionRuleSet {
+    match load_rules_file(path) {
+        Ok(set) => set,
+        Err(error) => {
+            invalid.push(InvalidRuleFile {
+                path: path.to_path_buf(),
+                error,
+            });
+            PermissionRuleSet::default()
+        }
+    }
 }
 
 /// Merge the three rule sources. Order is cosmetic — evaluation is
@@ -261,9 +304,15 @@ pub struct MergedRules {
 ///   rules — never inside the repo;
 /// - in-repo: `<repo>/.leveler/permissions.yaml` (user-authored), applied only
 ///   when the user has trusted its exact contents — see [`crate::trust`].
+///
+/// A source that exists but cannot be read or parsed is reported in
+/// [`MergedRules::invalid`] and marks the merged set degraded. It is never
+/// silently replaced by an empty set: that would discard the user's deny/ask
+/// rules and widen execution authority.
 pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Path) -> MergedRules {
-    let mut set = load_rules_file(&global_home.join("permissions.yaml")).unwrap_or_default();
-    set.extend(load_rules_file(state_rules).unwrap_or_default());
+    let mut invalid = Vec::new();
+    let mut set = load_or_report(&global_home.join("permissions.yaml"), &mut invalid);
+    set.extend(load_or_report(state_rules, &mut invalid));
 
     // The first two sources live under the user's own global home. The in-repo
     // file travels with a clone and its `Allow` short-circuits the approval
@@ -272,8 +321,12 @@ pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Pat
     match crate::trust::read_trusted_project_file(global_home, repo_root, PROJECT_RULES_RELATIVE) {
         crate::trust::TrustedRead::Absent => {}
         crate::trust::TrustedRead::Trusted(raw) => {
-            if let Ok(file) = serde_yaml::from_str::<PermissionRulesFile>(&raw) {
-                set.extend(PermissionRuleSet::from_rules(file.rules));
+            match serde_yaml::from_str::<PermissionRulesFile>(&raw) {
+                Ok(file) => set.extend(PermissionRuleSet::from_rules(file.rules)),
+                Err(error) => invalid.push(InvalidRuleFile {
+                    path: repo_root.join(PROJECT_RULES_RELATIVE),
+                    error: format!("parse trusted in-repo permission rules: {error}"),
+                }),
             }
         }
         crate::trust::TrustedRead::Untrusted { path, digest } => {
@@ -285,9 +338,21 @@ pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Pat
         }
     }
 
+    if !invalid.is_empty() {
+        set.mark_degraded();
+        for entry in &invalid {
+            tracing::warn!(
+                path = %entry.path.display(),
+                error = %entry.error,
+                "permission rules file could not be applied; rule-based decisions are degraded"
+            );
+        }
+    }
+
     MergedRules {
         rules: set,
         untrusted,
+        invalid,
     }
 }
 
@@ -517,6 +582,45 @@ mod tests {
             set.evaluate("apply_patch", None, &[PathBuf::from("README.md")]),
             RuleDecision::NoMatch
         );
+    }
+
+    #[test]
+    fn an_unparseable_rules_file_is_reported_not_read_as_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("permissions.yaml"), "rules: [ not: yaml\n").unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let merged = load_merged_rules(&home, &root.path().join("state.yaml"), &repo);
+        assert_eq!(merged.invalid.len(), 1, "{merged:?}");
+        assert!(
+            merged.invalid[0].path.ends_with("permissions.yaml"),
+            "{:?}",
+            merged.invalid[0]
+        );
+        assert!(
+            merged.rules.is_degraded(),
+            "an unreadable rule source must not look like a clean empty set"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_valid_empty_rules_file_is_not_degraded() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let merged = load_merged_rules(&home, &root.path().join("state.yaml"), &repo);
+        assert!(merged.invalid.is_empty());
+        assert!(!merged.rules.is_degraded());
+
+        std::fs::write(home.join("permissions.yaml"), "rules: []\n").unwrap();
+        let merged = load_merged_rules(&home, &root.path().join("state.yaml"), &repo);
+        assert!(merged.invalid.is_empty());
+        assert!(!merged.rules.is_degraded());
     }
 
     #[test]

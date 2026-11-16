@@ -684,11 +684,16 @@ impl Executor {
         // A poisoned lock only means a rules writer panicked mid-update; the
         // rule set is append-only, so read the latest state instead of turning
         // every future dispatch into a panic.
-        let rule_decision = self
-            .permission_rules
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .evaluate(&call.name, command_line.as_deref(), &rule_paths);
+        let (rule_decision, rules_degraded) = {
+            let rules = self
+                .permission_rules
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                rules.evaluate(&call.name, command_line.as_deref(), &rule_paths),
+                rules.is_degraded(),
+            )
+        };
         match rule_decision {
             leveler_execution::RuleDecision::Deny => {
                 return deny("forbidden by permission rule".to_string());
@@ -702,7 +707,24 @@ impl Executor {
                     AuthorizationEvidence::Rule,
                 ));
             }
-            leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
+            // `ask` is a user-configured boundary. Falling through to the
+            // profile policy erased it whenever that policy would auto-run
+            // the call, so the exact action the user asked to review ran
+            // without a decision.
+            leveler_execution::RuleDecision::Ask => {
+                approval_reason
+                    .get_or_insert_with(|| "permission rule requires approval".to_string());
+            }
+            // A rules source that exists but could not be parsed means the
+            // rules in it are unknown. Falling through to the profile's
+            // auto-allow would silently discard a deny/ask the user wrote.
+            leveler_execution::RuleDecision::NoMatch if rules_degraded => {
+                approval_reason.get_or_insert_with(|| {
+                    "权限规则文件无法解析，无法确认是否存在 deny/ask 规则；本次调用需要批准"
+                        .to_string()
+                });
+            }
+            leveler_execution::RuleDecision::NoMatch => {}
         }
 
         // A destination hint can reduce the prompt only when the execution
@@ -2212,6 +2234,88 @@ mod authorize_tests {
             name: "run_command".to_string(),
             arguments: serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/scratch"]}),
         }
+    }
+
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("r"),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        }
+    }
+
+    /// A user-configured `ask` rule must reach the approver even when the
+    /// profile's own policy would auto-run the call. Losing it is the same
+    /// class of hole as losing a `deny`: the configured boundary disappears.
+    #[tokio::test]
+    async fn a_matching_ask_rule_requires_approval_even_when_policy_would_auto_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let ask = leveler_execution::PermissionRule {
+            match_: leveler_execution::RuleMatch {
+                tool: Some("read_file".into()),
+                command_prefix: None,
+                command_exact: None,
+                write_path_glob: None,
+            },
+            effect: leveler_execution::RuleEffect::Ask,
+        };
+        let executor = executor_for(dir.path(), approver.clone())
+            .with_permission_rules(leveler_execution::PermissionRuleSet::from_rules(vec![ask]));
+        let mut session = HashSet::new();
+
+        executor
+            .authorize(&read_call("a.txt"), &mut session)
+            .await
+            .expect("the user approved the matching call");
+        assert_eq!(
+            approver.asks(),
+            1,
+            "a matching ask rule must force a decision"
+        );
+    }
+
+    /// A rule file that could not be parsed leaves the rule set incomplete.
+    /// The host must not fall through to the profile's auto-allow as if the
+    /// user had configured nothing.
+    #[tokio::test]
+    async fn a_degraded_rule_set_does_not_widen_an_auto_allowed_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut rules = leveler_execution::PermissionRuleSet::default();
+        rules.mark_degraded();
+        let executor = executor_for(dir.path(), approver.clone()).with_permission_rules(rules);
+        let mut session = HashSet::new();
+
+        executor
+            .authorize(&read_call("a.txt"), &mut session)
+            .await
+            .expect("the user approved the call");
+        assert_eq!(
+            approver.asks(),
+            1,
+            "an incomplete rule set must ask instead of silently auto-allowing"
+        );
+
+        // Full remains full: the product contract does not ask or deny.
+        let full_approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let full = executor_at(
+            dir.path(),
+            PermissionProfile::FullAccess,
+            full_approver.clone(),
+        )
+        .with_permission_rules({
+            let mut rules = leveler_execution::PermissionRuleSet::default();
+            rules.mark_degraded();
+            rules
+        });
+        let mut full_session = HashSet::new();
+        full.authorize(&read_call("a.txt"), &mut full_session)
+            .await
+            .unwrap();
+        assert_eq!(full_approver.asks(), 0, "Full must not ask");
     }
 
     #[tokio::test]

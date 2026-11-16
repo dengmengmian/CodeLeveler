@@ -89,8 +89,8 @@ pub use network::{
     is_local_lan, is_loopback, is_ordinary_destination, normalize_ip, resolve_network_resource,
 };
 pub use permission_rules::{
-    MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet, RuleDecision,
-    RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
+    InvalidRuleFile, MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet,
+    RuleDecision, RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
     clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
 };
 pub use policy::{
