@@ -38,6 +38,56 @@ const FINALIZATION_RESOLVING_OUTCOME: &str = "resolving_outcome";
 const FINALIZATION_CONTINUATION_CHECKPOINT: &str = "continuation_checkpoint";
 const FINALIZATION_PUBLISHING_TERMINAL: &str = "publishing_terminal";
 
+/// The runtime's own reason for continuing an owed goal after a transient
+/// provider failure.
+///
+/// This is not a user message: the person did not authorize a new turn, the
+/// runtime did, because the goal is still owed and the failure says nothing
+/// about the work. The context is generated from the typed failure, so the
+/// model is told exactly what ended the previous window and what survives —
+/// never a fixed instruction to rerun work.
+#[derive(Debug, Clone)]
+pub struct GoalRecoveryContext {
+    /// 1-based attempt within this logical turn's recovery budget.
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// The provider failure that ended the previous window.
+    pub failure: leveler_model::ModelError,
+}
+
+impl GoalRecoveryContext {
+    /// One runtime notice row for the resumed model context.
+    pub(crate) fn notice(&self) -> Message {
+        let retries = self
+            .failure
+            .retry_attempts
+            .map(|spent| {
+                format!(
+                    " after {spent} automatic request retr{}",
+                    if spent == 1 { "y" } else { "ies" }
+                )
+            })
+            .unwrap_or_default();
+        let text = format!(
+            "Runtime recovery notice (not a user message). The previous window ended with a \
+             transient provider failure{retries} (kind: {:?}, delivery: {:?}). No tool call from \
+             that failed request was dispatched. This window continues the same goal from the \
+             last durable execution boundary: the objective, plan, recorded requirements, \
+             completed tool calls and results, and verification evidence remain in effect. Do \
+             not repeat a tool call whose result is already in the transcript. Recovery attempt \
+             {} of {}. Continue the work and resolve the goal when it is genuinely complete.",
+            self.failure.kind, self.failure.delivery_state, self.attempt, self.max_attempts
+        );
+        Message::from_parts(
+            Role::User,
+            vec![ContentPart::Text { text }],
+            Some(TranscriptOrigin::RuntimeNotice {
+                notice: RuntimeNoticeKind::GoalRecovery,
+            }),
+        )
+    }
+}
+
 async fn begin_finalization_phase(
     log: &EventLog<'_>,
     phase: &str,
@@ -2543,6 +2593,10 @@ impl CodingRuntime {
                             prior_epoch_open,
                             session_id.clone(),
                             self.engine.stores.events.clone(),
+                            Some(crate::coding::turn::StoredGoalVerification::source(
+                                self.engine.stores.clone(),
+                                session_id.clone(),
+                            )),
                             Some(crate::coding::checkpoint::CodingCheckpointContext::new(
                                 self.engine.clone(),
                                 spec.coding.repository.as_deref().map(|root| {
@@ -2633,7 +2687,7 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        self.resume_inner(session_id, spec, None, true, observer, cancellation)
+        self.resume_inner(session_id, spec, None, true, None, observer, cancellation)
             .await
     }
 
@@ -2651,11 +2705,20 @@ impl CodingRuntime {
         &self,
         session_id: &SessionId,
         spec: &TaskSpec,
+        recovery: Option<&GoalRecoveryContext>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        self.resume_inner(session_id, spec, None, false, observer, cancellation)
-            .await
+        self.resume_inner(
+            session_id,
+            spec,
+            None,
+            false,
+            recovery,
+            observer,
+            cancellation,
+        )
+        .await
     }
 
     /// Continue the session's interrupted logical task with the user's
@@ -2680,6 +2743,7 @@ impl CodingRuntime {
             spec,
             Some(instruction),
             true,
+            None,
             observer,
             cancellation,
         )
@@ -3071,6 +3135,7 @@ impl CodingRuntime {
         spec: &TaskSpec,
         instruction: Option<Message>,
         allow_reopen: bool,
+        recovery: Option<&GoalRecoveryContext>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -3632,6 +3697,18 @@ impl CodingRuntime {
         if let Some(note) = self.crash_recovery_notice(&log).await? {
             prior.push(note);
         }
+        if let Some(context) = recovery {
+            // The runtime, not the person, is continuing this goal. State the
+            // failure and the preserved boundary as a runtime notice: no fake
+            // user message, no fixed work order.
+            prior.push(context.notice());
+            observer(EngineEvent::RuntimeInjection {
+                kind: "goal_recovery".to_string(),
+                role: "user".to_string(),
+                model_step: 1,
+                forces_continuation: false,
+            });
+        }
 
         let terminal_cancellation = cancellation.clone();
         let result = self
@@ -4126,6 +4203,10 @@ impl CodingRuntime {
                     true,
                     runner.session_id.clone(),
                     self.engine.stores.events.clone(),
+                    Some(crate::coding::turn::StoredGoalVerification::source(
+                        self.engine.stores.clone(),
+                        runner.session_id.clone(),
+                    )),
                     Some(crate::coding::checkpoint::CodingCheckpointContext::new(
                         self.engine.clone(),
                         spec.coding.repository.as_deref().map(|root| {
@@ -4289,6 +4370,10 @@ impl CodingRuntime {
                         prior_epoch_open,
                         runner.session_id.clone(),
                         self.engine.stores.events.clone(),
+                        Some(crate::coding::turn::StoredGoalVerification::source(
+                            self.engine.stores.clone(),
+                            runner.session_id.clone(),
+                        )),
                         Some(crate::coding::checkpoint::CodingCheckpointContext::new(
                             self.engine.clone(),
                             spec.coding.repository.as_deref().map(|root| {
@@ -5801,5 +5886,62 @@ mod effective_acceptance_facts_tests {
             "only eight are expanded: {text}"
         );
         assert!(text.contains("…and 2 more recorded requirements"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod goal_recovery_notice_tests {
+    use super::*;
+
+    fn context() -> GoalRecoveryContext {
+        let mut failure = leveler_model::ModelError::new(
+            leveler_model::ModelErrorKind::StreamInterrupted,
+            "provider detail that must not be repeated",
+        )
+        .with_delivery_state(leveler_model::DeliveryState::StreamInterrupted {
+            progress: leveler_model::StreamProgress {
+                text: false,
+                reasoning: true,
+                tool_args: true,
+            },
+        });
+        failure.retry_attempts = Some(2);
+        GoalRecoveryContext {
+            attempt: 2,
+            max_attempts: 3,
+            failure,
+        }
+    }
+
+    /// The resumed window is told what ended the previous one, that nothing
+    /// from the failed request was dispatched, and that durable work survives.
+    /// The row is a runtime notice, never a fabricated user instruction.
+    #[test]
+    fn the_recovery_notice_states_the_typed_failure_and_the_preserved_boundary() {
+        let message = context().notice();
+        assert_eq!(
+            message.origin,
+            Some(TranscriptOrigin::RuntimeNotice {
+                notice: RuntimeNoticeKind::GoalRecovery,
+            })
+        );
+        assert_eq!(message.role, Role::User);
+        let text = message.text_content();
+        assert!(text.contains("not a user message"), "{text}");
+        assert!(text.contains("StreamInterrupted"), "{text}");
+        assert!(text.contains("after 2 automatic request retries"), "{text}");
+        assert!(
+            text.contains("No tool call from that failed request was dispatched"),
+            "{text}"
+        );
+        assert!(text.contains("Recovery attempt 2 of 3"), "{text}");
+        assert!(
+            !text.contains("provider detail that must not be repeated"),
+            "raw provider prose is not the notice: {text}"
+        );
+        assert!(
+            !text.contains("继续") && !text.contains("continue\" now"),
+            "the runtime does not fabricate user words or a fixed order: {text}"
+        );
     }
 }

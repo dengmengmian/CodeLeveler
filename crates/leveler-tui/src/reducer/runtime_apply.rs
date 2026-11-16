@@ -403,6 +403,23 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.reconnected_until = None;
             state.activity_elapsed_secs = None;
         }
+        RuntimeEvent::GoalRecovery {
+            attempt,
+            max_attempts,
+        } => {
+            // The runtime is continuing an owed goal after a transient
+            // provider failure. This is live status, not a transcript row:
+            // no failure card is shown while recovery is in progress, and
+            // the resumed window's events replace this label.
+            mark_turn_busy(state);
+            let t = state.t();
+            state.activity = Some(
+                t.goal_recovery_activity
+                    .replacen("{}", &attempt.to_string(), 1)
+                    .replacen("{}", &max_attempts.to_string(), 1),
+            );
+            state.activity_elapsed_secs = None;
+        }
         RuntimeEvent::ProjectRulesLoaded { sources } => {
             mark_turn_busy(state);
             state.project_rule_sources = sources;
@@ -849,6 +866,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                         subtitle: failure_subtitle(
                             f,
                             state.resumable_task.then_some(t.resumable_hint),
+                            t,
                         ),
                         detail: failure_detail_text(f, t),
                     },
@@ -1408,11 +1426,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                         if shell.task_id.as_deref() == Some(task_id.as_str())
                 )
             });
+            // Lifecycle state is not a banner. A task this session never saw
+            // start still leaves a conversation record instead of an input-area
+            // notice that repeats the background strip.
             if !linked_shell {
-                state.notification = Some(Notification {
-                    level: NotificationLevel::Warning,
-                    message: state.t().background_task_unknown.replace("{}", &label),
-                });
+                state
+                    .transcript
+                    .push_note(state.t().background_task_unknown.replace("{}", &label));
             }
         }
         RuntimeEvent::BackgroundTaskExited {
@@ -1467,33 +1487,23 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             };
             crate::activity::bound_terminal_background(state);
             // Stopped is its own terminal outcome: a cancel is not a failure.
-            let (message, level) = if ok {
-                (
-                    t.background_task_done.replace("{}", &label),
-                    Some(NotificationLevel::Info),
-                )
+            // The message is a conversation record for a task with no row of
+            // its own; it is never an input-area lifecycle notice. The command
+            // row, the jobs list and the background strip already state the
+            // same fact.
+            let message = if ok {
+                t.background_task_done.replace("{}", &label)
             } else if stopped {
-                (
-                    t.background_task_stopped.replace("{}", &label),
-                    Some(NotificationLevel::Info),
-                )
+                t.background_task_stopped.replace("{}", &label)
             } else {
-                // A failure is a record, not a notice: the task's own row,
-                // its output and the jobs list keep the evidence. Repeating
-                // the command and exit code in a banner was the second
-                // surface for one fact.
                 let failed = t.background_task_failed.replace("{}", &label);
-                let message = match exit_code {
+                match exit_code {
                     Some(code) => format!("{failed} · exit {code}"),
                     None => failed,
-                };
-                (message, None)
+                }
             };
             if !has_starter && !linked_shell {
-                state.transcript.push_note(message.clone());
-            }
-            if !linked_shell && let Some(level) = level {
-                state.notification = Some(Notification { level, message });
+                state.transcript.push_note(message);
             }
         }
         RuntimeEvent::BackgroundTaskOutput { task_id, chunk } => {
@@ -1529,21 +1539,20 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // Readiness is a RUNNING fact: the process kept going. It is stored
             // where every projection reads it and stamped onto the command row,
             // and never touches `ok` / `stopped`.
-            let label = match state.background_task_labels.get_mut(&task_id) {
-                Some(chrome) => {
-                    if chrome.is_running() && chrome.ready.is_none() {
-                        chrome.ready = Some(evidence.clone());
-                    }
-                    chrome.label.clone()
-                }
-                None => state.t().background_task_generic.to_string(),
-            };
+            // Readiness is a RUNNING fact: the process kept going. It is stored
+            // where every projection reads it and stamped onto the command row,
+            // and never touches `ok` / `stopped`.
+            if let Some(chrome) = state.background_task_labels.get_mut(&task_id)
+                && chrome.is_running()
+                && chrome.ready.is_none()
+            {
+                chrome.ready = Some(evidence.clone());
+            }
             state.transcript.note_background_ready(&task_id, &evidence);
-            let message = state.t().background_task_ready.replace("{}", &label);
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message,
-            });
+            // No input-area notice: the command row, the background strip
+            // (`后台 N · 就绪 N ↗`) and the detail page all read the same
+            // structured fact. A second banner repeated it and pushed the
+            // command across the screen.
         }
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
             // This live correction names only what is still running. It
@@ -1853,9 +1862,14 @@ fn failure_summary(
 /// HTTP status when there was one (`kimi · invalid_request · HTTP 400`). The
 /// status is the first thing a provider report needs, so it rides on the
 /// always-visible line rather than only the disclosure.
+///
+/// When no automatic retry was attempted, the subtitle says why from the
+/// typed retryability/delivery facts. The raw error text is never parsed for
+/// this decision.
 fn failure_subtitle(
     failure: &leveler_client_protocol::UiFailure,
     resumable_hint: Option<&str>,
+    t: &crate::i18n::UiText,
 ) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(provider) = failure.provider.as_deref().filter(|p| !p.is_empty()) {
@@ -1865,10 +1879,39 @@ fn failure_subtitle(
     if let Some(status) = failure.status {
         parts.push(format!("HTTP {status}"));
     }
+    if let Some(reason) = failure_no_retry_reason(failure, t) {
+        parts.push(reason.to_string());
+    }
     if let Some(hint) = resumable_hint {
         parts.push(hint.to_string());
     }
     Some(parts.join(" · "))
+}
+
+/// Why the bounded retry lifecycle did not spend an attempt, from the typed
+/// facts. `None` means a retry was attempted (the count rides on the summary)
+/// or the failure is permanent for a reason the category already states.
+fn failure_no_retry_reason(
+    failure: &leveler_client_protocol::UiFailure,
+    t: &crate::i18n::UiText,
+) -> Option<&'static str> {
+    use leveler_client_protocol::{FailureDelivery, FailureRetryability};
+    if failure.retries.is_some_and(|retries| retries > 0) {
+        return None;
+    }
+    match failure.retryability {
+        FailureRetryability::Caution => match failure.delivery {
+            // Answer text may already be on screen; a replay would duplicate
+            // it. A cut that only produced reasoning or tool-argument
+            // fragments is retried by the runtime instead.
+            FailureDelivery::StreamInterrupted { text: true, .. } => {
+                Some(t.failure_no_retry_partial_answer)
+            }
+            _ => Some(t.failure_no_retry_upstream_started),
+        },
+        FailureRetryability::Unknown => Some(t.failure_no_retry_unknown_delivery),
+        FailureRetryability::Safe | FailureRetryability::Never => None,
+    }
 }
 
 /// Whether a typed failure is one a continuation may re-enter.

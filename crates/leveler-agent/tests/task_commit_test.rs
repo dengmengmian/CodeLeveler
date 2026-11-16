@@ -1950,6 +1950,158 @@ gamma\"";
     assert_eq!(verification.records[0].call_id.as_deref(), Some("call-2"));
 }
 
+/// The original real-session failure: a goal ran its check in one Chat turn,
+/// the user then said `继续`, and the next turn's `update_goal(complete)` cited
+/// that execution by call id. The runtime answered "no execution record in
+/// this task has call_id …" — the second turn had never loaded the goal's
+/// earlier record because it started as an ordinary Content turn and only
+/// joined the goal mid-flight.
+///
+/// The record is durable and belongs to the goal, so joining the goal must
+/// fold it into the live window. No rerun is required for a check that still
+/// judges the current workspace.
+#[tokio::test]
+async fn a_chat_turn_that_joins_a_goal_can_cite_an_earlier_turns_execution() {
+    const TURN_ONE: &str = "把构建脚本改成一条命令，完成后跑测试";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": TURN_ONE,
+                    "acceptance": ["测试通过"],
+                    "requirements": [{
+                        "kind": "command",
+                        "text": "测试通过",
+                        "target": test_runner_label(),
+                        "source_quote": "完成后跑测试"
+                    }]
+                }),
+            ),
+            Scripted::run_tests(),
+            // The window ends; the goal still owes work.
+            Scripted::Tool("update_goal", serde_json::json!({"status": "yield"})),
+        ],
+        false,
+    )
+    .await;
+    let first = chat_with_request(&fx, TURN_ONE, CancellationToken::new()).await;
+    assert_eq!(first.stop_reason, leveler_agent::StopReason::Yielded);
+
+    // The fixture appends a delivery round only for a resolving update_goal;
+    // a yielded window consumes none. Start turn two from a clean script.
+    {
+        let mut script = fx.runtime.script.lock().unwrap();
+        script.clear();
+        script.extend(vec![
+            Scripted::Tool(
+                "declare_intent",
+                serde_json::json!({
+                    "operations": [{"kind": "continue_task"}],
+                    "source_quote": "继续"
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "构建命令已改好，测试通过",
+                    "verification": {"status": "passed", "detail": "call_id:call-2"},
+                    "requirements": [{
+                        "id": "R1",
+                        "status": "done",
+                        "evidence": "测试已通过",
+                        "check_call_id": "call-2"
+                    }]
+                }),
+            ),
+            Scripted::Text("已完成，构建命令已改好并通过测试。"),
+        ]);
+    }
+
+    let second = chat_with_request(&fx, "继续", CancellationToken::new()).await;
+    assert_eq!(
+        second.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "the earlier execution is the goal's record, not a missing citation: {:?}",
+        second.completion_warnings
+    );
+    let verification = second
+        .verification
+        .expect("an accepted completion carries its verification report");
+    assert_eq!(
+        verification.status,
+        leveler_lifecycle::VerificationStatus::Verified,
+        "{verification:?}"
+    );
+    assert_eq!(
+        verification.records[0].call_id.as_deref(),
+        Some("call-2"),
+        "the citation names the execution turn one really ran"
+    );
+}
+
+/// A citation that names another goal's execution is still refused: the
+/// record is goal-scoped, and joining a goal does not widen that boundary.
+#[tokio::test]
+async fn a_joined_goal_does_not_adopt_an_unrelated_goals_execution() {
+    const OTHER: &str = "另一个任务";
+    const INDEPENDENT: &str = "另一个独立任务";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": OTHER,
+                    "acceptance": ["另一个任务完成"]
+                }),
+            ),
+            Scripted::run_tests(),
+            Scripted::Text("第一个任务的窗口说明。"),
+        ],
+        false,
+    )
+    .await;
+    let _first = chat_with_request(&fx, OTHER, CancellationToken::new()).await;
+
+    // A second, independent goal opens in this task. Goal A's execution does
+    // not belong to it, and joining is not how this test reaches it.
+    {
+        let mut script = fx.runtime.script.lock().unwrap();
+        script.clear();
+        script.extend(vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": INDEPENDENT,
+                    "acceptance": ["当前任务完成"],
+                    "task_relation": "new"
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "完成",
+                    "verification": {"status": "passed", "detail": "call_id:call-2"}
+                }),
+            ),
+            Scripted::Text("当前任务完成说明。"),
+        ]);
+    }
+    let second = chat_with_request(&fx, INDEPENDENT, CancellationToken::new()).await;
+    assert_ne!(
+        second.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "a foreign goal's execution must not satisfy this one: {:?}",
+        second.final_text
+    );
+    assert!(
+        second.verification.is_none(),
+        "no verification report is minted for a refused completion"
+    );
+}
+
 /// `content` compares the requirement's `text` to a line of the target file.
 /// A model that records the requirement as prose cannot satisfy it by
 /// rewriting the file; the refusal must name the declaration fix, and an
@@ -7351,5 +7503,89 @@ async fn a_stale_background_test_without_a_valid_rerun_blocks_honestly() {
         goals[0].state,
         leveler_storage::GoalState::Running,
         "the unmet tests obligation keeps the goal owed: {goals:?}"
+    );
+}
+
+/// A later `commit_task` on an existing goal cannot replace or erase the
+/// requirement set the first declaration recorded. The original real session
+/// was audited for exactly this risk: a schema-rejected first declaration was
+/// followed by a second one, and the question was whether the retry could
+/// weaken what the user had been promised. For an EXISTING goal the seeds are
+/// ignored by the binder; the recorded history is the authority.
+#[tokio::test]
+async fn a_recommit_cannot_drop_a_recorded_requirement() {
+    const TASK: &str = "实现 A 功能并交付";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": TASK,
+                    "acceptance": ["交付 A"],
+                    "requirements": [{
+                        "kind": "named",
+                        "text": "交付 A 功能",
+                        "source_quote": "实现 A 功能"
+                    }]
+                }),
+            ),
+            Scripted::Text("A 功能已经完成，等待最终验收。"),
+        ],
+        false,
+    )
+    .await;
+    let _ = chat_with_request(&fx, TASK, CancellationToken::new()).await;
+
+    {
+        let mut script = fx.runtime.script.lock().unwrap();
+        script.clear();
+        script.extend(vec![
+            // The retry names a different acceptance and no requirements.
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": "新的描述",
+                    "acceptance": ["只要说明就够了"],
+                    "task_relation": "continue"
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "完成",
+                    "verification": {"status": "not_applicable", "detail": "no executable check"}
+                }),
+            ),
+            Scripted::Text("当前实现说明。"),
+        ]);
+    }
+    let second = chat_with_request(&fx, "继续", CancellationToken::new()).await;
+
+    let mut texts = Vec::new();
+    for payload in leveler_storage::MessageRepository::new(&fx.db)
+        .load(&fx.session)
+        .await
+        .unwrap()
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if let Some(parts) = value.get("content").and_then(|content| content.as_array()) {
+            for part in parts {
+                if let Some(text) = part.pointer("/result/content").and_then(|v| v.as_str()) {
+                    texts.push(text.to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        texts.iter().any(|text| text.contains("R1")),
+        "the recorded requirement is still owed and named: {texts:?}"
+    );
+    assert_ne!(
+        second.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "a completion that ignores the recorded requirement is refused"
     );
 }

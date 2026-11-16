@@ -77,10 +77,14 @@ pub enum FailureRetryability {
     /// The request provably did no provider-side work, or the provider asked
     /// to be retried: a bounded automatic retry is safe.
     Safe,
-    /// The request may have reached the provider: retrying could duplicate
-    /// work, so it is never automatic.
+    /// The request may have reached the provider: a blind replay could
+    /// duplicate work. The runtime's bounded model-round lifecycle may still
+    /// re-request it when no answer text was delivered; this field is the
+    /// stricter delivery truth a client reports.
     Caution,
-    /// Delivery could not be established: never automatic, reported as unknown.
+    /// Delivery could not be established: never blindly replayable, reported as
+    /// unknown. The bounded lifecycle may still re-request when nothing was
+    /// received.
     Unknown,
     /// Retrying the identical request cannot help.
     Never,

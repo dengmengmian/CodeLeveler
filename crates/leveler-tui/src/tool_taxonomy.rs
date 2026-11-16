@@ -482,22 +482,28 @@ pub fn activity_class(name: &str) -> ActivityClass {
 /// Shell probes (`ls`/`tree`/`find`/`pwd`/file-exists tests) demote to
 /// [`ActivityVisibility::Silent`] even though `run_command` is Important by default.
 ///
-/// `update_goal(complete)` is Silent bookkeeping; `update_goal(blocked)` is
-/// Important so the user sees why work stopped.
+/// `update_goal` is goal lifecycle control: its call, its intermediate
+/// refusals and its "complete" claim are facts for the runtime, the durable
+/// log and the model — never a conversation row. The goal's authoritative
+/// terminal (settled/blocked/failed) is the user-facing surface. Silencing it
+/// here is the taxonomy answer; [`is_conversation_visible`] still keeps a
+/// failed ordinary probe visible.
 pub fn activity_visibility(name: &str, arguments: &str) -> ActivityVisibility {
     if is_silent_shell_probe(name, arguments) {
         return ActivityVisibility::Silent;
     }
-    if name == "update_goal" {
-        return if update_goal_is_blocked(arguments) {
-            ActivityVisibility::Important
-        } else {
-            ActivityVisibility::Silent
-        };
+    if is_goal_lifecycle_control(name) {
+        return ActivityVisibility::Silent;
     }
     lookup(name)
         .map(|e| e.visibility)
         .unwrap_or(ActivityVisibility::Normal)
+}
+
+/// Goal lifecycle control tools. Their events stay durable and model-visible;
+/// the conversation renders the goal state, not each control call.
+pub fn is_goal_lifecycle_control(name: &str) -> bool {
+    name == "update_goal"
 }
 
 pub(crate) fn update_goal_is_blocked(arguments: &str) -> bool {
@@ -832,7 +838,8 @@ mod tests {
             activity_visibility("shell_command", r#"{"cmd":"cargo test"}"#),
             ActivityVisibility::Important
         );
-        // Goal complete is bookkeeping; blocked stays visible.
+        // Every update_goal is goal lifecycle control: the goal's terminal
+        // carries the verdict, not a control-call row.
         assert_eq!(
             activity_visibility(
                 "update_goal",
@@ -842,7 +849,7 @@ mod tests {
         );
         assert_eq!(
             activity_visibility("update_goal", r#"{"status":"blocked","summary":"缺密钥"}"#),
-            ActivityVisibility::Important
+            ActivityVisibility::Silent
         );
     }
 

@@ -744,6 +744,7 @@ async fn cancelling_the_continued_window_ends_the_logical_goal() {
             Arc::new(leveler_agent::AutoClarify),
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
             &mut |_| {},
             CancellationToken::new(),
         )

@@ -253,19 +253,33 @@ fn a_refused_closeout_is_shown_as_a_warning_without_an_invented_cause() {
         }),
     );
 
+    // Goal lifecycle control is internal: no tool row, no refusal warning.
     let screen = screen(&mut state, 120);
-    // Wide glyphs claim two cells, so a row read cell-by-cell carries a filler
-    // between CJK characters. Compare without whitespace.
     let painted: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(painted.contains("目标收尾"), "{screen}");
-    assert!(screen.contains('⚠'), "{screen}");
-    assert!(
-        painted.contains("目标未更新：收尾请求被拒绝"),
-        "the row states the fact: {screen}"
-    );
+    assert!(!painted.contains("目标收尾"), "{screen}");
+    assert!(!painted.contains("目标未更新"), "{screen}");
     assert!(
         !painted.contains("需先说明状态"),
-        "the row must not name a check the runtime never ran: {screen}"
+        "the screen must not name a check the runtime never ran: {screen}"
+    );
+    // The durable refusal fact is still on the call for the log and Tools view.
+    let call = state
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            crate::transcript::TranscriptItem::ToolGroup(group) => {
+                group.calls.iter().find(|call| call.name == "update_goal")
+            }
+            _ => None,
+        })
+        .expect("the closeout call is recorded");
+    assert_eq!(call.status, crate::transcript::ToolStatus::Failed);
+    assert!(
+        call.preview
+            .as_deref()
+            .is_some_and(|preview| preview.contains("not fully accounted for")),
+        "the runtime account is retained: {call:?}"
     );
 }
 
@@ -277,7 +291,7 @@ fn a_refused_closeout_is_shown_as_a_warning_without_an_invented_cause() {
 fn a_refused_closeout_states_the_gate_the_runtime_named() {
     use leveler_client_protocol::ToolCallId;
 
-    for (kind, note) in [
+    for (kind, _note) in [
         ("outstanding_children", "子任务仍在运行"),
         ("user_pause_boundary", "目标已暂停"),
         ("invalid_status", "缺少状态"),
@@ -315,13 +329,12 @@ fn a_refused_closeout_states_the_gate_the_runtime_named() {
         let screen = screen(&mut state, 120);
         let painted: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            painted.contains(note),
-            "{kind} must state its own reason: {screen}"
+            !painted.contains("目标收尾") && !painted.contains("目标未更新"),
+            "{kind}: goal control is never a conversation row: {screen}"
         );
-        assert!(screen.contains('⚠'), "{kind} is a warning: {screen}");
         assert!(
             !painted.contains(&format!("runtimeaccountfor{kind}")),
-            "{kind}: the model-facing account stays behind the fold: {screen}"
+            "{kind}: the model-facing account never reaches the screen: {screen}"
         );
         assert!(
             !painted.contains("goal_refused"),
@@ -399,16 +412,28 @@ fn an_accepted_closeout_after_a_refused_one_is_visible() {
         }),
     );
 
+    // Neither the refused attempt nor the accepted closeout is a goal row.
+    // The accepted attempt IS the goal's last state, and it reaches the user
+    // through the goal terminal, not through a control-call row.
     let screen = screen(&mut state, 120);
     let painted: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        painted.contains("目标未更新：用户要求的条件尚未全部满足"),
-        "the refusal stays in history: {screen}"
+        !painted.contains("目标未更新") && !painted.contains("目标收尾"),
+        "no goal control row may reach the conversation: {screen}"
     );
-    assert!(
-        painted.contains("完成：README追加Verified.，测试实跑2个并交付答案"),
-        "the accepted closeout is the last goal state and must be visible: {screen}"
-    );
+    let closeouts: Vec<_> = state
+        .transcript
+        .items()
+        .iter()
+        .flat_map(|item| match item {
+            crate::transcript::TranscriptItem::ToolGroup(group) => group.calls.as_slice(),
+            _ => &[],
+        })
+        .filter(|call| call.name == "update_goal")
+        .collect();
+    assert_eq!(closeouts.len(), 2, "both attempts stay durable");
+    assert_eq!(closeouts[0].status, crate::transcript::ToolStatus::Failed);
+    assert_eq!(closeouts[1].status, crate::transcript::ToolStatus::Ok);
 }
 
 /// An accepted closeout with no refused attempt before it is ordinary

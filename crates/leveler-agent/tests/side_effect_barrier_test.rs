@@ -292,6 +292,7 @@ async fn run_chat_turn(
                     h.session.clone(),
                     stores.events.clone(),
                     None,
+                    None,
                     ports,
                     cancellation.clone(),
                 )

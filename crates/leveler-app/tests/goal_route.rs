@@ -281,6 +281,24 @@ async fn goals(f: &Fixture) -> Vec<GoalRecord> {
     stores.goals.for_task(&task).await.unwrap()
 }
 
+/// The goal settlement is committed by the terminal transaction; a turn row
+/// can read `completed` a moment before that write is visible to a fresh
+/// connection. Poll the durable owner instead of sampling once.
+async fn wait_for_goal_settled(f: &Fixture) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let goals = goals(f).await;
+        if goals.len() == 1 && goals[0].state == GoalState::Settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the goal did not settle: {goals:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn axis(f: &Fixture) -> String {
     let db = f.app.open_database().await.unwrap();
     SessionRepository::new(&db)
@@ -1506,5 +1524,309 @@ async fn an_unattended_user_decision_block_is_an_explicit_degradation() {
             .iter()
             .any(|text| text.contains("never put to the user as a question")),
         "the accepted block must state that no interaction happened: {texts:?}"
+    );
+}
+
+/// A transient provider failure at a window boundary is not the end of an owed
+/// goal. The runtime continues the same goal without fabricating a user
+/// message, bounded by the goal's own recorded failure streak. A 504 is
+/// deliberately chosen: the provider answered, so the model-round lifecycle
+/// does not replay it (there is no proof nothing was generated), but it is a
+/// transient provider fault and the goal can continue from the durable
+/// transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transient_goal_failure_is_continued_without_a_user_message() {
+    use leveler_client_protocol::RuntimeEvent;
+
+    let f = fixture(
+        vec![MockResponse::Status {
+            code: 504,
+            body: serde_json::json!({"error": {"message": "gateway timeout"}}).to_string(),
+        }],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    f.server
+        .push(completed_turn("c-recovered", "恢复后完成"))
+        .await;
+    f.server.push(plain_answer("恢复后已完成。")).await;
+
+    let runtime_client = client(&f);
+    let mut rx = runtime_client.subscribe_session(&f.session);
+    runtime_client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut saw_recovery = false;
+    let mut turns;
+    loop {
+        while let Ok(event) = rx.try_recv() {
+            if let RuntimeEvent::GoalRecovery {
+                attempt,
+                max_attempts,
+            } = event
+            {
+                assert_eq!((attempt, max_attempts), (1, 3), "first bounded recovery");
+                saw_recovery = true;
+            }
+        }
+        let db = f.app.open_database().await.unwrap();
+        turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+        if turns.len() >= 2 && turns.iter().all(|turn| turn.status != "running") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the recovered turn did not settle: {turns:?} goals={:?}",
+            goals(&f).await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw_recovery, "the runtime must announce the continuation");
+    assert_eq!(
+        turns.len(),
+        2,
+        "one failed window and one recovered window: {turns:?}"
+    );
+    assert_eq!(
+        user_input_count(&f).await,
+        1,
+        "recovery must not fabricate a user message"
+    );
+
+    let bodies = f.server.request_bodies().await;
+    assert!(
+        bodies[0].contains(OBJECTIVE),
+        "the first window carried the user's task"
+    );
+    let recovery = bodies
+        .iter()
+        .filter(|body| body.contains("Runtime recovery notice"))
+        .collect::<Vec<_>>();
+    assert!(
+        !recovery.is_empty(),
+        "the resumed window is told the runtime is continuing: {bodies:#?}"
+    );
+    assert!(
+        recovery[0].contains("Recovery attempt 1 of 3"),
+        "the attempt is stated: {}",
+        recovery[0]
+    );
+
+    wait_for_goal_settled(&f).await;
+}
+
+/// The recovery budget is bounded and durable. After three consecutive
+/// transient failures the runtime stops re-entering the goal and surfaces the
+/// last failure; it does not spin forever on a provider that keeps answering
+/// 504.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_goal_recovery_budget_is_bounded() {
+    use leveler_client_protocol::RuntimeEvent;
+
+    let failure = || MockResponse::Status {
+        code: 504,
+        body: serde_json::json!({"error": {"message": "gateway timeout"}}).to_string(),
+    };
+    let f = fixture(
+        vec![failure(), failure(), failure(), failure()],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+
+    let runtime_client = client(&f);
+    let mut rx = runtime_client.subscribe_session(&f.session);
+    runtime_client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut attempts = Vec::new();
+    let mut failed = false;
+    loop {
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                RuntimeEvent::GoalRecovery {
+                    attempt,
+                    max_attempts,
+                } => {
+                    assert_eq!(max_attempts, 3);
+                    attempts.push(attempt);
+                }
+                RuntimeEvent::TurnFailed { .. } => failed = true,
+                _ => {}
+            }
+        }
+        if failed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the bounded recovery never surfaced its failure"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        attempts,
+        vec![1, 2, 3],
+        "exactly three automatic continuations, not an unbounded loop"
+    );
+    let db = f.app.open_database().await.unwrap();
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(
+        turns.len(),
+        4,
+        "the original window plus three recoveries: {turns:?}"
+    );
+    assert_eq!(
+        user_input_count(&f).await,
+        1,
+        "no user message was fabricated across the attempts"
+    );
+}
+
+/// The original session's axis: a Chat turn binds a goal mid-flight with
+/// `commit_task`, then the provider fails transiently on a later request. The
+/// goal is owed even though the session axis is Chat, so the runtime continues
+/// it without asking the person to type `继续`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_turn_that_bound_a_goal_recovers_transiently() {
+    use leveler_client_protocol::RuntimeEvent;
+
+    const TASK: &str = "实现 X 并确认完成";
+    let f = fixture(
+        vec![
+            sse(vec![
+                tool_call_frame(
+                    "c-commit",
+                    "commit_task",
+                    serde_json::json!({
+                        "objective": TASK,
+                        "acceptance": ["确认完成"]
+                    }),
+                ),
+                finish_frame("tool_calls"),
+            ]),
+            MockResponse::Status {
+                code: 504,
+                body: serde_json::json!({"error": {"message": "gateway timeout"}}).to_string(),
+            },
+            completed_turn("c-done", "恢复后完成"),
+            plain_answer("完成说明。"),
+        ],
+        leveler_agent::CollaborationMode::Chat,
+    )
+    .await;
+
+    let runtime_client = client(&f);
+    let mut rx = runtime_client.subscribe_session(&f.session);
+    runtime_client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: TASK.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut saw_recovery = false;
+    let mut turns;
+    loop {
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, RuntimeEvent::GoalRecovery { .. }) {
+                saw_recovery = true;
+            }
+        }
+        let db = f.app.open_database().await.unwrap();
+        turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+        if turns.len() >= 2 && turns.iter().all(|turn| turn.status != "running") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the chat turn never recovered: {turns:?} goals={:?}",
+            goals(&f).await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_recovery,
+        "a bound goal is owed after the failed request"
+    );
+    assert_eq!(user_input_count(&f).await, 1);
+    wait_for_goal_settled(&f).await;
+}
+
+/// A plain Chat turn with no goal owes nothing: a transient provider failure
+/// ends the logical turn. Automatic recovery must not invent a task or open a
+/// new execution Turn on the model's behalf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_chat_failure_does_not_start_an_execution_turn() {
+    use leveler_client_protocol::RuntimeEvent;
+
+    let f = fixture(
+        vec![
+            MockResponse::Status {
+                code: 504,
+                body: serde_json::json!({"error": {"message": "gateway timeout"}}).to_string(),
+            },
+            plain_answer("这个答案不该被请求。"),
+        ],
+        leveler_agent::CollaborationMode::Chat,
+    )
+    .await;
+
+    let runtime_client = client(&f);
+    let mut rx = runtime_client.subscribe_session(&f.session);
+    runtime_client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "解释一下这个函数".to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut recovered = false;
+    let mut failed = false;
+    loop {
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                RuntimeEvent::GoalRecovery { .. } => recovered = true,
+                RuntimeEvent::TurnFailed { .. } => failed = true,
+                _ => {}
+            }
+        }
+        if failed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the chat turn did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!recovered, "no goal was owed, so nothing may be resumed");
+    let db = f.app.open_database().await.unwrap();
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(turns.len(), 1, "one logical turn, no execution window");
+    assert!(goals(&f).await.is_empty(), "no goal may be invented");
+    assert_eq!(
+        f.server.request_bodies().await.len(),
+        1,
+        "the failed request is surfaced, not silently re-sent as a new task"
     );
 }

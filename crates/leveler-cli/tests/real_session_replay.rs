@@ -150,7 +150,7 @@ async fn replay_a_recorded_session() {
 
     // The same projection a live client consumed.
     let (tx, mut rx) = tokio::sync::broadcast::channel(1 << 16);
-    let mut bridge = EventBridge::new(tx);
+    let mut bridge = EventBridge::new(tx.clone());
 
     let mut state = AppState::new(Theme::no_color(), boot());
     reduce(
@@ -167,10 +167,20 @@ async fn replay_a_recorded_session() {
 
     // Sample points: the frames a person would have been looking at.
     let n = records.len();
-    let marks: Vec<usize> = [n / 10, n / 4, n / 2, (n * 3) / 4, n.saturating_sub(1)]
-        .into_iter()
-        .filter(|m| *m > 0)
-        .collect();
+    // `REPLAY_EVERY=<n>` samples every n events for a dense pass over one
+    // interval (e.g. the goal-refusal stretch of a recorded session). The
+    // default marks stay sparse so a normal replay prints readable frames.
+    let marks: Vec<usize> = match std::env::var("REPLAY_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|every| *every > 0)
+    {
+        Some(every) => (0..n).step_by(every).collect(),
+        None => [n / 10, n / 4, n / 2, (n * 3) / 4, n.saturating_sub(1)]
+            .into_iter()
+            .filter(|m| *m > 0)
+            .collect(),
+    };
 
     let mut frames = Vec::new();
     let mut forwarded = 0usize;
@@ -178,7 +188,16 @@ async fn replay_a_recorded_session() {
         let Ok(event) = EngineEvent::from_payload(&rec.payload) else {
             continue;
         };
+        // The live runtime owns one bridge per work window: TaskFinished is
+        // that bridge's closed boundary, and the next turn gets a fresh one.
+        // A single bridge across a multi-turn session would silently drop
+        // every later turn (the exact first-turn-only frame this replay used
+        // to print).
+        let closes_window = matches!(event, EngineEvent::TaskFinished { .. });
         bridge.forward(event);
+        if closes_window {
+            bridge = EventBridge::new(tx.clone());
+        }
         while let Ok(ui) = rx.try_recv() {
             reduce(&mut state, Action::Runtime(ui));
             forwarded += 1;

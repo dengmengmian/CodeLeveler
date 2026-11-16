@@ -252,6 +252,10 @@ pub(crate) struct Drive<'a> {
     pending_commands: Vec<super::goal_verification::PendingCommand>,
     /// Goal-local order of registered check dispatch, preserved on resume.
     registered_check_order: u64,
+    /// The goal whose durable verification record this drive has already
+    /// merged into its live ledger. `None` until a goal is bound; a Chat turn
+    /// gains it mid-flight and must load the goal's earlier runs exactly once.
+    verification_goal: Option<leveler_core::GoalId>,
     /// Background task executions whose terminal result this drive already
     /// registered, by task id. The auto-delivered notice and an active
     /// `wait_task`/`get_task` read are two observations of ONE execution; this
@@ -1097,6 +1101,10 @@ impl Executor {
             verification_runs: self.seeded_verification.runs.clone(),
             pending_commands: self.seeded_verification.pending.clone(),
             registered_check_order: self.seeded_verification.latest_check_order(),
+            // A turn that started as a Goal/Resume already carries its
+            // goal's rebuilt facts; a Chat turn starts with none and learns
+            // its goal mid-flight.
+            verification_goal: self.goal_binder().and_then(|binder| binder.bound()),
             recorded_background_tasks: HashSet::new(),
             goal_gate_recovery_rounds: 0,
             answer_candidate: None,
@@ -2420,7 +2428,118 @@ fn intent_fatal(error: leveler_engine::PortError) -> IntentCall {
     IntentCall::Fatal(AgentError::Persistence(error.to_string()))
 }
 
+/// The execution identity of a pending background start: the task it launched,
+/// else the call that launched it. Two observations with the same key are one
+/// execution.
+fn pending_identity(
+    started: &crate::executor::goal_verification::PendingCommand,
+) -> Option<String> {
+    started
+        .task_id
+        .as_ref()
+        .map(|id| format!("task:{id}"))
+        .or_else(|| started.call_id.as_ref().map(|id| format!("call:{id}")))
+}
+
 impl Drive<'_> {
+    /// Fold the bound goal's durable verification record into this window's
+    /// live ledger, once per goal.
+    ///
+    /// A Chat turn learns its goal mid-flight (`commit_task` or
+    /// `declare_intent`). Its live ledger only holds commands run in this
+    /// window, so a citation of an earlier window's real execution would be
+    /// refused as "never ran in this task". The rebuilt record is older than
+    /// the live one; live runs win on identity because their ledger samples
+    /// are the live ones.
+    ///
+    /// A Goal/Resume turn enters with its facts already seeded and its goal
+    /// marked, so this is a no-op for it.
+    async fn sync_bound_goal_verification(&mut self) -> Result<(), AgentError> {
+        let Some(bound) = self
+            .executor
+            .goal_binder()
+            .and_then(|binder| binder.bound())
+        else {
+            return Ok(());
+        };
+        if self.verification_goal.as_ref() == Some(&bound) {
+            return Ok(());
+        }
+        let Some(source) = self.executor.goal_verification_source().cloned() else {
+            // A caller without a durable source (a library drive) cannot
+            // reconstruct older windows; keep its live record and remember the
+            // goal so this is attempted once, not every round.
+            self.verification_goal = Some(bound);
+            return Ok(());
+        };
+        let facts = source.load(&bound).await.map_err(AgentError::Persistence)?;
+        self.merge_verification_facts(facts);
+        self.verification_goal = Some(bound);
+        Ok(())
+    }
+
+    /// Rebuilt facts first, then this window's live observations. Identity is
+    /// the execution's call id (or its task id for a pending background
+    /// start); the live copy wins because its workspace versions were sampled
+    /// in this window.
+    fn merge_verification_facts(
+        &mut self,
+        facts: crate::executor::goal_verification::VerificationFacts,
+    ) {
+        let rebuilt_order = facts.latest_check_order();
+        let live_runs = std::mem::take(&mut self.verification_runs);
+        let live_calls: HashSet<String> = live_runs
+            .iter()
+            .filter_map(|run| run.call_id.clone())
+            .collect();
+        let live_shapes: HashSet<(String, u32, u64, bool, Option<i32>)> = live_runs
+            .iter()
+            .filter(|run| run.call_id.is_none())
+            .map(|run| {
+                (
+                    run.label.clone(),
+                    run.model_step,
+                    run.mutation_ops,
+                    run.ok,
+                    run.exit_code,
+                )
+            })
+            .collect();
+        let mut merged: Vec<_> = facts
+            .runs
+            .into_iter()
+            .filter(|run| match run.call_id.as_deref() {
+                Some(id) => !live_calls.contains(id),
+                None => !live_shapes.contains(&(
+                    run.label.clone(),
+                    run.model_step,
+                    run.mutation_ops,
+                    run.ok,
+                    run.exit_code,
+                )),
+            })
+            .collect();
+        merged.extend(live_runs);
+        self.verification_runs = merged;
+
+        let live_pending = std::mem::take(&mut self.pending_commands);
+        let live_keys: HashSet<String> = live_pending.iter().filter_map(pending_identity).collect();
+        let mut pending: Vec<_> = facts
+            .pending
+            .into_iter()
+            .filter(|started| {
+                !pending_identity(started).is_some_and(|key| live_keys.contains(&key))
+                    && !started
+                        .call_id
+                        .as_deref()
+                        .is_some_and(|id| live_calls.contains(id))
+            })
+            .collect();
+        pending.extend(live_pending);
+        self.pending_commands = pending;
+        self.registered_check_order = self.registered_check_order.max(rebuilt_order);
+    }
+
     /// State the running goals of this task while this turn does not yet serve
     /// one.
     ///
@@ -2629,6 +2748,12 @@ impl Drive<'_> {
         };
 
         binder.adopt(&target).await.map_err(intent_fatal)?;
+        // The adopted goal's earlier executions are now this drive's
+        // verification record. Load them before any `update_goal` in this
+        // round can cite them.
+        self.sync_bound_goal_verification()
+            .await
+            .map_err(IntentCall::Fatal)?;
         let scope = binder.scope().await.map_err(intent_fatal)?.ok_or_else(|| {
             IntentCall::Fatal(AgentError::Persistence(format!(
                 "adopted goal {target} has no durable row"
@@ -3803,6 +3928,10 @@ impl AgentHarness for Drive<'_> {
                 "cannot admit another request under a cost cap: task has an unpriced model attempt",
             )));
         }
+        // A goal bound earlier this round (or by a previous window's binding
+        // path this drive did not run) contributes its earlier executions to
+        // this window's verification record before the next request.
+        self.sync_bound_goal_verification().await?;
         Ok(Flow::Continue)
     }
 
@@ -5111,6 +5240,12 @@ impl AgentHarness for Drive<'_> {
                                             // The committed window carries the goal
                                             // contract from the next request on.
                                             self.tools = self.executor.request_tool_definitions();
+                                            // When this commit joined a goal the task
+                                            // already owed, its earlier windows are the
+                                            // verification record this window must judge.
+                                            // Load them before a same-round `update_goal`
+                                            // can cite them.
+                                            self.sync_bound_goal_verification().await?;
                                             // Report the DURABLE scope, not the model's
                                             // restatement. When this turn joined a goal the
                                             // task already owed, that goal's objective,

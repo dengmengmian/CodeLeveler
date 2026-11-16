@@ -118,6 +118,7 @@ pub async fn drive_turn(
     seed_task_state: bool,
     session_id: SessionId,
     events: Arc<dyn EventStore>,
+    goal_verification: Option<Arc<dyn crate::executor::GoalVerificationSource>>,
     checkpoint_context: Option<CodingCheckpointContext>,
     ports: TurnPorts,
     cancellation: CancellationToken,
@@ -244,6 +245,9 @@ pub async fn drive_turn(
             TurnInput::Content { .. } => VerificationFacts::default(),
         })
         .with_clarification_answers(clarification_answers);
+    if let Some(source) = goal_verification {
+        executor = executor.with_goal_verification_source(source);
+    }
 
     // A resumed execution has no in-process file observations. Existing files
     // it wants to overwrite are unknown versions: require a fresh read first.
@@ -705,6 +709,31 @@ pub(crate) async fn load_goal_verification(
         runs,
         pending: pending.into_values().collect(),
     })
+}
+
+/// The production [`crate::executor::GoalVerificationSource`]: rebuild a
+/// goal's record from the same durable stores the rest of the turn uses.
+pub(crate) struct StoredGoalVerification {
+    stores: leveler_storage::EngineStores,
+    session_id: SessionId,
+}
+
+impl StoredGoalVerification {
+    pub(crate) fn source(
+        stores: leveler_storage::EngineStores,
+        session_id: SessionId,
+    ) -> Arc<dyn crate::executor::GoalVerificationSource> {
+        Arc::new(Self { stores, session_id })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::executor::GoalVerificationSource for StoredGoalVerification {
+    async fn load(&self, goal: &leveler_core::GoalId) -> Result<VerificationFacts, String> {
+        load_goal_verification(&self.stores, &self.session_id, goal)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Attribute a durable background result to the call that started it.

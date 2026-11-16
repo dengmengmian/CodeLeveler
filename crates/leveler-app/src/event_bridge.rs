@@ -1120,14 +1120,11 @@ impl EventBridge {
                 if leveler_agent::is_commit_refusal_kind(&kind) {
                     self.registration_refused = true;
                 }
-                // Surface as a localized activity label; the gate's kind and the
-                // model-facing English account ride the tool result's preview
-                // (tagged), where the client states the reason in the user's
-                // language. Neither field is interpolated here: the detail is
-                // guidance written for the model.
-                let _ = self.events.send(RuntimeEvent::AgentActivity {
-                    label: "目标校验未通过，等待模型修正".to_string(),
-                });
+                // Goal-internal control is not user-facing activity. The
+                // refusal is durable, the model receives the full reason in
+                // its tool result, and the goal's terminal is the surface a
+                // person reads. Projecting each intermediate refusal as an
+                // activity label was the visible noise this removes.
             }
             EngineEvent::DelegationStage { action, detail } => {
                 // Durable ownership-provenance fact; surfaced as a light
@@ -4219,14 +4216,15 @@ mod projection_equivalence {
     }
 
     #[test]
-    fn goal_interception_surfaces_as_activity() {
+    fn goal_interception_stays_internal() {
         let shapes = project(vec![EngineEvent::GoalIntercepted {
             kind: "verification_refused".into(),
             detail: "`make regression` was cited as verification but never ran in this task".into(),
         }]);
-        // The user reads a localized fact; the model-facing English account is
-        // not interpolated into the status line.
-        assert_eq!(shapes, ["activity:目标校验未通过，等待模型修正"]);
+        // The refusal is durable and reaches the model in its tool result.
+        // It is goal-internal control, not user-facing activity: the goal's
+        // terminal is the surface a person reads.
+        assert!(shapes.is_empty(), "{shapes:?}");
     }
 
     #[test]

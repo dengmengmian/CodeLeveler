@@ -907,14 +907,14 @@
           ]
         },
         {
-          "description": "The request may have reached the provider: retrying could duplicate work, so it is never automatic.",
+          "description": "The request may have reached the provider: a blind replay could duplicate work. The runtime's bounded model-round lifecycle may still re-request it when no answer text was delivered; this field is the stricter delivery truth a client reports.",
           "type": "string",
           "enum": [
             "caution"
           ]
         },
         {
-          "description": "Delivery could not be established: never automatic, reported as unknown.",
+          "description": "Delivery could not be established: never blindly replayable, reported as unknown. The bounded lifecycle may still re-request when nothing was received.",
           "type": "string",
           "enum": [
             "unknown"
@@ -2080,6 +2080,33 @@
               "type": "string",
               "enum": [
                 "model_retrying"
+              ]
+            }
+          }
+        },
+        {
+          "description": "An owed goal is being continued automatically after a transient provider failure ended the previous window. Ephemeral status: the resumed window's own events replace it, and the goal's terminal is the only outcome a client states. `attempt` is 1-based within the logical turn's recovery budget.",
+          "type": "object",
+          "required": [
+            "attempt",
+            "max_attempts",
+            "type"
+          ],
+          "properties": {
+            "attempt": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "max_attempts": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "goal_recovery"
               ]
             }
           }

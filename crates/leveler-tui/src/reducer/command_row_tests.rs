@@ -1609,6 +1609,42 @@ fn a_handed_off_command_settles_when_its_task_exits() {
 /// BG-05 in the UI: the runtime observed a readiness signal while the process
 /// keeps running. The row says ready-and-running, never completed, and the
 /// readiness is a runtime fact, not something this client inferred.
+/// Every background lifecycle terminal is a record, never an input-area
+/// notice. A task with no row of its own still leaves a conversation record.
+#[test]
+fn background_lifecycle_terminals_never_raise_an_input_area_notice() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "t-unseen-stop".into(),
+            exit_code: None,
+            duration_ms: 900,
+            ok: false,
+            stopped: true,
+            output: String::new(),
+        }),
+    );
+    assert!(s.notification.is_none(), "stopped is not a banner");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskUnknown {
+            task_id: "t-unseen-unknown".into(),
+            duration_ms: 1_000,
+            output: String::new(),
+        }),
+    );
+    assert!(s.notification.is_none(), "unknown is not a banner");
+    let rows = plain(&s);
+    assert!(
+        rows.iter().any(|row| row.contains("无法确认后台任务状态")),
+        "an outcome with no row of its own still leaves a conversation record: {rows:#?}"
+    );
+}
+
+/// BG-05 in the UI: the runtime observed a readiness signal while the process
+/// keeps running. The row says ready-and-running, never completed, and the
+/// readiness is a runtime fact, not something this client inferred.
 #[test]
 fn a_ready_background_task_reads_as_ready_and_still_running() {
     let mut s = start_detached("make up", "t-ready");
@@ -1621,6 +1657,10 @@ fn a_ready_background_task_reads_as_ready_and_still_running() {
         }),
     );
     open_groups(&mut s);
+    assert!(
+        s.notification.is_none(),
+        "readiness is a running fact on the row and strip, never an input-area notice"
+    );
     let chrome = s.background_task_labels.get("t-ready").expect("chrome");
     assert!(chrome.is_ready(), "readiness is recorded on the task");
     assert!(chrome.is_running(), "a ready service is NOT a finished one");

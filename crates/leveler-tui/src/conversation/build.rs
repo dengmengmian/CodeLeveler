@@ -3051,7 +3051,6 @@ mod semantic_copy_tests {
         assert!(!copied.contains('└') && !copied.contains('›'), "{copied:?}");
     }
 
-    const CLOSEOUT_REASON: &str = "目标未更新：用户要求的条件尚未全部满足";
     const CLOSEOUT_DETAIL: &str = "update_goal(complete) was refused: the user's stated scope \
                                    is not fully accounted for.\n- `b.txt` is not covered\n- \
                                    `c.txt` is not covered";
@@ -3088,44 +3087,39 @@ mod semantic_copy_tests {
         (s, item)
     }
 
+    /// Goal lifecycle control is not a conversation unit, so there is
+    /// nothing to copy from it at any width, collapsed or expanded. The
+    /// refusal remains a durable fact on the call and in the model's tool
+    /// result; the goal's terminal is what a person reads.
     #[test]
-    fn a_refused_closeout_copies_its_localized_reason() {
-        let (s, item) = refused_closeout();
-        for width in [48usize, 80, 120] {
-            let copied = copy_item(&s, width, item);
-            assert!(
-                copied.starts_with("目标收尾  完成：13 组回归全过\n"),
-                "{copied:?}"
-            );
-            assert!(copied.contains(CLOSEOUT_REASON), "{copied:?}");
-            assert!(
-                !copied.contains("not fully accounted for")
-                    && !copied.contains("is not covered")
-                    && !copied.contains("goal_refused"),
-                "the model-facing account and the tag stay out of the copy: {copied:?}"
-            );
-            assert!(!copied.contains("(+"), "the fold hint is paint: {copied:?}");
-        }
-    }
-
-    #[test]
-    fn an_expanded_refused_closeout_copies_every_failing_requirement() {
+    fn a_refused_closeout_is_not_a_conversation_unit() {
         let (mut s, item) = refused_closeout();
+        let hidden = |s: &AppState| {
+            let lines: Vec<String> = crate::conversation::build::build_conversation_lines(s, 100)
+                .iter()
+                .map(crate::selection::line_to_plain)
+                .collect();
+            assert!(
+                !lines.iter().any(|line| line.contains("目标收尾")
+                    || line.contains("目标未更新")
+                    || line.contains(CLOSEOUT_DETAIL)),
+                "a goal control row must not be a conversation line: {lines:#?}"
+            );
+        };
+        hidden(&s);
         assert!(
             s.transcript
                 .set_item_display(item, crate::fold::DisplayMode::Expanded,)
         );
-        let copied = copy_item(&s, 100, item);
+        hidden(&s);
+        let call = match &s.transcript.items()[item] {
+            crate::transcript::TranscriptItem::ToolGroup(group) => &group.calls[0],
+            other => panic!("expected the closeout group, got {other:?}"),
+        };
         assert!(
-            copied.starts_with("目标收尾  完成：13 组回归全过\n"),
-            "{copied:?}"
+            crate::tool_cell::goal_refusal(call).is_some(),
+            "the durable refusal reason is still attached to the call"
         );
-        assert!(copied.contains(CLOSEOUT_REASON), "{copied:?}");
-        assert!(
-            copied.contains("`b.txt` is not covered") && copied.contains("`c.txt` is not covered"),
-            "both failing requirements copy: {copied:?}"
-        );
-        assert!(!copied.contains("goal_refused"), "{copied:?}");
     }
 
     #[test]

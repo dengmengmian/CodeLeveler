@@ -56,6 +56,20 @@ pub trait CompactionCheckpoint: Send + Sync {
     ) -> Result<Option<String>, PortError>;
 }
 
+/// Reads a goal's durable execution record.
+///
+/// The runner owns how verification facts are reconstructed from the event
+/// log; the drive owns when a mid-turn binding needs them. Splitting those two
+/// responsibilities here keeps the reconstruction in one place instead of
+/// teaching the executor storage layout.
+#[async_trait]
+pub trait GoalVerificationSource: Send + Sync {
+    async fn load(
+        &self,
+        goal: &leveler_core::GoalId,
+    ) -> Result<crate::executor::goal_verification::VerificationFacts, String>;
+}
+
 /// Skills the user named on this turn, plus the injection text.
 /// Names come from resolution, not from scanning the rendered body.
 struct SelectedSkills {
@@ -1553,6 +1567,11 @@ pub struct Executor {
     /// (resume / retry). The completion gate reads one task-wide record, not
     /// only the commands that happened to run after this window opened.
     seeded_verification: crate::executor::goal_verification::VerificationFacts,
+    /// Durable source for a goal's earlier verification record. A Chat turn
+    /// that binds or adopts a goal mid-flight has no seeded facts; the drive
+    /// reloads them the moment the binding exists, so evidence from an earlier
+    /// turn is not answered with "never ran in this task".
+    goal_verification_source: Option<Arc<dyn GoalVerificationSource>>,
     /// Clarification answers the user actually gave in this session. The
     /// requirement gate may quote them; every other tool result stays
     /// untrusted agent-visible output.
@@ -1704,6 +1723,7 @@ impl Executor {
             seeded_plan: PlanState::default(),
             seeded_ledger: EvidenceLedger::default(),
             seeded_verification: Default::default(),
+            goal_verification_source: None,
             seeded_clarification_answers: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),
@@ -1800,6 +1820,22 @@ impl Executor {
     ) -> Self {
         self.seeded_verification = verification;
         self
+    }
+
+    /// The durable record behind a goal's earlier verification runs. Used when
+    /// this turn joins a goal after it started (a Chat turn's `commit_task` or
+    /// `declare_intent`): the live window has no seeded facts for a goal it did
+    /// not know about when it opened.
+    pub(crate) fn with_goal_verification_source(
+        mut self,
+        source: Arc<dyn GoalVerificationSource>,
+    ) -> Self {
+        self.goal_verification_source = Some(source);
+        self
+    }
+
+    pub(crate) fn goal_verification_source(&self) -> Option<&Arc<dyn GoalVerificationSource>> {
+        self.goal_verification_source.as_ref()
     }
 
     /// Seed the clarification answers the user gave in this session. They are
@@ -2337,6 +2373,7 @@ impl Executor {
             seeded_ledger: EvidenceLedger::default(),
             // A child's commands are its own; they never prove the parent's goal.
             seeded_verification: Default::default(),
+            goal_verification_source: None,
             seeded_clarification_answers: Vec::new(),
             seeded_progress: ProgressLedger::default(),
             restart_settled_children: Vec::new(),

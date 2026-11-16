@@ -405,6 +405,12 @@ pub enum RuntimeEvent {
         max_attempts: u32,
         delay_ms: u64,
     },
+    /// An owed goal is being continued automatically after a transient
+    /// provider failure ended the previous window. Ephemeral status: the
+    /// resumed window's own events replace it, and the goal's terminal is the
+    /// only outcome a client states. `attempt` is 1-based within the logical
+    /// turn's recovery budget.
+    GoalRecovery { attempt: u32, max_attempts: u32 },
     /// Project behavior constraints loaded for this turn. Sources are
     /// workspace-relative paths; instruction contents never enter UI chrome.
     ProjectRulesLoaded { sources: Vec<String> },

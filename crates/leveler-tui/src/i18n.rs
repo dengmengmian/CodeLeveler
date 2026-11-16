@@ -233,6 +233,9 @@ pub struct UiText {
     pub reconnecting: &'static str,
     /// Brief confirmation once a retry attempt starts again: "已重连".
     pub reconnected: &'static str,
+    /// Automatic Goal continuation after a transient provider failure:
+    /// "正在恢复任务 · 第 {}/{} 次". Not a failure and not a user action.
+    pub goal_recovery_activity: &'static str,
     /// Footer prefix-cache hit rate of the latest prompt. Not the turn receipt.
     pub footer_cache: &'static str,
     /// This turn's model steps, on the turn receipt only.
@@ -995,6 +998,11 @@ pub struct UiText {
     pub failure_retried: &'static str,
     /// Disclosure label for the same count.
     pub failure_retries_label: &'static str,
+    /// Why no automatic retry was attempted. Derived from the typed
+    /// retryability and delivery facts, never from the error text.
+    pub failure_no_retry_partial_answer: &'static str,
+    pub failure_no_retry_upstream_started: &'static str,
+    pub failure_no_retry_unknown_delivery: &'static str,
 
     // Turn end / completion report
     pub turn_end_completed: &'static str,
@@ -1058,17 +1066,16 @@ pub struct UiText {
     pub settled_search: &'static str,
     pub settled_work_many: &'static str,
     pub settled_explore: &'static str,
-    /// Background task lifecycle toasts. The task's opaque runtime id is
+    /// Background task lifecycle records. The task's opaque runtime id is
     /// never the user-facing name: these carry what it is actually running.
+    /// They are conversation records for a task with no row of its own; no
+    /// lifecycle event produces an input-area notice.
     pub background_task_done: &'static str,
     pub background_task_failed: &'static str,
     /// A background task stopped on purpose: a user/agent cancel or session
     /// cleanup. Distinct from failure; the runtime's `Killed` state is the
     /// authority.
     pub background_task_stopped: &'static str,
-    /// A still-running task announced readiness in its own output. Not a
-    /// completion: the process keeps running.
-    pub background_task_ready: &'static str,
     pub background_task_unknown: &'static str,
     /// The task's owning process went away with the runtime; the work is gone
     /// rather than merely unreported. Never says whether the command finished.
@@ -1752,6 +1759,7 @@ static ZH: UiText = UiText {
     running_command: "运行 {}",
     reconnecting: "模型服务暂时不可用 · 重试 {attempt}/{max} · {secs}s",
     reconnected: "已恢复",
+    goal_recovery_activity: "正在恢复任务 · 第 {}/{} 次",
     footer_cache: "缓存 {}%",
     turn_rounds: "{} 轮",
     turn_tokens: "{} tokens",
@@ -2534,7 +2542,7 @@ static ZH: UiText = UiText {
     theme_hc_label: "High Contrast",
     theme_hc_desc: "高对比深色，状态与边框更强",
     cancelled_continue: "已取消，可继续输入",
-    resumable_hint: "可继续",
+    resumable_hint: "进度已保留 · 发送「继续」可恢复",
     task_cancelled: "任务已取消，无法继续",
     history_omitted_turns: "更早的 {} 个回合未显示",
     mode_plan_desc: "始终询问：外写文件、用网、危险命令都要你点同意",
@@ -2599,6 +2607,9 @@ static ZH: UiText = UiText {
     failure_reason_label: "原因",
     failure_retried: "已重试 {n} 次",
     failure_retries_label: "重试",
+    failure_no_retry_partial_answer: "已收到部分回答，重放可能重复内容，因此未自动重试",
+    failure_no_retry_upstream_started: "服务端可能已开始处理，为避免重复执行未自动重试",
+    failure_no_retry_unknown_delivery: "无法确认请求是否送达，为避免重复执行未自动重试",
     turn_end_completed: "任务已完成",
     turn_end_answered: "回答结束",
     turn_end_yielded: "本窗口结束 · 目标继续",
@@ -2636,7 +2647,6 @@ static ZH: UiText = UiText {
     background_task_done: "后台任务已完成：{}",
     background_task_failed: "后台任务失败：{}",
     background_task_stopped: "后台任务已停止：{}",
-    background_task_ready: "后台任务已就绪：{}",
     background_task_unknown: "无法确认后台任务状态：{}",
     background_status_lost: "随后台进程中断",
     background_status_unknown: "状态未知",
@@ -2867,6 +2877,7 @@ static EN: UiText = UiText {
     running_command: "Running {}",
     reconnecting: "Model service unavailable · retry {attempt}/{max} · {secs}s",
     reconnected: "Recovered",
+    goal_recovery_activity: "Recovering the task · attempt {}/{}",
     footer_cache: "cache {}%",
     turn_rounds: "{} rounds",
     turn_tokens: "{} tokens",
@@ -3649,7 +3660,7 @@ static EN: UiText = UiText {
     theme_hc_label: "High Contrast",
     theme_hc_desc: "high-contrast dark palette",
     cancelled_continue: "cancelled — you can keep typing",
-    resumable_hint: "you can continue",
+    resumable_hint: "progress preserved · send \"continue\" to resume",
     task_cancelled: "task cancelled — it cannot be continued",
     history_omitted_turns: "{} earlier turns not shown",
     mode_plan_desc: "always ask: external writes, network, and dangerous commands",
@@ -3714,6 +3725,9 @@ static EN: UiText = UiText {
     failure_reason_label: "Reason",
     failure_retried: "Retried {n} times",
     failure_retries_label: "Retries",
+    failure_no_retry_partial_answer: "part of the answer arrived; replaying could duplicate it, so no automatic retry was attempted",
+    failure_no_retry_upstream_started: "the provider may already have started work; no automatic retry was attempted",
+    failure_no_retry_unknown_delivery: "delivery could not be established; no automatic retry was attempted to avoid duplicate work",
     turn_end_completed: "Task completed",
     turn_end_answered: "Answer finished",
     turn_end_yielded: "Window ended · goal continues",
@@ -3751,7 +3765,6 @@ static EN: UiText = UiText {
     background_task_done: "Background task finished: {}",
     background_task_failed: "Background task failed: {}",
     background_task_stopped: "Background task stopped: {}",
-    background_task_ready: "Background task ready: {}",
     background_task_unknown: "Can't confirm the background task state: {}",
     background_status_lost: "Interrupted with the background process",
     background_status_unknown: "State unknown",

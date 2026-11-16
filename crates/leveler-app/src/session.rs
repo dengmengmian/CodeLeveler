@@ -287,6 +287,64 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
     })
 }
 
+/// Upper bound on automatic Goal continuations after consecutive transient
+/// provider failures within one logical turn.
+///
+/// The budget belongs to the logical turn, which a single process owns: a
+/// daemon restart ends that turn (nothing auto-resumes it), and the user's
+/// next message is a new authorization with its own budget.
+pub(crate) const MAX_GOAL_RECOVERY_ATTEMPTS: u32 = 3;
+
+impl Application {
+    /// Whether this session currently owes an unambiguous goal that may be
+    /// continued automatically.
+    ///
+    /// Eligibility is durable identity, not a process-local flag: exactly one
+    /// running goal, and the user has not paused it. The failure that led here
+    /// is typed by the caller; this answers only "is there work to continue".
+    pub(crate) async fn goal_accepts_automatic_recovery(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<bool, AppError> {
+        let db = self.open_database().await?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let Some(task) = stores.tasks.task_for_session(session_id).await? else {
+            return Ok(false);
+        };
+        let mut running = stores
+            .goals
+            .for_task(&task)
+            .await?
+            .into_iter()
+            .filter(|goal| {
+                goal.state == leveler_storage::GoalState::Running && goal.user_paused_at.is_none()
+            });
+        let Some(goal) = running.next() else {
+            return Ok(false);
+        };
+        if running.next().is_some() {
+            return Ok(false);
+        }
+        // The window that just failed must be the one bound to this goal. A
+        // Chat turn that never joined the goal must not auto-resume an older,
+        // unrelated objective.
+        let turns = stores.turns.list_for_session(session_id).await?;
+        // The newest turn is the window that just ended. Only that window's
+        // own binding may authorize continuing THIS goal: an older bound turn
+        // must not make a later, unrelated Chat failure resume an old task.
+        let latest_bound = turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.payload.as_deref())
+            .and_then(|payload| {
+                leveler_engine::decode_turn_continuation(payload)
+                    .ok()
+                    .and_then(|lineage| lineage.goal_id)
+            });
+        Ok(latest_bound.as_ref() == Some(&goal.id))
+    }
+}
+
 pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
     match error {
         // A provider fault stays typed all the way to the app: the callers
@@ -1210,6 +1268,10 @@ impl Application {
     /// yielded with the goal still owed — and a goal that settled since is
     /// NOT reopened: the caller receives [`AppError::GoalSettled`] and must
     /// stop without publishing a terminal.
+    ///
+    /// `recovery` names a transient provider failure the runtime is
+    /// continuing from. It is injected as a runtime notice, never recorded as
+    /// a user message.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_in_session_continuation(
         &self,
@@ -1218,6 +1280,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         task_cancel: Arc<AtomicBool>,
+        recovery: Option<leveler_agent::coding::GoalRecoveryContext>,
         observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -1227,7 +1290,7 @@ impl Application {
             .await?;
         let engine = engine.with_steering(steering);
         let result = engine
-            .resume_continuation(session_id, &spec, observer, cancellation)
+            .resume_continuation(session_id, &spec, recovery.as_ref(), observer, cancellation)
             .await;
         crate::interactive::reconcile_background_evidence(self, session_id).await;
         self.memory_after_turn(session_id, &model).await;

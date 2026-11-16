@@ -164,7 +164,7 @@ pub(crate) fn registered_run<'a>(
     runs: &'a [VerificationRun],
     pending: &[PendingCommand],
     mutation_ops: u64,
-) -> Result<&'a VerificationRun, &'static str> {
+) -> Result<&'a VerificationRun, String> {
     let matches = |start: &RegisteredCheckStart| {
         start.fingerprint == check.fingerprint && start.registrations.contains(&check.registered_by)
     };
@@ -182,18 +182,23 @@ pub(crate) fn registered_run<'a>(
             matches(start) && run.is_none_or(|(previous, _)| start.order >= previous.order)
         })
     }) {
-        return Err("the registered check is still running or its outcome is unknown");
+        return Err("the registered check is still running or its outcome is unknown".to_string());
     }
-    let (start, run) =
-        run.ok_or("no matching execution started after this check was registered")?;
+    let (start, run) = run.ok_or_else(|| {
+        "no matching execution started after this check was registered".to_string()
+    })?;
     if !run.ok || run.exit_code != Some(0) {
-        return Err("the latest matching check did not pass");
+        return Err("the latest matching check did not pass".to_string());
     }
     if run.call_id.as_deref() != Some(call_id) {
-        return Err("cite the latest matching execution of this registered check");
+        return Err("cite the latest matching execution of this registered check".to_string());
     }
     if start.mutation_ops != mutation_ops || run.mutation_ops != mutation_ops {
-        return Err("the workspace changed since the registered check started");
+        return Err(format!(
+            "the workspace changed since the registered check started (version {} → {}); \
+             the check has to pass against the current workspace",
+            start.mutation_ops, mutation_ops
+        ));
     }
     Ok(run)
 }
@@ -358,11 +363,19 @@ pub(crate) fn version_refusal(run: &VerificationRun, mutation_ops: u64) -> Optio
              again against the current workspace.",
             run.label
         )),
-        VersionApplicability::Stale => Some(format!(
-            "`{}`{execution} verification expired: it passed before the most recent file change. \
-             Re-run it against the current workspace before marking the goal complete.",
-            run.label
-        )),
+        VersionApplicability::Stale => {
+            let since = mutation_ops.saturating_sub(run.mutation_ops);
+            Some(format!(
+                "`{}`{execution} verification expired: it passed at workspace version {}, and \
+                 the workspace is now at version {} ({} later change{}). Re-run it against the \
+                 current workspace before marking the goal complete.",
+                run.label,
+                run.mutation_ops,
+                mutation_ops,
+                since,
+                if since == 1 { "" } else { "s" }
+            ))
+        }
     }
 }
 
@@ -1630,6 +1643,16 @@ mod tests {
             panic!("a pass from before the file change is expired");
         };
         assert!(message.contains("verification expired"), "{message}");
+        // The refusal names the mechanical facts: which version the run judged
+        // and how far the workspace moved since. It does not invent changed
+        // paths the ledger cannot attribute to this version.
+        assert!(
+            message.contains("passed at workspace version 1"),
+            "{message}"
+        );
+        assert!(message.contains("now at version 4"), "{message}");
+        assert!(message.contains("3 later changes"), "{message}");
+        assert!(!message.contains(".rs"), "no invented path: {message}");
     }
 
     #[test]
@@ -2102,7 +2125,7 @@ mod tests {
         let runs = vec![run("go test ./...", true, 4, 1)];
         assert!(matches!(
             decide(&VerificationClaim::Passed(vec!["go test".into()]), &runs, &[], 3, true),
-            VerificationDecision::Refuse(message) if message.contains("before the most recent")
+            VerificationDecision::Refuse(message) if message.contains("verification expired")
         ));
     }
 
@@ -2123,7 +2146,7 @@ mod tests {
             true,
         ) {
             VerificationDecision::Refuse(message) => {
-                assert!(message.contains("before the most recent"), "{message}")
+                assert!(message.contains("verification expired"), "{message}")
             }
             other => panic!("a cited run from before the change is stale: {other:?}"),
         }
@@ -2447,7 +2470,7 @@ print(f'  text={len(t)}')
         let stale = vec![run(TURN_19_COMMAND, true, 21, 4)];
         assert!(matches!(
             decide(&claim, &stale, &[], 5, true),
-            VerificationDecision::Refuse(message) if message.contains("before the most recent")
+            VerificationDecision::Refuse(message) if message.contains("verification expired")
         ));
     }
 

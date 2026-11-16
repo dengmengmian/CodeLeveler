@@ -808,12 +808,11 @@ fn bookkeeping_after_the_answer_reads_the_same_live_and_replayed() {
 }
 
 /// The real session `9a1230c9` shape: the model's first closeout was refused,
-/// then accepted. The refusal stays in history, and the accepted closeout is
-/// the last goal row — live and after reopening the session. A replay must
-/// reach the same conclusion from event order, not from a flag only the live
-/// path sets.
+/// then accepted. Both attempts stay durable, but neither is a conversation
+/// row: the goal's terminal is the user-facing fact. Live and replay must
+/// agree on that.
 #[test]
-fn a_closeout_accepted_after_a_refusal_survives_history_replay() {
+fn a_closeout_accepted_after_a_refusal_is_internal_in_live_and_replay() {
     let goal = |id: &str, ok: bool, preview: &str, summary: &str| -> [RuntimeEvent; 2] {
         [
             RuntimeEvent::ToolCallStarted {
@@ -884,20 +883,11 @@ fn a_closeout_accepted_after_a_refusal_survives_history_replay() {
             .iter()
             .map(crate::selection::line_to_plain)
             .collect();
-        let refused = lines
-            .iter()
-            .position(|l| l.contains("目标未更新：用户要求的条件尚未全部满足"));
-        let accepted = lines
-            .iter()
-            .position(|l| l.contains("完成：README 追加 Verified."));
-        assert!(refused.is_some(), "{label}: the refusal stays: {lines:#?}");
         assert!(
-            accepted.is_some(),
-            "{label}: the accepted closeout is visible: {lines:#?}"
-        );
-        assert!(
-            accepted > refused,
-            "{label}: the acceptance is the last goal state: {lines:#?}"
+            !lines.iter().any(|line| line.contains("目标未更新")
+                || line.contains("目标收尾")
+                || line.contains("完成：README 追加 Verified.")),
+            "{label}: no goal control row may reach the conversation: {lines:#?}"
         );
     }
 }
@@ -1555,8 +1545,8 @@ fn background_completion_updates_the_starter_without_a_duplicate_transcript_noti
         "the starter already owns the outcome: {rows:#?}"
     );
     assert!(
-        s.notification.is_some(),
-        "the transient notification remains available"
+        s.notification.is_none(),
+        "lifecycle is not an input-area notice: the starter row and the strip state it"
     );
 
     reduce(
@@ -1654,12 +1644,11 @@ fn a_replayed_goal_declaration_reads_the_same_as_the_live_one() {
     );
 }
 
-/// A refused closeout carries its gate in the result preview. A restored
-/// session must read that tag the same way the live turn did: the same
-/// localized reason, and the runtime's model-facing account still behind the
-/// fold rather than in the body.
+/// A refused closeout carries its gate in the result preview, but the preview
+/// is model-facing control data. A restored session must not turn it into a
+/// conversation row that the live turn never showed.
 #[test]
-fn a_replayed_closeout_refusal_names_the_same_gate() {
+fn a_replayed_closeout_refusal_stays_internal() {
     let events = vec![
         RuntimeEvent::UserMessageAdded {
             message: message(UiRole::User, "把 DevOrder 全套服务起来并跑完回归"),
@@ -1719,16 +1708,11 @@ fn a_replayed_closeout_refusal_names_the_same_gate() {
         "a restored session must not describe the same refusal differently"
     );
     assert!(
-        live_rows
-            .iter()
-            .any(|row| row.contains("用户要求的条件尚未全部满足")),
-        "{live_rows:#?}"
-    );
-    assert!(
-        !live_rows
-            .iter()
-            .any(|row| row.contains("not fully accounted for") || row.contains("[goal_refused:")),
-        "model-facing prose and the tag stay out of the body: {live_rows:#?}"
+        !live_rows.iter().any(|row| row.contains("目标未更新")
+            || row.contains("用户要求的条件尚未全部满足")
+            || row.contains("not fully accounted for")
+            || row.contains("[goal_refused:")),
+        "goal control and its model-facing prose stay out of the conversation: {live_rows:#?}"
     );
 }
 

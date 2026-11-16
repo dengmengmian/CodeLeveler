@@ -404,6 +404,7 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
                     h.session.clone(),
                     stores.events.clone(),
                     None,
+                    None,
                     ports,
                     cancellation.clone(),
                 )

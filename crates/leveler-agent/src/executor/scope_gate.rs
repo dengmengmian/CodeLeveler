@@ -455,7 +455,7 @@ fn check_mechanical<'a>(
         let result = account
             .check_call_id
             .as_deref()
-            .ok_or("supply check_call_id from a run of the registered check")
+            .ok_or_else(|| "supply check_call_id from a run of the registered check".to_string())
             .and_then(|id| {
                 registered_run(check, id, facts.runs, facts.pending, facts.mutation_ops)
             });
@@ -557,9 +557,10 @@ fn check_mechanical<'a>(
                     Mechanical::Failed(pending_refusal(item, target, started))
                 }
                 RunCheck::Stale(run) => Mechanical::Failed(format!(
-                    "`{}` [command] `{target}` last passed before the most recent change \
-                     (step {}); run it against the current workspace",
-                    item.id, run.model_step
+                    "`{}` [command] `{target}` last passed at workspace version {}; the \
+                     workspace is now at version {} (step {}). Run it against the current \
+                     workspace",
+                    item.id, run.mutation_ops, facts.mutation_ops, run.model_step
                 )),
                 RunCheck::Failed(run) => Mechanical::Failed(format!(
                     "`{}` [command] `{target}` was accounted done, but its last recorded run \
@@ -611,9 +612,10 @@ fn check_mechanical<'a>(
                     Mechanical::Failed(pending_refusal(item, target, started))
                 }
                 RunCheck::Stale(run) => Mechanical::Failed(format!(
-                    "`{}` [tests] `{target}` last passed before the most recent change \
-                     (step {}); run the declared test command against the current workspace",
-                    item.id, run.model_step
+                    "`{}` [tests] `{target}` last passed at workspace version {}; the \
+                     workspace is now at version {} (step {}). Run the declared test command \
+                     against the current workspace",
+                    item.id, run.mutation_ops, facts.mutation_ops, run.model_step
                 )),
                 RunCheck::Failed(run) => Mechanical::Failed(format!(
                     "`{}` [tests] `{target}` was accounted done, but its last recorded run \
@@ -1028,7 +1030,7 @@ mod tests {
             &unknown_literal,
         );
         assert!(
-            matches!(decision, ScopeDecision::Refuse(message) if message.contains("before the most recent change"))
+            matches!(decision, ScopeDecision::Refuse(message) if message.contains("last passed at workspace version"))
         );
     }
 
@@ -1492,7 +1494,7 @@ mod tests {
             &unknown_literal,
         );
         assert!(
-            matches!(decision, ScopeDecision::Refuse(message) if message.contains("before the most recent change"))
+            matches!(decision, ScopeDecision::Refuse(message) if message.contains("last passed at workspace version"))
         );
     }
 

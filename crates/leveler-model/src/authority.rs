@@ -131,6 +131,10 @@ pub enum RuntimeNoticeKind {
     /// The session's model is told which interrupted calls the user
     /// acknowledged as outcome-unknown, and that they were not replayed.
     CrashRecovery,
+    /// The runtime is continuing an owed goal after a transient provider
+    /// failure ended the previous window. The row is a runtime fact about
+    /// where execution resumes, not a message the person wrote.
+    GoalRecovery,
     /// The task string a parent agent handed a child.
     ChildTask,
     /// Host re-pin of the active objective after a fold.
@@ -379,6 +383,7 @@ fn classify_runtime_notice(notice: RuntimeNoticeKind) -> OriginClass {
         | RuntimeNoticeKind::ChildLost
         | RuntimeNoticeKind::ChildRecovery
         | RuntimeNoticeKind::CrashRecovery
+        | RuntimeNoticeKind::GoalRecovery
         | RuntimeNoticeKind::ObjectivePin
         | RuntimeNoticeKind::GoalCheckpoint => (PromptAuthority::RuntimeFact, false),
     };

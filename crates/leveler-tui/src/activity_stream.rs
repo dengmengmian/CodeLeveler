@@ -1618,6 +1618,13 @@ fn group_duration_ms(visible: &[&ToolCallBlock]) -> Option<u64> {
 
 /// Whether a completed/running call may appear as its own Conversation unit.
 pub(crate) fn is_conversation_visible(call: &ToolCallBlock) -> bool {
+    // Goal lifecycle control is never a conversation row, whatever its status:
+    // an intermediate refusal is feedback for the model, and the goal's
+    // authoritative terminal carries the user-facing verdict. This is a
+    // semantic exclusion, not a status exception.
+    if crate::tool_taxonomy::is_goal_lifecycle_control(&call.name) {
+        return false;
+    }
     // Silent tools (exploration probes, goal bookkeeping) stay out unless they
     // failed — a failure is always user-facing.
     match activity_visibility(&call.name, &call.arguments) {
@@ -7664,29 +7671,24 @@ mod tests {
     }
 
     #[test]
-    fn update_goal_blocked_stays_visible() {
-        // blocked resolves with tool ok=true; still user-facing (stuck).
+    fn update_goal_blocked_stays_out_of_the_conversation() {
+        // A blocked window's reason is the goal terminal's fact. Repeating the
+        // control call as a tool row was the noise this removes.
         let g = group(vec![call(
             "update_goal",
             r#"{"status":"blocked","summary":"缺 API key，无法继续"}"#,
             ToolStatus::Ok,
         )]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert!(lines.iter().any(|l| l.contains("目标收尾")), "{lines:?}");
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("受阻") && l.contains("缺 API key")),
-            "{lines:?}"
-        );
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
-    /// A refused closeout: the conversation row states the gate's own reason,
-    /// and the fold hint says the runtime's account is still behind Ctrl+O.
-    /// The real dogfood caught the hint missing: the guard branch suppressed it
-    /// for every `update_goal`, so the row looked like the whole story.
+    /// A refused closeout is goal-internal control: the gate's reason is
+    /// durable, reaches the model, and is available in the log — but the
+    /// conversation does not render the call, its refusal, or a fold hint for
+    /// a row that is not there. Real work in the same group still shows.
     #[test]
-    fn a_refused_closeout_states_its_gate_and_keeps_the_fold_hint() {
+    fn a_refused_closeout_is_internal_while_real_work_stays_visible() {
         let mut refusal = call(
             "update_goal",
             r#"{"status":"complete","summary":"13 组回归全过"}"#,
@@ -7698,32 +7700,25 @@ mod tests {
              `c.txt` is not covered"
                 .into(),
         );
-        let lines = render_group_text(&group(vec![refusal.clone()]), 100, Locale::Zh);
-        let text = lines.join("\n");
         assert!(
-            text.contains("目标未更新：用户要求的条件尚未全部满足"),
-            "{text}"
+            crate::tool_cell::goal_refusal(&refusal).is_some(),
+            "the durable refusal fact is retained on the call"
+        );
+        let mut failed_command = call(
+            "run_command",
+            r#"{"program":"sh","args":["run-tests.sh"]}"#,
+            ToolStatus::Failed,
+        );
+        failed_command.preview = Some("exit: 1".into());
+        let g = group(vec![refusal, failed_command]);
+        let text = render_group_text(&g, 100, Locale::Zh).join("\n");
+        assert!(
+            !text.contains("目标收尾") && !text.contains("目标未更新"),
+            "no goal control row may reach the conversation: {text}"
         );
         assert!(
-            !text.contains("not fully accounted for") && !text.contains("goal_refused"),
-            "the model-facing account and the tag are not the row: {text}"
-        );
-        // A refused closeout names the affordance instead of a bare line count:
-        // the runtime's reason IS the point, and the person has to know it is
-        // one keypress away.
-        assert!(
-            text.contains(Locale::Zh.text().goal_refusal_expand_hint),
-            "the row must say the refusal reason is behind the fold: {text}"
-        );
-
-        // Opened, the runtime's own lines are there to read.
-        let mut g = group(vec![refusal]);
-        g.display = crate::fold::DisplayMode::Expanded;
-        let expanded = render_group_text(&g, 100, Locale::Zh).join("\n");
-        assert!(
-            expanded.contains("`b.txt` is not covered")
-                && expanded.contains("`c.txt` is not covered"),
-            "{expanded}"
+            text.contains("run-tests.sh"),
+            "the real command that failed is still shown: {text}"
         );
     }
 

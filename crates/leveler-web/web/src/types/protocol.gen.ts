@@ -191,9 +191,9 @@ export type FailureDelivery =
 export type FailureRetryability =
   /** The request provably did no provider-side work, or the provider asked to be retried: a bounded automatic retry is safe. */
   | 'safe'
-  /** The request may have reached the provider: retrying could duplicate work, so it is never automatic. */
+  /** The request may have reached the provider: a blind replay could duplicate work. The runtime's bounded model-round lifecycle may still re-request it when no answer text was delivered; this field is the stricter delivery truth a client reports. */
   | 'caution'
-  /** Delivery could not be established: never automatic, reported as unknown. */
+  /** Delivery could not be established: never blindly replayable, reported as unknown. The bounded lifecycle may still re-request when nothing was received. */
   | 'unknown'
   /** Retrying the identical request cannot help. */
   | 'never';
@@ -421,6 +421,8 @@ export type RuntimeEvent =
   | { type: 'command_progress'; elapsed_ms: number; label: string }
   /** A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the retry budget; once `attempt == max_attempts` fails the turn is surfaced, not hidden behind an unbounded wait. */
   | { type: 'model_retrying'; attempt: number; delay_ms: number; max_attempts: number }
+  /** An owed goal is being continued automatically after a transient provider failure ended the previous window. Ephemeral status: the resumed window's own events replace it, and the goal's terminal is the only outcome a client states. `attempt` is 1-based within the logical turn's recovery budget. */
+  | { type: 'goal_recovery'; attempt: number; max_attempts: number }
   /** Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome. */
   | { type: 'project_rules_loaded'; sources: string[] }
   /** A tool call started . */

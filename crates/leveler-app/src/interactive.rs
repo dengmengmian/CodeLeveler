@@ -271,6 +271,7 @@ use crate::prompt_bridge::{
     ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
     resolve_clarification, supersede_pending_approvals, validate_pending_session,
 };
+use crate::session::MAX_GOAL_RECOVERY_ATTEMPTS;
 use crate::workspace_view::{compute_diff, detect_branch_label};
 
 fn spawn_auxiliary_assist(
@@ -4855,6 +4856,11 @@ impl InProcessRuntimeClient {
                 let mut first_window = true;
                 let mut started = false;
                 let mut user_cancelled = false;
+                // A transient provider failure does not end an owed goal. The
+                // context names the typed failure for the resumed window; the
+                // count is also durable, so this is a presentation-side view.
+                let mut recovery_context: Option<leveler_agent::coding::GoalRecoveryContext> = None;
+                let mut recovery_attempts: u32 = 0;
                 loop {
                     // Each window owns its bridge: the terminal publisher is
                     // single-use. The terminal event is held in the slot so
@@ -4914,6 +4920,7 @@ impl InProcessRuntimeClient {
                                 clarifier.clone(),
                                 Some(steering.clone() as Arc<dyn leveler_agent::SteeringSource>),
                                 admission.task_cancel(),
+                                recovery_context.take(),
                                 &mut observer,
                                 cancel.clone(),
                             )
@@ -4994,6 +5001,51 @@ impl InProcessRuntimeClient {
                             break;
                         }
                         continue;
+                    }
+                    // A transient provider failure is not the end of an owed
+                    // goal. Continue the same goal from the last durable
+                    // boundary, bounded by its recorded failure streak. The
+                    // failed window's terminal stays durable, but it is not
+                    // this logical turn's outcome while the runtime is
+                    // recovering.
+                    if started
+                        && !cancel.is_cancelled()
+                        && !admission
+                            .task_cancel()
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        && recovery_attempts < MAX_GOAL_RECOVERY_ATTEMPTS
+                        && let Err(crate::AppError::Model(error)) = &result
+                        && leveler_agent::coding::task_outcome_is_resumable(
+                            leveler_lifecycle::TaskOutcome::Failed,
+                            None,
+                            Some(error),
+                        )
+                    {
+                        match app.goal_accepts_automatic_recovery(&session_id).await {
+                            Ok(true) => {
+                                recovery_attempts = recovery_attempts.saturating_add(1);
+                                let attempt = recovery_attempts;
+                                let _ = events.send(RuntimeEvent::GoalRecovery {
+                                    attempt,
+                                    max_attempts: MAX_GOAL_RECOVERY_ATTEMPTS,
+                                });
+                                recovery_context =
+                                    Some(leveler_agent::coding::GoalRecoveryContext {
+                                        attempt,
+                                        max_attempts: MAX_GOAL_RECOVERY_ATTEMPTS,
+                                        failure: error.clone(),
+                                    });
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "goal recovery eligibility could not be read; the failure is \
+                                     published instead"
+                                );
+                            }
+                        }
                     }
                     // A cancel is the user saying stop: pending text is not
                     // delivered as a new turn. Every other ending owes the
@@ -6340,75 +6392,159 @@ impl InProcessRuntimeClient {
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 emit_project_rules(&events, repo.as_deref());
-                let terminal_active = active.clone();
-                let terminal_admission = admission.clone();
-                let terminal_events = events.clone();
-                let mut bridge = EventBridge::new(events.clone())
-                    .with_progress(active.clone(), session_id.clone())
-                    .with_terminal_publisher(move |event| {
-                        terminal_active.finish_with(&terminal_admission, || {
-                            let _ = terminal_events.send(event);
-                        });
-                    });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
-                let observer_acceptance = accepted_tx.clone();
-                let result = {
-                    let mut observer = |event: leveler_engine::EngineEvent| {
-                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
-                            && let Some(tx) = observer_acceptance
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take()
-                        {
-                            let _ = tx.send(Ok(()));
-                            hit_after_turn_started_test_barrier();
+                let mut first_window = true;
+                let mut started = false;
+                let mut user_cancelled = false;
+                let mut parts = Some(parts);
+                let mut recovery_context: Option<leveler_agent::coding::GoalRecoveryContext> = None;
+                let mut recovery_attempts: u32 = 0;
+                loop {
+                    // Each window owns its bridge and terminal slot: an
+                    // intermediate failure is durable but not this logical
+                    // turn's outcome when the runtime recovers it.
+                    let terminal: Arc<Mutex<Option<RuntimeEvent>>> = Arc::new(Mutex::new(None));
+                    let mut bridge = EventBridge::new(events.clone())
+                        .with_progress(active.clone(), session_id.clone())
+                        .with_terminal_publisher({
+                            let terminal = terminal.clone();
+                            move |event| {
+                                *terminal
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(event);
+                            }
+                        });
+                    let observer_acceptance = accepted_tx.clone();
+                    let result = {
+                        let mut observer = |event: leveler_engine::EngineEvent| {
+                            if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                                && let Some(tx) = observer_acceptance
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take()
+                            {
+                                let _ = tx.send(Ok(()));
+                                hit_after_turn_started_test_barrier();
+                            }
+                            bridge.forward(event);
+                        };
+                        if first_window {
+                            app.run_in_session_with_content(
+                                &session_id,
+                                &model,
+                                mode,
+                                parts.take().unwrap_or_default(),
+                                origin.clone(),
+                                approver.clone(),
+                                clarifier.clone(),
+                                sandbox,
+                                Some(steering.clone() as Arc<dyn leveler_agent::SteeringSource>),
+                                admission.task_cancel(),
+                                &mut observer,
+                                cancel.clone(),
+                            )
+                            .await
+                        } else {
+                            app.resume_in_session_continuation(
+                                &session_id,
+                                approver.clone(),
+                                clarifier.clone(),
+                                Some(steering.clone() as Arc<dyn leveler_agent::SteeringSource>),
+                                admission.task_cancel(),
+                                recovery_context.take(),
+                                &mut observer,
+                                cancel.clone(),
+                            )
+                            .await
                         }
-                        bridge.forward(event);
                     };
-                    app.run_in_session_with_content(
-                        &session_id,
-                        &model,
-                        mode,
-                        parts,
-                        origin,
-                        approver,
-                        clarifier,
-                        sandbox,
-                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
-                        admission.task_cancel(),
-                        &mut observer,
-                        cancel,
-                    )
-                    .await
-                };
-                // `TurnStarted` is the only consumer of the acceptance
-                // sender. Still holding it after the turn returned means the
-                // turn never reached durable admission.
-                let started = {
-                    let mut slot = accepted_tx
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match slot.take() {
-                        Some(tx) => {
-                            let _ = tx.send(Err(turn_rejection(&result)));
-                            false
-                        }
-                        None => true,
+                    if first_window {
+                        first_window = false;
+                        // `TurnStarted` is the only consumer of the acceptance
+                        // sender. Still holding it after the turn returned
+                        // means the turn never reached durable admission.
+                        started = {
+                            let mut slot = accepted_tx
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match slot.take() {
+                                Some(tx) => {
+                                    let _ = tx.send(Err(turn_rejection(&result)));
+                                    false
+                                }
+                                None => true,
+                            }
+                        };
                     }
-                };
-                // A cancel is the user saying stop: pending text is not
-                // delivered as a new turn. Every other ending owes the person
-                // an answer to what they typed.
-                let user_cancelled = matches!(
-                    &result,
-                    Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
-                );
-                if !bridge.terminal_published() {
-                    active.finish_with(&admission, || {
-                        let _ = events.send(turn_runtime_event(result));
+                    let terminal = terminal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    // A cancel is the user saying stop: pending text is not
+                    // delivered as a new turn. Every other ending owes the
+                    // person an answer to what they typed.
+                    user_cancelled = user_cancelled
+                        || matches!(
+                            &result,
+                            Err(crate::AppError::Agent(leveler_agent::AgentError::Cancelled))
+                        );
+                    if matches!(&result, Err(crate::AppError::GoalSettled(_))) {
+                        active.finish(&admission);
+                        break;
+                    }
+                    // A Chat turn can have bound a goal mid-flight. A
+                    // transient provider failure then leaves that goal owed:
+                    // continue it, bounded, without a fabricated user input.
+                    if started
+                        && !cancel.is_cancelled()
+                        && !admission
+                            .task_cancel()
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        && recovery_attempts < MAX_GOAL_RECOVERY_ATTEMPTS
+                        && let Err(crate::AppError::Model(error)) = &result
+                        && leveler_agent::coding::task_outcome_is_resumable(
+                            leveler_lifecycle::TaskOutcome::Failed,
+                            None,
+                            Some(error),
+                        )
+                    {
+                        match app.goal_accepts_automatic_recovery(&session_id).await {
+                            Ok(true) => {
+                                recovery_attempts = recovery_attempts.saturating_add(1);
+                                let attempt = recovery_attempts;
+                                let _ = events.send(RuntimeEvent::GoalRecovery {
+                                    attempt,
+                                    max_attempts: MAX_GOAL_RECOVERY_ATTEMPTS,
+                                });
+                                recovery_context =
+                                    Some(leveler_agent::coding::GoalRecoveryContext {
+                                        attempt,
+                                        max_attempts: MAX_GOAL_RECOVERY_ATTEMPTS,
+                                        failure: error.clone(),
+                                    });
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "goal recovery eligibility could not be read; the failure is \
+                                     published instead"
+                                );
+                            }
+                        }
+                    }
+                    // TaskFinished is the normal path's one terminal authority.
+                    active.finish_with(&admission, || match terminal {
+                        Some(event) => {
+                            let _ = events.send(event);
+                        }
+                        None => {
+                            let _ = events.send(turn_runtime_event(result));
+                        }
                     });
-                } else {
-                    active.finish(&admission);
+                    break;
                 }
                 // A turn can end the session's Goal route (a final goal
                 // terminal, or a `commit_task` goal that has now settled).

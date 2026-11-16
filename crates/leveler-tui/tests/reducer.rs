@@ -1893,6 +1893,138 @@ fn an_exhausted_failure_states_how_many_retries_were_spent() {
     );
 }
 
+/// A retry that was deliberately withheld says why, from the typed
+/// retryability/delivery facts — never by parsing the provider's text. The
+/// original failure had already delivered answer text, so replaying it could
+/// duplicate content the person already saw.
+#[test]
+fn a_withheld_automatic_retry_states_the_typed_reason() {
+    use leveler_client_protocol::{
+        FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+    };
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "stream interrupted".into(),
+            failure: Some(UiFailure {
+                category: FailureCategory::Network,
+                source: FailureSource::Provider,
+                provider: Some("deepseek".into()),
+                model: None,
+                provider_code: None,
+                request_id: None,
+                status: None,
+                retries: None,
+                retryability: FailureRetryability::Caution,
+                delivery: FailureDelivery::StreamInterrupted {
+                    text: true,
+                    tool_args: true,
+                },
+                summary: "模型连接中断。".into(),
+                detail: "stream interrupted".into(),
+            }),
+            recovery: None,
+        }),
+    );
+    let failure = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Failure(f) => Some(f),
+            _ => None,
+        })
+        .expect("a failure block");
+    let subtitle = failure.subtitle.clone().unwrap_or_default();
+    assert!(
+        subtitle.contains("已收到部分回答") && subtitle.contains("未自动重试"),
+        "the withheld retry is explained: {subtitle}"
+    );
+    assert!(
+        subtitle.contains("进度已保留") && subtitle.contains("发送「继续」"),
+        "a resumable failure states what survives and how to continue: {subtitle}"
+    );
+}
+
+/// A permanent failure must not promise a continuation that does not exist.
+#[test]
+fn a_permanent_failure_does_not_offer_a_continue_hint() {
+    use leveler_client_protocol::{
+        FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+    };
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "invalid api key".into(),
+            failure: Some(UiFailure {
+                category: FailureCategory::Authentication,
+                source: FailureSource::Provider,
+                provider: Some("deepseek".into()),
+                model: None,
+                provider_code: None,
+                request_id: None,
+                status: Some(401),
+                retries: None,
+                retryability: FailureRetryability::Never,
+                delivery: FailureDelivery::Responded,
+                summary: "鉴权失败。".into(),
+                detail: "invalid api key".into(),
+            }),
+            recovery: None,
+        }),
+    );
+    let failure = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Failure(f) => Some(f),
+            _ => None,
+        })
+        .expect("a failure block");
+    let subtitle = failure.subtitle.clone().unwrap_or_default();
+    assert!(
+        !subtitle.contains("继续") && !subtitle.contains("未自动重试"),
+        "an auth failure needs the user's key fix, not a retry explanation: {subtitle}"
+    );
+}
+
+/// Automatic Goal recovery is live status, not a terminal failure: the person
+/// sees the runtime continuing an owed goal, and no failure card is minted for
+/// the window that ended.
+#[test]
+fn goal_recovery_is_live_status_not_a_failure_card() {
+    let mut s = state();
+    s.status = RuntimeStatus::Busy;
+    s.goal_mode_active = true;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::GoalRecovery {
+            attempt: 2,
+            max_attempts: 3,
+        }),
+    );
+    assert!(
+        s.activity
+            .as_deref()
+            .is_some_and(|label| label.contains("正在恢复任务") && label.contains("2/3")),
+        "{:?}",
+        s.activity
+    );
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Failure(_))),
+        "recovery must not show a final failure"
+    );
+    let screen = rendered(&mut s, 100, 24);
+    assert!(screen.contains("正在恢复任务"), "{screen}");
+    assert!(!screen.contains("请求失败"), "{screen}");
+}
+
 #[test]
 fn a_local_configuration_failure_is_a_continuation_point_not_a_dead_task() {
     use leveler_client_protocol::{
@@ -6466,21 +6598,21 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
             output: String::new(),
         }),
     );
-    let note = s
-        .notification
-        .as_ref()
-        .expect("a successful exit posts its completion notice");
     assert!(
-        note.message.contains("cargo test"),
-        "the RIGHT task settled: {}",
-        note.message
+        s.notification.is_none(),
+        "a terminal is a record on the task's own row, never an input-area notice"
     );
-    assert!(
-        !note.message.contains("npm"),
-        "the other task is untouched: {}",
-        note.message
-    );
-    assert!(!note.message.contains("bg-7f3a"), "{}", note.message);
+    let noted = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Note(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!noted.contains("bg-7f3a"), "no opaque id: {noted}");
     assert!(
         s.background_task_labels
             .get("bg-7f3a")
@@ -6562,7 +6694,19 @@ fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
             output: String::new(),
         }),
     );
-    let msg = s.notification.as_ref().unwrap().message.clone();
+    assert!(
+        s.notification.is_none(),
+        "a lifecycle terminal never raises an input-area notice"
+    );
+    let msg = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Note(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("a task with no row of its own leaves a conversation record");
     assert!(!msg.contains("bg-unknown"), "{msg}");
     assert!(msg.contains("后台任务"), "generic but truthful: {msg}");
 }
