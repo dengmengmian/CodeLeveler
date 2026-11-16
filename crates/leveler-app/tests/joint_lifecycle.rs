@@ -1181,6 +1181,14 @@ async fn a_late_old_window_terminal_does_not_rewrite_the_running_window() {
     release.notify_one();
     settled(&f, 2).await;
     wait_for_goal_state(&f, GoalState::Settled).await;
+    // The session stream publishes the running window's terminal
+    // asynchronously of the durable settlement above. Wait for it before
+    // stopping the collector; otherwise this read races the stop and a loaded
+    // runner observes zero terminals instead of the one under test.
+    wait_seen(&seen, |events| {
+        events.iter().any(is_turn_terminal).then_some(())
+    })
+    .await;
     let _ = stop_tx.send(());
     let _ = collector.await;
 
