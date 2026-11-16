@@ -59,8 +59,15 @@ class Proxy(ThreadingHTTPServer):
         self.upstream_path = parsed.path.rstrip("/")
         self.https = parsed.scheme == "https"
         self.fault_armed = True
+        self.fault_mode = "stream"
         self.cuts = 0
+        self.goal_faults = 0
+        self.agent_requests = 0
         self.requests = 0
+        # Optional barrier for a harness that needs the second agent request
+        # (the recovery window) held open while it drives real UI actions.
+        self.held = threading.Event()
+        self.hold_release: threading.Event | None = None
         self.request_bodies: list[bytes] = []
         super().__init__(("127.0.0.1", 0), Handler)
         self.port = self.server_address[1]
@@ -78,6 +85,34 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         proxy.requests += 1
         proxy.request_bodies.append(body)
+
+        if b'"tools"' in body:
+            proxy.agent_requests += 1
+            if proxy.agent_requests == 2 and proxy.hold_release is not None:
+                proxy.held.set()
+                proxy.hold_release.wait(180)
+        if (
+            proxy.fault_armed
+            and proxy.fault_mode == "goal"
+            and b'"tools"' in body
+        ):
+            # A complete provider answer, not a transport cut: the model round
+            # has nothing to retry (the provider responded), so only the GOAL
+            # lifecycle can continue the task. This is the Goal-level fault a
+            # request-level retry must not be confused with.
+            proxy.fault_armed = False
+            proxy.goal_faults += 1
+            data = json.dumps({"error": {"message": "gateway timeout"}}).encode()
+            self.send_response(504)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except Exception:
+                pass
+            return
 
         headers = {
             key: value
@@ -169,6 +204,13 @@ def rows(home: str, sql: str):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", choices=["real"], default="real")
+    parser.add_argument(
+        "--fault",
+        choices=["stream", "goal"],
+        default="stream",
+        help="stream: cut an SSE tool-argument stream (request-level recovery). "
+        "goal: answer the first agent request with HTTP 504 (Goal-level recovery).",
+    )
     args = parser.parse_args()
     os.makedirs(EVIDENCE, exist_ok=True)
 
@@ -177,6 +219,7 @@ def main() -> int:
     if upstream is None:
         raise SystemExit("the machine config names no provider base_url")
     proxy = Proxy(upstream.group(1))
+    proxy.fault_mode = args.fault
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
 
     env = H.Env("real", None)
@@ -185,12 +228,21 @@ def main() -> int:
         fh.write("#!/bin/sh\necho VERIFY-OK\nexit 0\n")
     patch_config(home, proxy.port)
 
-    report = H.Report("goal-fault-real")
+    report = H.Report("goal-fault-real" if args.fault == "stream" else "goal-fault-real-goal")
     pty_ = H.boot(report, env, 120, 44)
+    if args.fault == "goal":
+        PROMPT_TEXT = "/goal " + PROMPT
+    else:
+        PROMPT_TEXT = PROMPT
     try:
-        pty_.write(PROMPT)
+        pty_.write(PROMPT_TEXT)
         time.sleep(0.2)
         pty_.key("\r")
+        recovery_status = False
+        if args.fault == "goal":
+            recovery_status = H.wait_until(
+                pty_, lambda text: "正在恢复任务" in text, timeout=90
+            )
         done = H.wait_until(
             pty_,
             lambda text: "任务已完成" in text or "目标已完成" in text or "已完成" in text,
@@ -199,6 +251,83 @@ def main() -> int:
         pty_.wait_stable(2.0, 60)
         report.dump("fault-model-round", pty_)
         screen = pty_.screen.text()
+        if args.fault == "goal":
+            attempts = rows(
+                home,
+                "SELECT turn_id, error_kind, retry_count FROM model_requests "
+                "WHERE turn_id IS NOT NULL",
+            )
+            report.check(
+                "goal-fault",
+                "the runtime opened a Goal recovery window after the 504",
+                proxy.goal_faults == 1,
+                str(proxy.goal_faults),
+            )
+            report.check(
+                "goal-fault",
+                "the 504 was one provider attempt with NO request-level retry",
+                sum(
+                    1
+                    for row in attempts
+                    if row["error_kind"] == "provider_unavailable"
+                )
+                == 1
+                and all(
+                    row["retry_count"] == 0
+                    for row in attempts
+                    if row["error_kind"] == "provider_unavailable"
+                ),
+                repr(attempts[:8]),
+            )
+            report.check(
+                "goal-fault",
+                "the recovery status is shown while the continuation runs",
+                recovery_status,
+                pty_.screen.text()[-600:],
+            )
+            turns = rows(home, "SELECT id, payload FROM turns ORDER BY ordinal")
+            report.check(
+                "goal-fault",
+                "the recovery is a continuation of the same goal, not a new task",
+                len(turns) >= 2
+                and all(
+                    (json.loads(row["payload"] or "{}").get("goal_id")
+                     == json.loads(turns[0]["payload"] or "{}").get("goal_id"))
+                    for row in turns
+                ),
+                repr([row["id"] for row in turns]),
+            )
+            report.check(
+                "goal-fault",
+                "the task completed without the user typing 继续",
+                done and os.path.exists(os.path.join(repo, "recover-probe.txt")),
+                screen[-900:],
+            )
+            user_inputs = rows(
+                home,
+                "SELECT count(*) AS n FROM session_messages WHERE payload LIKE '%user_input%'",
+            )
+            report.check(
+                "goal-fault",
+                "the user sent one message only (no manual continue)",
+                bool(user_inputs) and user_inputs[0]["n"] == 1,
+                repr(user_inputs),
+            )
+            report.check(
+                "goal-fault",
+                "no failure card survived the recovery",
+                "请求失败" not in screen,
+                screen[-900:],
+            )
+            report.check(
+                "goal-fault",
+                "no goal-control row reached the conversation",
+                "目标收尾" not in screen and "目标未更新" not in screen,
+                screen[-900:],
+            )
+            report.save()
+            print("assertions: %d, failures: %d" % (len(report.results), report.failures))
+            return 0 if report.failures == 0 else 1
         report.check("fault", "the provider stream really was truncated", proxy.cuts == 1, str(proxy.cuts))
         report.check(
             "fault",

@@ -8,12 +8,39 @@ use serde::{Deserialize, Serialize};
 use crate::findings::{FindingKind, FindingRecord};
 use crate::plan::PlanState;
 
+/// How completely one mutation op's changed paths are known.
+///
+/// The workspace version exists to answer "did the tree move since this check
+/// passed?". A record whose paths are unknown cannot answer "no": it must
+/// invalidate exactly like a known change, otherwise an unobserved write would
+/// silently pass a stale check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationScope {
+    /// The execution reported the complete set of paths it changed.
+    #[default]
+    Known,
+    /// The execution ran with write authority but its changed paths could not
+    /// be observed. The version advances; the path set is honestly unknown.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationRecord {
     pub seq: u64,
     pub tool_call_id: String,
     pub tool: String,
     pub paths: Vec<String>,
+    /// Whether `paths` is the complete changed set. Older records predate the
+    /// field and are known-path records.
+    #[serde(default)]
+    pub scope: MutationScope,
+    /// The workspace version this op advanced the tree to. It is the link
+    /// between "a mutation happened" and "which version observed it": the
+    /// sequence number is independent of `total_mutation_ops`, so it cannot
+    /// answer that question on its own. Older records predate the field (0).
+    #[serde(default)]
+    pub mutation_ops: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +113,43 @@ impl EvidenceLedger {
             tool_call_id: tool_call_id.into(),
             tool: tool.into(),
             paths,
+            scope: MutationScope::Known,
+            mutation_ops: self.total_mutation_ops,
         });
+    }
+
+    /// Record one mutating execution whose changed paths could not be
+    /// observed. The tree may have moved; the version must advance so no
+    /// earlier verification can claim the current tree.
+    ///
+    /// Returns whether a new record was written. The same execution identity
+    /// is recorded once: a repeated completion attempt must not inflate the
+    /// version it is judging against.
+    pub fn record_unknown_mutation(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        tool: impl Into<String>,
+    ) -> bool {
+        let tool_call_id = tool_call_id.into();
+        let tool = tool.into();
+        if self
+            .mutations
+            .iter()
+            .any(|record| record.tool == tool && record.tool_call_id == tool_call_id)
+        {
+            return false;
+        }
+        self.note_mutation_op();
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.mutations.push(MutationRecord {
+            seq: self.next_seq,
+            tool_call_id,
+            tool,
+            paths: Vec::new(),
+            scope: MutationScope::Unknown,
+            mutation_ops: self.total_mutation_ops,
+        });
+        true
     }
 
     pub fn record_intercept(&mut self, kind: impl Into<String>, detail: impl Into<String>) {
@@ -184,5 +247,46 @@ mod finding_tests {
         let mut led = EvidenceLedger::default();
         led.record_finding(FindingKind::Correctness, "looks wrong", None, None);
         assert_eq!(led.findings.len(), 1);
+    }
+
+    /// "Could not observe the change" is not "did not change". The version
+    /// must advance exactly like a known mutation, once per execution identity,
+    /// and the record must say its paths are unknown rather than empty-because-
+    /// nothing-new.
+    #[test]
+    fn an_unobservable_mutation_advances_the_version_once() {
+        let mut led = EvidenceLedger::default();
+        assert!(led.record_unknown_mutation("call-1", "shell_command"));
+        assert_eq!(led.total_mutation_ops, 1);
+        assert_eq!(led.mutations.len(), 1);
+        assert_eq!(led.mutations[0].scope, MutationScope::Unknown);
+        assert!(led.mutations[0].paths.is_empty());
+        assert_eq!(led.last_mutation_seq(), led.mutations[0].seq);
+
+        // A repeated completion attempt judges the same execution; it must not
+        // inflate the version against itself.
+        assert!(!led.record_unknown_mutation("call-1", "shell_command"));
+        assert_eq!(led.total_mutation_ops, 1);
+        assert_eq!(led.mutations.len(), 1);
+
+        // The same id from a different tool is a different execution.
+        assert!(led.record_unknown_mutation("call-1", "run_command"));
+        assert_eq!(led.total_mutation_ops, 2);
+    }
+
+    /// A known-path record stays `Known`, and pre-field snapshots replay as
+    /// known records.
+    #[test]
+    fn mutation_scope_survives_replay_and_defaults_to_known() {
+        let mut led = EvidenceLedger::default();
+        led.record_mutation("call-1", "apply_patch", vec!["src/lib.rs".into()]);
+        assert_eq!(led.mutations[0].scope, MutationScope::Known);
+
+        let legacy: EvidenceLedger = serde_json::from_str(
+            r#"{"plan":{"steps":[]},"mutations":[{"seq":1,"tool_call_id":"c","tool":"t","paths":["a"]}],
+                "intercepts":[],"next_seq":1}"#,
+        )
+        .expect("a snapshot without the scope field still replays");
+        assert_eq!(legacy.mutations[0].scope, MutationScope::Known);
     }
 }

@@ -760,6 +760,149 @@ mod tests {
         assert!(!kept.priority);
     }
 
+    /// J15: two clients acting on the SAME pending row cannot both win. The
+    /// database compares the revision in the UPDATE itself, so the loser sees
+    /// a durable state that is exactly one of the two outcomes — never a torn
+    /// row (cancelled with a saved body, or saved while the withdraw reported
+    /// success).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_begin_edit_and_withdrawal_have_one_winner() {
+        for attempt in 0..40 {
+            let db = Database::connect_in_memory().await.unwrap();
+            let session_id = session(&db).await;
+            let repo = SessionInputRepository::new(&db);
+            let now = leveler_core::now();
+            repo.admit("same", &session_id, None, "原文", now)
+                .await
+                .unwrap();
+            let lease = format!("b606db24-c8d0-486e-a1c7-{attempt:012}");
+
+            let edits = repo.mutate(
+                &session_id,
+                "same",
+                0,
+                SessionInputMutation::BeginEdit {
+                    lease_id: &lease,
+                    expires_ms: now.timestamp_millis() + 60_000,
+                },
+                now,
+            );
+            let withdraw = repo.mutate(&session_id, "same", 0, SessionInputMutation::Withdraw, now);
+            let (edit, withdraw) = tokio::join!(edits, withdraw);
+            let edit = edit.unwrap();
+            let withdraw = withdraw.unwrap();
+            assert!(
+                edit.is_some() != withdraw.is_some(),
+                "attempt {attempt}: exactly one mutation may win: {edit:?} / {withdraw:?}"
+            );
+            let row = repo.load(&session_id, "same").await.unwrap().unwrap();
+            if withdraw.is_some() {
+                assert_eq!(row.state, SessionInputState::Cancelled, "attempt {attempt}");
+                assert!(row.edit_expires_ms.is_none());
+                assert_eq!(row.content, "原文");
+            } else {
+                assert_eq!(row.state, SessionInputState::Pending, "attempt {attempt}");
+                assert!(row.editing_at(now));
+                assert_eq!(row.content, "原文");
+            }
+        }
+    }
+
+    /// J15: acceleration and withdrawal serialize on the same row. Whichever
+    /// order the two land in, a cancelled instruction never becomes
+    /// deliverable and a prioritized one is still exactly one row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_prioritize_and_withdrawal_leave_one_truthful_row() {
+        for attempt in 0..40 {
+            let db = Database::connect_in_memory().await.unwrap();
+            let session_id = session(&db).await;
+            let repo = SessionInputRepository::new(&db);
+            let now = leveler_core::now();
+            repo.admit("same", &session_id, None, "原文", now)
+                .await
+                .unwrap();
+            let accelerate = repo.prioritize(&session_id, &["same"]);
+            let withdraw = repo.mutate(&session_id, "same", 0, SessionInputMutation::Withdraw, now);
+            let (accelerate, withdraw) = tokio::join!(accelerate, withdraw);
+            accelerate.unwrap();
+            withdraw.unwrap();
+            let row = repo.load(&session_id, "same").await.unwrap().unwrap();
+            assert_eq!(row.state, SessionInputState::Cancelled, "attempt {attempt}");
+            assert_eq!(row.content, "原文");
+            assert!(
+                repo.prioritize(&session_id, &["same"])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "attempt {attempt}: a cancelled row cannot be accelerated"
+            );
+            assert!(repo.pending(&session_id).await.unwrap().is_empty());
+        }
+    }
+
+    /// J15: a save must match the active lease, and an expired lease frees the
+    /// row for withdrawal. Neither operation can leave a cancelled row with a
+    /// saved body, nor a live row whose lease survived an accepted save.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_save_and_withdrawal_is_atomic_on_the_lease() {
+        for attempt in 0..40 {
+            let db = Database::connect_in_memory().await.unwrap();
+            let session_id = session(&db).await;
+            let repo = SessionInputRepository::new(&db);
+            let now = leveler_core::now();
+            repo.admit("same", &session_id, None, "原文", now)
+                .await
+                .unwrap();
+            let lease = format!("726cbd12-8acb-4959-b0af-{attempt:012}");
+            repo.mutate(
+                &session_id,
+                "same",
+                0,
+                SessionInputMutation::BeginEdit {
+                    lease_id: &lease,
+                    expires_ms: now.timestamp_millis() + 5,
+                },
+                now,
+            )
+            .await
+            .unwrap()
+            .expect("the lease is taken");
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            let later = leveler_core::now();
+            let save = repo.mutate(
+                &session_id,
+                "same",
+                1,
+                SessionInputMutation::SaveEdit {
+                    lease_id: &lease,
+                    content: "保存",
+                },
+                later,
+            );
+            let withdraw = repo.mutate(
+                &session_id,
+                "same",
+                1,
+                SessionInputMutation::Withdraw,
+                later,
+            );
+            let (save, withdraw) = tokio::join!(save, withdraw);
+            let save = save.unwrap();
+            let withdraw = withdraw.unwrap();
+            let row = repo.load(&session_id, "same").await.unwrap().unwrap();
+            if save.is_some() {
+                assert_eq!(row.state, SessionInputState::Pending, "attempt {attempt}");
+                assert_eq!(row.content, "保存");
+                assert!(row.edit_expires_ms.is_none());
+                assert!(withdraw.is_none(), "attempt {attempt}");
+            } else {
+                assert_eq!(row.state, SessionInputState::Cancelled, "attempt {attempt}");
+                assert_eq!(row.content, "原文");
+                assert!(withdraw.is_some(), "attempt {attempt}");
+            }
+        }
+    }
+
     /// A database that stopped at the original input journal still opens.
     /// Pending rows gain a zero revision and keep their admitting turn.
     #[tokio::test]

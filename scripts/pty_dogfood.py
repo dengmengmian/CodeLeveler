@@ -500,6 +500,20 @@ class MockProvider:
                     except Exception:
                         pass
                     return
+                if isinstance(frames, dict):
+                    # A fault turn: the provider answered with a complete
+                    # non-2xx status. No SSE body, no model output.
+                    data = str(frames.get("body", "")).encode()
+                    self.send_response(int(frames.get("status", 500)))
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(data)))
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except Exception:
+                        pass
+                    return
                 payload = "".join(
                     "data: %s\n\n" % frame for frame in frames
                 ) + "data: [DONE]\n\n"
@@ -588,6 +602,10 @@ def tool_turn(name: str, arguments: str) -> list[str]:
         ),
         json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
     ]
+
+
+def status_turn(code: int, message: str) -> dict:
+    return {"status": code, "body": json.dumps({"error": {"message": message}})}
 
 
 def text_turn(text: str) -> list[str]:

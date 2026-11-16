@@ -60,6 +60,14 @@ pub(crate) struct CommandFacts {
     /// The tool's prose names the id too, but only this record is complete
     /// enough to survive the registry: the argv and the promised lifetime.
     pub started_background: Option<BackgroundStartFacts>,
+    /// Whether this command's file writes were observable.
+    ///
+    /// `Some(false)` means the execution had write authority but no baseline or
+    /// diff was available, so its changed paths are unknown. That is NOT the
+    /// same fact as "it changed nothing": the ledger must advance the workspace
+    /// version for it, or a completion could cite a check that predates an
+    /// unobserved write.
+    pub mutation_tracking_unknown: bool,
 }
 
 /// A background task a tool call started, as its spawn metadata reported it.
@@ -189,6 +197,10 @@ pub(crate) fn extract_command_facts(metadata: &serde_json::Value) -> CommandFact
             .map(str::to_string),
         started_task,
         started_background,
+        mutation_tracking_unknown: metadata
+            .get("mutation_tracking")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown"),
     }
 }
 
@@ -377,6 +389,30 @@ pub(crate) fn note_tool_side_effects(
     // The ledger mirrors the drive's live plan. A drive whose in-memory plan
     // is still empty must not erase a plan the turn was seeded with: the plan
     // is only ever replaced by a real declaration, never by "nothing yet".
+    if !plan_state.is_empty() {
+        ledger.plan = plan_state.clone();
+    }
+    observer(AgentEvent::EvidenceLedgerUpdated {
+        ledger: ledger.clone(),
+    });
+}
+
+/// Record an execution that may have changed the workspace but whose changed
+/// paths could not be observed.
+///
+/// The version advances exactly like a known mutation — an unknown change is
+/// not "no change" — and the record keeps the paths empty with an explicit
+/// unknown scope so a reader never mistakes it for a first-touch delta.
+pub(crate) fn note_unknown_side_effects(
+    ledger: &mut EvidenceLedger,
+    tool_call_id: &str,
+    tool: &str,
+    plan_state: &PlanState,
+    observer: &mut (dyn FnMut(AgentEvent) + Send),
+) {
+    if !ledger.record_unknown_mutation(tool_call_id, tool) {
+        return;
+    }
     if !plan_state.is_empty() {
         ledger.plan = plan_state.clone();
     }

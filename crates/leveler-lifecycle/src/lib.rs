@@ -63,7 +63,7 @@ pub use checkpoint::{
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint, MAX_EXECUTION_EVIDENCE,
 };
 pub use findings::{ChildResultProjection, ChildStatus, FindingKind, FindingRecord};
-pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord};
+pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord, MutationScope};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{ABANDONED, PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};

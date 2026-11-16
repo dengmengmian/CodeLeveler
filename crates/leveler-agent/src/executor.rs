@@ -62,12 +62,50 @@ pub trait CompactionCheckpoint: Send + Sync {
 /// log; the drive owns when a mid-turn binding needs them. Splitting those two
 /// responsibilities here keeps the reconstruction in one place instead of
 /// teaching the executor storage layout.
+/// What a durable lookup found for one cited tool-call id.
+#[derive(Debug, Clone)]
+pub enum DurableCall {
+    /// An execution record of this goal (possibly outside the bounded live
+    /// citation window).
+    Run(crate::executor::goal_verification::VerificationRun),
+    /// A started command of this goal whose result has not been observed.
+    Pending(crate::executor::goal_verification::PendingCommand),
+    /// The call exists in this session but under another turn lineage, so it
+    /// cannot vouch for this goal.
+    OtherLineage,
+    /// No durable record of this call exists in the session.
+    Missing,
+}
+
+/// The durable answer for a batch of cited call ids.
+#[derive(Debug, Default)]
+pub struct DurableCalls {
+    /// One classification per requested id (ids absent here are unknown to the
+    /// source and stay unresolved).
+    pub resolved: std::collections::HashMap<String, DurableCall>,
+    /// Every durable run of the same command as a resolved cited run, in
+    /// durable order. The gate's "a later run of this command failed" check
+    /// must see that history even when it lies outside the bounded live window.
+    pub related_runs: Vec<crate::executor::goal_verification::VerificationRun>,
+}
+
 #[async_trait]
 pub trait GoalVerificationSource: Send + Sync {
     async fn load(
         &self,
         goal: &leveler_core::GoalId,
     ) -> Result<crate::executor::goal_verification::VerificationFacts, String>;
+
+    /// Resolve cited call ids against the durable record.
+    ///
+    /// The live ledger is bounded (it keeps the newest runs), but the event log
+    /// is the authority. A citation older than the live window must resolve to
+    /// its real execution, not to a fabricated "never ran".
+    async fn load_calls(
+        &self,
+        goal: &leveler_core::GoalId,
+        call_ids: &[String],
+    ) -> Result<DurableCalls, String>;
 }
 
 /// Skills the user named on this turn, plus the injection text.

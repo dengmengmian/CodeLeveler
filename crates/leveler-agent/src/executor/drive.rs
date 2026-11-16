@@ -1495,7 +1495,23 @@ impl<'a> Drive<'a> {
                         push_unique_path(&mut self.scoped_paths, &path);
                     }
                 }
-                Ok(_) => {}
+                // A completed diff that found nothing is a real observation:
+                // the task changed nothing. Only "no baseline / no
+                // observation" is unknown.
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    // Active with no observable baseline: the task holds write
+                    // authority and its change set is unknown. Advance the
+                    // version once for this execution; "unobservable" is not
+                    // "unchanged".
+                    super::dispatch::note_unknown_side_effects(
+                        &mut self.ledger,
+                        &key,
+                        "background_task_live",
+                        &self.plan_state,
+                        &mut *self.observer,
+                    );
+                }
                 Err(error) => {
                     // The diff could not be computed. The task's change set
                     // stays unknown; it is never recorded as "no change".
@@ -1503,6 +1519,13 @@ impl<'a> Drive<'a> {
                         task = %task.id,
                         %error,
                         "could not observe a running background task's workspace changes"
+                    );
+                    super::dispatch::note_unknown_side_effects(
+                        &mut self.ledger,
+                        &key,
+                        "background_task_live",
+                        &self.plan_state,
+                        &mut *self.observer,
                     );
                 }
             }
@@ -1544,12 +1567,31 @@ impl<'a> Drive<'a> {
     /// accounted. The settlement diff is an observation window over the task's
     /// admitted namespace, not per-file authorship: a concurrent writer may
     /// appear in it, which keeps this rule conservative.
-    fn account_background_changes(&mut self, task_id: &str, modified: Option<&[String]>) {
+    fn account_background_changes(&mut self, task_id: &str, modified: Option<&[String]>) -> bool {
         let Some(modified) = modified else {
-            return;
+            // The task reached a terminal without an observed change set. It
+            // may have written anything; the version must advance so a check
+            // that predates it cannot claim the current tree. Recorded once
+            // per execution identity.
+            let key = format!("background:{task_id}");
+            super::dispatch::note_unknown_side_effects(
+                &mut self.ledger,
+                &key,
+                "background_task",
+                &self.plan_state,
+                &mut *self.observer,
+            );
+            // The unknown change belongs to THIS execution. Its own result is
+            // judged against the version that includes that settlement, the
+            // same way a foreground command is credited with its own writes.
+            return self.ledger.mutations.iter().any(|record| {
+                record.tool == "background_task"
+                    && record.tool_call_id == key
+                    && record.scope == leveler_lifecycle::MutationScope::Unknown
+            });
         };
         if modified.is_empty() {
-            return;
+            return false;
         }
         let key = format!("background:{task_id}");
         // Field-pair identity: a model-chosen tool call id that happens to
@@ -1561,14 +1603,14 @@ impl<'a> Drive<'a> {
             .iter()
             .any(|record| record.tool == "background_task" && record.tool_call_id == key)
         {
-            return;
+            return false;
         }
         let touched = workspace_mutations(
             self.executor.tool_context.execution.workspace.as_deref(),
             modified.to_vec(),
         );
         if touched.is_empty() {
-            return;
+            return false;
         }
         note_tool_side_effects(
             &mut self.ledger,
@@ -1582,6 +1624,7 @@ impl<'a> Drive<'a> {
             push_unique_path(&mut self.modified_files, &path);
             push_unique_path(&mut self.scoped_paths, &path);
         }
+        false
     }
 
     /// Register a terminal background result when it belongs to this drive.
@@ -1608,7 +1651,7 @@ impl<'a> Drive<'a> {
         // The workspace change is a real fact even when this result is not
         // evidence for this goal (another goal's task still changed the shared
         // tree). Account it before the ownership filter, once per execution.
-        self.account_background_changes(task_id, modified);
+        let own_unknown = self.account_background_changes(task_id, modified);
         let started = self
             .pending_commands
             .iter()
@@ -1640,6 +1683,7 @@ impl<'a> Drive<'a> {
             },
             model_step,
             self.ledger.total_mutation_ops,
+            own_unknown,
         )
     }
 
@@ -2491,6 +2535,120 @@ impl Drive<'_> {
         self.merge_verification_facts(facts);
         self.verification_goal = Some(bound);
         Ok(())
+    }
+
+    /// Resolve `call_id:` citations the bounded live record does not hold.
+    ///
+    /// The live record keeps the newest runs. A citation of a real execution
+    /// older than that window must resolve from the durable log — otherwise a
+    /// long goal is told its own check "does not exist". The related history
+    /// of that command is merged too, so the gate still sees a later failure.
+    async fn hydrate_cited_executions(
+        &mut self,
+        arguments: &serde_json::Value,
+    ) -> Result<super::goal_verification::CitationResolution, AgentError> {
+        use super::goal_verification::{CitationMiss, CitationResolution};
+        let mut resolution = CitationResolution::new();
+        let Some(goal) = self
+            .executor
+            .goal_binder()
+            .and_then(|binder| binder.bound())
+        else {
+            return Ok(resolution);
+        };
+        let Some(source) = self.executor.goal_verification_source().cloned() else {
+            return Ok(resolution);
+        };
+        let mut ids: Vec<String> = Vec::new();
+        if let Some(detail) = arguments
+            .get("verification")
+            .and_then(|verification| verification.get("detail"))
+            .and_then(serde_json::Value::as_str)
+        {
+            for line in detail.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("call_id:") else {
+                    continue;
+                };
+                let id = rest.trim();
+                if !id.is_empty() && !id.chars().any(char::is_whitespace) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        ids.retain(|id| {
+            !self
+                .verification_runs
+                .iter()
+                .any(|run| run.call_id.as_deref() == Some(id.as_str()))
+                && !self
+                    .pending_commands
+                    .iter()
+                    .any(|pending| pending.call_id.as_deref() == Some(id.as_str()))
+        });
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(resolution);
+        }
+        let durable = source
+            .load_calls(&goal, &ids)
+            .await
+            .map_err(AgentError::Persistence)?;
+        // Durable history first, then the live record: a later failure of the
+        // same command must stay after the cited run it invalidates.
+        let live = std::mem::take(&mut self.verification_runs);
+        let live_calls: HashSet<String> =
+            live.iter().filter_map(|run| run.call_id.clone()).collect();
+        let cited: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut merged: Vec<_> = durable
+            .related_runs
+            .into_iter()
+            // A run without a call id cannot be the cited execution; keeping it
+            // would duplicate a legacy live observation.
+            .filter(|run| {
+                run.call_id
+                    .as_deref()
+                    .is_some_and(|id| !live_calls.contains(id))
+            })
+            .collect();
+        merged.extend(live);
+        // The durable history is for the gate's "failed later" check, not an
+        // unbounded ledger. Keep the newest window plus the cited runs.
+        if merged.len() > super::goal_verification::MAX_VERIFICATION_RUNS {
+            let cutoff = merged.len() - super::goal_verification::MAX_VERIFICATION_RUNS;
+            let mut index = 0;
+            merged.retain(|run| {
+                let keep =
+                    index >= cutoff || run.call_id.as_deref().is_some_and(|id| cited.contains(id));
+                index += 1;
+                keep
+            });
+        }
+        self.verification_runs = merged;
+        for (id, call) in durable.resolved {
+            match call {
+                crate::executor::DurableCall::Run(_) => {
+                    // The run itself is in `related_runs`, in durable order.
+                }
+                crate::executor::DurableCall::Pending(pending) => {
+                    if !self
+                        .pending_commands
+                        .iter()
+                        .any(|existing| existing.call_id == pending.call_id)
+                    {
+                        self.pending_commands.push(pending);
+                    }
+                }
+                crate::executor::DurableCall::OtherLineage => {
+                    resolution.insert(id, CitationMiss::OtherLineage);
+                }
+                crate::executor::DurableCall::Missing => {
+                    resolution.insert(id, CitationMiss::Missing);
+                }
+            }
+        }
+        Ok(resolution)
     }
 
     /// Rebuilt facts first, then this window's live observations. Identity is
@@ -3436,7 +3594,27 @@ impl Drive<'_> {
                     }
                 }
                 if let Some(task_id) = facts.terminal_task_id.as_deref() {
-                    self.account_background_changes(task_id, Some(&job_files));
+                    self.account_background_changes(
+                        task_id,
+                        if facts.mutation_tracking_unknown {
+                            None
+                        } else {
+                            Some(&job_files)
+                        },
+                    );
+                }
+                if facts.mutation_tracking_unknown
+                    && facts.execution_status.is_some()
+                    && facts.background_result.is_none()
+                    && facts.terminal_task_id.is_none()
+                {
+                    super::dispatch::note_unknown_side_effects(
+                        &mut self.ledger,
+                        job.admitted.call.id.as_str(),
+                        job.admitted.call.name.as_str(),
+                        &self.plan_state,
+                        &mut *self.observer,
+                    );
                 }
                 if let Some(part) = extract_image(&metadata) {
                     pending_images.push(part);
@@ -3456,7 +3634,11 @@ impl Drive<'_> {
                         result.ok,
                         result.exit_code,
                         true,
-                        Some(&job_files),
+                        if facts.mutation_tracking_unknown {
+                            None
+                        } else {
+                            Some(&job_files)
+                        },
                         self.model_steps,
                     );
                 }
@@ -5884,6 +6066,10 @@ impl AgentHarness for Drive<'_> {
                     // every completion attempt, accepted or refused: a refused
                     // attempt's declaration is the answer candidate, and a
                     // revision must be able to replace an earlier candidate.
+                    // Citations older than the bounded live record are resolved
+                    // from the durable log before the gate judges them.
+                    let citation_resolution =
+                        self.hydrate_cited_executions(&call.arguments).await?;
                     let claim = match super::goal_verification::parse_claim(
                         &call.arguments,
                         &self.verification_runs,
@@ -5923,56 +6109,59 @@ impl AgentHarness for Drive<'_> {
                     };
                     let modified = !self.progress.cumulative_modified_paths.is_empty()
                         || !self.modified_files.is_empty();
-                    let (mut verification, mut goal_notes) = match super::goal_verification::decide(
-                        &claim,
-                        &self.verification_runs,
-                        &self.pending_commands,
-                        self.ledger.total_mutation_ops,
-                        modified,
-                    ) {
-                        super::goal_verification::VerificationDecision::Accept {
-                            status,
-                            warnings,
-                        } => {
-                            self.repeated_gate_refusal = None;
-                            (
-                                status.map(|status| VerificationReport::new(status, Vec::new())),
+                    let (mut verification, mut goal_notes) =
+                        match super::goal_verification::decide_resolved(
+                            &claim,
+                            &self.verification_runs,
+                            &self.pending_commands,
+                            self.ledger.total_mutation_ops,
+                            modified,
+                            &citation_resolution,
+                        ) {
+                            super::goal_verification::VerificationDecision::Accept {
+                                status,
                                 warnings,
-                            )
-                        }
-                        super::goal_verification::VerificationDecision::Refuse(message) => {
-                            self.note_refused_completion(
-                                &round_prose,
-                                declares_answer,
-                                revises_answer,
-                                round_has_work,
-                            );
-                            verification_refusals_this_round += 1;
-                            note_gate_refusal(&mut self.repeated_gate_refusal, &message);
-                            (self.observer)(AgentEvent::GoalIntercepted {
-                                kind: "verification_refused".to_string(),
-                                detail: message.clone(),
-                            });
-                            (self.observer)(AgentEvent::ToolResult {
-                                exit_code: None,
-                                stop: None,
-                                execution_status: None,
-                                id: call.id.as_str().to_string(),
-                                name: UPDATE_GOAL_TOOL.to_string(),
-                                is_error: true,
-                                preview: goal_refusal_preview("verification_refused", &message),
-                                applied_diff: None,
-                            });
-                            results[index] = Some(ContentPart::ToolResult {
-                                result: ToolResultContent {
-                                    call_id: call.id,
-                                    content: message,
+                            } => {
+                                self.repeated_gate_refusal = None;
+                                (
+                                    status
+                                        .map(|status| VerificationReport::new(status, Vec::new())),
+                                    warnings,
+                                )
+                            }
+                            super::goal_verification::VerificationDecision::Refuse(message) => {
+                                self.note_refused_completion(
+                                    &round_prose,
+                                    declares_answer,
+                                    revises_answer,
+                                    round_has_work,
+                                );
+                                verification_refusals_this_round += 1;
+                                note_gate_refusal(&mut self.repeated_gate_refusal, &message);
+                                (self.observer)(AgentEvent::GoalIntercepted {
+                                    kind: "verification_refused".to_string(),
+                                    detail: message.clone(),
+                                });
+                                (self.observer)(AgentEvent::ToolResult {
+                                    exit_code: None,
+                                    stop: None,
+                                    execution_status: None,
+                                    id: call.id.as_str().to_string(),
+                                    name: UPDATE_GOAL_TOOL.to_string(),
                                     is_error: true,
-                                },
-                            });
-                            continue;
-                        }
-                    };
+                                    preview: goal_refusal_preview("verification_refused", &message),
+                                    applied_diff: None,
+                                });
+                                results[index] = Some(ContentPart::ToolResult {
+                                    result: ToolResultContent {
+                                        call_id: call.id,
+                                        content: message,
+                                        is_error: true,
+                                    },
+                                });
+                                continue;
+                            }
+                        };
                     // Structured requirement accounting. The recorded set —
                     // not a re-reading of the objective's prose — is the
                     // authority, and it is read here from durable history, so
@@ -7297,7 +7486,30 @@ impl AgentHarness for Drive<'_> {
             // and the later auto-delivery of the same task cannot both
             // advance the version.
             if let Some(task_id) = command_facts.terminal_task_id.as_deref() {
-                self.account_background_changes(task_id, Some(&call_files));
+                self.account_background_changes(
+                    task_id,
+                    if command_facts.mutation_tracking_unknown {
+                        None
+                    } else {
+                        Some(&call_files)
+                    },
+                );
+            }
+            // A foreground command that ran with write authority but whose
+            // changed paths could not be observed is an unknown change. It
+            // advances the version like any mutation: "could not tell" is not
+            // "did not change".
+            if command_facts.mutation_tracking_unknown
+                && command_facts.execution_status.is_some()
+                && !observed_terminal_background
+            {
+                super::dispatch::note_unknown_side_effects(
+                    &mut self.ledger,
+                    call.id.as_str(),
+                    call.name.as_str(),
+                    &self.plan_state,
+                    &mut *self.observer,
+                );
             }
             (self.observer)(AgentEvent::ToolResult {
                 exit_code: command_facts.exit_code,

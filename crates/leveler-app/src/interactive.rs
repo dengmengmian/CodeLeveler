@@ -8033,6 +8033,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await;
                 self.active.finish(&lease);
                 let closed = acknowledged?;
+                // Acknowledging closes the window's dangling calls; the window
+                // itself is over. Settle turns left `running` by a boot that is
+                // proven dead, so the user's next continuation re-enters THAT
+                // lineage (and its pending input) instead of starting a fresh
+                // task that cannot see either.
+                if let Err(error) = self
+                    .reap_running_turns(Some(&session_id), leveler_engine::ReapScope::EndedBoots)
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        session = session_id.as_str(),
+                        "could not settle the acknowledged crash window's turn"
+                    );
+                }
                 let _ = self
                     .events_for(&session_id)
                     .send(RuntimeEvent::CrashWindowAcknowledged {

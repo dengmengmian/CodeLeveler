@@ -933,6 +933,10 @@ impl Tool for GetTaskTool {
                 let mut metadata = serde_json::json!({
                     "background_result": background_result(&snap),
                     "terminal_task_id": snap.status.is_terminal().then_some(&snap.id),
+                    // An absent settlement change set is an UNKNOWN scope, not
+                    // an observed empty one: the task ran with write authority
+                    // and its writes could not be listed.
+                    "mutation_tracking": if modified.is_some() { "tracked" } else { "unknown" },
                 });
                 if let Some(modified) = modified {
                     metadata["modified_files"] = serde_json::json!(modified);
@@ -1290,6 +1294,10 @@ impl Tool for WaitTaskTool {
                         .as_ref()
                         .map(|s| s.modified.clone())
                         .unwrap_or_default(),
+                    // No settlement report is an unknown change scope for a
+                    // task that ran with write authority; the acceptance gate
+                    // must not read it as "changed nothing".
+                    "mutation_tracking": if report.is_some() { "tracked" } else { "unknown" },
                     "workspace_snapshot": report.as_ref().and_then(|s| s.snapshot.as_ref()).map(|id| id.0.clone()),
                     "next_cursor": next_cursor,
                     "log_remaining": pending,

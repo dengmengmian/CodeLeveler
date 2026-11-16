@@ -2041,6 +2041,70 @@ async fn a_chat_turn_that_joins_a_goal_can_cite_an_earlier_turns_execution() {
     );
 }
 
+/// A citation older than the bounded live window is still a real execution.
+/// The live record keeps the newest 64 runs; a long goal must not be told its
+/// own first check "does not exist" when it cites it by call id.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_citation_outside_the_live_window_is_resolved_from_the_durable_log() {
+    const TASK: &str = "跑很多命令后引用最早的那次";
+    let mut script = vec![Scripted::Tool(
+        "commit_task",
+        serde_json::json!({
+            "objective": TASK,
+            "acceptance": ["命令都执行过"]
+        }),
+    )];
+    for index in 0..70 {
+        script.push(Scripted::Tool(
+            "run_command",
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", format!("exit 0 # step {index}")]
+            }),
+        ));
+    }
+    script.push(Scripted::Tool(
+        "update_goal",
+        serde_json::json!({
+            "status": "complete",
+            "summary": "最早的那次执行仍然可引用",
+            "verification": {"status": "passed", "detail": "call_id:call-2"}
+        }),
+    ));
+    let fx = fixture(script, false).await;
+    let mut intercepted = Vec::new();
+    let mut spec = spec(&fx);
+    spec.runtime.goal = TASK.into();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec,
+            vec![ContentPart::Text { text: TASK.into() }],
+            &mut |event| {
+                if let leveler_engine::EngineEvent::GoalIntercepted { kind, detail } = event {
+                    intercepted.push(format!("{kind}: {detail}"));
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a real execution outside the window is still citable");
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "intercepts: {intercepted:?}"
+    );
+    assert!(
+        intercepted
+            .iter()
+            .all(|line| !line.contains("citation does not exist")
+                && !line.contains("verification_refused")),
+        "the early execution was refused instead of resolved: {intercepted:?}"
+    );
+}
+
 /// A citation that names another goal's execution is still refused: the
 /// record is goal-scoped, and joining a goal does not widen that boundary.
 #[tokio::test]

@@ -69,7 +69,7 @@ pub struct VerificationRun {
 /// Unlike the human-facing label, the fingerprint preserves argv boundaries
 /// and the requested working directory without persisting raw arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RegisteredCheckStart {
+pub struct RegisteredCheckStart {
     pub fingerprint: String,
     pub registrations: Vec<String>,
     pub order: u64,
@@ -269,7 +269,7 @@ pub(crate) enum VerificationDecision {
 /// result yet — instead of "never ran in this task", which was untrue and sent
 /// a real agent looking for a citation problem it did not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingCommand {
+pub struct PendingCommand {
     /// The same label a citation is matched against.
     pub label: String,
     /// The background task id, when the start reported one.
@@ -418,6 +418,7 @@ pub(crate) fn record_background_result(
     fact: BackgroundResultFact,
     model_step: u32,
     mutation_ops: u64,
+    credit_own_unknown: bool,
 ) -> bool {
     let started = pending
         .iter()
@@ -453,6 +454,16 @@ pub(crate) fn record_background_result(
     {
         return false;
     }
+    // A terminal with no observed change set contributed an unknown mutation
+    // of its own. That settlement belongs to this execution, so the window is
+    // the settled version on both ends: the command's own unobserved write does
+    // not make its own result "changed during the run". A later change still
+    // advances the version past it and expires it.
+    let window_start = if credit_own_unknown {
+        Some(mutation_ops)
+    } else {
+        window_start
+    };
     runs.push(VerificationRun {
         label,
         ok: fact.ok && fact.evidence,
@@ -470,6 +481,22 @@ pub(crate) fn record_background_result(
     true
 }
 
+/// Why a cited call id did not resolve to this goal's evidence.
+///
+/// These are different facts: one call never existed, another exists under an
+/// unrelated turn lineage. Reporting both as "no such record" is inaccurate and
+/// sends the model looking for the wrong problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CitationMiss {
+    /// No durable record of this call exists in the session.
+    Missing,
+    /// The call exists, but under another goal/lineage.
+    OtherLineage,
+}
+
+/// The durable classification of cited ids the live record did not hold.
+pub(crate) type CitationResolution = std::collections::HashMap<String, CitationMiss>;
+
 /// Decide whether `update_goal(complete)` may resolve the goal.
 ///
 /// Only the model's own structured declaration is read here: the commands it
@@ -478,12 +505,32 @@ pub(crate) fn record_background_result(
 /// not have failed since, and it must be current for the workspace version.
 /// No command name is classified: what a command means belongs to the model,
 /// and a requirement's own evidence is checked by the scope gate.
+#[cfg(test)]
 pub(crate) fn decide(
     claim: &VerificationClaim,
     runs: &[VerificationRun],
     pending: &[PendingCommand],
     mutation_ops: u64,
     modified: bool,
+) -> VerificationDecision {
+    decide_resolved(
+        claim,
+        runs,
+        pending,
+        mutation_ops,
+        modified,
+        &CitationResolution::new(),
+    )
+}
+
+/// [`decide`] with the durable classification of ids the bounded record lacked.
+pub(crate) fn decide_resolved(
+    claim: &VerificationClaim,
+    runs: &[VerificationRun],
+    pending: &[PendingCommand],
+    mutation_ops: u64,
+    modified: bool,
+    resolution: &CitationResolution,
 ) -> VerificationDecision {
     match claim {
         VerificationClaim::Passed(commands) if !commands.is_empty() => {
@@ -492,7 +539,7 @@ pub(crate) fn decide(
                 if cited.is_empty() {
                     continue;
                 }
-                let run = match cited_run(cited, runs) {
+                let run = match cited_run_resolved(cited, runs, resolution) {
                     CitedRun::Refuse(message) => return VerificationDecision::Refuse(message),
                     CitedRun::Unmatched => {
                         return VerificationDecision::Refuse(unmatched_citation(
@@ -993,6 +1040,14 @@ enum CitedRun<'a> {
 /// matches, including a full command with a trailing result note. A bare id,
 /// an abbreviation, or a different command stays unmatched.
 fn cited_run<'a>(cited: &str, runs: &'a [VerificationRun]) -> CitedRun<'a> {
+    cited_run_resolved(cited, runs, &CitationResolution::new())
+}
+
+fn cited_run_resolved<'a>(
+    cited: &str,
+    runs: &'a [VerificationRun],
+    resolution: &CitationResolution,
+) -> CitedRun<'a> {
     if let Some(rest) = cited.strip_prefix("call_id:") {
         let id = rest.trim();
         if id.is_empty() || id.chars().any(char::is_whitespace) {
@@ -1009,9 +1064,15 @@ fn cited_run<'a>(cited: &str, runs: &'a [VerificationRun]) -> CitedRun<'a> {
             .find(|run| run.call_id.as_deref() == Some(id))
         {
             Some(run) => CitedRun::Found(run),
-            None => CitedRun::Refuse(format!(
-                "citation does not exist: no execution record in this task has call_id `{id}`."
-            )),
+            None => CitedRun::Refuse(match resolution.get(id) {
+                Some(CitationMiss::OtherLineage) => format!(
+                    "citation does not exist in this task: call_id `{id}` belongs to another turn \
+                     lineage, so it cannot vouch for this goal."
+                ),
+                _ => format!(
+                    "citation does not exist: no execution record in this task has call_id `{id}`."
+                ),
+            }),
         };
     }
     if let Some(run) = runs.iter().rev().find(|run| cites(&run.label, cited)) {
@@ -1749,7 +1810,8 @@ mod tests {
             &mut recorded,
             fact(),
             4,
-            7
+            7,
+            false
         ));
         // The second observation is the same execution, even when it arrives
         // through the other route (auto-delivery then `wait_task`, or the
@@ -1760,7 +1822,8 @@ mod tests {
             &mut recorded,
             fact(),
             5,
-            7
+            7,
+            false
         ));
         assert_eq!(runs.len(), 1);
         assert!(pending.is_empty(), "a terminal result retires its start");
@@ -1781,7 +1844,8 @@ mod tests {
             &mut recorded,
             background_fact("task-a", "call-a", label, true, true),
             4,
-            7
+            7,
+            false
         ));
         assert!(record_background_result(
             &mut runs,
@@ -1789,7 +1853,8 @@ mod tests {
             &mut recorded,
             background_fact("task-b", "call-b", label, true, true),
             9,
-            7
+            7,
+            false
         ));
         assert_eq!(
             runs.len(),
@@ -1816,7 +1881,8 @@ mod tests {
             &mut recorded,
             background_fact("task-a", "call-a", "cargo test", false, true),
             6,
-            3
+            3,
+            false
         ));
         assert_eq!(runs.len(), 1);
         assert!(!runs[0].ok);
@@ -1836,7 +1902,8 @@ mod tests {
             &mut recorded,
             background_fact("task-a", "call-a", "npm run dev", false, false),
             6,
-            3
+            3,
+            false
         ));
         assert!(runs.is_empty(), "a cancel has no command result to cite");
         assert!(
@@ -1858,7 +1925,8 @@ mod tests {
             &mut recorded,
             background_fact("task-a", "call-a", "go test ./...", true, true),
             8,
-            4
+            4,
+            false
         ));
         assert_eq!(runs.len(), 1);
         assert!(pending.is_empty());
@@ -1879,7 +1947,8 @@ mod tests {
             &mut recorded,
             background_fact("task-b", "call-b", "go test ./...", true, true),
             5,
-            2
+            2,
+            false
         ));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].task_id.as_deref(), Some("task-a"));

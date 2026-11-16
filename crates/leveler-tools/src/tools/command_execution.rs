@@ -484,6 +484,19 @@ impl CommandExecution {
         // command-driven mutations, not just tool edits.
         let mut command_modified: Vec<String> = Vec::new();
         let mut snapshot_note: Option<String> = None;
+        // A command with write authority whose changed paths could not be
+        // observed is an UNKNOWN change, not "no change". The completion gate
+        // must not let a check that predates it claim the current tree.
+        let mut mutation_tracking_unknown = false;
+        let writes_possible = !context.policy.read_only
+            && !context.policy.has_zero_write_authority()
+            && !matches!(context.write_scope(), leveler_execution::WriteScope::None);
+        // A workspace without change observation (a plain directory) is a
+        // documented limitation surfaced to the model, not a new unknown: there
+        // is no baseline capability to have failed. A git work tree whose
+        // snapshot or diff failed is an operational unknown.
+        let observes_changes =
+            writes_possible && leveler_execution::WorkspaceSnapshot::tracks_changes(&root).await;
         match (&snapshot, context.policy.read_only) {
             (Some(id), _) => {
                 match WorkspaceSnapshot::changed_since_for_scope(&root, id, &context.write_scope())
@@ -491,6 +504,7 @@ impl CommandExecution {
                 {
                     Ok(changed) => command_modified = changed,
                     Err(error) => {
+                        mutation_tracking_unknown = observes_changes;
                         snapshot_note = Some(format!(
                             "\n[note] could not diff the workspace after this command ({error}); \
                          its file changes were not tracked.\n"
@@ -500,6 +514,7 @@ impl CommandExecution {
             }
             (None, true) => {}
             (None, false) => {
+                mutation_tracking_unknown = observes_changes;
                 snapshot_note = Some(
                     "\n[note] a workspace mutation baseline was unavailable; file changes made by \
                      this command were not tracked and cannot be rolled back.\n"
@@ -643,6 +658,7 @@ impl CommandExecution {
                 // and a rejected mutation).
                 "execution_status": output.execution_status(),
                 "modified_files": command_modified,
+                "mutation_tracking": if mutation_tracking_unknown { "unknown" } else { "tracked" },
                 "workspace_snapshot": snapshot.as_ref().filter(|_| !matches!(context.write_scope(), leveler_execution::WriteScope::ScopedWorkspace { .. })).map(|id| id.0.clone()),
                 // What this execution proves ran, stated by the layer that ran it.
                 // Every command tool funnels through here, so completion evidence

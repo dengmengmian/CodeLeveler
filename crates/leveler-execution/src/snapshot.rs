@@ -90,6 +90,16 @@ impl WorkspaceSnapshot {
         }
     }
 
+    /// Whether this workspace can observe file changes at all.
+    ///
+    /// A git work tree can; a plain directory cannot. The distinction matters
+    /// to a caller deciding whether a missing snapshot is an operational
+    /// failure (change scope UNKNOWN) or a workspace with no observation
+    /// capability (already reported to the model, no new fact).
+    pub async fn tracks_changes(root: &Path) -> bool {
+        git_dir(root).await.is_some()
+    }
+
     /// Capture only the namespace this execution may mutate. The temporary
     /// index starts empty, so another owner's files never enter this snapshot.
     pub async fn capture_for_scope(

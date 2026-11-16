@@ -259,6 +259,41 @@ def result_events(home: str) -> list[dict]:
     return out
 
 
+def command_results(home: str) -> list[dict]:
+    """Foreground command terminals, joined to the call's own arguments.
+
+    The >15s suite may finish FOREGROUND when the model gave it an explicit
+    timeout: the execution route is the model's call, but the RESULT is just as
+    real and durable as a background terminal. The arguments come from the
+    matching `tool_call_started` row, so a check can name the command it means
+    instead of accepting any successful command.
+    """
+    started = {}
+    for (payload,) in query(
+        home, "select payload from events where type='tool_call_started' order by sequence"
+    ):
+        try:
+            value = json.loads(payload)
+        except Exception:
+            continue
+        value = value.get("payload", value)
+        started[value.get("call_id")] = value.get("arguments")
+    out = []
+    for (payload,) in query(
+        home,
+        "select payload from events where type='tool_call_finished' order by sequence",
+    ):
+        try:
+            value = json.loads(payload)
+        except Exception:
+            continue
+        value = value.get("payload", value)
+        if value.get("name") in ("run_command", "shell_command"):
+            value["arguments"] = started.get(value.get("call_id"))
+            out.append(value)
+    return out
+
+
 def wait_for(fn, timeout=30.0, interval=0.25):
     end = time.time() + timeout
     while time.time() < end:
@@ -903,12 +938,23 @@ def scenario_live(report: H.Report, layer: Layer):
             settled,
             pty_.screen.text()[-900:],
         )
-        results = result_events(env.home)
+        results = result_events(env.home) + command_results(env.home)
+
+        def names_e2e(entry: dict) -> bool:
+            argv = json.dumps(
+                [entry.get("program"), entry.get("args"), entry.get("arguments")],
+                ensure_ascii=False,
+            )
+            return "e2e" in argv
+
         report.check(
             "bg-live",
-            "EV-5 the >15s suite's real result is durable in the live run",
-            any(e.get("exit_code") == 0 and not e.get("is_error") for e in results),
-            repr(results)[:600],
+            "EV-5 the >15s e2e suite's real result is durable in the live run",
+            any(
+                names_e2e(e) and e.get("exit_code") == 0 and not e.get("is_error")
+                for e in results
+            ),
+            repr([e for e in results if names_e2e(e)])[:800],
         )
         time.sleep(1.5)
         report.dump("live-4-final", pty_)

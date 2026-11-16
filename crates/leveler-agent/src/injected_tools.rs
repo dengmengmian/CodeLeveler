@@ -129,54 +129,33 @@ pub(crate) const UPDATE_GOAL_TOOL: &str = "update_goal";
 /// a terminal Plan refresh.
 pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
     let description = String::from(
-        "Resolve the current objective. Call this ONLY to end the \
-            task or this work window: `complete` when every requirement is \
-            done, against the \
-            current workspace state; \
-            `blocked` when you are genuinely and \
-            repeatedly stuck and cannot make progress (if the obstruction is a \
-            decision or information only the user can provide, ask through \
-            `request_user_input` when it is advertised and wait instead of \
-            ending the goal); `yield` when the \
-            objective is NOT done and nothing obstructs it, but this window \
-            has reached its own end (context, time, or a deliberate split). \
-            `yield` ends the window, not the goal: the runtime opens the next \
-            window on the same objective with the same plan and history, so \
-            never use it to abandon work you could finish now, and never use \
-            `blocked` for a window you simply ended. Going silent does NOT end \
-            the task — you must call this. Do not mark complete on unproven or \
-            indirect evidence, and do not redefine success down to what already \
-            exists. `complete` means the objective AS THE USER STATED IT. If the \
-            stated objective cannot be satisfied — it conflicts with something \
-            you must not change (an existing test that pins the opposite \
-            behavior, a frozen interface, an explicit prohibition) — do NOT \
-            reinterpret or narrow its terms into a weaker task and complete \
-            that instead: that is a false completion. Report `blocked`, name \
-            the exact conflict (which requirement collides with which \
-            constraint), and first revert edits that served only the abandoned \
-            attempt so the workspace is left clean. Partial conflicts are the \
-            same rule: when only PART of the stated objective is satisfiable, \
-            delivering that part while quietly exempting the rest — with or \
-            without a rationalization — is still a false completion. Blocked, \
-            naming which part cannot be satisfied and why. \
-            For goal-wide evidence, use `verification`: `passed` citing the executions \
-            you rely on, one per line in `detail` (each citation is checked \
-            against the runtime's execution record, after your last change), or \
-            `not_applicable` with the reason in `detail`. The runtime never \
-            classifies a command by its name: the citation is what makes an \
-            execution evidence, and a completion that changed the workspace \
-            with no citation is accepted as unverified, never as a verified \
-            success. Do not duplicate a registered requirement check in goal-wide \
-            verification. When the goal has a \
-            recorded requirement set, `requirements` must account for every \
-            active deliverable by its stable id; a missing or `not_done` \
-            requirement refuses completion, and its account is the evidence the \
-            terminal carries. A requirement with a path, literal or declared \
-            command is checked against the workspace or the recorded executions \
-            (a `tests` requirement's declared command must have a passing run). \
-            A `named` requirement is model judgement: account it `done` when \
-            delivered. A registered check must pass and is cited in \
-            `check_call_id`. `unverifiable` is an explicit boundary, not an \
+        "Resolve the current objective. Call this ONLY to end the task or this work window. \
+            `complete` when every requirement is done against the current workspace state; \
+            `blocked` when you are genuinely and repeatedly stuck (if only the user can decide \
+            or inform, use `request_user_input` when advertised and wait instead); `yield` \
+            when the objective is not done and nothing obstructs it, but this window must end — \
+            the runtime opens the next window with the same objective, plan and history. Never \
+            yield to abandon work you could finish now. Going silent does NOT end the task. \
+            Do not mark complete on unproven or indirect evidence, and do not redefine success \
+            down to what already exists: `complete` means the objective AS THE USER STATED IT. \
+            If it conflicts with something you must not change (a test pinning the opposite \
+            behavior, a frozen interface, an explicit prohibition), do NOT narrow it into a \
+            weaker task — that is a false completion. Report `blocked`, name the exact conflict, \
+            and first revert edits that served only the abandoned attempt. Partial conflicts are the \
+            same rule: when only PART is satisfiable, delivering that part while exempting the \
+            rest is the same false completion; block naming what cannot be satisfied and why. \
+            Goal-wide evidence: `verification` = `passed` with one execution citation per line \
+            in `detail` (checked against the execution record, after your last change), or \
+            `not_applicable` with the reason. A command's name is never classified; a completion \
+            that changed the workspace with no citation is unverified, never verified. Do not \
+            duplicate a registered requirement check there. \
+            With a recorded requirement set, `requirements` must account for every active \
+            deliverable by id; a missing or `not_done` item refuses completion, and the account \
+            is the terminal's evidence. A requirement with a path, literal or declared command \
+            is checked against the workspace or recorded executions (a `tests` command must have \
+            a passing run). A resident service is proven by a finite probe, never by the service \
+            process. A `named` requirement is model judgement; a registered check must pass and \
+            is cited in `check_call_id`. `unverifiable` is an explicit boundary, not an \
             exemption from an observed fact.",
     );
     ToolDefinition {
@@ -188,7 +167,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 "status": {
                     "type": "string",
                     "enum": ["complete", "blocked", "yield"],
-                    "description": "complete = done, for the objective as stated; blocked = truly stuck, or the objective cannot be satisfied as written; yield = end this window, not the goal (see above)."
+                    "description": "Meaning is defined by the tool description above."
                 },
                 "blocked_kind": {
                     "type": "string",
@@ -221,7 +200,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                         },
                         "detail": {
                             "type": "string",
-                            "description": "For passed: cite each execution you rely on, one per line. Prefer `call_id:<id>` of the tool call that ran it. A full command line also matches; its name is not classified. A trailing result note (`→ ...` or a parenthetical) is not part of the command. Do not abbreviate a command, and do not rerun a check only to make the citation match. For not_applicable: why no executable check exists."
+                            "description": "One citation per line: `call_id:<id>` or the exact command (a trailing result note is ignored). For not_applicable: why no executable check exists."
                         }
                     },
                     "required": ["status", "detail"]
@@ -246,7 +225,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                             },
                             "evidence": {
                                 "type": "string",
-                                "description": "What proves it. A `tests` or `command` requirement is satisfied by the newest recorded run of its exact `target` command; the runtime reads that execution record, not this account."
+                                "description": "What proves it; a `tests`/`command` requirement is satisfied by the newest run of its exact `target`."
                             },
                             "check_call_id": {
                                 "type": "string",
@@ -400,7 +379,10 @@ fn requirement_target_contract() -> String {
         .map(|kind| format!("`{}`", kind.as_str()))
         .collect::<Vec<_>>();
     format!(
-        "{} need `target` (path, file or exact command).",
+        "{} need `target` (path, file or exact command). A `command`/`tests` target must be \
+         a FINITE command that exits 0; a resident service never exits, so prove it with a \
+         finite probe (`curl -sf .../health`, an e2e suite) or a `named` registered check. \
+         `wait_task(until: match)` readiness is an observation, not a terminal result.",
         kinds.join(", ")
     )
 }

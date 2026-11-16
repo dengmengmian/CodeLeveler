@@ -477,6 +477,150 @@ pub(crate) async fn load_goal_verification(
     session_id: &SessionId,
     goal_id: &leveler_core::GoalId,
 ) -> Result<VerificationFacts, EngineError> {
+    let mut facts = collect_goal_verification(stores, session_id, goal_id).await?;
+    // The live collector keeps the newest 64; a rebuilt record must answer
+    // the same questions a live one would. A check that is still owed beyond
+    // that window keeps its latest run, so a long goal can resolve a
+    // registered acceptance check it declared early.
+    let active_registrations: std::collections::HashSet<String> = stores
+        .goals
+        .requirements(goal_id)
+        .await?
+        .into_iter()
+        .filter(|item| item.state == leveler_lifecycle::RequirementState::Active)
+        .filter_map(|item| item.verification)
+        .map(|check| check.registered_by)
+        .collect();
+    crate::executor::goal_verification::retain_verification_runs(
+        &mut facts.runs,
+        &active_registrations,
+    );
+    Ok(facts)
+}
+
+/// Resolve cited call ids that are outside the live/bounded record.
+///
+/// The rebuilt facts are the same authority the live window uses; this lookup
+/// only answers "what does the durable record say about THIS call id", so a
+/// citation older than the retained window is not turned into "never ran". The
+/// returned classification distinguishes another lineage from a genuinely
+/// missing call: those are different facts and must not share a message.
+pub(crate) async fn load_goal_verification_calls(
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+    goal_id: &leveler_core::GoalId,
+    call_ids: &[String],
+) -> Result<crate::executor::DurableCalls, EngineError> {
+    use crate::executor::DurableCall;
+    let wanted: std::collections::HashSet<&str> = call_ids.iter().map(String::as_str).collect();
+    let mut calls = crate::executor::DurableCalls::default();
+    if wanted.is_empty() {
+        return Ok(calls);
+    }
+    let facts = collect_goal_verification(stores, session_id, goal_id).await?;
+    for id in call_ids {
+        if let Some(run) = facts
+            .runs
+            .iter()
+            .rev()
+            .find(|run| run.call_id.as_deref() == Some(id.as_str()))
+        {
+            calls
+                .resolved
+                .insert(id.clone(), DurableCall::Run(run.clone()));
+        } else if let Some(pending) = facts
+            .pending
+            .iter()
+            .find(|pending| pending.call_id.as_deref() == Some(id.as_str()))
+        {
+            calls
+                .resolved
+                .insert(id.clone(), DurableCall::Pending(pending.clone()));
+        }
+    }
+    // The gate also asks "did this command fail later?". Carry every durable
+    // run of a resolved command so that check sees history older than the
+    // bounded live window, in durable order.
+    let labels: std::collections::HashSet<&str> = calls
+        .resolved
+        .values()
+        .filter_map(|call| match call {
+            DurableCall::Run(run) => Some(run.label.as_str()),
+            _ => None,
+        })
+        .collect();
+    calls.related_runs = facts
+        .runs
+        .iter()
+        .filter(|run| labels.contains(run.label.as_str()))
+        .cloned()
+        .collect();
+    let unresolved: Vec<&String> = call_ids
+        .iter()
+        .filter(|id| !calls.resolved.contains_key(*id))
+        .collect();
+    if unresolved.is_empty() {
+        return Ok(calls);
+    }
+    // Not evidence for this goal. Distinguish "the call never existed" from
+    // "it exists under another lineage" from the same durable event log.
+    let turns = stores.turns.list_for_session(session_id).await?;
+    let goal_turns: std::collections::HashSet<&str> = turns
+        .iter()
+        .filter(|turn| {
+            turn.payload
+                .as_deref()
+                .and_then(|payload| leveler_engine::decode_turn_continuation(payload).ok())
+                .and_then(|lineage| lineage.goal_id)
+                .is_some_and(|id| &id == goal_id)
+        })
+        .map(|turn| turn.id.as_str())
+        .collect();
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let rows = stores.events.load(session_id).await?;
+    for row in &rows {
+        let Ok(event) = EngineEvent::from_payload(&row.payload) else {
+            continue;
+        };
+        let call_id = match &event {
+            EngineEvent::ToolCallStarted { call_id, .. }
+            | EngineEvent::ToolCallFinished { call_id, .. } => call_id,
+            _ => continue,
+        };
+        if !wanted.contains(call_id.as_str()) || calls.resolved.contains_key(call_id) {
+            continue;
+        }
+        let in_goal = row
+            .turn_id
+            .as_deref()
+            .is_some_and(|turn| goal_turns.contains(turn));
+        let entry = seen.entry(call_id.clone()).or_insert(false);
+        *entry |= in_goal;
+    }
+    for id in unresolved {
+        let in_goal = seen.get(id).copied().unwrap_or(false);
+        calls.resolved.insert(
+            id.clone(),
+            if in_goal {
+                // It ran in this goal but produced no citable execution fact
+                // (not a command, or only a start that was already reported).
+                DurableCall::Missing
+            } else if seen.contains_key(id) {
+                DurableCall::OtherLineage
+            } else {
+                DurableCall::Missing
+            },
+        );
+    }
+    Ok(calls)
+}
+
+/// Rebuild the goal's complete execution record from its durable events.
+async fn collect_goal_verification(
+    stores: &leveler_storage::EngineStores,
+    session_id: &SessionId,
+    goal_id: &leveler_core::GoalId,
+) -> Result<VerificationFacts, EngineError> {
     let turns = stores.turns.list_for_session(session_id).await?;
     let turn_ids: std::collections::HashSet<&str> = turns
         .iter()
@@ -510,6 +654,8 @@ pub(crate) async fn load_goal_verification(
     let mut task_by_call: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut mutation_ops = 0u64;
+    let mut unknown_mutations: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     let mut runs = Vec::new();
     for row in rows {
         let Ok(event) = EngineEvent::from_payload(&row.payload) else {
@@ -521,10 +667,12 @@ pub(crate) async fn load_goal_verification(
         // Legacy records only carry the call.
         if let EngineEvent::BackgroundTaskFinished {
             call_id,
+            task_id,
             goal_id: owner_goal,
             is_error,
             exit_code,
             status,
+            modified,
             ..
         } = &event
         {
@@ -544,6 +692,20 @@ pub(crate) async fn load_goal_verification(
                     .and_then(|start| start.started_mutation_ops)
                     .or_else(|| windows.get(call_id).map(|(start, _)| *start));
                 run.finished_mutation_ops = Some(mutation_ops);
+                // A terminal with no observed change set contributed an
+                // unknown mutation recorded under its task identity. Credit
+                // the execution with its own settlement so its result is not
+                // "changed during the run" — the same rule the live window
+                // applies. A later change still expires it.
+                if modified.is_none()
+                    && let Some(version) = unknown_mutations
+                        .get(&format!("background:{task_id}"))
+                        .copied()
+                {
+                    run.started_mutation_ops = Some(version);
+                    run.finished_mutation_ops = Some(version);
+                    run.mutation_ops = run.mutation_ops.max(version);
+                }
                 let exited = status
                     .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited);
                 if exited || run.check_start.is_some() {
@@ -687,24 +849,15 @@ pub(crate) async fn load_goal_verification(
             }
             EngineEvent::EvidenceLedgerUpdated { ledger } => {
                 mutation_ops = ledger.total_mutation_ops;
+                for record in &ledger.mutations {
+                    if record.scope == leveler_lifecycle::MutationScope::Unknown {
+                        unknown_mutations.insert(record.tool_call_id.clone(), record.mutation_ops);
+                    }
+                }
             }
             _ => {}
         }
     }
-    // The live collector keeps the newest 64; a rebuilt record must answer
-    // the same questions a live one would. A check that is still owed beyond
-    // that window keeps its latest run, so a long goal can resolve a
-    // registered acceptance check it declared early.
-    let active_registrations: std::collections::HashSet<String> = stores
-        .goals
-        .requirements(goal_id)
-        .await?
-        .into_iter()
-        .filter(|item| item.state == leveler_lifecycle::RequirementState::Active)
-        .filter_map(|item| item.verification)
-        .map(|check| check.registered_by)
-        .collect();
-    crate::executor::goal_verification::retain_verification_runs(&mut runs, &active_registrations);
     Ok(VerificationFacts {
         runs,
         pending: pending.into_values().collect(),
@@ -731,6 +884,16 @@ impl StoredGoalVerification {
 impl crate::executor::GoalVerificationSource for StoredGoalVerification {
     async fn load(&self, goal: &leveler_core::GoalId) -> Result<VerificationFacts, String> {
         load_goal_verification(&self.stores, &self.session_id, goal)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn load_calls(
+        &self,
+        goal: &leveler_core::GoalId,
+        call_ids: &[String],
+    ) -> Result<crate::executor::DurableCalls, String> {
+        load_goal_verification_calls(&self.stores, &self.session_id, goal, call_ids)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1399,6 +1562,7 @@ mod background_result_run_tests {
 #[cfg(test)]
 mod goal_verification_replay_tests {
     use super::*;
+    use crate::executor::goal_verification::MAX_VERIFICATION_RUNS;
     use leveler_storage::{Database, EngineStores, SessionRecord, SessionRepository};
 
     /// One goal window whose only command call ended with `finished`.
@@ -1538,6 +1702,162 @@ mod goal_verification_replay_tests {
         assert_eq!(runs[0].call_id.as_deref(), Some("call-this"));
     }
 
+    /// A citation older than the bounded live window is still a real
+    /// execution. The durable lookup must resolve it — and must distinguish a
+    /// call from another lineage from one that never existed — instead of
+    /// telling a long goal its own check "does not exist".
+    #[tokio::test]
+    async fn a_citation_beyond_the_bounded_window_resolves_from_the_durable_log() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
+        let goal = leveler_core::GoalId::new("goal-long");
+        let other = leveler_core::GoalId::new("goal-other");
+        append_command_call(
+            &stores,
+            &session,
+            &goal,
+            "call-early",
+            "cargo test",
+            false,
+            Some(0),
+            "ok",
+        )
+        .await;
+        for index in 0..70 {
+            append_command_call(
+                &stores,
+                &session,
+                &goal,
+                &format!("call-{index}"),
+                "cargo test",
+                false,
+                Some(0),
+                "ok",
+            )
+            .await;
+        }
+        append_command_call(
+            &stores,
+            &session,
+            &other,
+            "call-foreign",
+            "cargo test",
+            false,
+            Some(0),
+            "ok",
+        )
+        .await;
+
+        let bounded = load_goal_verification(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(bounded.runs.len(), MAX_VERIFICATION_RUNS);
+        assert!(
+            !bounded
+                .runs
+                .iter()
+                .any(|run| run.call_id.as_deref() == Some("call-early")),
+            "the early run is outside the bounded window"
+        );
+
+        let ids = vec![
+            "call-early".to_string(),
+            "call-foreign".to_string(),
+            "call-missing".to_string(),
+        ];
+        let durable = load_goal_verification_calls(&stores, &session, &goal, &ids)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                durable.resolved.get("call-early"),
+                Some(crate::executor::DurableCall::Run(run))
+                    if run.call_id.as_deref() == Some("call-early")
+            ),
+            "a real execution outside the window must resolve: {:?}",
+            durable.resolved
+        );
+        assert!(
+            durable
+                .related_runs
+                .iter()
+                .any(|run| run.call_id.as_deref() == Some("call-early")),
+            "the cited run travels with its durable command history"
+        );
+        assert!(matches!(
+            durable.resolved.get("call-foreign"),
+            Some(crate::executor::DurableCall::OtherLineage)
+        ));
+        assert!(matches!(
+            durable.resolved.get("call-missing"),
+            Some(crate::executor::DurableCall::Missing)
+        ));
+    }
+
+    /// The gate's "the same command failed later" check must still see a
+    /// failure that lies outside the bounded window.
+    #[tokio::test]
+    async fn a_later_failure_outside_the_window_travels_with_the_citation() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let stores = EngineStores::from_database(&db);
+        let goal = leveler_core::GoalId::new("goal-history");
+        append_command_call(
+            &stores,
+            &session,
+            &goal,
+            "call-pass",
+            "cargo test",
+            false,
+            Some(0),
+            "ok",
+        )
+        .await;
+        for index in 0..70 {
+            append_command_call(
+                &stores,
+                &session,
+                &goal,
+                &format!("filler-{index}"),
+                "echo filler",
+                false,
+                Some(0),
+                "ok",
+            )
+            .await;
+        }
+        append_command_call(
+            &stores,
+            &session,
+            &goal,
+            "call-fail",
+            "cargo test",
+            true,
+            Some(1),
+            "failed",
+        )
+        .await;
+
+        let durable =
+            load_goal_verification_calls(&stores, &session, &goal, &["call-pass".to_string()])
+                .await
+                .unwrap();
+        let failure = durable
+            .related_runs
+            .iter()
+            .find(|run| run.call_id.as_deref() == Some("call-fail"));
+        assert!(
+            failure.is_some_and(|run| !run.ok),
+            "the later failure must be in the cited command's history: {:?}",
+            durable.related_runs
+        );
+    }
+
     /// A crash-window acknowledgement is recovery control, not a tool result:
     /// replaying it as a failed verification run would tell a resumed goal its
     /// last command failed when its outcome is unknown.
@@ -1655,7 +1975,7 @@ mod goal_verification_replay_tests {
     /// its result arrived after a resume.
     #[tokio::test]
     async fn a_background_result_replays_with_its_launch_version() {
-        let (stores, session, goal) = goal_with_background_call("call-bg", true).await;
+        let (stores, session, goal) = goal_with_background_call("call-bg", true, false).await;
         let facts = load_goal_verification(&stores, &session, &goal)
             .await
             .unwrap();
@@ -1682,7 +2002,7 @@ mod goal_verification_replay_tests {
     /// consistency claim.
     #[tokio::test]
     async fn a_legacy_background_result_replays_with_an_unknown_start_version() {
-        let (stores, session, goal) = goal_with_background_call("call-legacy", false).await;
+        let (stores, session, goal) = goal_with_background_call("call-legacy", false, false).await;
         let facts = load_goal_verification(&stores, &session, &goal)
             .await
             .unwrap();
@@ -1696,11 +2016,38 @@ mod goal_verification_replay_tests {
         ));
     }
 
+    /// A background terminal with no observed change set contributed an
+    /// unknown mutation of its own. Replay must credit that settlement to the
+    /// execution: its result is current, not "changed during the run". A later
+    /// change must still expire it.
+    #[tokio::test]
+    async fn an_unknown_background_settlement_is_credited_to_its_own_run() {
+        let (stores, session, goal) = goal_with_background_call("call-unknown", true, true).await;
+        let facts = load_goal_verification(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(facts.runs.len(), 1);
+        let run = &facts.runs[0];
+        assert!(run.ok);
+        assert_eq!(run.started_mutation_ops, Some(2));
+        assert_eq!(run.finished_mutation_ops, Some(2));
+        assert_eq!(run.mutation_ops, 2);
+        assert!(matches!(
+            crate::executor::goal_verification::version_applicability(run, 2),
+            crate::executor::goal_verification::VersionApplicability::Current
+        ));
+        assert!(matches!(
+            crate::executor::goal_verification::version_applicability(run, 3),
+            crate::executor::goal_verification::VersionApplicability::Stale
+        ));
+    }
+
     /// One background command launched at version 0, an edit advances the
     /// ledger to 2, and its result arrives afterwards.
     async fn goal_with_background_call(
         call_id: &str,
         with_launch_row: bool,
+        unknown_settlement: bool,
     ) -> (EngineStores, SessionId, leveler_core::GoalId) {
         let db = Database::connect_in_memory().await.unwrap();
         let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
@@ -1783,6 +2130,17 @@ mod goal_verification_replay_tests {
         append(EngineEvent::EvidenceLedgerUpdated {
             ledger: leveler_lifecycle::EvidenceLedger {
                 total_mutation_ops: 2,
+                mutations: unknown_settlement
+                    .then(|| leveler_lifecycle::MutationRecord {
+                        seq: 1,
+                        tool_call_id: "background:task-bg".into(),
+                        tool: "background_task".into(),
+                        paths: Vec::new(),
+                        scope: leveler_lifecycle::MutationScope::Unknown,
+                        mutation_ops: 2,
+                    })
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             },
         })

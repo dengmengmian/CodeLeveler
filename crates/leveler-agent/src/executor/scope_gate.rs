@@ -704,6 +704,13 @@ fn version_unknown_message(
 
 /// A command that has only started is not a satisfied requirement: its result
 /// is unknown. Name the real missing fact and the exact action that resolves it.
+///
+/// A resident service never produces that result. Saying only "wait for it"
+/// would describe an exit that cannot happen, so the refusal also names the
+/// two honest ways to express a running service — a finite probe as this
+/// requirement's command, or a `named` deliverable whose registered check is
+/// that probe. This is guidance keyed on a structured fact (a started command
+/// with no result), not a classification of the command's name.
 fn pending_refusal(item: &RequirementItem, command: &str, started: &PendingCommand) -> String {
     let task = match started.task_id.as_deref() {
         Some(id) => format!(" as background task {id}"),
@@ -714,8 +721,13 @@ fn pending_refusal(item: &RequirementItem, command: &str, started: &PendingComma
         None => "wait_task for that task".to_string(),
     };
     format!(
-        "`{}` [{}] `{command}` has only STARTED{task} and reported no result yet. Wait for it \
-         ({wait}) and account for it again once it exits.",
+        "`{}` [{}] `{command}` has only STARTED{task} and reported no result yet. If it will \
+         exit, wait for it ({wait}) and account for it again once it exits. If it is a resident \
+         service that never exits, this requirement can never be satisfied by the process \
+         itself: replace its `target` with a finite probe that exits 0 when the service is \
+         healthy (for example `curl -sf http://127.0.0.1:<port>/health`, or the e2e suite), or \
+         make the deliverable `named` and register that finite probe as its check. \
+         `wait_task(until: match)` readiness is an observation, not a terminal result.",
         item.id,
         item.kind.label()
     )
