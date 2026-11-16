@@ -523,7 +523,7 @@ pub enum InputDelivery {
     Sending,
     /// Saved durably; no model round has taken it yet.
     Pending,
-    /// Its transcript row exists and a model request included it.
+    /// Its row was committed to the runtime's model context.
     Delivered,
     /// Settled without delivery because the task was cancelled.
     Cancelled(String),
@@ -541,6 +541,9 @@ pub struct UserInputBlock {
     pub id: MessageId,
     pub text: String,
     pub state: InputDelivery,
+    pub revision: i64,
+    pub edit_expires_ms: Option<i64>,
+    pub priority: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -623,6 +626,7 @@ fn is_foldable_item(item: &TranscriptItem) -> bool {
 #[derive(Debug, Default, Clone)]
 pub struct TranscriptState {
     items: Vec<TranscriptItem>,
+    journal_inputs: Vec<UserInputBlock>,
     /// Next concurrent-burst id. Monotonic for the session so two bursts are
     /// never confused after a group closes and reopens.
     next_batch: u32,
@@ -657,6 +661,7 @@ impl TranscriptState {
     pub fn replace_with(&mut self, other: TranscriptState) {
         self.version = self.version.max(other.version).wrapping_add(1);
         self.items = other.items;
+        self.journal_inputs = other.journal_inputs;
         self.next_batch = self.next_batch.max(other.next_batch);
     }
 
@@ -666,10 +671,12 @@ impl TranscriptState {
         &mut self.items
     }
 
+    /// Whether the projection has any conversation or input journal state.
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.journal_inputs.is_empty()
     }
 
+    /// Number of indexed conversation items.
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -688,19 +695,25 @@ impl TranscriptState {
         self.push_user(text);
     }
 
-    /// Whether a message with this identity is already in the transcript.
+    /// Whether the projection already knows the input identity.
     pub fn has_input(&self, id: &MessageId) -> bool {
-        self.items
-            .iter()
-            .any(|item| matches!(item, TranscriptItem::UserInput(block) if &block.id == id))
+        self.input_state(id).is_some()
     }
 
-    /// Every user-input row with its delivery state, in transcript order.
+    /// Delivered input rows in history order, followed by unsettled and
+    /// cancelled inputs in admission order.
     pub fn inputs(&self) -> impl Iterator<Item = &UserInputBlock> {
-        self.items.iter().filter_map(|item| match item {
-            TranscriptItem::UserInput(block) => Some(block),
-            _ => None,
-        })
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::UserInput(block) => Some(block),
+                _ => None,
+            })
+            .chain(self.journal_inputs.iter())
+    }
+
+    pub(crate) fn journal_inputs(&self) -> &[UserInputBlock] {
+        &self.journal_inputs
     }
 
     /// Add one user input with its delivery state, unless the identity is
@@ -711,52 +724,86 @@ impl TranscriptState {
             return false;
         }
         self.bump();
-        self.close_tool_group();
-        self.items.push(TranscriptItem::UserInput(UserInputBlock {
+        let block = UserInputBlock {
             id,
             text,
             state,
-        }));
+            revision: 0,
+            edit_expires_ms: None,
+            priority: false,
+        };
+        if block.state == InputDelivery::Delivered {
+            self.close_tool_group();
+            self.items.push(TranscriptItem::UserInput(block));
+        } else {
+            self.journal_inputs.push(block);
+        }
         true
+    }
+
+    pub(crate) fn apply_pending_steer(&mut self, steer: leveler_client_protocol::UiPendingSteer) {
+        if matches!(
+            self.input_state(&steer.message_id),
+            Some(InputDelivery::Delivered | InputDelivery::Cancelled(_))
+        ) {
+            return;
+        }
+        self.push_input(
+            steer.message_id.clone(),
+            steer.text.clone(),
+            InputDelivery::Pending,
+        );
+        if let Some(row) = self
+            .journal_inputs
+            .iter_mut()
+            .find(|row| row.id == steer.message_id)
+            && steer.revision >= row.revision
+        {
+            row.text = steer.text;
+            row.edit_expires_ms = steer.edit_expires_ms;
+            row.priority |= steer.priority;
+            row.revision = steer.revision;
+            self.bump();
+        }
     }
 
     /// Update the delivery state for `id`. Returns whether the identity was
     /// known.
     pub fn set_input_state(&mut self, id: &MessageId, state: InputDelivery) -> bool {
-        for item in &mut self.items {
-            if let TranscriptItem::UserInput(block) = item
-                && &block.id == id
-            {
-                if block.state != state {
-                    block.state = state;
-                    self.bump();
-                }
-                return true;
-            }
+        let Some(index) = self.journal_inputs.iter().position(|block| &block.id == id) else {
+            return self.inputs().any(|block| &block.id == id);
+        };
+        let block = &mut self.journal_inputs[index];
+        if block.state == state || matches!(block.state, InputDelivery::Cancelled(_)) {
+            return true;
         }
-        false
+        block.state = state;
+        if block.state == InputDelivery::Delivered {
+            // Admission can precede many output events. Place the visible
+            // user message at settlement, after the work that preceded it.
+            let block = self.journal_inputs.remove(index);
+            self.close_tool_group();
+            self.items.push(TranscriptItem::UserInput(block));
+        }
+        self.bump();
+        true
     }
 
     /// The delivery state currently painted for `id`, if the row exists.
     pub fn input_state(&self, id: &MessageId) -> Option<&InputDelivery> {
-        self.items.iter().find_map(|item| match item {
-            TranscriptItem::UserInput(block) if &block.id == id => Some(&block.state),
-            _ => None,
-        })
+        self.inputs()
+            .find(|block| &block.id == id)
+            .map(|block| &block.state)
     }
 
     /// Drop a locally painted input the runtime explicitly refused. Text the
     /// runtime never admitted has no message to keep.
     pub fn remove_input(&mut self, id: &MessageId) -> bool {
-        let Some(index) = self
-            .items
-            .iter()
-            .position(|item| matches!(item, TranscriptItem::UserInput(block) if &block.id == id))
-        else {
+        let Some(index) = self.journal_inputs.iter().position(|block| &block.id == id) else {
             return false;
         };
         self.bump();
-        self.items.remove(index);
+        self.journal_inputs.remove(index);
         true
     }
 
@@ -2591,6 +2638,7 @@ impl TranscriptState {
     pub fn clear(&mut self) {
         self.bump();
         self.items.clear();
+        self.journal_inputs.clear();
     }
 
     fn assistant_mut(&mut self, id: &MessageId) -> Option<&mut AssistantBlock> {

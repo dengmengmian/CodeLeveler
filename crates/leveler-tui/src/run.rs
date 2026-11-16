@@ -215,6 +215,11 @@ pub async fn run(
                         Err(_) => DeliveryAnswer::None,
                     };
                     match answer {
+                        DeliveryAnswer::Delivered
+                            if matches!(command, ClientCommand::ManageSteer { .. }) =>
+                        {
+                            EffectCompletion::SteerCommandDelivered(command)
+                        }
                         DeliveryAnswer::Delivered => EffectCompletion::CommandDelivered,
                         DeliveryAnswer::Rejected { message, .. } => {
                             EffectCompletion::CommandRejected {
@@ -601,6 +606,7 @@ pub async fn run(
         let _ = execute!(stdout, LeaveAlternateScreen);
     }
 
+    crate::pending_steer::restore_draft(&mut state);
     // Persist (or clear) the composer draft for next launch (spec §24).
     if let Some(path) = state.draft_path() {
         let draft = state.composer.canonical_text();

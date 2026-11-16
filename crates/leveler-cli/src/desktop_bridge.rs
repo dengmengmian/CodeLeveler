@@ -686,6 +686,7 @@ fn error_kind(error: &anyhow::Error) -> &'static str {
         Some(ClientError::RecoveryRequired(_)) => "recovery_required",
         Some(ClientError::Unresolvable(_)) => "unresolvable",
         Some(ClientError::OwnershipConflict(_)) => "ownership_conflict",
+        Some(ClientError::SteerConflict(_)) => "steer_conflict",
         Some(ClientError::SessionNotFound(_)) => "session_not_found",
         Some(ClientError::Runtime(_)) => "rejected",
         None if error

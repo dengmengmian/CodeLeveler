@@ -123,9 +123,8 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             return Vec::new();
         }
         // The product default: a message typed while a turn runs joins that
-        // turn at its next model round. The row appears immediately as
-        // Sending; only the runtime's admission answer promotes it to saved,
-        // and only its settlement says the model actually took it.
+        // turn at its next model round. The composer shows the submission
+        // state until the runtime settles the input into history.
         let text = state.composer.take().trim().to_string();
         if text.is_empty() {
             return Vec::new();

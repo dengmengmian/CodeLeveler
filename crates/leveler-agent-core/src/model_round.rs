@@ -220,6 +220,9 @@ async fn run_model_round_with(
 #[async_trait::async_trait]
 pub trait ModelRoundObserver: Send {
     type Error: From<AgentCoreError> + Send;
+    fn model_attempt_interrupt(&self) -> Option<CancellationToken> {
+        None
+    }
     /// Re-read host admission immediately before every physical send, including
     /// after retry backoff when concurrent work may have spent shared budget.
     async fn before_attempt(&mut self) -> Result<(), Self::Error> {
@@ -287,6 +290,7 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             .into());
         }
         observer.before_attempt().await?;
+        let interrupt = observer.model_attempt_interrupt();
         observer.on_event(AgentEvent::StreamAttemptStarted);
         let attempt_started = std::time::Instant::now();
         let mut observed_usage = None;
@@ -298,6 +302,7 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             runtime,
             attempt_request,
             cancellation,
+            interrupt.as_ref(),
             &mut |event| observer.on_event(event),
             &mut observed_usage,
             &mut output_estimate,
@@ -368,6 +373,9 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             }
             // Cancellation is surfaced as its own error, never retried.
             Err(e) if cancellation.is_cancelled() => return Err(e.into()),
+            Err(AgentCoreError::Model(e)) if e.kind == ModelErrorKind::SupersededBySteer => {
+                return Err(AgentCoreError::Model(e).into());
+            }
             Err(AgentCoreError::Model(e)) => e,
             Err(e) => return Err(e.into()),
         };
@@ -458,6 +466,7 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             biased;
             _ = cancellation.cancelled() => return Err(AgentCoreError::Cancelled.into()),
             _ = wait_for_deadline(request.deadline) => return Err(AgentCoreError::Model(ModelError::new(ModelErrorKind::Timeout,"model request deadline elapsed during retry backoff")).into()),
+            _ = wait_for_steer(interrupt.as_ref()) => return Err(steer_superseded(DeliveryState::NotSent).into()),
             _ = tokio::time::sleep(wait) => {}
         }
     }
@@ -531,10 +540,28 @@ struct AttemptDiagnostics {
     max_event_gap_ms: Option<u64>,
 }
 
+async fn wait_for_steer(interrupt: Option<&CancellationToken>) {
+    match interrupt {
+        Some(signal) => signal.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn steer_superseded(delivery: DeliveryState) -> AgentCoreError {
+    ModelError::new(
+        ModelErrorKind::SupersededBySteer,
+        "replaced by pending user input",
+    )
+    .with_delivery_state(delivery)
+    .into()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_round(
     runtime: &dyn ModelRuntime,
     request: ModelRequest,
     cancellation: &CancellationToken,
+    interrupt: Option<&CancellationToken>,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     observed_usage: &mut Option<TokenUsage>,
     output_estimate: &mut leveler_model::TokenEstimate,
@@ -564,11 +591,20 @@ async fn stream_round(
     // exists to prevent.
     let route = runtime.route_identity(&request.model);
 
+    if cancellation.is_cancelled() {
+        return Err(AgentCoreError::Cancelled);
+    }
+    if interrupt.is_some_and(CancellationToken::is_cancelled) {
+        return Err(steer_superseded(DeliveryState::NotSent));
+    }
+    let attempt_cancellation = cancellation.child_token();
+    let _attempt_guard = attempt_cancellation.clone().drop_guard();
     let started_stream = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(AgentCoreError::Cancelled),
         _ = wait_for_deadline(deadline) => return Err(ModelError::new(ModelErrorKind::Timeout, "model request deadline elapsed").into()),
-        result = runtime.stream(request, cancellation.child_token()) => result,
+        _ = wait_for_steer(interrupt) => return Err(steer_superseded(DeliveryState::Unknown)),
+        result = runtime.stream(request, attempt_cancellation) => result,
     };
     let mut stream = match started_stream {
         Ok(s) => s,
@@ -626,6 +662,15 @@ async fn stream_round(
             biased;
             _ = cancellation.cancelled() => return Err(AgentCoreError::Cancelled),
             _ = wait_for_deadline(deadline) => return Err(ModelError::new(ModelErrorKind::Timeout, "model request deadline elapsed").into()),
+            _ = wait_for_steer(interrupt), if text.is_empty() && !completed => {
+                return Err(steer_superseded(DeliveryState::StreamInterrupted {
+                    progress: StreamProgress {
+                        text: false,
+                        reasoning: reasoning_started,
+                        tool_args: tool_args_started || !calls.is_empty(),
+                    },
+                }));
+            },
             event = stream.next() => event,
         };
         let Some(event) = event else { break };

@@ -272,6 +272,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // transcript, so the conversation shrinks by exactly what the decision box
     // needs and the message that raised it stays visible right above it.
     let workspace_inner = crate::layout::horizontal_inset(area, crate::layout::WORKSPACE_GUTTER_X);
+    let steer_rows = crate::pending_steer::rows(state);
     let composer_rows = match &state.overlay {
         Some(ov) => {
             crate::overlay::overlay_height(ov, &state.theme, workspace_inner.width, state.locale)
@@ -299,7 +300,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // Plan and runtime claim rows before the transcript gets its viewport.
     let strip = state_strip(state, workspace_inner.width as usize);
     let strip_rows = u16::from(strip.is_some());
-    let chrome_rows = strip_rows + attach_rows + pending_rows + live_rows;
+    let chrome_rows = strip_rows + attach_rows + pending_rows + live_rows + steer_rows;
     // One breathing row separates the roster from the context footer.
     let team_gap = u16::from(team_rows > 0);
     let base_rows = header_rows
@@ -320,7 +321,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // Breathing room around the input box: blank above only when live chrome
     // (the state strip / attachments / 待发送) sits on top of it; blank below
     // always so Context footer is not flush on the composer border.
-    let pre_composer_gap = u16::from(chrome_rows + plan_rows > 0);
+    let pre_composer_gap = u16::from(chrome_rows + plan_rows > steer_rows);
     let [
         header,
         conversation,
@@ -332,6 +333,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         pending,
         shell,
         _,
+        steer,
         composer,
         footer,
         _,
@@ -348,6 +350,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         Constraint::Length(pending_rows),
         Constraint::Length(live_rows),
         Constraint::Length(pre_composer_gap),
+        Constraint::Length(steer_rows),
         Constraint::Length(composer_rows),
         Constraint::Length(footer_rows),
         // The agent runtime roster lives BELOW the composer/status chrome:
@@ -384,6 +387,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_attachments(frame, chrome_slot(attachments), state);
     crate::pending_inputs::render(frame, chrome_slot(pending), state, area.height);
     render_shell_live_activity(frame, chrome_slot(shell), state);
+    crate::pending_steer::render_compact(frame, chrome_slot(steer), state);
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
@@ -395,7 +399,10 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 
     // /btw is its own surface (see `crate::btw`), not an overlay here.
 
-    if state.active_screen == Screen::Conversation && state.overlay.is_none() {
+    if state.active_screen == Screen::Conversation
+        && state.overlay.is_none()
+        && state.steer.edit.is_none()
+    {
         let shell_popup =
             crate::render::render_shell_completion(frame, conversation, input_slot, state);
         let slash_popup = render_slash_popup(frame, conversation, input_slot, state);
@@ -1449,7 +1456,13 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
         width
     };
 
-    if show_secondary
+    if state.steer.edit.is_some() && left_limit > 0 {
+        let hint = crate::render::truncate_display(state.t().steer_edit_hint, left_limit);
+        frame.render_widget(
+            Paragraph::new(Line::styled(hint, dim)),
+            Rect::new(area.x, area.y, left_limit as u16, 1),
+        );
+    } else if show_secondary
         && left_limit > 0
         && let Some(line) = crate::render::key_hint_line(state, left_limit)
             .into_iter()
@@ -1707,6 +1720,82 @@ mod tests {
             .iter()
             .position(|l| l.contains(needle))
             .unwrap_or_else(|| panic!("`{needle}` not on screen:\n{}", lines.join("\n")))
+    }
+
+    #[test]
+    fn admitted_steer_stays_above_the_composer_until_settlement() {
+        use leveler_client_protocol::{
+            MessageId, RuntimeEvent, UiInputState, UiMessage, UiMessageKind, UiRole,
+        };
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.composer.replace("unsent draft");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut render = |state: &mut AppState| {
+            terminal
+                .draw(|frame| crate::render::render(frame, state))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let lines = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let history = crate::conversation::build::build_conversation_lines(state, 90)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            (lines, history, state.conv.rect.unwrap().3)
+        };
+        let (_, _, initial_height) = render(&mut state);
+        let id = MessageId::new("persisted-steer");
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::Runtime(RuntimeEvent::InputAdmitted {
+                message: UiMessage {
+                    id: id.clone(),
+                    role: UiRole::User,
+                    text: "additional requirement".into(),
+                    ordinal: None,
+                    kind: Some(UiMessageKind::PendingInput),
+                    images: 0,
+                },
+            }),
+        );
+        state.transcript.push_note("continued working".into());
+        let (lines, history, pending_height) = render(&mut state);
+        assert!(
+            history
+                .iter()
+                .all(|line| !line.contains("additional requirement"))
+        );
+        assert_eq!(pending_height + 2, initial_height);
+        assert!(row_of(&lines, "continued working") < row_of(&lines, "additional requirement"));
+        assert!(row_of(&lines, "additional requirement") < row_of(&lines, "unsent draft"));
+
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::Runtime(RuntimeEvent::InputSettled {
+                message_id: id,
+                state: UiInputState::Delivered,
+                reason: String::new(),
+                ordinal: Some(2),
+            }),
+        );
+        let (lines, history, settled_height) = render(&mut state);
+        assert_eq!(settled_height, initial_height);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("additional requirement"))
+                .count(),
+            1
+        );
+        assert!(row_of(&history, "continued working") < row_of(&history, "additional requirement"));
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub enum Screen {
     Issue,
     /// Full active plan, opened from the workbench's one-line plan summary.
     Plan,
+    /// The pending input journal for the current conversation.
+    PendingSteer,
     /// Full active objective, opened from the bounded header summary.
     Goal,
     Help,
@@ -1431,6 +1433,7 @@ mod reachability_tests {
             Screen::Memory => Some("`/memory` — reducer/submit.rs"),
             Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
             Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
+            Screen::PendingSteer => Some("Alt+S or pending steer controls — pending_steer.rs"),
         }
     }
 
@@ -1454,6 +1457,7 @@ mod reachability_tests {
             Screen::Schedules,
             Screen::Memory,
             Screen::Output,
+            Screen::PendingSteer,
         ];
         for screen in all {
             assert!(

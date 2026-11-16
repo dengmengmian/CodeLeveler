@@ -356,6 +356,8 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ordinal: Option<u64>,
     },
+    /// Authoritative, revisioned state of a pending steer.
+    SteerUpdated { steer: UiPendingSteer },
     /// A new assistant message began; deltas will target this id.
     AssistantMessageStarted { message_id: MessageId },
     /// A retry attempt began. Remove the prior transient message, if present,
@@ -1055,6 +1057,17 @@ pub enum RuntimeEvent {
         #[serde(default)]
         omitted_turns: u32,
     },
+}
+
+/// The current contents and controls of an undelivered input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiPendingSteer {
+    pub message_id: MessageId,
+    pub text: String,
+    pub revision: i64,
+    pub edit_expires_ms: Option<i64>,
+    pub priority: bool,
 }
 
 /// Deserialize a runtime event, treating **unknown** `type` tags as

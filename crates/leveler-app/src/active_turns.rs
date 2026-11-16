@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use leveler_core::SessionId;
+use leveler_core::{SessionId, TurnId};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub(crate) struct TurnLease {
     /// interrupt the running turn. The engine reads it at terminal time to
     /// distinguish `cancelled` from `interrupted`.
     task_cancel: Arc<AtomicBool>,
+    steering: Arc<ActiveSteering>,
 }
 
 impl TurnLease {
@@ -41,6 +42,10 @@ impl TurnLease {
     /// The explicit-task-cancellation flag this turn runs under.
     pub(crate) fn task_cancel(&self) -> Arc<AtomicBool> {
         self.task_cancel.clone()
+    }
+
+    pub(crate) fn steering(&self) -> Arc<ActiveSteering> {
+        self.steering.clone()
     }
 }
 
@@ -63,6 +68,18 @@ struct ActiveTurn {
     /// The accepted input this turn was promoted from, if any. A retry of the
     /// same submission must not also queue it as a mid-turn steer.
     seed_input_id: Option<String>,
+    /// Shared by the admission command and the drive's completion decision.
+    steering: Arc<ActiveSteering>,
+}
+
+#[derive(Default)]
+pub(crate) struct ActiveSteering {
+    pub(crate) admission_closed: tokio::sync::Mutex<bool>,
+    pub(crate) window: Mutex<Option<TurnId>>,
+    // A wake-up hint for observation tools. The journal still owns pending state.
+    pub(crate) input_signal: AtomicBool,
+    pub(crate) changed: tokio::sync::Notify,
+    pub(crate) model_interrupt: Mutex<CancellationToken>,
 }
 
 /// The outcome of an atomic retirement decision.
@@ -147,6 +164,7 @@ impl ActiveTurns {
         }
         let token = CancellationToken::new();
         let task_cancel = Arc::new(AtomicBool::new(false));
+        let steering = Arc::new(ActiveSteering::default());
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let now = Instant::now();
         active.insert(
@@ -159,6 +177,7 @@ impl ActiveTurns {
                 last_activity_at: now,
                 run_model: None,
                 seed_input_id: None,
+                steering: steering.clone(),
             },
         );
         Ok(TurnLease {
@@ -166,6 +185,7 @@ impl ActiveTurns {
             generation,
             cancellation: token,
             task_cancel,
+            steering,
         })
     }
 
@@ -213,6 +233,14 @@ impl ActiveTurns {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(session_id)
+    }
+
+    pub(crate) fn steering(&self, session_id: &SessionId) -> Option<Arc<ActiveSteering>> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|turn| turn.steering.clone())
     }
 
     /// Record observable progress for a running turn. A no-op when the session

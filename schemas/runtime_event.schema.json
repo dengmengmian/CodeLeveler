@@ -426,6 +426,25 @@
       }
     },
     {
+      "description": "Authoritative, revisioned state of a pending steer.",
+      "type": "object",
+      "required": [
+        "steer",
+        "type"
+      ],
+      "properties": {
+        "steer": {
+          "$ref": "#/definitions/UiPendingSteer"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "steer_updated"
+          ]
+        }
+      }
+    },
+    {
       "description": "A new assistant message began; deltas will target this id.",
       "type": "object",
       "required": [
@@ -4429,6 +4448,25 @@
               "type": "string",
               "enum": [
                 "input_settled"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Authoritative, revisioned state of a pending steer.",
+          "type": "object",
+          "required": [
+            "steer",
+            "type"
+          ],
+          "properties": {
+            "steer": {
+              "$ref": "#/definitions/UiPendingSteer"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "steer_updated"
               ]
             }
           }
@@ -10168,6 +10206,38 @@
           }
         }
       ]
+    },
+    "UiPendingSteer": {
+      "description": "The current contents and controls of an undelivered input.",
+      "type": "object",
+      "required": [
+        "message_id",
+        "priority",
+        "revision",
+        "text"
+      ],
+      "properties": {
+        "edit_expires_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "message_id": {
+          "$ref": "#/definitions/MessageId"
+        },
+        "priority": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
     },
     "UiPlan": {
       "description": "The execution plan (spec §20).",

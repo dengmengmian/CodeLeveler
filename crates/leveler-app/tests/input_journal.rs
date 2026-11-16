@@ -242,6 +242,311 @@ async fn wait_for_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEven
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steer_during_the_last_answer_is_consumed_in_the_original_turn() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = harness(vec![
+        MockResponse::GatedSse {
+            first: "data: {\"choices\":[{\"delta\":{\"content\":\"initial answer\"}}]}\n\n".into(),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            release: release.clone(),
+        },
+        text("revised answer"),
+    ])
+    .await;
+    let mut events = harness.client.subscribe();
+    harness
+        .client
+        .send(ClientCommand::SubmitMessage {
+            session_id: harness.session.clone(),
+            content: "ordinary question".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            events.recv().await.unwrap(),
+            RuntimeEvent::AssistantTextDelta { .. }
+        ) {}
+    })
+    .await
+    .expect("the final answer started streaming");
+    let id = MessageId::new("steer-during-stream");
+    harness
+        .client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: harness.session.clone(),
+            content: "include this detail in the same answer".into(),
+            message_id: Some(id.clone()),
+        })
+        .await
+        .unwrap();
+    release.notify_one();
+    settle_event(&mut events, &id, UiInputState::Delivered).await;
+    wait_for_terminal(&mut events).await;
+    let db = harness.app.open_database().await.unwrap();
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&harness.session)
+        .await
+        .unwrap();
+    let input = leveler_storage::SessionInputRepository::new(&db)
+        .load(&harness.session, id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(turns.len(), 1, "a steer must not open an unrelated turn");
+    assert_eq!(input.turn_id.as_ref().unwrap().as_str(), turns[0].id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_turn_does_not_consume_a_steer_bound_to_another_turn() {
+    let harness = harness(vec![text("first answer"), text("second answer")]).await;
+    let mut events = harness.client.subscribe();
+    let submit = |content: &str| ClientCommand::SubmitMessage {
+        session_id: harness.session.clone(),
+        content: content.into(),
+        attachments: vec![],
+    };
+    harness.client.send(submit("first question")).await.unwrap();
+    wait_for_terminal(&mut events).await;
+    let db = harness.app.open_database().await.unwrap();
+    let original = leveler_storage::TurnRepository::new(&db)
+        .list(&harness.session)
+        .await
+        .unwrap()
+        .remove(0);
+    let inputs = leveler_storage::SessionInputRepository::new(&db);
+    inputs
+        .admit(
+            "from-previous-turn",
+            &harness.session,
+            Some(&leveler_core::TurnId::new(original.id)),
+            "steer from the previous turn",
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    harness
+        .client
+        .send(submit("unrelated question"))
+        .await
+        .unwrap();
+    wait_for_terminal(&mut events).await;
+    let input = inputs
+        .load(&harness.session, "from-previous-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(input.state, leveler_storage::SessionInputState::Pending);
+    let requests = harness._server.request_bodies().await;
+    assert!(
+        requests
+            .iter()
+            .all(|body| !body.contains("steer from the previous turn")),
+        "a different lineage must not receive the instruction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_edit_replaces_the_steer_and_a_withdrawn_steer_stays_out() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = harness(vec![
+        MockResponse::GatedSse {
+            first: "data: {\"choices\":[{\"delta\":{\"content\":\"initial answer\"}}]}\n\n".into(),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+            release: release.clone(),
+        },
+        text("revised answer"),
+    ])
+    .await;
+    let mut events = harness.client.subscribe();
+    harness
+        .client
+        .send(ClientCommand::SubmitMessage {
+            session_id: harness.session.clone(),
+            content: "ordinary question".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            events.recv().await.unwrap(),
+            RuntimeEvent::AssistantTextDelta { .. }
+        ) {}
+    })
+    .await
+    .unwrap();
+    for (id, text) in [
+        ("edited", "stale-draft-marker"),
+        ("withdrawn", "withdrawn-marker"),
+    ] {
+        harness
+            .client
+            .send(ClientCommand::SteerCurrentTurn {
+                session_id: harness.session.clone(),
+                content: text.into(),
+                message_id: Some(MessageId::new(id)),
+            })
+            .await
+            .unwrap();
+    }
+    let command = |action: serde_json::Value| {
+        serde_json::from_value(serde_json::json!({
+            "type": "manage_steer", "session_id": harness.session, "action": action,
+        }))
+        .expect("Runtime supports structured steer management")
+    };
+    let lease = "b606db24-c8d0-486e-a1c7-be3f65b69d66";
+    let begin = |id: &str| {
+        command(serde_json::json!({
+            "type": "begin_edit", "message_id": "edited", "revision": 0, "lease_id": id,
+        }))
+    };
+    harness.client.send(begin(lease)).await.unwrap();
+    assert!(
+        harness
+            .client
+            .send(begin("726cbd12-8acb-4959-b0af-d316b229d4fb"))
+            .await
+            .is_err()
+    );
+    let save = command(serde_json::json!({
+        "type": "save_edit", "message_id": "edited", "revision": 1, "lease_id": lease,
+        "content": "final-draft-marker"
+    }));
+    harness.client.send(save.clone()).await.unwrap();
+    assert!(
+        harness.client.send(save).await.is_err(),
+        "a stale save must fail"
+    );
+    harness
+        .client
+        .send(command(serde_json::json!({
+            "type": "withdraw", "message_id": "withdrawn", "revision": 0,
+        })))
+        .await
+        .unwrap();
+    release.notify_one();
+    settle_event(
+        &mut events,
+        &MessageId::new("edited"),
+        UiInputState::Delivered,
+    )
+    .await;
+    wait_for_terminal(&mut events).await;
+    let requests = harness._server.request_bodies().await;
+    assert!(
+        requests
+            .iter()
+            .any(|body| body.contains("final-draft-marker"))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|body| !body.contains("stale-draft-marker") && !body.contains("withdrawn-marker"))
+    );
+    let db = harness.app.open_database().await.unwrap();
+    let inputs = leveler_storage::SessionInputRepository::new(&db);
+    let edited = inputs
+        .load(&harness.session, "edited")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.content, "final-draft-marker");
+    assert_eq!(edited.revision, 2);
+    let withdrawn = inputs
+        .load(&harness.session, "withdrawn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        withdrawn.state,
+        leveler_storage::SessionInputState::Cancelled
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immediate_steer_supersedes_an_in_flight_attempt_before_tool_dispatch() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let partial = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "id": "incomplete",
+        "function": {"name": "shell_command", "arguments": "{\"cmd\":"}
+    }]}}]});
+    let harness = harness(vec![
+        MockResponse::GatedSse {
+            first: format!("data: {partial}\n\n"),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".into(),
+            release: release.clone(),
+        },
+        text("answer with the correction"),
+    ]).await;
+    let mut events = harness.client.subscribe();
+    harness
+        .client
+        .send(ClientCommand::SubmitMessage {
+            session_id: harness.session.clone(),
+            content: "original".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness._server.request_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = MessageId::new("expedite");
+    harness
+        .client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: harness.session.clone(),
+            content: "priority-marker".into(),
+            message_id: Some(id.clone()),
+        })
+        .await
+        .unwrap();
+    let action = leveler_client_protocol::SteerAction::Prioritize {
+        message_id: id.clone(),
+        revision: 0,
+    };
+    let command = ClientCommand::ManageSteer {
+        session_id: harness.session.clone(),
+        action,
+    };
+    harness.client.send(command.clone()).await.unwrap();
+    harness.client.send(command).await.unwrap();
+    let before_tail = tokio::time::timeout(Duration::from_secs(4), async {
+        while harness._server.request_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    release.notify_one();
+    assert!(
+        before_tail.is_ok(),
+        "the first attempt must not hold up the prioritized input"
+    );
+    settle_event(&mut events, &id, UiInputState::Delivered).await;
+    wait_for_terminal(&mut events).await;
+    let requests = harness._server.request_bodies().await;
+    assert!(!requests[0].contains("priority-marker"));
+    assert_eq!(requests[1].matches("priority-marker").count(), 1);
+    let db = harness.app.open_database().await.unwrap();
+    assert_eq!(
+        leveler_storage::TurnRepository::new(&db)
+            .list(&harness.session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// A stale busy client may submit a steer after the runtime became idle.
 /// Admission still has to precede every execution event for that identity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -296,6 +296,12 @@ pub trait AgentHarness: Send {
         ControlContext::default()
     }
 
+    /// Optional signal for replacing this model attempt before public
+    /// output. Its lifetime does not extend to tool execution.
+    fn model_attempt_interrupt(&self) -> Option<CancellationToken> {
+        None
+    }
+
     /// Round top, before admission. Inject anything that must reach the model
     /// before it is asked (host input, settled background work).
     async fn on_round_start(

@@ -75,7 +75,7 @@ pub use approval::{
     ClarificationQuestionKind, UiApprovalRequest, UiClarificationQuestion, UiClarificationRequest,
     UiPendingInteraction,
 };
-pub use client::{ClientError, InteractiveRuntimeClient};
+pub use client::{ClientError, InteractiveRuntimeClient, SteerConflict};
 pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
@@ -89,10 +89,11 @@ pub use skills::{
     UiSkillStatus,
 };
 
+pub use command::SteerAction;
 pub use event::{
     ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RecoveryStop,
-    RuntimeEvent, UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiTurnUsage,
-    parse_runtime_event,
+    RuntimeEvent, UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiPendingSteer,
+    UiTurnUsage, parse_runtime_event,
 };
 pub use global_tasks::{
     UiGlobalTaskIndex, UiGlobalTaskSourceError, UiGlobalTaskSourceErrorKind, UiGlobalTaskSummary,

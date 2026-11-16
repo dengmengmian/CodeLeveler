@@ -427,7 +427,9 @@ impl IntoResponse for ApiError {
             ClientError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             ClientError::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ClientError::OutcomeUnknown(_) => StatusCode::SERVICE_UNAVAILABLE,
-            ClientError::RecoveryRequired(_) => StatusCode::CONFLICT,
+            ClientError::RecoveryRequired(_) | ClientError::SteerConflict(_) => {
+                StatusCode::CONFLICT
+            }
             ClientError::Unresolvable(_) | ClientError::OwnershipConflict(_) => {
                 StatusCode::CONFLICT
             }

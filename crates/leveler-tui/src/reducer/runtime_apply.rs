@@ -289,6 +289,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .push_input(message.id, shown, InputDelivery::Pending);
             }
         }
+        RuntimeEvent::SteerUpdated { steer } => state.transcript.apply_pending_steer(steer),
         RuntimeEvent::InputSettled {
             message_id,
             state: settled,
@@ -2413,12 +2414,22 @@ fn restore_history(
                 InputDelivery::Pending | InputDelivery::Cancelled(_)
             )
         })
-        .map(|input| (input.id.clone(), input.text.clone(), input.state.clone()))
+        .cloned()
         .collect();
     state.transcript.replace_with(scratch.transcript);
-    for (id, text, delivery) in journal_held {
-        if !state.transcript.has_input(&id) {
-            state.transcript.push_input(id, text, delivery);
+    for row in journal_held {
+        if row.state == InputDelivery::Pending {
+            state
+                .transcript
+                .apply_pending_steer(leveler_client_protocol::UiPendingSteer {
+                    message_id: row.id,
+                    text: row.text,
+                    revision: row.revision,
+                    edit_expires_ms: row.edit_expires_ms,
+                    priority: row.priority,
+                });
+        } else if !state.transcript.has_input(&row.id) {
+            state.transcript.push_input(row.id, row.text, row.state);
         }
     }
     settle_background_rows_from_chrome(state);
@@ -2428,6 +2439,9 @@ fn restore_history(
 
 /// Update header metadata from a snapshot without touching the transcript.
 fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
+    if state.session_id != session.id {
+        crate::pending_steer::restore_draft(state);
+    }
     if state.repository != session.repository {
         state.file_candidates.clear();
         state.file_index_requested = false;

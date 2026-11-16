@@ -448,6 +448,10 @@ struct KernelObserver<'a, H> {
 #[async_trait::async_trait]
 impl<H: AgentHarness> ModelRoundObserver for KernelObserver<'_, H> {
     type Error = KernelRoundError<H::Error>;
+    fn model_attempt_interrupt(&self) -> Option<CancellationToken> {
+        self.harness.model_attempt_interrupt()
+    }
+
     async fn before_attempt(&mut self) -> Result<(), Self::Error> {
         self.harness
             .before_model_attempt(self.ctx)

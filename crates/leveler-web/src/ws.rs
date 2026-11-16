@@ -372,6 +372,7 @@ fn error_frame(error: &ClientError, command_id: Option<String>) -> DownstreamMes
         ClientError::RecoveryRequired(_) => "recovery_required",
         ClientError::Unresolvable(_) => "outcome_unresolvable",
         ClientError::OwnershipConflict(_) => "ownership_conflict",
+        ClientError::SteerConflict(_) => "steer_conflict",
     };
     DownstreamMessage::Error {
         code: code.to_string(),

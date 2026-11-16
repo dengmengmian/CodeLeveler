@@ -45,6 +45,7 @@ mod observability;
 pub mod output_view;
 pub mod overlay;
 pub mod pending_inputs;
+mod pending_steer;
 #[cfg(test)]
 mod perf_bench;
 mod plan_cell;

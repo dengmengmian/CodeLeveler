@@ -495,6 +495,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Schedules => return crate::schedules::handle_key(state, &key),
+        Screen::PendingSteer => return crate::pending_steer::key(state, key).unwrap_or_default(),
         Screen::Memory => return crate::memory::handle_key(state, &key),
         Screen::Clean => match key.code {
             // Esc leaves the page. It never cancels foreground Agent work, and

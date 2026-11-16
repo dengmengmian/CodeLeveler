@@ -16,6 +16,12 @@ use tokio::sync::Mutex;
 pub enum MockResponse {
     /// 200 `text/event-stream` written as one body, then a clean close.
     Sse { body: String },
+    /// Stream the opening frame, then wait for the test to release the tail.
+    GatedSse {
+        first: String,
+        tail: String,
+        release: Arc<tokio::sync::Notify>,
+    },
     /// 200 stream written as separate raw byte chunks (to force fragmentation),
     /// each flushed with a small delay, then a clean close.
     RawChunks { chunks: Vec<Vec<u8>> },
@@ -288,6 +294,20 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
                 stream.flush().await?;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+        }
+        MockResponse::GatedSse {
+            first,
+            tail,
+            release,
+        } => {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await?;
+            stream.write_all(first.as_bytes()).await?;
+            stream.flush().await?;
+            release.notified().await;
+            stream.write_all(tail.as_bytes()).await?;
+            stream.flush().await?;
         }
         MockResponse::SilentThenJson { silent_ms, body } => {
             tokio::time::sleep(Duration::from_millis(silent_ms)).await;

@@ -784,7 +784,7 @@ fn infrastructure_cause_from_model_error(
     use leveler_model::ModelErrorKind as K;
     match error.kind {
         // Not infrastructure boundaries (UsageLimited / Incomplete).
-        K::RateLimit | K::Cancelled => None,
+        K::RateLimit | K::Cancelled | K::SupersededBySteer => None,
         // Wire/protocol contract violations: the provider rejected the request
         // as invalid, or sent a body we could not decode.
         K::InvalidRequest | K::Decode => Some(leveler_eval::FailureCategory::ProviderProtocol),

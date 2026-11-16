@@ -397,6 +397,8 @@ export type RuntimeEvent =
   | { type: 'input_admitted'; message: UiMessage }
   /** A previously admitted input reached a terminal state. `Delivered` means its transcript row is durable (and `ordinal` locates it); `Cancelled` means it never will be. A cancelled input is never resurrected by a later turn. */
   | { type: 'input_settled'; message_id: MessageId; ordinal?: number | null; reason?: string; state: UiInputState }
+  /** Authoritative, revisioned state of a pending steer. */
+  | { type: 'steer_updated'; steer: UiPendingSteer }
   /** A new assistant message began; deltas will target this id. */
   | { type: 'assistant_message_started'; message_id: MessageId }
   /** A retry attempt began. Remove the prior transient message, if present, and clear its reasoning before applying new deltas. */
@@ -793,6 +795,16 @@ export interface ScheduleWakeView {
 
 /** Identifies a single agent session (one user goal end to end). */
 export type SessionId = string;
+
+/** An operation on the pending steer journal. */
+export type SteerAction =
+  | { type: 'list' }
+  | { type: 'begin_edit'; lease_id: string; message_id: MessageId; revision: number }
+  | { type: 'save_edit'; content: string; lease_id: string; message_id: MessageId; revision: number }
+  | { type: 'cancel_edit'; lease_id: string; message_id: MessageId; revision: number }
+  | { type: 'withdraw'; message_id: MessageId; revision: number }
+  | { type: 'prioritize'; message_id: MessageId; revision: number }
+  | { type: 'prioritize_all' };
 
 /** How hard the user wants the model to think, in CodeLeveler's own words. The order is the product contract: weakest → strongest, with `Auto` first because "no override" precedes explicit intensity choices. */
 export type ThinkingLevel =
@@ -1494,6 +1506,15 @@ export type UiPendingInteraction =
   | { type: 'approval'; request: UiApprovalRequest }
   | { type: 'clarification'; request: UiClarificationRequest };
 
+/** The current contents and controls of an undelivered input. */
+export interface UiPendingSteer {
+  edit_expires_ms?: number | null;
+  message_id: MessageId;
+  priority: boolean;
+  revision: number;
+  text: string;
+}
+
 /** The execution plan (spec §20). */
 export interface UiPlan {
   /** Lifecycle of the newest declaration. Older runtimes omit it, which decodes as [`UiPlanState::Active`] — their only previous behavior. */
@@ -1845,8 +1866,10 @@ export type ClientCommand =
   | { type: 'request_away_summary'; session_id: SessionId }
   /** Submit a user message; the runtime drives a turn in the given session. */
   | { type: 'submit_message'; attachments?: AttachmentRef[]; content: string; session_id: SessionId }
-  /** Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. This is the default meaning of Enter while a turn runs. The runtime persists the text before it acknowledges the command. A turn that ends before the next round still delivers it as a new turn, so it is never silently dropped. A correction like "actually use the other module" is worthless once the work is finished, which is why it joins the running turn rather than a later one. When no turn is running the runtime starts one with the same text, so the busy/idle race in the client cannot lose the message. `message_id` is the client's stable identity for this input. The runtime echoes it in `InputAdmitted` and every later state event, so a retry cannot create a second row and a client can update the exact row it drew. Legacy clients omit it; the runtime generates one. */
+  /** Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. This is the default meaning of Enter while a turn runs. The runtime persists accepted text before acknowledging it. Input accepted by a live turn stays with its execution lineage. When no turn is running the runtime starts one with the same text, so the busy/idle race in the client cannot lose the message. `message_id` is the client's stable identity for this input. The runtime echoes it in `InputAdmitted` and every later state event, so a retry cannot create a second row and a client can update the exact row it drew. Legacy clients omit it; the runtime generates one. */
   | { type: 'steer_current_turn'; content: string; message_id?: MessageId | null; session_id: SessionId }
+  /** Read or modify the authoritative journal of undelivered steers. */
+  | { type: 'manage_steer'; action: SteerAction; session_id: SessionId }
   /** Run an explicit goal task. Unlike ordinary chat messages, this enables goal-mode completion (`update_goal`) in the agent loop. */
   | { type: 'run_goal'; content: string; require_new_turn?: boolean; session_id: SessionId }
   /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. This is an EXPLICIT client command: the user chose to resume, so the client does not need to classify their words. The runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text, preserved alongside the original objective and added to it, never replacing it. */

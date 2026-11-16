@@ -1298,8 +1298,8 @@ pub(crate) mod transcript_lines;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub(crate) use transcript_lines::{
-    USER_SHELL_STOP_ZONE, input_state_line, paint_reasoning_rail, reasoning_rail_rows,
-    sub_agent_detail, turn_end_marker, user_shell_lines_with_copy, user_shell_output_room,
+    USER_SHELL_STOP_ZONE, paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail,
+    turn_end_marker, user_shell_lines_with_copy, user_shell_output_room,
 };
 pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
@@ -1326,6 +1326,7 @@ use screens::{
 /// Conversation uses the workbench layout (Header / Conversation viewport /
 /// Plan / Input / Footer). Other screens keep the classic full-screen panes.
 pub fn render(frame: &mut Frame, state: &mut AppState) {
+    crate::pending_steer::clear_hits(state);
     state.plan_hit = None;
     state.background_stop_hits.clear();
     state.background_list_hits.clear();
@@ -1383,6 +1384,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Team => render_team_screen(frame, area, state),
         Screen::Issue => render_issue_screen(frame, area, state),
         Screen::Plan => render_plan_screen(frame, area, state),
+        Screen::PendingSteer => crate::pending_steer::render_detail(frame, area, state),
         Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
         Screen::Doctor => crate::terminal_diagnostics::render_screen(frame, area, state),

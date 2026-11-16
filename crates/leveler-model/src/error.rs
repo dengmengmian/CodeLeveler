@@ -39,6 +39,8 @@ pub enum ModelErrorKind {
     Timeout,
     /// The request was cancelled by the caller.
     Cancelled,
+    /// The host replaced this attempt to deliver newly accepted user input.
+    SupersededBySteer,
     /// CodeLeveler built a message sequence that breaks the tool-exchange
     /// invariant, and refused to send it. An internal defect, not a provider
     /// rejection: the request never left this process.
@@ -360,6 +362,7 @@ impl ModelError {
             | K::Truncated
             | K::ContentFiltered
             | K::Cancelled
+            | K::SupersededBySteer
             | K::ConversationProtocol
             | K::Other => return Retryability::Never,
             K::RateLimit

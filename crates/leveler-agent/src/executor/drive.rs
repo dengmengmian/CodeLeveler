@@ -2286,6 +2286,21 @@ impl<'a> Drive<'a> {
                 "settled goal terminal requested without a resolution".to_string(),
             ));
         };
+        if reason == StopReason::Completed
+            && let Some(source) = self.executor.steering.as_ref()
+            && !source
+                .try_close_input_admission(rt.cancellation().clone())
+                .await?
+        {
+            // The completion decision predates input the model hasn't seen.
+            // Its candidate answer and verification cannot settle that input.
+            self.settled_rounds = 0;
+            self.delivery_followup_issued = false;
+            self.completion_verification = None;
+            self.terminal_answer = None;
+            self.answer_candidate = None;
+            return Ok(Flow::NextRound);
+        }
         let delivered = self
             .terminal_answer
             .as_ref()
@@ -3607,6 +3622,10 @@ impl AgentHarness for Drive<'_> {
         self.forward_kernel_event(event);
     }
 
+    fn model_attempt_interrupt(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.executor.steering.as_ref()?.model_attempt_interrupt()
+    }
+
     async fn before_model_attempt(&mut self, rt: &mut LoopContext) -> Result<(), AgentError> {
         let input = self.last_projected_input_tokens.ok_or_else(|| {
             AgentError::InvalidBudget(
@@ -3874,9 +3893,9 @@ impl AgentHarness for Drive<'_> {
         // model is asked anything: a correction that arrives after the work
         // is done is worthless. Empty is the normal case.
         if let Some(source) = &self.executor.steering {
-            for input in source.take_pending_inputs() {
-                let text = input.text.trim();
-                if text.is_empty() {
+            for input in source.pending_inputs_for_round().await? {
+                let text = input.text.as_str();
+                if text.trim().is_empty() {
                     continue;
                 }
                 // The user just spoke; a declaration about the newest input
@@ -3884,8 +3903,6 @@ impl AgentHarness for Drive<'_> {
                 // already acted on. An answer given before this input may
                 // already have been reversed, so it is no longer current
                 // scope authority either.
-                self.latest_user_input = text.to_string();
-                self.scope_answers_from = self.clarification_answers.len();
                 let message = Message::user_input(text);
                 // A journalled input is appended and settled in one durable
                 // transaction. `false` means the user cancelled it while this
@@ -3895,12 +3912,14 @@ impl AgentHarness for Drive<'_> {
                         Some(ordinal) => source.input_consumed(id, Some(ordinal)),
                         // Cancelled (or already consumed) while this round was
                         // being prepared: it must not enter the context.
-                        None => continue,
+                        None => break,
                     },
                     None => {
                         self.sink.append(std::slice::from_ref(&message)).await?;
                     }
                 }
+                self.latest_user_input = text.to_string();
+                self.scope_answers_from = self.clarification_answers.len();
                 // A user message during a running goal becomes scope only
                 // through the model's structured declaration: `declare_intent`
                 // records the reading, and `declare_scope` records the
@@ -4001,6 +4020,11 @@ impl AgentHarness for Drive<'_> {
     ) -> Result<Flow<AgentOutcome>, AgentError> {
         let cancellation = rt.cancellation().clone();
         match error {
+            AgentCoreError::Model(e)
+                if e.kind == leveler_model::ModelErrorKind::SupersededBySteer =>
+            {
+                return Ok(Flow::NextRound);
+            }
             AgentCoreError::Model(e)
                 if e.kind == leveler_model::ModelErrorKind::Decode
                     && self.decode_retries < MAX_DECODE_RETRIES
@@ -4518,6 +4542,13 @@ impl AgentHarness for Drive<'_> {
                 return Ok(Flow::NextRound);
             }
             self.sink.append(&[assistant]).await?;
+            if let Some(source) = self.executor.steering.as_ref()
+                && !source
+                    .try_close_input_admission(cancellation.clone())
+                    .await?
+            {
+                return Ok(Flow::NextRound);
+            }
             (self.observer)(AgentEvent::Finished(self.last_text.clone()));
             self.enter_finalization();
             // In goal mode reaching this point means the model went quiet
@@ -8772,6 +8803,7 @@ impl AgentHarness for Drive<'_> {
                 .await?
             {
                 Flow::Stop(outcome) => return Ok(outcome),
+                Flow::NextRound if self.settled_goal.is_none() => {}
                 Flow::Continue | Flow::NextRound => {
                     return Err(AgentError::ContextManagementFailure(
                         "settled goal terminal did not publish".to_string(),

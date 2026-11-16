@@ -101,6 +101,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     if grouped {
         state.composer.end_edit_group();
     }
+    crate::pending_steer::reconcile(state);
     if !effects.contains(&Effect::Quit)
         && let Some(advance) = drain_pending_input(state)
     {
@@ -118,6 +119,13 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             Action::Key(_) | Action::Mouse(_) | Action::Paste(_) | Action::TextInput(_)
         )
     {
+        return Vec::new();
+    }
+    if state.steer.edit.is_some()
+        && state.overlay.is_none()
+        && let Action::Paste(text) | Action::TextInput(text) = &action
+    {
+        state.composer.insert_paste(text);
         return Vec::new();
     }
     // Search owns all text, including terminal paste/burst events. A query
@@ -200,6 +208,18 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             apply_runtime(state, event);
             interaction::restore_reading_anchor(state, anchor);
             let mut effects = Vec::new();
+            if opened
+                && state
+                    .transcript
+                    .journal_inputs()
+                    .iter()
+                    .any(|row| row.state == crate::transcript::InputDelivery::Pending)
+            {
+                effects.push(Effect::Send(ClientCommand::ManageSteer {
+                    session_id: state.session_id.clone(),
+                    action: leveler_client_protocol::SteerAction::List,
+                }));
+            }
             // A reopened conversation shows its text from the snapshot at
             // once; what ran in it comes from the durable history.
             if opened && !state.is_busy() && !state.transcript.is_empty() {
@@ -531,6 +551,9 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             }
         }
         EffectCompletion::CommandDelivered => {}
+        EffectCompletion::SteerCommandDelivered(command) => {
+            crate::pending_steer::completed(state, &command, true)
+        }
         EffectCompletion::CommandRejected {
             command,
             message,
@@ -539,6 +562,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             if let Some(snapshot) = snapshot {
                 runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
+            crate::pending_steer::completed(state, &command, false);
             // Nothing is being stopped: the row goes back to offering a stop.
             if let ClientCommand::CancelToolCall { call_id, .. } = &command {
                 state
@@ -555,6 +579,7 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             if let Some(snapshot) = snapshot {
                 runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
+            crate::pending_steer::completed(state, &command, false);
             // The stop may or may not have reached the runtime. A call still
             // running says exactly that; one that settled says how.
             if let ClientCommand::CancelToolCall { call_id, .. } = &command {
@@ -999,6 +1024,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     // Shift+drag: do not capture selection — leave room for terminal-native select.
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
         return Vec::new();
+    }
+    if !state.completion.open
+        && let Some(effects) = crate::pending_steer::mouse(state, mouse)
+    {
+        return effects;
     }
 
     // The completion menu owns the pointer over itself: wheel moves the
@@ -1978,6 +2008,9 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let btw = state.surface == SurfaceFocus::Btw;
+    if !btw && let Some(effects) = crate::pending_steer::key(state, key) {
+        return effects;
+    }
 
     if !btw
         && alt
@@ -2187,7 +2220,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // Whether the slash-command popup is showing (drives Up/Down/Tab/Enter/Esc).
     // The side thread is a plain conversation: no slash popups, no completions,
     // no next-step ghost.
-    let popup_len = if btw {
+    let popup_len = if btw || state.steer.edit.is_some() {
         0
     } else {
         crate::screen::visible_slash_popup(state)
@@ -2195,12 +2228,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             .max(crate::screen::visible_file_popup(state).len())
             .max(crate::screen::visible_skill_popup(state).len())
     };
-    let file_popup_len = if btw {
+    let file_popup_len = if btw || state.steer.edit.is_some() {
         0
     } else {
         crate::screen::visible_file_popup(state).len()
     };
-    let skill_popup_len = if btw {
+    let skill_popup_len = if btw || state.steer.edit.is_some() {
         0
     } else {
         crate::screen::visible_skill_popup(state).len()
@@ -2214,7 +2247,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // Shell Mode's mode marker is a mode, not text: `!` on an empty Normal
     // composer enters it, and Esc/Backspace on an empty Shell composer leaves
     // it. Both are checked before the ordinary edit/busy arms.
-    if !btw && state.active_screen == Screen::Conversation && state.overlay.is_none() {
+    if !btw
+        && state.active_screen == Screen::Conversation
+        && state.overlay.is_none()
+        && state.steer.edit.is_none()
+    {
         // Typing claims Input focus, so `!` does the same on any region.
         if state.input_mode == crate::shell_mode::InputMode::Normal
             && state.composer.is_empty()

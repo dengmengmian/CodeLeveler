@@ -19,6 +19,7 @@ pub enum EffectCompletion {
     /// Explicit client exit waits until its session has stopped executing.
     QuitFinished(Result<(), String>),
     CommandDelivered,
+    SteerCommandDelivered(ClientCommand),
     /// The runtime answered with an error: it is reachable, and it did not
     /// accept the command.
     CommandRejected {

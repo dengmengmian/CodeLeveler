@@ -26,6 +26,34 @@ pub enum SessionInputState {
     Cancelled,
 }
 
+/// One compare-and-set operation on a still-pending instruction.
+#[derive(Clone, Copy)]
+pub enum SessionInputMutation<'a> {
+    /// Reserve the instruction for one editor until the given deadline.
+    BeginEdit {
+        /// Opaque capability held by the editor.
+        lease_id: &'a str,
+        /// Unix milliseconds at which this reservation expires.
+        expires_ms: i64,
+    },
+    /// Replace the content under the active lease and release it.
+    SaveEdit {
+        /// The active edit capability.
+        lease_id: &'a str,
+        /// The new user-authored instruction.
+        content: &'a str,
+    },
+    /// Release the active lease without changing the content.
+    CancelEdit {
+        /// The active edit capability.
+        lease_id: &'a str,
+    },
+    /// Settle the instruction without delivery.
+    Withdraw,
+    /// Request early delivery while preserving FIFO order.
+    Prioritize,
+}
+
 impl SessionInputState {
     /// Stable database spelling.
     pub fn as_str(self) -> &'static str {
@@ -58,6 +86,8 @@ pub struct SessionInputRecord {
     pub session_id: SessionId,
     /// Turn the input was admitted against, when known.
     pub turn_id: Option<TurnId>,
+    /// Immutable window at admission. Older consumed inputs may not have one.
+    pub origin_turn_id: Option<TurnId>,
     /// The user's text, redacted before write.
     pub content: String,
     /// Current lifecycle state.
@@ -70,6 +100,20 @@ pub struct SessionInputRecord {
     pub created_at: String,
     /// RFC 3339 time the row reached a terminal state.
     pub settled_at: Option<String>,
+    /// Version of the pending state, including state-only operations.
+    pub revision: i64,
+    /// Deadline of the current edit reservation in Unix milliseconds.
+    pub edit_expires_ms: Option<i64>,
+    /// Whether the user requested acceleration.
+    pub priority: bool,
+}
+
+impl SessionInputRecord {
+    /// An active lease reserves the pending instruction until its deadline.
+    pub fn editing_at(&self, at: Timestamp) -> bool {
+        self.edit_expires_ms
+            .is_some_and(|deadline| deadline > at.timestamp_millis())
+    }
 }
 
 /// Read/write access to the `session_inputs` table.
@@ -77,14 +121,15 @@ pub struct SessionInputRepository<'a> {
     db: &'a Database,
 }
 
-const COLUMNS: &str = "id, session_id, turn_id, content, state, reason, ordinal, created_at, \
-                       settled_at";
+const COLUMNS: &str = "id, session_id, turn_id, origin_turn_id, content, state, reason, ordinal, \
+                       created_at, settled_at, revision, edit_expires_ms, priority";
 
 fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<SessionInputRecord, StorageError> {
     use sqlx::Row;
     let id: String = row.try_get("id")?;
     let session_id: String = row.try_get("session_id")?;
     let turn_id: Option<String> = row.try_get("turn_id")?;
+    let origin_turn_id: Option<String> = row.try_get("origin_turn_id")?;
     let content: String = row.try_get("content")?;
     let state: String = row.try_get("state")?;
     let reason: String = row.try_get("reason")?;
@@ -95,12 +140,16 @@ fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<SessionInputRecord, StorageEr
         id,
         session_id: SessionId::new(session_id),
         turn_id: turn_id.map(TurnId::new),
+        origin_turn_id: origin_turn_id.map(TurnId::new),
         content,
         state: SessionInputState::parse(&state)?,
         reason,
         ordinal: ordinal.map(|value| value as u64),
         created_at,
         settled_at,
+        revision: row.try_get("revision")?,
+        edit_expires_ms: row.try_get("edit_expires_ms")?,
+        priority: row.try_get("priority")?,
     })
 }
 
@@ -129,8 +178,8 @@ impl<'a> SessionInputRepository<'a> {
         }
         sqlx::query(
             "INSERT INTO session_inputs \
-             (id, session_id, turn_id, content, state, reason, ordinal, created_at) \
-             VALUES (?1, ?2, ?3, ?4, 'pending', '', NULL, ?5) \
+             (id, session_id, turn_id, origin_turn_id, content, state, reason, ordinal, created_at) \
+             VALUES (?1, ?2, ?3, ?3, ?4, 'pending', '', NULL, ?5) \
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(id)
@@ -170,6 +219,132 @@ impl<'a> SessionInputRepository<'a> {
         .fetch_optional(self.db.pool())
         .await?;
         row.as_ref().map(decode).transpose()
+    }
+
+    /// Mutate the matching pending revision. A lost lease, stale revision or
+    /// already settled row returns `None` without changing durable state.
+    pub async fn mutate(
+        &self,
+        session_id: &SessionId,
+        id: &str,
+        revision: i64,
+        action: SessionInputMutation<'_>,
+        now: Timestamp,
+    ) -> Result<Option<SessionInputRecord>, StorageError> {
+        let millis = now.timestamp_millis();
+        let mut query = sqlx::QueryBuilder::new("UPDATE session_inputs SET ");
+        let mut secrets = Vec::new();
+        if !matches!(action, SessionInputMutation::Prioritize) {
+            query.push("revision = revision + 1, ");
+        }
+        match action {
+            SessionInputMutation::BeginEdit {
+                lease_id,
+                expires_ms,
+            } => {
+                query
+                    .push("edit_id = ")
+                    .push_bind(lease_id)
+                    .push(", edit_expires_ms = ")
+                    .push_bind(expires_ms);
+            }
+            SessionInputMutation::SaveEdit { content, .. } => {
+                let (text, found) = leveler_core::sanitize_model_visible(content);
+                secrets = found;
+                query
+                    .push("content = ")
+                    .push_bind(text)
+                    .push(", edit_id = NULL, edit_expires_ms = NULL");
+            }
+            SessionInputMutation::CancelEdit { .. } => {
+                query.push("edit_id = NULL, edit_expires_ms = NULL");
+            }
+            SessionInputMutation::Withdraw => {
+                query.push("state = 'cancelled', reason = 'withdrawn', edit_id = NULL, edit_expires_ms = NULL, settled_at = ")
+                    .push_bind(now.to_rfc3339());
+            }
+            SessionInputMutation::Prioritize => {
+                query.push("priority = 1");
+            }
+        }
+        query
+            .push(" WHERE session_id = ")
+            .push_bind(session_id.as_str())
+            .push(" AND id = ")
+            .push_bind(id)
+            .push(" AND revision = ")
+            .push_bind(revision)
+            .push(" AND state = 'pending'");
+        match action {
+            SessionInputMutation::BeginEdit { .. } | SessionInputMutation::Withdraw => {
+                query
+                    .push(" AND (edit_expires_ms IS NULL OR edit_expires_ms <= ")
+                    .push_bind(millis)
+                    .push(")");
+            }
+            SessionInputMutation::SaveEdit { lease_id, .. }
+            | SessionInputMutation::CancelEdit { lease_id } => {
+                query
+                    .push(" AND edit_id = ")
+                    .push_bind(lease_id)
+                    .push(" AND edit_expires_ms > ")
+                    .push_bind(millis);
+            }
+            SessionInputMutation::Prioritize => {
+                query.push(" AND priority = 0");
+            }
+        }
+        query.push(" RETURNING ").push(COLUMNS);
+        let row = query.build().fetch_optional(self.db.pool()).await?;
+        if row.is_some() && !secrets.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &secrets);
+        }
+        row.as_ref().map(decode).transpose()
+    }
+
+    /// Request acceleration for a set of scoped pending inputs atomically.
+    pub async fn prioritize(
+        &self,
+        session_id: &SessionId,
+        ids: &[&str],
+    ) -> Result<Vec<SessionInputRecord>, StorageError> {
+        let ids = serde_json::to_string(ids)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let rows = sqlx::query(&format!(
+            "UPDATE session_inputs SET priority = 1 WHERE session_id = ?1
+             AND state = 'pending' AND priority = 0 AND id IN (SELECT value FROM json_each(?2))
+             RETURNING {COLUMNS}"
+        ))
+        .bind(session_id.as_str())
+        .bind(ids)
+        .fetch_all(self.db.pool())
+        .await?;
+        rows.iter().map(decode).collect()
+    }
+
+    /// Settle only the inputs the caller resolved to this execution lineage.
+    pub async fn cancel_scoped(
+        &self,
+        session_id: &SessionId,
+        ids: &[&str],
+        reason: &str,
+        now: Timestamp,
+    ) -> Result<Vec<SessionInputRecord>, StorageError> {
+        let ids = serde_json::to_string(ids)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let rows = sqlx::query(&format!(
+            "UPDATE session_inputs SET state = 'cancelled', reason = ?3, settled_at = ?4,
+             edit_id = NULL, edit_expires_ms = NULL WHERE session_id = ?1
+             AND state = 'pending' AND id IN (SELECT value FROM json_each(?2))
+             RETURNING {COLUMNS}"
+        ))
+        .bind(session_id.as_str())
+        .bind(ids)
+        .bind(reason)
+        .bind(now.to_rfc3339())
+        .fetch_all(self.db.pool())
+        .await?;
+        rows.iter().map(decode).collect()
     }
 
     /// Inputs still awaiting delivery, oldest first.

@@ -1363,6 +1363,27 @@ pub trait SteeringSource: Send + Sync {
     /// failed or was skipped.
     fn input_consumed(&self, _id: &str, _ordinal: Option<u64>) {}
 
+    /// Try to close steer admission at a normal completion boundary. If
+    /// accepted input still needs a round, leave admission open.
+    fn try_close_input_admission(
+        &self,
+        _cancellation: CancellationToken,
+    ) -> futures::future::BoxFuture<'_, Result<bool, PortError>> {
+        Box::pin(async { Ok(true) })
+    }
+
+    /// Read the inputs eligible for this round. Durable hosts can resolve
+    /// them against the active execution lineage without caching their text.
+    fn pending_inputs_for_round(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<PendingUserInput>, PortError>> {
+        Box::pin(async { Ok(self.take_pending_inputs()) })
+    }
+
+    fn model_attempt_interrupt(&self) -> Option<CancellationToken> {
+        None
+    }
+
     /// The durable input this turn was started from, when the host promoted an
     /// accepted append into a fresh turn.
     ///

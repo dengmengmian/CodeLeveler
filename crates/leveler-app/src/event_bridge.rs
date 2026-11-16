@@ -222,9 +222,9 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
             }
             ModelErrorKind::Timeout => FailureCategory::Timeout,
             ModelErrorKind::Cancelled => FailureCategory::Cancelled,
-            ModelErrorKind::ConversationProtocol | ModelErrorKind::Other => {
-                FailureCategory::Internal
-            }
+            ModelErrorKind::ConversationProtocol
+            | ModelErrorKind::SupersededBySteer
+            | ModelErrorKind::Other => FailureCategory::Internal,
         }
     };
     // Source follows the same fact: a locally refused request is the local
@@ -234,7 +234,9 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
         FailureSource::Local
     } else {
         match error.kind {
-            ModelErrorKind::ConversationProtocol => FailureSource::Runtime,
+            ModelErrorKind::ConversationProtocol | ModelErrorKind::SupersededBySteer => {
+                FailureSource::Runtime
+            }
             _ => FailureSource::Provider,
         }
     };

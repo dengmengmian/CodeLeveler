@@ -43,6 +43,23 @@ pub enum ClientError {
     /// unaffected.
     #[error("{0}")]
     OwnershipConflict(String),
+    /// The pending instruction changed or is no longer available to this action.
+    #[error("{0}")]
+    SteerConflict(SteerConflict),
+}
+
+/// Which authoritative state refused a steer action.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerConflict {
+    #[error("追加指令已经结算或不属于当前任务")]
+    Unavailable,
+    #[error("追加指令已更新，请刷新后重试")]
+    StaleRevision,
+    #[error("追加指令的编辑权已被占用或过期")]
+    EditLease,
 }
 
 /// The seam between UI clients and the CodeLeveler runtime.

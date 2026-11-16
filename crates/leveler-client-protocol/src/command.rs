@@ -81,11 +81,8 @@ pub enum ClientCommand {
     /// of the next round instead of waiting for the turn to end. This is the
     /// default meaning of Enter while a turn runs.
     ///
-    /// The runtime persists the text before it acknowledges the command. A
-    /// turn that ends before the next round still delivers it as a new turn,
-    /// so it is never silently dropped. A correction like "actually use the
-    /// other module" is worthless once the work is finished, which is why it
-    /// joins the running turn rather than a later one.
+    /// The runtime persists accepted text before acknowledging it. Input
+    /// accepted by a live turn stays with its execution lineage.
     ///
     /// When no turn is running the runtime starts one with the same text, so
     /// the busy/idle race in the client cannot lose the message.
@@ -99,6 +96,11 @@ pub enum ClientCommand {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<MessageId>,
+    },
+    /// Read or modify the authoritative journal of undelivered steers.
+    ManageSteer {
+        session_id: SessionId,
+        action: SteerAction,
     },
     /// Run an explicit goal task. Unlike ordinary chat messages, this enables
     /// goal-mode completion (`update_goal`) in the agent loop.
@@ -628,6 +630,39 @@ pub const SNAPSHOT_VERSIONED_COMMANDS: &[&str] = &[
     "set_product_axes",
 ];
 
+/// An operation on the pending steer journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SteerAction {
+    List,
+    BeginEdit {
+        message_id: MessageId,
+        revision: i64,
+        lease_id: String,
+    },
+    SaveEdit {
+        message_id: MessageId,
+        revision: i64,
+        lease_id: String,
+        content: String,
+    },
+    CancelEdit {
+        message_id: MessageId,
+        revision: i64,
+        lease_id: String,
+    },
+    Withdraw {
+        message_id: MessageId,
+        revision: i64,
+    },
+    Prioritize {
+        message_id: MessageId,
+        revision: i64,
+    },
+    PrioritizeAll,
+}
+
 impl ClientCommand {
     /// Use the serialized wire tag as the single classification key.
     pub fn requires_snapshot_version(&self) -> Result<bool, serde_json::Error> {
@@ -650,6 +685,7 @@ impl ClientCommand {
             | ClientCommand::RequestAwaySummary { session_id }
             | ClientCommand::SubmitMessage { session_id, .. }
             | ClientCommand::SteerCurrentTurn { session_id, .. }
+            | ClientCommand::ManageSteer { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
             | ClientCommand::ResumeTask { session_id, .. }
             | ClientCommand::AddAttachment { session_id, .. }

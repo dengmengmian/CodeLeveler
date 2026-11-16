@@ -59,7 +59,9 @@ pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,
 };
 pub use session_facts::SessionFacts;
-pub use session_input_repo::{SessionInputRecord, SessionInputRepository, SessionInputState};
+pub use session_input_repo::{
+    SessionInputMutation, SessionInputRecord, SessionInputRepository, SessionInputState,
+};
 pub use session_recap_repo::{SessionRecapRecord, SessionRecapRepository};
 pub use session_repo::{
     SessionEdit, SessionEditResult, SessionRecord, SessionRepository, SessionSettingsSnapshot,

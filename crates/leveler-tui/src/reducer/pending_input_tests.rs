@@ -1,7 +1,6 @@
 //! 待发送: the explicit "process after the running task" lane. A message typed
 //! while a turn runs goes to that turn on Enter; Tab is what holds it here.
-//! Held items are sent one at a time on the user's say-so and enter the
-//! conversation only when the runtime admits them. Once the running turn
+//! Held items are sent one at a time on the user's say-so. Once the running turn
 //! reaches its terminal event and the runtime is ready, the FIFO head advances
 //! on its own.
 
@@ -58,9 +57,9 @@ fn user_messages(s: &AppState) -> Vec<String> {
         .iter()
         .filter_map(|i| match i {
             TranscriptItem::User(t) => Some(t.clone()),
-            TranscriptItem::UserInput(block) => Some(block.text.clone()),
             _ => None,
         })
+        .chain(s.transcript.inputs().map(|block| block.text.clone()))
         .collect()
 }
 
@@ -137,6 +136,87 @@ fn an_input_admission_resolves_an_unknown_submission() {
     );
     assert_eq!(s.transcript.input_state(&id), Some(&InputDelivery::Pending));
     assert_eq!(s.transcript.inputs().count(), 1);
+}
+
+#[test]
+fn pending_steer_detail_can_be_opened_without_changing_the_draft() {
+    let mut s = state();
+    s.composer.replace("unsent main draft");
+    s.transcript.push_input(
+        MessageId::new("waiting-runtime-input"),
+        "existing steer".into(),
+        crate::transcript::InputDelivery::Pending,
+    );
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+    );
+    assert_ne!(s.active_screen, crate::screen::Screen::Conversation);
+    assert_eq!(s.composer.text(), "unsent main draft");
+    key(&mut s, KeyCode::Esc);
+    assert_eq!(s.active_screen, crate::screen::Screen::Conversation);
+    assert_eq!(s.composer.text(), "unsent main draft");
+}
+
+#[test]
+fn accepted_edit_reuses_the_composer_and_restores_the_previous_draft() {
+    use leveler_client_protocol::SteerAction;
+    let mut s = state();
+    s.composer.replace("draft\nsecond line");
+    key(&mut s, KeyCode::Left);
+    let cursor = s.composer.text_before_cursor().to_owned();
+    s.transcript.push_input(
+        MessageId::new("editable"),
+        "initial instruction".into(),
+        crate::transcript::InputDelivery::Pending,
+    );
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+    );
+    let begin = key(&mut s, KeyCode::Char('e'));
+    let [
+        Effect::Send(
+            command @ ClientCommand::ManageSteer {
+                action: SteerAction::BeginEdit { .. },
+                ..
+            },
+        ),
+    ] = begin.as_slice()
+    else {
+        panic!("expected a Runtime edit reservation: {begin:?}");
+    };
+    assert_eq!(s.composer.text(), "draft\nsecond line");
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SteerCommandDelivered(command.clone())),
+    );
+    assert_eq!(s.composer.text(), "initial instruction");
+    s.composer.replace("保存这两行\n✅");
+    let save = key(&mut s, KeyCode::Enter);
+    let [
+        Effect::Send(
+            command @ ClientCommand::ManageSteer {
+                action:
+                    SteerAction::SaveEdit {
+                        content,
+                        revision: 1,
+                        ..
+                    },
+                ..
+            },
+        ),
+    ] = save.as_slice()
+    else {
+        panic!("expected a Runtime save: {save:?}");
+    };
+    assert_eq!(content, "保存这两行\n✅");
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::SteerCommandDelivered(command.clone())),
+    );
+    assert_eq!(s.composer.text(), "draft\nsecond line");
+    assert_eq!(s.composer.text_before_cursor(), cursor);
 }
 
 fn texts(s: &AppState) -> Vec<String> {
@@ -314,8 +394,8 @@ fn any_item_can_be_sent_and_it_stays_until_the_runtime_admits_it() {
     );
     assert!(user_messages(&s).is_empty(), "sent is not admitted");
 
-    // The runtime's admission is the first fact that puts the text into the
-    // conversation, under the identity the client sent.
+    // The runtime's admission adds the text to the pending projection under
+    // the identity the client sent.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::InputAdmitted {

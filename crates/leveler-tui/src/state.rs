@@ -618,6 +618,7 @@ pub struct AppState {
     pub background_task_views: std::collections::HashMap<String, crate::activity::ActivityView>,
     /// Last-painted one-line plan summary hit (row, x_start, x_end).
     pub plan_hit: Option<(u16, u16, u16)>,
+    pub(crate) steer: crate::pending_steer::SteerUi,
     /// Last-painted header goal hit (row, x_start, x_end).
     pub goal_hit: Option<(u16, u16, u16)>,
     /// The running execution under the Command workbench focus. Presentation
@@ -870,6 +871,7 @@ impl AppState {
             background_list_focus: crate::activity::BackgroundPane::List,
             background_task_views: std::collections::HashMap::new(),
             plan_hit: None,
+            steer: Default::default(),
             goal_hit: None,
             command_selected: None,
             shell_output_focus: None,

@@ -534,6 +534,8 @@ struct WireError {
     /// [`ClientError::RecoveryRequired`]. Absent from older daemons.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     recovery_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    steer_conflict: Option<leveler_client_protocol::SteerConflict>,
 }
 
 #[cfg(any(unix, windows))]
@@ -547,6 +549,7 @@ impl From<ClientError> for WireError {
                 unresolvable: false,
                 ownership_conflict: false,
                 recovery_required: false,
+                steer_conflict: None,
             },
             ClientError::Runtime(message) => Self {
                 message,
@@ -555,6 +558,7 @@ impl From<ClientError> for WireError {
                 unresolvable: false,
                 ownership_conflict: false,
                 recovery_required: false,
+                steer_conflict: None,
             },
             ClientError::RecoveryRequired(message) => Self {
                 message,
@@ -563,6 +567,7 @@ impl From<ClientError> for WireError {
                 unresolvable: false,
                 ownership_conflict: false,
                 recovery_required: true,
+                steer_conflict: None,
             },
             ClientError::OutcomeUnknown(message) => Self {
                 message,
@@ -571,6 +576,7 @@ impl From<ClientError> for WireError {
                 unresolvable: false,
                 ownership_conflict: false,
                 recovery_required: false,
+                steer_conflict: None,
             },
             ClientError::Unresolvable(message) => Self {
                 message,
@@ -579,6 +585,16 @@ impl From<ClientError> for WireError {
                 unresolvable: true,
                 ownership_conflict: false,
                 recovery_required: false,
+                steer_conflict: None,
+            },
+            ClientError::SteerConflict(conflict) => Self {
+                message: conflict.to_string(),
+                session_id: None,
+                outcome_unknown: false,
+                unresolvable: false,
+                ownership_conflict: false,
+                recovery_required: false,
+                steer_conflict: Some(conflict),
             },
             ClientError::OwnershipConflict(message) => Self {
                 message,
@@ -587,6 +603,7 @@ impl From<ClientError> for WireError {
                 unresolvable: false,
                 ownership_conflict: true,
                 recovery_required: false,
+                steer_conflict: None,
             },
         }
     }
@@ -595,6 +612,9 @@ impl From<ClientError> for WireError {
 #[cfg(any(unix, windows))]
 impl WireError {
     fn into_client_error(self) -> ClientError {
+        if let Some(conflict) = self.steer_conflict {
+            return ClientError::SteerConflict(conflict);
+        }
         match self.session_id {
             Some(session_id) => ClientError::SessionNotFound(session_id),
             None if self.outcome_unknown => ClientError::OutcomeUnknown(self.message),
@@ -2249,6 +2269,7 @@ mod transport {
                     unresolvable: false,
                     ownership_conflict: false,
                     recovery_required: false,
+                    steer_conflict: None,
                 }),
             )
             .await?;

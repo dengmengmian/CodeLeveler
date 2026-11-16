@@ -8578,7 +8578,7 @@ fn a_task_cancelled_event_withdraws_resumability() {
 }
 
 /// Enter while a turn runs is an append to that turn: the text is sent as a
-/// steer with a stable identity, shown at once, and never parked in 待发送.
+/// steer with a stable identity, without creating a history row.
 #[test]
 fn entering_while_busy_steers_the_running_turn() {
     let mut s = busy_state();
@@ -8597,15 +8597,17 @@ fn entering_while_busy_steers_the_running_turn() {
     );
     assert!(
         s.composer.is_empty(),
-        "the composer clears into the transcript"
+        "the composer clears after submission"
     );
     assert!(
         s.pending_inputs.is_empty(),
         "the default is not the after-turn lane"
     );
     assert!(
-        format!("{:?}", s.transcript.items()).contains("改用另一个模块"),
-        "the append row is shown immediately"
+        s.transcript
+            .inputs()
+            .any(|input| input.text == "改用另一个模块"),
+        "the pending input is tracked immediately"
     );
 }
 
@@ -8644,10 +8646,9 @@ fn send_first_pending(s: &mut AppState) -> Vec<Effect> {
     reduce(s, key(KeyCode::Enter))
 }
 
-/// A steer row enters the conversation the moment the runtime admits it, and
-/// the later settlement updates that same row instead of adding a second one.
+/// The runtime's settlement places the input in history once.
 #[test]
-fn steered_text_appears_in_the_conversation_once_admitted() {
+fn steered_text_appears_in_the_conversation_once_settled() {
     use leveler_tui::transcript::InputDelivery;
     let mut s = busy_state();
     s.composer.replace("改用另一个模块");
@@ -8665,7 +8666,7 @@ fn steered_text_appears_in_the_conversation_once_admitted() {
             .filter(|item| matches!(item, TranscriptItem::UserInput(block) if block.text == "改用另一个模块"))
             .count()
     };
-    assert_eq!(count(s.transcript.items()), 1);
+    assert_eq!(count(s.transcript.items()), 0);
     assert!(matches!(
         s.transcript.input_state(&message_id),
         Some(InputDelivery::Sending)
@@ -8686,8 +8687,8 @@ fn steered_text_appears_in_the_conversation_once_admitted() {
     );
     assert_eq!(
         count(s.transcript.items()),
-        1,
-        "admission updates, never duplicates"
+        0,
+        "admission leaves the input out of history"
     );
     assert!(matches!(
         s.transcript.input_state(&message_id),
@@ -8703,8 +8704,8 @@ fn steered_text_appears_in_the_conversation_once_admitted() {
     );
     assert_eq!(
         count(s.transcript.items()),
-        1,
-        "the ACK paints no second row"
+        0,
+        "the command ACK does not place the input in history"
     );
 
     reduce(
@@ -8734,12 +8735,8 @@ fn several_steers_are_each_sent() {
     }
     let ids: Vec<leveler_client_protocol::MessageId> = s
         .transcript
-        .items()
-        .iter()
-        .filter_map(|item| match item {
-            TranscriptItem::UserInput(block) => Some(block.id.clone()),
-            _ => None,
-        })
+        .inputs()
+        .map(|block| block.id.clone())
         .collect();
     assert_eq!(ids.len(), 2);
     assert_ne!(
@@ -8748,21 +8745,15 @@ fn several_steers_are_each_sent() {
     );
     assert_eq!(
         s.transcript
-            .items()
-            .iter()
-            .filter(
-                |item| matches!(item, TranscriptItem::UserInput(block) if block.text == "先改模块")
-            )
+            .inputs()
+            .filter(|block| block.text == "先改模块")
             .count(),
         1
     );
     assert_eq!(
         s.transcript
-            .items()
-            .iter()
-            .filter(
-                |item| matches!(item, TranscriptItem::UserInput(block) if block.text == "再加测试")
-            )
+            .inputs()
+            .filter(|block| block.text == "再加测试")
             .count(),
         1
     );

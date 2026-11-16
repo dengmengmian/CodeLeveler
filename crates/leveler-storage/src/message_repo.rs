@@ -249,17 +249,21 @@ impl<'a> MessageRepository<'a> {
             drop(tx);
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM session_inputs WHERE session_id = ?1 AND id = ?2",
+        let eligible: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM session_inputs WHERE session_id = ?1 AND id = ?2 \
+             AND state = 'pending' AND (edit_expires_ms IS NULL OR edit_expires_ms <= ?3) \
+             AND content = json_extract(?4, '$.content[0].text')",
         )
         .bind(session_id.as_str())
         .bind(input_id)
+        .bind(now.timestamp_millis())
+        .bind(&redacted)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
-        if state.as_deref() != Some("pending") {
-            // Cancelled, already consumed, or never admitted: this input has
-            // no authority to write a transcript row.
+        if eligible.is_none() {
+            // An editor may have taken or changed the input after it was read.
+            // Only the current unreserved text can cross the context boundary.
             tx.commit()
                 .await
                 .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
@@ -288,7 +292,8 @@ impl<'a> MessageRepository<'a> {
         .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
         let settled = sqlx::query(
             "UPDATE session_inputs \
-             SET state = 'consumed', turn_id = ?3, ordinal = ?4, settled_at = ?5 \
+             SET state = 'consumed', turn_id = ?3, ordinal = ?4, settled_at = ?5, \
+                 edit_id = NULL, edit_expires_ms = NULL \
              WHERE session_id = ?1 AND id = ?2 AND state = 'pending'",
         )
         .bind(session_id.as_str())
@@ -853,6 +858,62 @@ mod tests {
             .await
             .unwrap();
 
+        let stale = repo
+            .append_input_in_turn_owned(
+                &token,
+                &session,
+                &turn_id,
+                "input-1",
+                r#"{"role":"user","content":[{"type":"text","text":"a stale draft"}]}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stale, None,
+            "only the journal's current content can be committed"
+        );
+        assert!(repo.load(&session).await.unwrap().is_empty());
+
+        let now = leveler_core::now();
+        let reserved = inputs
+            .mutate(
+                &session,
+                "input-1",
+                0,
+                crate::SessionInputMutation::BeginEdit {
+                    lease_id: "lease-a",
+                    expires_ms: now.timestamp_millis() + 1_000,
+                },
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved.revision, 1);
+        let original =
+            r#"{"role":"user","content":[{"type":"text","text":"还有管理员管理也没有"}]}"#;
+        let during_edit = repo
+            .append_input_in_turn_owned(&token, &session, &turn_id, "input-1", original, now)
+            .await
+            .unwrap();
+        assert_eq!(during_edit, None);
+        let after_expiry = now + chrono::Duration::seconds(2);
+        let late_save = inputs
+            .mutate(
+                &session,
+                "input-1",
+                1,
+                crate::SessionInputMutation::SaveEdit {
+                    lease_id: "lease-a",
+                    content: "late text",
+                },
+                after_expiry,
+            )
+            .await
+            .unwrap();
+        assert!(late_save.is_none());
+
         let ordinal = repo
             .append_input_in_turn_owned(
                 &token,
@@ -860,7 +921,7 @@ mod tests {
                 &turn_id,
                 "input-1",
                 r#"{"role":"user","content":[{"type":"text","text":"还有管理员管理也没有"}]}"#,
-                leveler_core::now(),
+                after_expiry,
             )
             .await
             .unwrap();
