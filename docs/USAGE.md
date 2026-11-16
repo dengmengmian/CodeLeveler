@@ -20,6 +20,29 @@ recovery_seconds = 600  # ceiling for retries (waits and attempts), from the fir
 
 A permanent error (authentication, an invalid request, a rejected conversation) is never retried. When the budget runs out the failure is reported as resumable: the task and its completed tool work are kept, and sending a new message continues from there.
 
+
+### Custom OpenAI-compatible discovery
+
+For a custom gateway such as A2Agent, keep using the existing provider settings in
+`~/.leveler/config.toml` (this is a provider entry, not a complete model configuration):
+
+```toml
+[providers.a2agent]
+base_url = "https://api.a2agent.me/v1"
+api_key_env = "A2AGENT_API_KEY"
+```
+
+Set `A2AGENT_API_KEY` locally to your own key; never put a real key in shared
+configuration or examples. In your manually configured model entry, use
+`provider = "a2agent"` and an explicit model ID and limits verified for that
+endpoint. A model appearing in a catalog does not establish its capabilities.
+
+Model discovery queries `/models` without running inference. A valid empty
+`data` array or a missing `data` field keeps the existing empty-list behavior;
+an explicitly non-array `data` value is reported as a malformed listing.
+Discovery failure does not remove manually configured models. This example is
+configuration guidance, not a claim of live compatibility verification.
+
 ## Input and results
 
 - `Ctrl+R` searches input history. Enter restores an entry to the draft without sending it.

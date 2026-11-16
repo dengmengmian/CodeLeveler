@@ -10295,21 +10295,38 @@ async fn assisted_runs_a_workdir_deletion_and_gates_one_outside_it() {
         std::process::id() as u64 * 13 + 11
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let canary = dir.join("CANARY.txt");
-    std::fs::write(&canary, "removed by an allowed workspace rm\n").unwrap();
+    let canary = dir.join("CANARY");
+    std::fs::create_dir_all(&canary).unwrap();
+    std::fs::write(
+        canary.join("keep.txt"),
+        "removed by an allowed workspace deletion\n",
+    )
+    .unwrap();
     let outside =
         std::env::temp_dir().join(format!("leveler-assisted-outside-{}", std::process::id()));
-    std::fs::write(&outside, "must survive\n").unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), "must survive\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
-    let outside_cmd = format!("rm -rf {}", outside.display());
+    // `rm`/`rmdir` are both in the destructive set; Windows needs the native
+    // `rmdir` because Git Bash's MSYS `rm` cannot initialize under Low IL.
+    let inside_cmd = if cfg!(windows) {
+        "rmdir /S /Q CANARY"
+    } else {
+        "rm -rf CANARY"
+    };
+    let outside_cmd = if cfg!(windows) {
+        format!("rmdir /S /Q \"{}\"", outside.display())
+    } else {
+        format!("rm -rf {}", outside.display())
+    };
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
             "shell_command",
-            serde_json::json!({"cmd": "rm CANARY.txt"}),
+            serde_json::json!({"cmd": inside_cmd}),
         ),
         assistant_tool_call(
             "c2",
@@ -10341,7 +10358,7 @@ async fn assisted_runs_a_workdir_deletion_and_gates_one_outside_it() {
 
     assert!(
         !canary.exists(),
-        "a literal rm in the working directory must run without approval"
+        "a literal workspace deletion must run without approval"
     );
     assert!(
         outside.exists(),
@@ -10349,7 +10366,7 @@ async fn assisted_runs_a_workdir_deletion_and_gates_one_outside_it() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
-    std::fs::remove_file(&outside).ok();
+    std::fs::remove_dir_all(&outside).ok();
 }
 
 // ── R006 R6-P1: harness-policy refusals must not become a stagnation kill ───

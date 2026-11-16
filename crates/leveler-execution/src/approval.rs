@@ -624,12 +624,33 @@ fn deletion_targets_stay_in_workdir(program: &str, args: &[String]) -> bool {
             options_ended = true;
             continue;
         }
-        if !options_ended && arg.starts_with('-') && arg != "-" {
+        if !options_ended && is_deletion_option(program, arg) {
             continue;
         }
         operands.push(arg.as_str());
     }
     !operands.is_empty() && operands.iter().copied().all(workdir_literal_path)
+}
+
+/// Whether `arg` is an option rather than a deletion target.
+fn is_deletion_option(program: &str, arg: &str) -> bool {
+    if arg != "-" && arg.starts_with('-') {
+        return true;
+    }
+    // Windows `rmdir`/`del` switches use `/` (`/S`, `/Q`, ...). On Unix a
+    // leading `/` is an absolute path and must stay a target; `//server/share`
+    // stays a UNC path even on Windows.
+    #[cfg(windows)]
+    {
+        if matches!(program, "rmdir" | "del")
+            && arg.len() > 1
+            && arg.starts_with('/')
+            && !arg.starts_with("//")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// A path the shell will not expand into somewhere outside the working directory.
@@ -1667,6 +1688,21 @@ mod tests {
             ),
             Requirement::NeedApproval,
             "shell_command must not bypass classify_command under Assisted"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rmdir_switches_are_options_not_deletion_targets() {
+        assert_eq!(
+            classify_program("rmdir", &["/S".into(), "/Q".into(), "target".into()]),
+            CommandClass::Safe,
+            "a literal target inside the working directory must auto-run"
+        );
+        assert_eq!(
+            classify_program("rmdir", &["/S".into(), "/Q".into(), r"C:\outside".into()]),
+            CommandClass::Dangerous,
+            "an absolute target still asks"
         );
     }
 

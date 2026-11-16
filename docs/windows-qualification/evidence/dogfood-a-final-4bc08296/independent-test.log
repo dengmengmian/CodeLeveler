@@ -1,0 +1,24 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src\lib.rs (target\debug\deps\order_summary-76d660e6e7e79821.exe)
+
+running 4 tests
+test tests::crlf_line_endings_and_trailing_blank_lines ... ok
+test tests::zero_amount_sums_to_zero ... ok
+test tests::sums_the_orders ... ok
+test tests::empty_data_sums_to_zero ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\order_summary-2d5815ea77605212.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests order_summary
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+cargo_test_exit=0

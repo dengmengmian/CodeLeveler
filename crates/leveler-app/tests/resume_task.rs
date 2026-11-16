@@ -901,7 +901,7 @@ async fn verification_facts_survive_the_next_work_window() {
     let (program, args, script_name, script) = if cfg!(windows) {
         (
             "cmd",
-            vec!["/c", "verify.cmd"],
+            vec!["/c", ".\\verify.cmd"],
             "verify.cmd",
             "exit /b 0\r\n",
         )
@@ -1145,15 +1145,14 @@ async fn a_repository_named_suite_survives_the_next_work_window() {
 /// had actually passed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finished_background_command_is_evidence_after_resume() {
-    let (script_name, script) = if cfg!(windows) {
-        ("run-tests.cmd", "exit /b 0\r\n")
-    } else {
-        ("run-tests.sh", "exit 0\n")
-    };
+    // A batch script needs a leading `.\` on hosts that set
+    // `NoDefaultCurrentDirectoryInExePath`; this test is about the durable
+    // RESULT path, so a native builtin that exits at once keeps the fixture
+    // from depending on script resolution.
     let (program, args) = if cfg!(windows) {
-        ("cmd", vec!["/c", script_name])
+        ("cmd", vec!["/c", "exit 0"])
     } else {
-        ("sh", vec![script_name])
+        ("sh", vec!["-c", "exit 0"])
     };
     let cited = format!("{program} {}", args.join(" "));
     let f = fixture(
@@ -1192,7 +1191,6 @@ async fn a_finished_background_command_is_evidence_after_resume() {
         leveler_agent::CollaborationMode::Goal,
     )
     .await;
-    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
 
     let model = ModelRef::new("mock", "m");
     let run = |rounds: u32| {
@@ -1429,15 +1427,13 @@ async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
 /// `a_finished_background_command_is_evidence_after_resume`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_started_command_is_not_rebuilt_as_a_pass() {
-    let (script_name, script) = if cfg!(windows) {
-        ("run-tests.cmd", "ping -n 60 127.0.0.1 >NUL\r\n")
-    } else {
-        ("run-tests.sh", "sleep 60\nexit 0\n")
-    };
+    // A native long-running command keeps this about the START record. A
+    // batch script would exercise the host's `.cmd` resolution instead, and a
+    // script that failed at once would not leave the start running.
     let (program, args) = if cfg!(windows) {
-        ("cmd", vec!["/c", script_name])
+        ("ping", vec!["-n", "60", "127.0.0.1"])
     } else {
-        ("sh", vec![script_name])
+        ("sh", vec!["-c", "sleep 60"])
     };
     let cited = format!("{program} {}", args.join(" "));
     let f = fixture(
@@ -1476,7 +1472,6 @@ async fn a_started_command_is_not_rebuilt_as_a_pass() {
         leveler_agent::CollaborationMode::Goal,
     )
     .await;
-    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
 
     let model = ModelRef::new("mock", "m");
     let run = |rounds: u32| {
@@ -1558,7 +1553,7 @@ async fn a_started_command_is_not_rebuilt_as_a_pass() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_verification_survives_into_the_retry() {
     let (program, args, script_name) = if cfg!(windows) {
-        ("cmd", vec!["/c", "verify.cmd"], "verify.cmd")
+        ("cmd", vec!["/c", ".\\verify.cmd"], "verify.cmd")
     } else {
         ("sh", vec!["verify.sh"], "verify.sh")
     };

@@ -115,25 +115,42 @@ pub fn edit_text(text: &str) -> Result<String, String> {
 
 /// Run the editor command with `path` appended, through the platform shell.
 fn run_editor(command_line: &str, path: &Path) -> Result<bool, String> {
-    let mut command = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C")
-            .arg(format!("{command_line} \"{}\"", path.display()));
-        c
-    } else {
-        let mut c = Command::new("sh");
-        // `"$1"` keeps paths with spaces intact without re-quoting the user's
-        // own command line.
-        c.arg("-c")
-            .arg(format!("{command_line} \"$1\""))
-            .arg("sh")
-            .arg(path);
-        c
-    };
+    let mut command = editor_command(command_line, path);
     let status = command
         .status()
         .map_err(|e| format!("无法启动 `{command_line}`：{e}"))?;
     Ok(status.success())
+}
+
+#[cfg(windows)]
+fn editor_command(command_line: &str, path: &Path) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    // `fs::canonicalize` returns a verbatim `\\?\C:\...` path on Windows.
+    // Console programs such as `more.com` reject that spelling; the drive or
+    // UNC form names the same file, and display_path only strips prefixes
+    // where that equivalence holds.
+    let path = leveler_core::path::display_path(path);
+    let mut command = Command::new("cmd");
+    command.arg("/C");
+    // cmd parses everything after `/C` with its own rules, and a backslash is
+    // not a quote escape there. Rust's argv quoting would wrap this tail and
+    // escape the path's quotes, so the tail has to reach cmd verbatim.
+    command.raw_arg(format!("{command_line} \"{path}\""));
+    command
+}
+
+#[cfg(not(windows))]
+fn editor_command(command_line: &str, path: &Path) -> Command {
+    let mut command = Command::new("sh");
+    // `"$1"` keeps paths with spaces intact without re-quoting the user's
+    // own command line.
+    command
+        .arg("-c")
+        .arg(format!("{command_line} \"$1\""))
+        .arg("sh")
+        .arg(path);
+    command
 }
 
 /// Hand the terminal to a child process: leave the alternate screen and undo
@@ -212,5 +229,32 @@ mod tests {
         assert_eq!(pager_command_line(Some("most")), "most");
         assert_eq!(pager_command_line(Some("  ")), DEFAULT_PAGER);
         assert_eq!(pager_command_line(None), DEFAULT_PAGER);
+    }
+
+    /// A capture path comes from `std::fs::canonicalize`, which on Windows is a
+    /// verbatim `\\?\C:\...` path. The pager is a console program (`more`) and
+    /// cannot open that spelling, so it must receive the ordinary drive path.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_capture_path_reaches_the_pager_as_a_normal_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let witness = dir.path().join("witness.txt");
+        let script = dir.path().join("pager-probe.cmd");
+        std::fs::write(&script, "@echo off\r\necho %~1> \"%~dp0witness.txt\"\r\n").unwrap();
+        let output = dir.path().join("OUTPUT.txt");
+        std::fs::write(&output, "pager").unwrap();
+        let verbatim =
+            std::path::PathBuf::from(format!(r"\\?\{}\OUTPUT.txt", dir.path().display()));
+        assert!(
+            run_editor(script.to_str().unwrap(), &verbatim).unwrap(),
+            "the probe pager must run"
+        );
+        let seen = std::fs::read_to_string(&witness).unwrap();
+        let expected = format!("{}\\OUTPUT.txt", dir.path().display());
+        assert_eq!(
+            seen.trim(),
+            expected,
+            "the pager must receive the ordinary drive path, not a quoted or verbatim one"
+        );
     }
 }

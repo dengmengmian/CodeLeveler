@@ -8148,7 +8148,7 @@ mod tests {
 
     #[test]
     fn shell_command_compacts_its_head_and_preserves_cwd_in_details() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/example".into());
+        let home = "/Users/example";
         let args =
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && cargo test --workspace"}}"#);
         let mut g = group(vec![call("shell_command", &args, ToolStatus::Ok)]);
@@ -8169,7 +8169,7 @@ mod tests {
             "must not leak JSON args: {lines:?}"
         );
         assert!(
-            !head.contains(&home)
+            !head.contains(home)
                 && lines
                     .iter()
                     .any(|l| l.contains(&format!("cd {home}/Develop/app"))),

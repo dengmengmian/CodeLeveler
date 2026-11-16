@@ -1,0 +1,55 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1e3bd2b..f932bd3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,9 +1,23 @@
+ //! 订单汇总的核心逻辑。
+ 
+-/// 汇总订单总额。当前实现返回 0，业务逻辑尚未实现。
++/// 汇总订单总额。
++///
++/// 输入是 UTF-8 中文表头的 CSV：首行为表头，金额是每行最后一个字段。
++/// 允许 CRLF 行尾与末尾空行，完全空行会被忽略。
++/// 金额不是整数时直接 panic，避免静默少算。
+ pub fn total_amount(csv: &str) -> u64 {
+-    let _ = csv;
+-    0
++    csv.lines()
++        .skip(1) // 跳过中文表头
++        .map(str::trim)
++        .filter(|line| !line.is_empty())
++        .map(|line| {
++            // 取最后一个字段作为金额，逗号后可能带空格。
++            let amount = line.rsplit(',').next().unwrap_or_default().trim();
++            amount
++                .parse::<u64>()
++                .unwrap_or_else(|_| panic!("金额列不是整数: {line:?}"))
++        })
++        .sum()
+ }
+ 
+ #[cfg(test)]
+@@ -15,4 +29,23 @@ mod tests {
+         let csv = "订单号,客户,金额\nA-1,张三,120\nA-2,李四,80\n";
+         assert_eq!(total_amount(csv), 200);
+     }
++
++    #[test]
++    fn crlf_line_endings_and_trailing_blank_lines() {
++        let csv = "订单号,客户,金额\r\nA-1,张三,120\r\nA-2,李四,80\r\n\r\n\r\n";
++        assert_eq!(total_amount(csv), 200);
++    }
++
++    #[test]
++    fn empty_data_sums_to_zero() {
++        assert_eq!(total_amount(""), 0);
++        assert_eq!(total_amount("订单号,客户,金额\n"), 0);
++        assert_eq!(total_amount("订单号,客户,金额\n\n\n"), 0);
++    }
++
++    #[test]
++    fn zero_amount_sums_to_zero() {
++        let csv = "订单号,客户,金额\nA-1,张三,0\n";
++        assert_eq!(total_amount(csv), 0);
++    }
+ }

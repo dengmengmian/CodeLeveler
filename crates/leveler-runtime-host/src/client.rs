@@ -146,8 +146,9 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
 /// Whether a transport error means no runtime owns this endpoint. Linux can
 /// report a closed listener as ECONNRESET during the subscribe handshake, the
 /// same fact as ECONNREFUSED; macOS can report EPIPE when the closed listener
-/// leaves no peer to receive that handshake. None says the endpoint is
-/// recoverable.
+/// leaves no peer to receive that handshake, and Windows named pipes report
+/// EOF when the server accepted and then closed without a reply. None says the
+/// endpoint is recoverable.
 #[cfg(any(unix, windows))]
 fn endpoint_unavailable(error: &std::io::Error) -> bool {
     matches!(
@@ -156,6 +157,7 @@ fn endpoint_unavailable(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionRefused
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
     )
 }
 
@@ -1506,29 +1508,8 @@ mod probe_tests {
         );
     }
 
-    /// A stale endpoint can fail the subscribe handshake with ECONNRESET or
-    /// EPIPE: Linux reports the former when the listener behind the socket file
-    /// is gone, and macOS can report the latter when the closed listener leaves
-    /// no peer to receive the handshake. Both are the same fact as
-    /// ECONNREFUSED — no runtime owns the endpoint — and must not turn startup
-    /// into a transport error.
-    #[test]
-    fn an_unusable_endpoint_is_no_runtime() {
-        for kind in [
-            std::io::ErrorKind::NotFound,
-            std::io::ErrorKind::ConnectionRefused,
-            std::io::ErrorKind::ConnectionReset,
-            std::io::ErrorKind::BrokenPipe,
-        ] {
-            assert!(
-                endpoint_unavailable(&std::io::Error::from(kind)),
-                "{kind:?} means no runtime is listening"
-            );
-        }
-        assert!(!endpoint_unavailable(&std::io::Error::from(
-            std::io::ErrorKind::PermissionDenied
-        )));
-    }
+    // The platform-independent endpoint classification test lives in
+    // `endpoint_classification_tests`, so it also runs on Windows.
 
     /// The drain budget is a policy with exactly one surprising value: `0`
     /// means "wait forever". Everything unparseable must land on the default
@@ -2091,5 +2072,38 @@ mod generation_attach_tests {
             info.health.retiring_reason,
             Some(RestartReason::BuildMismatch)
         );
+    }
+}
+
+/// Facts about an endpoint that are the same on every supported host. Kept
+/// outside the Unix-only socket tests so Windows named-pipe EOF is covered too.
+#[cfg(all(test, any(unix, windows)))]
+mod endpoint_classification_tests {
+    use super::*;
+
+    /// A stale endpoint can fail the subscribe handshake with ECONNRESET or
+    /// EPIPE: Linux reports the former when the listener behind the socket file
+    /// is gone, macOS reports the latter when the closed listener leaves no
+    /// peer to receive the handshake, and Windows reports EOF when the pipe
+    /// server accepted and closed without a reply. All are the same fact as
+    /// ECONNREFUSED — no runtime owns the endpoint — and must not turn startup
+    /// into a transport error.
+    #[test]
+    fn an_unusable_endpoint_is_no_runtime() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                endpoint_unavailable(&std::io::Error::from(kind)),
+                "{kind:?} means no runtime is listening"
+            );
+        }
+        assert!(!endpoint_unavailable(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
     }
 }

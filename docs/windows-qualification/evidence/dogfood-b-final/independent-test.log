@@ -1,0 +1,24 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src\lib.rs (target\debug\deps\inventory_reconcile-504516b75a42a7be.exe)
+
+running 4 tests
+test tests::reconciles_and_sorts_by_sku ... ok
+test tests::empty_movements_keep_opening_stock ... ok
+test tests::rejects_a_movement_for_an_unknown_sku ... ok
+test tests::rejects_negative_final_stock ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\main.rs (target\debug\deps\inventory_reconcile-7a2e8a54eaea7c18.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests inventory_reconcile
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+cargo_test_exit=0

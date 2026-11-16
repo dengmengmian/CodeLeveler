@@ -29,6 +29,16 @@ fn default_registry() -> leveler_tools::ToolRegistry {
     registry
 }
 
+/// A native marker command. MSYS `printf` cannot create its named objects in
+/// the Low-integrity sandbox on Windows, so the Windows fixture uses cmd.
+fn marker_command(marker: &str) -> serde_json::Value {
+    if cfg!(windows) {
+        serde_json::json!({"program": "cmd", "args": ["/C", format!("echo {marker}")]})
+    } else {
+        serde_json::json!({"program": "printf", "args": [marker]})
+    }
+}
+
 struct MockRuntime {
     responses: Arc<Mutex<VecDeque<ModelResponse>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -1000,11 +1010,7 @@ async fn answered_chat_does_not_spend_the_next_tasks_command_budget() {
             serde_json::json!({"program": "true", "args": []}),
         ),
         text("first turn spent one command"),
-        tool_call(
-            "c2",
-            "run_command",
-            serde_json::json!({"program": "printf", "args": ["SECOND_TASK_RAN"]}),
-        ),
+        tool_call("c2", "run_command", marker_command("SECOND_TASK_RAN")),
         text("second turn spent its own command"),
     ])
     .await;
@@ -1240,7 +1246,7 @@ async fn answered_chat_does_not_spend_the_next_goals_command_budget() {
         tool_call(
             "c2",
             "run_command",
-            serde_json::json!({"program": "printf", "args": ["GOAL_RAN"]}),
+            marker_command("GOAL_RAN"),
         ),
         // Goal mode does not end on prose. Settle the window in this round so
         // the run is not a script underrun.
@@ -1373,11 +1379,7 @@ async fn a_completed_task_ignores_a_later_active_ledger() {
             serde_json::json!({"program": "true", "args": []}),
         ),
         text("first task closed"),
-        tool_call(
-            "c2",
-            "run_command",
-            serde_json::json!({"program": "printf", "args": ["FRESH_TASK"]}),
-        ),
+        tool_call("c2", "run_command", marker_command("FRESH_TASK")),
         text("second task ran"),
     ])
     .await;
