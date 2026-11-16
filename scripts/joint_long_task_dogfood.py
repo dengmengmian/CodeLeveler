@@ -33,12 +33,121 @@ OUT.mkdir(parents=True, exist_ok=True)
 H.EVIDENCE = str(OUT)
 
 TASK = (
-    "/goal 在仓库根目录创建 joint-final.txt，内容正好一行 ok。用工具完成；"
-    "最终回答必须包含标记 JOINT-FINAL-MARKER，并说明你收到了编辑后的补充要求。"
+    "/goal 在仓库根目录创建 joint-final.txt，内容正好一行 ok。然后用前台工具运行下面这一条命令并等它结束："
+    "sh -c 'until [ -f joint-gate-release ]; do sleep 0.1; done; echo GATE-OK'。"
+    "这条命令必须用 run_command 前台运行：background 为 false，timeout_seconds 设为 120（不要用 0 或省略）。"
+    "不要自己创建 joint-gate-release，也不要把它移到后台；只有我会创建这个文件。"
+    "命令结束后给出最终回答；最终回答必须包含标记 JOINT-FINAL-MARKER，并说明你收到了编辑后的补充要求。"
 )
 ALPHA = "STEER_ALPHA_ORIGINAL"
 BETA = "STEER_BETA_EDITED"
 WITHDRAW = "STEER_WITHDRAW_ME"
+GATE_WAIT = "STEER_GATE_WAIT"
+GATE = "joint-gate-release"
+GATE_COMMAND = "until [ -f joint-gate-release ]"
+
+
+def wait_for_consumed(home: str, needle: str, timeout: float = 120) -> bool:
+    """Wait until every admitted row carrying `needle` has been consumed."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rows = GF.rows(
+            home,
+            "SELECT state FROM session_inputs WHERE content LIKE '%%%s%%'" % needle,
+        )
+        if rows and all(row["state"] == "consumed" for row in rows):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _calls_gate(payload: dict) -> bool:
+    """Whether one command-tool payload embeds the controlled gate command.
+
+    Match the call's real arguments, and only command tools: a reason, a
+    scope declaration, or a completion citation that merely quotes the task
+    must not look like the boundary.
+    """
+    if payload.get("name") not in ("run_command", "shell_command"):
+        return False
+    arguments = payload.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return GATE_COMMAND in arguments
+    return GATE_COMMAND in json.dumps(arguments, ensure_ascii=False)
+
+
+def running_gate_calls(home: str) -> list[str]:
+    """Call ids whose gate command started and has not finished yet.
+
+    The screen collapses a running tool's argv, so the durable dispatch rows
+    are the authority for "the tool boundary is real right now", not a guess
+    from rendered text.
+    """
+    started: list[str] = []
+    finished: set[str] = set()
+    for row in GF.rows(
+        home,
+        "SELECT type, payload FROM events WHERE type IN "
+        "('tool_call_started','tool_call_finished')",
+    ):
+        try:
+            payload = json.loads(row["payload"]).get("payload") or {}
+        except (TypeError, ValueError):
+            continue
+        if not _calls_gate(payload):
+            continue
+        call_id = payload.get("call_id")
+        if not call_id:
+            continue
+        if row["type"] == "tool_call_started":
+            started.append(call_id)
+        else:
+            finished.add(call_id)
+    return [call_id for call_id in started if call_id not in finished]
+
+
+def gate_dispatches(home: str) -> list[str]:
+    """Every gate command dispatch on the durable record."""
+    calls: list[str] = []
+    for row in GF.rows(
+        home,
+        "SELECT payload FROM events WHERE type='tool_call_started'",
+    ):
+        try:
+            payload = json.loads(row["payload"]).get("payload") or {}
+        except (TypeError, ValueError):
+            continue
+        if _calls_gate(payload) and payload.get("call_id"):
+            calls.append(payload["call_id"])
+    return calls
+
+
+def user_message_rows(home: str, needle: str) -> list[dict]:
+    """User-role transcript rows carrying `needle` (assistant quotes excluded)."""
+    found = []
+    for row in GF.rows(
+        home,
+        "SELECT payload FROM session_messages WHERE payload LIKE '%%%s%%'" % needle,
+    ):
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        if payload.get("role") == "user":
+            found.append(payload)
+    return found
+
+
+def wait_for_running_gate(home: str, timeout: float = 240) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if running_gate_calls(home):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def main() -> int:
@@ -103,14 +212,98 @@ def main() -> int:
         pty_.key("\x1b")
         time.sleep(0.3)
 
-        # Send now: the priority interrupts the held attempt, and the next
-        # round carries the edited text.
+        # Release the recovery window so the model reaches a REAL foreground
+        # tool execution. A held model call is not a safe-delivery boundary:
+        # a priority steer interrupts that call and can be delivered before
+        # the next frame is painted, so asserting the waiting label there is
+        # asserting a race, not a state. The gate command below is the
+        # controlled boundary where "waiting for safe delivery" is true.
+        proxy.hold_release.set()
+        running = wait_for_running_gate(home)
+        report.check(
+            "joint",
+            "the controlled gate tool is really running",
+            running,
+            pty_.screen.text()[-700:],
+        )
+        if not running:
+            raise RuntimeError("the model never started the controlled gate command")
+
+        # The edited steer admitted during the held recovery request was
+        # already delivered by the model's own next round. That is the
+        # "delivered" state, not a waiting one; assert it is gone before the
+        # boundary test below creates the only pending row.
+        consumed = wait_for_consumed(home, BETA)
+        report.check(
+            "joint",
+            "the edited steer was delivered on the model's next round",
+            consumed,
+            pty_.screen.text()[-700:],
+        )
+
+        # A NEW steer while the tool genuinely executes. Only now does
+        # "send now" have a safe delivery to wait for: the running tool keeps
+        # the current round open, so the row cannot be consumed until it ends.
+        pty_.write(GATE_WAIT)
+        time.sleep(0.15)
+        pty_.key("\r")
+        wait("等待投递", 20)
         pty_.key("\x1bs")
         wait("待投递追加指令", 20)
         pty_.key("a")
         wait("等待安全投递", 20)
+        report.dump("2-safe-wait", pty_)
+        boundary_samples = []
+        for _ in range(10):
+            boundary_samples.append(pty_.screen.text())
+            time.sleep(0.15)
+        boundary_running = bool(running_gate_calls(home))
+        report.check(
+            "joint",
+            "the gate tool is still executing at the sampled boundary",
+            boundary_running,
+            pty_.screen.text()[-900:],
+        )
+        report.check(
+            "joint",
+            "the priority row waits while the tool is still executing",
+            boundary_running
+            and all("等待安全投递" in frame for frame in boundary_samples),
+            repr(
+                [
+                    ("等待安全投递" in frame, frame[-300:])
+                    for frame in boundary_samples
+                ]
+            ),
+        )
+        # Releasing the tool is the safe boundary; the next round carries the
+        # edited text. Stay on the detail screen: it is the surface whose
+        # post-delivery state this scenario asserts.
+        Path(repo, GATE).write_text("release\n")
+        delivered = H.wait_until(
+            pty_,
+            lambda text: "暂无待投递的追加指令" in text,
+            timeout=600,
+        )
+        report.check(
+            "joint",
+            "the pending area is empty after safe delivery",
+            delivered,
+            pty_.screen.text()[-900:],
+        )
+        report.dump("2-delivered", pty_)
+        stale = H.wait_until(
+            pty_,
+            lambda text: "等待安全投递" in text or "等待投递" in text,
+            timeout=1,
+        )
+        report.check(
+            "joint",
+            "no stale waiting hint survives delivery",
+            not stale,
+            pty_.screen.text()[-900:],
+        )
         pty_.key("\x1b")
-        proxy.hold_release.set()
 
         completed = H.wait_until(
             pty_,
@@ -121,6 +314,12 @@ def main() -> int:
         report.dump("2-final", pty_)
         screen = pty_.screen.text()
         report.check("joint", "the goal completed with the required marker", completed, screen[-900:])
+        report.check(
+            "joint",
+            "the conversation carries no stale pending-area copy",
+            "等待安全投递" not in screen and "等待投递" not in screen,
+            screen[-900:],
+        )
 
         bodies = [body.decode("utf-8", "replace") for body in proxy.request_bodies]
         joined = "\n".join(bodies)
@@ -131,11 +330,23 @@ def main() -> int:
             proxy.held.is_set(),
             "no hold",
         )
+        first = next((index for index, body in enumerate(bodies) if BETA in body), None)
         report.check(
             "joint",
-            "the edited revision reached a provider request once",
-            any(body.count(BETA) == 1 for body in bodies),
-            "BETA not delivered once",
+            "the edited revision is introduced into exactly one round",
+            first is not None
+            and bodies[first].count(BETA) == 1
+            and all(BETA not in body for body in bodies[:first]),
+            repr([body.count(BETA) for body in bodies]),
+        )
+        gate_first = next((index for index, body in enumerate(bodies) if GATE_WAIT in body), None)
+        report.check(
+            "joint",
+            "the boundary steer is introduced into exactly one round",
+            gate_first is not None
+            and bodies[gate_first].count(GATE_WAIT) == 1
+            and all(GATE_WAIT not in body for body in bodies[:gate_first]),
+            repr([body.count(GATE_WAIT) for body in bodies]),
         )
         report.check(
             "joint",
@@ -167,13 +378,66 @@ def main() -> int:
             "目标收尾" not in screen and "目标未更新" not in screen,
             screen[-700:],
         )
-        rows = GF.rows(home, "SELECT payload FROM events WHERE type='task_finished'")
-        report.check("joint", "the goal reached a completed terminal", bool(rows), repr(rows[:1]))
+        terminals = []
+        for row in GF.rows(home, "SELECT payload FROM events WHERE type='task_finished'"):
+            try:
+                payload = json.loads(row["payload"]).get("payload") or {}
+            except (TypeError, ValueError):
+                continue
+            terminals.append(payload.get("outcome"))
+        report.check(
+            "joint",
+            "one failed old-window terminal and one completed final terminal",
+            terminals.count("failed") == 1 and terminals.count("completed") == 1,
+            repr(terminals),
+        )
+        report.check(
+            "joint",
+            "the controlled gate command dispatched exactly once",
+            len(gate_dispatches(home)) == 1,
+            repr(gate_dispatches(home)),
+        )
+        journal = GF.rows(
+            home,
+            "SELECT state, revision, content FROM session_inputs "
+            "WHERE content LIKE '%STEER_BETA_EDITED%'",
+        )
+        report.check(
+            "joint",
+            "the edited steer has exactly one consumed journal row",
+            len(journal) == 1 and journal[0]["state"] == "consumed",
+            repr(journal),
+        )
+        history = user_message_rows(home, BETA)
+        report.check(
+            "joint",
+            "the edited steer appears exactly once in user history",
+            len(history) == 1,
+            repr([json.dumps(row, ensure_ascii=False)[:120] for row in history]),
+        )
+        gate_journal = GF.rows(
+            home,
+            "SELECT state, revision, content FROM session_inputs "
+            "WHERE content LIKE '%STEER_GATE_WAIT%'",
+        )
+        report.check(
+            "joint",
+            "the boundary steer has exactly one consumed journal row",
+            len(gate_journal) == 1 and gate_journal[0]["state"] == "consumed",
+            repr(gate_journal),
+        )
+        gate_history = user_message_rows(home, GATE_WAIT)
+        report.check(
+            "joint",
+            "the boundary steer appears exactly once in user history",
+            len(gate_history) == 1,
+            repr([json.dumps(row, ensure_ascii=False)[:120] for row in gate_history]),
+        )
     finally:
         proxy.hold_release.set()
         pty_.close()
         proxy.shutdown()
-    report.save()
+        report.save()
     print("assertions: %d, failures: %d" % (len(report.results), report.failures))
     return 0 if report.failures == 0 else 1
 

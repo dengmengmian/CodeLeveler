@@ -1552,10 +1552,14 @@ fn debug_fault(point: &str) {
     {
         // A real, unwinding-free death: cleanup and the persistence loop must
         // not get a chance to turn the injected window into a durable fact.
+        // SIGKILL delivery is asynchronous, so a loaded host can still reach
+        // the next statement (the OS spawn) before it dies; abort() is the
+        // synchronous barrier that makes "die at this point" exact.
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(std::process::id() as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
+        std::process::abort();
     }
     #[cfg(not(unix))]
     std::process::abort();

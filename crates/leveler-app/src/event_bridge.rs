@@ -4351,4 +4351,75 @@ mod projection_equivalence {
         }
         assert_eq!(completed, vec![("c2".to_string(), false)]);
     }
+
+    /// J12: each Goal work window owns its bridge, and a terminal closes that
+    /// bridge for good. A duplicate/late terminal or activity event from the
+    /// old window can only be projected through the bridge that already
+    /// published it — where `terminal_published` drops it — never into the
+    /// next window's bridge, which starts with its own authority. This is the
+    /// structural half of "a late old-window event cannot overwrite the
+    /// running window": the old stream projects its one real terminal, and
+    /// nothing after it, while the new window's terminal is its own.
+    #[test]
+    fn a_late_duplicate_terminal_cannot_cross_a_window_bridge() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut old_window = EventBridge::new(tx.clone());
+        let mut new_window = EventBridge::new(tx.clone());
+
+        let yielded = || EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Yielded,
+            reason: Some("window ended".into()),
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Yielded),
+            warnings: Vec::new(),
+            verification: None,
+        };
+        old_window.forward(yielded());
+        assert!(old_window.terminal_published());
+        // At-least-once shape: the same terminal again, then a late activity
+        // event that would otherwise repaint the stream as busy.
+        old_window.forward(yielded());
+        old_window.forward(EngineEvent::AssistantDelta {
+            text: "late old-window text".into(),
+        });
+
+        let mut old_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            old_events.push(event);
+        }
+        assert!(
+            matches!(old_events.as_slice(), [RuntimeEvent::TurnYielded { .. }]),
+            "the old window projects one terminal and nothing after it: {old_events:?}"
+        );
+
+        // The next window has its own terminal authority. It is not closed by
+        // the previous window's terminal, and it accepts exactly one terminal.
+        assert!(!new_window.terminal_published());
+        new_window.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Completed,
+            reason: None,
+            failure: None,
+            stop: Some(leveler_agent::StopReason::Completed),
+            warnings: Vec::new(),
+            verification: None,
+        });
+        new_window.forward(EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Failed,
+            reason: Some("duplicate".into()),
+            failure: None,
+            stop: None,
+            warnings: Vec::new(),
+            verification: None,
+        });
+        assert!(new_window.terminal_published());
+
+        let mut new_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            new_events.push(event);
+        }
+        assert!(
+            matches!(new_events.as_slice(), [RuntimeEvent::TurnCompleted]),
+            "the new window publishes only its own terminal: {new_events:?}"
+        );
+    }
 }

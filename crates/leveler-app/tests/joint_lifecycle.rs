@@ -28,7 +28,8 @@ use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::{
-    EngineStores, GoalRecord, GoalState, SessionInputRepository, SessionInputState, TurnRepository,
+    EngineStores, EventStore, GoalRecord, GoalState, SessionInputRepository, SessionInputState,
+    TurnRepository,
 };
 use leveler_test_support::{MockResponse, MockServer};
 
@@ -291,6 +292,58 @@ async fn turns(f: &Fixture) -> Vec<leveler_storage::TurnRecord> {
     TurnRepository::new(&db).list(&f.session).await.unwrap()
 }
 
+/// The durable background results recorded for this session. A background
+/// task's terminal fact outlives the window that started it, so these are the
+/// legitimate old-window facts a late delivery must keep.
+async fn background_results(f: &Fixture) -> Vec<leveler_engine::EngineEvent> {
+    let db = f.app.open_database().await.unwrap();
+    db.load_by_types(&f.session, &["background_task_finished"])
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| leveler_engine::EngineEvent::from_payload(&row.payload).ok())
+        .collect()
+}
+
+/// Poll until the session has a durable background result for `call_id`.
+async fn wait_for_background_result(f: &Fixture, call_id: &str) -> leveler_engine::EngineEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(event) = background_results(f).await.into_iter().find(|event| {
+            matches!(
+                event,
+                leveler_engine::EngineEvent::BackgroundTaskFinished { call_id: id, .. }
+                    if id == call_id
+            )
+        }) {
+            return event;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the background result for {call_id} never became durable"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn is_turn_terminal(event: &RuntimeEvent) -> bool {
+    matches!(
+        event,
+        RuntimeEvent::TurnCompleted
+            | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
+            | RuntimeEvent::TurnCompletedWithWarnings { .. }
+            | RuntimeEvent::TurnAnswered
+            | RuntimeEvent::TurnPaused { .. }
+            | RuntimeEvent::TurnYielded { .. }
+            | RuntimeEvent::TurnTruncated { .. }
+            | RuntimeEvent::TurnIncomplete { .. }
+            | RuntimeEvent::TurnBlocked { .. }
+            | RuntimeEvent::TurnFailed { .. }
+            | RuntimeEvent::TurnCancelled
+            | RuntimeEvent::TaskCancelled
+    )
+}
+
 /// Wait until `min_turns` turns exist and the runtime has published a terminal.
 async fn settled(f: &Fixture, min_turns: usize) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
@@ -323,6 +376,24 @@ async fn wait_for<T>(
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
             other => panic!("event stream ended while waiting: {other:?}"),
         }
+    }
+}
+
+/// Wait until a collector thread has seen an event matching `done`.
+async fn wait_seen<T>(
+    seen: &Arc<std::sync::Mutex<Vec<RuntimeEvent>>>,
+    mut done: impl FnMut(&[RuntimeEvent]) -> Option<T>,
+) -> T {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(value) = done(&seen.lock().unwrap()) {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the expected event never reached the session stream"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -917,6 +988,291 @@ async fn a_recovery_window_neither_stops_nor_duplicates_a_background_process() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// J12: Window 1's late events must not rewrite the window that is running
+/// now. A background check started by the failed window exits — for real, with
+/// a non-zero status — while the recovery window is in flight. Its durable
+/// terminal, a duplicate old-window turn terminal, and the live background
+/// activity all land after that window ended. The current window keeps its
+/// authority: the Goal still runs, the steer revision does not move, no
+/// completion/failure/cancel is published for the old epoch, and no second
+/// continuation is opened. The old facts still survive for the audit trail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_old_window_terminal_does_not_rewrite_the_running_window() {
+    let (program, args) = if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec!["/c".to_string(), "verify.cmd".to_string()],
+        )
+    } else {
+        ("sh".to_string(), vec!["verify.sh".to_string()])
+    };
+    let start = tool_call_with_id(
+        "call-bg-late",
+        "run_command",
+        serde_json::json!({
+            "program": program,
+            "args": args,
+            "cwd": ".",
+            "background": true,
+            "background_lifetime": "goal",
+            "reason": "start the acceptance check in the background"
+        }),
+    );
+    let (gated, release) = gated_tool_call("read_file", serde_json::json!({"path": "src/lib.rs"}));
+    let f = fixture(
+        vec![
+            start,
+            gateway_failure(),
+            gated,
+            update_goal_complete("late terminal handled without rewriting the window"),
+            text("the late terminal did not rewrite the running window"),
+        ],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    // The script is the old window's check: it outlives its window and fails.
+    let script = if cfg!(windows) {
+        "ping -n 3 127.0.0.1 >nul\r\nexit /b 7\r\n"
+    } else {
+        "sleep 2\nexit 7\n"
+    };
+    let script_name = if cfg!(windows) {
+        "verify.cmd"
+    } else {
+        "verify.sh"
+    };
+    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
+
+    let seen: Arc<std::sync::Mutex<Vec<RuntimeEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut rx = f.client.subscribe_session(&f.session);
+    let sink = seen.clone();
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let collector = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                event = rx.recv() => match event {
+                    Ok(event) => sink.lock().unwrap().push(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    submit(&f, OBJECTIVE).await;
+    // Window 1 starts the background check, then fails on its next round; the
+    // runtime opens the recovery window.
+    wait_for_request(&f, 2).await;
+    wait_seen(&seen, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::GoalRecovery { attempt: 1, .. }))
+            .then_some(())
+    })
+    .await;
+    // Window 2's first request is held so the old window's late facts land
+    // while that window is unquestionably the running one.
+    wait_for_request(&f, 3).await;
+    steer(&f, "steer-j12", "STEER_LATE_WINDOW").await;
+    let revision = {
+        let rows = inputs(&f).await;
+        input(&rows, "steer-j12").revision
+    };
+
+    let late = wait_for_background_result(&f, "call-bg-late").await;
+    assert!(
+        matches!(
+            &late,
+            leveler_engine::EngineEvent::BackgroundTaskFinished {
+                is_error: true,
+                exit_code: Some(7),
+                ..
+            }
+        ),
+        "the old window's check must really have failed: {late:?}"
+    );
+    wait_seen(&seen, |events| {
+        events
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::BackgroundTaskExited {
+                        exit_code: Some(7),
+                        ok: false,
+                        ..
+                    }
+                )
+            })
+            .then_some(())
+    })
+    .await;
+    let terminals_before_release = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| is_turn_terminal(event))
+        .count();
+    assert_eq!(
+        terminals_before_release, 0,
+        "no old-window terminal may be published for the running window"
+    );
+    assert_eq!(
+        goals(&f)
+            .await
+            .iter()
+            .map(|goal| goal.state)
+            .collect::<Vec<_>>(),
+        vec![GoalState::Running],
+        "the old window's late failure must not fail or complete the Goal"
+    );
+    let rows = inputs(&f).await;
+    let row = input(&rows, "steer-j12");
+    assert_eq!(row.state, SessionInputState::Pending);
+    assert_eq!(row.revision, revision, "a late event is not a steer edit");
+
+    // A duplicate of the old window's own turn terminal, landing in the
+    // durable log while the new window is running. This is the at-least-once
+    // shape of a stale producer; it must stay history, not become authority.
+    let turns_before = turns(&f).await;
+    assert_eq!(turns_before.len(), 2, "one failed window + one recovery");
+    let old_turn = leveler_core::TurnId::new(turns_before[0].id.clone());
+    {
+        let db = f.app.open_database().await.unwrap();
+        leveler_engine::EventLog::new(&db, f.session.clone())
+            .append(
+                Some(&old_turn),
+                leveler_engine::EngineEvent::TurnFinished {
+                    turn_id: old_turn.clone(),
+                    outcome: leveler_lifecycle::TurnOutcome::Interrupted,
+                    stop_reason: "late duplicate of the failed window".to_string(),
+                    stop: None,
+                    model_steps: 0,
+                    modified_files: Vec::new(),
+                    usage: None,
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        goals(&f)
+            .await
+            .iter()
+            .map(|goal| goal.state)
+            .collect::<Vec<_>>(),
+        vec![GoalState::Running],
+        "a durable late old-window terminal must not settle the running Goal"
+    );
+    assert_eq!(
+        turns(&f).await.len(),
+        2,
+        "a late old-window terminal must not open a continuation"
+    );
+
+    release.notify_one();
+    settled(&f, 2).await;
+    wait_for_goal_state(&f, GoalState::Settled).await;
+    let _ = stop_tx.send(());
+    let _ = collector.await;
+
+    let turns = turns(&f).await;
+    assert_eq!(turns.len(), 2, "no duplicate continuation: {turns:?}");
+    let goals = goals(&f).await;
+    assert_eq!(
+        goals.len(),
+        1,
+        "the recovery did not open a sibling: {goals:?}"
+    );
+    assert_eq!(goals[0].state, GoalState::Settled);
+    assert_eq!(goals[0].windows_run, 2, "one failed window + one recovery");
+
+    let rows = inputs(&f).await;
+    assert_eq!(
+        rows.iter().filter(|row| row.id == "steer-j12").count(),
+        1,
+        "one admitted row, no duplicated history: {rows:?}"
+    );
+    let row = input(&rows, "steer-j12");
+    assert_eq!(row.state, SessionInputState::Consumed);
+    assert_eq!(row.content, "STEER_LATE_WINDOW");
+    assert_eq!(
+        row.revision, revision,
+        "no late event may bump the steer revision"
+    );
+    let bodies = f.server.request_bodies().await;
+    let counts: Vec<usize> = bodies
+        .iter()
+        .map(|body| body.matches("STEER_LATE_WINDOW").count())
+        .collect();
+    assert_eq!(
+        counts.get(2),
+        Some(&0),
+        "the request that was in flight while the old window's facts landed must not carry the steer: {counts:?}"
+    );
+    assert_eq!(
+        counts.get(3),
+        Some(&1),
+        "the steer is introduced exactly once, in the next round: {counts:?}"
+    );
+
+    // The old window's failure is retained as an audit fact, exactly once,
+    // even though the goal ended successfully in the new window.
+    let results = background_results(&f).await;
+    assert_eq!(
+        results.len(),
+        1,
+        "one terminal fact, no duplicate row: {results:?}"
+    );
+    assert!(
+        matches!(
+            &results[0],
+            leveler_engine::EngineEvent::BackgroundTaskFinished {
+                call_id,
+                is_error: true,
+                exit_code: Some(7),
+                ..
+            } if call_id == "call-bg-late"
+        ),
+        "the failed check stays on the record: {:?}",
+        results[0]
+    );
+    let db = f.app.open_database().await.unwrap();
+    let rows = db
+        .load_by_types(&f.session, &["turn_finished"])
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().any(|row| {
+            row.turn_id.as_deref() == Some(old_turn.as_str())
+                && row.payload.contains("late duplicate of the failed window")
+        }),
+        "the injected late terminal is on the record, not silently dropped: {rows:#?}"
+    );
+
+    let events = seen.lock().unwrap();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::TurnFailed { .. }
+                | RuntimeEvent::TurnCancelled
+                | RuntimeEvent::TaskCancelled
+        )),
+        "a late old-window failure must never cancel the new window: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| is_turn_terminal(event))
+            .count(),
+        1,
+        "the running window publishes its own terminal exactly once"
+    );
 }
 
 /// B05: a tool call whose outcome is unknown (dispatched, never finished)
