@@ -1,221 +1,242 @@
-# CodeLeveler Windows 11 Full Qualification
+# CodeLeveler Windows Platform Final Closure
 
-> 状态：已执行完毕并定稿。当前候选在已执行范围为 **PARTIAL PASS**；Task Scheduler 为非提升 XML 注册失败（L6，未修复），独立标准用户、ConHost、Release Lab/RC、远端 CI、PS7/VS Code/IME、macOS/Linux 与 Windows 10 当前候选为 BLOCKED / NOT VERIFIED。未执行 push、tag、release 或远端写操作。
+> 状态：Task Scheduler P1 已在本轮修复并以真实非提升宿主、真实到期触发和真实业务副作用验证关闭。Windows 11 当前候选在已执行范围内 **PASS**。独立标准用户、Console Host、PowerShell 7、VS Code、中文 IME、Release Lab/RC、远端 CI、macOS/Linux 与 Windows 10 当前候选仍为 BLOCKED / NOT VERIFIED；这些外部项不因本地通过而放宽。未执行 push、tag、release 或远端写操作。
 
 ## 1. 候选与版本身份
 
 | 项目 | 值 |
 | --- | --- |
-| 基线 `main` | `644d765c6208eba7b59bc0db88559a0445036135`（v1.0.27 之后 4 个提交） |
-| 本次修复提交 | `0ebfa59d` doctor PATHEXT；`4b159c83` TUI DA1；`6edf54ec` ACL 测试能力；`0f9a5cbd` debug-only fault probe；`9936f513` rmdir 开关分类；`8d76717d` TUI pager 路径/引号；`9693cc68` Windows 测试夹具；`1016b495` 写根恢复并发；`3390713d` memory 原子替换；`940ae12c` runtime 端点 EOF；`4bc08296` Windows 原生测试夹具 |
-| 最终候选代码 HEAD | `4bc08296`（产品代码）；报告文档 HEAD `527fd14a` |
 | 版本 | 1.0.27 |
-| 最终候选产物 | 见第 8 节与 `evidence/candidate.sha256` |
-| 安装方式 | 从 ZIP 解压到 `C:\qlab\install\archive` 验证；未覆盖用户已安装的 `C:\Users\code\.local\bin\leveler.exe` |
-| 用户真实配置/会话 | 只读复制到 `C:\qlab\home-upgrade` 用于兼容性检查；未修改原件 |
+| 最终代码 HEAD | `7966c829697356afaef0881755894fff5bd78d59` |
+| 候选构建 revision | `03def7aaeecb07632a9ab74c47862eb6310799c2`（代码提交 + 仅证据的 docs 提交；无源代码差异） |
+| 二进制 provenance | `1.0.27 (03def7aa)`，干净构建（无 dirty/UNTRUSTED） |
+| 本报告文档 HEAD | `03def7aaeecb（证据提交；最终文档提交在收口提交中记录）` |
+| 基线 `main` | `644d765c6208eba7b59bc0db88559a0445036135` |
+| 本轮代码提交 | `7966c829`：Windows LogonTrigger 绑定当前用户；Windows doctor 不再比较平台无法保存的 environment map |
+| 上一候选（保留证据） | `4bc08296`（1.0.27；Task Scheduler P1 未修复） |
+| 构建方式 | `cargo build --release --locked -p leveler-cli -p leveler-win-confine`，工作树干净 |
+| 归档 | `C:\qlab\artifacts\candidate-7966c829\leveler-v1.0.27-x86_64-pc-windows-msvc.zip` |
+| 安装/验收方式 | 从正式 ZIP 解压到 `C:\qlab\install\candidate-7966c829\leveler-v1.0.27-x86_64-pc-windows-msvc\`；未覆盖用户已安装的 `C:\Users\code\.local\bin\leveler.exe` |
+
+证据归属：`4bc08296` 的 TUI、Dogfood A/B/E、MCP、Edge、安全 canary 与全量测试结论保留为**上一候选证据**；本轮 `7966c829` 只修改 schedule wakeup/doctor，不对未改动的 agent/TUI 代码重复完整专项。凡未在 `7966c829` 上重跑的项目均明确标注，不自动继承为新候选证据。
 
 ## 2. 真机环境
 
-完整环境身份见 [ENVIRONMENT.md](ENVIRONMENT.md)。要点：
+完整身份见 [ENVIRONMENT.md](ENVIRONMENT.md)。要点：
 
 - Windows 11 家庭中文版，Build 26300.9711，x64。
-- Windows Terminal 1.25.3131.0；`WT_SESSION` 真实存在。
-- PowerShell 5.1 / CMD / Git Bash；无 PowerShell 7、无 VS Code、无 WSL 发行版。
-- zh-CN，ANSI/OEM 代码页 936；物理 1920×1080 @150% DPI。
-- 用户 `code` 属于 Administrators 组但 token 未提升，进程 IL 为 Medium。
-- 长路径未启用；测试工作区位于短路径 `C:\qlab`，另含中文+空格目录。
-
-Windows 10 历史证据不在本仓/本机，见 [HISTORICAL_BASELINE.md](HISTORICAL_BASELINE.md)。
+- Windows Terminal 1.25.3131.0；PowerShell 5.1 / CMD / Git Bash；无 PowerShell 7、无 VS Code、无 WSL 发行版。
+- zh-CN，ANSI/OEM 代码页 936；1920×1080 @150% DPI；已安装 Microsoft Pinyin，但本轮未用合成输入驱动 IME 组合/候选。
+- 当前账户 `DESKTOP-6EGC57E\code` 属于 Administrators 组，但 token 未提升，进程 IL 为 Medium。
+- 本机唯一启用的本地账户为 `code`；没有已准备好的独立标准用户。创建标准用户需要管理员授权，本轮未执行。
+- `HKCU\Console\%%Startup` 未设置，Windows 11 将传统控制台委派给 Windows Terminal；本轮未修改用户终端设置。
+- Release Lab 脚本 `eval/scripts/release_check.py` / `rc_check.py` 不在本仓或本机；`./dev pre-release` 以 `DOGFOOD_ROOT_NOT_FOUND` 阻断。
 
 ## 3. 方法与证据原则
 
-- 最终结论只关联最终候选的代码身份；修复前后的候选分开记录。
-- Dogfood 使用真实 Provider（`taotoken/deepseek-v4.1-flash-1017`）、真实模型、真实工作区、真实工具执行；scripted/mock 只用于确定性回归与故障注入。
-- 安全结果以真实文件副作用、子进程完整性级别和退出码为准，不以错误文案或初始化成功代替。
-- 未执行的矩阵项标记 NOT VERIFIED；环境不允许的项标记 BLOCKED，不以其他宿主结果外推。
+- 根因先于修复：保留修复前失败证据，用最小对照（无 LogonTrigger / 无 UserId / 有 UserId / 简单 `schtasks`）定位到具体 XML 语义，而不是把“非提升用户”当作不可修复前提。
+- 产品入口优先：真实业务验收通过 `leveler schedule add|enable|run-now|cancel|update|grant|pause|resume|disable` 与真实 Task Scheduler 到期唤醒执行，不只手写 `schtasks` 或 `/Run`。
+- 候选身份优先：最终业务验收使用从正式 ZIP 解压的 `leveler.exe`；修复过程中的 debug 构建只作功能定位，不冒充出货字节。
+- 安全结论以真实身份、IL、文件副作用和退出码为准，不以错误文案或“命令返回 0”代替。
+- 未执行的项标记 NOT VERIFIED；环境不允许的项标记 BLOCKED，不以其他宿主结果外推；不把不同性质的缺失混为一谈。
 
-## 4. 本次修复的缺陷
-| ID | 级别 | 缺陷 | 根因 | 修复与验证 |
-| --- | --- | --- | --- | --- |
-| WIN11-D1 | P1 | `leveler doctor` 在所有正常 Windows 主机上误报 git/cargo/node 缺失，必需 git 检查失败并使 doctor 退出非零 | `find_in_path` 只做 `dir.join(name)`，Windows 执行依赖 `PATHEXT`（`git` → `git.exe`） | 按 PATHEXT 生成候选名并保留精确名回退；Windows 单测先 Red（`None`）后 Green；真机 doctor 中 git/cargo 变为 ✓，退出 0 |
-| WIN11-D2 | P1 | Windows Terminal 的 DA1/Sixel 能力应答在探测超时后落入输入框，显示为 `7;14;…;52c` 等终端簿记文本 | 探测在 150 ms 固定窗口内未读完回复时，未消费的应答尾部留在与 TUI 共用的输入队列 | 回复一旦开始就获得独立完成窗口；未完成时消费已排队尾部；只有 Esc/`[`/`?` 可延长探测。单测覆盖 DA1 解析与 opener 判定；CPU 高负载下真机 TUI 粘贴不再出现前缀，吉祥物仍正常显示 |
-| WIN11-D3 | P2（测试可移植性） | `windows_acl` 的 6 个 restore 单测在非提升 Medium 用户上失败 | `icacls /restore` 需要 `SeRestorePrivilege`；该 coordinator 未被出货的 Low-IL 后端使用 | 按宿主能力断言：有特权时验证成功恢复，无特权时验证明确的 `Restore` 错误；CI 同款 canary 命令 0 failed |
-| WIN11-D4 | P3（构建卫生） | Release 构建出现 `unused variable: exited` 警告 | debug-only fault probe 的绑定在 release 中未使用 | 绑定与使用同置于 `#[cfg(debug_assertions)]`；release 构建无该警告 |
-| WIN11-D5 | P1 | TUI `/output` 完整输出 Pager 在 Windows 上失败（`'more' 以非零状态退出`） | `Capture::open` 的 `fs::canonicalize` 返回 `\\?\C:\...`，`more.com` 无法打开；同时 Rust 的 argv 引号把 `cmd /C` 尾部包住，路径带字面引号到达 cmd | pager 路径经 `display_path` 转为普通盘符/UNC 形式；Windows 用 `raw_arg` 把尾部原样交给 `cmd /C`。Windows 单测先 Red（收到带引号的 verbatim 路径）后 Green |
-| WIN11-D6 | P2 | `rmdir /S /Q 相对目录` 在工作区内也被要求审批，违反“字面路径工作区删除自动运行”的策略 | `deletion_targets_stay_in_workdir` 把 `/S`、`/Q` 当作删除目标操作数 | 仅对 Windows `rmdir`/`del` 识别 `/` 开关；Unix 的前导 `/` 仍视为绝对路径，绝对 Windows 路径仍要求审批。Windows 单测覆盖 Safe/Dangerous 两侧，loop_test 真机通过 |
-| WIN11-D7 | P1（并发正确性） | 同一 `LEVELER_HOME` 下多个 `Application`/窗口并存时，一个窗口的启动恢复会把另一个窗口正在使用的写根标签从 Low 恢复为 Medium；该窗口的 Low 命令随后以“拒绝访问”失败 | `recover_stale_write_roots` 把目录里所有 `.label` 记录都当作崩溃遗留，没有“记录仍被活动租约持有”的事实源 | 每个记录增加 sidecar guard 独占锁，活动租约持有到标签恢复完成；恢复只处理能拿到 guard 的记录，并显式跳过本进程 `held` 中的根；租约时对遗留记录做一次加锁恢复。新增 `recovery_leaves_a_live_lease_alone` 先 Red（恢复后标签不再是 Low）后 Green；`execution_ownership` 压测由 3/10 失败变为 12/12 通过 |
-| WIN11-D8 | P2（数据原子性） | 并发读线程打开 memory topic 时，原子替换偶发 `拒绝访问 (os error 5)` | overwrite 路径使用 `tempfile::persist`，其 Windows 实现 `MoveFileExW` 不能替换仍被读句柄打开的目标 | overwrite 改用 `std::fs::rename`（NTFS 上原子且可替换读打开的目标）；`persist_noclobber` 保留新建语义。并发测试由 2/40 失败变为 100/100 通过 |
-| WIN11-D9 | P2（启动可靠性） | Windows named pipe 服务端在握手后立即退出时，`probe_default_runtime` 返回 `UnexpectedEof`，启动把“端点不存在”误报为传输错误 | `endpoint_unavailable` 未把 Windows EOF 归类为端点不可用 | 把 `UnexpectedEof` 与 ECONNRESET/EPIPE 同等归类；共享分类单测在 Windows 也运行；`windows_runtime_host` 真机验收 10/10 通过 |
-| WIN11-D10 | P2（测试可移植性） | 全量 Windows 套件中若干仅按 Unix 语义编写的测试失败：`sleep`/`sh`/裸 `.cmd` 工作区脚本、未转义的 HOME JSON、空环境快照下 `cmd` 无法执行批处理 | 测试夹具假设 POSIX 工具和完整宿主环境；不是产品在这些路径上的真实失败 | 改为 Windows 原生命令/显式 `.\` 脚本；JSON 夹具使用固定 POSIX 路径；后台批处理测试改用产品安装的宿主环境快照。目标测试全部 Green；全量套件复跑结果见第 7 节 |
+## 4. Task Scheduler P1：根因、修复与真机验收
 
-原生 Ctrl+V 多行/非 BMP 粘贴的换行提交与 emoji 丢失是 **Windows Terminal 宿主行为**，不是本次新缺陷：产品已在 footer 提供 Alt+V，源码注释明确记录该宿主路径限制。详见第 9 节 WIN11-10。
+### 4.1 修复前的真实失败
 
-## 4.1 安全与权限证据
-
-**身份矩阵**
-
-| 环境 | 结果 |
-| --- | --- |
-| 管理员组成员的非提升 Medium 会话（本次宿主） | 已验证；IL Medium，Administrators 在过滤 token 中为 deny-only |
-| 独立标准用户（不在 Administrators） | BLOCKED；创建需要管理员授权，本次未执行；未把当前 token 等同于标准用户 |
-| Low Integrity 子进程 | 已验证；`S-1-16-4096`，由 `leveler-confine.exe` 启动 |
-| 提升管理员环境 | 未使用；未据此掩盖标准用户问题 |
-
-**独立 ACL / Low-IL canary（真实文件副作用）**
-
-`evidence/security-canary-manual.log` 记录 11 项检查，全部 PASS：
-
-| 检查 | 结果 |
-| --- | --- |
-| 子进程 IL 为 Low | PASS |
-| 读取已验证写根内的文件 | PASS |
-| 在已标记写根内创建文件 | PASS |
-| 修改写根内既有文件 | PASS |
-| 写入未标记的外部目录 | 拒绝（exit 1，文件不存在） |
-| 通过 Junction 写入外部目录 | 拒绝（exit 1，目标不存在） |
-| `..` 相对路径穿越 | 拒绝（exit 1，目标不存在） |
-| `\\?\` 扩展路径穿越 | 拒绝（exit 1，目标不存在） |
-| 显式 ACL Deny(W) 目录 | 拒绝（exit 1，文件不存在） |
-| 写根内大小写不同路径 | 允许 |
-| 宿主未提升 | `IsInRole(Administrator)=False` |
-
-**CI 同款 Windows canary**
-
-`cargo build -p leveler-win-confine --all-features` + `cargo test -p leveler-tools windows_ ...` + `cargo test -p leveler-execution windows_ ...`：76 个匹配测试通过（73 execution + 3 tools），0 失败，退出 0。覆盖真实 NTFS ACL、Low Integrity 写根、Job Object 取消/超时杀死孙进程、真实 `cargo build`、崩溃后标签恢复、并发恢复保护、Junction/父目录替换等。证据：`evidence/security-canaries-final.log`。
-
-**Launcher 缺失 fail-closed**
-
-把 `leveler.exe` 单独复制到不含 `leveler-confine.exe` 的目录后，doctor 报告 `write=Unsupported backend=None`；真实模型执行 `shell_command` 时在 spawn 前被拒绝：
+上一候选 `4bc08296` 在非提升 Medium 会话中：
 
 ```text
-Windows FS sandbox is not available (capability write=unsupported); refuse non-FullAccess spawn with write_root="\\?\C:\qlab\repos\ascii-tui"
+LEVELER_TASK_SCHEDULER_ACCEPTANCE=1
+schtasks.exe /Create failed (exit code: 1): 错误: 拒绝访问。
 ```
 
-命令从未执行，`MISSING-LAUNCHER-CANARY` 未出现在任何 stdout，`modified_files: []`，会话以 `Blocked` 结束；模型尝试申请 FullAccess 被非交互审批拒绝。证据：`evidence/nolauncher-run.jsonl`。
+同账户简单 `/Create` 成功；导出的简单任务 XML 重新注册也成功。证据：`evidence/task-scheduler-acceptance.json`（上一候选）与本轮 `evidence/final-7966c829/task-scheduler-root-cause.log`。
 
-**ACL coordinator 限制（非出货路径）**
+### 4.2 根因
 
-`windows_acl` 的 `icacls /restore` 需要 `SeRestorePrivilege`，非提升 Medium token 不具备（`whoami /priv` 实测）。该 coordinator 当前没有生产调用者，出货的 Low-IL 后端不经过它；测试按宿主能力断言明确的 `Restore` 错误，而不是伪造成功。若未来把它用于标准用户路径，需要改用不依赖 restore 特权的 ACL 恢复机制。
+产品 XML 的 `<LogonTrigger>` 只有 `<Enabled>` 和 `<Repetition>`，没有 `<UserId>`。Task Scheduler 语义：**没有 UserId 的登录触发器作用于所有用户**；非提升用户无权注册“所有用户”的触发器，因此返回 Access Denied。它不是“普通用户不能使用计划任务”，也不是 XML 编码/文件 ACL/任务目录权限问题。
 
-## 5. 验收结果
+最小对照（当前宿主，非提升 Medium，原始日志 `evidence/final-7966c829/task-scheduler-root-cause.log`）：
+
+| 对照 | XML 形状 | 结果 |
+| --- | --- | --- |
+| A | 产品 XML，去掉 LogonTrigger | exit 0，创建成功 |
+| B | 产品 XML，LogonTrigger 无 UserId | exit 1，拒绝访问 |
+| C | 产品 XML，LogonTrigger 绑定 `DOMAIN\user` | exit 0，创建成功 |
+| D | `schtasks /SC ONLOGON /RU <user> /IT`（无 XML） | exit 1，拒绝访问 |
+| E | 简单 `/Create` 导出的 XML 重新注册 | exit 0，创建成功 |
+
+### 4.3 修复
+
+`task_scheduler_xml` 在 `<LogonTrigger>` 中写入与 Principal 相同的 `<UserId>`，顺序为 `<Repetition>`、`<Enabled>`、`<UserId>`（符合 Task Scheduler 扩展 schema）。没有提升权限、没有 SYSTEM、没有保存密码、没有修改系统 ACL 或安全策略、没有切换 FullAccess、没有伪造任务状态。
+
+先写的回归 `a_logon_trigger_is_bound_to_the_registered_user` 在修复前失败，修复后通过；真实 `task_scheduler_acceptance` 在修复前 FAIL、修复后 PASS（注册、按需执行、IgnoreNew 去重、自然到期触发、删除）。
+
+同轮发现的第二个 Windows 缺陷：`schedule doctor` 把 Task Scheduler 无法保存的 environment map 与期望 spec 比较，导致每次成功注册都报 `environment` FAIL。修复为在 `WakeupStatus` 记录平台是否报告 environment（Task Scheduler=false，launchd=true），仅在可比较时比较；两处 doctor（CLI 与共享 manage）各有先 Red 后 Green 的回归。
+
+### 4.4 产品级真机验收（20 项对照）
+
+最终候选 Release 归档二进制 + 隔离 `LEVELER_HOME`/config + 中文与空格工作区。详细 JSON/XML 见 `evidence/final-7966c829/`；生命周期与恢复场景的补充 E2E 见 `evidence/final-7966c829/debug-candidate/`（debug 构建，代码与 `7966c829` 相同，仅用于行为覆盖）。
+
+| # | 场景 | 结果 | 证据/说明 |
+| --- | --- | --- | --- |
+| 1 | 创建一次性任务 | PASS | `schedule add --at` 返回 id 与 next occurrence |
+| 2 | 创建周期任务 | PASS | `--every 60`；自然运行 ≥2 次 |
+| 3 | 查询任务 | PASS | `list/show --json`；label、workspace、grant、next |
+| 4 | 手动触发 | PASS | `run-now`；run 结算 succeeded |
+| 5 | 自然到期触发 | PASS | 不调用 `dispatch`/`/Run`，由真实 Task Scheduler wake 执行；OS wake claimed=1 |
+| 6 | 修改任务 | PASS | `update` 改命令；revision 前进；新命令生效、旧命令未执行 |
+| 7 | 禁用/重新启用 | PASS | `pause` 后 enabled=false；`resume` 后 true；`enable` 幂等；只保留一个同名任务 |
+| 8 | 取消任务 | PASS | 运行中 `cancel`；run 结算 cancelled，未伪造 succeeded |
+| 9 | 删除任务 | PASS | `remove` 删除定义与运行历史；无孤儿 run |
+| 10 | 同名冲突 | PASS | 重复 `enable` 使用 `/F` 覆盖同一 label；两个独立 home 的 label 不同，互不覆盖 |
+| 11 | 注册失败后的状态 | PARTIAL | 修复前真实失败证据保留；`enable` 失败返回错误且无本地“已启用”伪状态；本轮无授权制造第二次系统级拒绝 |
+| 12 | 成功任务结果 | PASS | 退出码 0、due.txt 含 `定时中文完成`、OS wake 记录 |
+| 13 | 失败任务结果 | PASS | `exit /b 7` → state=failed、exit_code=7 |
+| 14 | 中文/空格工作目录 | PASS | 最终候选 cwd=`C:\qlab\ts-final-7966c829\工作 空间` |
+| 15 | 中文参数与输出 | PASS | 命令与输出保留中文；输出文件按宿主 ANSI/CP936 读取为 `定时中文完成` |
+| 16 | 客户端退出后触发 | PASS（CLI 语义） | enable 的短生命周期进程已退出，真实到期 wake 独立执行；未在本轮重新驱动 TUI |
+| 17 | Runtime/daemon 重启恢复 | PASS | 杀掉 serve 进程后下一 OS wake 启动新 PID，持久事件恢复并结算 succeeded |
+| 18 | Session/Goal 关联与执行记录 | PARTIAL | run 绑定 durable session；Goal 动作的真实模型调度本轮未重跑（agent runtime 未改动） |
+| 19 | 重复触发/并发策略 | PASS | Task Scheduler IgnoreNew 验收 PASS；两个并发 `dispatch` 对同一 due slot 只产生 1 个 run |
+| 20 | 无关用户任务安全 | PASS | `disable/uninstall` 只删除本 label；无关任务保留；测试后清理本轮任务 |
+
+实际执行身份与边界（最终候选）：
+
+- 宿主：`DESKTOP-6EGC57E\code`，非提升，Medium（`S-1-16-8192`）。
+- 定时动作子进程：同一用户，Low Integrity（`S-1-16-4096`），由 Assisted 写沙箱启动；这是安全契约，不是降级或提权。
+- 实际 cwd：定义的工作区（中文+空格），不是 Task Scheduler 的 `WorkingDirectory`（后者是 home，仅用于 dispatch 进程）。
+- 退出码：0；业务副作用：工作区内 `due.txt`。
+
+## 5. 缺陷闭合
+
+| ID | 级别 | 缺陷 | 状态 | 根因/修复 |
+| --- | --- | --- | --- | --- |
+| WIN11-D11 | P1 | 非提升会话无法启用 Task Scheduler wakeup | **CLOSED** | LogonTrigger 缺 UserId → any-user；绑定当前用户；真实到期业务验收 PASS |
+| WIN11-D12 | P2 | Windows 注册成功后 `schedule doctor` 恒失败 | **CLOSED** | Task Scheduler 无 environment map；新增平台能力位，仅在可比较时比较；真实 doctor PASS |
+
+上一候选的 D1–D10 保留在历史报告中，不因本轮修复被重写；本轮回归覆盖其受影响范围（见第 8 节）。
+
+## 6. 验收结果
 
 | 验收项 | 结果 | 证据 |
 | --- | --- | --- |
-| 全量 workspace 测试 | PASS：328 个 test binary，7930 passed / 0 failed，exit 0 | `evidence/workspace-tests-final.log` |
-| 全量 workspace Clippy | PASS：`-D warnings`，exit 0 | `evidence/clippy-full.log` |
-| Format | PASS：`cargo fmt --all -- --check` | 本报告第 7 节 |
-| 真实业务 Dogfood A/B/E | PASS：真实 Provider/模型，A/B/E 均 Completed，独立 `cargo test` exit 0 | `evidence/dogfood-a-final-4bc08296/` 等 |
-| 真实 TUI 关键路径 | PASS/见 5.1：WT 1.25、中文路径、Alt+V、DA1 修复、`/output` Pager | `evidence/tui-final2-*.png` |
-| 安全 canary | PASS：11 项独立 canary + CI 同款 76 项（73 execution + 3 tools，0 failed） | `security-canary-manual.log`、`security-canaries-final.log` |
-| Browser acceptance | 见第 7 节 | `evidence/browser-acceptance.log` |
-| Task Scheduler acceptance | 见第 7 节 | `evidence/task-scheduler-acceptance.json` |
-| Release Lab / RC | BLOCKED：本机/本仓无外部实验室脚本 | 第 7 节 |
-| 独立标准用户 / ConHost | BLOCKED：需要管理员授权/修改用户终端设置 | `LIMITATIONS.md` |
+| Task Scheduler 真实验收 | PASS：注册、按需执行、IgnoreNew、自然触发、删除 | `evidence/final-7966c829/task-scheduler-acceptance.log` |
+| 最终候选自然到期业务任务 | PASS：真实 OS wake，非 `/Run` | `evidence/final-7966c829/product-e2e-final.json` |
+| 定义生命周期 | PASS：失败 7、取消、修改/授权失效/重授权、暂停/恢复、删除 | `evidence/final-7966c829/debug-candidate/product-e2e-lifecycle.json` |
+| 周期运行与 daemon 重启 | PASS：≥2 次自然运行；kill→新 daemon→新 run succeeded | `evidence/final-7966c829/debug-candidate/product-e2e-os-stage-b1.json` |
+| 并发与任务隔离 | PASS：单 due slot 单 run；无关任务保留；两 home label 独立 | `evidence/final-7966c829/debug-candidate/product-e2e-os-stage-b2.json` |
+| 安全 canary（独立） | PASS：11/11（Low IL、写根、Junction/.. /\\?\ /ACL Deny、大小写） | `evidence/final-7966c829/security-canary-manual.log` |
+| 安全 canary（CI 同款） | `PASS：76 passed / 0 failed（3 tools + 73 execution）` | `evidence/final-7966c829/security-canaries-ci.log` |
+| Workspace tests | `PASS：328 targets，7933 passed / 0 failed（PATH 含文档化便携 CPython 3.12.10；首次缺 python3 的 4 个 web fixture 已复跑 39/39）` | `evidence/final-7966c829/workspace-tests.log` |
+| Workspace Clippy | `PASS：--all-targets --all-features -- -D warnings，exit 0` | `evidence/final-7966c829/clippy.log` |
+| Format | `PASS：exit 0` | `evidence/final-7966c829/fmt.txt` |
+| Release payload | `PASS` | `evidence/final-7966c829/release-payload.log` |
+| ZIP 冒烟 | `PASS：--version 1.0.27 (03def7aaeecb)，completions 6043 bytes，confine exit 23` | `evidence/final-7966c829/package.log` |
+| Browser acceptance | PASS：12 passed / 0 failed；真实 Edge（当前候选） | `evidence/final-7966c829/browser-acceptance.log` |
 
-### 5.1 TUI 真机观察（已执行）
+`./dev verify` 本轮输出 `NO_OWNED_CHANGES；version 1.0.27；verify PASS（不是独立完整验证）`：它是所有者变更检查，不是又一次独立完整验证；不作为上述门禁的替代。
 
-| 项目 | 结果 | 证据 |
+### 6.1 Dogfood A–G 覆盖关系
+
+| 场景 | 当前状态 | 证据 / 说明 |
 | --- | --- | --- |
-| Windows Terminal + CMD（`cmd /k` 启动 TUI） | PASS；真实 WT 窗口、Sixel 吉祥物、中文界面 | `evidence/tui-layout-120x30-clean.png` |
-| 最终候选 TUI 启动 | PASS；真实 WT 新窗口，版本 1.0.27、Sixel 吉祥物、中文+空格工作区、模型/权限 Footer | `evidence/tui-final2-welcome.png` |
-| Windows Terminal + PowerShell 5.1（PowerShell runner 启动 TUI） | PASS；中文+空格工作区路径与分支正常 | `evidence/tui-chinese-path.png` |
-| Windows Terminal + PowerShell 7 | NOT VERIFIED；本机未安装 `pwsh` | — |
-| Console Host 独立窗口 | BLOCKED；Windows 11 默认委派给 WT，未获授权修改 `HKCU\Console\%%Startup` | `ENVIRONMENT.md` |
-| VS Code Integrated Terminal | NOT VERIFIED；本机未安装 VS Code | — |
-| 120×30 布局 | PASS；Header、欢迎卡、输入框、Footer、模型/权限/协作状态完整 | `evidence/tui-layout-120x30-clean.png` |
-| 100×30 布局 | PASS；吉祥物显示，全部 hint 完整 | `evidence/tui-layout-100x30.png` |
-| 80×24 布局 | PASS（有意的截断）；吉祥物隐藏且不保留空白，最后一条 hint 省略，模型名与时钟保留 | `evidence/tui-layout-80x24.png` |
-| 最大化窗口 | PASS；大窗口布局稳定；系统“激活 Windows”水印覆盖右下角（环境因素） | `evidence/tui-layout-maximized3.png` |
-| 图片协议支持 | PASS；WT 1.25 + DA1 属性 4 → Sixel 高清吉祥物 | `evidence/tui-layout-120x30-clean.png` |
-| 图片能力未知 / Sixel 不支持 | PASS；清除 `WT_SESSION` 后直接隐藏吉祥物，无字符画/像素图/空白占位 | `evidence/tui-image-hidden.png` |
-| 中文路径与分支符号 | PASS；Header 显示 `C:\qlab\repos\中文 工程 · ◆ master`，无 `\\?\` 前缀 | `evidence/tui-chinese-path.png` |
-| 权限模式切换 | PASS；Shift+Tab 在 auto / full / ask 间切换，Footer 同步；切到 FullAccess 时出现“完全访问（免审批）”提示 | `evidence/tui-permission-full.png`、`evidence/tui-permission-request.png` |
-| 帮助与面板快捷键 | PASS；Ctrl+? 打开帮助，Alt+1 会话列表，Alt+3 模型选择器，中文完整 | `evidence/tui-shortcuts-overlay.png`、`evidence/tui-alt1-history.png`、`evidence/tui-alt3-model.png` |
-| 中文/多行/emoji 粘贴（Alt+V） | PASS；保留换行与 🙂，不提交 | `evidence/tui-altv-multiline.png` |
-| 原生 Ctrl+V / Ctrl+Shift+V 单行 BMP | PASS（单行中文可粘贴） | `evidence/tui-ctrlc-paste.png` |
-| 原生 Ctrl+V / Ctrl+Shift+V 多行或非 BMP | PARTIAL（宿主限制）；WT 把换行变成 Enter，消息被提交为 steer，emoji 丢失；Footer 提供 Alt+V 作为可靠替代 | `evidence/tui-multiline-paste.png`、`evidence/tui-ctrlshiftv-paste.png` |
-| DA1 应答泄漏（修复前） | FAIL 复现；输入框出现 `7;14;…;52c` 前缀 | `evidence/tui-paste-altv.png` |
-| DA1 应答泄漏（修复后） | PASS；相同高负载场景下输入框只含粘贴文本 | `evidence/tui-da1-fixed-paste.png` |
-| `/output` 完整输出 Pager（修复后） | PASS；真实 TUI 本地命令产生 4627 行输出，`more` 正常打开并显示 `-- More (0%) --`，不再出现“以非零状态退出” | `evidence/tui-final2-pager.png`、`evidence/tui-final2-shell-output-long.png` |
-| Shell Mode 输入 | PARTIAL；通过真实剪贴板粘贴 `!cmd ...` 进入并执行本地命令；合成 Shift+1 在本次自动化环境中被当作普通字符，物理键盘路径未独立验证 | `evidence/tui-final2-shellmode.png`、`evidence/tui-final2-shell-output-long.png` |
-| 双 Ctrl+C 退出确认 | PASS；Footer 提示“再按一次 Ctrl+C 退出”，未立即退出 | `evidence/tui-cancel-ctrlc.png` |
-| IME 候选与组合输入 | NOT VERIFIED；无法用合成按键可靠驱动系统 IME；需人工按第 9 节步骤验证 | — |
+| A：基础业务实现 | PASS（4bc08296，按影响范围复用） | 真实 Provider/模型；独立测试 4/4；本轮代码未改动 agent runtime |
+| B：库存对账 + CLI + 后台测试 | PASS（4bc08296，按影响范围复用） | 两次后台 `cargo test` + `wait_task`；独立输出核对 |
+| C：取消与恢复 | PARTIAL | 当前候选真实取消（运行中 → cancelled）已验证；完整 TUI 退出/重启/Session Resume 后继续剩余业务未在本轮重跑 |
+| D：Windows Unicode 路径 | PASS（当前候选范围） | 最终候选中文+空格工作区的真实定时业务；TUI/路径/显示复用上一候选证据 |
+| E：后台 mutation 与验证证据 | PASS（确定性回归，Windows） | `task_commit_test::b12_a_background_write_expires_the_verification_it_followed` 与 `a_workspace_change_after_acceptance_prevents_verified_delivery` 在 Windows 套件运行通过；Unix-only 后台 barrier 测试覆盖启动版本窗口；真实 Goal 同场景未重跑 |
+| F：长 Session / Compaction | NOT VERIFIED | 本轮未真实触发 Compaction；不以普通长对话冒充 |
+| G：其他正式执行入口 | PARTIAL | MCP 真实调用为 4bc08296；本轮通过 CLI + 真实 Runtime/daemon + schedule 入口验证；未新建客户端 |
 
+## 7. Windows 10 历史与当前候选
 
-## 6. 真实业务 Dogfood
+用户提供的 Windows 10 历史真机结论（外部基线）：
 
-最终候选 `1.0.27 (4bc082963fee)` 在题述 Windows 11 真机上，以真实 Provider `taotoken` / 模型 `deepseek-v4.1-flash-1017`（high）运行。每个场景都有真实工区、真实工具调用和独立的 `cargo test`。
+- Windows 10 Education 19045。
+- 历史候选 `1.0.26 (5a4fc17480a6)`；代码提交 `5a4fc17480a63e14b29fa785778fcde92ca3b940`；文档 HEAD `4e984c3993dd1d3736ee0f1608a0b03caf8e9254`；报告目录 `docs/windows-tui-acceptance/`。
+- TUI、Windows Terminal、Console Host、PowerShell/CMD、权限契约、编码修复及最终候选真实 Goal Dogfood 已验证。
 
-| 场景 | 结果 | 关键证据 |
+本轮检索结果：
+
+1. **历史版本已有验收结论**：以上述外部基线为准，保留为 Windows 10 历史事实，不再写成“无历史证据”。
+2. **原始历史证据**：不在当前仓库（`docs/windows-tui-acceptance/` 不存在，`git log --all` 无记录，两个历史提交对象不存在）、不在本机文件系统/归档、不在用户会话记录中；未编造截图或日志。
+3. **Windows 10 当前候选**：本机无 Windows 10 宿主，未运行跨机器验收 → **NOT VERIFIED**。
+4. **Windows 11 当前候选**：见第 1、4、6 节。
+
+`b1f002d`、`5a4fc174...` 等历史 SHA 在本仓不可解析；按“行为而非 SHA”核对，Display Path（`leveler-core/src/path.rs`）、OutputDecoder（`leveler-execution/src/encoding.rs`，含 UTF-8 跨读、GBK lead/trail 与截断测试）、Welcome 图片/无字符画降级（TUI splash）、Alt+V（Footer/粘贴路径）、sidecar 精确性（`leveler-execution`）均在当前代码中，并由上一候选真机证据/测试覆盖。
+
+## 8. 工程回归（四个 Windows 11 修复）
+
+| 提交 | 机制 | 回归结论 |
 | --- | --- | --- |
-| A：订单 CSV 汇总实现 | Completed，7 轮，12 次工具调用，修改 `src/lib.rs`；独立 `cargo test` 4 passed / 0 failed / exit 0；`data/orders.csv` 未修改 | `evidence/dogfood-a-final-4bc08296/` |
-| B：库存对账 + CLI | Completed，12 轮，18 次工具调用；两次后台 `cargo test` + `wait_task`，再 `cargo run -- data/stock.csv data/movements.csv`，输出 SKU-1=9 / SKU-2=9 / SKU-3=6；独立测试 4/4 | `evidence/dogfood-b-final-4bc08296/` |
-| E：README 收尾 + 重新验证 | Completed，8 轮，11 次工具调用；只修改 `README.md`；README 修改后重新运行 `cargo test`，4/4 通过 | `evidence/dogfood-e-final-4bc08296/` |
-| MCP 真实工具调用 | Completed，5 轮；批准 `mcp__qual__echo_business` 后真实执行，fixture 记录 `WIN11-MCP-4BC08296` | `evidence/mcp-final.jsonl`、`evidence/mcp-side-effect-final.log` |
+| `1016b495` | 活动写根租约 + guard 独占锁 + 恢复跳过 held | 同进程/跨进程、恢复幂等、活动租约不被恢复均有测试；本轮 workspace 复用 |
+| `3390713d` | overwrite 用 `std::fs::rename`；新建保留 `persist_noclobber` | 并发读 100/100；Unix/NTFS 原子语义；未引入 Memory 2.0 产品面 |
+| `940ae12c` | Windows named pipe 握手 EOF 归为端点不存在 | 平台无关分类测试覆盖 NotFound/Refused/Reset/EPIPE/EOF，PermissionDenied 仍不是“不存在”；真实 runtime host 验收见上一候选 |
+| `4bc08296` | Windows 原生命令/显式 `.\`/宿主环境夹具 | 保留断言，只替换不可移植的 POSIX 工具；后台 .cmd 回归仍在 |
 
-A/B/E 的 `run.jsonl` 均以 `session_completed` + `stop_reason=Completed` 结束，不是模型自述完成；独立测试在新进程执行。
+Memory topic 的所属模块与契约：`leveler-memory` 的 topic 文件写入（`access_policy.rs`）负责用户全局 memory 的原子覆盖；本次改动只替换 overwrite 系统调用，不新增/恢复任何 Memory 2.0 功能、状态或 UI。
 
-## 7. 工程门禁
+## 9. 工程门禁
 
 | 门禁 | 命令 | 结果 |
 | --- | --- | --- |
-| Format | `cargo fmt --all -- --check` | PASS（全仓检查通过） |
-| Workspace check | `cargo check --workspace --all-features --locked` | 由 Clippy 全量覆盖；PASS |
-| Workspace Clippy | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | PASS，exit 0 |
-| Workspace tests | `RUST_TEST_THREADS=2 cargo test --workspace --all-features --locked --no-fail-fast` | PASS：328 个 test binary，7930 passed / 0 failed，exit 0 |
-| `./dev verify` | `./dev verify` | PASS（`NO_OWNED_CHANGES` + version 1.0.27；提交后无未拥有改动） |
-| Windows security canaries | `cargo build -p leveler-win-confine --all-features` + `cargo test ... windows_` | PASS：73 项 execution + 3 项 tools，0 failed；手动 11 项 canary PASS |
-| Browser acceptance | `LEVELER_BROWSER_ACCEPTANCE=edge cargo test -p leveler-browser --test acceptance ...` | PASS：12/12，真实 Edge；包含网页交互、崩溃、截图、进程清理、公网访问 |
-| Task Scheduler | `LEVELER_TASK_SCHEDULER_ACCEPTANCE=1 ... cargo test -p leveler-schedule --test task_scheduler_acceptance` | **FAIL**：`schtasks /Create /XML` 在非提升 Medium 会话返回“拒绝访问”；简单 `/Create` 非提升可成功，见第 9 节 L6 |
-| Release payload | `sh packaging/scripts/check_release_payload.sh` | PASS |
-| Release Lab / RC | `./dev pre-release` / `./dev release` | BLOCKED：`FAIL DOGFOOD_ROOT_NOT_FOUND`，无外部 dogfood lab；未执行 `./dev release` |
-| 远端 CI | GitHub Actions | NOT RUN（未授权 push / 远端运行） |
-| macOS / Linux | 本地跨平台检查 | NOT VERIFIED（本机无对应宿主；未执行 cross-target build） |
+| Format | `cargo fmt --all -- --check` | `PASS：exit 0` |
+| Workspace check | `cargo check --workspace --all-features --locked` | `PASS：exit 0（1m11s）` |
+| Workspace Clippy | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | `PASS：--all-targets --all-features -- -D warnings，exit 0` |
+| Workspace tests | `RUST_TEST_THREADS=2 cargo test --workspace --all-features --locked --no-fail-fast` | `PASS：328 targets，7933 passed / 0 failed（PATH 含文档化便携 CPython 3.12.10；首次缺 python3 的 4 个 web fixture 已复跑 39/39）` |
+| Sandbox canary | `cargo build -p leveler-win-confine --all-features` + `cargo test -p leveler-tools windows_` + `cargo test -p leveler-execution windows_` | `PASS：76 passed / 0 failed（3 tools + 73 execution）` |
+| Release build | `cargo build --release --locked -p leveler-cli -p leveler-win-confine` | PASS（干净工作树） |
+| Release payload | `sh packaging/scripts/check_release_payload.sh` | `PASS` |
+| ZIP 冒烟 | 正式 ZIP 解压 + `--version`/completions/`leveler-confine exit 23` | `PASS：--version 1.0.27 (03def7aaeecb)，completions 6043 bytes，confine exit 23` |
+| Release Lab / RC | `./dev pre-release` / `./dev release` | BLOCKED：`DOGFOOD_ROOT_NOT_FOUND`，无外部 dogfood lab |
+| 远端 CI | GitHub Actions | NOT RUN（未授权 push/远端运行） |
+| macOS / Linux | 本地跨平台 | NOT VERIFIED（本机无宿主；未运行 cross-target） |
 
+## 10. 最终产物
 
-## 8. 最终产物
-
-版本：`1.0.27 (4bc082963fee)`（provenance 无 dirty 标记）。
+版本 `1.0.27 (03def7aa)`；provenance 为干净构建（无 dirty/UNTRUSTED）。
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `leveler.exe` | `d6613530b909bca6e0de5bbc9f2ab5cbac1f3d92574a1e2a087d30d9844e7742` |
+| `leveler.exe` | `899a9cc635554019f48a4d9f717d7acaa4924145e904023c1963f80bf9907951` |
 | `leveler-confine.exe` | `51398c17c0dfb7ae896392ba9df284927efee47e3896eb0e6a794f21ba7b9ab5` |
-| `leveler-v1.0.27-x86_64-pc-windows-msvc.zip` | `8e4ef237e3102bf58f5e5204bf0b625364475b87ba183277ee19fc492289bf58` |
+| `leveler-v1.0.27-x86_64-pc-windows-msvc.zip` | `c80e2f49f43ef68249ab63968f740edfebae6715ae1827658677dd707ce82628` |
 | `README.md` | `d56333375683882ed0ac8928b607ed71a65bd19562a4181c7e66272c04e0fd2d` |
 | `LICENSE-APACHE` | `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4` |
 
-ZIP：`C:\qlab\artifacts\leveler-v1.0.27-x86_64-pc-windows-msvc.zip`；解压至 `C:\qlab\install\archive\leveler-v1.0.27-x86_64-pc-windows-msvc\`。归档冒烟：`--version`、`completions bash`、`leveler-confine -- cmd /d /c exit 23` 全部通过。未覆盖用户已安装的 `C:\Users\code\.local\bin\leveler.exe`。
+ZIP：`C:\qlab\artifacts\candidate-7966c829\leveler-v1.0.27-x86_64-pc-windows-msvc.zip`；解压至 `C:\qlab\install\candidate-7966c829\leveler-v1.0.27-x86_64-pc-windows-msvc\`。归档冒烟：`--version`、`completions bash`、`leveler-confine -- cmd /d /c exit 23` 全部通过。未覆盖用户已安装的 `C:\Users\code\.local\bin\leveler.exe`。
 
-## 9. 剩余风险与未验证项
-
-完整复现见 [LIMITATIONS.md](LIMITATIONS.md)。
+## 11. 剩余风险与未验证项
 
 | ID | 级别 | 项 | 状态 / 影响 |
 | --- | --- | --- | --- |
-| L1 | P2 | Git Bash/MSYS `rm`/`printf`/`sh` 在 Low Integrity 沙箱内无法创建 MSYS 命名对象（0xC0000022） | 确认；原生命令（cmd/PowerShell/cargo/git）正常；替代为原生命令或 FullAccess |
-| L2 | 已撤销 | 早期认为“后台 `.cmd`/`.bat` 脚本失败” | 复核为测试夹具使用空环境快照（缺 `SystemRoot`），`cmd` 无法执行批处理；产品入口安装完整宿主快照后，后台 `.cmd` 真实通过（`a_background_batch_script_runs_with_the_host_environment`） |
-| L3 | P2 | 本机 `NoDefaultCurrentDirectoryInExePath=1`，裸脚本名不被 cmd 搜索；显式 `.\` 可用 | 环境限制；测试夹具已显式化，产品未静默移除用户设置 |
-| L4 | P2 | Windows Terminal 原生 Ctrl+V/Ctrl+Shift+V 多行/非 BMP 丢失并拆分提交 | 宿主限制；Alt+V 已提供可靠 Unicode 粘贴 |
-| L6 | P1 | 非提升 Medium 会话中 `schtasks /Create /XML` 返回“拒绝访问”，产品 Windows wakeup 后端无法启用计划任务；同账户简单 `/Create` 可成功 | 未修复；Task Scheduler 真机验收 FAIL；见 `LIMITATIONS.md` 与 `evidence/task-scheduler-acceptance.json` |
-| U1 | — | 独立标准用户（非 Administrators） | BLOCKED：创建需要管理员授权 |
-| U2 | — | Console Host 独立窗口 | BLOCKED：Windows 11 默认委派 WT，未改用户终端设置 |
-| U3 | — | PowerShell 7、VS Code Integrated Terminal | NOT VERIFIED：未安装 |
-| U4 | — | 中文 IME 候选与组合输入 | NOT VERIFIED：无法用合成按键可靠驱动，需人工步骤 |
-| U5 | — | 图片渲染失败注入、160×45 精确网格 | NOT VERIFIED / PARTIAL |
-| U6 | — | Release Lab / RC | BLOCKED：仓库/本机无 `eval/scripts/release_check.py`、`rc_check.py` |
-| U7 | — | 远端 CI、macOS/Linux 真实终端、Windows 10 当前候选 | NOT RUN / NOT VERIFIED：未授权远端；本机无对应宿主 |
+| L1 | P2 | Git Bash/MSYS `rm`/`printf`/`sh` 在 Low IL 沙箱内无法初始化 | 确认；原生命令正常；替代为原生命令或 FullAccess |
+| L3 | P2 | 本机 `NoDefaultCurrentDirectoryInExePath=1`，裸脚本名不被 cmd 搜索 | 环境限制；显式 `.\` 可用 |
+| L4 | P2 | Windows Terminal 原生 Ctrl+V 多行/非 BMP 丢失并拆分提交 | 宿主限制；Alt+V 为可靠替代 |
+| L5 | — | 独立标准用户（非 Administrators） | BLOCKED：本机仅有 `code`；创建需要管理员授权。未把非提升管理员组 token 等同于标准用户 |
+| L6 | — | Console Host 独立窗口 | BLOCKED：Windows 11 默认委派 WT；未修改 `HKCU\Console\%%Startup` |
+| L7 | — | PowerShell 7 / VS Code Integrated Terminal | NOT VERIFIED：均未安装 |
+| L8 | — | 中文 IME 候选/组合输入 | NOT VERIFIED：Microsoft Pinyin 已安装，但未用合成的 IME 组合可靠驱动；需人工按真实键盘验收 |
+| L9 | — | 160×45 精确网格 / 图片渲染失败注入 | PARTIAL / NOT VERIFIED（沿用上一候选限制） |
+| L10 | — | Release Lab / RC | BLOCKED：无 `eval/scripts/release_check.py` / `rc_check.py`，`DOGFOOD_ROOT_NOT_FOUND` |
+| L11 | — | 远端 CI | NOT RUN：未授权 push/远端运行 |
+| L12 | — | macOS / Linux 真实终端、Windows 10 当前候选 | NOT VERIFIED：无对应宿主 |
+| L13 | — | Dogfood F（长 Session/Compaction） | NOT VERIFIED：本轮未真实触发 Compaction；不以普通长对话冒充 |
+| L14 | — | Dogfood E 的旧证据拒绝（Windows 真机 Goal） | 确定性回归在 Windows 套件通过（`b12_a_background_write_expires_the_verification_it_followed`、`a_workspace_change_after_acceptance_prevents_verified_delivery`）；Unix-only 后台 barrier 覆盖启动版本窗口；真实 Goal 同场景未重跑 |
+| L15 | — | Defender 误报（旧 dirty 构建） | 已通过：干净构建的 CLI test binary 未被 Defender 阻断；旧 dirty 构建的误报未影响本轮；未关闭防护、未加排除。 |
 
-安全结论不因这些限制而放宽：P0 未发现；L1/L4 都是拒绝或宿主行为，不是权限被绕过。早期 L2 的 P1 结论已按真实根因撤销（空环境测试夹具，不是产品缺陷）。
+安全结论不因这些限制放宽：P0 未发现；P1 Task Scheduler 已关闭；标准用户路径仍未独立验证，不能据当前非提升管理员组 token 外推。
 
-## 10. 合并与发布资格
+## 12. 合并与发布资格
 
 | 判定 | 结论 | 依据 |
 | --- | --- | --- |
-| Windows 11 当前候选 | **PARTIAL PASS（已执行范围）** | 全量测试、Clippy、安全 canary、真实 Dogfood、TUI 关键路径与 Edge acceptance 通过；Task Scheduler 非提升 XML 注册失败（L6），独立标准用户、ConHost、PS7/VS Code/IME、图片失败注入、160×45 仍 BLOCKED/NOT VERIFIED |
-| Windows 10 历史证据 | **BLOCKED** | 本机/本仓没有历史 Windows 10 证据与 51 项失败记录，无法对照；不把 Windows 11 结果外推 |
-| Windows 10 当前候选 | **BLOCKED** | 本机无 Windows 10 宿主；未运行跨机器验收 |
-| 合并资格 | **条件性可合并（仅本地）** | 修复已本地提交并通过 Windows 全量门禁；未 push、未运行远端 CI；macOS/Linux 当前候选未验证，合并前应由远端 CI 覆盖 |
-| 发布资格 | **NOT ELIGIBLE** | Release Lab/RC 脚本不可用；跨宿主（Windows 10/macOS/Linux）、独立标准用户、远端 CI 与完整发布流水线未验证。不得以本地候选替代发布门禁 |
+| Windows 11 当前候选 | **PASS（已执行范围）** | Task Scheduler P1 关闭；最终 Release 归档真实到期业务任务 PASS；doctor PASS；生命周期/恢复/并发/隔离 PASS；安全 canary PASS；构建干净 |
+| Windows 10 历史版本 | **外部基线已确认** | 历史结论保留；原始证据未在当前工作区恢复 |
+| Windows 10 当前候选 | **NOT VERIFIED** | 本机无 Windows 10 宿主 |
+| 合并资格 | **条件性可合并（仅本地）** | 代码已本地提交；Windows 11 已执行范围通过；远端 CI、macOS/Linux 与发布门禁未运行，合并前应由远端 CI 覆盖 |
+| 发布资格 | **NOT ELIGIBLE** | Release Lab/RC、远端 CI、独立标准用户、跨宿主与完整发布流水线未验证；不得以本地候选替代发布门禁 |
 
-本次未执行任何 push、tag、release、远端分支或远端 CI 写操作。
+本轮未执行任何 push、tag、release、远端分支或远端 CI 写操作。

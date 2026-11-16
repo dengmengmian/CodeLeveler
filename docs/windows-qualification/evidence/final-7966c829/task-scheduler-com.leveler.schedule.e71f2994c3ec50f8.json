@@ -1,0 +1,118 @@
+{
+  "automatic_trigger": {
+    "fired": true,
+    "marker": "started\r\ndone\r\n",
+    "status": {
+      "backend": "task-scheduler",
+      "detail": null,
+      "label": "com.leveler.schedule.e71f2994c3ec50f8",
+      "last_exit_code": null,
+      "loaded": true,
+      "registered": true,
+      "registration": {
+        "arguments": [
+          "/c",
+          "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16\\wakeup.cmd"
+        ],
+        "executable": "C:\\WINDOWS\\system32\\cmd.exe",
+        "interval_secs": 60,
+        "working_directory": "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16"
+      },
+      "run_count": null,
+      "supported": true
+    }
+  },
+  "command": "C:\\WINDOWS\\system32\\cmd.exe",
+  "dedup": {
+    "detail": "",
+    "verdict": "VERIFIED"
+  },
+  "dedup_first_run": {
+    "exit_code": 0,
+    "started": true,
+    "stderr": ""
+  },
+  "dedup_marker": "started\r\ndone\r\n",
+  "dedup_second_run": {
+    "exit_code": 0,
+    "stderr": ""
+  },
+  "dedup_started_instances": 1,
+  "disable": {
+    "backend": "task-scheduler",
+    "detail": null,
+    "label": "com.leveler.schedule.e71f2994c3ec50f8",
+    "last_exit_code": null,
+    "loaded": false,
+    "registered": false,
+    "registration": null,
+    "run_count": null,
+    "supported": true
+  },
+  "enable": {
+    "backend": "task-scheduler",
+    "detail": null,
+    "label": "com.leveler.schedule.e71f2994c3ec50f8",
+    "last_exit_code": null,
+    "loaded": true,
+    "registered": true,
+    "registration": {
+      "arguments": [
+        "/c",
+        "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16\\wakeup.cmd"
+      ],
+      "executable": "C:\\WINDOWS\\system32\\cmd.exe",
+      "interval_secs": 60,
+      "working_directory": "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16"
+    },
+    "run_count": null,
+    "supported": true
+  },
+  "execution": {
+    "detail": "",
+    "verdict": "VERIFIED"
+  },
+  "failures": [],
+  "finished_at": "2026-11-16T02:25:10.958603400+00:00",
+  "home": "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16",
+  "label": "com.leveler.schedule.e71f2994c3ec50f8",
+  "marker": "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16\\marker.txt",
+  "marker_after_run": "started\r\ndone\r\n",
+  "on_demand_run": {
+    "exit_code": 0,
+    "stderr": "",
+    "stdout": "�ɹ�: �������� \"com.leveler.schedule.e71f2994c3ec50f8\"��\r\n"
+  },
+  "query_after_disable": {
+    "exit_code": 1,
+    "stderr": "����: ϵͳ�Ҳ���ָ�����ļ���\r\r\n"
+  },
+  "schema": "leveler.task-scheduler-acceptance/1",
+  "script": "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16\\wakeup.cmd",
+  "started_at": "2026-11-16T02:24:10.387727400+00:00",
+  "status_after_run": {
+    "backend": "task-scheduler",
+    "detail": null,
+    "label": "com.leveler.schedule.e71f2994c3ec50f8",
+    "last_exit_code": null,
+    "loaded": true,
+    "registered": true,
+    "registration": {
+      "arguments": [
+        "/c",
+        "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16\\wakeup.cmd"
+      ],
+      "executable": "C:\\WINDOWS\\system32\\cmd.exe",
+      "interval_secs": 60,
+      "working_directory": "C:\\Users\\code\\AppData\\Local\\Temp\\leveler ts acceptance e297122d-d670-4788-a649-ef391a07ab16"
+    },
+    "run_count": null,
+    "supported": true
+  },
+  "trigger": {
+    "detail": "",
+    "verdict": "VERIFIED"
+  },
+  "user": "code",
+  "verdict": "PASS"
+}

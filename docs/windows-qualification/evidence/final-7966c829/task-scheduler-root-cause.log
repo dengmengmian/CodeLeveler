@@ -1,0 +1,9 @@
+﻿user=desktop-6egc57e\code
+host=elevated=False
+os=Microsoft Windows NT 10.0.26300.0
+CASE LevelerRootCauseControl: exit=0 成功: 成功创建计划任务 "LevelerRootCauseControl"。
+CLEANUP LevelerRootCauseControl: deleted
+CASE LevelerRootCauseNoUser: exit=1 错误: 拒绝访问。 System.Management.Automation.RemoteException
+CASE LevelerRootCauseWithUser: exit=0 成功: 成功创建计划任务 "LevelerRootCauseWithUser"。
+CLEANUP LevelerRootCauseWithUser: deleted
+CASE LevelerRootCauseOnLogon: exit=1 错误: 拒绝访问。 System.Management.Automation.RemoteException
