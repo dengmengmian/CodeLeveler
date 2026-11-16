@@ -148,6 +148,37 @@ impl GitWorkflow {
             .map_err(|e| VcsError::Spawn(e.to_string()))
     }
 
+    /// Run a historical/read-only git query with the workspace mounted
+    /// read-only and the network denied.
+    ///
+    /// History queries never need to mutate the repository. Running them under
+    /// `WriteScope::None` makes that structural: a git invocation cannot
+    /// refresh the index, run a hook that writes, or turn an inspection into a
+    /// repository mutation. `GIT_OPTIONAL_LOCKS=0` keeps git from trying to
+    /// take an optional index lock the sandbox would deny anyway.
+    pub async fn inspect_history(
+        &self,
+        args: &[&str],
+        cancellation: CancellationToken,
+    ) -> Result<ProcessOutput, VcsError> {
+        let mut request = ProcessRequest::new(
+            "git",
+            args.iter().map(|s| s.to_string()).collect(),
+            self.repo_root.clone(),
+        );
+        request.timeout = INSPECT_TIMEOUT;
+        request.write_scope = leveler_execution::WriteScope::None;
+        request.deny_network = true;
+        request.authority_env = vec![
+            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ];
+        self.runner
+            .run(request, cancellation)
+            .await
+            .map_err(|e| VcsError::Spawn(e.to_string()))
+    }
+
     /// The repository root this workflow operates in.
     pub fn repo_root(&self) -> &std::path::Path {
         &self.repo_root

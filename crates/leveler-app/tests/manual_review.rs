@@ -267,6 +267,63 @@ async fn a_manual_review_runs_persists_and_does_not_open_a_turn() {
         "a review must never create a turn"
     );
 
+    // The investigation trace belongs to the REVIEW row, not to the session
+    // it judged. It names the tools the reviewer actually called.
+    let activity: serde_json::Value =
+        serde_json::from_str(&stored.activity_json).expect("activity JSON");
+    let rows = activity.as_array().expect("an activity array");
+    assert!(!rows.is_empty(), "the review must leave a tool trace");
+    assert!(
+        rows.iter()
+            .all(|row| row["review_id"] == finished.id.as_str()),
+        "every activity row belongs to this review: {activity}"
+    );
+    assert!(
+        stored.activity_json.contains("report_finding"),
+        "the trace records the finding tool: {}",
+        stored.activity_json
+    );
+
+    // The real model request declares the role's read-only investigation
+    // surface: code intelligence and revision-scoped git, and none of the
+    // write/command/spawn/self-widening controls.
+    let bodies = server.request_bodies().await;
+    let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let names: Vec<&str> = first["tools"]
+        .as_array()
+        .expect("a tool-calling request declares tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    for expected in [
+        "find_symbol",
+        "read_symbol",
+        "find_references",
+        "diagnostics",
+        "git_history",
+        "report_finding",
+        "report_review",
+        "session_history",
+    ] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
+    for forbidden in [
+        "write_file",
+        "apply_patch",
+        "run_command",
+        "shell_command",
+        "spawn_agent",
+        "capability",
+        "claim_write_scope",
+        "kill_task",
+        "wait_task",
+    ] {
+        assert!(
+            !names.contains(&forbidden),
+            "{forbidden} must not reach a review seat: {names:?}"
+        );
+    }
+
     // The report is served from the durable row, not from the live stream.
     let query = CommandId::new("report-query");
     client
@@ -741,4 +798,107 @@ async fn a_stale_running_row_settles_incomplete_on_list() {
     assert_eq!(stored.status, "incomplete");
     assert!(stored.stop_detail.is_some());
     assert!(stored.finished_at.is_some());
+}
+
+/// A commit-scoped review must read the committed tree, not the dirty
+/// worktree, and must refuse the live-worktree tools structurally. The test
+/// scripts a `git_history` read followed by a `read_file` call the host must
+/// deny, so both halves are observable in the real wire transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_review_reads_that_tree_and_refuses_live_worktree_tools() {
+    let responses = vec![
+        sse(&[
+            tool_call_frame(
+                "call_history",
+                "git_history",
+                serde_json::json!({
+                    "action": "file",
+                    "rev": "HEAD",
+                    "path": "src/billing.rs"
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(&[
+            tool_call_frame(
+                "call_live_read",
+                "read_file",
+                serde_json::json!({"path": "src/billing.rs"}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        final_response("审查完成：该提交中不存在 receipt。"),
+    ];
+    let (tmp, server, app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session,
+            focus: "检查该提交的账单读取实现".into(),
+            scope: UiReviewScope::Commit { rev: "HEAD".into() },
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.status, UiReviewStatus::Completed);
+    assert!(!finished.modified_source);
+
+    // The object identity is the RESOLVED commit SHA, not the user's
+    // spelling ("HEAD"): a later `HEAD` move must not change what was
+    // reviewed.
+    let app_db = app.open_database().await.unwrap();
+    let stored = ReviewRepository::new(&app_db)
+        .get(&finished.id)
+        .await
+        .unwrap()
+        .expect("the review row is durable");
+    let object: serde_json::Value =
+        serde_json::from_str(stored.object_json.as_deref().expect("object identity")).unwrap();
+    let revision = object["revision"].as_str().expect("revision");
+    assert_eq!(revision.len(), 40, "{revision}");
+    assert!(
+        revision.chars().all(|c| c.is_ascii_hexdigit()),
+        "revision must be the resolved SHA: {revision}"
+    );
+
+    let bodies = server.request_bodies().await;
+    let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let names: Vec<&str> = first["tools"]
+        .as_array()
+        .expect("a tool-calling request declares tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"git_history"),
+        "the revision-scoped tool must be advertised: {names:?}"
+    );
+    for live_tool in ["read_file", "grep", "list_files", "git_status", "git_diff"] {
+        assert!(
+            !names.contains(&live_tool),
+            "{live_tool} must not be offered for a fixed commit: {names:?}"
+        );
+    }
+
+    let all: String = bodies
+        .iter()
+        .map(|body| body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all.contains("pub fn load") && !all.contains("pub fn receipt"),
+        "the git_history result must be the commit's file, not the worktree"
+    );
+    assert!(
+        all.contains("固定版本") && all.contains("不能作为该对象的证据"),
+        "the live read must be refused with the revision reason: {all}"
+    );
+    assert!(
+        std::fs::read_to_string(tmp.path().join("src/billing.rs"))
+            .unwrap()
+            .contains("pub fn receipt"),
+        "the review must not alter the dirty worktree"
+    );
 }

@@ -41,10 +41,13 @@ use tokio_util::sync::CancellationToken;
 use super::InProcessRuntimeClient;
 
 /// A user-requested review investigates more than a closure tail, but it is
-/// still finite. 100 rounds and the child wall cap bound a runaway reviewer
-/// without reproducing the closure reviewer's 20-round tail budget.
+/// still finite. 100 rounds bound a runaway reviewer without reproducing the
+/// closure reviewer's 20-round tail budget.
+///
+/// The wall clock deliberately has NO duplicate constant here: the child
+/// runner's role budget is the one authority. A local "30 minutes" used to be
+/// declared here and then silently overwritten by that 20-minute cap.
 const REVIEW_MAX_ROUNDS: u32 = 100;
-const REVIEW_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const REVIEW_FINALIZATION_GRACE: Duration = Duration::from_secs(3 * 60);
 /// Bounds on inputs and on what is embedded in the reviewer's context.
 const FOCUS_MAX_BYTES: usize = 8 * 1024;
@@ -434,6 +437,7 @@ async fn settle_if_stale(
                 stop_detail: Some(detail),
                 usage_json: &record.usage_json,
                 verdict_json: record.verdict_json.as_deref(),
+                activity_json: &record.activity_json,
                 object_changed: record.object_changed,
                 modified_source: record.modified_source,
                 finished_at: leveler_core::now(),
@@ -570,6 +574,9 @@ struct ReviewOutcome {
     modified_source: bool,
     object: UiReviewObject,
     object_changed: bool,
+    /// Bounded tool-activity trace, as JSON. Owned by the review row: a review
+    /// must not append diagnostic events to the session it is judging.
+    activity_json: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -642,6 +649,10 @@ async fn run_review(
             db.clone(),
             context.session_id.clone(),
         )));
+        // Historical review objects need evidence from the Git object
+        // database, not the working tree. The tool is registered only on this
+        // review engine, so ordinary turns keep their existing surface.
+        registry.register(Arc::new(leveler_tools::tools::GitHistoryTool));
         engine.factory.registry = Arc::new(registry);
     }
     let executor = match engine
@@ -668,6 +679,13 @@ async fn run_review(
             session_id.clone(),
         );
 
+    // A bounded, durable trace of what the reviewer actually did. It is
+    // written to THIS review's row at settlement — never to the session it is
+    // judging — and holds tool name, phase, a bounded preview, error state and
+    // elapsed time. Live progress remains the UI's channel; this is the record
+    // an offline audit reads.
+    let activity = std::sync::Arc::new(std::sync::Mutex::new(ReviewActivityTrace::default()));
+    let activity_obs = activity.clone();
     let mut usage = UiReviewUsage::default();
     let mut cost_total: u64 = 0;
     let mut cost_known = true;
@@ -690,8 +708,26 @@ async fn run_review(
                 last_output = *output_tokens;
                 last_cached = *cached_input_tokens;
             }
-            AgentEvent::SubAgentActivity { phase, tool, .. } if phase == "tool_started" => {
-                last_tool = Some(tool.clone());
+            AgentEvent::SubAgentActivity {
+                phase,
+                tool,
+                preview,
+                is_error,
+                ..
+            } => {
+                if let Ok(mut trace) = activity_obs.lock() {
+                    trace.push(ReviewActivityRecord {
+                        review_id: review_id_for_events.clone(),
+                        phase: phase.clone(),
+                        tool: tool.clone(),
+                        preview: preview.clone(),
+                        is_error: *is_error,
+                        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    });
+                }
+                if phase == "tool_started" {
+                    last_tool = Some(tool.clone());
+                }
             }
             AgentEvent::SubAgentModelRequest { record } => {
                 usage.input_tokens = usage.input_tokens.saturating_add(record.usage.input_tokens);
@@ -727,6 +763,9 @@ async fn run_review(
             review_id.to_string(),
             brief,
             resolved.files.clone(),
+            // A commit/branch review is about a fixed historical object; a
+            // live-worktree read cannot answer for it and must be refused.
+            resolved.object.revision.clone(),
             REVIEW_MAX_ROUNDS,
             &mut observer,
             cancellation.clone(),
@@ -759,6 +798,17 @@ async fn run_review(
         object_changed,
         object_checked,
     );
+    let activity_json = serde_json::to_string(
+        &activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .into_records(),
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, review_id, "could not serialize the review activity trace");
+        "[]".to_string()
+    });
     ReviewOutcome {
         status,
         report,
@@ -768,6 +818,7 @@ async fn run_review(
         stop_detail,
         usage,
         modified_source,
+        activity_json,
         // The report is about the CAPTURED object. A moved workspace is
         // recorded as `object_changed` plus a limitation; replacing the
         // identity with the post-review version would claim the conclusions
@@ -819,6 +870,7 @@ async fn settle(
                 stop_detail: outcome.stop_detail.as_deref(),
                 usage_json: &usage_json,
                 verdict_json: verdict_json.as_deref(),
+                activity_json: &outcome.activity_json,
                 object_changed: outcome.object_changed,
                 modified_source: outcome.modified_source,
                 finished_at,
@@ -877,6 +929,53 @@ async fn settle(
             review: summary.clone(),
         },
     );
+}
+
+/// One bounded tool-activity row for the durable review trace.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReviewActivityRecord {
+    review_id: String,
+    phase: String,
+    tool: String,
+    /// Already bounded by the sub-agent activity projection (160 bytes).
+    preview: String,
+    is_error: bool,
+    elapsed_ms: u64,
+}
+
+/// The hard bound on one review's persisted activity. A review that used more
+/// rounds than this keeps the first MAX and a final marker; the trace never
+/// grows without limit.
+const MAX_REVIEW_ACTIVITY: usize = 500;
+
+#[derive(Debug, Default, Clone)]
+struct ReviewActivityTrace {
+    records: Vec<ReviewActivityRecord>,
+    dropped: usize,
+}
+
+impl ReviewActivityTrace {
+    fn push(&mut self, record: ReviewActivityRecord) {
+        if self.records.len() < MAX_REVIEW_ACTIVITY {
+            self.records.push(record);
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    fn into_records(mut self) -> Vec<ReviewActivityRecord> {
+        if self.dropped > 0 {
+            let last = self.records.last().cloned();
+            if let Some(mut marker) = last {
+                marker.phase = "trace_truncated".to_string();
+                marker.tool = String::new();
+                marker.preview = format!("{} later activity rows were not persisted", self.dropped);
+                marker.is_error = false;
+                self.records.push(marker);
+            }
+        }
+        self.records
+    }
 }
 
 fn classify(
@@ -959,12 +1058,15 @@ fn failed_outcome(resolved: &ResolvedScope, error: String) -> ReviewOutcome {
         modified_source: false,
         object: resolved.object.clone(),
         object_changed: false,
+        activity_json: "[]".to_string(),
     }
 }
 
 fn review_limits() -> StepLimits {
     StepLimits {
-        max_duration: Some(REVIEW_MAX_DURATION),
+        // None here means "not capped by this layer"; the child role's single
+        // wall-clock authority supplies the real bound.
+        max_duration: None,
         finalization_grace: Some(REVIEW_FINALIZATION_GRACE),
         max_commands: Some(0),
         max_modified_files: Some(0),
@@ -1402,7 +1504,9 @@ fn resolve_commit(repo: &Path, rev: &str) -> Result<ResolvedScope, ClientError> 
         dirty,
         files: cap_files(&files),
         untracked: Vec::new(),
-        revision: Some(rev.clone()),
+        // The resolved commit identity, not the user's spelling (`HEAD~2`,
+        // a tag): the report must name the exact object it reviewed.
+        revision: Some(sha.clone()),
         // The commit is immutable, but the worktree it is being read through
         // is not. HEAD and its status enter the fingerprint so a moved or
         // dirtied read source is visible.
@@ -1451,7 +1555,9 @@ fn resolve_branch(repo: &Path, base: &str) -> Result<ResolvedScope, ClientError>
         dirty: !status.trim().is_empty(),
         files: cap_files(&files),
         untracked: cap_files(&untracked),
-        revision: Some(format!("{base}...HEAD")),
+        // Resolved identities for both ends; the user's spelling remains in
+        // the scope description.
+        revision: Some(format!("{base_sha}...{head}")),
         fingerprint: fingerprint_parts(&[
             "branch",
             &base_sha,
@@ -1805,6 +1911,26 @@ fn build_brief(
         out.push('\n');
     }
     out.push('\n');
+    if let Some(revision) = &resolved.object.revision {
+        out.push_str(&format!(
+            "### 固定历史对象\n\n\
+             本次审查对象是 `{revision}`。读取当前工作区的工具（`read_file`、`grep`、\
+             `list_files`、`find_files`、符号/引用/诊断工具、`git_status`、`git_diff`）\
+             不能代表该版本，已从你的工具面移除，运行时也会拒绝这些调用。\n\n\
+             使用 `git_history` 读取该对象：`log` 看提交历史，`show` 看单个提交的\
+             metadata/stat/patch，`file` 读该版本的完整文件，`search` 在该版本的树内\
+             搜索，`list` 枚举该版本的文件，`blame` 查看行的归属。`rev` 不接受时工具\
+             会明确失败，不会回退到 HEAD 或工作区。\n\n\
+             系统提示中的项目规则（AGENTS.md 等）来自当前工作区，不是该版本的树；\
+             不要把它当作该版本的证据。\n\n",
+        ));
+    }
+    out.push_str(
+        "### Git 历史调查\n\n\
+         `git_history` 可查询已提交的历史与对象数据库（log/show/file/search/list/blame）。\
+         它先把你给的 rev 解析成 Commit SHA，再读取该对象；无法解析时会报错。\
+         它不能替代对当前工作区的读取，也不会修改仓库。\n\n",
+    );
     if let Some(diff) = resolved
         .diff
         .as_deref()
@@ -2703,6 +2829,7 @@ mod tests {
                 stop_detail: None,
                 usage_json: usage_json.into(),
                 verdict_json: None,
+                activity_json: "[]".into(),
                 object_changed: false,
                 modified_source: false,
                 created_at: "t".into(),

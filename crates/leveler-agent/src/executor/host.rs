@@ -467,6 +467,22 @@ impl Executor {
         });
         let command_line = command_line_for_match(call, program.as_deref(), &args);
 
+        // A review bound to a fixed historical object has no live-worktree
+        // authority: those tools answer about a tree that is not the reviewed
+        // object. This is a ROLE boundary, so Full does not lift it (the
+        // product keeps Full's meaning for the tools a seat actually holds).
+        if self.agent_role == crate::child_profile::AgentRole::Reviewer
+            && let Some(revision) = ctx.review_revision()
+            && Self::WORKTREE_ONLY_REVIEW_TOOLS.contains(&call.name.as_str())
+        {
+            return PolicyResolution::Deny(PolicyDenial {
+                reason: format!(
+                    "本次审查对象是固定版本 `{revision}`，`{}` 读取的是当前工作区，不能作为该对象的证据；请使用 `git_history` 查询该版本的源码、历史与搜索。",
+                    call.name
+                ),
+            });
+        }
+
         // Highest-priority product contract: Full bypasses CodeLeveler
         // permission rules, hooks, Git gates and sandbox boundaries entirely.
         if ctx.policy.unrestricted_execution() {
@@ -2474,6 +2490,53 @@ mod authorize_tests {
         };
         executor.authorize(&other, &mut fresh).await.unwrap();
         assert_eq!(approver.asks(), 2, "a variant must not ride the exact rule");
+    }
+
+    /// Code intelligence is a legitimate read-only investigation tool for the
+    /// review seat: the host admits it (the surface is the other half of the
+    /// same contract).
+    #[tokio::test]
+    async fn a_review_seat_is_admitted_to_use_code_intelligence() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let parent = executor_for(dir.path(), approver.clone());
+        let reviewer =
+            parent.child_for_role_on(crate::child_profile::AgentRole::Reviewer, Vec::new(), None);
+        let call = ToolCall {
+            id: ToolCallId::new("sym"),
+            name: "find_symbol".to_string(),
+            arguments: serde_json::json!({"symbol": "OrderService"}),
+        };
+        let mut session = HashSet::new();
+        reviewer
+            .authorize(&call, &mut session)
+            .await
+            .expect("a read-only symbol lookup is admitted on a review seat");
+        assert_eq!(approver.asks(), 0, "a Safe observe tool needs no prompt");
+    }
+
+    /// A commit/branch review cannot use a live-worktree tool as evidence,
+    /// and Full does not lift this role boundary.
+    #[tokio::test]
+    async fn a_fixed_revision_review_refuses_live_worktree_tools_even_in_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "worktree\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let parent = executor_at(dir.path(), PermissionProfile::FullAccess, approver.clone());
+        let mut reviewer =
+            parent.child_for_role_on(crate::child_profile::AgentRole::Reviewer, Vec::new(), None);
+        reviewer.tool_context = reviewer
+            .tool_context
+            .clone()
+            .with_review_revision("0123456789abcdef0123456789abcdef01234567");
+        let mut session = HashSet::new();
+        let err = reviewer
+            .authorize(&read_call("a.txt"), &mut session)
+            .await
+            .unwrap_err();
+        assert!(err.contains("固定版本"), "{err}");
+        assert!(err.contains("git_history"), "{err}");
+        assert_eq!(approver.asks(), 0, "this is a refusal, not a prompt");
     }
 
     #[tokio::test]

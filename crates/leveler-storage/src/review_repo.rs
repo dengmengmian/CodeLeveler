@@ -55,6 +55,9 @@ pub struct ReviewFinish<'a> {
     /// Structured coverage, limitations and conclusion, as JSON. `None` means
     /// the reviewer declared nothing.
     pub verdict_json: Option<&'a str>,
+    /// Bounded tool-activity trace, as JSON. Diagnostic evidence about the
+    /// investigation, never part of the report or the finding ledger.
+    pub activity_json: &'a str,
     /// Whether the object moved while the review ran.
     pub object_changed: bool,
     /// Whether the read-only reviewer changed product files (a contract
@@ -98,6 +101,8 @@ pub struct ReviewRecord {
     pub usage_json: String,
     /// Structured coverage, limitations and conclusion, as JSON.
     pub verdict_json: Option<String>,
+    /// Bounded tool-activity trace, as JSON.
+    pub activity_json: String,
     /// Whether the object moved while the review ran.
     pub object_changed: bool,
     /// Whether the reviewer changed product files.
@@ -153,7 +158,7 @@ impl<'a> ReviewRepository<'a> {
             "UPDATE reviews SET status = ?2, object_json = ?3, findings_json = ?4, \
              report = ?5, error = ?6, stop_detail = ?7, usage_json = ?8, \
              verdict_json = ?9, object_changed = ?10, modified_source = ?11, \
-             finished_at = ?12 \
+             finished_at = ?12, activity_json = ?13 \
              WHERE id = ?1 AND status = 'running'",
         )
         .bind(id)
@@ -168,6 +173,7 @@ impl<'a> ReviewRepository<'a> {
         .bind(finish.object_changed)
         .bind(finish.modified_source)
         .bind(finish.finished_at.to_rfc3339())
+        .bind(finish.activity_json)
         .execute(self.db.pool())
         .await?;
         Ok(result.rows_affected() > 0)
@@ -179,7 +185,7 @@ impl<'a> ReviewRepository<'a> {
             "SELECT id, session_id, focus, scope_json, model, status, source_session_id, \
              source_turn_id, object_json, findings_json, report, error, stop_detail, \
              usage_json, verdict_json, object_changed, modified_source, created_at, \
-             finished_at \
+             finished_at, activity_json \
              FROM reviews WHERE id = ?1",
         )
         .bind(id)
@@ -197,7 +203,7 @@ impl<'a> ReviewRepository<'a> {
             "SELECT id, session_id, focus, scope_json, model, status, source_session_id, \
              source_turn_id, object_json, findings_json, report, error, stop_detail, \
              usage_json, verdict_json, object_changed, modified_source, created_at, \
-             finished_at \
+             finished_at, activity_json \
              FROM reviews WHERE session_id = ?1 ORDER BY created_at DESC, id DESC",
         )
         .bind(session_id.as_str())
@@ -225,6 +231,7 @@ fn decode_row(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewRecord, StorageErro
         stop_detail: row.try_get("stop_detail")?,
         usage_json: row.try_get("usage_json")?,
         verdict_json: row.try_get("verdict_json")?,
+        activity_json: row.try_get("activity_json")?,
         object_changed: row.try_get::<i64, _>("object_changed")? != 0,
         modified_source: row.try_get::<i64, _>("modified_source")? != 0,
         created_at: row.try_get("created_at")?,
@@ -280,6 +287,7 @@ mod tests {
             stop_detail: None,
             usage_json: r#"{"input_tokens":10}"#,
             verdict_json: Some(r#"{"conclusion":"no_issues_found"}"#),
+            activity_json: r#"[{"tool":"report_review"}]"#,
             object_changed: true,
             modified_source: false,
             finished_at: leveler_core::now(),
@@ -301,6 +309,7 @@ mod tests {
             stop_detail: Some("late"),
             usage_json: "{}",
             verdict_json: None,
+            activity_json: "[]",
             object_changed: false,
             modified_source: false,
             finished_at: leveler_core::now(),

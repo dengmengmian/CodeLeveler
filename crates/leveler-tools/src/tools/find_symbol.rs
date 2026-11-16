@@ -70,7 +70,11 @@ impl Tool for FindSymbolTool {
         let root = workspace.root().to_path_buf();
 
         // Precise path: ask a language server (session reused across calls).
-        if let Some(located) = self.lsp.locate(&root, &input.symbol).await {
+        // A read-only review seat disables servers: starting one can run
+        // project build scripts, which is outside that role's contract.
+        if context.language_servers_enabled()
+            && let Some(located) = self.lsp.locate(&root, &input.symbol).await
+        {
             let mut body = format!(
                 "`{}` is defined at (via {}):\n",
                 input.symbol, located.spec.program
@@ -160,6 +164,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A review seat disables language servers, so the tool must take the
+    /// in-process scan path and say so — never start a server, and never
+    /// pretend the weaker answer is a precise server answer.
+    #[tokio::test]
+    async fn a_disabled_language_server_falls_back_to_the_scan_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-findsym-scan-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "pub fn cancel_order() {}\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess)
+            .without_language_servers();
+        let out = tool()
+            .execute(
+                serde_json::json!({ "symbol": "cancel_order" }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("via scan"), "{}", out.content);
+        assert!(out.content.contains("src/a.rs"), "{}", out.content);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

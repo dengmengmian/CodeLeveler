@@ -69,7 +69,9 @@ impl Tool for ReadSymbolTool {
         let root = workspace.root().to_path_buf();
 
         // Precise: language-server location, then read the block from the file.
-        if let Some(located) = self.lsp.locate(&root, &input.symbol).await {
+        if context.language_servers_enabled()
+            && let Some(located) = self.lsp.locate(&root, &input.symbol).await
+        {
             let mut body = String::new();
             for m in located.definitions.iter().take(3) {
                 {

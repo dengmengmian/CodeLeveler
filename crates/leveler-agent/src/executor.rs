@@ -1954,6 +1954,27 @@ impl Executor {
             .map_or(legacy, |state| state.exposed(id))
     }
 
+    /// Tools whose answer is the LIVE working tree. A review bound to a fixed
+    /// commit or branch range cannot use them as evidence about that object:
+    /// the worktree may hold a third state. They are removed from the review
+    /// surface and refused at admission, never silently answered from the
+    /// worktree.
+    pub(crate) const WORKTREE_ONLY_REVIEW_TOOLS: &'static [&'static str] = &[
+        "blast_radius",
+        "diagnostics",
+        "find_files",
+        "find_references",
+        "find_symbol",
+        "git_diff",
+        "git_status",
+        "grep",
+        "list_files",
+        "read_file",
+        "read_project_rules",
+        "read_symbol",
+        "view_image",
+    ];
+
     /// Project permissions without discarding actual handles. A profile switch
     /// can expose those same handles on the next call, including in children.
     fn projected_tool_registry(&self) -> ToolRegistry {
@@ -1964,8 +1985,11 @@ impl Executor {
         // else. Kept here so advertisement, role admission and `capability`
         // disclosure all read the same projection.
         if self.depth > 0 && self.agent_role == AgentRole::Reviewer {
-            let registry = crate::sub_agent::ChildProfile::resolve(self.agent_role)
+            let mut registry = crate::sub_agent::ChildProfile::resolve(self.agent_role)
                 .apply_to_registry(&self.registry);
+            if self.tool_context.review_revision().is_some() {
+                registry = registry.without_named(Self::WORKTREE_ONLY_REVIEW_TOOLS);
+            }
             return match &self.agent_tool_allowlist {
                 Some(names) => registry.named_subset(names),
                 None => registry,
@@ -2232,9 +2256,13 @@ impl Executor {
         role: AgentRole,
         spec: &leveler_lifecycle::ChildSpawnSpec,
         brief: Option<String>,
+        review_revision: Option<String>,
     ) -> Executor {
         let model_override = spec.model.as_deref().and_then(ModelRef::parse);
         let mut child = self.child_for_role_on(role, spec.files.clone(), model_override);
+        if let Some(revision) = review_revision {
+            child.tool_context = child.tool_context.with_review_revision(revision);
+        }
         if let Some(agent) = &spec.agent {
             if let Some(effort) = agent
                 .reasoning_effort
@@ -2259,6 +2287,17 @@ impl Executor {
         // for each model request and resolved by ToolHost at admission, so a
         // live switch to Full never needs to reconstruct discarded handles.
         let profile = crate::sub_agent::ChildProfile::resolve(role);
+        // A reviewer must not acquire an indirect execution path (a language
+        // server that can run build scripts) or read host credentials merely
+        // because the parent session is Full. Both are role facts, not
+        // permission profiles: an ordinary read-only explorer keeps the
+        // product's existing behavior.
+        let mut tool_context = self.tool_context.clone();
+        if role == AgentRole::Reviewer {
+            tool_context = tool_context
+                .without_language_servers()
+                .with_confined_sensitive_reads();
+        }
         let registry = self.registry.clone();
         let write_allowlist = (!profile.read_only() && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(
@@ -2292,7 +2331,7 @@ impl Executor {
             // the subset its parent handed it.
             discovered: std::sync::RwLock::new(Arc::new(ToolRegistry::default())),
             tool_discovery: None,
-            tool_context: self.tool_context.clone(),
+            tool_context,
             model: model_override.unwrap_or_else(|| self.model.clone()),
             continuation: match profile.max_rounds() {
                 Some(n) if n > 0 => ContinuationPolicy::bounded(n),
@@ -4132,6 +4171,161 @@ mod ownership_authority_tests {
         assert!(
             !explorer_names.iter().any(|name| name == "report_review"),
             "an explorer has no review verdict to declare: {explorer_names:?}"
+        );
+    }
+
+    /// The review seat gets its role's read-only symbol tools without a
+    /// `capability` round trip. A review child cannot call `capability` at
+    /// all, so requiring an enable would hide the tools forever; the ordinary
+    /// agent keeps the normal on-demand disclosure.
+    #[test]
+    fn a_reviewer_sees_read_only_code_intelligence_without_an_enable_round_trip() {
+        use crate::capability::{CapabilityDisclosure, CapabilityId};
+        let mut parent = executor();
+        parent.capabilities = Some(Arc::new(
+            CapabilityDisclosure::new(
+                vec![CapabilityId::CodeIntelligence],
+                vec![CapabilityId::CodeIntelligence],
+                vec![],
+            )
+            .unwrap(),
+        ));
+
+        let ordinary: Vec<String> = parent
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            !ordinary.iter().any(|name| name == "find_symbol"),
+            "an ordinary turn keeps CodeIntelligence on demand: {ordinary:?}"
+        );
+
+        let reviewer = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        assert!(
+            !reviewer.tool_context.language_servers_enabled(),
+            "a review seat must not start language-server processes"
+        );
+        assert!(
+            reviewer.tool_context.policy.confine_sensitive_reads,
+            "a review seat must keep credential reads denied under Full"
+        );
+        let explorer = parent.child_for_role_on(AgentRole::Explorer, Vec::new(), None);
+        assert!(
+            explorer.tool_context.language_servers_enabled(),
+            "an ordinary read-only explorer keeps its existing code-intelligence path"
+        );
+        let names: Vec<String> = reviewer
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for expected in [
+            "find_symbol",
+            "read_symbol",
+            "find_references",
+            "diagnostics",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "{expected} must be on the review surface: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name == "capability"),
+            "the review seat has no capability control: {names:?}"
+        );
+        for forbidden in ["write_file", "apply_patch", "run_command", "spawn_agent"] {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "{forbidden} must not be on the review surface: {names:?}"
+            );
+        }
+    }
+
+    /// Code intelligence is still gated by HOST availability and permission:
+    /// a role default is exposure, not authority over what the host can
+    /// provide.
+    #[test]
+    fn a_reviewer_does_not_gain_an_unavailable_code_intelligence_pack() {
+        use crate::capability::{CapabilityDisclosure, CapabilityId};
+        let mut parent = executor();
+        parent.capabilities = Some(Arc::new(
+            CapabilityDisclosure::new(Vec::new(), vec![CapabilityId::CodeIntelligence], vec![])
+                .unwrap(),
+        ));
+        let reviewer = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        let names: Vec<String> = reviewer
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "find_symbol"),
+            "an unavailable pack must stay absent: {names:?}"
+        );
+    }
+
+    #[test]
+    fn child_for_spec_binds_a_fixed_review_revision() {
+        let parent = executor();
+        let spec = leveler_lifecycle::ChildSpawnSpec::default();
+        let child = parent.child_for_spec(
+            AgentRole::Reviewer,
+            &spec,
+            None,
+            Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        );
+        assert_eq!(
+            child.tool_context.review_revision(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    /// A revision-bound review advertises the historical evidence path and
+    /// removes the tools that answer from the live worktree. Admission refuses
+    /// the same names, so a direct call cannot bypass the projection.
+    #[test]
+    fn a_fixed_revision_review_surface_is_revision_scoped() {
+        let mut parent = executor();
+        let mut registry = leveler_tools::default_registry();
+        registry.register(Arc::new(leveler_tools::tools::GitHistoryTool));
+        parent.registry = Arc::new(registry);
+        let mut reviewer = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        reviewer.tool_context = reviewer
+            .tool_context
+            .clone()
+            .with_review_revision("0123456789abcdef0123456789abcdef01234567");
+        let names: Vec<String> = reviewer
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for worktree_tool in [
+            "read_file",
+            "grep",
+            "list_files",
+            "find_files",
+            "find_symbol",
+            "read_symbol",
+            "find_references",
+            "diagnostics",
+            "blast_radius",
+            "git_status",
+            "git_diff",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == worktree_tool),
+                "{worktree_tool} must not be advertised for a fixed revision: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "git_history"),
+            "the revision-scoped evidence path must remain: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "report_review"),
+            "the reviewer still declares its verdict: {names:?}"
         );
     }
 

@@ -146,6 +146,22 @@ pub struct ToolPolicy {
     pub max_files_per_step: usize,
     /// Paths a command may modify. `None` means unrestricted.
     pub command_write_allowlist: Option<Arc<Vec<String>>>,
+    /// Whether code-intelligence tools may start a language server process.
+    ///
+    /// A server is an external program that can run project build scripts and
+    /// proc macros. A read-only review seat must not acquire that execution
+    /// path by calling a tool labeled Safe, so it uses the dependency-free
+    /// scan fallbacks instead. Ordinary agents keep the server.
+    pub language_servers: bool,
+    /// Whether this context keeps the workspace's sensitive-read checks in
+    /// force even under FullAccess. A review seat may investigate the review
+    /// object, but "read-only" is not a licence to read host credentials.
+    pub confine_sensitive_reads: bool,
+    /// The fixed historical object (commit / branch range) a review is about.
+    /// When set, tools that answer from the live working tree cannot answer
+    /// for the reviewed object and are refused; revision-scoped git queries
+    /// are the evidence path.
+    pub review_revision: Option<Arc<str>>,
     /// How many additional files a command may modify. `None` means unlimited.
     pub command_modified_files_remaining: Option<usize>,
     /// Files already counted against the run budget before this command.
@@ -412,6 +428,9 @@ impl ToolContext {
                 deny_env: Arc::new(Vec::new()),
                 max_files_per_step: 0,
                 command_write_allowlist: None,
+                language_servers: true,
+                confine_sensitive_reads: false,
+                review_revision: None,
                 command_modified_files_remaining: None,
                 command_previously_modified: Arc::new(Vec::new()),
                 command_foreign_paths: Arc::new(Vec::new()),
@@ -440,7 +459,9 @@ impl ToolContext {
         Ok(self
             .require_workspace()?
             .clone()
-            .with_unrestricted_access(self.policy.unrestricted_execution())
+            .with_unrestricted_access(
+                self.policy.unrestricted_execution() && !self.policy.confine_sensitive_reads,
+            )
             .with_resource_bindings(
                 self.policy
                     .resource_grant()
@@ -595,6 +616,38 @@ impl ToolContext {
     }
 
     /// Paths another agent exclusively owns for the duration of this call.
+    /// Disable language-server processes for this context. Code-intelligence
+    /// tools fall back to their in-process scan paths; a tool that needs a
+    /// server reports the capability as unavailable instead of starting one.
+    pub fn without_language_servers(mut self) -> Self {
+        self.policy.language_servers = false;
+        self
+    }
+
+    pub fn language_servers_enabled(&self) -> bool {
+        self.policy.language_servers
+    }
+
+    /// Bind this context to a fixed historical review object. The value is the
+    /// user-facing revision label (`<sha>` or `<base>...<head>`), used in
+    /// refusals so the model knows which object the live tools cannot answer
+    /// for.
+    pub fn with_review_revision(mut self, revision: impl Into<Arc<str>>) -> Self {
+        self.policy.review_revision = Some(revision.into());
+        self
+    }
+
+    pub fn review_revision(&self) -> Option<&str> {
+        self.policy.review_revision.as_deref()
+    }
+
+    /// Keep sensitive paths (`.ssh`, `.aws`, `.env`, credentials) denied even
+    /// when the session runs with Full access.
+    pub fn with_confined_sensitive_reads(mut self) -> Self {
+        self.policy.confine_sensitive_reads = true;
+        self
+    }
+
     pub fn with_foreign_owned_paths(mut self, paths: Vec<String>) -> Self {
         self.policy.command_foreign_paths = Arc::new(paths);
         self

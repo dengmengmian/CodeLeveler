@@ -79,6 +79,14 @@ impl Tool for DiagnosticsTool {
             .resolve_for_read(&input.path)?;
         let root = context.require_workspace()?.root().to_path_buf();
 
+        if !context.language_servers_enabled() {
+            return Ok(ToolOutput::ok(
+                "(diagnostics unavailable in this read-only review: language-server \
+                 processes are not started for a review seat; read the source and any \
+                 recorded build output instead)\n"
+                    .to_string(),
+            ));
+        }
         let Some(language) = Language::from_path(&abs) else {
             return Ok(ToolOutput::ok(format!(
                 "(no recognized language for `{}`; diagnostics need a language server)\n",
@@ -203,5 +211,34 @@ mod tests {
         assert_eq!(severity_label(3), "info");
         assert_eq!(severity_label(4), "hint");
         assert_eq!(severity_label(99), "diagnostic");
+    }
+
+    #[tokio::test]
+    async fn a_review_seat_reports_diagnostics_unavailable_without_a_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-diagnostics-review-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn f() {}\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess)
+            .without_language_servers();
+        let out = DiagnosticsTool::new(Arc::new(LspSessions::new(Arc::new(
+            leveler_core::environment().clone(),
+        ))))
+        .execute(
+            serde_json::json!({ "path": "a.rs" }),
+            ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.content.contains("unavailable in this read-only review"),
+            "{}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

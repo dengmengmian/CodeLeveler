@@ -489,6 +489,7 @@ impl Executor {
             files,
             parent_elapsed,
             reviewer_rounds,
+            None,
             observer,
             cancellation,
         )
@@ -504,11 +505,13 @@ impl Executor {
     /// only registry, lifecycle, event attribution, cancellation, findings)
     /// is the reviewer contract, unchanged.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_manual_review_child(
         &self,
         id: String,
         brief: String,
         files: Vec<String>,
+        review_revision: Option<String>,
         max_rounds: u32,
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
@@ -519,6 +522,7 @@ impl Executor {
             files,
             std::time::Duration::ZERO,
             max_rounds,
+            review_revision,
             observer,
             cancellation,
         )
@@ -533,6 +537,7 @@ impl Executor {
         files: Vec<String>,
         parent_elapsed: std::time::Duration,
         reviewer_rounds: u32,
+        review_revision: Option<String>,
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> DelegatedChildResult {
@@ -553,6 +558,7 @@ impl Executor {
             self.step_limits,
             cancellation,
             parent_wall,
+            review_revision,
         );
         tokio::pin!(run);
         let result = loop {
@@ -596,6 +602,7 @@ impl Executor {
         residual_limits: StepLimits,
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
+        review_revision: Option<String>,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + '_ {
         // A child's state machine is as large as the parent's. Polling it
         // inline makes nesting consume another full stack frame, which
@@ -613,6 +620,7 @@ impl Executor {
                 residual_limits,
                 cancellation,
                 parent_wall,
+                review_revision,
             )
             .await
         })
@@ -636,9 +644,10 @@ impl Executor {
         residual_limits: StepLimits,
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
+        review_revision: Option<String>,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
         let prepared_child = self
-            .child_for_spec(role, &spec, brief)
+            .child_for_spec(role, &spec, brief, review_revision)
             .with_agent_id(id.clone());
         let hook_runner = self.hook_runner.clone();
         run_prepared_sub_agent(
@@ -680,7 +689,7 @@ impl Executor {
             .as_ref()
             .and_then(|agent| agent.brief.clone());
         let prepared_child = self
-            .child_for_spec(child.role, &child.spec, brief)
+            .child_for_spec(child.role, &child.spec, brief, None)
             .with_agent_id(child.id.clone());
         run_prepared_sub_agent(
             prepared_child,

@@ -30,6 +30,7 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "find_symbol",
     "get_task",
     "git_diff",
+    "git_history",
     "git_status",
     "grep",
     "list_files",
@@ -1045,6 +1046,11 @@ mod tests {
             // The runtime already checkpoints before every write and owns
             // rollback and crash recovery.
             "create_checkpoint",
+            // `update_plan` is a harness control registered by
+            // `register_harness_controls`, not a model_surface tool. The
+            // reviewer receives it as a child-local plan; absence here is the
+            // registry's surface, not the review seat's.
+            "update_plan",
             "restore_checkpoint",
             // System customization: the user makes skills, the model loads them.
             "create_skill",

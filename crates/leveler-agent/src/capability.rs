@@ -344,6 +344,30 @@ impl CapabilityDisclosure {
     pub fn permits_tool(&self, name: &str) -> bool {
         tool_capability(name).is_none_or(|id| self.exposed(id))
     }
+
+    /// Tool exposure for a review seat.
+    ///
+    /// A review child is never offered `capability` (it must not widen its
+    /// own authority), so a pack that requires an explicit enable can never
+    /// reach it. Its role's read-only investigation pack — code intelligence
+    /// — is therefore exposed whenever the host provides and permits it.
+    /// Every other pack keeps the normal exposure rule: the role default is
+    /// not a second authority over what the session activated.
+    pub fn permits_tool_for_review(&self, name: &str) -> bool {
+        match tool_capability(name) {
+            Some(CapabilityId::CodeIntelligence) => {
+                self.exposed_for_review(CapabilityId::CodeIntelligence)
+            }
+            None => true,
+            Some(id) => self.exposed(id),
+        }
+    }
+
+    /// A read-only role default: available AND permitted, without requiring
+    /// an activation the review seat has no protocol to perform.
+    fn exposed_for_review(&self, id: CapabilityId) -> bool {
+        self.available(id) && self.permitted.contains(&id)
+    }
     pub fn for_child(&self, tools: &[ToolDefinition]) -> Self {
         let offered: BTreeSet<_> = tools
             .iter()

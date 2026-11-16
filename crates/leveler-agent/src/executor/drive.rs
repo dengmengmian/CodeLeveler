@@ -829,16 +829,25 @@ impl Executor {
 
     pub(crate) fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = self.candidate_tool_definitions();
+        let review_seat = self.depth > 0 && self.agent_role == AgentRole::Reviewer;
 
         if let Some(state) = &self.capabilities {
             // Exposure is the same in every permission mode: FullAccess
             // removes the ASK/DENY boundary, not the model's ability to
             // discover an optional pack through the catalog.
-            tools.retain(|tool| state.permits_tool(&tool.name));
+            if review_seat {
+                // A review child cannot call `capability`, so an on-demand
+                // pack would be unreachable to it. Its role's read-only code-
+                // intelligence pack is exposed directly; host availability
+                // and permission still decide whether it exists at all.
+                tools.retain(|tool| state.permits_tool_for_review(&tool.name));
+            } else {
+                tools.retain(|tool| state.permits_tool(&tool.name));
+            }
             // A reviewer seat's toolset is fixed. Offering `capability` would
             // let it spend rounds enabling packs that its read-only
             // projection still cannot hold.
-            if !(self.depth > 0 && self.agent_role == AgentRole::Reviewer) {
+            if !review_seat {
                 tools.push(crate::capability::control_definition());
             }
         }
@@ -4637,10 +4646,26 @@ impl AgentHarness for Drive<'_> {
                 && !advertised.contains(&call.name)
                 && !(call.name == "ask_user" && advertised.contains("request_user_input"))
             {
-                let content = format!(
-                    "Tool {} is not exposed on this request. Discover and enable its capability first.",
-                    call.name
-                );
+                // A revision-bound review removes live-worktree tools for a
+                // reason that is not capability disclosure. Telling the model
+                // to "enable its capability" would send it looking for a
+                // control that does not exist.
+                let content = match self.executor.tool_context.review_revision() {
+                    Some(revision)
+                        if self.executor.agent_role == AgentRole::Reviewer
+                            && Executor::WORKTREE_ONLY_REVIEW_TOOLS
+                                .contains(&call.name.as_str()) =>
+                    {
+                        format!(
+                            "本次审查对象是固定版本 `{revision}`，`{}` 读取的是当前工作区，不能作为该对象的证据；请使用 `git_history` 查询该版本的源码、历史与搜索。",
+                            call.name
+                        )
+                    }
+                    _ => format!(
+                        "Tool {} is not exposed on this request. Discover and enable its capability first.",
+                        call.name
+                    ),
+                };
                 (self.observer)(AgentEvent::ToolCall {
                     id: call.id.to_string(),
                     name: call.name.clone(),
@@ -7729,6 +7754,7 @@ impl AgentHarness for Drive<'_> {
                         residual,
                         token.clone(),
                         parent_wall,
+                        None,
                     );
                     let handle = tokio::spawn(fut);
                     self.progress.outstanding_children.push(format!(
@@ -7796,6 +7822,7 @@ impl AgentHarness for Drive<'_> {
                             residual,
                             token,
                             parent_wall,
+                            None,
                         )
                         .await;
                     (index, call_id, id, nickname, role, result)

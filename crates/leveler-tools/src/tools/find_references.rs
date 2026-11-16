@@ -69,7 +69,8 @@ impl Tool for FindReferencesTool {
         let root = workspace.root().to_path_buf();
 
         // Precise: locate the definition, then ask the server for references.
-        if let Some(located) = self.lsp.locate(&root, &input.symbol).await
+        if context.language_servers_enabled()
+            && let Some(located) = self.lsp.locate(&root, &input.symbol).await
             && let Some(body) =
                 lsp_references(&located, &input.symbol, &root, &workspace, &cancellation).await?
         {

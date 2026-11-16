@@ -466,4 +466,50 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A review seat gets the workspace's sensitive-name check even when the
+    /// session is Full: "read-only" is not a licence to read host credentials.
+    /// The ordinary Full agent keeps its product contract.
+    #[tokio::test]
+    async fn a_review_seat_cannot_read_a_credential_file_even_in_full_access() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-read-review-confine-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "API_KEY=secret\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "public\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+
+        let ordinary =
+            ToolContext::new(ws.clone(), leveler_execution::PermissionProfile::FullAccess);
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": ".env"}),
+                ordinary,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("secret"), "Full keeps its contract");
+
+        let review = ToolContext::new(ws.clone(), leveler_execution::PermissionProfile::FullAccess)
+            .with_confined_sensitive_reads();
+        let denied = ReadFileTool
+            .execute(
+                serde_json::json!({"path": ".env"}),
+                review,
+                CancellationToken::new(),
+            )
+            .await;
+        match denied {
+            Err(error) => assert!(!error.to_string().contains("secret"), "{error}"),
+            Ok(out) => assert!(
+                out.is_error,
+                "credential read must be refused: {}",
+                out.content
+            ),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
