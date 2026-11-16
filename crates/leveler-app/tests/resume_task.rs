@@ -1357,28 +1357,10 @@ async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
         "the second window must really be a budget stop: {second:?}"
     );
 
-    // The check has really exited, and its result is durable. Nobody has read
-    // the terminal yet: the next admission is the first observation.
-    let db = f.app.open_database().await.unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut rows = Vec::new();
-    while std::time::Instant::now() < deadline {
-        rows = EventRepository::new(&db).load(&f.session).await.unwrap();
-        if rows
-            .iter()
-            .any(|row| row.event_type == "background_task_finished")
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    drop(db);
-    assert!(
-        rows.iter()
-            .any(|row| row.event_type == "background_task_finished"),
-        "the exited background command must leave a durable result: {rows:#?}"
-    );
-
+    // The next admission is the first observation: its turn boundary
+    // reconciles the background result before the model request. The third
+    // window below is that admission, so the durable-result assertion comes
+    // after it rather than racing the exit during the edit window.
     f.server.clear().await;
     f.server
         .push(sse(vec![
@@ -1408,6 +1390,11 @@ async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
 
     let db = f.app.open_database().await.unwrap();
     let rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row.event_type == "background_task_finished"),
+        "the exited background command must leave a durable result: {rows:#?}"
+    );
     assert!(
         rows.iter().any(|row| {
             row.event_type == "goal_intercepted" && row.payload.contains("verification_refused")
