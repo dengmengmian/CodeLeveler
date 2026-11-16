@@ -10,7 +10,7 @@
 | 最终代码 HEAD | `7966c829697356afaef0881755894fff5bd78d59` |
 | 候选构建 revision | `03def7aaeecb07632a9ab74c47862eb6310799c2`（代码提交 + 仅证据的 docs 提交；无源代码差异） |
 | 二进制 provenance | `1.0.27 (03def7aa)`，干净构建（无 dirty/UNTRUSTED） |
-| 本报告文档 HEAD | `03def7aaeecb（证据提交；最终文档提交在收口提交中记录）` |
+| 本报告文档 HEAD | `50e50c675897dae185b4767571305e2955a8ccc5` |
 | 基线 `main` | `644d765c6208eba7b59bc0db88559a0445036135` |
 | 本轮代码提交 | `7966c829`：Windows LogonTrigger 绑定当前用户；Windows doctor 不再比较平台无法保存的 environment map |
 | 上一候选（保留证据） | `4bc08296`（1.0.27；Task Scheduler P1 未修复） |
