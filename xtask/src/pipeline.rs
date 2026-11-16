@@ -1378,7 +1378,11 @@ fn drive(
             "stage {stage} {}: {}{} in {}",
             state::stage_name(stage),
             status.label(),
-            if reused { " (required checks reused)" } else { "" },
+            if reused {
+                " (required checks reused)"
+            } else {
+                ""
+            },
             crate::clock::human_duration(finished - started)
         );
         println!("{note}");
