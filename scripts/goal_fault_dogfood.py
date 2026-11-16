@@ -147,7 +147,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
-        fault = proxy.fault_armed
+        # The stream cut belongs to --fault stream only. A Goal fault targets
+        # a later request through the branch above; cutting earlier requests
+        # would spend the fault before the Goal lifecycle ever sees it.
+        fault = proxy.fault_armed and proxy.fault_mode == "stream"
         tool_seen = False
         try:
             while True:

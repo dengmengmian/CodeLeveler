@@ -45,7 +45,8 @@ PROMPT = (
     "（目标命令 `sh verify.sh`），再用 run_command 的 background=true 在后台运行 "
     "`sh verify.sh`，等它真实结束；完成后必须把这次后台执行的 call_id 作为验收证据"
     "（verification.detail 和 requirement.evidence 都写 call_id:<那个 id>）。"
-    "不要重新运行这个检查，也不要伪造结果。"
+    "注意 call_id 是 run_command 这次调用的 id（形如 call_00_...），不是 task_id"
+    "（形如 host-... 或 bg-...）。不要重新运行这个检查，也不要伪造结果。"
 )
 
 CHECK = "#!/bin/sh\nsleep 10\necho VERIFY-OK\nexit 0\n"
