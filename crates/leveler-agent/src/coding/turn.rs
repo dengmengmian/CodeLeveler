@@ -693,18 +693,23 @@ async fn collect_goal_verification(
                     .or_else(|| windows.get(call_id).map(|(start, _)| *start));
                 run.finished_mutation_ops = Some(mutation_ops);
                 // A terminal with no observed change set contributed an
-                // unknown mutation recorded under its task identity. Credit
-                // the execution with its own settlement so its result is not
-                // "changed during the run" — the same rule the live window
-                // applies. A later change still expires it.
+                // unknown mutation recorded under its task identity. That
+                // settlement is the execution's own one operation: the run
+                // keeps its durable start, closes just before the settlement,
+                // and is credited with the settlement version. A change that
+                // was already in the ledger before the settlement therefore
+                // stays in the window and still expires the result.
                 if modified.is_none()
-                    && let Some(version) = unknown_mutations
+                    && let Some(settled) = unknown_mutations
                         .get(&format!("background:{task_id}"))
                         .copied()
                 {
-                    run.started_mutation_ops = Some(version);
-                    run.finished_mutation_ops = Some(version);
-                    run.mutation_ops = run.mutation_ops.max(version);
+                    let finished = run
+                        .finished_mutation_ops
+                        .filter(|finished| *finished < settled)
+                        .unwrap_or_else(|| settled.saturating_sub(1));
+                    run.finished_mutation_ops = Some(finished);
+                    run.mutation_ops = finished.saturating_add(1);
                 }
                 let exited = status
                     .is_none_or(|status| status == leveler_execution::BackgroundTaskStatus::Exited);
@@ -1975,7 +1980,7 @@ mod goal_verification_replay_tests {
     /// its result arrived after a resume.
     #[tokio::test]
     async fn a_background_result_replays_with_its_launch_version() {
-        let (stores, session, goal) = goal_with_background_call("call-bg", true, false).await;
+        let (stores, session, goal) = goal_with_background_call("call-bg", true, None).await;
         let facts = load_goal_verification(&stores, &session, &goal)
             .await
             .unwrap();
@@ -2002,7 +2007,7 @@ mod goal_verification_replay_tests {
     /// consistency claim.
     #[tokio::test]
     async fn a_legacy_background_result_replays_with_an_unknown_start_version() {
-        let (stores, session, goal) = goal_with_background_call("call-legacy", false, false).await;
+        let (stores, session, goal) = goal_with_background_call("call-legacy", false, None).await;
         let facts = load_goal_verification(&stores, &session, &goal)
             .await
             .unwrap();
@@ -2017,37 +2022,68 @@ mod goal_verification_replay_tests {
     }
 
     /// A background terminal with no observed change set contributed an
-    /// unknown mutation of its own. Replay must credit that settlement to the
-    /// execution: its result is current, not "changed during the run". A later
-    /// change must still expire it.
+    /// unknown mutation of its own. Replay credits that settlement to the
+    /// execution: its own op is not "changed during the run", and no other op
+    /// preceded it here, so the result is current at the settlement version.
+    /// A later change must still expire it.
     #[tokio::test]
     async fn an_unknown_background_settlement_is_credited_to_its_own_run() {
-        let (stores, session, goal) = goal_with_background_call("call-unknown", true, true).await;
+        let (stores, session, goal) =
+            goal_with_background_call("call-unknown", true, Some(1)).await;
         let facts = load_goal_verification(&stores, &session, &goal)
             .await
             .unwrap();
         assert_eq!(facts.runs.len(), 1);
         let run = &facts.runs[0];
         assert!(run.ok);
-        assert_eq!(run.started_mutation_ops, Some(2));
-        assert_eq!(run.finished_mutation_ops, Some(2));
-        assert_eq!(run.mutation_ops, 2);
+        assert_eq!(run.started_mutation_ops, Some(0));
+        assert_eq!(run.finished_mutation_ops, Some(0));
+        assert_eq!(run.mutation_ops, 1);
         assert!(matches!(
-            crate::executor::goal_verification::version_applicability(run, 2),
+            crate::executor::goal_verification::version_applicability(run, 1),
             crate::executor::goal_verification::VersionApplicability::Current
         ));
         assert!(matches!(
-            crate::executor::goal_verification::version_applicability(run, 3),
+            crate::executor::goal_verification::version_applicability(run, 2),
             crate::executor::goal_verification::VersionApplicability::Stale
         ));
     }
 
-    /// One background command launched at version 0, an edit advances the
-    /// ledger to 2, and its result arrives afterwards.
+    /// The settlement is the execution's own one operation, not an eraser for
+    /// an edit that was already in the ledger. Replay keeps the real window:
+    /// the run started at 0, the edit moved the tree to 1, and the settlement
+    /// (version 2) credits only itself.
+    #[tokio::test]
+    async fn an_unknown_settlement_does_not_hide_a_prior_edit_on_replay() {
+        let (stores, session, goal) =
+            goal_with_background_call("call-unknown", true, Some(2)).await;
+        let facts = load_goal_verification(&stores, &session, &goal)
+            .await
+            .unwrap();
+        assert_eq!(facts.runs.len(), 1);
+        let run = &facts.runs[0];
+        assert_eq!(run.started_mutation_ops, Some(0));
+        assert_eq!(run.finished_mutation_ops, Some(1));
+        assert_eq!(run.mutation_ops, 2);
+        assert!(matches!(
+            crate::executor::goal_verification::version_applicability(run, 2),
+            crate::executor::goal_verification::VersionApplicability::ChangedDuringRun {
+                started: 0,
+                finished: 1
+            }
+        ));
+    }
+
+    /// One background command launched at version 0, its result arrives
+    /// afterwards. `unknown_settlement` is the workspace version the missing
+    /// change set settled at: `None` keeps the fixture's ledger
+    /// total of two without a settlement record, `Some(v)` sets the total and
+    /// adds the execution's own unknown record at `v` (so `v - 1` operations
+    /// precede it).
     async fn goal_with_background_call(
         call_id: &str,
         with_launch_row: bool,
-        unknown_settlement: bool,
+        unknown_settlement: Option<u64>,
     ) -> (EngineStores, SessionId, leveler_core::GoalId) {
         let db = Database::connect_in_memory().await.unwrap();
         let record = SessionRecord::new("repo", "goal", "mock/m", leveler_core::now());
@@ -2129,15 +2165,15 @@ mod goal_verification_replay_tests {
         .await;
         append(EngineEvent::EvidenceLedgerUpdated {
             ledger: leveler_lifecycle::EvidenceLedger {
-                total_mutation_ops: 2,
+                total_mutation_ops: unknown_settlement.unwrap_or(2),
                 mutations: unknown_settlement
-                    .then(|| leveler_lifecycle::MutationRecord {
+                    .map(|settled| leveler_lifecycle::MutationRecord {
                         seq: 1,
                         tool_call_id: "background:task-bg".into(),
                         tool: "background_task".into(),
                         paths: Vec::new(),
                         scope: leveler_lifecycle::MutationScope::Unknown,
-                        mutation_ops: 2,
+                        mutation_ops: settled,
                     })
                     .into_iter()
                     .collect(),

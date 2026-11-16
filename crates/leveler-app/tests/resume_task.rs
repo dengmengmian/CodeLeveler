@@ -1255,6 +1255,169 @@ async fn a_finished_background_command_is_evidence_after_resume() {
     );
 }
 
+/// A background check running while the tree changes cannot verify the tree
+/// it never finished on. Window 1 launches a check that exits only after
+/// `src/later.rs` appears and stops; window 2 creates that file while the
+/// check is still running. When the check exits, its durable window spans the
+/// edit (or ends before it), so citing it for the now-edited tree must be
+/// refused.
+///
+/// The unknown settlement the runtime records when it first reads the
+/// terminal belongs to the execution's own version; it is not a fresh
+/// observation of the tree the edit produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
+    let (script_name, script) = if cfg!(windows) {
+        (
+            "run-tests.cmd",
+            ":wait\r\nif exist src\\later.rs goto done\r\nping -n 2 127.0.0.1 >NUL\r\ngoto wait\r\n:done\r\nexit /b 0\r\n",
+        )
+    } else {
+        (
+            "run-tests.sh",
+            "while [ ! -f src/later.rs ]; do sleep 0.05; done\nexit 0\n",
+        )
+    };
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/c", script_name])
+    } else {
+        ("sh", vec![script_name])
+    };
+    let f = fixture(
+        vec![sse(vec![
+            tool_call_frame(
+                "b1",
+                "run_command",
+                serde_json::json!({
+                    "program": program,
+                    "args": args,
+                    "background": true,
+                    "reason": "run the suite the user required"
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ])],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    std::fs::write(f._tmp.path().join(script_name), script).unwrap();
+
+    let model = ModelRef::new("mock", "m");
+    let run = |rounds: u32| {
+        let app = f.app.clone();
+        let session = f.session.clone();
+        let model = model.clone();
+        async move {
+            app.run_in_session_bounded(
+                &session,
+                &model,
+                PermissionProfile::Assisted,
+                "跑通全部测试并确认通过",
+                Arc::new(AutoApprove),
+                false,
+                &mut |_| {},
+                CancellationToken::new(),
+                rounds,
+                None,
+            )
+            .await
+        }
+    };
+
+    let first = run(1).await.expect("the first window stops at its budget");
+    assert!(
+        matches!(
+            first.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "the first window must really be a budget stop: {first:?}"
+    );
+
+    // The edit lands while the check is still running: the script only exits
+    // once `src/later.rs` exists.
+    f.server.clear().await;
+    f.server
+        .push(sse(vec![
+            tool_call_frame(
+                "e1",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/later.rs\n+pub fn later() {}\n*** End Patch"
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ]))
+        .await;
+    let second = run(1).await.expect("the second window stops at its budget");
+    assert!(
+        matches!(
+            second.stop_reason,
+            leveler_agent::StopReason::TurnLimitReached
+                | leveler_agent::StopReason::BudgetExhausted
+        ),
+        "the second window must really be a budget stop: {second:?}"
+    );
+
+    // The check has really exited, and its result is durable. Nobody has read
+    // the terminal yet: the next admission is the first observation.
+    let db = f.app.open_database().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut rows = Vec::new();
+    while std::time::Instant::now() < deadline {
+        rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+        if rows
+            .iter()
+            .any(|row| row.event_type == "background_task_finished")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    drop(db);
+    assert!(
+        rows.iter()
+            .any(|row| row.event_type == "background_task_finished"),
+        "the exited background command must leave a durable result: {rows:#?}"
+    );
+
+    f.server.clear().await;
+    f.server
+        .push(sse(vec![
+            tool_call_frame(
+                "g1",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete",
+                    "summary": "the suite passed",
+                    "verification": {"status": "passed", "detail": "call_id:b1"},
+                    "requirements": [{
+                        "requirement": "tests",
+                        "status": "done",
+                        "evidence": "call_id:b1"
+                    }]
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ]))
+        .await;
+    let third = run(1).await.expect("the third window stops at its budget");
+    assert_ne!(
+        third.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "a check that ran through the edit cannot close the goal: {third:?}"
+    );
+
+    let db = f.app.open_database().await.unwrap();
+    let rows = EventRepository::new(&db).load(&f.session).await.unwrap();
+    assert!(
+        rows.iter().any(|row| {
+            row.event_type == "goal_intercepted" && row.payload.contains("verification_refused")
+        }),
+        "the citation must be refused on the record: {rows:#?}"
+    );
+}
+
 /// A recorded START is not a recorded RESULT. Window 1 starts a suite in the
 /// background and stops at its round budget while the suite is STILL RUNNING;
 /// the durable log then holds that start's successful tool result (no exit

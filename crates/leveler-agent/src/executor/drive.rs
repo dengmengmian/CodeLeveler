@@ -1567,7 +1567,16 @@ impl<'a> Drive<'a> {
     /// accounted. The settlement diff is an observation window over the task's
     /// admitted namespace, not per-file authorship: a concurrent writer may
     /// appear in it, which keeps this rule conservative.
-    fn account_background_changes(&mut self, task_id: &str, modified: Option<&[String]>) -> bool {
+    ///
+    /// Returns the workspace version the unknown settlement established, when
+    /// this execution has one. The version is the settlement's own: a later
+    /// observation of the same terminal must credit the execution at that
+    /// version, not at whatever version the tree has reached since.
+    fn account_background_changes(
+        &mut self,
+        task_id: &str,
+        modified: Option<&[String]>,
+    ) -> Option<u64> {
         let Some(modified) = modified else {
             // The task reached a terminal without an observed change set. It
             // may have written anything; the version must advance so a check
@@ -1581,17 +1590,20 @@ impl<'a> Drive<'a> {
                 &self.plan_state,
                 &mut *self.observer,
             );
-            // The unknown change belongs to THIS execution. Its own result is
-            // judged against the version that includes that settlement, the
-            // same way a foreground command is credited with its own writes.
-            return self.ledger.mutations.iter().any(|record| {
-                record.tool == "background_task"
-                    && record.tool_call_id == key
-                    && record.scope == leveler_lifecycle::MutationScope::Unknown
-            });
+            return self
+                .ledger
+                .mutations
+                .iter()
+                .rev()
+                .find(|record| {
+                    record.tool == "background_task"
+                        && record.tool_call_id == key
+                        && record.scope == leveler_lifecycle::MutationScope::Unknown
+                })
+                .map(|record| record.mutation_ops);
         };
         if modified.is_empty() {
-            return false;
+            return None;
         }
         let key = format!("background:{task_id}");
         // Field-pair identity: a model-chosen tool call id that happens to
@@ -1603,14 +1615,14 @@ impl<'a> Drive<'a> {
             .iter()
             .any(|record| record.tool == "background_task" && record.tool_call_id == key)
         {
-            return false;
+            return None;
         }
         let touched = workspace_mutations(
             self.executor.tool_context.execution.workspace.as_deref(),
             modified.to_vec(),
         );
         if touched.is_empty() {
-            return false;
+            return None;
         }
         note_tool_side_effects(
             &mut self.ledger,
@@ -1624,7 +1636,7 @@ impl<'a> Drive<'a> {
             push_unique_path(&mut self.modified_files, &path);
             push_unique_path(&mut self.scoped_paths, &path);
         }
-        false
+        None
     }
 
     /// Register a terminal background result when it belongs to this drive.

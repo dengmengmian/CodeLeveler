@@ -418,7 +418,7 @@ pub(crate) fn record_background_result(
     fact: BackgroundResultFact,
     model_step: u32,
     mutation_ops: u64,
-    credit_own_unknown: bool,
+    own_unknown: Option<u64>,
 ) -> bool {
     let started = pending
         .iter()
@@ -454,27 +454,33 @@ pub(crate) fn record_background_result(
             .find(|run| run.call_id.as_deref() == Some(id))
     {
         // The rebuilt run predates the unknown settlement this observation
-        // produced: the durable exit row carries no change set, and the
-        // ledger record is written when the terminal is read. That
-        // settlement belongs to this same execution, so the run closes at
-        // the settled version — the rule the live registration applies to a
-        // run it creates itself.
-        if credit_own_unknown {
-            existing.mutation_ops = mutation_ops;
-            existing.started_mutation_ops = Some(mutation_ops);
-            existing.finished_mutation_ops = Some(mutation_ops);
+        // accounts for: the durable exit row carries no change set, and the
+        // ledger record is written when the terminal is read. That settlement
+        // is this execution's own one operation, so the run is credited with
+        // it (its real finish version plus one) — the rule the live
+        // registration applies. The execution window itself stays exactly as
+        // the durable log recorded it: another writer that moved the tree
+        // while the command ran must still expire the result.
+        if let Some(settled) = own_unknown {
+            let finished = existing
+                .finished_mutation_ops
+                .unwrap_or_else(|| settled.saturating_sub(1));
+            existing.mutation_ops = finished.saturating_add(1);
+            existing.finished_mutation_ops = Some(finished);
+            if existing.started_mutation_ops.is_none() {
+                existing.started_mutation_ops = window_start;
+            }
         }
         return false;
     }
     // A terminal with no observed change set contributed an unknown mutation
-    // of its own. That settlement belongs to this execution, so the window is
-    // the settled version on both ends: the command's own unobserved write does
-    // not make its own result "changed during the run". A later change still
-    // advances the version past it and expires it.
-    let window_start = if credit_own_unknown {
-        Some(mutation_ops)
-    } else {
-        window_start
+    // of its own. That settlement is this execution's one operation: the run
+    // closes at the version just before its own settlement and is credited
+    // with that settlement version. A later change still advances the version
+    // past it and expires it.
+    let (finished, credited) = match own_unknown {
+        Some(settled) => (settled.saturating_sub(1), settled),
+        None => (mutation_ops, mutation_ops),
     };
     runs.push(VerificationRun {
         label,
@@ -483,10 +489,11 @@ pub(crate) fn record_background_result(
         model_step,
         // The terminal observation's version closes the execution window that
         // the pending start opened. The start version is never replaced by
-        // this newer value.
-        mutation_ops,
+        // this newer value; without one the run stays unprovable rather than
+        // claiming a window it never observed.
+        mutation_ops: credited,
         started_mutation_ops: window_start,
-        finished_mutation_ops: Some(mutation_ops),
+        finished_mutation_ops: Some(finished),
         call_id,
         check_start,
     });
@@ -1823,7 +1830,7 @@ mod tests {
             fact(),
             4,
             7,
-            false
+            None
         ));
         // The second observation is the same execution, even when it arrives
         // through the other route (auto-delivery then `wait_task`, or the
@@ -1835,7 +1842,7 @@ mod tests {
             fact(),
             5,
             7,
-            false
+            None
         ));
         assert_eq!(runs.len(), 1);
         assert!(pending.is_empty(), "a terminal result retires its start");
@@ -1857,7 +1864,7 @@ mod tests {
             background_fact("task-a", "call-a", label, true, true),
             4,
             7,
-            false
+            None
         ));
         assert!(record_background_result(
             &mut runs,
@@ -1866,7 +1873,7 @@ mod tests {
             background_fact("task-b", "call-b", label, true, true),
             9,
             7,
-            false
+            None
         ));
         assert_eq!(
             runs.len(),
@@ -1894,7 +1901,7 @@ mod tests {
             background_fact("task-a", "call-a", "cargo test", false, true),
             6,
             3,
-            false
+            None
         ));
         assert_eq!(runs.len(), 1);
         assert!(!runs[0].ok);
@@ -1915,7 +1922,7 @@ mod tests {
             background_fact("task-a", "call-a", "npm run dev", false, false),
             6,
             3,
-            false
+            None
         ));
         assert!(runs.is_empty(), "a cancel has no command result to cite");
         assert!(
@@ -1938,7 +1945,7 @@ mod tests {
             background_fact("task-a", "call-a", "go test ./...", true, true),
             8,
             4,
-            false
+            None
         ));
         assert_eq!(runs.len(), 1);
         assert!(pending.is_empty());
@@ -1963,14 +1970,131 @@ mod tests {
             background_fact("task-a", "call-a", "go test ./...", true, true),
             8,
             1,
-            true
+            Some(1)
         ));
         assert_eq!(runs.len(), 1, "the same execution is not registered twice");
         assert_eq!(runs[0].mutation_ops, 1);
-        assert_eq!(execution_window(&runs[0]), Some((1, 1)));
+        // The settlement is the execution's own one operation: the durable
+        // window (launch and finish both at 0) is not rewritten by it.
+        assert_eq!(execution_window(&runs[0]), Some((0, 0)));
         assert_eq!(
             version_applicability(&runs[0], 1),
             VersionApplicability::Current
+        );
+    }
+
+    #[test]
+    fn a_late_reobservation_does_not_recredit_a_rebuilt_run() {
+        // The settlement was established at version 1; another real change
+        // then moved the tree to version 2. Re-reading the same terminal is
+        // the same settlement, not a fresh observation: the run stays at its
+        // own version and the later change still expires it.
+        let mut runs = vec![run_id("go test ./...", true, 2, 0, "call-a")];
+        let mut pending = Vec::new();
+        let mut recorded = HashSet::new();
+
+        assert!(!record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "go test ./...", true, true),
+            8,
+            2,
+            Some(1)
+        ));
+        assert_eq!(runs[0].mutation_ops, 1);
+        assert_eq!(execution_window(&runs[0]), Some((0, 0)));
+        assert_eq!(
+            version_applicability(&runs[0], 2),
+            VersionApplicability::Stale
+        );
+    }
+
+    #[test]
+    fn a_settlement_does_not_hide_a_change_that_happened_during_the_run() {
+        // The launch version is 0 and the durable terminal observed version
+        // 1: the tree changed while the command ran. Its own unknown
+        // settlement (version 2) contributes only its one operation; the
+        // execution window still spans the concurrent change.
+        let mut run = run_id("go test ./...", true, 2, 1, "call-a");
+        run.started_mutation_ops = Some(0);
+        run.finished_mutation_ops = Some(1);
+        let mut runs = vec![run];
+        let mut pending = Vec::new();
+        let mut recorded = HashSet::new();
+
+        assert!(!record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "go test ./...", true, true),
+            8,
+            2,
+            Some(2)
+        ));
+        assert_eq!(runs[0].mutation_ops, 2);
+        assert_eq!(execution_window(&runs[0]), Some((0, 1)));
+        assert_eq!(
+            version_applicability(&runs[0], 2),
+            VersionApplicability::ChangedDuringRun {
+                started: 0,
+                finished: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_settlement_closes_at_the_launch_version() {
+        // The live registration has the launch version but no later sample of
+        // its own: the settlement is its one operation, so the window stays
+        // closed at the launch version and the credited version is launch + 1.
+        let mut runs = Vec::new();
+        let mut pending = vec![pending_start("go test ./...", "task-a", "call-a")];
+        let mut recorded = HashSet::new();
+
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "go test ./...", true, true),
+            8,
+            1,
+            Some(1)
+        ));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].mutation_ops, 1);
+        assert_eq!(execution_window(&runs[0]), Some((0, 0)));
+        assert_eq!(
+            version_applicability(&runs[0], 1),
+            VersionApplicability::Current
+        );
+    }
+
+    #[test]
+    fn a_settlement_without_a_start_version_invents_no_window() {
+        // A legacy/edge record has neither a pending start nor a durable
+        // launch version. The settlement still advances the ledger, but the
+        // run cannot claim a window it never observed: the verdict is
+        // UnknownStart, never a fabricated consistency.
+        let mut runs = Vec::new();
+        let mut pending = Vec::new();
+        let mut recorded = HashSet::new();
+
+        assert!(record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "go test ./...", true, true),
+            8,
+            1,
+            Some(1)
+        ));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].mutation_ops, 1);
+        assert_eq!(execution_window(&runs[0]), None);
+        assert_eq!(
+            version_applicability(&runs[0], 1),
+            VersionApplicability::UnknownStart
         );
     }
 
@@ -1990,7 +2114,7 @@ mod tests {
             background_fact("task-b", "call-b", "go test ./...", true, true),
             5,
             2,
-            false
+            None
         ));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].task_id.as_deref(), Some("task-a"));
