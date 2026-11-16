@@ -60,6 +60,14 @@ class Proxy(ThreadingHTTPServer):
         self.https = parsed.scheme == "https"
         self.fault_armed = True
         self.fault_mode = "stream"
+        # Which agent request carries the Goal-level fault. The stream fault
+        # always targets the first; a later target lets a harness wait for a
+        # real fact (a background check's terminal) before the 504 is sent.
+        self.fault_after = 1
+        # When set, the faulting handler waits on this gate before answering,
+        # so the fact that must be durable before the recovery window can land
+        # first. None keeps the original immediate behavior.
+        self.fault_gate: threading.Event | None = None
         self.cuts = 0
         self.goal_faults = 0
         self.agent_requests = 0
@@ -95,11 +103,14 @@ class Handler(BaseHTTPRequestHandler):
             proxy.fault_armed
             and proxy.fault_mode == "goal"
             and b'"tools"' in body
+            and proxy.agent_requests == proxy.fault_after
         ):
             # A complete provider answer, not a transport cut: the model round
             # has nothing to retry (the provider responded), so only the GOAL
             # lifecycle can continue the task. This is the Goal-level fault a
             # request-level retry must not be confused with.
+            if proxy.fault_gate is not None:
+                proxy.fault_gate.wait(180)
             proxy.fault_armed = False
             proxy.goal_faults += 1
             data = json.dumps({"error": {"message": "gateway timeout"}}).encode()
