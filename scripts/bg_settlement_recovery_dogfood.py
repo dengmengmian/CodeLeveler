@@ -46,7 +46,9 @@ PROMPT = (
     "`sh verify.sh`，等它真实结束；完成后必须把这次后台执行的 call_id 作为验收证据"
     "（verification.detail 和 requirement.evidence 都写 call_id:<那个 id>）。"
     "注意 call_id 是 run_command 这次调用的 id（形如 call_00_...），不是 task_id"
-    "（形如 host-... 或 bg-...）。不要重新运行这个检查，也不要伪造结果。"
+    "（形如 host-... 或 bg-...）。如果工具结果没有直接展示 call_id，引用真实运行的命令 "
+    "`sh verify.sh` 即可；不要为了找 id 去翻运行时状态目录。"
+    "不要重新运行这个检查，也不要伪造结果。"
 )
 
 CHECK = "#!/bin/sh\nsleep 10\necho VERIFY-OK\nexit 0\n"
@@ -84,9 +86,11 @@ def main() -> int:
 
     proxy = GF.Proxy(upstream.group(1))
     proxy.fault_mode = "goal"
-    # The launch is the first agent request; the request after its tool result
-    # is held until the check has really ended, then answered with the 504.
-    proxy.fault_after = 2
+    # The model may spend a round on recon before launching; arm the fault
+    # only after the durable start exists. The request that follows the launch
+    # is then held until the check has really ended, and answered with the 504.
+    proxy.fault_after = 0
+    proxy.fault_armed = False
     proxy.fault_gate = threading.Event()
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
 
@@ -110,6 +114,9 @@ def main() -> int:
             bool(starts),
             repr(starts)[:700],
         )
+        # Arm now: the next agent request is the one after the launch, and the
+        # handler will hold it until the check's terminal is durable.
+        proxy.fault_armed = bool(starts)
         start = starts[0] if starts else {}
         launch_call = start.get("call_id")
         report.check(
@@ -132,15 +139,34 @@ def main() -> int:
         # The check's terminal is durable; the held request now gets the 504.
         proxy.fault_gate.set()
 
-        recovery = H.wait_until(
-            pty_, lambda text: "正在恢复任务" in text, timeout=120
+        # The transient recovery status is presentation; the durable turn and
+        # goal records are the fact. Observe the screen briefly for the frame,
+        # then assert the continuation from the log.
+        recovery_screen = H.wait_until(
+            pty_, lambda text: "正在恢复任务" in text, timeout=30
         )
         report.dump("1-recovery", pty_)
+        recovery_turns = BG.query(
+            home, "select id, status, payload from turns order by ordinal"
+        )
+        recovery_goals = []
+        for _, _, payload in recovery_turns:
+            try:
+                recovery_goals.append(json.loads(payload or "{}").get("goal_id"))
+            except Exception:
+                recovery_goals.append(None)
+        recovered = (
+            proxy.goal_faults == 1
+            and len(recovery_turns) >= 2
+            and bool(recovery_goals[0])
+            and all(goal == recovery_goals[0] for goal in recovery_goals)
+            and [status for _, status, _ in recovery_turns] == ["failed", "completed"]
+        )
         report.check(
             "scenario-a",
-            "a Goal recovery window opened after the check finished",
-            recovery and proxy.goal_faults == 1,
-            repr((recovery, proxy.goal_faults)),
+            "the 504 opened a Goal continuation after the check finished",
+            recovered,
+            repr((recovery_screen, proxy.goal_faults, recovery_turns))[:1200],
         )
 
         done = H.wait_until(
@@ -211,15 +237,25 @@ def main() -> int:
             for call in BG.tool_calls(home)
             if call.get("name") == "update_goal"
         ]
-        cited_call = bool(launch_call) and any(
-            ("call_id:" + launch_call) in (call.get("arguments") or "")
-            for call in goal_calls
+        # The model may cite the command text or `call_id:<id>`; what must hold
+        # is that the accepted record resolves to the call that started this
+        # background execution.
+        recorded_calls = [
+            record.get("call_id")
+            for record in (verification.get("records") or [])
+        ]
+        cited_call = bool(launch_call) and (
+            launch_call in recorded_calls
+            or any(
+                ("call_id:" + launch_call) in (call.get("arguments") or "")
+                for call in goal_calls
+            )
         )
         report.check(
             "scenario-a",
-            "the completion cites the launch call id",
+            "the accepted completion resolves the launch call id",
             cited_call,
-            repr((launch_call, goal_calls[-2:]))[:1200],
+            repr((launch_call, recorded_calls, goal_calls[-2:]))[:1200],
         )
 
         turns = BG.query(

@@ -63,6 +63,9 @@ class Proxy(ThreadingHTTPServer):
         # Which agent request carries the Goal-level fault. The stream fault
         # always targets the first; a later target lets a harness wait for a
         # real fact (a background check's terminal) before the 504 is sent.
+        # Zero means "the first agent request after the harness arms it",
+        # which is how a fault targets the round that follows a background
+        # launch instead of a fixed round the model may spend on recon.
         self.fault_after = 1
         # When set, the faulting handler waits on this gate before answering,
         # so the fact that must be durable before the recovery window can land
@@ -103,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
             proxy.fault_armed
             and proxy.fault_mode == "goal"
             and b'"tools"' in body
-            and proxy.agent_requests == proxy.fault_after
+            and (proxy.fault_after == 0 or proxy.agent_requests == proxy.fault_after)
         ):
             # A complete provider answer, not a transport cut: the model round
             # has nothing to retry (the provider responded), so only the GOAL
