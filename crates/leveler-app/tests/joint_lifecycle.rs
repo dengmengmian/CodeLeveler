@@ -410,6 +410,9 @@ async fn wait_for_request(f: &Fixture, count: usize) {
 }
 
 /// A fresh runtime over the same durable layout: new process state, same DB.
+/// Only the Unix restart test re-enters the same fixture this way; the helper
+/// stays out of the Windows build instead of tripping its dead-code lint.
+#[cfg(unix)]
 async fn restart(f: Fixture) -> Fixture {
     let Fixture {
         server,
