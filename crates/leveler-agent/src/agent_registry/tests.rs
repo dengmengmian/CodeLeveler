@@ -86,6 +86,33 @@ fn builtins_are_present_with_no_files() {
     }
 }
 
+/// The reviewer's recall policy is part of its product contract: investigate
+/// actively, but never turn a suspicious-looking snippet into a defect
+/// claim. The old "when in doubt, omit" rule is gone; the evidence bar is
+/// not.
+#[test]
+fn the_reviewer_persona_investigates_actively_and_reports_honestly() {
+    let reg = Fixture::new().load();
+    let text = &reg
+        .get("code-reviewer")
+        .unwrap()
+        .definition()
+        .unwrap()
+        .instructions;
+    for expected in [
+        "主动探索，严格验证，证据决定结论",
+        "不要因为某个代码片段看起来可疑就直接认定存在缺陷",
+        "没有实际执行测试或复现时，不得声称已经动态验证",
+        "不要为了增加数量而拆分问题",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in persona");
+    }
+    assert!(
+        !text.contains("宁可漏"),
+        "the recall-suppressing rule must not survive"
+    );
+}
+
 #[test]
 fn every_shipped_persona_passes_the_user_schema() {
     for (name, manifest, instructions) in builtin::persona_sources() {
