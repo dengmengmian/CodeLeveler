@@ -633,7 +633,10 @@ fn deletion_targets_stay_in_workdir(program: &str, args: &[String]) -> bool {
 }
 
 /// Whether `arg` is an option rather than a deletion target.
-fn is_deletion_option(program: &str, arg: &str) -> bool {
+///
+/// `program` only matters for Windows `rmdir`/`del` switches; the underscore
+/// keeps the non-Windows clippy gate clean without a cfg-shaped signature.
+fn is_deletion_option(_program: &str, arg: &str) -> bool {
     if arg != "-" && arg.starts_with('-') {
         return true;
     }
@@ -642,7 +645,7 @@ fn is_deletion_option(program: &str, arg: &str) -> bool {
     // stays a UNC path even on Windows.
     #[cfg(windows)]
     {
-        if matches!(program, "rmdir" | "del")
+        if matches!(_program, "rmdir" | "del")
             && arg.len() > 1
             && arg.starts_with('/')
             && !arg.starts_with("//")
