@@ -448,10 +448,22 @@ pub(crate) fn record_background_result(
         .or(fact.start_call_id);
     // A run rebuilt from the durable log already names this execution by its
     // starting call. Re-registering it would count the same execution twice.
-    if call_id
-        .as_deref()
-        .is_some_and(|id| runs.iter().any(|run| run.call_id.as_deref() == Some(id)))
+    if let Some(id) = call_id.as_deref()
+        && let Some(existing) = runs
+            .iter_mut()
+            .find(|run| run.call_id.as_deref() == Some(id))
     {
+        // The rebuilt run predates the unknown settlement this observation
+        // produced: the durable exit row carries no change set, and the
+        // ledger record is written when the terminal is read. That
+        // settlement belongs to this same execution, so the run closes at
+        // the settled version — the rule the live registration applies to a
+        // run it creates itself.
+        if credit_own_unknown {
+            existing.mutation_ops = mutation_ops;
+            existing.started_mutation_ops = Some(mutation_ops);
+            existing.finished_mutation_ops = Some(mutation_ops);
+        }
         return false;
     }
     // A terminal with no observed change set contributed an unknown mutation
@@ -1930,6 +1942,36 @@ mod tests {
         ));
         assert_eq!(runs.len(), 1);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_rebuilt_run_is_credited_with_its_own_unknown_settlement() {
+        // Window 1 launched the command and stopped; window 2 rebuilt its run
+        // from the durable log, whose exit row carries no change set. The
+        // terminal therefore contributes one unknown mutation of its own
+        // (current version 1). The rebuilt record and the live registration
+        // describe the same execution: the settlement belongs to it, so the
+        // run closes at version 1 instead of being refused as expired.
+        let mut runs = vec![run_id("go test ./...", true, 2, 0, "call-a")];
+        let mut pending = Vec::new();
+        let mut recorded = HashSet::new();
+
+        assert!(!record_background_result(
+            &mut runs,
+            &mut pending,
+            &mut recorded,
+            background_fact("task-a", "call-a", "go test ./...", true, true),
+            8,
+            1,
+            true
+        ));
+        assert_eq!(runs.len(), 1, "the same execution is not registered twice");
+        assert_eq!(runs[0].mutation_ops, 1);
+        assert_eq!(execution_window(&runs[0]), Some((1, 1)));
+        assert_eq!(
+            version_applicability(&runs[0], 1),
+            VersionApplicability::Current
+        );
     }
 
     #[test]
