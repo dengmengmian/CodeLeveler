@@ -1357,10 +1357,33 @@ async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
         "the second window must really be a budget stop: {second:?}"
     );
 
-    // The next admission is the first observation: its turn boundary
-    // reconciles the background result before the model request. The third
-    // window below is that admission, so the durable-result assertion comes
-    // after it rather than racing the exit during the edit window.
+    // The check exits only after it observes the file this window created.
+    // No client bridge is attached to a headless run, so its terminal fact
+    // enters the durable log at a turn boundary. Wait for the process to
+    // reach a terminal snapshot first: the judging admission below reconciles
+    // it, and the citation is then refused because its result spans the edit
+    // rather than because no result exists yet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snapshots = f
+            .app
+            .background_tasks()
+            .try_all_snapshots()
+            .await
+            .expect("the background registry is readable");
+        if snapshots
+            .iter()
+            .any(|task| task.status.is_terminal() && task.exit_code == Some(0))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background check never reached a terminal snapshot: {snapshots:#?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
     f.server.clear().await;
     f.server
         .push(sse(vec![
@@ -1395,11 +1418,18 @@ async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
             .any(|row| row.event_type == "background_task_finished"),
         "the exited background command must leave a durable result: {rows:#?}"
     );
-    assert!(
-        rows.iter().any(|row| {
+    let refusal = rows
+        .iter()
+        .find(|row| {
             row.event_type == "goal_intercepted" && row.payload.contains("verification_refused")
-        }),
-        "the citation must be refused on the record: {rows:#?}"
+        })
+        .unwrap_or_else(|| panic!("the citation must be refused on the record: {rows:#?}"));
+    assert!(
+        refusal
+            .payload
+            .contains("the workspace changed while it was running"),
+        "the refusal must be the concurrent-change reason, not a missing result: {}",
+        refusal.payload
     );
 }
 
