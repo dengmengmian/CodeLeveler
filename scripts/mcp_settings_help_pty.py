@@ -238,7 +238,7 @@ def scenario_mcp(report, env, python):
         raise
 
 
-def scenario_settings(report, pty):
+def scenario_settings(report, pty, env):
     command(pty, "/settings")
     ok = wait(pty, "设置")
     check(report, "settings", "the page opens", ok, pty.screen.text()[:600])
@@ -256,8 +256,25 @@ def scenario_settings(report, pty):
     pty.key("\r")
     time.sleep(0.4)
     check(report, "settings", "theme opens the shared picker", "主题" in pty.screen.text())
-    pty.key("\x1b")
-    time.sleep(0.3)
+    # Choose the next theme and verify it reached the persisted client config.
+    pty.write("\x1b[B")  # Down: auto -> dark
+    time.sleep(0.2)
+    pty.key("\r")
+    time.sleep(0.5)
+    config_text = ""
+    try:
+        with open(os.path.join(env.home, "config.toml")) as fh:
+            config_text = fh.read()
+    except OSError as error:
+        config_text = str(error)
+    check(
+        report,
+        "settings",
+        "a theme choice persists to the client configuration",
+        'theme = "dark"' in config_text,
+        config_text[-300:],
+    )
+    report.dump("settings-theme-persisted", pty)
 
     # Reload: clear the previous filter, filter to the row, leave the filter,
     # activate.
@@ -367,6 +384,22 @@ def scenario_busy(report, pty, mock):
     time.sleep(1.5)
 
 
+def scenario_merged_surfaces(report, pty):
+    """The Phase A merge's own pages still render on this candidate binary."""
+    to_conversation(pty)
+    for slash, needle, label in [
+        ("/find needle", "搜索", "find"),
+        ("/jump", "回合", "jump"),
+        ("/tasks", "任务", "tasks"),
+        ("/doctor", "诊断", "doctor"),
+    ]:
+        command(pty, slash)
+        ok = wait(pty, needle, 15)
+        check(report, "merged", f"{label} opens on the merged candidate", ok, pty.screen.text()[:700])
+        report.dump(f"merged-{label}", pty)
+        to_conversation(pty)
+
+
 def scenario_i18n(report, python):
     mock = base.MockProvider()
     mock.turns = []
@@ -424,9 +457,10 @@ def main():
     pty = env = mock = None
     try:
         pty, env, mock = scenario_mcp(report, env, python)
-        scenario_settings(report, pty)
+        scenario_settings(report, pty, env)
         scenario_help(report, pty)
         scenario_busy(report, pty, mock)
+        scenario_merged_surfaces(report, pty)
     except Exception as error:  # noqa: BLE001 - the report records the failure
         report.check("mcp", "the PTY scenario completed", False, repr(error))
     finally:
