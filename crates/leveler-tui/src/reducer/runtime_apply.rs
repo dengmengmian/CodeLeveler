@@ -598,10 +598,27 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
         }
         RuntimeEvent::SessionList { sessions } => {
-            if state.sessions_selected >= sessions.len() {
-                state.sessions_selected = 0;
+            // The list is the runtime's authoritative inventory, including
+            // archived rows (marked, not hidden — archive never deletes).
+            state.all_sessions = sessions;
+            refilter_sessions(state);
+            // If the session this client is showing is not in the inventory,
+            // it was deleted — by this client after switching, or by another
+            // client. Keeping the old id would send the next message to a row
+            // the runtime no longer has, so mark the view and refuse input
+            // until `SessionOpened` names a live session.
+            let current_missing = !state.session_id.as_str().is_empty()
+                && !state
+                    .all_sessions
+                    .iter()
+                    .any(|session| session.id == state.session_id);
+            if current_missing && !state.session_deleted {
+                state.session_deleted = true;
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().session_deleted_input_held.to_string(),
+                });
             }
-            state.sessions = sessions;
         }
         // `RuntimeEvent::ContextUpdated` carried the old ContextCompiler's
         // candidate files and token guess. Nothing produces it any more, and the
@@ -2355,6 +2372,29 @@ fn seal_analysis_segment(state: &mut AppState) {
     state.transcript.finish_thought(None);
 }
 
+/// Rebuild the visible Sessions view from the full inventory and the current
+/// filter. Selection stays on a row when possible; when the selected row
+/// leaves the view the cursor returns to the top rather than pointing past
+/// the end.
+pub(super) fn refilter_sessions(state: &mut AppState) {
+    let selected = state
+        .sessions
+        .get(state.sessions_selected)
+        .map(|session| session.id.clone());
+    state.sessions = state
+        .all_sessions
+        .iter()
+        .filter(|session| state.sessions_filter.includes(session.archived))
+        .cloned()
+        .collect();
+    state.sessions_selected = selected
+        .and_then(|id| state.sessions.iter().position(|session| session.id == id))
+        .unwrap_or(0);
+    if state.sessions_selected >= state.sessions.len() {
+        state.sessions_selected = 0;
+    }
+}
+
 fn mark_turn_busy(state: &mut AppState) {
     // Real runtime progress: a goal that was waiting to resume is now running.
     if let Some(goal) = state.active_goal.as_mut() {
@@ -2643,6 +2683,9 @@ fn apply_session_with(
     // token state intact.
     let switching = state.session_id != session.id;
     apply_meta(state, &session);
+    // A snapshot names a session the runtime actually has; the deleted-view
+    // latch is over.
+    state.session_deleted = false;
     // The runtime's own crash-window evidence, not a client-side guess. An
     // empty list means this session holds no recovery gate right now.
     state.interrupted_tool_calls = session.interrupted_tool_calls.clone();

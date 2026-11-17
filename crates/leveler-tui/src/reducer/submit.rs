@@ -14,7 +14,8 @@ use super::overlay_keys::{
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
-    open_clean, open_diff_screen, open_sessions_screen, open_stats, open_trace, toggle_screen,
+    open_clean, open_diff_screen, open_review_report, open_sessions_screen, open_stats, open_trace,
+    toggle_screen,
 };
 
 /// "The composer text just changed" hook: re-arm the slash popup and drop any
@@ -428,6 +429,8 @@ pub(super) fn delete_pending_input(state: &mut AppState, index: usize) {
 fn turn_input_held(state: &mut AppState) -> bool {
     let message = if !state.runtime_connected {
         state.t().input_held_offline
+    } else if state.session_deleted {
+        state.t().session_deleted_input_held
     } else if state
         .pending_submissions
         .iter()
@@ -597,14 +600,8 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         .unwrap_or(name);
 
     match primary {
-        "model" => {
-            open_model_picker(state);
-            Vec::new()
-        }
-        "permission" => {
-            open_mode_picker(state);
-            Vec::new()
-        }
+        "model" => model_slash(state, command),
+        "permission" => permission_slash(state, command),
         "thinking" => thinking_slash(state, command),
         "goal" => run_goal(state, command),
         "btw" => run_btw(state, command),
@@ -629,9 +626,13 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "review" => review_slash(state, command),
         "web" => start_web(state),
         "copy" => copy_slash(state, command),
-        "output" => output_slash(state),
+        "output" => output_slash(state, command),
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
+        // Display title only. The session's original request and its current
+        // goal objective are separate facts; the runtime write is a
+        // snapshot-versioned metadata edit, like /model.
+        "rename" => rename_slash(state, command),
         // Exact id imports straight away; an omitted id opens that source's
         // picker. Independent of native `/resume`: the import always creates a
         // NEW CodeLeveler session.
@@ -782,6 +783,19 @@ fn applied_diff(call: &crate::transcript::ToolCallBlock) -> Option<&str> {
 fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     use crate::transcript::{TranscriptItem, UserShellStatus};
     let arg = command.split_whitespace().nth(1).unwrap_or("");
+    // Complete assistant answers only: a streaming message is not what the
+    // user asked to copy, and the painted terminal text is not Markdown.
+    let copy_answer = |state: &mut AppState, index: usize| -> Vec<Effect> {
+        let Some(text) = nth_complete_answer(state.transcript.items(), index) else {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().copy_no_answer.to_string(),
+            });
+            return Vec::new();
+        };
+        let text = text.to_string();
+        copy_now(state, &text)
+    };
     let latest = state
         .transcript
         .items()
@@ -884,24 +898,94 @@ fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             }
             copy_now(state, &text)
         }
-        _ => {
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: state.t().copy_usage.to_string(),
-            });
-            Vec::new()
-        }
+        "" => copy_answer(state, 1),
+        other => match other.parse::<usize>() {
+            Ok(index) if index > 0 => copy_answer(state, index),
+            _ => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: state.t().copy_usage.to_string(),
+                });
+                Vec::new()
+            }
+        },
     }
 }
 
 /// `/output`: page the latest command's complete output.
 ///
+/// The `index`-th newest COMPLETE assistant answer (1 = newest).
+///
+/// Only a finished message is an answer; a streaming one is still changing,
+/// and copied terminal rows are not the authored Markdown.
+fn nth_complete_answer(items: &[crate::transcript::TranscriptItem], index: usize) -> Option<&str> {
+    if index == 0 {
+        return None;
+    }
+    items
+        .iter()
+        .rev()
+        .filter_map(|item| match item {
+            crate::transcript::TranscriptItem::Assistant(block)
+                if block.done && !block.text.trim().is_empty() =>
+            {
+                Some(block.text.as_str())
+            }
+            _ => None,
+        })
+        .nth(index - 1)
+}
+
 /// A capture is handed to the pager as a file path, so even a 10 MiB result is
 /// read on demand. Only a complete result that never had a capture is written
 /// to a temporary file. A truncated tail with no capture is refused.
-fn output_slash(state: &mut AppState) -> Vec<Effect> {
+fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     use crate::action::PagerSource;
     use crate::transcript::TranscriptItem;
+    // `/output tool [id]`: the full artifact the runtime saved for a model
+    // tool result. The conversation keeps a bounded preview; the artifact is
+    // the same complete bytes the model can page from.
+    let mut args = command.split_whitespace();
+    let _ = args.next(); // "output"
+    if args.next() == Some("tool") {
+        let wanted = args.next();
+        let artifact = state
+            .transcript
+            .items()
+            .iter()
+            .rev()
+            .filter_map(|item| match item {
+                TranscriptItem::ToolGroup(group) => Some(&group.calls),
+                _ => None,
+            })
+            .flat_map(|calls| calls.iter().rev())
+            .find_map(|call| {
+                if wanted.is_some_and(|id| call.id.as_str() != id) {
+                    return None;
+                }
+                call.preview
+                    .as_deref()
+                    .and_then(|preview| preview.lines().next())
+                    .and_then(saved_output_path)
+            });
+        let Some(path) = artifact else {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().output_no_tool.to_string(),
+            });
+            return Vec::new();
+        };
+        if let Some(path) = valid_artifact(state, &path) {
+            return vec![Effect::OpenOutputPager {
+                source: PagerSource::File(path),
+            }];
+        }
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().output_tool_unavailable.to_string(),
+        });
+        return Vec::new();
+    }
     let latest = state
         .transcript
         .items()
@@ -944,6 +1028,23 @@ fn output_slash(state: &mut AppState) -> Vec<Effect> {
 }
 
 /// Validate a persisted capture path against the local state root.
+/// The absolute artifact path from the runtime's saved-output reference line.
+fn saved_output_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix(leveler_model::tool_output::TOOL_OUTPUT_SAVED_PREFIX)?;
+    let path = rest.split(" | sha256:").next()?.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// An artifact is a regular file under this runtime's state directory. Model
+/// output is untrusted: a path it names is evidence, not authority.
+fn valid_artifact(state: &AppState, path: &str) -> Option<std::path::PathBuf> {
+    let root = state.shell_output_root()?;
+    let state_dir = root.parent()?;
+    let root = std::fs::canonicalize(state_dir).ok()?;
+    let path = std::fs::canonicalize(path).ok()?;
+    (path.is_file() && path.starts_with(root)).then_some(path)
+}
+
 fn valid_capture(state: &AppState, directory: &str) -> Result<crate::output_view::Capture, String> {
     crate::output_view::Capture::open(
         std::path::Path::new(directory),
@@ -991,8 +1092,10 @@ fn new_conversation(state: &mut AppState) -> Vec<Effect> {
 }
 
 /// `/export [path]`: write the visible conversation to a markdown file. Default
-/// path is `<cwd>/leveler-chat-<timestamp>.md`; an argument overrides it. Only
-/// the dialogue (user + assistant prose) is written — tool activity is skipped.
+/// path is `<cwd>/leveler-chat-<timestamp>.md`; an argument overrides it. The
+/// dialogue (user + assistant prose) is written first, followed by a `## Tools`
+/// evidence section (call identity, status, exit code, duration and the
+/// complete-output artifact reference). Raw stdout is never inlined.
 /// Expand a leading `~` / `~/` to the user's home. `~user` is not supported
 /// (rare, and needs passwd lookup); anything else is returned verbatim.
 fn expand_tilde(arg: &str) -> std::path::PathBuf {
@@ -1105,7 +1208,67 @@ fn build_export_markdown(state: &AppState) -> String {
             _ => {}
         }
     }
+    out.push_str(&exported_tool_evidence(state));
     out
+}
+
+/// Tool evidence for the export: identities and result facts, never the raw
+/// stdout. A large result is named by its artifact path (the same complete
+/// copy `/output tool` opens); its bytes stay out of the Markdown.
+fn exported_tool_evidence(state: &AppState) -> String {
+    use crate::transcript::TranscriptItem;
+    let mut rows = String::new();
+    for item in state.transcript.items() {
+        let TranscriptItem::ToolGroup(group) = item else {
+            continue;
+        };
+        for call in &group.calls {
+            let mut line = format!(
+                "- `{}` · 调用 {} · 状态 {:?}",
+                call.name, call.id, call.status
+            );
+            if let Some(code) = call.exit_code {
+                line.push_str(&format!(" · 退出码 {code}"));
+            }
+            if let Some(duration) = call.duration_ms {
+                line.push_str(&format!(" · {duration} ms"));
+            }
+            rows.push_str(&line);
+            rows.push('\n');
+            let arguments = call.arguments.lines().next().unwrap_or("");
+            if !arguments.trim().is_empty() {
+                // Arguments can carry a credential VALUE. The export is a
+                // delivery artifact, not a secret copy.
+                let (safe, _) = leveler_core::sanitize_model_visible(arguments);
+                let summary: String = safe.chars().take(200).collect();
+                rows.push_str(&format!("  - 参数: `{summary}`"));
+                if safe.chars().count() > 200 {
+                    rows.push('…');
+                }
+                rows.push('\n');
+            }
+            let artifact = call
+                .preview
+                .as_deref()
+                .and_then(|preview| preview.lines().next())
+                .and_then(saved_output_path);
+            match artifact {
+                Some(path) if std::path::Path::new(&path).is_file() => rows.push_str(&format!(
+                    "  - 完整输出: `{path}`（预览之外的内容以该文件为准）\n"
+                )),
+                Some(_) => rows.push_str("  - 输出副本: 不可用（已被清理或不在本机）\n"),
+                None if call.output_truncated => {
+                    rows.push_str("  - 输出副本: 不完整（没有保留完整副本）\n")
+                }
+                None => {}
+            }
+        }
+    }
+    if rows.is_empty() {
+        String::new()
+    } else {
+        format!("## Tools\n\n{rows}\n")
+    }
 }
 
 /// Start `/update`: open the panel and hand the work to the event loop, which
@@ -1258,6 +1421,36 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         return Vec::new();
     }
     let tokens: Vec<&str> = rest.split_whitespace().collect();
+    // Keyboard entry to a durable report. The mouse path (clicking the review
+    // card) is unchanged; this names the same report by id, or the newest
+    // settled review when no id is given.
+    if tokens.first() == Some(&"report") {
+        let review_id = tokens.get(1).map(|id| (*id).to_string()).or_else(|| {
+            state
+                .transcript
+                .items()
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    crate::transcript::TranscriptItem::Review(block)
+                        if block.summary.status.settled() =>
+                    {
+                        Some(block.summary.id.clone())
+                    }
+                    _ => None,
+                })
+        });
+        return match review_id {
+            Some(id) => open_review_report(state, &id),
+            None => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Info,
+                    message: "当前没有可查看的审查报告".to_string(),
+                });
+                Vec::new()
+            }
+        };
+    }
     if tokens.first() == Some(&"cancel") {
         let running = state
             .transcript
@@ -1509,6 +1702,118 @@ fn agents_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
 }
 
 /// `/goal <task>` starts a goal turn; `/goal status` and `/goal clear` manage it.
+/// `/model [ref]`: switch this session's model. `default <ref>` is the
+/// separate, explicit way to change the global default.
+fn model_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let rest = command
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("")
+        .to_string();
+    if rest.is_empty() {
+        open_model_picker(state);
+        return Vec::new();
+    }
+    // Require the separator: a model ref that happens to start with
+    // "default" is not the default-model form.
+    let (set_default, raw) = match rest.split_once(char::is_whitespace) {
+        Some(("default", tail)) => (true, tail.trim()),
+        _ => (false, rest.as_str()),
+    };
+    if raw.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().model_usage.to_string(),
+        });
+        return Vec::new();
+    }
+    let Some(model) = ModelRef::parse(raw) else {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().model_usage.to_string(),
+        });
+        return Vec::new();
+    };
+    // Reuse the same catalog the picker shows. A model this runtime cannot
+    // resolve would fail at the next request instead of here.
+    if !state.available_models.is_empty() && !state.available_models.contains(&model) {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: format!("模型不可用: {model}"),
+        });
+        return Vec::new();
+    }
+    state.model_label = model.to_string();
+    state.thinking = None;
+    if set_default {
+        vec![Effect::Send(ClientCommand::SetDefaultModel {
+            session_id: state.session_id.clone(),
+            model,
+        })]
+    } else {
+        vec![Effect::Send(ClientCommand::SelectModel {
+            session_id: state.session_id.clone(),
+            model,
+        })]
+    }
+}
+
+/// `/permission [ask|auto|full]`: the same runtime setting the picker sends.
+fn permission_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let rest = command
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if rest.is_empty() {
+        open_mode_picker(state);
+        return Vec::new();
+    }
+    let mode = match rest.as_str() {
+        "ask" | "request_approval" => leveler_client_protocol::PermissionProfile::RequestApproval,
+        "auto" | "assisted" => leveler_client_protocol::PermissionProfile::Assisted,
+        "full" | "full_access" => leveler_client_protocol::PermissionProfile::FullAccess,
+        _ => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().permission_usage.to_string(),
+            });
+            return Vec::new();
+        }
+    };
+    state.pending_permission = Some(mode);
+    vec![Effect::Send(ClientCommand::SetPermissionProfile {
+        session_id: state.session_id.clone(),
+        mode,
+    })]
+}
+
+/// `/rename <title>`: change only the display title.
+fn rename_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let title = command
+        .split_once(char::is_whitespace)
+        .map(|(_, title)| title.trim())
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().rename_usage.to_string(),
+        });
+        return Vec::new();
+    }
+    if state.session_deleted {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().session_deleted_input_held.to_string(),
+        });
+        return Vec::new();
+    }
+    vec![Effect::Send(ClientCommand::RenameSession {
+        session_id: state.session_id.clone(),
+        name: title,
+    })]
+}
+
 fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command
         .strip_prefix("goal")
@@ -1736,6 +2041,42 @@ mod export_tests {
         assert!(
             md.contains("## 助手\n\n好的，已经加上 /export 了。"),
             "{md}"
+        );
+    }
+
+    /// E5: tool evidence names the call and its result facts, and points at
+    /// the complete artifact instead of copying its stdout into the Markdown.
+    #[test]
+    fn tool_evidence_is_named_without_dumping_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("artifact.txt");
+        std::fs::write(&artifact, "RAW-STDOUT-THAT-MUST-NOT-APPEAR").unwrap();
+        let mut s = state_with_dialogue();
+        let id = leveler_client_protocol::ToolCallId::new("call-1");
+        s.transcript.push_tool_started(
+            id.clone(),
+            "read_file".into(),
+            r#"{"path":"src/lib.rs"}"#.into(),
+            false,
+            0,
+            Some(1),
+            None,
+        );
+        let preview = format!(
+            "[tool output saved: {} | sha256:abc | 32 bytes. The preview below is partial.]\nPREVIEW-TAIL",
+            artifact.display()
+        );
+        s.transcript
+            .complete_command(&id, true, preview, 12, None, Some(0), None);
+        let md = build_export_markdown(&s);
+        assert!(md.contains("## Tools"), "{md}");
+        assert!(md.contains("read_file"), "{md}");
+        assert!(md.contains("call-1"), "{md}");
+        assert!(md.contains("退出码 0"), "{md}");
+        assert!(md.contains(&artifact.display().to_string()), "{md}");
+        assert!(
+            !md.contains("RAW-STDOUT-THAT-MUST-NOT-APPEAR") && !md.contains("PREVIEW-TAIL"),
+            "the export names the artifact; it does not inline its bytes: {md}"
         );
     }
 
@@ -2122,6 +2463,48 @@ mod goal_clear_tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::Send(ClientCommand::CancelTask { .. }))),
             "`/goal cancel` must cancel the logical task, not clear a local mode: {effects:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nth_answer_tests {
+    use super::nth_complete_answer;
+    use crate::transcript::TranscriptState;
+    use leveler_client_protocol::MessageId;
+
+    /// Bare `/copy` takes the newest FINISHED answer; `/copy N` walks back.
+    /// A streaming message is not an answer yet.
+    #[test]
+    fn copy_indexes_only_complete_answers_newest_first() {
+        let mut transcript = TranscriptState::new();
+        let first = MessageId::new("a1");
+        transcript.begin_assistant(first.clone());
+        transcript.append_assistant(&first, "first answer");
+        transcript.finish_assistant(&first);
+
+        let streaming = MessageId::new("a2");
+        transcript.begin_assistant(streaming);
+        transcript.append_assistant(&MessageId::new("a2"), "still streaming");
+
+        let second = MessageId::new("a3");
+        transcript.begin_assistant(second.clone());
+        transcript.append_assistant(&second, "second answer");
+        transcript.finish_assistant(&second);
+
+        assert_eq!(
+            nth_complete_answer(transcript.items(), 1),
+            Some("second answer")
+        );
+        assert_eq!(
+            nth_complete_answer(transcript.items(), 2),
+            Some("first answer")
+        );
+        assert_eq!(nth_complete_answer(transcript.items(), 3), None);
+        assert_eq!(
+            nth_complete_answer(transcript.items(), 1),
+            Some("second answer"),
+            "a streaming message never becomes /copy's target"
         );
     }
 }

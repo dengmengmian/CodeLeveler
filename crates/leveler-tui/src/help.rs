@@ -40,7 +40,6 @@ pub fn entries(t: &UiText) -> Vec<HelpEntry> {
         ),
         ("PageUp/PageDown", t.key_scroll_page),
         ("Ctrl+C", t.key_cancel_quit),
-        ("Ctrl+M", t.key_model),
         ("Ctrl+V", t.key_paste_image),
         ("Ctrl+O", t.key_expand),
         ("Ctrl+?", t.help_title),

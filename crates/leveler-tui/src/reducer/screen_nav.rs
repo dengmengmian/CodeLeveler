@@ -1,10 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use leveler_client_protocol::{ClientCommand, CommandId};
+use leveler_client_protocol::{ClientCommand, CommandId, NotificationLevel};
 
 use crate::action::Effect;
 use crate::screen::Screen;
-use crate::state::AppState;
+use crate::state::{AppState, Notification};
 
 fn page_size(state: &AppState) -> usize {
     // Rough page: the screen viewport minus header/status/composer chrome.
@@ -256,6 +256,36 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                             Screen::Sessions,
                         );
                     }
+                }
+                // Archive is reversible and never deletes the transcript, so
+                // it is a single key rather than a confirmation.
+                KeyCode::Char('a') => {
+                    if let Some(s) = state.sessions.get(state.sessions_selected)
+                        && !s.archived
+                    {
+                        return vec![Effect::Send(ClientCommand::ArchiveSession {
+                            session_id: s.id.clone(),
+                        })];
+                    }
+                }
+                KeyCode::Char('u') => {
+                    if let Some(s) = state.sessions.get(state.sessions_selected)
+                        && s.archived
+                    {
+                        return vec![Effect::Send(ClientCommand::UnarchiveSession {
+                            session_id: s.id.clone(),
+                        })];
+                    }
+                }
+                KeyCode::Char('f') => {
+                    state.sessions_filter = state.sessions_filter.cycle();
+                    super::runtime_apply::refilter_sessions(state);
+                    let label = state.sessions_filter.label(state.t());
+                    let message = state.t().sessions_filter_label.replacen("{}", label, 1);
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Info,
+                        message,
+                    });
                 }
                 _ => {}
             }

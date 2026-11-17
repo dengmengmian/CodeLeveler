@@ -45,6 +45,9 @@ pub enum Overlay {
     UnsupportedMedia(Box<SelectionModel>),
     /// Pick a conversation checkpoint to restore (spec §68).
     CheckpointPicker(Box<SelectionModel>),
+    /// Second, explicit confirmation of a destructive restore. The checkpoint
+    /// id is the non-cancel row's key, so a moved list cannot redirect it.
+    ConfirmCheckpointRestore(Box<SelectionModel>),
     /// Confirm deleting a stored session. Deleting is irreversible, so it takes
     /// an explicit choice rather than firing on the first `d`.
     ConfirmSessionDelete(Box<SelectionModel>),
@@ -83,6 +86,7 @@ impl Overlay {
             | Overlay::ThemePicker(_)
             | Overlay::CollabPicker(_)
             | Overlay::CheckpointPicker(_)
+            | Overlay::ConfirmCheckpointRestore(_)
             | Overlay::ConfirmSessionDelete(_)
             | Overlay::ConfirmSchedule(_)
             | Overlay::ConfirmRecovery(_)
@@ -111,6 +115,7 @@ impl Overlay {
             | Overlay::CollabPicker(m)
             | Overlay::UnsupportedMedia(m)
             | Overlay::CheckpointPicker(m)
+            | Overlay::ConfirmCheckpointRestore(m)
             | Overlay::ConfirmSessionDelete(m)
             | Overlay::ConfirmRecovery(m)
             | Overlay::ReviewScopePicker(m) => {
@@ -327,6 +332,7 @@ fn build_content(
         | Overlay::CollabPicker(model)
         | Overlay::UnsupportedMedia(model)
         | Overlay::CheckpointPicker(model)
+        | Overlay::ConfirmCheckpointRestore(model)
         | Overlay::ConfirmSessionDelete(model)
         | Overlay::ConfirmRecovery(model)
         | Overlay::ThinkingPicker(model)

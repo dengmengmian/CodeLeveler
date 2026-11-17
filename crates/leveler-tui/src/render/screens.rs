@@ -320,6 +320,11 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
     let theme = &state.theme;
 
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        t.sessions_filter_label
+            .replacen("{}", state.sessions_filter.label(t), 1),
+        Style::default().fg(theme.text.secondary),
+    )));
     if state.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             t.sessions_empty,
@@ -346,11 +351,16 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
         } else {
             &s.status
         };
-        let goal = truncate_display(&s.goal, 40);
+        let goal = truncate_display(s.title.as_deref().unwrap_or(&s.goal), 40);
+        let archived = if s.archived {
+            format!(" [{}]", t.sessions_filter_archived)
+        } else {
+            String::new()
+        };
         lines.push(Line::from(vec![
             Span::styled(cursor, Style::default().fg(theme.accent.primary)),
             Span::styled(format!("{dot} "), Style::default().fg(color)),
-            Span::raw(format!("{goal}  ")),
+            Span::raw(format!("{goal}{archived}  ")),
             Span::styled(
                 format!("[{status}] "),
                 Style::default().fg(theme.text.secondary),

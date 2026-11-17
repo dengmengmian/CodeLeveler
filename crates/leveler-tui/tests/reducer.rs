@@ -110,6 +110,7 @@ fn snapshot() -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "interactive session".to_string(),
+        title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
         branch: Some("main".to_string()),
@@ -141,6 +142,101 @@ fn snapshot() -> UiSessionSnapshot {
         children: Vec::new(),
         foreign_origin: None,
     }
+}
+
+/// D9: restoring rolls back the working tree, not just the conversation. A
+/// destructive operation takes a second, explicit confirmation; the first
+/// Enter opens that confirmation instead of executing.
+/// E1: a model tool result that was too large for the context keeps a complete
+/// artifact. The TUI can open that exact file; the visible preview is not
+/// treated as the whole output.
+#[test]
+fn output_tool_opens_the_saved_artifact_instead_of_the_preview() {
+    let tmp = tempfile::tempdir().unwrap();
+    let artifact_dir = tmp.path().join("state").join("artifacts");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    let artifact = artifact_dir.join("payload.txt");
+    std::fs::write(&artifact, "FULL TOOL OUTPUT\n").unwrap();
+    let mut s = opened_at_state_root(tmp.path());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("call-1"),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+            parallel: false,
+            model_step: Some(1),
+            answer_effect: None,
+        }),
+    );
+    let preview = format!(
+        "[tool output saved: {} | sha256:abc | 17 bytes. The preview below is partial; read the full output with read_file, passing this absolute path and start_line to page.]\nHEAD…TAIL",
+        artifact.display()
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("call-1"),
+            ok: true,
+            preview,
+            duration_ms: 1,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        }),
+    );
+    typed(&mut s, "/output tool");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let expected = std::fs::canonicalize(&artifact).unwrap();
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::OpenOutputPager {
+                source: leveler_tui::action::PagerSource::File(path)
+            }] if path == &expected
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn restoring_a_checkpoint_requires_a_second_explicit_confirmation() {
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.checkpoints = vec![UiCheckpoint {
+        id: leveler_client_protocol::CheckpointId::new("cp-1"),
+        label: "before the risky edit".into(),
+        ordinal: 3,
+    }];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    typed(&mut s, "/restore");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(matches!(s.overlay, Some(Overlay::CheckpointPicker(_))));
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "the picker must not execute: {effects:?}"
+    );
+    assert!(
+        matches!(s.overlay, Some(Overlay::ConfirmCheckpointRestore(_))),
+        "a second confirmation names the destructive consequence"
+    );
+
+    // The confirmation starts on Cancel; move to Restore and confirm.
+    reduce(&mut s, key(KeyCode::Down));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::RestoreCheckpoint { checkpoint_id, .. })]
+                if checkpoint_id.as_str() == "cp-1"
+        ),
+        "{effects:?}"
+    );
 }
 
 #[test]
@@ -2740,6 +2836,34 @@ fn approval_req() -> UiApprovalRequest {
 }
 
 #[test]
+fn slash_rename_sends_only_the_display_title() {
+    let mut s = opened();
+    typed(&mut s, "/rename Quarterly plan");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::RenameSession {
+            session_id: SessionId::new("s1"),
+            name: "Quarterly plan".into(),
+        })]
+    );
+}
+
+#[test]
+fn slash_rename_without_a_title_explains_the_usage() {
+    let mut s = opened();
+    typed(&mut s, "/rename");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty());
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("/rename <")),
+        "the empty form must explain its argument"
+    );
+}
+
+#[test]
 fn slash_model_opens_picker_and_is_not_sent() {
     let mut s = opened();
     typed(&mut s, "/model");
@@ -2752,18 +2876,85 @@ fn slash_model_opens_picker_and_is_not_sent() {
     assert!(s.composer.is_empty());
 }
 
+/// D10/D11: `/model <ref>` takes effect for THIS session; the global default
+/// is a separate explicit form. Both validate against the runtime's catalog.
 #[test]
-fn model_picker_confirm_selects_and_sets_default() {
+fn slash_model_argument_switches_the_session_and_default_is_explicit() {
+    let mut s = opened();
+    s.available_models =
+        vec![leveler_client_protocol::ModelRef::parse("mock/m").expect("model ref")];
+    typed(&mut s, "/model mock/m");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SelectModel { model, .. })]
+                if model.to_string() == "mock/m"
+        ),
+        "{effects:?}"
+    );
+
+    typed(&mut s, "/model default mock/m");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SetDefaultModel { model, .. })]
+                if model.to_string() == "mock/m"
+        ),
+        "{effects:?}"
+    );
+
+    typed(&mut s, "/model mock/unknown");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "an unavailable model is not sent");
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("不可用"))
+    );
+}
+
+#[test]
+fn slash_permission_argument_applies_and_rejects_unknown_values() {
+    let mut s = opened();
+    typed(&mut s, "/permission full");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SetPermissionProfile {
+                mode: leveler_client_protocol::PermissionProfile::FullAccess,
+                ..
+            })]
+        ),
+        "{effects:?}"
+    );
+
+    typed(&mut s, "/permission nonsense");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty());
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("/permission")),
+        "{:?}",
+        s.notification
+    );
+}
+
+#[test]
+fn model_picker_confirm_switches_the_session() {
     let mut s = opened();
     typed(&mut s, "/model");
     reduce(&mut s, key(KeyCode::Enter)); // open picker
     // Two models (not searchable): quick-select the 2nd → glm/5.
     let effects = reduce(&mut s, key(KeyCode::Char('2')));
-    // The picker is the user's explicit selection, so it carries the authority
-    // to persist the default — not the session-scoped `SelectModel`.
+    // `/model` is one product action across clients: switch THIS session.
+    // Changing the global default is the separate `/model default <ref>`.
     assert_eq!(
         effects,
-        vec![Effect::Send(ClientCommand::SetDefaultModel {
+        vec![Effect::Send(ClientCommand::SelectModel {
             session_id: SessionId::new("s1"),
             model: leveler_client_protocol::ModelRef::parse("glm/5").unwrap(),
         })]
@@ -3617,7 +3808,7 @@ fn the_clarification_field_edits_with_the_composer_editing_keys() {
 #[test]
 fn a_clarification_keeps_editing_keys_from_global_bindings() {
     let mut s = clarification_open();
-    let effects = reduce(&mut s, ctrl('m'));
+    let effects = reduce(&mut s, ctrl('s'));
     assert!(effects.is_empty(), "{effects:?}");
     assert!(
         matches!(s.overlay, Some(Overlay::Clarification(_))),
@@ -3636,7 +3827,8 @@ fn global_bindings_return_after_the_clarification_closes() {
     let effects = reduce(&mut s, key(KeyCode::Esc));
     assert!(!effects.is_empty(), "Esc resolves the interaction");
     assert!(s.overlay.is_none());
-    reduce(&mut s, ctrl('m'));
+    typed(&mut s, "/model");
+    reduce(&mut s, key(KeyCode::Enter));
     assert!(matches!(s.overlay, Some(Overlay::ModelPicker(_))));
 }
 
@@ -3866,10 +4058,15 @@ fn absolute_path_at_message_start_is_sent_instead_of_parsed_as_a_command() {
     assert!(s.composer.is_empty());
 }
 
+/// Ctrl+M is what most terminals report for Enter; it is not a reachable
+/// model-picker binding. `/model` is the advertised entry.
 #[test]
-fn ctrl_m_opens_model_picker() {
+fn ctrl_m_is_not_a_model_picker_binding() {
     let mut s = opened();
     reduce(&mut s, ctrl('m'));
+    assert!(!matches!(s.overlay, Some(Overlay::ModelPicker(_))));
+    typed(&mut s, "/model");
+    reduce(&mut s, key(KeyCode::Enter));
     assert!(matches!(s.overlay, Some(Overlay::ModelPicker(_))));
 }
 
@@ -4398,6 +4595,9 @@ fn summary(id: &str, goal: &str) -> leveler_client_protocol::UiSessionSummary {
         task_terminal: None,
         id: SessionId::new(id),
         goal: goal.into(),
+        archived: false,
+        title: None,
+        original_request: None,
         status: "completed".into(),
         declaration: None,
         model: "deepseek/v3".into(),
@@ -4470,6 +4670,56 @@ fn sessions_d_opens_a_delete_confirmation_instead_of_deleting() {
 }
 
 #[test]
+fn archive_and_unarchive_are_reversible_row_actions() {
+    let mut active = summary("active", "active work");
+    let mut archived = summary("archived", "old work");
+    archived.archived = true;
+    let mut s = opened();
+    reduce(&mut s, ctrl('s'));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![active.clone(), archived.clone()],
+        }),
+    );
+    assert_eq!(s.sessions.len(), 1, "the active filter hides archived rows");
+    assert_eq!(s.sessions[0].id, SessionId::new("active"));
+
+    // Archive the visible row.
+    let effects = reduce(&mut s, key(KeyCode::Char('a')));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::ArchiveSession {
+            session_id: SessionId::new("active"),
+        })]
+    );
+
+    // The filter still hides it until the runtime answers; the archived view
+    // shows it and `u` restores it.
+    active.archived = true;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![active, archived.clone()],
+        }),
+    );
+    assert!(s.sessions.is_empty(), "both rows are archived now");
+    reduce(&mut s, key(KeyCode::Char('f')));
+    assert_eq!(
+        s.sessions_filter,
+        leveler_tui::state::SessionFilter::Archived
+    );
+    assert_eq!(s.sessions.len(), 2);
+    let effects = reduce(&mut s, key(KeyCode::Char('u')));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::UnarchiveSession {
+            session_id: s.sessions[0].id.clone(),
+        })]
+    );
+}
+
+#[test]
 fn delete_confirmation_defaults_to_cancel() {
     let mut s = opened();
     reduce(&mut s, ctrl('s'));
@@ -4532,6 +4782,63 @@ fn delete_confirmation_deletes_only_after_explicit_selection() {
         s.overlay.is_none(),
         "the confirmation closes after deciding"
     );
+}
+
+/// Deleting the session being viewed must move the composer to a live
+/// session first. Otherwise the next message would target a row the runtime
+/// just removed.
+#[test]
+fn deleting_the_current_session_switches_to_a_live_one_first() {
+    let mut s = opened();
+    reduce(&mut s, ctrl('s'));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![summary("s1", "current"), summary("b", "other")],
+        }),
+    );
+    reduce(&mut s, key(KeyCode::Char('d')));
+    reduce(&mut s, key(KeyCode::Down));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        effects,
+        vec![
+            Effect::Send(ClientCommand::OpenSessionFor {
+                requester_session_id: SessionId::new("s1"),
+                session_id: SessionId::new("b"),
+            }),
+            Effect::Send(ClientCommand::DeleteSessionFor {
+                requester_session_id: SessionId::new("s1"),
+                session_id: SessionId::new("s1"),
+            }),
+        ]
+    );
+}
+
+/// The runtime's list is authoritative. A current session missing from it is
+/// deleted, and the client must stop pretending it can still send there.
+#[test]
+fn a_session_list_without_the_current_session_marks_it_deleted() {
+    let mut s = opened();
+    assert!(!s.session_deleted);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![summary("other", "somewhere else")],
+        }),
+    );
+    assert!(
+        s.session_deleted,
+        "a current session absent from the runtime inventory was deleted"
+    );
+    // A fresh snapshot of a live session clears the latch.
+    let mut live = snapshot();
+    live.id = SessionId::new("other");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: live }),
+    );
+    assert!(!s.session_deleted, "SessionOpened names a live session");
 }
 
 #[test]
@@ -4640,8 +4947,16 @@ fn checkpoint_created_event_is_recorded_and_restore_picker_works() {
     reduce(&mut s, key(KeyCode::Enter));
     assert!(matches!(s.overlay, Some(Overlay::CheckpointPicker(_))));
 
-    // Only one checkpoint → number 1 restores it.
+    // Only one checkpoint → number 1 selects it. Restore is destructive to
+    // the working tree, so a second confirmation starts on Cancel.
     let effects = reduce(&mut s, key(KeyCode::Char('1')));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(matches!(
+        s.overlay,
+        Some(Overlay::ConfirmCheckpointRestore(_))
+    ));
+    reduce(&mut s, key(KeyCode::Down));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(
         effects,
         vec![Effect::Send(ClientCommand::RestoreCheckpoint {
@@ -9983,7 +10298,8 @@ fn a_typing_burst_reaches_a_searchable_picker_s_query() {
 #[test]
 fn a_paste_with_a_list_only_picker_still_goes_to_the_composer() {
     let mut s = opened();
-    reduce(&mut s, ctrl('m'));
+    typed(&mut s, "/model");
+    reduce(&mut s, key(KeyCode::Enter));
     let Some(Overlay::ModelPicker(m)) = &s.overlay else {
         panic!("the picker did not open");
     };
@@ -10008,7 +10324,8 @@ fn searchable_model_picker() -> AppState {
         &mut s,
         Action::Runtime(RuntimeEvent::SessionOpened { session }),
     );
-    reduce(&mut s, ctrl('m'));
+    typed(&mut s, "/model");
+    reduce(&mut s, key(KeyCode::Enter));
     let Some(Overlay::ModelPicker(m)) = &s.overlay else {
         panic!("the picker did not open");
     };
@@ -13664,6 +13981,32 @@ fn a_targetless_commit_review_is_refused_before_it_can_lie() {
             .is_some_and(|notice| notice.message.contains("用法")),
         "{:?}",
         s.notification
+    );
+}
+
+/// D8: a report is reachable without a mouse. `/review report` names the
+/// newest settled review's durable report; `/review report <id>` names one.
+#[test]
+fn slash_review_report_opens_the_latest_settled_report() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: review_summary(
+                "review-1",
+                leveler_client_protocol::UiReviewStatus::Completed,
+            ),
+        }),
+    );
+    typed(&mut s, "/review report");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::QueryReviewReport { review_id, .. })]
+                if review_id == "review-1"
+        ),
+        "{effects:?}"
     );
 }
 

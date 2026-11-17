@@ -295,6 +295,43 @@ impl Reconnecting {
 pub const RECONNECTED_NOTICE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The whole UI state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionFilter {
+    /// The default list: sessions that are not archived.
+    #[default]
+    Active,
+    /// Only archived sessions; every row is still fully readable.
+    Archived,
+    /// Both, so an archived session can be found without changing filters.
+    All,
+}
+
+impl SessionFilter {
+    pub fn label(self, t: &crate::i18n::UiText) -> &'static str {
+        match self {
+            Self::Active => t.sessions_filter_active,
+            Self::Archived => t.sessions_filter_archived,
+            Self::All => t.sessions_filter_all,
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Active => Self::Archived,
+            Self::Archived => Self::All,
+            Self::All => Self::Active,
+        }
+    }
+
+    pub fn includes(self, archived: bool) -> bool {
+        match self {
+            Self::Active => !archived,
+            Self::Archived => archived,
+            Self::All => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub running: bool,
@@ -319,6 +356,13 @@ pub struct AppState {
     /// the count tells the client its live view is the newer one.
     pub settled_turns: u64,
     pub session_id: SessionId,
+    /// The runtime's session list no longer contained the current session.
+    ///
+    /// Set from `SessionList` (another client deleted it, or this client
+    /// deleted the current one and has not switched yet); cleared by the next
+    /// `SessionOpened`. While true, typed input is refused instead of being
+    /// sent to a session the runtime no longer has.
+    pub session_deleted: bool,
     pub transcript: TranscriptState,
     /// Which conversation surface owns the viewport and the composer. One
     /// field decides both, so they cannot disagree about who is focused.
@@ -450,7 +494,13 @@ pub struct AppState {
     pub vision: bool,
 
     /// Stored sessions and cursor for the Sessions screen (spec §52).
+    ///
+    /// `sessions` is the view after [`Self::sessions_filter`]; `all_sessions`
+    /// is the runtime's full inventory. Keeping both lets the filter change
+    /// without another round trip and without a second store.
     pub sessions: Vec<UiSessionSummary>,
+    pub all_sessions: Vec<UiSessionSummary>,
+    pub sessions_filter: SessionFilter,
     pub sessions_selected: usize,
     /// `/resume-claude` / `/resume-codex`: the source picker's projection.
     pub foreign_sessions: crate::foreign_session::ForeignSessionsView,
@@ -771,6 +821,7 @@ impl AppState {
             snapshot_version: None,
             settled_turns: 0,
             session_id: boot.session_id.clone(),
+            session_deleted: false,
             transcript: TranscriptState::new(),
             surface: crate::btw::SurfaceFocus::Main,
             btw: crate::btw::BtwThread::default(),
@@ -816,6 +867,8 @@ impl AppState {
             pending_attachments: Vec::new(),
             vision: false,
             sessions: Vec::new(),
+            all_sessions: Vec::new(),
+            sessions_filter: SessionFilter::default(),
             sessions_selected: 0,
             foreign_sessions: crate::foreign_session::ForeignSessionsView::default(),
             foreign_origin: None,

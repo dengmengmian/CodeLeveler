@@ -418,6 +418,7 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             | crate::overlay::Overlay::CollabPicker(_)
             | crate::overlay::Overlay::UnsupportedMedia(_)
             | crate::overlay::Overlay::CheckpointPicker(_)
+            | crate::overlay::Overlay::ConfirmCheckpointRestore(_)
             | crate::overlay::Overlay::ConfirmSessionDelete(_)
             | crate::overlay::Overlay::ConfirmSchedule(_)
             | crate::overlay::Overlay::ConfirmRecovery(_)

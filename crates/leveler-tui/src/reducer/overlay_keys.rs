@@ -72,7 +72,11 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                         // declines (a model only this environment can resolve).
                         message: format!("已切换模型: {model}"),
                     });
-                    vec![Effect::Send(ClientCommand::SetDefaultModel {
+                    // `/model` switches THIS session. Changing the global
+                    // default is a separate, explicit action
+                    // (`/model default <ref>`); the other clients already
+                    // treat a model choice as session-scoped.
+                    vec![Effect::Send(ClientCommand::SelectModel {
                         session_id: state.session_id.clone(),
                         model,
                     })]
@@ -163,10 +167,39 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
             }
             SelectionOutcome::Cancel => Vec::new(),
             SelectionOutcome::Confirm(key) => {
-                vec![Effect::Send(ClientCommand::RestoreCheckpoint {
-                    session_id: state.session_id.clone(),
-                    checkpoint_id: leveler_client_protocol::CheckpointId::new(key),
-                })]
+                // Restore rolls back the working tree too, including files
+                // created after the checkpoint. Opening the picker is not
+                // consent to that; the second overlay names the consequence
+                // and starts on Cancel.
+                let t = state.t();
+                let options = vec![
+                    SelectionOption::new(CHECKPOINT_RESTORE_CANCEL, t.approval_deny),
+                    SelectionOption::new(key, "回退对话与工作区"),
+                ];
+                let model = SelectionModel::new("确认回退检查点？", options, false)
+                    .with_description(
+                        "对话与工作区文件将一并回退；未提交的改动会丢失（非 git 仓库只回退对话）。此操作不能撤销。",
+                    )
+                    .without_quick_select();
+                state.overlay = Some(Overlay::ConfirmCheckpointRestore(Box::new(model)));
+                Vec::new()
+            }
+        },
+        Overlay::ConfirmCheckpointRestore(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ConfirmCheckpointRestore(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => {
+                if key == CHECKPOINT_RESTORE_CANCEL {
+                    Vec::new()
+                } else {
+                    vec![Effect::Send(ClientCommand::RestoreCheckpoint {
+                        session_id: state.session_id.clone(),
+                        checkpoint_id: leveler_client_protocol::CheckpointId::new(key),
+                    })]
+                }
             }
         },
         Overlay::ConfirmSessionDelete(mut sel) => match sel.on_key(effective) {
@@ -182,10 +215,35 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 if key == SESSION_DELETE_CANCEL {
                     Vec::new()
                 } else {
-                    vec![Effect::Send(ClientCommand::DeleteSessionFor {
+                    let target = leveler_client_protocol::SessionId::new(key);
+                    let mut effects = Vec::new();
+                    // Deleting the session being viewed would leave the
+                    // composer pointed at a row the runtime is about to
+                    // remove. Switch to another live session first (or open a
+                    // fresh one), then delete the old id.
+                    if target == state.session_id {
+                        let requester_session_id = state.session_id.clone();
+                        if let Some(other) = state
+                            .sessions
+                            .iter()
+                            .find(|session| session.id != target)
+                            .map(|session| session.id.clone())
+                        {
+                            effects.push(Effect::Send(ClientCommand::OpenSessionFor {
+                                requester_session_id,
+                                session_id: other,
+                            }));
+                        } else {
+                            effects.push(Effect::Send(ClientCommand::NewSessionFor {
+                                requester_session_id,
+                            }));
+                        }
+                    }
+                    effects.push(Effect::Send(ClientCommand::DeleteSessionFor {
                         requester_session_id: state.session_id.clone(),
-                        session_id: leveler_client_protocol::SessionId::new(key),
-                    })]
+                        session_id: target,
+                    }));
+                    effects
                 }
             }
         },
@@ -394,6 +452,10 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
 /// are UUIDs, so this can never collide with the row it protects.
 const SESSION_DELETE_CANCEL: &str = "__cancel__";
 
+/// The cancel row of the checkpoint-restore confirmation; checkpoint ids are
+/// generated ids, so this sentinel cannot collide with one.
+const CHECKPOINT_RESTORE_CANCEL: &str = "__checkpoint_restore_cancel__";
+
 /// The two rows of the recovery confirmation. Neither is a call id, so they
 /// cannot collide with the evidence shown above them.
 const RECOVERY_CANCEL: &str = "__recovery_cancel__";
@@ -455,7 +517,8 @@ pub(super) fn open_session_delete_confirm(state: &mut AppState, index: usize) {
         return;
     };
     let id = session.id.as_str().to_string();
-    let goal = crate::render::truncate_display(&session.goal, 40);
+    let goal =
+        crate::render::truncate_display(session.title.as_deref().unwrap_or(&session.goal), 40);
     let updated = session.updated_at.clone();
     let t = state.t();
     let title = t.session_delete_title;

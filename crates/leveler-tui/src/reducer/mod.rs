@@ -24,7 +24,7 @@ mod shell;
 mod shell_output;
 mod submit;
 
-use overlay_keys::{handle_overlay_key, open_model_picker};
+use overlay_keys::handle_overlay_key;
 use runtime_apply::apply_runtime;
 use screen_nav::{
     handle_screen_key, open_diff_screen, open_sessions_screen, open_team, toggle_screen,
@@ -2454,7 +2454,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.composer.delete_word_back();
             touch_slash_filter(state);
         }
-        KeyCode::Char('m') if ctrl && !btw => open_model_picker(state),
         // Ctrl+? (and Ctrl+/) open Help — low-frequency bindings live there.
         // A terminal without the Kitty keyboard protocol sends 0x1F for both,
         // which crossterm reports as Ctrl+7: without that arm the shortcut the

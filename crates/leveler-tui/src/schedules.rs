@@ -318,6 +318,9 @@ pub enum ScheduleField {
     Workspace,
     ActionKind,
     ActionText,
+    /// Explicit model for an Agent action. The runtime never guesses one, so
+    /// the form must collect it before the store can create the schedule.
+    Model,
     TriggerKind,
     TriggerText,
     Mode,
@@ -329,6 +332,7 @@ const CREATE_FIELDS: &[ScheduleField] = &[
     ScheduleField::Workspace,
     ScheduleField::ActionKind,
     ScheduleField::ActionText,
+    ScheduleField::Model,
     ScheduleField::TriggerKind,
     ScheduleField::TriggerText,
     ScheduleField::Mode,
@@ -343,6 +347,7 @@ const EDIT_FIELDS: &[ScheduleField] = &[
     ScheduleField::Workspace,
     ScheduleField::ActionKind,
     ScheduleField::ActionText,
+    ScheduleField::Model,
     ScheduleField::TriggerKind,
     ScheduleField::TriggerText,
     ScheduleField::Mode,
@@ -367,6 +372,8 @@ pub struct ScheduleForm {
     pub workspace: String,
     pub action_kind: ScheduleActionKind,
     pub action_text: String,
+    /// Agent model (`provider/model`); required only for an Agent action.
+    pub model: String,
     pub trigger_kind: ScheduleTriggerKind,
     pub trigger_text: String,
     pub mode: ScheduleMode,
@@ -388,6 +395,7 @@ impl ScheduleForm {
             workspace: String::new(),
             action_kind: ScheduleActionKind::Shell,
             action_text: String::new(),
+            model: String::new(),
             trigger_kind: ScheduleTriggerKind::Daily,
             trigger_text: String::new(),
             mode: ScheduleMode::Assisted,
@@ -426,6 +434,7 @@ impl ScheduleForm {
             workspace: view.workspace.clone(),
             action_kind,
             action_text,
+            model: view.model.clone().unwrap_or_default(),
             trigger_kind,
             trigger_text,
             mode: ScheduleMode::parse(&view.mode).unwrap_or(ScheduleMode::Assisted),
@@ -459,6 +468,7 @@ impl ScheduleForm {
             ScheduleField::Name => Some(&mut self.name),
             ScheduleField::Workspace => Some(&mut self.workspace),
             ScheduleField::ActionText => Some(&mut self.action_text),
+            ScheduleField::Model => Some(&mut self.model),
             ScheduleField::TriggerText => Some(&mut self.trigger_text),
             ScheduleField::ActionKind
             | ScheduleField::TriggerKind
@@ -472,6 +482,7 @@ impl ScheduleForm {
             ScheduleField::Name => Some(&self.name),
             ScheduleField::Workspace => Some(&self.workspace),
             ScheduleField::ActionText => Some(&self.action_text),
+            ScheduleField::Model => Some(&self.model),
             ScheduleField::TriggerText => Some(&self.trigger_text),
             ScheduleField::ActionKind
             | ScheduleField::TriggerKind
@@ -504,6 +515,7 @@ impl ScheduleForm {
             ScheduleField::Name
             | ScheduleField::Workspace
             | ScheduleField::ActionText
+            | ScheduleField::Model
             | ScheduleField::TriggerText => self.move_cursor(forward),
         }
     }
@@ -1405,8 +1417,27 @@ fn submit_form(state: &mut AppState) -> Vec<Effect> {
         ScheduleActionKind::Shell => ScheduleActionWire::Shell {
             command: action_text,
         },
-        ScheduleActionKind::Agent => ScheduleActionWire::Agent { goal: action_text },
+        ScheduleActionKind::Agent => {
+            let model = form.model.trim();
+            if model.is_empty() {
+                return set_form_error(state, t.schedules.error_required_model);
+            }
+            // Reuse the runtime's own model catalog when the snapshot provided
+            // one: creating a definition with a model this runtime cannot
+            // resolve would only fail later, at the scheduled run.
+            if !state.available_models.is_empty()
+                && !state
+                    .available_models
+                    .iter()
+                    .any(|available| available.to_string() == model)
+            {
+                return set_form_error(state, t.schedules.error_unknown_model);
+            }
+            ScheduleActionWire::Agent { goal: action_text }
+        }
     };
+    let model =
+        (form.action_kind == ScheduleActionKind::Agent).then(|| form.model.trim().to_string());
     // An untouched interval trigger carries an anchor the compact text cannot
     // express; reusing the original projection keeps the stored zero point.
     let trigger = match (&form.original_trigger, form.trigger_kind) {
@@ -1426,7 +1457,7 @@ fn submit_form(state: &mut AppState) -> Vec<Effect> {
                 session_policy: None,
                 overlap: None,
                 mode: Some(form.mode.as_str().to_string()),
-                model: None,
+                model: model.clone(),
                 timeout_secs: None,
                 misfire: None,
                 misfire_grace_secs: None,
@@ -1454,7 +1485,7 @@ fn submit_form(state: &mut AppState) -> Vec<Effect> {
                 session_policy: None,
                 overlap: None,
                 mode: Some(form.mode.as_str().to_string()),
-                model: None,
+                model,
                 timeout_secs: None,
                 misfire: None,
                 misfire_grace_secs: None,
@@ -2118,6 +2149,15 @@ fn render_form(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 muted,
                 value_style,
             ),
+            ScheduleField::Model => text_field_line(
+                focused,
+                t.schedules.field_model,
+                &form.model,
+                form.cursor,
+                focus_style,
+                muted,
+                value_style,
+            ),
             ScheduleField::TriggerKind => enum_field_line(
                 focused,
                 t.schedules.field_trigger,
@@ -2243,6 +2283,7 @@ fn field_hint(field: ScheduleField, form: &ScheduleForm, t: &SchedulesText) -> O
             ScheduleActionKind::Shell => t.hint_command.into(),
             ScheduleActionKind::Agent => t.hint_goal.into(),
         }),
+        ScheduleField::Model => Some(t.hint_model.into()),
         ScheduleField::TriggerText => Some(form.trigger_kind.hint(t).into()),
         ScheduleField::ActionKind | ScheduleField::TriggerKind | ScheduleField::Mode => {
             Some(t.hint_cycle.into())
@@ -2535,6 +2576,54 @@ mod tests {
             Some(state.t().schedules.error_required_workspace)
         );
         assert!(state.schedule.manage_query.is_none());
+    }
+
+    /// D20: an Agent schedule without a model could never be stored. The form
+    /// collects the model the store requires and refuses to submit without it.
+    #[test]
+    fn an_agent_schedule_requires_and_sends_its_model() {
+        let mut state = state();
+        state.available_models =
+            vec![leveler_client_protocol::ModelRef::parse("mock/maven").expect("model ref")];
+        let _ = open(&mut state);
+        let _ = begin_create(&mut state);
+        {
+            let form = state.schedule.form.as_mut().unwrap();
+            form.name = "nightly".into();
+            form.workspace = "/tmp/work".into();
+            form.action_kind = ScheduleActionKind::Agent;
+            form.action_text = "summarize the overnight failures".into();
+            form.trigger_text = "09:30".into();
+        }
+        assert!(
+            submit_form(&mut state).is_empty(),
+            "an Agent schedule without a model must not be sent"
+        );
+        assert_eq!(
+            state.schedule.form.as_ref().unwrap().error.as_deref(),
+            Some(state.t().schedules.error_required_model)
+        );
+
+        state.schedule.form.as_mut().unwrap().model = "mock/unknown".into();
+        assert!(submit_form(&mut state).is_empty());
+        assert_eq!(
+            state.schedule.form.as_ref().unwrap().error.as_deref(),
+            Some(state.t().schedules.error_unknown_model)
+        );
+
+        state.schedule.form.as_mut().unwrap().model = "mock/maven".into();
+        let sent = requests(&submit_form(&mut state));
+        match &sent[0] {
+            ScheduleRequest::Create { draft } => {
+                assert_eq!(
+                    draft.model.as_deref(),
+                    Some("mock/maven"),
+                    "the store requires the explicit model"
+                );
+                assert!(matches!(draft.action, ScheduleActionWire::Agent { .. }));
+            }
+            other => panic!("expected a create request, got {other:?}"),
+        }
     }
 
     #[test]

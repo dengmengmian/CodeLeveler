@@ -270,6 +270,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::Always,
     ),
     // Session
+    // Display title only: the original request and the current goal objective
+    // are separate facts and rename never touches either.
+    slash(
+        "/rename",
+        &[],
+        SlashCategory::Session,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // `/rewind` is what every other agent CLI calls this.
     slash(
         "/restore",
@@ -588,6 +597,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/context" => s.context,
         "/usage" => s.usage,
         "/sessions" => s.sessions,
+        "/rename" => s.rename,
         "/memory" => s.memory,
         "/remember" => s.remember,
         "/dream" => s.dream,
@@ -913,6 +923,7 @@ mod surface_tests {
                 "/context",
                 "/usage",
                 "/sessions",
+                "/rename",
                 "/restore",
                 "/fork",
                 "/compact",
