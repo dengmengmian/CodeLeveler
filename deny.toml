@@ -53,6 +53,23 @@ ignore = [
     #   $ cargo tree --target all -i libsqlite3-sys
     #   libsqlite3-sys v0.30.1 └── sqlx-sqlite v0.8.6 └── sqlx v0.8.6 └── leveler-schedule └── leveler-app └── leveler-cli
     "RUSTSEC-2026-0459",
+    # chrono-tz — `informational = "unmaintained"` (all versions), not a
+    # vulnerability. Expires 2027-01-01. Reached at runtime by the schedule
+    # timezone resolver and the CLI's local-time display. No safe upgrade
+    # exists: the advisory says so explicitly. Replacing it means replacing
+    # the timezone database, tracked as a separate dependency task rather than
+    # forced into this release.
+    #   $ cargo tree --target all -i chrono-tz
+    #   chrono-tz v0.10.4 └── leveler-schedule └── leveler-app └── leveler-cli
+    "RUSTSEC-2026-0555",
+    # chrono — `informational = "unmaintained"` (all versions), not a
+    # vulnerability. Expires 2027-01-01. Reached at runtime everywhere this
+    # product renders or compares wall-clock time. No safe upgrade exists; a
+    # replacement (jiff/time) touches every crate's time API and is tracked as
+    # its own migration rather than forced into this release.
+    #   $ cargo tree --target all -i chrono
+    #   chrono v0.4.x └── leveler-* (cli, schedule, core, storage, tui, …)
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
