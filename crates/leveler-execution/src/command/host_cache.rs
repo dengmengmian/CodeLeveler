@@ -35,6 +35,11 @@ pub(crate) struct SandboxPaths {
     go_mod_cache: PathBuf,
     npm_cache: PathBuf,
     cache_write_roots: Vec<PathBuf>,
+    /// Workspace placeholders that give protected paths a bind destination.
+    /// Dropping the set removes them; a background command carries it into its
+    /// [`SandboxScratch`] so the cleanup follows the command's lifetime.
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    fences: super::FenceSet,
     /// OS lease on `<scratch>.lock`, held for this scratch's lifetime. Its Drop
     /// removes the lock file; the flock releases when the file handle drops
     /// (including on crash, where the reaper reclaims the orphan). Kept last so
@@ -152,6 +157,18 @@ fn reap_orphaned_sandboxes(sandboxes_root: &Path) {
 }
 
 impl SandboxPaths {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_fences(&mut self, fences: super::FenceSet) {
+        self.fences = fences;
+    }
+
+    /// Remove the workspace placeholders before the caller publishes the
+    /// command's terminal event.
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    pub(crate) fn clear_fences(&mut self) {
+        self.fences.clear();
+    }
+
     pub(crate) fn scratch_path(&self) -> &Path {
         self.scratch.path()
     }
@@ -192,6 +209,8 @@ impl SandboxPaths {
         SandboxScratch {
             dir: self.scratch,
             _lease: Some(self._lease),
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            _fences: self.fences,
             #[cfg(windows)]
             _write_roots: None,
         }
@@ -206,6 +225,8 @@ impl SandboxPaths {
 pub(crate) struct SandboxScratch {
     dir: tempfile::TempDir,
     _lease: Option<SandboxLeaseGuard>,
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    _fences: super::FenceSet,
     #[cfg(windows)]
     _write_roots: Option<crate::windows_confine::WriteRootLease>,
 }
@@ -233,6 +254,8 @@ impl SandboxScratch {
         Self {
             dir,
             _lease: None,
+            #[cfg(any(target_os = "linux", all(test, unix)))]
+            _fences: super::FenceSet::default(),
             #[cfg(windows)]
             _write_roots: None,
         }
@@ -542,6 +565,8 @@ pub(crate) fn prepare_sandbox_paths(
         go_mod_cache,
         npm_cache,
         cache_write_roots,
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        fences: super::FenceSet::default(),
         _lease: lease,
         _tool_cache_lease: tool_cache_lease,
     })
