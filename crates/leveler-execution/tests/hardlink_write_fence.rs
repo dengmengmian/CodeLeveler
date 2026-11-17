@@ -116,6 +116,11 @@ async fn a_hardlink_alias_inside_the_workspace_writes_the_outside_inode() {
         );
     }
 
+    // Linux and Windows do not make the seatbelt assertion; the call above is
+    // still part of the fixture, but its result has no use there.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &created;
+
     // Step 2: an alias that already exists (created before confinement, by a
     // Full session, or by the user) names the same inode. Path checks cannot
     // tell the workspace name from the outside file, so a confined write

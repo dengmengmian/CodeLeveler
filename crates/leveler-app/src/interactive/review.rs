@@ -3904,7 +3904,7 @@ mod review_budget_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod untracked_sample_tests {
     use super::*;
 
