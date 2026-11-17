@@ -77,10 +77,18 @@ def main() -> int:
         pty = base.boot(REPORT, env, 120, 44)
         base.ask(pty, PROMPT)
         answered = wait(pty, lambda: ANSWER in pty.screen.text(), 300)
+        terminal = wait(
+            pty,
+            lambda: any(
+                word in flat(pty)
+                for word in ("回答结束", "任务已完成", "已取消", "失败", "未完成")
+            ),
+            120,
+        )
         REPORT.check(
             "transcript-search-real",
             "a real provider turn completed in the real TUI",
-            answered,
+            answered and terminal and "已取消" not in flat(pty),
             pty.screen.text()[:600],
         )
         REPORT.dump("real-01-turn", pty)

@@ -178,7 +178,23 @@ def main() -> int:
         pty.key("\x1b")  # back to the conversation; the turn keeps running
         time.sleep(0.3)
         answered = wait(pty, lambda: ANSWER in pty.screen.text(), 180)
-        check("a scripted real turn completed", answered, pty.screen.text()[:500])
+        # Wait for the turn terminal before any later Esc: Esc on a still-busy
+        # conversation is the cancel binding, and the harness must not turn its
+        # own key into "the search disturbed the turn".
+        terminal = wait(
+            pty,
+            lambda: any(
+                word in flat(pty)
+                for word in ("回答结束", "任务已完成", "已取消", "失败", "未完成")
+            ),
+            60,
+        )
+        not_cancelled = "已取消" not in flat(pty)
+        check(
+            "a scripted real turn completed normally",
+            answered and terminal and not_cancelled,
+            pty.screen.text()[:500],
+        )
         REPORT.dump("01-turn-complete", pty)
         if not answered:
             return 1
