@@ -42,8 +42,14 @@ pub enum Screen {
     /// Full active objective, opened from the bounded header summary.
     Goal,
     Help,
-    /// Local terminal capability diagnostics; never a runtime health claim.
+    /// Structured diagnostics: live client/runtime facts plus the shared
+    /// configuration checks. Terminal capabilities remain one of its
+    /// categories; the page is never a blanket runtime health claim.
     Doctor,
+    /// `/tasks`: one read-only aggregation over session, goal, child agent,
+    /// background task and schedule-run facts. Enter opens the existing detail
+    /// surface for the selected row; this page owns no lifecycle.
+    Tasks,
     /// Durable runtime observatory (`/trace`).
     Trace,
     /// The Context & Usage page. `/context` and `/usage` are two entry points
@@ -241,6 +247,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         &[],
         SlashCategory::View,
         SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    // One aggregation over every task source the runtime already owns. Safe
+    // while busy: the page reads state and sends only read-only queries.
+    slash(
+        "/tasks",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
     // Search the conversation the reader is already looking at. Always safe
@@ -639,6 +654,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/theme" => s.theme,
         "/new" => s.new,
         "/help" => s.help,
+        "/tasks" => s.tasks,
         "/doctor" => s.doctor,
         "/clean" => s.clean,
         "/schedules" => s.schedules,
@@ -945,6 +961,7 @@ mod surface_tests {
                 "/skills",
                 "/review",
                 "/diff",
+                "/tasks",
                 "/find",
                 "/jump",
                 "/trace",
@@ -1480,7 +1497,8 @@ mod reachability_tests {
             Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),
             Screen::Goal => Some("Enter or click on the header goal — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
-            Screen::Doctor => Some("`/doctor` — toggle_screen"),
+            Screen::Doctor => Some("`/doctor` — doctor::open"),
+            Screen::Tasks => Some("`/tasks` — tasks::open"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
@@ -1508,6 +1526,7 @@ mod reachability_tests {
             Screen::Goal,
             Screen::Help,
             Screen::Doctor,
+            Screen::Tasks,
             Screen::Trace,
             Screen::Context,
             Screen::Review,

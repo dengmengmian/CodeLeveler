@@ -757,12 +757,17 @@ mod transport {
         match request {
             WireRequest::Ping => send_response(&mut stream, WireResponse::Ack).await,
             WireRequest::Send(command) => {
-                if !transport_trusted && matches!(&command, ClientCommand::QueryGlobalTasks { .. })
+                if !transport_trusted
+                    && matches!(
+                        &command,
+                        ClientCommand::QueryGlobalTasks { .. }
+                            | ClientCommand::QueryDiagnostics { .. }
+                    )
                 {
                     return send_result(
                         &mut stream,
                         Err(ClientError::Runtime(
-                            "global tasks require trusted local access".into(),
+                            "global tasks and diagnostics require trusted local access".into(),
                         )),
                     )
                     .await;
@@ -802,12 +807,13 @@ mod transport {
                     && matches!(
                         &envelope.body.command,
                         ClientCommand::QueryGlobalTasks { .. }
+                            | ClientCommand::QueryDiagnostics { .. }
                     )
                 {
                     return send_result(
                         &mut stream,
                         Err(ClientError::Runtime(
-                            "global tasks require trusted local access".into(),
+                            "global tasks and diagnostics require trusted local access".into(),
                         )),
                     )
                     .await;
@@ -1031,7 +1037,8 @@ mod transport {
                         // EOF, an error, or unexpected data all mean "done".
                         _ = reader.read_u8() => return Ok(()),
                         event = events.recv() => match event {
-                            Ok(RuntimeEvent::GlobalTasksLoaded { .. }) if !transport_trusted || client_kind == ClientKind::Remote => continue,
+                            Ok(RuntimeEvent::GlobalTasksLoaded { .. } | RuntimeEvent::DiagnosticsLoaded { .. })
+                                if !transport_trusted || client_kind == ClientKind::Remote => continue,
                             Ok(event) => {
                                 if let Some(event) = event_for_tool_timing_peer(event, understands_tool_timing) {
                                     send_response(&mut writer, WireResponse::Event(event)).await?;
@@ -1613,9 +1620,14 @@ mod transport {
     impl InteractiveRuntimeClient for LocalSocketRuntimeClient {
         async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
             if self.client_kind == ClientKind::Remote
-                && matches!(&command, ClientCommand::QueryGlobalTasks { .. })
+                && matches!(
+                    &command,
+                    ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QueryDiagnostics { .. }
+                )
             {
-                return Err(ClientError::Runtime("global tasks are local-only".into()));
+                return Err(ClientError::Runtime(
+                    "global tasks and diagnostics are local-only".into(),
+                ));
             }
             if let ClientCommand::OpenSession { session_id }
             | ClientCommand::OpenSessionFor { session_id, .. } = &command
@@ -1640,9 +1652,14 @@ mod transport {
 
         async fn deliver(&self, envelope: CommandEnvelope) -> Result<(), ClientError> {
             if self.client_kind == ClientKind::Remote
-                && matches!(&envelope.command, ClientCommand::QueryGlobalTasks { .. })
+                && matches!(
+                    &envelope.command,
+                    ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QueryDiagnostics { .. }
+                )
             {
-                return Err(ClientError::Runtime("global tasks are local-only".into()));
+                return Err(ClientError::Runtime(
+                    "global tasks and diagnostics are local-only".into(),
+                ));
             }
             let protected = envelope
                 .command
@@ -3388,6 +3405,44 @@ mod tests {
             assert!(matches!(event, RuntimeEvent::TurnAnswered), "{event:?}");
             break;
         }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn tcp_diagnostics_access_is_refused_and_never_reaches_the_runtime() {
+        let (addr, runtime, shutdown) = tcp_server("diagnostics-token").await;
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, "diagnostics-token")
+            .await
+            .unwrap();
+        let session = SessionId::new("s1");
+        let command = ClientCommand::QueryDiagnostics {
+            requester_session_id: session.clone(),
+            query_id: leveler_client_protocol::CommandId::new("diag-tcp"),
+        };
+        assert!(
+            client
+                .send(command.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted local")
+        );
+        assert!(
+            client
+                .deliver(CommandEnvelope {
+                    command_id: leveler_client_protocol::CommandId::new("diag-tcp-deliver"),
+                    session_id: session,
+                    expected_version: None,
+                    issued_at: "now".into(),
+                    command,
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted local")
+        );
+        assert!(runtime.commands.lock().unwrap().is_empty());
+        assert!(runtime.deliveries.lock().unwrap().is_empty());
         shutdown.cancel();
     }
 

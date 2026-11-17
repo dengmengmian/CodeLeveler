@@ -343,7 +343,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             )
             .await
         }
-        Command::Doctor => cmd_doctor(layout),
+        Command::Doctor { json } => cmd_doctor(layout, json),
         Command::Native(command) => Ok(native_cmd::cmd_native(command).await),
         Command::Schedule(command) => {
             schedule_cmd::cmd_schedule(layout, schedule_config_dir, command)

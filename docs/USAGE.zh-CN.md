@@ -83,6 +83,12 @@ leveler schedule add --name nightly --command "cargo test" --daily 02:00 --timez
 
 TUI 中用 `/schedules` 打开定义列表、详情和编辑表单。Agent 通过 `schedule_inspect` 与 `schedule_manage` 工具执行同样的操作。
 
+## 任务工作台与诊断
+
+`/tasks` 打开一个只读任务工作台，聚合当前会话的目标、子 Agent、后台任务与审查，定时任务定义及最近一次运行，以及全局存储中的全部会话。`Tab` 在“进行中 / 最近 / 全部”之间切换；Enter 进入已有详情页（活动、目标或定时任务页）；`x` 通过运行时取消当前会话中允许取消的任务；`r` 重新读取两个快照来源。会话行会标注快照时间，子 Agent 与后台任务行实时更新。其他工作区的会话在这里只读，因为当前运行时不能打开别的工作区的存储。
+
+`/doctor` 打开结构化诊断：运行时连接、构建、会话有效性与崩溃恢复窗口；配置；Provider 凭据；模型推理配置；MCP 配置；权限档位；沙箱能力；终端能力。每条记录都有稳定 ID、类型化状态（`pass`、`warn`、`fail`、`unknown`、`not checked`、`not applicable`）、真实观测证据和可选的已有操作。`UNKNOWN` 与 `NOT CHECKED` 永远不会显示为通过。`R` 重新执行共享检查；任务运行时也可以打开，且不会调用模型。MCP 的实时连接状态目前没有权威来源，页面会如实标注。`leveler doctor --json` 以机器可读形式输出同一组 finding。
+
 ## 原生动作与桌面操作
 
 `leveler native capabilities` 报告 macOS 的 Mail 或 Windows 的 Outlook 是否已安装、正在运行、已登录，以及是否允许被自动化。`leveler native action` 不经过模型执行一个确定性动作：

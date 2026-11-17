@@ -25,7 +25,7 @@ pub mod matching;
 pub mod render;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1098,12 +1098,12 @@ fn queue_artifact(
     call: Option<usize>,
     call_id: Option<ToolCallId>,
     shell_id: Option<UserShellId>,
-    path: &PathBuf,
+    path: &Path,
     title: &str,
     turn: usize,
     kind: ArtifactKind,
 ) {
-    if !seen_paths.insert(path.clone()) {
+    if !seen_paths.insert(path.to_path_buf()) {
         // Content-addressed storage can hand two rows the same file. Scanning
         // it twice would duplicate every match; the first transcript row owns
         // the result.
@@ -1114,7 +1114,7 @@ fn queue_artifact(
         call,
         call_id,
         shell_id,
-        path: Arc::new(path.clone()),
+        path: Arc::new(path.to_path_buf()),
         title: Arc::from(format!("{title} · T{turn:02}")),
         kind,
     });

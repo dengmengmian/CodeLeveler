@@ -249,6 +249,14 @@ pub enum RuntimeEvent {
         query_id: String,
         index: crate::UiGlobalTaskIndex,
     },
+    /// The answer to [`crate::ClientCommand::QueryDiagnostics`]. Read-only:
+    /// the findings are observations from the runtime's own checks, never a
+    /// client-supplied health claim.
+    DiagnosticsLoaded {
+        requester_session_id: crate::SessionId,
+        query_id: crate::CommandId,
+        report: Box<crate::DiagnosticReport>,
+    },
     /// The answer to [`crate::ClientCommand::ManageSchedule`]. `response`
     /// carries domain failures too; a transport failure is the only case where
     /// no answer arrives.
@@ -1196,6 +1204,31 @@ mod tests {
                 no_progress_streak: 2,
             },
             "turn_progress",
+        );
+    }
+
+    #[test]
+    fn diagnostics_loaded_roundtrips_with_stable_finding_ids() {
+        let report = crate::DiagnosticReport {
+            generated_at: "2026-11-17T00:00:00Z".into(),
+            findings: vec![crate::DiagnosticFinding {
+                id: crate::finding_id::RUNTIME_CONNECTION.into(),
+                subject: None,
+                category: crate::DiagnosticCategory::Runtime,
+                severity: crate::DiagnosticSeverity::Info,
+                status: crate::DiagnosticStatus::Pass,
+                evidence: vec!["connected".into()],
+                action: None,
+                checked_at: "2026-11-17T00:00:00Z".into(),
+            }],
+        };
+        roundtrip(
+            RuntimeEvent::DiagnosticsLoaded {
+                requester_session_id: SessionId::new("s1"),
+                query_id: CommandId::new("q1"),
+                report: Box::new(report),
+            },
+            "diagnostics_loaded",
         );
     }
 

@@ -437,6 +437,13 @@ pub struct AppState {
     /// `/memory`: a view over the runtime's memory API. Presentation only; the
     /// store, capture queue and tombstones stay with the runtime.
     pub memory: crate::memory::MemoryState,
+    /// `/tasks`: a read-only aggregation over session, goal, child, background,
+    /// schedule and global-session facts the runtime already owns. No second
+    /// lifecycle lives here.
+    pub tasks: crate::tasks::TasksState,
+    /// `/doctor`: structured diagnostics. Local facts are recomputed from this
+    /// state; the runtime-owned checks arrive from `QueryDiagnostics`.
+    pub doctor: crate::doctor::DoctorState,
 
     /// Active plan from the current run, if any. Terminal plans move into the
     /// transcript and never remain in this slot.
@@ -854,6 +861,8 @@ impl AppState {
             clean: crate::clean::CleanState::default(),
             schedule: crate::schedules::ScheduleState::default(),
             memory: crate::memory::MemoryState::default(),
+            tasks: crate::tasks::TasksState::default(),
+            doctor: crate::doctor::DoctorState::default(),
             plan: None,
             find: crate::find::FindState::default(),
             find_highlight: None,

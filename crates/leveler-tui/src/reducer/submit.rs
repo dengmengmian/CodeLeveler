@@ -720,7 +720,11 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "new" => new_conversation(state),
         "help" => toggle_screen(state, Screen::Help),
-        "doctor" => toggle_screen(state, Screen::Doctor),
+        // The unified task workbench: a view over existing runtime facts.
+        "tasks" => crate::tasks::open(state),
+        // Structured diagnostics: local facts immediately, the shared check
+        // core from the runtime asynchronously.
+        "doctor" => crate::doctor::open(state),
         "update" => start_update(state),
         other => {
             state.notification = Some(Notification {

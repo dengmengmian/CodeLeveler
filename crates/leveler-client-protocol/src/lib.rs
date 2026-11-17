@@ -42,6 +42,8 @@ mod client;
 mod command;
 mod command_envelope;
 mod contribution;
+/// Structured diagnostics shared by the CLI doctor and UI clients.
+pub mod diagnostics;
 mod event;
 mod failure;
 mod foreign;
@@ -81,6 +83,10 @@ pub use client::{ClientError, InteractiveRuntimeClient, SteerConflict};
 pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
+pub use diagnostics::{
+    DiagnosticCategory, DiagnosticFinding, DiagnosticReport, DiagnosticSeverity, DiagnosticStatus,
+    action_id, finding_id,
+};
 pub use failure::{
     FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
 };

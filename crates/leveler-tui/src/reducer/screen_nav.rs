@@ -428,13 +428,10 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 state.help.handle_key(key, t, page);
             }
         }
-        Screen::Doctor => {
-            if key.code == KeyCode::Esc {
-                return back(state);
-            } else {
-                scroll_screen_key(state, &key, true);
-            }
-        }
+        // Both pages own every key while active: they keep their own
+        // selection, filter and detail state.
+        Screen::Doctor => return crate::doctor::handle_key(state, key),
+        Screen::Tasks => return crate::tasks::handle_key(state, key),
         Screen::Trace => {
             use crate::observability::TraceTab;
             match key.code {
@@ -600,6 +597,10 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         // The schedule page's back is one level, not always the whole page:
         // form → detail → list → conversation, the same rule Esc follows.
         Screen::Schedules => crate::schedules::back(state),
+        // Both pages drop their in-flight query on the way out, so a late
+        // answer is not attributed to a later visit.
+        Screen::Tasks => crate::tasks::close(state),
+        Screen::Doctor => crate::doctor::close(state),
         Screen::Memory => crate::memory::back(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),

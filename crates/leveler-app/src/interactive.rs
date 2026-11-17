@@ -7261,6 +7261,33 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         });
                 Ok(())
             }
+            ClientCommand::QueryDiagnostics {
+                requester_session_id,
+                query_id,
+            } => {
+                // Read-only and local: the same checks `leveler doctor` runs,
+                // plus the project's resolved agent registry. No provider
+                // request, no MCP call, no configuration write.
+                let config = self.app.effective_config();
+                let mut findings = crate::doctor::run(&config);
+                if let Some(root) = self.app.layout.primary_workspace() {
+                    findings.push(crate::doctor::agents_check(
+                        &leveler_agent::agent_registry::AgentRoots::for_project(root),
+                    ));
+                }
+                let report = leveler_client_protocol::DiagnosticReport {
+                    generated_at: leveler_core::now().to_rfc3339(),
+                    findings,
+                };
+                let _ =
+                    self.events_for(&requester_session_id)
+                        .send(RuntimeEvent::DiagnosticsLoaded {
+                            requester_session_id,
+                            query_id,
+                            report: Box::new(report),
+                        });
+                Ok(())
+            }
             ClientCommand::RequestPromptSuggestion { session_id } => {
                 spawn_auxiliary_assist(
                     self.app.clone(),

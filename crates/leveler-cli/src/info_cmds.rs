@@ -9,11 +9,58 @@ use leveler_project::Layout;
 use leveler_provider::probe_basic;
 
 use crate::common::parse_model_ref;
-use crate::output::{Line, print_check};
+use crate::output::{Line, print_finding};
+use leveler_client_protocol::{
+    DiagnosticCategory, DiagnosticFinding, DiagnosticReport, DiagnosticSeverity, DiagnosticStatus,
+    finding_id,
+};
 
-pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCode> {
+pub(crate) fn cmd_doctor(layout: Layout, json: bool) -> anyhow::Result<std::process::ExitCode> {
     // Load config leniently so doctor can report problems instead of aborting.
     let config = Application::load_config(&layout).unwrap_or_default();
+
+    let mut findings = leveler_app::doctor::run(&config);
+    if let Some(root) = layout.primary_workspace() {
+        findings.push(leveler_app::doctor::agents_check(
+            &leveler_agent::agent_registry::AgentRoots::for_project(root),
+        ));
+    }
+    // Terminal observations are real local facts; the CLI can collect them
+    // without a runtime. The live runtime checks exist only in the TUI's
+    // `/doctor`, and this finding says so instead of guessing.
+    let terminal = leveler_tui::terminal_diagnostics::TerminalDiagnostics::detect();
+    findings.push(DiagnosticFinding {
+        id: finding_id::TERMINAL_CAPABILITY.into(),
+        subject: None,
+        category: DiagnosticCategory::Terminal,
+        severity: DiagnosticSeverity::Info,
+        status: DiagnosticStatus::Pass,
+        evidence: terminal.describe().lines().map(str::to_string).collect(),
+        action: None,
+        checked_at: leveler_core::now().to_rfc3339(),
+    });
+    findings.push(DiagnosticFinding {
+        id: finding_id::RUNTIME_CONNECTION.into(),
+        subject: None,
+        category: DiagnosticCategory::Runtime,
+        severity: DiagnosticSeverity::Info,
+        status: DiagnosticStatus::NotChecked,
+        evidence: vec![
+            "no live runtime was consulted; open the TUI and run /doctor for runtime checks".into(),
+        ],
+        action: None,
+        checked_at: leveler_core::now().to_rfc3339(),
+    });
+
+    if json {
+        let report = DiagnosticReport {
+            generated_at: leveler_core::now().to_rfc3339(),
+            findings: findings.clone(),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(exit_for(&findings));
+    }
+
     println!("{}", Line::heading("leveler doctor"));
     println!(
         "  repo:    {}",
@@ -28,21 +75,17 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
     );
     println!();
 
-    let mut results = leveler_app::doctor::run(&config);
-    if let Some(root) = layout.primary_workspace() {
-        results.push(leveler_app::doctor::agents_check(
-            &leveler_agent::agent_registry::AgentRoots::for_project(root),
-        ));
-    }
-    for r in &results {
-        print_check(r);
+    for finding in &findings {
+        // The text view prints the full terminal observations once, in their
+        // own section; only the JSON report needs the terminal finding.
+        if finding.id == finding_id::TERMINAL_CAPABILITY {
+            continue;
+        }
+        print_finding(finding);
     }
     println!();
     println!("{}", Line::heading("Terminal observations"));
-    println!(
-        "{}",
-        leveler_tui::terminal_diagnostics::TerminalDiagnostics::detect().describe()
-    );
+    println!("{}", terminal.describe());
 
     // Crashes are otherwise invisible: the TUI tears the screen down and the
     // message scrolls away. Point at the records rather than reprinting them.
@@ -59,12 +102,19 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
         println!("  Local only — nothing was sent anywhere.");
     }
     println!();
-    if leveler_app::doctor::has_failure(&results) {
+    if leveler_app::doctor::has_failure(&findings) {
         println!("{}", Line::warn("Some checks failed. See details above."));
-        Ok(std::process::ExitCode::FAILURE)
     } else {
-        println!("{}", Line::ok("Environment looks healthy."));
-        Ok(std::process::ExitCode::SUCCESS)
+        println!("{}", Line::ok("No failed checks."));
+    }
+    Ok(exit_for(&findings))
+}
+
+fn exit_for(findings: &[DiagnosticFinding]) -> std::process::ExitCode {
+    if leveler_app::doctor::has_failure(findings) {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
     }
 }
 

@@ -1069,6 +1069,15 @@ impl TranscriptState {
         })
     }
 
+    /// Every review card in the conversation, in transcript order. Read-only:
+    /// the durable review row remains the authority for status and report.
+    pub fn reviews(&self) -> impl Iterator<Item = &ReviewBlock> {
+        self.items.iter().filter_map(|item| match item {
+            TranscriptItem::Review(block) => Some(block),
+            _ => None,
+        })
+    }
+
     /// Return a recap when a successful terminal `update_goal` supplied a
     /// summary or concrete next step. Freeform assistant prose is never used.
     pub fn latest_turn_handoff(&self) -> Option<RecapBlock> {
