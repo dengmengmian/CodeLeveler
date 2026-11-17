@@ -155,6 +155,9 @@ pub mod action_id {
     pub const FIX_CONFIG: &str = "action.fix-config";
     pub const INSTALL_TOOL: &str = "action.install-tool";
     pub const REVIEW_MCP_CONFIG: &str = "action.review-mcp-config";
+    /// Open the MCP management surface, where a person can reconnect or
+    /// inspect the server. The doctor itself never connects anything.
+    pub const OPEN_MCP: &str = "action.open-mcp";
     pub const REVIEW_PERMISSION: &str = "action.review-permission";
     pub const ACKNOWLEDGE_RECOVERY: &str = "action.acknowledge-recovery";
     pub const RESTART_TO_MATCH: &str = "action.restart-to-match";

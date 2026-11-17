@@ -50,6 +50,13 @@ pub enum Screen {
     /// background task and schedule-run facts. Enter opens the existing detail
     /// surface for the selected row; this page owns no lifecycle.
     Tasks,
+    /// `/mcp`: the runtime's MCP servers, their live connection state and
+    /// discovered tool catalog, plus the management actions the runtime owns.
+    Mcp,
+    /// `/settings`: one projection of the runtime's effective settings and
+    /// their sources. Edits are the existing typed commands, never a second
+    /// configuration writer.
+    Settings,
     /// Durable runtime observatory (`/trace`).
     Trace,
     /// The Context & Usage page. `/context` and `/usage` are two entry points
@@ -441,6 +448,25 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // MCP status and management. The page reads while busy; mutations are
+    // refused by the page and by the runtime while a turn owns the tool
+    // surface.
+    slash(
+        "/mcp",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    // The unified settings projection. Opening and reading are safe while a
+    // turn runs; edits reuse the existing commands and their own busy rules.
+    slash(
+        "/settings",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Reclaim CodeLeveler's own local storage. Safe while a turn runs: the scan
     // and cleanup happen off-thread, and only provably-safe items are removed.
     slash(
@@ -613,7 +639,34 @@ pub fn slash_def(token: &str) -> Option<&'static SlashDef> {
         .find(|d| d.name == t.as_str() || d.aliases.contains(&t.as_str()))
 }
 
-fn slash_description(name: &str, t: &UiText) -> &'static str {
+/// The usage line shown by Help. The command name is the registry's canonical
+/// name; only the argument vocabulary differs. A command with no arguments
+/// returns its own name, so help never invents a parameter a handler ignores.
+pub fn slash_usage(name: &'static str) -> &'static str {
+    match name {
+        "/model" => "/model [<provider/model> | default <provider/model>]",
+        "/permission" => "/permission [ask|auto|full]",
+        "/thinking" => "/thinking [auto|off|minimal|low|medium|high|max|reset]",
+        "/goal" => "/goal <objective>",
+        "/btw" => "/btw <question>",
+        "/collab" => "/collab [chat|plan|goal]",
+        "/review" => "/review [code|business|security|architecture|test|delivery|session] [focus]",
+        "/find" => "/find <query>",
+        "/jump" => "/jump [turn]",
+        "/rename" => "/rename <title>",
+        "/resume-claude" => "/resume-claude [session-id]",
+        "/resume-codex" => "/resume-codex [session-id]",
+        "/attach" => "/attach <path>",
+        "/theme" => "/theme [auto|dark|light|high-contrast]",
+        "/copy" => "/copy [answer|command|output|diff] [n]",
+        "/output" => "/output [tool <id>]",
+        "/export" => "/export [path]",
+        "/remember" => "/remember <text>",
+        _ => name,
+    }
+}
+
+pub(crate) fn slash_description(name: &str, t: &UiText) -> &'static str {
     slash_copy(name, t, false)
 }
 
@@ -667,6 +720,8 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/exit" | "/quit" => s.exit,
         "/tasks" => s.tasks,
         "/doctor" => s.doctor,
+        "/mcp" => s.mcp,
+        "/settings" => s.settings,
         "/clean" => s.clean,
         "/schedules" => s.schedules,
         "/update" | "/upgrade" => s.update,
@@ -996,6 +1051,8 @@ mod surface_tests {
                 "/help",
                 "/exit",
                 "/doctor",
+                "/mcp",
+                "/settings",
                 "/clean",
                 "/schedules",
                 "/memory",
@@ -1511,6 +1568,8 @@ mod reachability_tests {
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
             Screen::Doctor => Some("`/doctor` — doctor::open"),
             Screen::Tasks => Some("`/tasks` — tasks::open"),
+            Screen::Mcp => Some("`/mcp` — mcp::open"),
+            Screen::Settings => Some("`/settings` — settings::open"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
@@ -1539,6 +1598,8 @@ mod reachability_tests {
             Screen::Help,
             Screen::Doctor,
             Screen::Tasks,
+            Screen::Mcp,
+            Screen::Settings,
             Screen::Trace,
             Screen::Context,
             Screen::Review,

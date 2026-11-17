@@ -516,6 +516,8 @@ fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
         (Screen::Help, "Help"),
         (Screen::Doctor, "Doctor"),
         (Screen::Tasks, "Tasks"),
+        (Screen::Mcp, "MCP"),
+        (Screen::Settings, "Settings"),
         (Screen::Context, "Context"),
         (Screen::Clean, "Clean"),
         (Screen::Tools, "Tools"),
@@ -537,6 +539,8 @@ fn pages_with_clickable_rows() -> Vec<(Screen, &'static str)> {
         (Screen::Tools, "Tools"),
         (Screen::Help, "Help"),
         (Screen::Tasks, "Tasks"),
+        (Screen::Mcp, "MCP"),
+        (Screen::Settings, "Settings"),
     ]
 }
 
@@ -594,6 +598,58 @@ fn seed(state: &mut AppState, screen: Screen) {
                     BackgroundTaskChrome::running(format!("worker --job {i}"), i as u64),
                 );
             }
+        }
+        Screen::Mcp => {
+            // Real row shape, populated by the page's own projection: the
+            // seed only supplies the runtime answer a live page would hold.
+            state.mcp.servers = (0..6)
+                .map(|i| leveler_client_protocol::mcp::McpServerView {
+                    name: format!("server-{i}"),
+                    transport: leveler_client_protocol::mcp::McpTransport::Stdio,
+                    endpoint: "npx".into(),
+                    source: "/tmp/config.toml".into(),
+                    spec: leveler_client_protocol::mcp::McpServerSpec {
+                        name: format!("server-{i}"),
+                        transport: leveler_client_protocol::mcp::McpTransport::Stdio,
+                        command: Some("npx".into()),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        url: None,
+                        headers: Vec::new(),
+                        bearer_token_env: None,
+                        enabled: true,
+                    },
+                    enabled: true,
+                    state: leveler_client_protocol::mcp::McpConnectionState::NotConnected,
+                    protocol: None,
+                    initialized: false,
+                    tool_count: None,
+                    tools: Vec::new(),
+                    tools_truncated: false,
+                    last_error: None,
+                    last_attempt_at: None,
+                    connected_at: None,
+                    updated_at: None,
+                    generation: 0,
+                    retry_in_seconds: None,
+                })
+                .collect();
+            state.mcp.selected = Some("server-0".into());
+        }
+        Screen::Settings => {
+            state.settings.snapshot = Some(leveler_client_protocol::settings::UiSettingsSnapshot {
+                generated_at: "2026-11-17T00:00:00Z".into(),
+                config_version: 1,
+                config_path: Some("/tmp/config.toml".into()),
+                project_config_dir: Some("/tmp/configs".into()),
+                default_model: None,
+                resolved_default_model: None,
+                thinking_default: None,
+                theme_default: None,
+                context_soft_percent: Some(80),
+                providers: Vec::new(),
+                sources: Vec::new(),
+            });
         }
         Screen::Sessions => {
             for i in 0..14 {

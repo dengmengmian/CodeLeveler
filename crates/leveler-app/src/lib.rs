@@ -26,6 +26,7 @@ mod goal_recap;
 mod interactive;
 mod live_view;
 pub mod mcp_config;
+mod mcp_service;
 pub mod memory;
 pub mod observability;
 mod parallel;
@@ -37,6 +38,7 @@ mod schedule_tools;
 mod session;
 pub mod session_history;
 pub mod session_projection;
+mod settings_service;
 mod side_question;
 pub mod skills;
 pub mod usage;
@@ -180,6 +182,13 @@ pub struct LoadedConfig {
     pub models: Vec<ModelConfigFile>,
     /// Default model from the global config (`~/.leveler/config.toml`), if set.
     pub default_model: Option<String>,
+    /// Global Thinking Level from the global config, before a model override.
+    pub thinking_default: Option<leveler_model::ThinkingLevel>,
+    /// Global TUI theme id from `[ui].theme`, if set.
+    pub theme_default: Option<String>,
+    /// Provider ids the global config supplied. The rest came from the
+    /// project's config bundle; the settings projection names the source.
+    pub global_provider_ids: Vec<String>,
     /// TUI language from global config (`zh` / `en`), if set.
     pub lang: Option<String>,
     /// Whether CodeLeveler-authored commits include a model-aware co-author trailer.
@@ -350,7 +359,13 @@ pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
             model.profile.thinking = Some(global_config.thinking_level_for(&model.profile.id));
         }
     }
+    let thinking_default = global_config.thinking;
     let global = global_config.into_bundle();
+    let global_provider_ids: Vec<String> = global
+        .providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect();
     merge_providers(&mut providers, global.providers);
     for model in global.models {
         let exists = models.iter().any(|m| {
@@ -364,6 +379,9 @@ pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
         providers,
         models,
         default_model: global.default_model,
+        thinking_default,
+        theme_default: global.theme,
+        global_provider_ids,
         lang: global.lang,
         vcs_co_author: global.vcs_co_author,
         mcp_servers: global.mcp_servers,
@@ -387,6 +405,9 @@ impl Default for LoadedConfig {
             providers: Vec::new(),
             models: Vec::new(),
             default_model: None,
+            thinking_default: None,
+            theme_default: None,
+            global_provider_ids: Vec::new(),
             lang: None,
             vcs_co_author: true,
             mcp_servers: Vec::new(),
@@ -516,12 +537,27 @@ impl McpToolSource {
             || !due.is_empty();
         if rebuild {
             let previous = guard.take();
-            let (kept, previous_servers, mut retry) = match previous {
-                Some(cache) => (cache.tools, cache.servers, cache.retry),
-                None => (Vec::new(), Default::default(), Default::default()),
+            let (kept, previous_servers, mut retry, mut states) = match previous {
+                Some(cache) => (cache.tools, cache.servers, cache.retry, cache.states),
+                None => (
+                    Vec::new(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ),
             };
-            // A server that is no longer configured keeps no schedule.
+            // A server that is no longer configured keeps no schedule and no
+            // connection fact.
             retry.retain(|server, _| desired.contains_key(server));
+            states.retain(|server, _| desired.contains_key(server));
+            // A server whose child closed is not connected any more, even
+            // before its reconnect finishes. Do not let the previous
+            // "Connected" fact survive the observation.
+            for server in &catalog_refresh {
+                if let Some(state) = states.get_mut(server) {
+                    *state = state.degraded();
+                }
+            }
             // Keep every tool whose server is unchanged: its connection, its
             // child process and its handshake stay exactly as they were.
             let mut tools: Vec<Arc<dyn leveler_tools::tool::Tool>> = kept
@@ -543,6 +579,18 @@ impl McpToolSource {
                 {
                     continue;
                 }
+                // One attempt owns one generation. A later attempt supersedes
+                // this one, and an answer from the older attempt is dropped
+                // rather than allowed to overwrite the newer fact.
+                let generation = states
+                    .get(&server.name)
+                    .map(|state| state.generation)
+                    .unwrap_or(0)
+                    + 1;
+                states.insert(
+                    server.name.clone(),
+                    crate::mcp_service::McpServerRuntime::connecting(generation),
+                );
                 for connection in leveler_tools::mcp::connect_all_detailed(
                     std::slice::from_ref(server),
                     &self.environment,
@@ -550,12 +598,28 @@ impl McpToolSource {
                 )
                 .await
                 {
+                    let descriptors = connection
+                        .tools
+                        .iter()
+                        .map(|tool| crate::mcp_service::descriptor_for(&connection.server, tool))
+                        .collect::<Vec<_>>();
+                    let tool_total = connection.tools.len();
+                    let protocol = connection.protocol.clone();
                     tools.extend(connection.tools);
                     match connection.error {
                         // Connected (even with a legitimately empty catalog):
                         // this server owes no retry.
                         None => {
                             retry.remove(&connection.server);
+                            states.insert(
+                                connection.server.clone(),
+                                crate::mcp_service::McpServerRuntime::connected(
+                                    generation,
+                                    protocol,
+                                    descriptors,
+                                    tool_total,
+                                ),
+                            );
                         }
                         Some(reason) => {
                             let failures = retry
@@ -569,6 +633,13 @@ impl McpToolSource {
                                 retry_in_seconds = mcp_retry_delay(failures).as_secs(),
                                 error = %reason,
                                 "MCP server not connected; will retry on a later turn"
+                            );
+                            states.insert(
+                                connection.server.clone(),
+                                crate::mcp_service::McpServerRuntime::failed(
+                                    generation,
+                                    reason.clone(),
+                                ),
                             );
                             retry.insert(
                                 connection.server,
@@ -586,6 +657,7 @@ impl McpToolSource {
                 unrestricted,
                 servers: desired,
                 retry,
+                states,
                 tools,
             });
         }
@@ -614,6 +686,146 @@ impl McpToolSource {
             reasons.join("; ")
         ))
     }
+
+    /// The runtime's fact for every configured server. Never connects: a
+    /// server with no attempt is `NotConnected`, not a fabricated success.
+    pub(crate) async fn states(
+        &self,
+        configured: &[leveler_tools::mcp::McpServerConfig],
+    ) -> std::collections::BTreeMap<String, crate::mcp_service::McpServerRuntime> {
+        let guard = self.cache.lock().await;
+        configured
+            .iter()
+            .map(|config| {
+                let state = guard
+                    .as_ref()
+                    .and_then(|cache| cache.states.get(&config.name))
+                    .cloned()
+                    .unwrap_or_else(crate::mcp_service::McpServerRuntime::not_connected);
+                (config.name.clone(), state)
+            })
+            .collect()
+    }
+
+    /// Connect one server again under this call's authority.
+    ///
+    /// The previous generation's tools are dropped before the attempt, so a
+    /// failure can never leave a dead catalog advertised as live. The returned
+    /// fact is the same one `/mcp` and `/doctor` read.
+    pub(crate) async fn reconnect(
+        &self,
+        config: &leveler_tools::mcp::McpServerConfig,
+        mode: PermissionProfile,
+    ) -> Result<crate::mcp_service::McpServerRuntime, String> {
+        if !self.has_workspace {
+            return Err(
+                "this runtime has no workspace; MCP servers cannot be launched here".into(),
+            );
+        }
+        let unrestricted = mode == PermissionProfile::FullAccess;
+        let mut guard = self.cache.lock().await;
+        let cache = guard.get_or_insert_with(|| McpToolCache::empty(unrestricted));
+        let generation = cache
+            .states
+            .get(&config.name)
+            .map(|state| state.generation)
+            .unwrap_or(0)
+            + 1;
+        cache.states.insert(
+            config.name.clone(),
+            crate::mcp_service::McpServerRuntime::connecting(generation),
+        );
+        let prefix = format!("mcp__{}__", config.name);
+        cache.tools.retain(|tool| !tool.name().starts_with(&prefix));
+        let Some(connection) = leveler_tools::mcp::connect_all_detailed(
+            std::slice::from_ref(config),
+            &self.environment,
+            unrestricted,
+        )
+        .await
+        .into_iter()
+        .next() else {
+            return Err("the MCP connection attempt produced no result".into());
+        };
+        // A newer attempt owns the fact. This cannot interleave while the
+        // cache is held, but the guard keeps the invariant explicit for a
+        // future caller that releases the lock before connecting.
+        if cache
+            .states
+            .get(&config.name)
+            .is_some_and(|state| state.generation != generation)
+        {
+            return Err("a newer MCP connection attempt owns this server".into());
+        }
+        let state = match connection.error {
+            None => {
+                cache
+                    .servers
+                    .insert(config.name.clone(), mcp_server_digest(config));
+                cache.retry.remove(&config.name);
+                let descriptors = connection
+                    .tools
+                    .iter()
+                    .map(|tool| crate::mcp_service::descriptor_for(&connection.server, tool))
+                    .collect::<Vec<_>>();
+                let total = connection.tools.len();
+                cache.tools.extend(connection.tools);
+                crate::mcp_service::McpServerRuntime::connected(
+                    generation,
+                    connection.protocol.clone(),
+                    descriptors,
+                    total,
+                )
+            }
+            Some(reason) => {
+                let failures = cache
+                    .retry
+                    .get(&config.name)
+                    .map(|retry| retry.failures)
+                    .unwrap_or(0)
+                    + 1;
+                cache.retry.insert(
+                    config.name.clone(),
+                    McpRetry {
+                        failures,
+                        next_attempt: std::time::Instant::now() + mcp_retry_delay(failures),
+                        reason: reason.clone(),
+                    },
+                );
+                crate::mcp_service::McpServerRuntime::failed(generation, reason)
+            }
+        };
+        cache.states.insert(config.name.clone(), state.clone());
+        Ok(state)
+    }
+
+    /// Drop every connection fact and tool whose server is no longer in the
+    /// enabled configuration. Never connects anything: a reload that added a
+    /// server leaves it `NotConnected` until a turn or an explicit reconnect.
+    pub(crate) async fn sync(&self, configured: &[leveler_tools::mcp::McpServerConfig]) {
+        let mut guard = self.cache.lock().await;
+        let Some(cache) = guard.as_mut() else {
+            return;
+        };
+        if configured.is_empty() {
+            *guard = None;
+            return;
+        }
+        let names: std::collections::BTreeSet<&str> = configured
+            .iter()
+            .map(|config| config.name.as_str())
+            .collect();
+        cache
+            .servers
+            .retain(|name, _| names.contains(name.as_str()));
+        cache.retry.retain(|name, _| names.contains(name.as_str()));
+        cache.states.retain(|name, _| names.contains(name.as_str()));
+        cache.tools.retain(|tool| {
+            names
+                .iter()
+                .any(|name| tool.name().starts_with(&format!("mcp__{name}__")))
+        });
+    }
 }
 
 /// Bridges the host's MCP cache into a running turn, so an external catalog
@@ -641,7 +853,23 @@ struct McpToolCache {
     /// not a connection: the server stays configured and is retried with
     /// backoff, because an MCP server commonly starts after CodeLeveler does.
     retry: std::collections::BTreeMap<String, McpRetry>,
+    /// The runtime's current fact for every server it has attempted. The
+    /// single source `/mcp` and `/doctor` read; a configured server with no
+    /// entry has never been attempted and is `NotConnected`.
+    states: std::collections::BTreeMap<String, crate::mcp_service::McpServerRuntime>,
     tools: Vec<Arc<dyn leveler_tools::tool::Tool>>,
+}
+
+impl McpToolCache {
+    fn empty(unrestricted: bool) -> Self {
+        Self {
+            unrestricted,
+            servers: Default::default(),
+            retry: Default::default(),
+            states: Default::default(),
+            tools: Vec::new(),
+        }
+    }
 }
 
 /// One server's retry schedule after a failed connection attempt, and the
@@ -978,6 +1206,19 @@ impl Application {
     /// The config manager itself (watcher lifecycle, `/reload`, subscribers).
     pub fn config_manager(&self) -> &Arc<ConfigManager> {
         &self.config
+    }
+
+    /// The process-lived MCP connection authority, shared with every turn and
+    /// with the `/mcp` / `/doctor` projections.
+    pub(crate) fn mcp_source(&self) -> &Arc<McpToolSource> {
+        &self.mcp_tools
+    }
+
+    /// The runtime's effective settings projection.
+    pub(crate) fn settings_snapshot(
+        &self,
+    ) -> leveler_client_protocol::settings::UiSettingsSnapshot {
+        crate::settings_service::snapshot(self)
     }
 
     /// Re-read the configured sources and publish the result. The caller owns

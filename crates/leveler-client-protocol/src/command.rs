@@ -77,6 +77,25 @@ pub enum ClientCommand {
         query_id: CommandId,
         request: Box<crate::schedule::ScheduleRequest>,
     },
+    /// Read or manage MCP servers through the runtime's single authority.
+    ///
+    /// Answers with [`crate::RuntimeEvent::McpManaged`] carrying the same
+    /// `query_id`. Reserved for trusted local clients: the answer names
+    /// configuration paths, commands and tool schemas.
+    ManageMcp {
+        requester_session_id: SessionId,
+        query_id: CommandId,
+        request: Box<crate::mcp::McpRequest>,
+    },
+    /// Read the runtime's effective settings projection.
+    ///
+    /// Answers with [`crate::RuntimeEvent::SettingsLoaded`]. Read-only and
+    /// local: the projection names configuration paths and provider
+    /// identities, never secret values. Reserved for trusted local clients.
+    QuerySettings {
+        requester_session_id: SessionId,
+        query_id: CommandId,
+    },
     /// Ask the runtime for one best-effort prediction of the user's next
     /// prompt. The request is advisory UI chrome: it starts no task, persists
     /// no message, and may produce no event when there is insufficient context.
@@ -810,6 +829,14 @@ impl ClientCommand {
                 requester_session_id,
                 ..
             }
+            | ClientCommand::ManageMcp {
+                requester_session_id,
+                ..
+            }
+            | ClientCommand::QuerySettings {
+                requester_session_id,
+                ..
+            }
             | ClientCommand::RequestSessionListFor {
                 requester_session_id,
             }
@@ -1087,6 +1114,31 @@ mod tests {
                 query_id: CommandId::new("q1"),
             },
             "query_diagnostics",
+        );
+    }
+
+    #[test]
+    fn mcp_management_roundtrips_with_its_request() {
+        roundtrip(
+            ClientCommand::ManageMcp {
+                requester_session_id: SessionId::new("s1"),
+                query_id: CommandId::new("q1"),
+                request: Box::new(crate::mcp::McpRequest::Reconnect {
+                    server: "fs".into(),
+                }),
+            },
+            "manage_mcp",
+        );
+    }
+
+    #[test]
+    fn settings_query_roundtrips_with_its_requester_and_correlation() {
+        roundtrip(
+            ClientCommand::QuerySettings {
+                requester_session_id: SessionId::new("s1"),
+                query_id: CommandId::new("q1"),
+            },
+            "query_settings",
         );
     }
 

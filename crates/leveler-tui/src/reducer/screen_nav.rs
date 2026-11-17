@@ -420,17 +420,20 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Help => {
-            if key.code == KeyCode::Esc {
+            // Esc is one level: the detail page returns to the list, and the
+            // list returns to the conversation.
+            if key.code == KeyCode::Esc && state.help.detail.is_none() {
                 return back(state);
-            } else {
-                let page = page_size(state);
-                let t = state.t();
-                state.help.handle_key(key, t, page);
             }
+            let page = page_size(state);
+            let t = state.t();
+            state.help.handle_key(key, t, page);
         }
         // Both pages own every key while active: they keep their own
         // selection, filter and detail state.
         Screen::Doctor => return crate::doctor::handle_key(state, key),
+        Screen::Mcp => return crate::mcp::handle_key(state, key),
+        Screen::Settings => return crate::settings::handle_key(state, key),
         Screen::Tasks => return crate::tasks::handle_key(state, key),
         Screen::Trace => {
             use crate::observability::TraceTab;
@@ -601,6 +604,16 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         // answer is not attributed to a later visit.
         Screen::Tasks => crate::tasks::close(state),
         Screen::Doctor => crate::doctor::close(state),
+        Screen::Mcp => crate::mcp::close(state),
+        Screen::Settings => crate::settings::close(state),
+        Screen::Help => {
+            if state.help.detail.is_some() {
+                state.help.detail = None;
+                state.help.detail_scroll = 0;
+            } else {
+                close_screen(state);
+            }
+        }
         Screen::Memory => crate::memory::back(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
@@ -823,7 +836,7 @@ pub(super) fn open_trace(
 ///
 /// Both queries are read-only and are issued here rather than by a turn: no
 /// model request, no queue, and both answer while the agent is running.
-pub(super) fn open_stats(
+pub(crate) fn open_stats(
     state: &mut AppState,
     section: crate::screen::StatsSection,
 ) -> Vec<Effect> {

@@ -12,68 +12,228 @@ use super::text::{sanitize_terminal_line, truncate_display, wrap};
 use super::{render_list_focused, render_scrolled};
 
 pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let zh = state.locale == crate::i18n::Locale::Zh;
+    if state.help.detail.is_some() {
+        render_help_detail(frame, area, state);
+        return;
+    }
+    let t = &state.t().help_page;
     let page = crate::secondary::SecondaryPage {
-        title: state.t().help_title,
+        title: t.title,
         status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint: if zh {
-            "输入搜索 · ↑↓ 选择 · PageUp/Down 翻页 · Esc 返回"
-        } else {
-            "Type to search · ↑↓ select · PageUp/Down · Esc back"
-        },
+        hint: t.footer_list,
     };
     let layout = crate::secondary::layout(area, 1);
     crate::secondary::draw_header(frame, state, &layout, &page);
     crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let theme = &state.theme;
+    let category = state
+        .help
+        .category
+        .map(|category| t.category_label(category).to_string())
+        .unwrap_or_else(|| t.all_categories.to_string());
+    let search = format!(
+        "{}{}    [{}: {}]",
+        t.search_label, state.help.query, t.category, category
+    );
     frame.render_widget(
-        ratatui::widgets::Paragraph::new(sanitize_terminal_line(&format!(
-            "{}{}",
-            if zh { "搜索: " } else { "Search: " },
-            state.help.query
-        ))),
+        ratatui::widgets::Paragraph::new(sanitize_terminal_line(&search))
+            .style(Style::default().fg(state.theme.text.muted)),
         layout.composer,
     );
-    let matches = state.help.matches(state.t());
+    // The cursor sits after the query text, before the category chip.
+    let cursor_text = format!("{}{}", t.search_label, state.help.query);
+    let cursor_text = sanitize_terminal_line(&cursor_text);
+    let x = UnicodeWidthStr::width(cursor_text.as_str())
+        .min(layout.composer.width.saturating_sub(1) as usize);
+    frame.set_cursor_position((layout.composer.x + x as u16, layout.composer.y));
+    let entries = state.help.matches(state.t());
     let mut lines = Vec::new();
     let mut rows: Vec<(usize, String)> = Vec::new();
     let mut focus = 0;
-    for (index, entry) in matches.iter().enumerate() {
+    let mut last_category: Option<crate::screen::SlashCategory> = None;
+    let mut keys_started = false;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_key {
+            if !keys_started {
+                lines.push(Line::from(Span::styled(
+                    t.key_bindings,
+                    Style::default()
+                        .fg(theme.text.muted)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )));
+                keys_started = true;
+            }
+        } else if last_category != entry.category {
+            lines.push(Line::from(Span::styled(
+                entry
+                    .category
+                    .map(|category| t.category_label(category))
+                    .unwrap_or(t.all_categories),
+                Style::default()
+                    .fg(theme.text.muted)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )));
+            last_category = entry.category;
+        }
         let selected = index == state.help.selected;
         if selected {
             focus = lines.len();
         }
-        // An entry can wrap, so its hit starts at its first line and covers
-        // the entry: the index is the binding's position in the result set.
         rows.push((lines.len(), index.to_string()));
-        let text = sanitize_terminal_line(&format!(
-            "{}{}  {}",
-            if selected { "› " } else { "  " },
-            entry.binding,
-            entry.description
+        let mut spans = vec![
+            Span::styled(
+                if selected { "› " } else { "  " }.to_string(),
+                Style::default().fg(theme.accent.primary),
+            ),
+            Span::styled(
+                entry.binding.clone(),
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(if selected {
+                        ratatui::style::Modifier::BOLD
+                    } else {
+                        ratatui::style::Modifier::empty()
+                    }),
+            ),
+        ];
+        if !entry.aliases.is_empty() {
+            spans.push(Span::styled(
+                format!("  ({})", entry.aliases.join(", ")),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  {}", entry.description),
+            Style::default().fg(theme.text.muted),
         ));
-        let style = Style::default().fg(if selected {
-            theme.accent.primary
-        } else {
-            theme.text.primary
-        });
-        lines.extend(
-            wrap(&text, layout.content.width as usize)
-                .into_iter()
-                .map(|line| Line::from(Span::styled(line, style))),
-        );
+        if state.is_busy() && entry.busy == Some(crate::screen::BusyPolicy::IdleOnly) {
+            spans.push(Span::styled(
+                format!("  · {}", t.unavailable_busy),
+                Style::default().fg(theme.status.warning),
+            ));
+        }
+        for line in wrap(
+            &spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            layout.content.width as usize,
+        ) {
+            // A wrapped row keeps the original style: plain text is rebuilt
+            // with the selected row's colour so the marker and the hint stay
+            // readable at every width.
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(if selected {
+                    theme.accent.primary
+                } else {
+                    theme.text.primary
+                }),
+            )));
+        }
     }
-    if matches.is_empty() {
-        lines.push(Line::from(if zh {
-            "无匹配结果"
-        } else {
-            "No matches"
-        }));
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t.no_matches,
+            Style::default().fg(theme.text.muted),
+        )));
     }
     let mut hits = Vec::new();
     crate::render::render_list_rows(frame, layout.content, lines, &rows, focus, theme, &mut hits);
     state.screen_rows = hits;
-    search_cursor(frame, layout.composer, &state.help.query, zh);
+}
+
+fn push_help_field(lines: &mut Vec<Line<'static>>, theme: &Theme, label: &str, value: &str) {
+    lines.push(Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(theme.text.muted)),
+        Span::styled(
+            sanitize_terminal_line(value),
+            Style::default().fg(theme.text.primary),
+        ),
+    ]));
+}
+
+fn render_help_detail(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let t = &state.t().help_page;
+    let page = crate::secondary::SecondaryPage {
+        title: state.help.detail.unwrap_or(t.title),
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.footer_detail,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
+    let Some(entry) = state.help.detail_entry(state.t()) else {
+        return;
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                entry.binding.clone(),
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  [{}]",
+                    entry
+                        .category
+                        .map(|category| t.category_label(category))
+                        .unwrap_or(t.all_categories)
+                ),
+                Style::default().fg(theme.text.muted),
+            ),
+        ]),
+        Line::default(),
+    ];
+    push_help_field(&mut lines, theme, t.usage, entry.usage);
+    let aliases = if entry.aliases.is_empty() {
+        t.aliases_none.to_string()
+    } else {
+        entry.aliases.join(", ")
+    };
+    push_help_field(&mut lines, theme, t.aliases, &aliases);
+    push_help_field(
+        &mut lines,
+        theme,
+        t.availability,
+        if state.is_busy() && entry.busy == Some(crate::screen::BusyPolicy::IdleOnly) {
+            t.unavailable_busy
+        } else {
+            t.available
+        },
+    );
+    push_help_field(
+        &mut lines,
+        theme,
+        t.category,
+        entry
+            .category
+            .map(|category| t.category_label(category))
+            .unwrap_or(t.all_categories),
+    );
+    push_help_field(&mut lines, theme, t.source, t.source_registry);
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!("{}: ", t.description),
+        Style::default().fg(theme.text.muted),
+    )));
+    for line in wrap(&entry.description, layout.content.width as usize) {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(theme.text.primary),
+        )));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        t.detail_hint,
+        Style::default().fg(theme.text.muted),
+    )));
+    let paragraph = ratatui::widgets::Paragraph::new(lines)
+        .scroll((state.help.detail_scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, layout.content);
 }
 
 pub(super) fn render_history_search(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -546,6 +706,9 @@ mod search_tests {
         state.help.selected = 0;
         assert!(help_text(&mut state, 28, 10).contains("Ctrl+J"));
         state.help.query = "missing-binding".into();
-        assert!(help_text(&mut state, 28, 10).contains("No matches"));
+        assert!(
+            help_text(&mut state, 28, 10).contains("No matching commands"),
+            "the empty result names itself"
+        );
     }
 }

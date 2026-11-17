@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use leveler_client_protocol::mcp::{McpServerSpec, McpTransport};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::global_config::GlobalConfig;
@@ -22,6 +23,9 @@ pub struct McpEntry {
     pub transport: String,
     /// Streamable HTTP endpoint. `None` for stdio.
     pub url: Option<String>,
+    /// Whether the runtime should connect this server. Absence in the file
+    /// means enabled; a disabled entry stays listed and editable.
+    pub enabled: bool,
     /// Destination env keys forwarded into the MCP process (display only).
     pub env_keys: Vec<String>,
     /// Source env var names corresponding to [`Self::env_keys`] (same order).
@@ -38,6 +42,18 @@ pub struct McpEntry {
     pub available: bool,
 }
 
+impl McpEntry {
+    /// A display-safe endpoint: the launch command or the HTTP URL. Arguments
+    /// and header values are deliberately not shown.
+    pub fn endpoint_label(&self) -> String {
+        if let Some(url) = &self.url {
+            url.clone()
+        } else {
+            self.command.clone()
+        }
+    }
+}
+
 /// Errors from editing the MCP config.
 #[derive(Debug, thiserror::Error)]
 pub enum McpConfigError {
@@ -49,6 +65,12 @@ pub enum McpConfigError {
     Exists(String),
     #[error("no MCP server named `{0}`")]
     NotFound(String),
+    #[error("invalid MCP server name: {0}")]
+    InvalidName(String),
+    #[error("a stdio MCP server requires a command")]
+    MissingCommand,
+    #[error("a streamable HTTP MCP server requires a URL")]
+    MissingUrl,
     #[error(
         "MCP env `{key}` looks like a plaintext secret; store an environment variable name reference instead (e.g. `{key}={key}` or `{key}=`)"
     )]
@@ -137,6 +159,10 @@ pub fn list_at(path: &std::path::Path) -> Result<Vec<McpEntry>, McpConfigError> 
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let enabled = table
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let available = if url.is_some() {
                 url.as_deref().is_some_and(|url| {
                     leveler_tools::mcp::validate_streamable_http_url(url).is_ok()
@@ -150,6 +176,7 @@ pub fn list_at(path: &std::path::Path) -> Result<Vec<McpEntry>, McpConfigError> 
                 args,
                 transport,
                 url,
+                enabled,
                 env_keys,
                 env_sources,
                 header_names,
@@ -347,6 +374,201 @@ fn write_document(path: &std::path::Path, doc: &DocumentMut) -> Result<(), McpCo
         std::fs::create_dir_all(parent).map_err(|e| McpConfigError::Io(e.to_string()))?;
     }
     std::fs::write(path, doc.to_string()).map_err(|e| McpConfigError::Io(e.to_string()))
+}
+
+/// A server name a runtime and a client can both address unambiguously.
+///
+/// Conservative on purpose: an identifier that survives a CLI argument, a
+/// display row and the model-facing `mcp__<server>__<tool>` prefix without
+/// quoting.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a server name is required".into());
+    }
+    if name.len() > 64 {
+        return Err("a server name is limited to 64 bytes".into());
+    }
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return Err("a server name must start with a letter or digit".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err("a server name may contain only letters, digits, `-`, `_` and `.`".into());
+    }
+    Ok(())
+}
+
+/// Build one `[[mcp_servers]]` table from a protocol spec.
+///
+/// This is the editor's own validation boundary: the runtime service also
+/// validates, but a config write must never depend on a caller having done it.
+fn spec_table(spec: &McpServerSpec) -> Result<Table, McpConfigError> {
+    validate_name(&spec.name).map_err(McpConfigError::InvalidName)?;
+    let mut table = Table::new();
+    table["name"] = value(spec.name.trim());
+    match spec.transport {
+        McpTransport::Stdio => {
+            let command = spec.command.as_deref().unwrap_or("").trim();
+            if command.is_empty() {
+                return Err(McpConfigError::MissingCommand);
+            }
+            if spec
+                .url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+                || !spec.headers.is_empty()
+                || spec.bearer_token_env.is_some()
+            {
+                return Err(McpConfigError::MixedTransport);
+            }
+            table["command"] = value(command);
+            let mut arg_arr = Array::new();
+            for arg in &spec.args {
+                arg_arr.push(arg.as_str());
+            }
+            table["args"] = value(arg_arr);
+            if !spec.env.is_empty() {
+                let mut env_tab = InlineTable::new();
+                for reference in &spec.env {
+                    if !is_env_identifier(&reference.key) {
+                        return Err(McpConfigError::InvalidKey(reference.key.clone()));
+                    }
+                    let source = normalize_env_ref(&reference.key, &reference.source)?;
+                    env_tab.insert(&reference.key, Value::from(source.as_str()));
+                }
+                table["env"] = value(env_tab);
+            }
+        }
+        McpTransport::StreamableHttp => {
+            let url = spec.url.as_deref().unwrap_or("").trim();
+            if url.is_empty() {
+                return Err(McpConfigError::MissingUrl);
+            }
+            leveler_tools::mcp::validate_streamable_http_url(url)
+                .map_err(McpConfigError::InvalidUrl)?;
+            if spec
+                .command
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
+                || !spec.args.is_empty()
+                || !spec.env.is_empty()
+            {
+                return Err(McpConfigError::MixedTransport);
+            }
+            table["transport"] = value("streamable_http");
+            table["url"] = value(url);
+            if !spec.headers.is_empty() {
+                let mut header_tab = InlineTable::new();
+                for reference in &spec.headers {
+                    if reference.key.eq_ignore_ascii_case("authorization") {
+                        return Err(McpConfigError::AuthorizationHeader);
+                    }
+                    if !is_header_name(&reference.key) {
+                        return Err(McpConfigError::InvalidKey(reference.key.clone()));
+                    }
+                    let source = normalize_env_ref(&reference.key, &reference.source)?;
+                    header_tab.insert(&reference.key, Value::from(source.as_str()));
+                }
+                table["headers"] = value(header_tab);
+            }
+            if let Some(raw) = &spec.bearer_token_env {
+                let source = normalize_env_ref("bearer_token_env", raw)?;
+                table["bearer_token_env"] = value(source.as_str());
+            }
+        }
+    }
+    if !spec.enabled {
+        table["enabled"] = value(false);
+    }
+    Ok(table)
+}
+
+/// Add one server from a protocol spec.
+pub fn add_spec_at(
+    path: &std::path::Path,
+    spec: &McpServerSpec,
+) -> Result<PathBuf, McpConfigError> {
+    let table = spec_table(spec)?;
+    let mut doc = document_at(path)?;
+    if !doc.contains_key("mcp_servers") {
+        doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let servers = doc["mcp_servers"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| McpConfigError::Parse("`mcp_servers` is not an array of tables".into()))?;
+    if servers
+        .iter()
+        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(spec.name.trim()))
+    {
+        return Err(McpConfigError::Exists(spec.name.clone()));
+    }
+    servers.push(table);
+    write_document(path, &doc)?;
+    Ok(path.to_path_buf())
+}
+
+/// Replace the server named `original_name` in place.
+pub fn update_spec_at(
+    path: &std::path::Path,
+    original_name: &str,
+    spec: &McpServerSpec,
+) -> Result<PathBuf, McpConfigError> {
+    let table = spec_table(spec)?;
+    let mut doc = document_at(path)?;
+    let servers = doc
+        .get_mut("mcp_servers")
+        .and_then(Item::as_array_of_tables_mut)
+        .ok_or_else(|| McpConfigError::NotFound(original_name.to_string()))?;
+    let index = servers
+        .iter()
+        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(original_name))
+        .ok_or_else(|| McpConfigError::NotFound(original_name.to_string()))?;
+    if spec.name.trim() != original_name
+        && servers
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(spec.name.trim()))
+    {
+        return Err(McpConfigError::Exists(spec.name.clone()));
+    }
+    if let Some(slot) = servers.get_mut(index) {
+        *slot = table;
+    }
+    write_document(path, &doc)?;
+    Ok(path.to_path_buf())
+}
+
+/// Enable or disable one server without touching its other fields.
+///
+/// Enabled is the absence of `enabled = false`, which keeps a hand-written
+/// config clean and matches the parser's default.
+pub fn set_enabled_at(
+    path: &std::path::Path,
+    name: &str,
+    enabled: bool,
+) -> Result<PathBuf, McpConfigError> {
+    let mut doc = document_at(path)?;
+    let servers = doc
+        .get_mut("mcp_servers")
+        .and_then(Item::as_array_of_tables_mut)
+        .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
+    let table = servers
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
+    if enabled {
+        table.remove("enabled");
+    } else {
+        table.insert("enabled", value(false));
+    }
+    write_document(path, &doc)?;
+    Ok(path.to_path_buf())
 }
 
 fn command_available(command: &str) -> bool {
@@ -759,6 +981,128 @@ env = {{ GITHUB_TOKEN = "{secret}" }}
         // env_sources may still hold the raw string for doctor redaction, but
         // callers that display must use env_keys only (mcp list does).
         assert!(!format!("{:?}", servers[0].env_keys).contains(secret));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn spec_dir(tag: &str) -> (PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-mcpcfg-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        (dir, cfg)
+    }
+
+    fn stdio_spec(name: &str) -> McpServerSpec {
+        McpServerSpec {
+            name: name.into(),
+            transport: McpTransport::Stdio,
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "server".into()],
+            env: vec![leveler_client_protocol::mcp::McpNameRef {
+                key: "GITHUB_TOKEN".into(),
+                source: "GITHUB_TOKEN".into(),
+            }],
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn a_spec_adds_lists_and_survives_a_disable_roundtrip() {
+        let (dir, cfg) = spec_dir("spec");
+        add_spec_at(&cfg, &stdio_spec("fs")).unwrap();
+        let listed = list_at(&cfg).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "fs");
+        assert!(listed[0].enabled);
+        assert_eq!(listed[0].env_keys, vec!["GITHUB_TOKEN"]);
+        assert_eq!(listed[0].env_sources, vec!["GITHUB_TOKEN"]);
+
+        set_enabled_at(&cfg, "fs", false).unwrap();
+        assert!(!list_at(&cfg).unwrap()[0].enabled);
+        set_enabled_at(&cfg, "fs", true).unwrap();
+        assert!(list_at(&cfg).unwrap()[0].enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_replaces_in_place_and_refuses_a_name_collision() {
+        let (dir, cfg) = spec_dir("update");
+        add_spec_at(&cfg, &stdio_spec("fs")).unwrap();
+        add_spec_at(&cfg, &stdio_spec("other")).unwrap();
+        let mut renamed = stdio_spec("fs-two");
+        renamed.command = Some("node".into());
+        update_spec_at(&cfg, "fs", &renamed).unwrap();
+        let listed = list_at(&cfg).unwrap();
+        assert_eq!(listed[0].name, "fs-two");
+        assert_eq!(listed[0].command, "node");
+        assert_eq!(listed[1].name, "other");
+
+        let collision = update_spec_at(&cfg, "fs-two", &stdio_spec("other"));
+        assert!(matches!(collision, Err(McpConfigError::Exists(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mixed_or_unnamed_spec_is_refused_before_it_is_written() {
+        let (dir, cfg) = spec_dir("refuse");
+        let mut mixed = stdio_spec("fs");
+        mixed.url = Some("http://localhost:3000/mcp".into());
+        assert!(matches!(
+            add_spec_at(&cfg, &mixed),
+            Err(McpConfigError::MixedTransport)
+        ));
+        let mut unnamed = stdio_spec("../escape");
+        unnamed.name = "../escape".into();
+        assert!(matches!(
+            add_spec_at(&cfg, &unnamed),
+            Err(McpConfigError::InvalidName(_))
+        ));
+        assert!(!cfg.exists(), "a refused spec never creates the file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_http_spec_keeps_header_sources_and_refuses_authorization() {
+        let (dir, cfg) = spec_dir("http");
+        let mut spec = McpServerSpec {
+            name: "remote".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: Some("https://example.com/mcp".into()),
+            headers: vec![leveler_client_protocol::mcp::McpNameRef {
+                key: "X-API-Key".into(),
+                source: "SERVICE_API_KEY".into(),
+            }],
+            bearer_token_env: Some("SERVICE_TOKEN".into()),
+            enabled: true,
+        };
+        add_spec_at(&cfg, &spec).unwrap();
+        let listed = list_at(&cfg).unwrap();
+        assert_eq!(listed[0].transport, "streamable_http");
+        assert_eq!(listed[0].header_names, vec!["X-API-Key"]);
+        assert_eq!(listed[0].header_sources, vec!["SERVICE_API_KEY"]);
+        assert_eq!(listed[0].bearer_token_env.as_deref(), Some("SERVICE_TOKEN"));
+
+        spec.name = "authorized".into();
+        spec.headers = vec![leveler_client_protocol::mcp::McpNameRef {
+            key: "Authorization".into(),
+            source: "SERVICE_TOKEN".into(),
+        }];
+        assert!(matches!(
+            add_spec_at(&cfg, &spec),
+            Err(McpConfigError::AuthorizationHeader)
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

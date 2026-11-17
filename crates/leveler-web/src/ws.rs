@@ -304,7 +304,10 @@ async fn handle_upstream(
         } => {
             if matches!(
                 &command,
-                ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QueryDiagnostics { .. }
+                ClientCommand::QueryGlobalTasks { .. }
+                    | ClientCommand::QueryDiagnostics { .. }
+                    | ClientCommand::QuerySettings { .. }
+                    | ClientCommand::ManageMcp { .. }
             ) {
                 send_or_ignore(outgoing, error_frame(&ClientError::Runtime("global task discovery and diagnostics are only available through the trusted local runtime transport".into()), Some(command_id))).await;
                 return;

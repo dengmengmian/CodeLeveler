@@ -466,6 +466,10 @@ pub struct AppState {
     /// `/doctor`: structured diagnostics. Local facts are recomputed from this
     /// state; the runtime-owned checks arrive from `QueryDiagnostics`.
     pub doctor: crate::doctor::DoctorState,
+    /// `/mcp`: server status and management, read from the runtime authority.
+    pub mcp: crate::mcp::McpState,
+    /// `/settings`: the runtime's effective settings projection.
+    pub settings: crate::settings::SettingsState,
 
     /// Active plan from the current run, if any. Terminal plans move into the
     /// transcript and never remain in this slot.
@@ -884,6 +888,8 @@ impl AppState {
             composer: Composer::new(),
             history_search: None,
             help: crate::help::HelpSearch::default(),
+            mcp: crate::mcp::McpState::default(),
+            settings: crate::settings::SettingsState::default(),
             prompt_suggestion: None,
             prompt_suggestion_allowed: true,
             away_summary_pending: false,

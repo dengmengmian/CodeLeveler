@@ -276,6 +276,134 @@ export type FoldRequirement =
   /** Over the hard capacity. Without a fold the request cannot legally be sent, so a failed briefing must be folded mechanically or the turn fails without ever sending an oversized request. */
   | 'hard_required';
 
+/** What the runtime currently knows about one configured server. `NotConnected` is a fact, not a failure: the runtime connects on a turn boundary or on an explicit reconnect. `Unknown` means the runtime cannot answer at all (for example, it has no workspace and therefore cannot launch a stdio server). */
+export type McpConnectionState =
+  /** The user disabled this server in configuration. */
+  | 'disabled'
+  /** Configured and enabled; no connection attempt has completed. */
+  | 'not_connected'
+  /** An attempt is in progress. The answer is not final. */
+  | 'connecting'
+  /** The handshake and tools/list completed. */
+  | 'connected'
+  /** A previously connected server can no longer serve its catalog (for example, its child process exited). It is not connected now. */
+  | 'degraded'
+  /** The last attempt failed. The reason is in `last_error`. */
+  | 'failed'
+  /** The runtime cannot observe this server's state. */
+  | 'unknown';
+
+/** One environment/header name reference in a server specification. `source` is an environment variable name, never a value. The runtime resolves it at launch; a client must not send a literal secret. */
+export interface McpNameRef {
+  key: string;
+  source: string;
+}
+
+/** One management request. Every action answers with the same authoritative list, so a client cannot merge a partial update into stale rows. */
+export type McpRequest =
+  /** Read the current authority. Never connects a server. */
+  | { action: 'list' }
+  /** Connect one configured server again, replacing its current connection. */
+  | { action: 'reconnect'; server: string }
+  /** Re-read the configuration sources and apply the result to this runtime. */
+  | { action: 'reload' }
+  | { action: 'add'; spec: McpServerSpec }
+  /** Replace the server named `original_name`. Renaming must not collide. */
+  | { action: 'update'; original_name: string; spec: McpServerSpec }
+  | { action: 'remove'; server: string }
+  | { action: 'set_enabled'; enabled: boolean; server: string };
+
+/** The answer to one [`McpRequest`]. */
+export type McpResponse =
+  /** A read-only answer. */
+  | { servers: McpServerView[]; status: 'snapshot' }
+  /** A management action changed the authority (or configuration) and this is the resulting list. `message` is a machine-free summary; the client localizes its own success wording from the action it sent. */
+  | { message: string; servers: McpServerView[]; status: 'changed' }
+  /** The action failed. `servers` still carries the latest authority, so a failed write never destroys the page's rows. */
+  | { message: string; servers: McpServerView[]; status: 'error' };
+
+/** A complete server declaration for add/update. The fields are the configuration vocabulary, not a resolved connection: the runtime validates names and references before writing the file. Unknown transport fields are refused rather than silently ignored. */
+export interface McpServerSpec {
+  args?: string[];
+  bearer_token_env?: string | null;
+  /** Stdio launch program. */
+  command?: string | null;
+  enabled?: boolean;
+  /** Destination environment key → source environment variable name. */
+  env?: McpNameRef[];
+  /** Header name → source environment variable name. `Authorization` is refused here; use `bearer_token_env`. */
+  headers?: McpNameRef[];
+  name: string;
+  transport: McpTransport;
+  /** Streamable HTTP endpoint. */
+  url?: string | null;
+}
+
+/** One configured server and its live connection facts. */
+export interface McpServerView {
+  connected_at?: string | null;
+  enabled: boolean;
+  /** A display-safe endpoint: the command for stdio, the URL without credentials/query for HTTP. Never an environment or header value. */
+  endpoint: string;
+  /** Monotonic connection generation. A later answer with a smaller generation is stale and must not overwrite this one. */
+  generation: number;
+  /** Whether the initialize handshake completed. */
+  initialized?: boolean;
+  /** RFC3339 timestamps from the runtime clock. */
+  last_attempt_at?: string | null;
+  /** Redacted reason from the last failed attempt. */
+  last_error?: string | null;
+  name: string;
+  /** The protocol version the server negotiated, when known. */
+  protocol?: string | null;
+  /** Seconds until the next automatic retry, when the runtime scheduled one. */
+  retry_in_seconds?: number | null;
+  /** The configuration file this entry came from, for display only. */
+  source: string;
+  /** The declaration as configured, so an edit form starts from the real values instead of parsing a display string. Contains name references, never resolved secrets. */
+  spec: McpServerSpec;
+  state: McpConnectionState;
+  /** How many tools the last successful discovery produced. `None` when no catalog was ever discovered. */
+  tool_count?: number | null;
+  /** A bounded catalog for the selected server. Other servers in a list answer carry no tools; a client asks for a detail view explicitly. */
+  tools?: McpToolView[];
+  /** True when the runtime bounded the catalog it returned. `tool_count` remains the authoritative count. */
+  tools_truncated?: boolean;
+  transport: McpTransport;
+  updated_at?: string | null;
+}
+
+/** How a discovered tool relates to the current session's admission rules. This is a projection of the live policy, never a permission grant. The execution boundary still decides on each call; a tool advertised here can still be refused by a later policy change or a per-call approval. */
+export type McpToolAdmission =
+  /** The session's profile admits network-risk tools. */
+  | 'admitted'
+  /** The session's profile routes risky calls to approval. */
+  | 'requires_approval'
+  /** The session profile denies network access by default; the call needs an explicit network grant. */
+  | 'requires_network_grant'
+  /** The runtime cannot decide from the current facts. */
+  | 'unknown';
+
+/** One tool a connected server advertised to the runtime. */
+export interface McpToolView {
+  admission: McpToolAdmission;
+  /** The server's own description, bounded by the producer. */
+  description: string;
+  /** The model-facing name: `mcp__<server>__<tool>`. */
+  exposed_name: string;
+  /** JSON Schema for the arguments, bounded by the producer. */
+  input_schema: unknown;
+  /** The name the server itself uses. */
+  remote_name: string;
+  /** The tool's risk classification; MCP tools are always network-risk. */
+  risk: string;
+  /** True when the producer truncated the description or schema to keep the catalog bounded. The full value is not available to a client. */
+  truncated?: boolean;
+}
+
+/** The transport a server uses. */
+export type McpTransport = 'stdio' | 'streamable_http';
+
 /** Identifies a single assistant/user message in the transcript. A protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message. */
 export type MessageId = string;
 
@@ -412,6 +540,10 @@ export type RuntimeEvent =
   | { type: 'diagnostics_loaded'; query_id: CommandId; report: DiagnosticReport; requester_session_id: SessionId }
   /** The answer to [`crate::ClientCommand::ManageSchedule`]. `response` carries domain failures too; a transport failure is the only case where no answer arrives. */
   | { type: 'schedule_managed'; query_id: CommandId; requester_session_id: SessionId; response: ScheduleResponse }
+  /** The answer to [`crate::ClientCommand::ManageMcp`]. Every answer carries the runtime's authoritative server list, including after a failed management action, so a client never merges into stale rows. */
+  | { type: 'mcp_managed'; query_id: CommandId; requester_session_id: SessionId; response: McpResponse }
+  /** The answer to [`crate::ClientCommand::QuerySettings`]. A projection of the current configuration generation; it is not a configuration store. */
+  | { type: 'settings_loaded'; query_id: CommandId; requester_session_id: SessionId; settings: UiSettingsSnapshot }
   /** The runtime finished booting and is ready for commands. */
   | { type: 'runtime_ready' }
   /** The build this client's stream is connected to, observed when the stream is first established. A long-lived runtime can outlive an application update, so the client must learn at connect time whether it is talking to the build it was installed with. Like [`RuntimeEvent::RuntimeReconnected`], an unknown identity proves nothing and is never a version change. */
@@ -1182,6 +1314,16 @@ export interface UiCompletionReport {
   success: boolean;
 }
 
+/** One configuration source the runtime reads, in precedence order (later entries override earlier ones). */
+export interface UiConfigSource {
+  /** `global`, `project` or `environment`. */
+  kind: string;
+  path: string;
+  /** 0 = lowest precedence. */
+  precedence: number;
+  present: boolean;
+}
+
 /** A summary of working-tree changes. */
 export interface UiDiff {
   files: UiDiffFile[];
@@ -1595,6 +1737,22 @@ export interface UiPlanStep {
   status: PlanStepStatus;
 }
 
+/** One configured provider, without secrets. */
+export interface UiProviderSetting {
+  /** Whether a key is resolvable right now. The value itself never leaves the runtime. */
+  api_key_configured: boolean;
+  /** The environment variable name the key is read from, when configured. */
+  api_key_env?: string | null;
+  /** A display-safe base URL (credentials and query removed). */
+  base_url: string;
+  id: string;
+  /** How many model entries this provider serves. */
+  model_count: number;
+  protocol: string;
+  /** Where this provider entry was configured. */
+  source: UiSettingSource;
+}
+
 /** Recovery facts that are already durable and safe to show. */
 export interface UiRecoveryObservation {
   interrupted_turns: number;
@@ -1968,6 +2126,47 @@ export interface UiSessionSummary {
   updated_at: string;
 }
 
+/** Where a settings value came from. */
+export type UiSettingSource =
+  /** The user-global `config.toml`. */
+  | 'global_config'
+  /** The project's configuration bundle. */
+  | 'project_config'
+  /** An environment variable (never its value). */
+  | 'environment'
+  /** The current session row or override. */
+  | 'session'
+  /** A built-in default because no source set the value. */
+  | 'default'
+  /** A client-local preference (for example the TUI theme). */
+  | 'client_local'
+  /** The runtime cannot attribute the value to a source. */
+  | 'unknown';
+
+/** The runtime's effective settings projection. */
+export interface UiSettingsSnapshot {
+  /** The user-global config path, when the runtime knows one. */
+  config_path?: string | null;
+  /** The configuration generation these values describe. */
+  config_version: number;
+  /** The global soft-compaction percent, when configured. */
+  context_soft_percent?: number | null;
+  /** The explicitly configured default model, unresolved text as written. */
+  default_model?: string | null;
+  /** RFC3339, from the runtime clock. */
+  generated_at: string;
+  /** The project configuration directory. */
+  project_config_dir?: string | null;
+  providers: UiProviderSetting[];
+  /** The default model resolved against this environment's registry. */
+  resolved_default_model?: ModelRef | null;
+  sources: UiConfigSource[];
+  /** The global TUI theme id configured for future clients. */
+  theme_default?: string | null;
+  /** The global Thinking Level configured for this environment. */
+  thinking_default?: ThinkingLevel | null;
+}
+
 /** A lower-precedence definition the active one hides. */
 export interface UiShadowedAgent {
   location?: string | null;
@@ -2142,6 +2341,10 @@ export type ClientCommand =
   | { type: 'query_diagnostics'; query_id: CommandId; requester_session_id: SessionId }
   /** Manage user-global scheduled automation. The schedule store remains the single authority; this command is the structured adapter every client uses, so no client parses human-readable CLI output back into state. The answer is [`crate::RuntimeEvent::ScheduleManaged`] carrying the same `query_id`. */
   | { type: 'manage_schedule'; query_id: CommandId; request: ScheduleRequest; requester_session_id: SessionId }
+  /** Read or manage MCP servers through the runtime's single authority. Answers with [`crate::RuntimeEvent::McpManaged`] carrying the same `query_id`. Reserved for trusted local clients: the answer names configuration paths, commands and tool schemas. */
+  | { type: 'manage_mcp'; query_id: CommandId; request: McpRequest; requester_session_id: SessionId }
+  /** Read the runtime's effective settings projection. Answers with [`crate::RuntimeEvent::SettingsLoaded`]. Read-only and local: the projection names configuration paths and provider identities, never secret values. Reserved for trusted local clients. */
+  | { type: 'query_settings'; query_id: CommandId; requester_session_id: SessionId }
   /** Ask the runtime for one best-effort prediction of the user's next prompt. The request is advisory UI chrome: it starts no task, persists no message, and may produce no event when there is insufficient context. */
   | { type: 'request_prompt_suggestion'; session_id: SessionId }
   /** Generate a one-shot recap after the UI has observed a post-turn idle window. The runtime may decline when the conversation is too short. */

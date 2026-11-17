@@ -720,12 +720,18 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "new" => new_conversation(state),
         "exit" => super::request_exit(state),
-        "help" => toggle_screen(state, Screen::Help),
+        "help" => help_slash(state, command),
         // The unified task workbench: a view over existing runtime facts.
         "tasks" => crate::tasks::open(state),
         // Structured diagnostics: local facts immediately, the shared check
         // core from the runtime asynchronously.
         "doctor" => crate::doctor::open(state),
+        // The runtime's one MCP authority, projected for viewing and
+        // management. It never connects anything on open.
+        "mcp" => crate::mcp::open(state),
+        // One projection of the effective settings; edits reuse the existing
+        // typed commands and pickers.
+        "settings" => crate::settings::open(state),
         "update" => start_update(state),
         other => {
             state.notification = Some(Notification {
@@ -735,6 +741,44 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             Vec::new()
         }
     }
+}
+
+/// `/help` with no argument toggles the browser; `/help <command>` opens that
+/// command's detail page. A name that resolves through an alias opens the
+/// canonical command. An unknown name is not silently ignored: the page opens
+/// filtered by it and the notice says why.
+fn help_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let arg = command
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("");
+    if arg.is_empty() {
+        // Reopening starts at the full registry: a previous visit's filter is
+        // not a fact about what the reader wants now.
+        if state.active_screen != Screen::Help {
+            state.help.query.clear();
+            state.help.category = None;
+            state.help.selected = 0;
+            state.help.detail = None;
+            state.help.detail_scroll = 0;
+        }
+        return toggle_screen(state, Screen::Help);
+    }
+    let token = arg
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/');
+    if let Some(canonical) = crate::screen::slash_primary(token) {
+        crate::help::open_detail_for(state, canonical);
+        return Vec::new();
+    }
+    crate::help::open_filtered(state, arg);
+    state.notification = Some(Notification {
+        level: NotificationLevel::Warning,
+        message: state.t().unknown_command.replace("{name}", arg),
+    });
+    Vec::new()
 }
 
 /// Everything after the command name, for `/find <query>`.

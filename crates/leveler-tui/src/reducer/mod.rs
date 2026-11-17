@@ -24,7 +24,7 @@ pub mod overlay_keys;
 mod paste_file;
 mod paste_image;
 mod runtime_apply;
-mod screen_nav;
+pub(crate) mod screen_nav;
 mod shell;
 mod shell_output;
 mod submit;
@@ -170,6 +170,16 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 state.active_screen == Screen::Tasks && crate::tasks::should_refresh(&event);
             let doctor_reload =
                 state.active_screen == Screen::Doctor && crate::doctor::should_reload(&event);
+            let mcp_reload =
+                state.active_screen == Screen::Mcp && crate::mcp::should_reload(&event);
+            let settings_reload =
+                state.active_screen == Screen::Settings && crate::settings::should_reload(&event);
+            let config_reload = match &event {
+                RuntimeEvent::ConfigReloaded { outcome, error, .. } => {
+                    Some((outcome.clone(), error.clone()))
+                }
+                _ => None,
+            };
             let usage_dirty =
                 state.active_screen == Screen::Context && crate::usage::should_refresh(&event);
             if trace_dirty {
@@ -233,6 +243,19 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 effects.extend(crate::doctor::session_changed(state));
             } else if doctor_reload {
                 effects.extend(crate::doctor::reload(state));
+            }
+            if let Some((outcome, error)) = config_reload {
+                crate::settings::observe_config_reloaded(state, &outcome, error.as_deref());
+            }
+            if opened && state.active_screen == Screen::Mcp {
+                effects.extend(crate::mcp::session_changed(state));
+            } else if mcp_reload {
+                effects.extend(crate::mcp::reload(state));
+            }
+            if opened && state.active_screen == Screen::Settings {
+                effects.extend(crate::settings::session_changed(state));
+            } else if settings_reload {
+                effects.extend(crate::settings::reload(state));
             }
             if opened
                 && state
@@ -1279,6 +1302,15 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     }
     if state.active_screen == Screen::Doctor {
         return crate::doctor::handle_mouse(state, mouse);
+    }
+    if state.active_screen == Screen::Mcp {
+        return crate::mcp::handle_mouse(state, mouse);
+    }
+    if state.active_screen == Screen::Settings {
+        return crate::settings::handle_mouse(state, mouse);
+    }
+    if state.active_screen == Screen::Help {
+        return crate::help::handle_mouse(state, mouse);
     }
     if state.active_screen == Screen::Output {
         return output_mouse(state, mouse);

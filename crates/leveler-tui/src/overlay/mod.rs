@@ -35,6 +35,9 @@ pub use selection::{SelectionModel, SelectionOption, SelectionOutcome};
 #[derive(Debug, Clone)]
 pub enum Overlay {
     ModelPicker(Box<SelectionModel>),
+    /// `/settings` → the global default model. Distinct from
+    /// [`Self::ModelPicker`] because only this choice persists configuration.
+    DefaultModelPicker(Box<SelectionModel>),
     ModePicker(Box<SelectionModel>),
     /// Named TUI palettes (`auto` / `dark` / `light` / `high-contrast`).
     ThemePicker(Box<SelectionModel>),
@@ -87,6 +90,7 @@ impl Overlay {
             Overlay::Clarification(_) => Some(t.overlay_clarify),
             Overlay::UnsupportedMedia(_) => Some(t.overlay_media),
             Overlay::ModelPicker(_)
+            | Overlay::DefaultModelPicker(_)
             | Overlay::ModePicker(_)
             | Overlay::ThemePicker(_)
             | Overlay::CollabPicker(_)
@@ -116,6 +120,7 @@ impl Overlay {
                 true
             }
             Overlay::ModelPicker(m)
+            | Overlay::DefaultModelPicker(m)
             | Overlay::ModePicker(m)
             | Overlay::ThemePicker(m)
             | Overlay::CollabPicker(m)
@@ -334,6 +339,7 @@ fn build_content(
 ) -> RawContent {
     match overlay {
         Overlay::ModelPicker(model)
+        | Overlay::DefaultModelPicker(model)
         | Overlay::ModePicker(model)
         | Overlay::ThemePicker(model)
         | Overlay::CollabPicker(model)

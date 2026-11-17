@@ -162,6 +162,17 @@ fn path_candidates(name: &str) -> Vec<String> {
 
 /// Run diagnostics against the loaded configuration.
 pub fn run(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
+    run_with_mcp(config, None)
+}
+
+/// Run diagnostics with the live MCP connection facts, when the caller has
+/// them. `None` means this process is not the runtime that owns the
+/// connections (the CLI doctor); the answer then says the check was not run,
+/// never that a server is connected.
+pub fn run_with_mcp(
+    config: &LoadedConfig,
+    mcp: Option<&[leveler_client_protocol::mcp::McpServerView]>,
+) -> Vec<DiagnosticFinding> {
     let mut results = Vec::new();
 
     // Required tooling.
@@ -233,7 +244,10 @@ pub fn run(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
 
     // MCP env refs: only report keys / validated source names, never raw values.
     results.extend(check_mcp_env_refs());
-    results.push(check_mcp_connection());
+    results.extend(match mcp {
+        Some(servers) => check_mcp_connection_states(servers),
+        None => vec![check_mcp_connection()],
+    });
 
     // OS sandbox honesty (WS0): never report sandbox=yes when unsupported.
     let sand = leveler_execution::doctor_sandbox_line();
@@ -739,8 +753,11 @@ fn push_mcp_ref(
     }
 }
 
-/// Live MCP connection state is not part of the protocol yet. Saying so is the
-/// honest answer; the runtime must not fabricate "connected".
+/// Live MCP connection state when the caller is not the owning runtime.
+///
+/// The CLI doctor runs in its own process and cannot see the daemon's
+/// connections. Saying the check was not run is the honest answer; it never
+/// becomes a pass and never claims a server is connected.
 fn check_mcp_connection() -> DiagnosticFinding {
     let count = crate::mcp_config::config_path()
         .ok()
@@ -762,9 +779,91 @@ fn check_mcp_connection() -> DiagnosticFinding {
         DiagnosticCategory::Mcp,
         DiagnosticStatus::NotChecked,
         vec![format!(
-            "{count} server(s) configured; live connection state is not exposed by the runtime"
+            "{count} server(s) configured; this process does not own their connections"
         )],
     )
+}
+
+/// One finding per configured server, from the same runtime authority `/mcp`
+/// reads. A server that only exists in configuration is never reported as
+/// connected.
+fn check_mcp_connection_states(
+    servers: &[leveler_client_protocol::mcp::McpServerView],
+) -> Vec<DiagnosticFinding> {
+    use leveler_client_protocol::mcp::McpConnectionState as State;
+    if servers.is_empty() {
+        return vec![finding(
+            finding_id::MCP_CONNECTION,
+            None,
+            DiagnosticCategory::Mcp,
+            DiagnosticStatus::NotApplicable,
+            vec!["no MCP servers configured".into()],
+        )];
+    }
+    servers
+        .iter()
+        .map(|server| {
+            let (status, evidence) = match server.state {
+                State::Disabled => (
+                    DiagnosticStatus::NotApplicable,
+                    "disabled by configuration".to_string(),
+                ),
+                State::NotConnected => (
+                    DiagnosticStatus::Warn,
+                    format!(
+                        "configured but not connected ({}); open /mcp to connect",
+                        server.endpoint
+                    ),
+                ),
+                State::Connecting => (
+                    DiagnosticStatus::Unknown,
+                    "a connection attempt is in progress".to_string(),
+                ),
+                State::Connected => {
+                    let mut detail = format!(
+                        "connected · {} tool(s)",
+                        server.tool_count.unwrap_or(0)
+                    );
+                    if let Some(protocol) = &server.protocol {
+                        detail.push_str(&format!(" · protocol {protocol}"));
+                    }
+                    (DiagnosticStatus::Pass, detail)
+                }
+                State::Degraded => (
+                    DiagnosticStatus::Warn,
+                    "the previous connection is no longer serving its catalog; open /mcp to reconnect"
+                        .to_string(),
+                ),
+                State::Failed => (
+                    DiagnosticStatus::Fail,
+                    match &server.last_error {
+                        Some(reason) => format!("last attempt failed: {reason}"),
+                        None => "last attempt failed".to_string(),
+                    },
+                ),
+                State::Unknown => (
+                    DiagnosticStatus::Unknown,
+                    "the runtime cannot observe this server".to_string(),
+                ),
+            };
+            let needs_action = matches!(
+                server.state,
+                State::NotConnected | State::Degraded | State::Failed
+            );
+            let found = finding(
+                finding_id::MCP_CONNECTION,
+                Some(server.name.clone()),
+                DiagnosticCategory::Mcp,
+                status,
+                vec![evidence],
+            );
+            if needs_action {
+                with_action(found, action_id::OPEN_MCP)
+            } else {
+                found
+            }
+        })
+        .collect()
 }
 
 /// Whether any check failed.

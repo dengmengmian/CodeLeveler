@@ -84,6 +84,60 @@
       }
     },
     {
+      "description": "The answer to [`crate::ClientCommand::ManageMcp`]. Every answer carries the runtime's authoritative server list, including after a failed management action, so a client never merges into stale rows.",
+      "type": "object",
+      "required": [
+        "query_id",
+        "requester_session_id",
+        "response",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "$ref": "#/definitions/CommandId"
+        },
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "response": {
+          "$ref": "#/definitions/McpResponse"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "mcp_managed"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The answer to [`crate::ClientCommand::QuerySettings`]. A projection of the current configuration generation; it is not a configuration store.",
+      "type": "object",
+      "required": [
+        "query_id",
+        "requester_session_id",
+        "settings",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "$ref": "#/definitions/CommandId"
+        },
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "settings": {
+          "$ref": "#/definitions/UiSettingsSnapshot"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "settings_loaded"
+          ]
+        }
+      }
+    },
+    {
       "description": "The runtime finished booting and is ready for commands.",
       "type": "object",
       "required": [
@@ -3980,6 +4034,418 @@
         }
       ]
     },
+    "McpConnectionState": {
+      "description": "What the runtime currently knows about one configured server.\n\n`NotConnected` is a fact, not a failure: the runtime connects on a turn boundary or on an explicit reconnect. `Unknown` means the runtime cannot answer at all (for example, it has no workspace and therefore cannot launch a stdio server).",
+      "oneOf": [
+        {
+          "description": "The user disabled this server in configuration.",
+          "type": "string",
+          "enum": [
+            "disabled"
+          ]
+        },
+        {
+          "description": "Configured and enabled; no connection attempt has completed.",
+          "type": "string",
+          "enum": [
+            "not_connected"
+          ]
+        },
+        {
+          "description": "An attempt is in progress. The answer is not final.",
+          "type": "string",
+          "enum": [
+            "connecting"
+          ]
+        },
+        {
+          "description": "The handshake and tools/list completed.",
+          "type": "string",
+          "enum": [
+            "connected"
+          ]
+        },
+        {
+          "description": "A previously connected server can no longer serve its catalog (for example, its child process exited). It is not connected now.",
+          "type": "string",
+          "enum": [
+            "degraded"
+          ]
+        },
+        {
+          "description": "The last attempt failed. The reason is in `last_error`.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "The runtime cannot observe this server's state.",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        }
+      ]
+    },
+    "McpNameRef": {
+      "description": "One environment/header name reference in a server specification.\n\n`source` is an environment variable name, never a value. The runtime resolves it at launch; a client must not send a literal secret.",
+      "type": "object",
+      "required": [
+        "key",
+        "source"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    },
+    "McpResponse": {
+      "description": "The answer to one [`McpRequest`].",
+      "oneOf": [
+        {
+          "description": "A read-only answer.",
+          "type": "object",
+          "required": [
+            "servers",
+            "status"
+          ],
+          "properties": {
+            "servers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/McpServerView"
+              }
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "snapshot"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A management action changed the authority (or configuration) and this is the resulting list. `message` is a machine-free summary; the client localizes its own success wording from the action it sent.",
+          "type": "object",
+          "required": [
+            "message",
+            "servers",
+            "status"
+          ],
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "servers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/McpServerView"
+              }
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "changed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The action failed. `servers` still carries the latest authority, so a failed write never destroys the page's rows.",
+          "type": "object",
+          "required": [
+            "message",
+            "servers",
+            "status"
+          ],
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "servers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/McpServerView"
+              }
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "error"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "McpServerSpec": {
+      "description": "A complete server declaration for add/update.\n\nThe fields are the configuration vocabulary, not a resolved connection: the runtime validates names and references before writing the file. Unknown transport fields are refused rather than silently ignored.",
+      "type": "object",
+      "required": [
+        "name",
+        "transport"
+      ],
+      "properties": {
+        "args": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "bearer_token_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "Stdio launch program.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "env": {
+          "description": "Destination environment key → source environment variable name.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/McpNameRef"
+          }
+        },
+        "headers": {
+          "description": "Header name → source environment variable name. `Authorization` is refused here; use `bearer_token_env`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/McpNameRef"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "transport": {
+          "$ref": "#/definitions/McpTransport"
+        },
+        "url": {
+          "description": "Streamable HTTP endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpServerView": {
+      "description": "One configured server and its live connection facts.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "endpoint",
+        "generation",
+        "name",
+        "source",
+        "spec",
+        "state",
+        "transport"
+      ],
+      "properties": {
+        "connected_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "A display-safe endpoint: the command for stdio, the URL without credentials/query for HTTP. Never an environment or header value.",
+          "type": "string"
+        },
+        "generation": {
+          "description": "Monotonic connection generation. A later answer with a smaller generation is stale and must not overwrite this one.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "initialized": {
+          "description": "Whether the initialize handshake completed.",
+          "default": false,
+          "type": "boolean"
+        },
+        "last_attempt_at": {
+          "description": "RFC3339 timestamps from the runtime clock.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error": {
+          "description": "Redacted reason from the last failed attempt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "protocol": {
+          "description": "The protocol version the server negotiated, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_in_seconds": {
+          "description": "Seconds until the next automatic retry, when the runtime scheduled one.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "source": {
+          "description": "The configuration file this entry came from, for display only.",
+          "type": "string"
+        },
+        "spec": {
+          "description": "The declaration as configured, so an edit form starts from the real values instead of parsing a display string. Contains name references, never resolved secrets.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpServerSpec"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/definitions/McpConnectionState"
+        },
+        "tool_count": {
+          "description": "How many tools the last successful discovery produced. `None` when no catalog was ever discovered.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "tools": {
+          "description": "A bounded catalog for the selected server. Other servers in a list answer carry no tools; a client asks for a detail view explicitly.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/McpToolView"
+          }
+        },
+        "tools_truncated": {
+          "description": "True when the runtime bounded the catalog it returned. `tool_count` remains the authoritative count.",
+          "default": false,
+          "type": "boolean"
+        },
+        "transport": {
+          "$ref": "#/definitions/McpTransport"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpToolAdmission": {
+      "description": "How a discovered tool relates to the current session's admission rules.\n\nThis is a projection of the live policy, never a permission grant. The execution boundary still decides on each call; a tool advertised here can still be refused by a later policy change or a per-call approval.",
+      "oneOf": [
+        {
+          "description": "The session's profile admits network-risk tools.",
+          "type": "string",
+          "enum": [
+            "admitted"
+          ]
+        },
+        {
+          "description": "The session's profile routes risky calls to approval.",
+          "type": "string",
+          "enum": [
+            "requires_approval"
+          ]
+        },
+        {
+          "description": "The session profile denies network access by default; the call needs an explicit network grant.",
+          "type": "string",
+          "enum": [
+            "requires_network_grant"
+          ]
+        },
+        {
+          "description": "The runtime cannot decide from the current facts.",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        }
+      ]
+    },
+    "McpToolView": {
+      "description": "One tool a connected server advertised to the runtime.",
+      "type": "object",
+      "required": [
+        "admission",
+        "description",
+        "exposed_name",
+        "input_schema",
+        "remote_name",
+        "risk"
+      ],
+      "properties": {
+        "admission": {
+          "$ref": "#/definitions/McpToolAdmission"
+        },
+        "description": {
+          "description": "The server's own description, bounded by the producer.",
+          "type": "string"
+        },
+        "exposed_name": {
+          "description": "The model-facing name: `mcp__<server>__<tool>`.",
+          "type": "string"
+        },
+        "input_schema": {
+          "description": "JSON Schema for the arguments, bounded by the producer."
+        },
+        "remote_name": {
+          "description": "The name the server itself uses.",
+          "type": "string"
+        },
+        "risk": {
+          "description": "The tool's risk classification; MCP tools are always network-risk.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "True when the producer truncated the description or schema to keep the catalog bounded. The full value is not available to a client.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "McpTransport": {
+      "description": "The transport a server uses.",
+      "type": "string",
+      "enum": [
+        "stdio",
+        "streamable_http"
+      ]
+    },
     "MessageId": {
       "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
       "type": "string"
@@ -4434,6 +4900,60 @@
               "type": "string",
               "enum": [
                 "schedule_managed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The answer to [`crate::ClientCommand::ManageMcp`]. Every answer carries the runtime's authoritative server list, including after a failed management action, so a client never merges into stale rows.",
+          "type": "object",
+          "required": [
+            "query_id",
+            "requester_session_id",
+            "response",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "$ref": "#/definitions/CommandId"
+            },
+            "requester_session_id": {
+              "$ref": "#/definitions/SessionId"
+            },
+            "response": {
+              "$ref": "#/definitions/McpResponse"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "mcp_managed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The answer to [`crate::ClientCommand::QuerySettings`]. A projection of the current configuration generation; it is not a configuration store.",
+          "type": "object",
+          "required": [
+            "query_id",
+            "requester_session_id",
+            "settings",
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "$ref": "#/definitions/CommandId"
+            },
+            "requester_session_id": {
+              "$ref": "#/definitions/SessionId"
+            },
+            "settings": {
+              "$ref": "#/definitions/UiSettingsSnapshot"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "settings_loaded"
               ]
             }
           }
@@ -9353,6 +9873,34 @@
         }
       }
     },
+    "UiConfigSource": {
+      "description": "One configuration source the runtime reads, in precedence order (later entries override earlier ones).",
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "precedence",
+        "present"
+      ],
+      "properties": {
+        "kind": {
+          "description": "`global`, `project` or `environment`.",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "precedence": {
+          "description": "0 = lowest precedence.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "present": {
+          "type": "boolean"
+        }
+      }
+    },
     "UiDiff": {
       "description": "A summary of working-tree changes.",
       "type": "object",
@@ -10822,6 +11370,55 @@
         },
         "status": {
           "$ref": "#/definitions/PlanStepStatus"
+        }
+      }
+    },
+    "UiProviderSetting": {
+      "description": "One configured provider, without secrets.",
+      "type": "object",
+      "required": [
+        "api_key_configured",
+        "base_url",
+        "id",
+        "model_count",
+        "protocol",
+        "source"
+      ],
+      "properties": {
+        "api_key_configured": {
+          "description": "Whether a key is resolvable right now. The value itself never leaves the runtime.",
+          "type": "boolean"
+        },
+        "api_key_env": {
+          "description": "The environment variable name the key is read from, when configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url": {
+          "description": "A display-safe base URL (credentials and query removed).",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "model_count": {
+          "description": "How many model entries this provider serves.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "protocol": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Where this provider entry was configured.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiSettingSource"
+            }
+          ]
         }
       }
     },
@@ -12375,6 +12972,153 @@
         },
         "updated_at": {
           "type": "string"
+        }
+      }
+    },
+    "UiSettingSource": {
+      "description": "Where a settings value came from.",
+      "oneOf": [
+        {
+          "description": "The user-global `config.toml`.",
+          "type": "string",
+          "enum": [
+            "global_config"
+          ]
+        },
+        {
+          "description": "The project's configuration bundle.",
+          "type": "string",
+          "enum": [
+            "project_config"
+          ]
+        },
+        {
+          "description": "An environment variable (never its value).",
+          "type": "string",
+          "enum": [
+            "environment"
+          ]
+        },
+        {
+          "description": "The current session row or override.",
+          "type": "string",
+          "enum": [
+            "session"
+          ]
+        },
+        {
+          "description": "A built-in default because no source set the value.",
+          "type": "string",
+          "enum": [
+            "default"
+          ]
+        },
+        {
+          "description": "A client-local preference (for example the TUI theme).",
+          "type": "string",
+          "enum": [
+            "client_local"
+          ]
+        },
+        {
+          "description": "The runtime cannot attribute the value to a source.",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        }
+      ]
+    },
+    "UiSettingsSnapshot": {
+      "description": "The runtime's effective settings projection.",
+      "type": "object",
+      "required": [
+        "config_version",
+        "generated_at",
+        "providers",
+        "sources"
+      ],
+      "properties": {
+        "config_path": {
+          "description": "The user-global config path, when the runtime knows one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_version": {
+          "description": "The configuration generation these values describe.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "context_soft_percent": {
+          "description": "The global soft-compaction percent, when configured.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "default_model": {
+          "description": "The explicitly configured default model, unresolved text as written.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "description": "RFC3339, from the runtime clock.",
+          "type": "string"
+        },
+        "project_config_dir": {
+          "description": "The project configuration directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiProviderSetting"
+          }
+        },
+        "resolved_default_model": {
+          "description": "The default model resolved against this environment's registry.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiConfigSource"
+          }
+        },
+        "theme_default": {
+          "description": "The global TUI theme id configured for future clients.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking_default": {
+          "description": "The global Thinking Level configured for this environment.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThinkingLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

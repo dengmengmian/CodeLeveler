@@ -87,6 +87,34 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 None => Vec::new(),
             },
         },
+        Overlay::DefaultModelPicker(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::DefaultModelPicker(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => match ModelRef::parse(&key) {
+                Some(model) => {
+                    state.model_label = model.to_string();
+                    state.thinking = None;
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Info,
+                        message: state
+                            .t()
+                            .model_switched
+                            .replace("{model}", &model.to_string()),
+                    });
+                    // The explicit "use this from now on" command. It also
+                    // switches this session, so the header follows at once;
+                    // only the runtime may rewrite the persisted default.
+                    vec![Effect::Send(ClientCommand::SetDefaultModel {
+                        session_id: state.session_id.clone(),
+                        model,
+                    })]
+                }
+                None => Vec::new(),
+            },
+        },
         Overlay::ModePicker(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::ModePicker(sel));
@@ -441,7 +469,7 @@ pub(super) fn open_unsupported_media(state: &mut AppState) {
     state.overlay = Some(Overlay::UnsupportedMedia(Box::new(model)));
 }
 
-pub(super) fn open_model_picker(state: &mut AppState) {
+pub(crate) fn open_model_picker(state: &mut AppState) {
     if state.available_models.is_empty() {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
@@ -463,6 +491,35 @@ pub(super) fn open_model_picker(state: &mut AppState) {
     let model =
         SelectionModel::new(state.t().choose_model, options, searchable).focus_key(&current);
     state.overlay = Some(Overlay::ModelPicker(Box::new(model)));
+}
+
+/// `/settings` → the global default model. The table is the same runtime
+/// catalog `/model` shows; only the command on confirm differs.
+pub(crate) fn open_default_model_picker(state: &mut AppState) {
+    if state.available_models.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().no_switchable_model.to_string(),
+        });
+        return;
+    }
+    let current = state.model_label.clone();
+    let options: Vec<SelectionOption> = state
+        .available_models
+        .iter()
+        .map(|m| {
+            let key = m.to_string();
+            SelectionOption::new(key.clone(), key).current(m.to_string() == current)
+        })
+        .collect();
+    let searchable = options.len() > 6;
+    let model = SelectionModel::new(
+        state.t().settings_page.row_default_model,
+        options,
+        searchable,
+    )
+    .focus_key(&current);
+    state.overlay = Some(Overlay::DefaultModelPicker(Box::new(model)));
 }
 
 pub(super) fn open_checkpoint_picker(state: &mut AppState) {
@@ -575,7 +632,7 @@ pub(super) fn open_session_delete_confirm(state: &mut AppState, index: usize) {
     state.overlay = Some(Overlay::ConfirmSessionDelete(Box::new(model)));
 }
 
-pub(super) fn open_mode_picker(state: &mut AppState) {
+pub(crate) fn open_mode_picker(state: &mut AppState) {
     let current = mode_chip_key(state.mode);
     let t = state.t();
     // Same three PermissionProfile values; labels are the footer chips.
@@ -670,7 +727,7 @@ fn start_review(state: &mut AppState, scope: UiReviewScope) -> Vec<Effect> {
     })]
 }
 
-pub(super) fn open_theme_picker(state: &mut AppState) {
+pub(crate) fn open_theme_picker(state: &mut AppState) {
     let current = state.theme.id.as_str();
     let t = state.t();
     let options = vec![
@@ -703,7 +760,7 @@ pub(super) const THINKING_RESET_KEY: &str = "__reset__";
 /// The list is the runtime's capability-driven set — the levels this model can
 /// actually distinguish — so a model with two levels offers three things and
 /// not seven, and a provider's own parameter never appears.
-pub(super) fn open_thinking_picker(state: &mut AppState) {
+pub(crate) fn open_thinking_picker(state: &mut AppState) {
     let t = state.t();
     let Some(thinking) = state.thinking.clone() else {
         state.notification = Some(Notification {

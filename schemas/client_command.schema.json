@@ -81,6 +81,56 @@
       }
     },
     {
+      "description": "Read or manage MCP servers through the runtime's single authority.\n\nAnswers with [`crate::RuntimeEvent::McpManaged`] carrying the same `query_id`. Reserved for trusted local clients: the answer names configuration paths, commands and tool schemas.",
+      "type": "object",
+      "required": [
+        "query_id",
+        "request",
+        "requester_session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "$ref": "#/definitions/CommandId"
+        },
+        "request": {
+          "$ref": "#/definitions/McpRequest"
+        },
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "manage_mcp"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Read the runtime's effective settings projection.\n\nAnswers with [`crate::RuntimeEvent::SettingsLoaded`]. Read-only and local: the projection names configuration paths and provider identities, never secret values. Reserved for trusted local clients.",
+      "type": "object",
+      "required": [
+        "query_id",
+        "requester_session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "$ref": "#/definitions/CommandId"
+        },
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_settings"
+          ]
+        }
+      }
+    },
+    {
       "description": "Ask the runtime for one best-effort prediction of the user's next prompt. The request is advisory UI chrome: it starts no task, persists no message, and may produce no event when there is insufficient context.",
       "type": "object",
       "required": [
@@ -2085,6 +2135,228 @@
     "CommandId": {
       "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
       "type": "string"
+    },
+    "McpNameRef": {
+      "description": "One environment/header name reference in a server specification.\n\n`source` is an environment variable name, never a value. The runtime resolves it at launch; a client must not send a literal secret.",
+      "type": "object",
+      "required": [
+        "key",
+        "source"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    },
+    "McpRequest": {
+      "description": "One management request. Every action answers with the same authoritative list, so a client cannot merge a partial update into stale rows.",
+      "oneOf": [
+        {
+          "description": "Read the current authority. Never connects a server.",
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Connect one configured server again, replacing its current connection.",
+          "type": "object",
+          "required": [
+            "action",
+            "server"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "reconnect"
+              ]
+            },
+            "server": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Re-read the configuration sources and apply the result to this runtime.",
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "reload"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "spec"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "add"
+              ]
+            },
+            "spec": {
+              "$ref": "#/definitions/McpServerSpec"
+            }
+          }
+        },
+        {
+          "description": "Replace the server named `original_name`. Renaming must not collide.",
+          "type": "object",
+          "required": [
+            "action",
+            "original_name",
+            "spec"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "update"
+              ]
+            },
+            "original_name": {
+              "type": "string"
+            },
+            "spec": {
+              "$ref": "#/definitions/McpServerSpec"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "server"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "remove"
+              ]
+            },
+            "server": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "enabled",
+            "server"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "set_enabled"
+              ]
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "server": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "McpServerSpec": {
+      "description": "A complete server declaration for add/update.\n\nThe fields are the configuration vocabulary, not a resolved connection: the runtime validates names and references before writing the file. Unknown transport fields are refused rather than silently ignored.",
+      "type": "object",
+      "required": [
+        "name",
+        "transport"
+      ],
+      "properties": {
+        "args": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "bearer_token_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "Stdio launch program.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "env": {
+          "description": "Destination environment key → source environment variable name.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/McpNameRef"
+          }
+        },
+        "headers": {
+          "description": "Header name → source environment variable name. `Authorization` is refused here; use `bearer_token_env`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/McpNameRef"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "transport": {
+          "$ref": "#/definitions/McpTransport"
+        },
+        "url": {
+          "description": "Streamable HTTP endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpTransport": {
+      "description": "The transport a server uses.",
+      "type": "string",
+      "enum": [
+        "stdio",
+        "streamable_http"
+      ]
     },
     "MessageId": {
       "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",

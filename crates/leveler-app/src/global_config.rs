@@ -433,6 +433,10 @@ struct GlobalMcpServer {
     /// Environment variable holding a bearer token, without the `Bearer ` prefix.
     #[serde(default)]
     bearer_token_env: Option<String>,
+    /// Whether the runtime should connect this server. Absent means enabled;
+    /// a disabled entry stays configured and visible in `/mcp`.
+    #[serde(default = "default_true")]
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1435,6 +1439,7 @@ impl GlobalConfig {
         let mcp_servers = self
             .mcp_servers
             .into_iter()
+            .filter(|server| server.enabled)
             .map(|s| {
                 if mcp_server_is_http(&s) {
                     let headers = resolve_mcp_env_refs(&s.name, s.headers);

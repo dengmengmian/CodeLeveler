@@ -4041,7 +4041,9 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
         );
     }
     for closed in [
-        "/quit", "/paste", "/editor", "/clear",
+        // `/quit` is intentionally absent from this list: it is a live alias
+        // of `/exit`, and Help now shows aliases on the command row.
+        "/paste", "/editor", "/clear",
         // `/skills` is a live inspector, so the guard is the bare command with
         // a trailing gap — `/skills` never matches this.
         "/skill ", "/plan",
@@ -4051,6 +4053,10 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
             "help still lists {closed}: {frame}"
         );
     }
+    assert!(
+        frame.contains("(/quit)"),
+        "the live alias of /exit is shown: {frame}"
+    );
 }
 
 #[test]

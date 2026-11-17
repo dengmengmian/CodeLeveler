@@ -1391,6 +1391,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
         Screen::Doctor => crate::doctor::render_screen(frame, area, state),
+        Screen::Mcp => crate::mcp::render_screen(frame, area, state),
+        Screen::Settings => crate::settings::render_screen(frame, area, state),
         Screen::Tasks => crate::tasks::render_screen(frame, area, state),
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_stats_screen(frame, area, state),

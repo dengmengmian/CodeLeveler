@@ -762,6 +762,8 @@ mod transport {
                         &command,
                         ClientCommand::QueryGlobalTasks { .. }
                             | ClientCommand::QueryDiagnostics { .. }
+                            | ClientCommand::QuerySettings { .. }
+                            | ClientCommand::ManageMcp { .. }
                     )
                 {
                     return send_result(
@@ -808,6 +810,8 @@ mod transport {
                         &envelope.body.command,
                         ClientCommand::QueryGlobalTasks { .. }
                             | ClientCommand::QueryDiagnostics { .. }
+                            | ClientCommand::QuerySettings { .. }
+                            | ClientCommand::ManageMcp { .. }
                     )
                 {
                     return send_result(
@@ -1622,7 +1626,10 @@ mod transport {
             if self.client_kind == ClientKind::Remote
                 && matches!(
                     &command,
-                    ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QueryDiagnostics { .. }
+                    ClientCommand::QueryGlobalTasks { .. }
+                        | ClientCommand::QueryDiagnostics { .. }
+                        | ClientCommand::QuerySettings { .. }
+                        | ClientCommand::ManageMcp { .. }
                 )
             {
                 return Err(ClientError::Runtime(
@@ -1654,7 +1661,10 @@ mod transport {
             if self.client_kind == ClientKind::Remote
                 && matches!(
                     &envelope.command,
-                    ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QueryDiagnostics { .. }
+                    ClientCommand::QueryGlobalTasks { .. }
+                        | ClientCommand::QueryDiagnostics { .. }
+                        | ClientCommand::QuerySettings { .. }
+                        | ClientCommand::ManageMcp { .. }
                 )
             {
                 return Err(ClientError::Runtime(

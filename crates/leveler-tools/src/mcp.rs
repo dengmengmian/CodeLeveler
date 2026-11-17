@@ -162,6 +162,10 @@ pub struct McpClient {
     /// Set when the server's stdout closed: every discovered tool now points at
     /// a dead pipe and the next turn must reconnect this server.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// The protocol version the server negotiated during `initialize`. Starts
+    /// as the version this client requested so a server that omits the field
+    /// still has a truthful fallback.
+    protocol: std::sync::Mutex<String>,
     _child: Child,
 }
 
@@ -248,10 +252,11 @@ impl McpClient {
             pending,
             next_id: AtomicU64::new(1),
             closed,
+            protocol: std::sync::Mutex::new(PROTOCOL_VERSION.to_string()),
             _child: child,
         });
 
-        client
+        let initialized = client
             .request(
                 "initialize",
                 serde_json::json!({
@@ -261,10 +266,27 @@ impl McpClient {
                 }),
             )
             .await?;
+        if let Some(negotiated) = initialized
+            .get("protocolVersion")
+            .and_then(|value| value.as_str())
+        {
+            *client
+                .protocol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = negotiated.to_string();
+        }
         client
             .notify("notifications/initialized", serde_json::json!({}))
             .await?;
         Ok(client)
+    }
+
+    /// The protocol version negotiated with this server.
+    pub fn protocol(&self) -> String {
+        self.protocol
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| PROTOCOL_VERSION.to_string())
     }
 
     async fn request(
@@ -640,6 +662,8 @@ pub struct McpServerConnection {
     pub server: String,
     pub tools: Vec<Arc<dyn Tool>>,
     pub error: Option<String>,
+    /// The negotiated protocol version when the handshake completed.
+    pub protocol: Option<String>,
 }
 
 /// Connect to each configured server and report every attempt separately.
@@ -651,7 +675,7 @@ pub async fn connect_all_detailed(
     let mut connections: Vec<McpServerConnection> = Vec::new();
     for cfg in configs {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-        let error = if cfg.is_streamable_http() {
+        let (error, protocol) = if cfg.is_streamable_http() {
             match mcp_http::HttpSession::connect(cfg).await {
                 Ok(session) => match session.list_tools().await {
                     Ok(infos) => {
@@ -672,7 +696,7 @@ pub async fn connect_all_detailed(
                                 info,
                             )));
                         }
-                        None
+                        (None, Some(protocol))
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -682,7 +706,7 @@ pub async fn connect_all_detailed(
                             error = %error,
                             "MCP tools/list failed"
                         );
-                        Some(format!("tools/list failed: {error}"))
+                        (Some(format!("tools/list failed: {error}")), None)
                     }
                 },
                 Err(error) => {
@@ -693,32 +717,34 @@ pub async fn connect_all_detailed(
                         error = %error,
                         "MCP server unavailable"
                     );
-                    Some(error)
+                    (Some(error), None)
                 }
             }
         } else {
             match McpClient::connect_with_authority(cfg, environment, unrestricted).await {
                 Ok(client) => match client.list_tools().await {
                     Ok(infos) => {
+                        let protocol = client.protocol();
                         tracing::info!(
                             server = %cfg.name,
                             transport = "stdio",
+                            protocol = %protocol,
                             tools = infos.len(),
                             "MCP server connected"
                         );
                         for info in infos {
                             tools.push(Arc::new(McpTool::new(client.clone(), &cfg.name, info)));
                         }
-                        None
+                        (None, Some(protocol))
                     }
                     Err(e) => {
                         tracing::warn!("MCP `{}` tools/list 失败:{e}", cfg.name);
-                        Some(format!("tools/list failed: {e}"))
+                        (Some(format!("tools/list failed: {e}")), None)
                     }
                 },
                 Err(e) => {
                     tracing::warn!("{e}");
-                    Some(e)
+                    (Some(e), None)
                 }
             }
         };
@@ -726,6 +752,7 @@ pub async fn connect_all_detailed(
             server: cfg.name.clone(),
             tools,
             error,
+            protocol,
         });
     }
     connections
@@ -915,6 +942,7 @@ for line in sys.stdin:
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            protocol: std::sync::Mutex::new(PROTOCOL_VERSION.to_string()),
             _child: child,
         });
         let tool = McpTool::new(

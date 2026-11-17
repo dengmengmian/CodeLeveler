@@ -42,6 +42,7 @@ pub mod i18n;
 mod issue;
 mod layout;
 pub mod markdown;
+pub mod mcp;
 pub mod memory;
 pub mod motion;
 pub mod multi_agent;
@@ -70,6 +71,7 @@ pub(crate) mod shell_render;
 /// is the product's fixed window height: a client test asserting "the record
 /// stopped growing" must describe the same bound the renderer paints.
 pub use shell_render::SHELL_OUTPUT_WINDOW_ROWS;
+pub mod settings;
 pub mod skills_view;
 mod splash;
 pub mod state;

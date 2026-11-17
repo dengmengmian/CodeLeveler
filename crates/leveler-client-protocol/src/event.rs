@@ -265,6 +265,21 @@ pub enum RuntimeEvent {
         query_id: crate::CommandId,
         response: Box<crate::schedule::ScheduleResponse>,
     },
+    /// The answer to [`crate::ClientCommand::ManageMcp`]. Every answer carries
+    /// the runtime's authoritative server list, including after a failed
+    /// management action, so a client never merges into stale rows.
+    McpManaged {
+        requester_session_id: crate::SessionId,
+        query_id: crate::CommandId,
+        response: Box<crate::mcp::McpResponse>,
+    },
+    /// The answer to [`crate::ClientCommand::QuerySettings`]. A projection of
+    /// the current configuration generation; it is not a configuration store.
+    SettingsLoaded {
+        requester_session_id: crate::SessionId,
+        query_id: crate::CommandId,
+        settings: Box<crate::settings::UiSettingsSnapshot>,
+    },
     /// The runtime finished booting and is ready for commands.
     RuntimeReady,
     /// The build this client's stream is connected to, observed when the

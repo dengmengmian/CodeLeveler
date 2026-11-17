@@ -45,6 +45,16 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             query_id,
             report,
         } => crate::doctor::apply_loaded(state, &requester_session_id, &query_id, *report),
+        RuntimeEvent::McpManaged {
+            requester_session_id,
+            query_id,
+            response,
+        } => crate::mcp::apply_managed(state, &requester_session_id, &query_id, *response),
+        RuntimeEvent::SettingsLoaded {
+            requester_session_id,
+            query_id,
+            settings,
+        } => crate::settings::apply_loaded(state, &requester_session_id, &query_id, *settings),
         RuntimeEvent::RuntimeReady => {}
         RuntimeEvent::RuntimeBuildObserved { runtime_build } => {
             let was_mismatched = state.runtime_version_mismatch;

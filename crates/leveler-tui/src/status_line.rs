@@ -417,6 +417,7 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             // Pickers are also user-blocked, but they are local chrome, not
             // runtime waits — still treat as awaiting-user for honesty.
             crate::overlay::Overlay::ModelPicker(_)
+            | crate::overlay::Overlay::DefaultModelPicker(_)
             | crate::overlay::Overlay::ModePicker(_)
             | crate::overlay::Overlay::ThemePicker(_)
             | crate::overlay::Overlay::CollabPicker(_)

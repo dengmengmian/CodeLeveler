@@ -615,6 +615,10 @@ pub struct InProcessRuntimeClient {
     session_runtime: Arc<Mutex<HashMap<SessionId, SessionRuntimeConfig>>>,
     // Serialize committed settings with their live permission projection.
     settings_edits: Arc<tokio::sync::Mutex<()>>,
+    /// One MCP management mutation at a time. The config file and the live
+    /// connection cache must change together; two clients interleaving their
+    /// read-modify-write would lose one server or apply a stale generation.
+    mcp_manage: Arc<tokio::sync::Mutex<()>>,
     /// When true, skip the approval overlay (AutoApprove) so unattended TUI
     /// PTY drivers and CI dogfood can run interactive turns.
     auto_approve: bool,
@@ -1946,6 +1950,7 @@ impl InProcessRuntimeClient {
             },
             session_runtime: Arc::new(Mutex::new(HashMap::new())),
             settings_edits: Arc::new(tokio::sync::Mutex::new(())),
+            mcp_manage: Arc::new(tokio::sync::Mutex::new(())),
             auto_approve,
             media_root,
             events,
@@ -7110,6 +7115,66 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             return Err(ClientError::Runtime("snapshot version required: deliver this setting with its observed expected_version".into()));
         }
         match command {
+            ClientCommand::ManageMcp {
+                requester_session_id,
+                query_id,
+                request,
+            } => {
+                let mode = self
+                    .runtime_config(&requester_session_id)
+                    .await
+                    .map(|config| config.mode)
+                    .unwrap_or(PermissionProfile::Assisted);
+                // A configuration write or reconnect under a live turn would
+                // change the tool surface that turn is already using. Reads
+                // stay available; every mutation names the reason it waited.
+                let is_list = matches!(
+                    request.as_ref(),
+                    leveler_client_protocol::mcp::McpRequest::List
+                );
+                // One mutation at a time. `List` stays lock-free: a page must
+                // never wait behind a slow config write to show its rows.
+                let _manage = if is_list {
+                    None
+                } else {
+                    Some(self.mcp_manage.lock().await)
+                };
+                let response = if !is_list && !self.active.snapshots().is_empty() {
+                    let servers = crate::mcp_service::servers(self.app.as_ref(), mode)
+                        .await
+                        .unwrap_or_default();
+                    leveler_client_protocol::mcp::McpResponse::Error {
+                        servers,
+                        message:
+                            "MCP servers cannot be changed while a turn is running; wait for it to settle"
+                                .into(),
+                    }
+                } else {
+                    crate::mcp_service::manage(self.app.as_ref(), mode, *request).await
+                };
+                let _ = self
+                    .events_for(&requester_session_id)
+                    .send(RuntimeEvent::McpManaged {
+                        requester_session_id,
+                        query_id,
+                        response: Box::new(response),
+                    });
+                Ok(())
+            }
+            ClientCommand::QuerySettings {
+                requester_session_id,
+                query_id,
+            } => {
+                let settings = self.app.settings_snapshot();
+                let _ = self
+                    .events_for(&requester_session_id)
+                    .send(RuntimeEvent::SettingsLoaded {
+                        requester_session_id,
+                        query_id,
+                        settings: Box::new(settings),
+                    });
+                Ok(())
+            }
             ClientCommand::ManageSchedule {
                 requester_session_id,
                 query_id,
@@ -7269,7 +7334,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // plus the project's resolved agent registry. No provider
                 // request, no MCP call, no configuration write.
                 let config = self.app.effective_config();
-                let mut findings = crate::doctor::run(&config);
+                let mode = self
+                    .runtime_config(&requester_session_id)
+                    .await
+                    .map(|runtime| runtime.mode)
+                    .unwrap_or(PermissionProfile::Assisted);
+                // The same authority `/mcp` reads. This projection never
+                // connects a server just because diagnostics asked.
+                let mcp = crate::mcp_service::servers(self.app.as_ref(), mode)
+                    .await
+                    .ok();
+                let mut findings = crate::doctor::run_with_mcp(&config, mcp.as_deref());
                 if let Some(root) = self.app.layout.primary_workspace() {
                     findings.push(crate::doctor::agents_check(
                         &leveler_agent::agent_registry::AgentRoots::for_project(root),

@@ -50,6 +50,8 @@ mod foreign;
 mod global_tasks;
 mod goal_command;
 mod goals;
+/// MCP server status and management shared by every client.
+pub mod mcp;
 mod media;
 mod memory;
 mod observability;
@@ -62,6 +64,8 @@ pub mod review;
 pub mod schedule;
 /// WebSocket framing for a session: the shapes every session client speaks.
 pub mod session_wire;
+/// The runtime's effective settings projection shared by every client.
+pub mod settings;
 mod skills;
 mod snapshot;
 mod terminal;
