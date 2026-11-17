@@ -141,7 +141,7 @@ max_results = 5
 timeout_ms = 15000
 ```
 
-在启动 CodeLeveler 前设置对应环境变量。只设置 Key、不添加 `[web.search]` 不会启用搜索。界面链接和 `/web` 使用系统默认浏览器。
+在启动 CodeLeveler 前设置对应环境变量。只设置 Key、不添加 `[web.search]` 不会启用搜索。界面链接使用系统默认浏览器。
 
 ## MCP 服务
 

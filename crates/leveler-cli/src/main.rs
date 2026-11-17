@@ -51,9 +51,7 @@ use info_cmds::{
 };
 use mcp_lsp_cmds::{cmd_lsp, cmd_mcp};
 use permissions_cmds::cmd_permissions;
-use run_cmds::{
-    cmd_resume, cmd_run, cmd_run_parallel, cmd_run_resume, cmd_serve, cmd_tui, cmd_web,
-};
+use run_cmds::{cmd_resume, cmd_run, cmd_run_parallel, cmd_run_resume, cmd_serve, cmd_tui};
 use sessions_cmd::cmd_sessions;
 
 /// Deep asynchronous turns (engine -> turn -> agent -> tools) need more stack
@@ -319,27 +317,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                 socket,
                 tcp,
                 ready_json,
-            )
-            .await
-        }
-        Command::Web {
-            addr,
-            connect,
-            token,
-            model,
-            mode,
-            auto_approve,
-            deny_network,
-        } => {
-            cmd_web(
-                layout,
-                addr,
-                connect,
-                token,
-                model,
-                mode,
-                auto_approve,
-                deny_network,
             )
             .await
         }

@@ -668,7 +668,7 @@ fn lifecycle_state(error: &anyhow::Error) -> Option<leveler_runtime_host::Runtim
 ///
 /// `kind` is the protocol error class; `state` and `next_step` are present only
 /// for a lifecycle failure, and they come from the SAME vocabulary the terminal
-/// and the Web use — so a Desktop client can offer the actionable next step
+/// uses — so a Desktop client can offer the actionable next step
 /// instead of a generic "connect failed".
 fn error_payload(error: &anyhow::Error) -> Value {
     let mut payload = json!({"message": error.to_string(), "kind": error_kind(error)});

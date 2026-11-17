@@ -33,7 +33,6 @@ members = [
     "crates/leveler-schedule",
     "crates/leveler-update",
     "crates/leveler-tui",
-    "crates/leveler-web",
     "crates/leveler-cli",
     "crates/leveler-test-support",
     "xtask",
@@ -81,7 +80,6 @@ leveler-native = { version = "1.0.27", path = "crates/leveler-native" }
 leveler-schedule = { version = "1.0.27", path = "crates/leveler-schedule" }
 leveler-update = { version = "1.0.27", path = "crates/leveler-update" }
 leveler-tui = { version = "1.0.27", path = "crates/leveler-tui" }
-leveler-web = { version = "1.0.27", path = "crates/leveler-web" }
 leveler-test-support = { version = "1.0.27", path = "crates/leveler-test-support" }
 
 # Async runtime
@@ -105,13 +103,11 @@ bytes = "1"
 # No TLS features — the endpoint is always 127.0.0.1.
 tokio-tungstenite = "0.26"
 
-# Web UI server (browser client)
+# HTTP test server for the MCP HTTP client tests
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
-rust-embed = { version = "8", features = ["debug-embed"] }
-mime_guess = "2"
-ignore = "0.4"
 
 # Deterministic workspace search (the `read`/`ls`/`find`/`grep` primitives)
+ignore = "0.4"
 globset = "0.4"
 regex = "1"
 

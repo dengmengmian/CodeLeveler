@@ -6,9 +6,9 @@
 //! contract: `deliver` returns only after the engine committed the turn's
 //! write-ahead input record — the `turns` row carrying the user's message —
 //! which is what makes a post-crash retry with the same `command_id` safe.
-//! The in-process runtime inside the `leveler` process, the `/web` UI served
-//! from that same runtime, and the daemon `leveler serve` exposes through the
-//! same client all wait on that acceptance. The old split — the daemon
+//! The in-process runtime inside the `leveler` process and the daemon
+//! `leveler serve` exposes through the same client both wait on that
+//! acceptance. The old split — the daemon
 //! awaiting admission while the embedded configuration answered as soon as a
 //! worker was spawned — is gone; `docs/ARCHITECTURE.zh-CN.md` (§13.2.1) was
 //! updated with it.
@@ -120,9 +120,8 @@ fn model() -> ModelRef {
 }
 
 /// The one in-process configuration every interactive client uses: the
-/// `leveler` process's TUI runtime, the `/web` UI served from that runtime,
-/// and the daemon `leveler serve` exposes. There is no longer a second
-/// setting for the ACK boundary.
+/// `leveler` process's TUI runtime and the daemon `leveler serve` exposes.
+/// There is no longer a second setting for the ACK boundary.
 fn embedded(app: Arc<Application>) -> InProcessRuntimeClient {
     InProcessRuntimeClient::new_with_options(
         app,
@@ -490,12 +489,12 @@ async fn an_embedded_success_ack_does_not_deadlock_a_multi_thread_runtime() {
     assert_an_embedded_success_ack_is_durable_admission().await;
 }
 
-/// ACK-02: the WebUI's entry point is `deliver_protocol` (the frame the
-/// WebSocket handler hands the runtime), not `deliver`. It must reach the same
-/// admission barrier — a browser told `ack` may not be told that for a command
+/// ACK-02: the protocol entry point is `deliver_protocol` (the frame an
+/// enveloped client hands the runtime), not `deliver`. It must reach the same
+/// admission barrier — a client told `ack` may not be told that for a command
 /// the runtime refused.
 #[tokio::test]
-async fn the_web_protocol_entry_reaches_the_same_admission_barrier() {
+async fn the_protocol_entry_reaches_the_same_admission_barrier() {
     let owned = owned_session().await;
     let other = embedded(second_window(owned._tmp.path()));
     let delivered = tokio::time::timeout(
@@ -503,11 +502,11 @@ async fn the_web_protocol_entry_reaches_the_same_admission_barrier() {
         other.deliver_protocol(ProtocolEnvelope::wrap(owned.envelope.clone())),
     )
     .await
-    .expect("the web entry point must answer, not hang");
+    .expect("the protocol entry point must answer, not hang");
 
     assert!(
         matches!(delivered, Err(ClientError::OwnershipConflict(_))),
-        "the WebUI's entry point must surface the refusal, not ack it: {delivered:?}"
+        "the protocol entry point must surface the refusal, not ack it: {delivered:?}"
     );
     assert_eq!(
         turns(&owned.owner, &owned.session).await,

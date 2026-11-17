@@ -539,26 +539,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             apply_effect_completion(state, completion);
             Vec::new()
         }
-        Action::WebLaunched(result) => {
-            state.web_starting = false;
-            match result {
-                Ok(url) => {
-                    state.notification = Some(Notification {
-                        level: NotificationLevel::Info,
-                        message: format!("Web UI 已启动：{url}"),
-                    });
-                    state.web_url = Some(url.clone());
-                    vec![Effect::OpenWebUrl(url)]
-                }
-                Err(message) => {
-                    state.notification = Some(Notification {
-                        level: NotificationLevel::Warning,
-                        message: format!("Web UI 启动失败：{message}"),
-                    });
-                    Vec::new()
-                }
-            }
-        }
         Action::UrlOpened { url, result } => {
             state.notification = Some(match result {
                 Ok(()) => Notification {

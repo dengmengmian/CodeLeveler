@@ -1255,8 +1255,8 @@ impl EventBridge {
             }
             EngineEvent::CommandProgress { label, elapsed_ms } => {
                 // Structured event; the TUI reducer turns it into the status-line
-                // label ("运行 cargo test · 02:31"). Single source, so Web/logs get
-                // the same structured data instead of a pre-formatted string.
+                // label ("运行 cargo test · 02:31"). Single source, so clients and
+                // logs get the same structured data instead of a pre-formatted string.
                 let _ = self
                     .events
                     .send(RuntimeEvent::CommandProgress { label, elapsed_ms });

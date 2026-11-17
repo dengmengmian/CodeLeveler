@@ -6,7 +6,7 @@
 
 ## 创建
 
-在 Web 界面打开「设置 → Agents」，或直接在对话里请 CodeLeveler 创建。通过对话保存或删除时，界面会先展示要改的内容，等你确认。
+在对话里请 CodeLeveler 创建。通过对话保存或删除时，界面会先展示要改的内容，等你确认。
 
 也可以自己建目录。每个 Agent 需要两个文件，`agent.yaml` 填设置，`instructions.md` 写工作要求。
 
@@ -56,7 +56,7 @@ name: frontend-worker
 description: Implements frontend changes.
 capability: writer
 workspace:
-  write_roots: [crates/leveler-web/web/src]
+  write_roots: [apps/leveler-desktop/src]
 ```
 
 ## 使用与排错

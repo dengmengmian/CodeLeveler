@@ -44,11 +44,6 @@ pub fn apply(host: &dyn Host, repo: &Path, mode: Mode) -> Result<Report, Fail> {
         }
     }
     if mode == Mode::All {
-        let rel = "crates/leveler-web/web/dist";
-        let path = repo.join(rel);
-        if remove_registered(&repo, &path)? {
-            removed.push(rel.to_string());
-        }
         cargo_clean(host, &repo, &[])?;
         removed.push("cargo clean".to_string());
         let shared = repo.join(".codeleveler-target");

@@ -27,7 +27,7 @@ use leveler_client_protocol::{
     NotificationLevel, ProtocolEnvelope, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
 
-use crate::action::{Action, CleanHost, Effect, EffectCompletion, UrlOpener, WebLauncher};
+use crate::action::{Action, CleanHost, Effect, EffectCompletion, UrlOpener};
 use crate::reducer::reduce;
 use crate::render::render;
 use crate::screen::Screen;
@@ -111,10 +111,6 @@ const INPUT_BURST_WINDOW: Duration = Duration::from_millis(2);
 /// How many history entries persist across restarts.
 const HISTORY_CAP: usize = 100;
 
-/// Fallback when the host did not inject a Web launcher. Local Unix-socket
-/// daemons are not this case — they carry a launcher. Do not call them remote.
-const WEB_LAUNCHER_UNAVAILABLE: &str = "当前 TUI 没有可用的 Web UI 启动器";
-
 /// `/clean` needs a host-provided scanner; without it the page cannot run.
 /// Only the standalone TUI tests hit this — the CLI always injects one.
 const CLEAN_UNAVAILABLE: &str = "storage cleanup host unavailable";
@@ -140,7 +136,6 @@ pub enum TuiExit {
 /// quits. Restores the terminal on any exit path.
 pub async fn run(
     client: Arc<dyn InteractiveRuntimeClient>,
-    web_launcher: Option<WebLauncher>,
     url_opener: Option<UrlOpener>,
     clean_host: Option<CleanHost>,
     boot: Boot,
@@ -527,7 +522,6 @@ pub async fn run(
             &client,
             &completion_tx,
             &delivery_tx,
-            &web_launcher,
             &url_opener,
             &clean_host,
             &mut alt,
@@ -1045,7 +1039,6 @@ fn dispatch_effects(
     client: &Arc<dyn InteractiveRuntimeClient>,
     completion_tx: &mpsc::UnboundedSender<Action>,
     delivery_tx: &mpsc::UnboundedSender<DeliveryJob>,
-    web_launcher: &Option<WebLauncher>,
     url_opener: &Option<UrlOpener>,
     clean_host: &Option<CleanHost>,
     // `$EDITOR` takes the terminal over, so it needs the alternate-screen
@@ -1145,21 +1138,6 @@ fn dispatch_effects(
                     }
                 });
             }
-            Effect::StartWeb => match web_launcher {
-                Some(launcher) => {
-                    let launcher = Arc::clone(launcher);
-                    let tx = completion_tx.clone();
-                    tokio::spawn(async move {
-                        let result = launcher().await;
-                        let _ = tx.send(Action::WebLaunched(result));
-                    });
-                }
-                None => {
-                    let _ = completion_tx.send(Action::WebLaunched(Err(
-                        WEB_LAUNCHER_UNAVAILABLE.to_string()
-                    )));
-                }
-            },
             Effect::OpenWebUrl(url) => {
                 let tx = completion_tx.clone();
                 match url_opener {
@@ -1816,7 +1794,6 @@ mod tests {
             &delivery_tx,
             &None,
             &None,
-            &None,
             &mut None,
             &mut io::stdout(),
         );
@@ -2312,22 +2289,6 @@ mod tests {
             level: NotificationLevel::Info,
             message: "hi".into(),
         }
-    }
-
-    #[test]
-    fn missing_web_launcher_does_not_call_a_local_daemon_remote() {
-        assert!(
-            !WEB_LAUNCHER_UNAVAILABLE.contains("远程"),
-            "{WEB_LAUNCHER_UNAVAILABLE}"
-        );
-        assert!(
-            !WEB_LAUNCHER_UNAVAILABLE.contains("remote"),
-            "{WEB_LAUNCHER_UNAVAILABLE}"
-        );
-        assert!(
-            !WEB_LAUNCHER_UNAVAILABLE.contains("leveler web --connect"),
-            "{WEB_LAUNCHER_UNAVAILABLE}"
-        );
     }
 
     #[test]

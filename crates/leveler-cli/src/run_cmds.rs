@@ -940,60 +940,6 @@ async fn observe_retiring_runtime(
     .await
 }
 
-/// Bind the TUI-embedded Web UI against an existing local runtime service.
-///
-/// `/web` is a TUI capability, not an in-process-runtime capability: HTTP
-/// lives in this process and routes through whatever [`LocalRuntimeService`]
-/// the TUI already has. It does not own that runtime and does not open
-/// daemon TCP.
-async fn bind_tui_web_ui(
-    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
-    repo_root: PathBuf,
-    shutdown: CancellationToken,
-) -> Result<String, String> {
-    let token = leveler_runtime_host::generate_daemon_token();
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
-    let router = leveler_web::RouterService::new(service, repo_root);
-    let manager = leveler_web::ProjectManager::new(
-        router.clone(),
-        leveler_core::LevelerHome::resolve(leveler_core::environment()),
-        std::env::current_exe().ok(),
-    );
-    let background = manager.clone();
-    tokio::spawn(async move {
-        background.clone().load_registry().await;
-        background
-            .discover_historical_projects(&std::env::temp_dir())
-            .await;
-    });
-    let server = leveler_web::bind_multi(router, manager, addr, token.clone())
-        .await
-        .map_err(|e| e.to_string())?;
-    let local = server.local_addr();
-    if !local.ip().is_loopback() {
-        return Err(format!("refusing to serve Web UI on non-loopback {local}"));
-    }
-    let url = format!("http://{local}/?token={token}");
-    tokio::spawn(async move {
-        let _ = server.serve(shutdown).await;
-    });
-    Ok(url)
-}
-
-/// Shared `/web` launcher for in-process and daemon-connected TUIs.
-fn make_web_launcher(
-    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
-    repo_root: PathBuf,
-    shutdown: CancellationToken,
-) -> leveler_tui::WebLauncher {
-    Arc::new(move || {
-        let service = service.clone();
-        let repo_root = repo_root.clone();
-        let shutdown = shutdown.clone();
-        Box::pin(async move { bind_tui_web_ui(service, repo_root, shutdown).await })
-    })
-}
-
 fn make_url_opener() -> leveler_tui::UrlOpener {
     Arc::new(move |url| {
         Box::pin(async move {
@@ -1011,8 +957,8 @@ fn make_url_opener() -> leveler_tui::UrlOpener {
 /// durable way to ask for the goal lifecycle. The statement lives ONCE, on the
 /// axis vocabulary itself
 /// ([`leveler_lifecycle::CollaborationMode::interactive_session`]), because
-/// every interactive host states it — the terminal, the Web host and the
-/// Desktop bridge. Reading `CollaborationMode::default()` instead would hand the
+/// every interactive host states it — the terminal and the Desktop bridge.
+/// Reading `CollaborationMode::default()` instead would hand the
 /// axis to the product's coding-session default, and interactive clients would
 /// silently disagree the moment that default moved. Resuming a session takes its
 /// persisted axis and never passes through here.
@@ -1240,17 +1186,9 @@ pub(crate) async fn cmd_tui(
             // screen is not the one the user last chose.
             model_notice,
         };
-        let runtime_service: Arc<dyn leveler_local_transport::LocalRuntimeService> = client.clone();
-        let web_shutdown = CancellationToken::new();
-        let web_launcher = make_web_launcher(
-            runtime_service,
-            layout.require_workspace()?.to_path_buf(),
-            web_shutdown.clone(),
-        );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
         let exit = leveler_tui::run(
             client,
-            Some(web_launcher),
             Some(make_url_opener()),
             Some(crate::clean_cmd::clean_host()),
             boot,
@@ -1258,8 +1196,6 @@ pub(crate) async fn cmd_tui(
             leveler_tui::ClientExitScope::DetachesFromRuntime,
         )
         .await;
-        // Stop the TUI-owned HTTP server on errors too; the daemon keeps running.
-        web_shutdown.cancel();
         let exit = exit?;
         // `/update` installed a new binary: replace this process, preserving
         // the original invocation. The daemon keeps serving either way.
@@ -1342,22 +1278,7 @@ pub(crate) async fn cmd_tui(
         app.set_persisted_permission_profile(&session_id, mode)
             .await?;
     }
-    // `/web` inside the TUI binds the browser Web UI over this same in-process
-    // runtime. The service is the `InProcessRuntimeClient` itself (it implements
-    // `LocalRuntimeService`); the launcher mints a fresh token and serves on an
-    // ephemeral loopback port, returning the token-carrying URL. Aggregation
-    // mode, same as `leveler web`: without it every `/api/projects` endpoint
-    // 404s ("打开项目失败: Not Found") and the sidebar can only ever show the
-    // current repository.
-    let web_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
-        in_process_client.clone();
     let quit_client = in_process_client.clone();
-    let web_shutdown = CancellationToken::new();
-    let web_launcher = make_web_launcher(
-        web_service,
-        app.layout.require_workspace()?.to_path_buf(),
-        web_shutdown.clone(),
-    );
 
     let client: Arc<dyn InteractiveRuntimeClient> = in_process_client;
 
@@ -1395,7 +1316,6 @@ pub(crate) async fn cmd_tui(
 
     let exit = leveler_tui::run(
         client,
-        Some(web_launcher),
         Some(make_url_opener()),
         Some(crate::clean_cmd::clean_host()),
         boot,
@@ -1404,7 +1324,6 @@ pub(crate) async fn cmd_tui(
         leveler_tui::ClientExitScope::EndsWithClient,
     )
     .await;
-    web_shutdown.cancel();
     // Terminal loss is not an explicit session stop, but this process owns
     // the runtime. Shut it down on both success and terminal I/O failure.
     let _ = quit_client
@@ -1414,14 +1333,7 @@ pub(crate) async fn cmd_tui(
     if exit == leveler_tui::TuiExit::Restart {
         crate::upgrade_cmd::restart_after_update();
     }
-    // The TUI owns the only runtime, and an in-process `/web` server is spawned
-    // detached on a token it never cancels (it serves "until the process
-    // exits"). Falling through to a normal return would drop the runtime with
-    // that task still live, which hangs the process — the terminal is restored
-    // and the composer draft/history are already persisted inside `run`, but the
-    // shell never comes back. Exit the process directly so a running Web UI can
-    // never keep the CLI alive after the user quits the TUI.
-    std::process::exit(0);
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1503,7 +1415,7 @@ pub(crate) async fn cmd_serve(
     }
     if let Some((server, token)) = &bound.tcp {
         println!("  tcp: {}", server.local_addr()?);
-        // Printed once to the operator's own terminal: this is how a WebUI /
+        // Printed once to the operator's own terminal: this is how an
         // external client authenticates. Not logged elsewhere.
         println!("  token: {token}");
     }
@@ -1562,219 +1474,6 @@ pub(crate) async fn cmd_serve(
         .await;
     result?;
     Ok(std::process::ExitCode::SUCCESS)
-}
-
-/// Start the browser WebUI server. Default: assemble an in-process runtime
-/// (like `serve`); with `--connect`, bridge an existing TCP daemon instead.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn cmd_web(
-    layout: Layout,
-    addr: SocketAddr,
-    connect: Option<SocketAddr>,
-    token: Option<String>,
-    model: Option<String>,
-    mode: Option<RunMode>,
-    auto_approve: bool,
-    sandbox: bool,
-) -> anyhow::Result<std::process::ExitCode> {
-    // The owned runtime is kept only so an in-process server can shut it down
-    // explicitly on exit; a connected daemon belongs to another process. The
-    // in-process path runs in aggregation mode: the primary repository behind
-    // a RouterService, plus registered project daemons (probe-or-spawn).
-    let (server, runtime, token) = match connect {
-        Some(daemon_addr) => {
-            let token =
-                token.ok_or_else(|| anyhow::anyhow!("--token is required with --connect"))?;
-            let client = LocalSocketRuntimeClient::connect_tcp(daemon_addr, token.clone()).await?;
-            let service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
-                Arc::new(DaemonService(client));
-            // Aggregation is available in --connect mode too, so the WebUI's
-            // "open project" flow works (POST /api/projects) instead of 404ing.
-            // The daemon is the primary behind the RouterService; added projects
-            // get their own probe-or-spawn daemons like the in-process path.
-            let router =
-                leveler_web::RouterService::new(service, layout.require_workspace()?.to_path_buf());
-            let manager = leveler_web::ProjectManager::new(
-                router.clone(),
-                leveler_core::LevelerHome::resolve(leveler_core::environment()),
-                std::env::current_exe().ok(),
-            );
-            let background = manager.clone();
-            tokio::spawn(async move {
-                background.clone().load_registry().await;
-                background
-                    .discover_historical_projects(&std::env::temp_dir())
-                    .await;
-            });
-            let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
-            (server, None, token)
-        }
-        None => {
-            if token.is_some() {
-                return Err(anyhow::anyhow!(
-                    "--token is only meaningful with --connect (without it, a token is generated)"
-                ));
-            }
-            let app = Arc::new(Application::assemble(layout)?);
-            app.reconcile_execution_services().await?;
-            let model_ref = resolve_model(app.as_ref(), model)?;
-            let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
-                app.clone(),
-                model_ref,
-                resolve_mode(mode, project_default_mode(&app.layout)),
-                sandbox,
-                auto_approve,
-            ));
-            app.start_config_watcher();
-            runtime.spawn_config_bridge();
-            let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
-            let db = app.open_database().await?;
-            let engine = app.task_engine(&db)?;
-            let reap = leveler_engine::reap_after_restart(
-                &engine,
-                None,
-                leveler_engine::ReapScope::EndedBoots,
-            )
-            .await?;
-            app.finish_reaped_sessions(&engine, &reap.reaped_sessions)
-                .await?;
-            if !reap.events.is_empty() {
-                tracing::warn!(
-                    reaped = reap.events.len(),
-                    "reaped zombie turns before WebUI startup"
-                );
-            }
-            let router = leveler_web::RouterService::new(
-                service,
-                app.layout.require_workspace()?.to_path_buf(),
-            );
-            let manager = leveler_web::ProjectManager::new(
-                router.clone(),
-                leveler_core::LevelerHome::resolve(leveler_core::environment()),
-                std::env::current_exe().ok(),
-            );
-            // Bring persisted projects online in the background — the server
-            // must not wait on daemons that need spawning. Then register
-            // every repository that has Leveler state (TUI-only projects), so
-            // the sidebar lists all previously used projects.
-            let background = manager.clone();
-            tokio::spawn(async move {
-                background.clone().load_registry().await;
-                background
-                    .discover_historical_projects(&std::env::temp_dir())
-                    .await;
-            });
-            let token = leveler_runtime_host::generate_daemon_token();
-            let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
-            (server, Some(runtime), token)
-        }
-    };
-
-    println!("{}", Line::heading("Web UI ready"));
-    // Printed once to the operator's own terminal: the URL carries the bearer
-    // token the browser needs. Not logged elsewhere.
-    println!("  url: http://{}/?token={token}", server.local_addr());
-    println!("  press Ctrl+C to stop the server");
-
-    let shutdown = CancellationToken::new();
-    let signal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
-        // must not orphan background tasks / the browser tree (R004 F7).
-        #[cfg(unix)]
-        {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-            // SIGHUP: a closing spawn terminal must trigger the same graceful
-            // path, never a default hard kill that orphans background tasks
-            // and wipes session policy (R006 R6-P2).
-            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("install SIGHUP handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-                _ = hup.recv() => {}
-            }
-            signal_shutdown.cancel();
-        }
-        #[cfg(not(unix))]
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_shutdown.cancel();
-        }
-    });
-    let result = server.serve(shutdown).await;
-    if let Some(runtime) = runtime {
-        // Stopping an in-process server is an explicit runtime shutdown,
-        // unlike closing a browser tab. Cancel and reap remaining turns.
-        let _ = runtime
-            .send(leveler_client_protocol::ClientCommand::Quit)
-            .await;
-    }
-    result?;
-    Ok(std::process::ExitCode::SUCCESS)
-}
-
-/// A `LocalRuntimeService` facade over a TCP-connected daemon client: the
-/// transport client has the right methods but cannot implement the trait in
-/// its own crate without a dependency cycle, so the impl lives here.
-struct DaemonService(LocalSocketRuntimeClient);
-
-#[async_trait::async_trait]
-impl InteractiveRuntimeClient for DaemonService {
-    async fn send(
-        &self,
-        command: leveler_client_protocol::ClientCommand,
-    ) -> Result<(), leveler_client_protocol::ClientError> {
-        self.0.send(command).await
-    }
-
-    async fn deliver(
-        &self,
-        envelope: leveler_client_protocol::CommandEnvelope,
-    ) -> Result<(), leveler_client_protocol::ClientError> {
-        self.0.deliver(envelope).await
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
-        self.0.subscribe()
-    }
-
-    fn subscribe_session(
-        &self,
-        session_id: &leveler_core::SessionId,
-    ) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
-        self.0.subscribe_session(session_id)
-    }
-
-    async fn snapshot(
-        &self,
-        session_id: &leveler_core::SessionId,
-    ) -> Result<leveler_client_protocol::UiSessionSnapshot, leveler_client_protocol::ClientError>
-    {
-        self.0.snapshot(session_id).await
-    }
-}
-
-#[async_trait::async_trait]
-impl leveler_local_transport::LocalRuntimeService for DaemonService {
-    async fn create_session(
-        &self,
-        request: CreateSessionRequest,
-    ) -> Result<leveler_local_transport::SessionBootstrap, leveler_client_protocol::ClientError>
-    {
-        self.0.create_session(request).await
-    }
-
-    async fn local_waiter_count(&self) -> Result<usize, leveler_client_protocol::ClientError> {
-        self.0.local_waiter_count().await
-    }
-
-    async fn runtime_info(
-        &self,
-    ) -> Result<leveler_client_protocol::RuntimeInfo, leveler_client_protocol::ClientError> {
-        leveler_local_transport::LocalRuntimeService::runtime_info(&self.0).await
-    }
 }
 
 /// Interactive resume: reopen a session in the TUI (the mainstream `resume`).
@@ -2441,142 +2140,10 @@ compatibility:
     }
 
     #[test]
-    fn in_process_and_socket_clients_are_the_same_web_capability() {
+    fn in_process_and_socket_clients_share_the_same_capability() {
         fn check<T: LocalRuntimeService + InteractiveRuntimeClient + Send + Sync + 'static>() {}
         check::<InProcessRuntimeClient>();
         check::<LocalSocketRuntimeClient>();
-    }
-
-    #[test]
-    fn tui_web_does_not_shell_out_to_leveler_web() {
-        let src = include_str!("run_cmds.rs");
-        assert!(
-            !src.contains("arg(\"web\")"),
-            "/web must call leveler-web, not spawn `leveler web`"
-        );
-    }
-}
-
-#[cfg(test)]
-mod web_launcher_tests {
-    use super::*;
-    use leveler_client_protocol::{
-        ClientCommand, ClientError, InteractiveRuntimeClient, RuntimeEvent, SessionId,
-        UiSessionSnapshot,
-    };
-    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
-    use tokio::sync::broadcast;
-
-    struct StubService {
-        events: broadcast::Sender<RuntimeEvent>,
-    }
-
-    impl StubService {
-        fn new() -> Self {
-            Self {
-                events: broadcast::channel(8).0,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl InteractiveRuntimeClient for StubService {
-        async fn send(&self, _command: ClientCommand) -> Result<(), ClientError> {
-            Ok(())
-        }
-        async fn deliver(
-            &self,
-            _envelope: leveler_client_protocol::CommandEnvelope,
-        ) -> Result<(), ClientError> {
-            Ok(())
-        }
-        fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
-            self.events.subscribe()
-        }
-        fn subscribe_session(&self, _session_id: &SessionId) -> broadcast::Receiver<RuntimeEvent> {
-            self.events.subscribe()
-        }
-        async fn snapshot(
-            &self,
-            _session_id: &SessionId,
-        ) -> Result<UiSessionSnapshot, ClientError> {
-            Err(ClientError::Runtime("not exercised".into()))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LocalRuntimeService for StubService {
-        async fn create_session(
-            &self,
-            _request: CreateSessionRequest,
-        ) -> Result<SessionBootstrap, ClientError> {
-            Err(ClientError::Runtime("not exercised".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn make_web_launcher_binds_loopback_with_a_bearer_token() {
-        let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
-        let shutdown = CancellationToken::new();
-        let url = bind_tui_web_ui(
-            service,
-            PathBuf::from("/tmp/web-cap-repo"),
-            shutdown.clone(),
-        )
-        .await
-        .expect("bind Web UI");
-        assert!(
-            url.starts_with("http://127.0.0.1:"),
-            "must be loopback, got {url}"
-        );
-        assert!(!url.contains("0.0.0.0"), "{url}");
-        let token = url.split("token=").nth(1).expect("token-bearing URL");
-        assert_eq!(token.len(), 64, "{url}");
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{url}");
-        let status = get_projects_status(&url).await;
-        assert_eq!(
-            status, 200,
-            "/api/projects must stay on the multi-project surface, got {status}"
-        );
-        shutdown.cancel();
-    }
-
-    async fn get_projects_status(url: &str) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let host = url
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .expect("host");
-        let mut stream = tokio::net::TcpStream::connect(host)
-            .await
-            .expect("connect web");
-        let req = format!(
-            "GET /api/projects?token={token} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-            token = url.split("token=").nth(1).unwrap_or("")
-        );
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = stream.read(&mut buf).await.unwrap();
-        let resp = String::from_utf8_lossy(&buf[..n]);
-        resp.split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    }
-
-    #[tokio::test]
-    async fn make_web_launcher_returns_the_bound_url() {
-        let service: Arc<dyn LocalRuntimeService> = Arc::new(StubService::new());
-        let shutdown = CancellationToken::new();
-        let launcher = make_web_launcher(
-            service,
-            PathBuf::from("/tmp/web-cap-repo"),
-            shutdown.clone(),
-        );
-        let url = launcher().await.expect("bind Web UI");
-        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
-        shutdown.cancel();
     }
 }
 
@@ -2586,13 +2153,12 @@ mod web_launcher_tests {
 mod daemon_bind_tests {
     use super::*;
     use leveler_client_protocol::{
-        ClientCommand, ClientError, NotificationLevel, RuntimeEvent, SessionId, UiSessionSnapshot,
+        ClientCommand, ClientError, RuntimeEvent, SessionId, UiSessionSnapshot,
         mock::MockRuntimeClient,
     };
     use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::broadcast;
 
     /// Minimal LocalRuntimeService for bind tests: command surface is never
@@ -2600,8 +2166,6 @@ mod daemon_bind_tests {
     struct TestService {
         mock: MockRuntimeClient,
         session_events: Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
-        raw_sends: AtomicUsize,
-        deliveries: AtomicUsize,
     }
 
     impl TestService {
@@ -2613,23 +2177,17 @@ mod daemon_bind_tests {
                 .or_insert_with(|| broadcast::channel(64).0)
                 .clone()
         }
-
-        fn emit_for(&self, session_id: &SessionId, event: RuntimeEvent) {
-            let _ = self.session_sender(session_id).send(event);
-        }
     }
 
     #[async_trait::async_trait]
     impl InteractiveRuntimeClient for TestService {
         async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
-            self.raw_sends.fetch_add(1, Ordering::SeqCst);
             self.mock.send(command).await
         }
         async fn deliver(
             &self,
             envelope: leveler_client_protocol::CommandEnvelope,
         ) -> Result<(), ClientError> {
-            self.deliveries.fetch_add(1, Ordering::SeqCst);
             self.mock.deliver(envelope).await
         }
         fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
@@ -2657,84 +2215,7 @@ mod daemon_bind_tests {
         Arc::new(TestService {
             mock: MockRuntimeClient::new(SessionId::new("s-test")),
             session_events: Mutex::new(HashMap::new()),
-            raw_sends: AtomicUsize::new(0),
-            deliveries: AtomicUsize::new(0),
         })
-    }
-
-    #[tokio::test]
-    async fn connected_web_bridge_preserves_the_daemon_s_runtime_contract() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("daemon.sock");
-        let upstream = test_service();
-        let mut bound = bind_daemon_transports(
-            &sock,
-            Some("127.0.0.1:0".parse().unwrap()),
-            Some("bridge-token".to_string()),
-            upstream.clone(),
-            leveler_local_transport::LocalWaiters::new(),
-        )
-        .await
-        .expect("daemon transports bind");
-        let (server, token) = bound.tcp.take().expect("TCP transport");
-        let addr = server.local_addr().unwrap();
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(server.serve(shutdown.clone()));
-
-        let client = LocalSocketRuntimeClient::connect_tcp(addr, token)
-            .await
-            .expect("web bridge connects to daemon");
-        let session_id = SessionId::new("s1");
-        client
-            .send(ClientCommand::OpenSession {
-                session_id: session_id.clone(),
-            })
-            .await
-            .expect("opens the daemon's per-session subscription");
-        let bridge = DaemonService(client);
-        let mut events = bridge.subscribe_session(&session_id);
-
-        upstream.emit_for(
-            &session_id,
-            RuntimeEvent::Notification {
-                level: NotificationLevel::Info,
-                message: "session-only".to_string(),
-            },
-        );
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("the web bridge lost the daemon's per-session stream")
-            .unwrap();
-        assert!(matches!(
-            event,
-            RuntimeEvent::Notification { message, .. } if message == "session-only"
-        ));
-
-        let sends_before = upstream.raw_sends.load(Ordering::SeqCst);
-        bridge
-            .issue(session_id, ClientCommand::RequestSessionList)
-            .await
-            .expect("the web bridge delivers an enveloped command");
-        assert_eq!(
-            upstream.deliveries.load(Ordering::SeqCst),
-            1,
-            "the web bridge must preserve the daemon's idempotent delivery boundary"
-        );
-        assert_eq!(
-            upstream.raw_sends.load(Ordering::SeqCst),
-            sends_before,
-            "an enveloped web command must not be downgraded to raw send"
-        );
-        assert_eq!(
-            bridge.local_waiter_count().await.unwrap(),
-            0,
-            "the count must come from the daemon, not the facade default of one; \
-             a TCP peer is never a trusted local waiter, whatever ClientKind it \
-             declares (see `tcp_forged_local_kind_cannot_disarm_remote_approval_timeout`)"
-        );
-
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2758,40 +2239,6 @@ mod daemon_bind_tests {
             "env 提供的 token 必须被沿用而不是重新生成"
         );
         assert!(tcp_server.local_addr().unwrap().port() > 0);
-    }
-
-    #[tokio::test]
-    async fn local_socket_client_feeds_the_shared_web_binder() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("daemon.sock");
-        let mut bound = bind_daemon_transports(
-            &sock,
-            None,
-            None,
-            test_service(),
-            leveler_local_transport::LocalWaiters::new(),
-        )
-        .await
-        .expect("unix daemon");
-        let unix = bound.unix.take().expect("unix listener");
-        let daemon_shutdown = CancellationToken::new();
-        let daemon_task = tokio::spawn(unix.serve(daemon_shutdown.clone()));
-        let client = LocalSocketRuntimeClient::connect(&sock)
-            .await
-            .expect("tui-style socket client");
-        let service: Arc<dyn LocalRuntimeService> = Arc::new(client);
-        let shutdown = CancellationToken::new();
-        let url = bind_tui_web_ui(service, dir.path().to_path_buf(), shutdown.clone())
-            .await
-            .expect("socket-backed /web");
-        assert!(
-            url.starts_with("http://127.0.0.1:"),
-            "loopback only, got {url}"
-        );
-        assert!(url.contains("?token="), "{url}");
-        shutdown.cancel();
-        daemon_shutdown.cancel();
-        let _ = daemon_task.await;
     }
 
     /// Healthy attach must be a local operation with no noticeable latency:

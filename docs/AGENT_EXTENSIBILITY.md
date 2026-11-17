@@ -6,7 +6,7 @@ Custom agents provide reusable instructions for specific work, such as read-only
 
 ## Create an agent
 
-Ask CodeLeveler to create one, or use Settings → Agents in the Web UI. Saving or deleting a definition through chat shows the proposed change and requires your confirmation.
+Ask CodeLeveler to create one. Saving or deleting a definition through chat shows the proposed change and requires your confirmation.
 
 To create one manually, make a directory with `agent.yaml` and `instructions.md`:
 
@@ -56,7 +56,7 @@ name: frontend-worker
 description: Implements frontend changes.
 capability: writer
 workspace:
-  write_roots: [crates/leveler-web/web/src]
+  write_roots: [apps/leveler-desktop/src]
 ```
 
 ## Use and troubleshoot

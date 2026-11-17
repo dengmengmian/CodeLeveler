@@ -157,7 +157,7 @@ pub struct CreateSessionRequest {
     /// Carried on the trusted local transport so `--auto-approve` selects a
     /// per-session policy instead of forcing an in-process runtime. `default`
     /// keeps old clients (and any request that omits it) at `Interactive`; the
-    /// remote/web boundary force-resets it so a remote client cannot elevate.
+    /// remote boundary force-resets it so a remote client cannot elevate.
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
     /// The collaboration axis this session is created with.

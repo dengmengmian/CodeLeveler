@@ -998,167 +998,6 @@ pub fn looks_like_absolute_path_arg(arg: &str) -> bool {
     false
 }
 
-/// A protected path made concrete only for the lifetime of one confined
-/// command.
-///
-/// `bwrap` can bind only existing destinations, so a protected path that does
-/// not exist yet cannot be fenced without creating it. The placeholder is
-/// created before spawn and removed when the command is reaped; recording the
-/// device/inode means a path another process replaced in the meantime is left
-/// untouched. Without this cleanup, the first confined command in a bare
-/// workspace would leave `.git`, `.leveler/` and `AGENTS.md` behind.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-pub(crate) struct FencePlaceholder {
-    path: PathBuf,
-    directory: bool,
-    device: u64,
-    inode: u64,
-}
-
-/// The placeholders one command created. Dropping the set removes them.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-#[derive(Default)]
-pub(crate) struct FenceSet(Vec<FencePlaceholder>);
-
-#[cfg(any(target_os = "linux", all(test, unix)))]
-impl FenceSet {
-    /// Remove every placeholder this set created, deepest first so a parent
-    /// that is itself a placeholder is empty by the time it is removed.
-    pub(crate) fn clear(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-
-        let mut entries = std::mem::take(&mut self.0);
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.path.components().count()));
-        for entry in entries {
-            let Ok(metadata) = std::fs::symlink_metadata(&entry.path) else {
-                continue;
-            };
-            // Never remove a path that was replaced after we created it.
-            if metadata.dev() != entry.device || metadata.ino() != entry.inode {
-                continue;
-            }
-            if entry.directory {
-                let _ = std::fs::remove_dir(&entry.path);
-            } else {
-                let _ = std::fs::remove_file(&entry.path);
-            }
-        }
-    }
-
-    fn capture(&mut self, path: PathBuf, directory: bool) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt;
-
-        let metadata = std::fs::symlink_metadata(&path)?;
-        self.0.push(FencePlaceholder {
-            path,
-            directory,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        });
-        Ok(())
-    }
-}
-
-#[cfg(any(target_os = "linux", all(test, unix)))]
-impl Drop for FenceSet {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-/// Materialize every protected path that does not exist yet.
-///
-/// Fails rather than leaving a command unfenced when a placeholder cannot be
-/// created. Only directories below the writable root are created; the root
-/// itself must already exist.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-pub(crate) fn prepare_fences(scope: &WriteScope) -> std::io::Result<FenceSet> {
-    let mut fences = FenceSet::default();
-    let Some(root) = scope.root() else {
-        return Ok(fences);
-    };
-    if !root.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("workspace root does not exist: {}", root.display()),
-        ));
-    }
-    for path in protected_write_paths(scope) {
-        if std::fs::symlink_metadata(&path).is_ok() {
-            continue;
-        }
-        if !path.starts_with(root) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("protected path escapes the workspace: {}", path.display()),
-            ));
-        }
-        let mut missing = Vec::new();
-        let mut cursor = path.parent();
-        while let Some(dir) = cursor {
-            if dir == root || std::fs::symlink_metadata(dir).is_ok() {
-                break;
-            }
-            missing.push(dir.to_path_buf());
-            cursor = dir.parent();
-        }
-        for dir in missing.into_iter().rev() {
-            match std::fs::create_dir(&dir) {
-                Ok(()) => match fences.capture(dir.clone(), true) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let _ = std::fs::remove_dir(&dir);
-                        return Err(error);
-                    }
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let directory = fence_is_directory(&path);
-        let created = if directory {
-            match std::fs::create_dir(&path) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(error) => return Err(error),
-            }
-        } else {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(error) => return Err(error),
-            }
-        };
-        if created {
-            match fences.capture(path.clone(), directory) {
-                Ok(()) => {}
-                Err(error) => {
-                    if directory {
-                        let _ = std::fs::remove_dir(&path);
-                    } else {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-    }
-    Ok(fences)
-}
-
-/// `.git` and agent/skill definition directories are directories; policy files
-/// and scoped exclusions are files. A file placeholder fences either kind.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-fn fence_is_directory(path: &Path) -> bool {
-    path.file_name() == Some(std::ffi::OsStr::new(".git"))
-        || path.ends_with(".leveler/agents")
-        || path.ends_with(".leveler/skills")
-}
-
 /// Build the Linux `bwrap` (bubblewrap) invocation:
 /// bind-mount the whole filesystem read-only, then re-`--bind` each writable
 /// root read-write, with `--dev`/`--proc` for a minimal working environment and
@@ -1196,18 +1035,6 @@ fn linux_sandbox_command(
     // covers `.git`, definitions and AGENTS.md on every backend.
     let roots = writable_roots_for_scope(scope, scratch_root, cache_write_roots);
     let protected = protected_write_paths(scope);
-    // bwrap cannot bind a missing destination. Create only the parent chain
-    // of a protected path (never the protected path itself); the child is
-    // then bound to /dev/null, so a command cannot create the directory or
-    // file that a later session would load as authority.
-    for path in &protected {
-        if path.exists() {
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-    }
     (
         "bwrap".to_string(),
         bwrap_args(program, args, deny_network, &roots, &protected),
@@ -1242,18 +1069,19 @@ fn bwrap_args(
         a.push(p);
     }
     // After writable binds, re-lock .git and every policy/definition path as
-    // read-only. A missing path is bound to `/dev/null` so the sandbox cannot
-    // create it; this covers a not-yet-existing AGENTS.md and a not-yet-existing
-    // definition directory alike.
+    // read-only. bwrap can mount only an existing destination; a missing path
+    // is left absent rather than materialized. Creating it here would change
+    // the workspace (an empty `.git` even breaks Go's VCS detection), and
+    // bwrap cannot name-fence a path that does not exist. The residual is
+    // documented in SECURITY.md: a confined command may create a protected
+    // path that did not exist before it ran.
     for p in protected {
-        let source = if p.exists() {
-            p.display().to_string()
-        } else {
-            "/dev/null".to_string()
-        };
+        if !p.exists() {
+            continue;
+        }
         let s = p.display().to_string();
         a.push("--ro-bind".to_string());
-        a.push(source);
+        a.push(s.clone());
         a.push(s);
     }
     if deny_network {
@@ -1710,8 +1538,7 @@ impl CommandRunner {
             return Err(ProcessError::SandboxPolicy(err.to_string()));
         }
 
-        #[allow(unused_mut)]
-        let mut sandbox_paths = request
+        let sandbox_paths = request
             .write_scope
             .confines()
             .then(|| {
@@ -1728,18 +1555,6 @@ impl CommandRunner {
                     "create private sandbox scratch directory: {source}"
                 ))
             })?;
-        // bwrap can only bind an existing destination. Materialize the missing
-        // protected paths for exactly as long as this command runs; dropping
-        // the set (on wait or process drop) removes them again.
-        #[cfg(target_os = "linux")]
-        if let Some(paths) = sandbox_paths.as_mut() {
-            let fences = prepare_fences(&request.write_scope).map_err(|source| {
-                ProcessError::SandboxPolicy(format!(
-                    "create protected-path fences in the workspace: {source}"
-                ))
-            })?;
-            paths.set_fences(fences);
-        }
         let sandbox_scratch_root = sandbox_paths.as_ref().map(SandboxPaths::scratch_path);
         // The host may authorize one extra writable root for this command (a
         // frozen Git execution target); it is exactly as trusted as the
@@ -2241,17 +2056,13 @@ impl ManagedProcess {
     /// Wait for the direct child to exit.
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         #[cfg(unix)]
-        let status = self.child.wait().await;
-        #[cfg(windows)]
-        let status = Box::into_pin(self.child.wait()).await;
-        // The terminal event is published after this returns, so the
-        // workspace no longer carries the short-lived protected-path
-        // placeholders by the time a client inspects it.
-        #[cfg(any(target_os = "linux", all(test, unix)))]
-        if let Some(paths) = self.sandbox_paths.as_mut() {
-            paths.clear_fences();
+        {
+            self.child.wait().await
         }
-        status
+        #[cfg(windows)]
+        {
+            Box::into_pin(self.child.wait()).await
+        }
     }
 
     /// Kill the direct child (Windows: the whole job) without waiting.
@@ -3650,47 +3461,34 @@ mod tests {
         assert_eq!(a[go + 1], "build", "command args follow the program");
     }
 
-    /// A definition directory that does not exist yet must be fenced too:
-    /// otherwise a confined shell could create the directory and then author
-    /// an agent/skill definition a later session loads as authority.
+    /// bwrap can mount only an existing destination. A missing protected path
+    /// is left absent rather than materialized: a placeholder changes the
+    /// workspace for the duration of every command, and an empty `.git`
+    /// makes build tools try (and fail) to read VCS metadata. The residual is
+    /// documented in SECURITY.md.
     #[test]
-    fn bwrap_fences_a_missing_definition_directory() {
+    fn bwrap_skips_missing_protected_paths_and_binds_existing_ones() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let root = scratch.path();
-        let protected = definition_write_protected_paths(root);
-        let a = bwrap_args("sh", &[], false, &[], &protected);
-        for path in protected {
-            let text = path.display().to_string();
-            assert!(
-                a.windows(3)
-                    .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == text),
-                "a missing definition path must be fenced by /dev/null: {path:?} in {a:?}"
-            );
-        }
-    }
-
-    /// A policy file that does not exist yet must still be fenced. bwrap can
-    /// only re-bind real paths, so the absent `AGENTS.md` is bound to
-    /// `/dev/null`: the child sees an empty read-only file and cannot create
-    /// the one a later turn would load.
-    #[test]
-    fn bwrap_fences_a_missing_agents_file() {
-        let scratch = tempfile::tempdir().expect("scratch");
-        let missing = scratch.path().join("AGENTS.md");
+        let missing_definition = scratch.path().join(".leveler/agents");
+        let missing_agents = scratch.path().join("AGENTS.md");
         let existing = scratch.path().join("present.txt");
         std::fs::write(&existing, "ORIGINAL").unwrap();
-        let a = bwrap_args(
-            "sh",
-            &["-c".into(), "true".into()],
-            false,
-            &[],
-            &[missing.clone(), existing.clone()],
-        );
-        let missing_text = missing.display().to_string();
+        let protected = vec![
+            missing_definition.clone(),
+            missing_agents.clone(),
+            existing.clone(),
+        ];
+        let a = bwrap_args("sh", &[], false, &[], &protected);
+        for missing in [&missing_definition, &missing_agents] {
+            let text = missing.display().to_string();
+            assert!(
+                !a.windows(3).any(|w| w[0] == "--ro-bind" && w[2] == text),
+                "a missing protected path must stay absent: {missing:?} in {a:?}"
+            );
+        }
         assert!(
-            a.windows(3)
-                .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == missing_text),
-            "an absent AGENTS.md must be bound read-only from /dev/null: {a:?}"
+            !a.iter().any(|s| s == "/dev/null"),
+            "no missing destination is materialized: {a:?}"
         );
         let existing_text = existing.display().to_string();
         assert!(
@@ -7981,59 +7779,5 @@ mod managed_runner_tests {
             out.stderr,
             out.exit_code
         );
-    }
-}
-
-#[cfg(all(test, unix))]
-mod fence_tests {
-    use super::*;
-
-    #[test]
-    fn missing_protected_paths_are_materialized_and_removed() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let scope = WriteScope::Workspace {
-            root: workspace.path().to_path_buf(),
-        };
-        let fences = prepare_fences(&scope).expect("fences");
-        assert!(workspace.path().join(".git").is_dir(), "missing .git");
-        assert!(
-            workspace.path().join("AGENTS.md").is_file(),
-            "missing AGENTS.md"
-        );
-        assert!(
-            workspace.path().join(".leveler/agents").is_dir(),
-            "missing definition directory"
-        );
-
-        drop(fences);
-        let mut entries: Vec<_> = std::fs::read_dir(workspace.path())
-            .expect("list workspace")
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        entries.sort();
-        assert!(
-            entries.is_empty(),
-            "the fence changed the workspace: {entries:?}"
-        );
-    }
-
-    #[test]
-    fn existing_protected_paths_survive_the_fence() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::write(workspace.path().join("AGENTS.md"), "rules").unwrap();
-        std::fs::create_dir(workspace.path().join(".git")).unwrap();
-        let scope = WriteScope::Workspace {
-            root: workspace.path().to_path_buf(),
-        };
-
-        let fences = prepare_fences(&scope).expect("fences");
-        drop(fences);
-
-        assert_eq!(
-            std::fs::read_to_string(workspace.path().join("AGENTS.md")).unwrap(),
-            "rules"
-        );
-        assert!(workspace.path().join(".git").is_dir());
-        assert!(!workspace.path().join(".leveler").exists());
     }
 }

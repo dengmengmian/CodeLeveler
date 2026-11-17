@@ -7,7 +7,7 @@
 <p align="center">A coding agent that works in your local repository</p>
 <p align="center"><a href="README.zh-CN.md">中文</a> · <a href="LICENSE-APACHE">Apache 2.0</a></p>
 
-CodeLeveler reads code, edits files, and runs tests in your local workspace. Inspect tool output and diffs in the terminal or browser, reopen a session later, or run a task directly from the CLI. Choose BigModel, DeepSeek, Moonshot/Kimi, OpenAI, Anthropic, or another OpenAI-compatible provider.
+CodeLeveler reads code, edits files, and runs tests in your local workspace. Inspect tool output and diffs in the terminal, reopen a session later, or run a task directly from the CLI. Choose BigModel, DeepSeek, Moonshot/Kimi, OpenAI, Anthropic, or another OpenAI-compatible provider.
 
 ## Install
 
@@ -46,7 +46,6 @@ Try asking “Find the test entry points for this project and run the smallest r
 | Task | Entry point |
 | --- | --- |
 | Inspect and edit a project interactively | `leveler` |
-| Open the browser UI | `leveler web` |
 | Run a task directly from a shell or script | `leveler run "find and fix the failing tests"` |
 | Reopen a session | `leveler resume` |
 | Run a goal with acceptance criteria in the terminal UI | `/goal <task>` |

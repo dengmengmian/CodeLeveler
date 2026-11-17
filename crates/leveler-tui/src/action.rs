@@ -110,9 +110,6 @@ pub enum Action {
     ShellCompletionsLoaded(crate::shell_mode::CompletionResult),
     /// An asynchronous edge effect completed.
     EffectCompleted(EffectCompletion),
-    /// The embedded Web UI server finished starting: `Ok(url)` with the
-    /// token-carrying URL, or `Err(message)` if it could not start.
-    WebLaunched(Result<String, String>),
     /// The host finished handing a URL to the user's default browser.
     UrlOpened {
         url: String,
@@ -222,12 +219,7 @@ pub enum Effect {
     ShellComplete {
         request: crate::shell_mode::CompletionRequest,
     },
-    /// Start the embedded browser Web UI server (`/web`). The event loop runs
-    /// the injected [`WebLauncher`] and folds its result back as
-    /// [`Action::WebLaunched`].
-    StartWeb,
-    /// Open a URL in the default browser (conversation link click, or `/web`
-    /// re-invocation when the server is already up).
+    /// Open a URL in the default browser (conversation link click).
     OpenWebUrl(String),
     /// Suspend the TUI, open `$VISUAL`/`$EDITOR` on the current draft, and fold
     /// the result back as [`Action::EditorFinished`]. The composer is a poor
@@ -308,17 +300,6 @@ pub enum Effect {
     /// Tear down the UI and exit.
     Quit,
 }
-
-/// Injected at startup by the CLI: binds and serves the browser Web UI over
-/// the current local runtime service (in-process client or local Unix-socket
-/// daemon), returning the token-carrying URL (or an error). Opaque so
-/// `leveler-tui` need not depend on the web server. `None` only when the
-/// host could not provide any local runtime service.
-pub type WebLauncher = std::sync::Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
-        + Send
-        + Sync,
->;
 
 /// Injected by the host: opens an HTTP URL in the user's default browser and
 /// reports whether the operating system accepted the request.

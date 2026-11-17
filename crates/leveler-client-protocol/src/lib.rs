@@ -62,8 +62,6 @@ mod retirement;
 pub mod review;
 /// Structured scheduled-automation management shared by every client.
 pub mod schedule;
-/// WebSocket framing for a session: the shapes every session client speaks.
-pub mod session_wire;
 /// The runtime's effective settings projection shared by every client.
 pub mod settings;
 mod skills;
@@ -137,7 +135,6 @@ pub use review::{
     UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewSeverity, UiReviewStatus,
     UiReviewSummary, UiReviewUsage, UiReviewVerdict,
 };
-pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
     UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiBackgroundTaskRecord,

@@ -7,7 +7,7 @@
 <p align="center">在本地仓库里工作的编程智能体</p>
 <p align="center"><a href="README.md">English</a> · <a href="LICENSE-APACHE">Apache 2.0</a></p>
 
-CodeLeveler 在你的本地工作区读取代码、编辑文件并运行测试。你可以在终端或浏览器里查看工具输出和改动，稍后重新打开会话，也可以通过 CLI 直接执行任务。模型可选 BigModel、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic 或其他 OpenAI 兼容服务。
+CodeLeveler 在你的本地工作区读取代码、编辑文件并运行测试。你可以在终端里查看工具输出和改动，稍后重新打开会话，也可以通过 CLI 直接执行任务。模型可选 BigModel、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic 或其他 OpenAI 兼容服务。
 
 ## 安装
 
@@ -46,7 +46,6 @@ leveler
 | 任务 | 入口 |
 | --- | --- |
 | 查看项目并交互修改 | `leveler` |
-| 在浏览器打开界面 | `leveler web` |
 | 从脚本或命令行直接执行任务 | `leveler run "找出失败的测试并修复"` |
 | 打开已有会话 | `leveler resume` |
 | 在终端界面运行带验收条件的目标 | `/goal <任务>` |

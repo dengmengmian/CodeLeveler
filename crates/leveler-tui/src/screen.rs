@@ -108,7 +108,7 @@ pub enum SlashCategory {
     Session,
     /// Attachments.
     Input,
-    /// Theme, web, help.
+    /// Theme, help.
     System,
 }
 
@@ -221,7 +221,7 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::IdleOnly,
     ),
     // Read-only view of the agent registry: `/agents` lists, `/agents <name>`
-    // inspects. Creating and editing agents is a conversation or Web task.
+    // inspects. Creating and editing agents is a conversation task.
     slash(
         "/agents",
         &[],
@@ -231,7 +231,7 @@ pub const SLASH_DEFS: &[SlashDef] = &[
     ),
     // Read-only view of the resolved skill registry: `/skills` lists,
     // `/skills <name>` inspects. Creating and editing skills is a conversation
-    // (skill-creator + save_skill/delete_skill) or Web task.
+    // (skill-creator + save_skill/delete_skill) or Desktop task.
     slash(
         "/skills",
         &[],
@@ -412,13 +412,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
     // System
     slash(
         "/theme",
-        &[],
-        SlashCategory::System,
-        SlashVisibility::Searchable,
-        BusyPolicy::Always,
-    ),
-    slash(
-        "/web",
         &[],
         SlashCategory::System,
         SlashVisibility::Searchable,
@@ -712,7 +705,6 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/find" | "/search" => s.find,
         "/jump" => s.jump,
         "/export" | "/save" => s.export,
-        "/web" => s.web,
         "/image" | "/attach" => s.attach,
         "/theme" => s.theme,
         "/new" => s.new,
@@ -1010,6 +1002,17 @@ mod surface_tests {
         assert!(super::slash_primary("/develop").is_none());
     }
 
+    /// `/web` was retired with the browser Web UI. It must not survive as a
+    /// completion, a help row, or an alias that starts a server.
+    #[test]
+    fn web_is_absent_from_every_command_surface() {
+        let tokens = all_slash_tokens();
+        assert!(!tokens.contains(&"/web"), "/web is still discoverable");
+        assert!(!super::is_known_slash_token("web"));
+        assert!(super::slash_def("/web").is_none());
+        assert!(super::slash_primary("/web").is_none());
+    }
+
     #[test]
     fn registry_is_the_closed_command_surface() {
         let names: Vec<_> = SLASH_DEFS.iter().map(|d| d.name).collect();
@@ -1047,7 +1050,6 @@ mod surface_tests {
                 "/resume-codex",
                 "/attach",
                 "/theme",
-                "/web",
                 "/help",
                 "/exit",
                 "/doctor",
@@ -1255,7 +1257,6 @@ mod ghost_tests {
             "/export",
             "/attach",
             "/theme",
-            "/web",
         ] {
             assert!(!names.contains(&hidden), "searchable leaked on /: {hidden}");
         }

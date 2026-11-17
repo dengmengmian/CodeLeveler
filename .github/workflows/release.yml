@@ -111,48 +111,9 @@ jobs:
             *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
-  # The SPA is platform-independent output that rust-embed freezes into every
-  # binary at Rust compile time. It used to be built four times, once per matrix
-  # runner, and sat on the Windows critical path. Build it once here, hash it,
-  # and hand the same bytes to every Rust build.
-  prepare-web:
-    name: prepare WebUI (once)
-    runs-on: ubuntu-24.04
-    outputs:
-      digest: ${{ steps.hash.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: crates/leveler-web/web/package-lock.json
-
-      - name: Build WebUI
-        working-directory: crates/leveler-web/web
-        run: |
-          npm ci
-          npm run build
-
-      - name: Hash the built WebUI
-        id: hash
-        run: |
-          set -euo pipefail
-          digest="$(sh packaging/scripts/web_dist_hash.sh)"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Upload WebUI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-dist
-          path: crates/leveler-web/web/dist
-          if-no-files-found: error
-          retention-days: 1
-
   build:
     name: build (${{ matrix.target }})
-    needs: [version, prepare-web]
+    needs: [version]
     strategy:
       fail-fast: false
       matrix:
@@ -171,30 +132,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-
-      # rust-embed reads `crates/leveler-web/web/dist` at compile time, so it
-      # must exist before the first cargo build. rust-cache prunes workspace
-      # crates, so leveler-web always recompiles here and always embeds these
-      # bytes rather than a cached copy.
-      - name: Fetch the prepared WebUI
-        uses: actions/download-artifact@v4
-        with:
-          name: web-dist
-          path: crates/leveler-web/web/dist
-
-      - name: Verify the WebUI artifact
-        shell: bash
-        env:
-          EXPECTED_DIGEST: ${{ needs.prepare-web.outputs.digest }}
-        run: |
-          set -euo pipefail
-          test -s crates/leveler-web/web/dist/index.html
-          got="$(sh packaging/scripts/web_dist_hash.sh)"
-          if [ "$EXPECTED_DIGEST" != "$got" ]; then
-            echo "::error::WebUI artifact hash mismatch: built $EXPECTED_DIGEST, downloaded $got"
-            exit 1
-          fi
-          echo "WebUI digest: $got"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0

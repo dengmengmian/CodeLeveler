@@ -617,17 +617,12 @@ pub struct AppState {
     pub reconnected_until: Option<std::time::Instant>,
     pub notification: Option<Notification>,
 
-    /// The running embedded Web UI URL (with token), once `/web` has started it.
-    /// `Some` also guards against launching a second server.
-    pub web_url: Option<String>,
     /// The `/update` panel, while a self-update is in flight or just finished.
     /// Presentation only: the update itself belongs to `leveler-update`.
     pub update: Option<crate::update::UpdateView>,
     /// Set when an installed update requires replacing this process. The event
     /// loop exits and the CLI restarts into the new binary.
     pub restart_requested: bool,
-    /// True while `/web`'s server is starting (guards against double-launch).
-    pub web_starting: bool,
 
     /// Models the user can switch to, and the current execution mode — used to
     /// build the model/mode pickers.
@@ -958,10 +953,8 @@ impl AppState {
             reconnecting: None,
             reconnected_until: None,
             notification: None,
-            web_url: None,
             update: None,
             restart_requested: false,
-            web_starting: false,
             available_models: Vec::new(),
             mode: PermissionProfile::Assisted,
             screen_scroll: 0,

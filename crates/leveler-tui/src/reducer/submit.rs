@@ -560,30 +560,6 @@ pub(super) fn request_file_candidates(state: &mut AppState) -> Vec<Effect> {
     }
 }
 
-/// Start (or re-surface) the embedded browser Web UI. The server is bound and
-/// served at the event-loop edge via the injected `WebLauncher`; here we only
-/// guard against launching twice and give immediate feedback.
-fn start_web(state: &mut AppState) -> Vec<Effect> {
-    if let Some(url) = &state.web_url {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Info,
-            message: state.t().web_ui_running.replace("{url}", url),
-        });
-        // The tab that opened on first launch may be long closed — re-open the
-        // browser every time instead of stranding the user with a URL to copy.
-        return vec![Effect::OpenWebUrl(url.clone())];
-    }
-    if state.web_starting {
-        return Vec::new();
-    }
-    state.web_starting = true;
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: state.t().web_ui_starting.to_string(),
-    });
-    vec![Effect::StartWeb]
-}
-
 /// Handle a `/command` typed in the composer.
 pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let name = command.split_whitespace().next().unwrap_or("");
@@ -630,7 +606,6 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "agents" => agents_slash(state, command),
         "skills" => skills_slash(state, command),
         "review" => review_slash(state, command),
-        "web" => start_web(state),
         "copy" => copy_slash(state, command),
         "output" => output_slash(state, command),
         // Reading the session this client already holds. `/find` opens the
@@ -2273,64 +2248,17 @@ mod export_tests {
     }
 
     #[test]
-    fn web_slash_launches_once_then_re_surfaces_the_url() {
+    fn retired_web_command_uses_the_unknown_command_path() {
         let mut s = state_with_dialogue();
-
-        // First /web asks the edge to start the server and arms the guard.
-        assert_eq!(handle_slash(&mut s, "web"), vec![Effect::StartWeb]);
-        assert!(s.web_starting);
-        assert!(s.web_url.is_none());
-
-        // A second /web while it is still starting is a no-op (no double bind).
-        assert!(handle_slash(&mut s, "web").is_empty());
-
-        // The launch completes: URL is stored and the guard clears.
-        let effects = crate::reducer::reduce(
-            &mut s,
-            crate::action::Action::WebLaunched(Ok("http://127.0.0.1:9/?token=abc".to_string())),
-        );
-        assert!(!s.web_starting);
-        assert_eq!(s.web_url.as_deref(), Some("http://127.0.0.1:9/?token=abc"));
+        let effects = handle_slash(&mut s, "web");
         assert!(
-            matches!(&s.notification, Some(n) if n.message.contains("Web UI 已启动") && !n.message.contains("浏览器打开")),
-            "server readiness must not claim that the browser opener has completed"
-        );
-        assert_eq!(
-            effects,
-            vec![Effect::OpenWebUrl(
-                "http://127.0.0.1:9/?token=abc".to_string()
-            )],
-            "the first /web must use the same opener path as later invocations"
-        );
-
-        // Now /web re-surfaces the running URL AND re-opens the browser —
-        // "already running" must not strand the user with a bare URL to copy.
-        assert_eq!(
-            handle_slash(&mut s, "web"),
-            vec![Effect::OpenWebUrl(
-                "http://127.0.0.1:9/?token=abc".to_string()
-            )],
-            "re-invoking /web must re-open the browser, not just print the URL"
+            effects.is_empty(),
+            "a retired command must not run an effect"
         );
         assert!(
-            matches!(&s.notification, Some(n) if n.message.contains("已在运行")),
-            "should report the already-running URL"
-        );
-    }
-
-    #[test]
-    fn web_launch_failure_clears_guard_and_warns() {
-        let mut s = state_with_dialogue();
-        s.web_starting = true;
-        crate::reducer::reduce(
-            &mut s,
-            crate::action::Action::WebLaunched(Err("boom".to_string())),
-        );
-        assert!(!s.web_starting);
-        assert!(s.web_url.is_none(), "a failed launch must not record a URL");
-        assert!(
-            matches!(&s.notification, Some(n) if n.message.contains("启动失败")),
-            "should warn on failure"
+            matches!(&s.notification, Some(n) if n.message.contains("未知命令") && n.message.contains("web")),
+            "{:?}",
+            s.notification
         );
     }
 

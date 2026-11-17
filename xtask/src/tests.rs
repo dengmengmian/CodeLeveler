@@ -284,7 +284,6 @@ fn clean_all_invokes_cargo_clean_and_keeps_unknown_dirs() {
     touch(&repo.join("target/debug/keep"));
     touch(&repo.join("mystery/keep"));
     touch(&repo.join("dist/gone"));
-    touch(&repo.join("crates/leveler-web/web/dist/gone"));
     touch(&repo.join(".codeleveler-target/keep"));
     let host = FakeHost::new(|spec| {
         assert_eq!(spec.program, "cargo");
@@ -296,7 +295,6 @@ fn clean_all_invokes_cargo_clean_and_keeps_unknown_dirs() {
     assert!(repo.join("target/debug/keep").is_file());
     assert!(repo.join("mystery/keep").is_file());
     assert!(!repo.join("dist").exists());
-    assert!(!repo.join("crates/leveler-web/web/dist").exists());
     let log = host.log();
     assert!(log.iter().any(|spec| is_cmd(spec, "cargo", &["clean"])));
     assert!(log.iter().any(|spec| {
