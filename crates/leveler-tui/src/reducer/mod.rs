@@ -144,6 +144,9 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.help.selected = 0;
             return Vec::new();
         }
+        if state.active_screen == Screen::Find {
+            return crate::find::push_text(state, text);
+        }
     }
     match action {
         Action::Runtime(event) => {
@@ -385,6 +388,24 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     message,
                 });
             }
+            Vec::new()
+        }
+        // Search results are applied only when they answer the query the page
+        // is showing. A late worker from an older keystroke is discarded.
+        Action::FindTranscriptReady {
+            generation,
+            hits,
+            capped,
+        } => {
+            crate::find::apply_transcript_results(state, generation, hits, capped);
+            Vec::new()
+        }
+        Action::FindArtifactReady {
+            generation,
+            request,
+            outcome,
+        } => {
+            crate::find::apply_artifact_result(state, generation, &request, outcome);
             Vec::new()
         }
         Action::EffectCompleted(completion) => {
@@ -1582,7 +1603,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 }
 
 /// Content width of the full-output page at the current terminal size.
-fn output_view_width(state: &AppState) -> usize {
+pub(crate) fn output_view_width(state: &AppState) -> usize {
     let cols = state.size.0;
     let pad = crate::secondary::padding_x(cols);
     cols.saturating_sub(pad.saturating_mul(2)).max(1) as usize
@@ -3327,6 +3348,9 @@ mod input_recovery_tests;
 
 #[cfg(test)]
 mod goal_terminal_tests;
+
+#[cfg(test)]
+mod find_tests;
 
 #[cfg(test)]
 mod output_view_tests;

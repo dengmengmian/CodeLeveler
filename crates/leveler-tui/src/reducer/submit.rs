@@ -92,7 +92,13 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             // What a command does lands at the end of the conversation. A user
             // who ran /compact while reading history saw only a notification
             // fade, and the line it wrote stayed a page below them.
-            crate::conversation::interaction::jump_to_live_edge(state);
+            //
+            // `/find` and `/jump` are the exception: they open a page or move
+            // to a turn the reader chose, and yanking the conversation to the
+            // live edge first would be a viewport change neither asked for.
+            if !matches!(name, "find" | "search" | "jump") {
+                crate::conversation::interaction::jump_to_live_edge(state);
+            }
             // `take()` returns the canonical content (paste chips expanded);
             // slash ARGUMENTS must come from it, not from the raw buffer, or
             // a pasted goal/question degrades to its placeholder (R004 F1).
@@ -627,6 +633,21 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "web" => start_web(state),
         "copy" => copy_slash(state, command),
         "output" => output_slash(state, command),
+        // Reading the session this client already holds. `/find` opens the
+        // page (optionally with a query); `/jump` opens its Turns list or
+        // validates one turn number. Neither sends anything to the runtime.
+        "find" => {
+            if state.surface == crate::btw::SurfaceFocus::Btw {
+                super::leave_btw(state);
+            }
+            crate::find::open(state, find_argument(command), crate::find::FindTab::Search)
+        }
+        "jump" => {
+            if state.surface == crate::btw::SurfaceFocus::Btw {
+                super::leave_btw(state);
+            }
+            crate::find::jump_slash(state, command)
+        }
         "diff" => open_diff_screen(state),
         "sessions" => open_sessions_screen(state),
         // Display title only. The session's original request and its current
@@ -709,6 +730,14 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             Vec::new()
         }
     }
+}
+
+/// Everything after the command name, for `/find <query>`.
+fn find_argument(command: &str) -> &str {
+    command
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("")
 }
 
 /// The applied patch of the most recent edit node, verbatim, for `/copy diff`.
@@ -851,7 +880,7 @@ fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 return Vec::new();
             }
             if let Some(directory) = full_output {
-                match valid_capture(state, &directory) {
+                match crate::artifact_ref::validated_shell_capture(state, &directory) {
                     Ok(capture) => {
                         return vec![Effect::CopyUserShellOutput {
                             directory: Some(capture.directory),
@@ -966,7 +995,7 @@ fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 call.preview
                     .as_deref()
                     .and_then(|preview| preview.lines().next())
-                    .and_then(saved_output_path)
+                    .and_then(crate::artifact_ref::saved_tool_output_path)
             });
         let Some(path) = artifact else {
             state.notification = Some(Notification {
@@ -975,7 +1004,7 @@ fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         };
-        if let Some(path) = valid_artifact(state, &path) {
+        if let Some(path) = crate::artifact_ref::validated_tool_output(state, &path) {
             return vec![Effect::OpenOutputPager {
                 source: PagerSource::File(path),
             }];
@@ -1007,7 +1036,7 @@ fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         return Vec::new();
     };
     if let Some(directory) = full_output
-        && let Ok(capture) = valid_capture(state, &directory)
+        && let Ok(capture) = crate::artifact_ref::validated_shell_capture(state, &directory)
     {
         return vec![Effect::OpenOutputPager {
             source: PagerSource::File(capture.combined),
@@ -1025,31 +1054,6 @@ fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     vec![Effect::OpenOutputPager {
         source: PagerSource::Text(crate::shell_render::copy_text(&retained)),
     }]
-}
-
-/// Validate a persisted capture path against the local state root.
-/// The absolute artifact path from the runtime's saved-output reference line.
-fn saved_output_path(line: &str) -> Option<String> {
-    let rest = line.strip_prefix(leveler_model::tool_output::TOOL_OUTPUT_SAVED_PREFIX)?;
-    let path = rest.split(" | sha256:").next()?.trim();
-    (!path.is_empty()).then(|| path.to_string())
-}
-
-/// An artifact is a regular file under this runtime's state directory. Model
-/// output is untrusted: a path it names is evidence, not authority.
-fn valid_artifact(state: &AppState, path: &str) -> Option<std::path::PathBuf> {
-    let root = state.shell_output_root()?;
-    let state_dir = root.parent()?;
-    let root = std::fs::canonicalize(state_dir).ok()?;
-    let path = std::fs::canonicalize(path).ok()?;
-    (path.is_file() && path.starts_with(root)).then_some(path)
-}
-
-fn valid_capture(state: &AppState, directory: &str) -> Result<crate::output_view::Capture, String> {
-    crate::output_view::Capture::open(
-        std::path::Path::new(directory),
-        state.shell_output_root().as_deref(),
-    )
 }
 
 /// Copy a small, already-clean string (a command, or a selection). Output
@@ -1270,7 +1274,7 @@ fn exported_tool_evidence(state: &AppState) -> String {
                 .preview
                 .as_deref()
                 .and_then(|preview| preview.lines().next())
-                .and_then(saved_output_path);
+                .and_then(crate::artifact_ref::saved_tool_output_path);
             match artifact {
                 Some(path) if std::path::Path::new(&path).is_file() => rows.push_str(&format!(
                     "{}\n",

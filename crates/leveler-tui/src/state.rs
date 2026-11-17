@@ -450,6 +450,16 @@ pub struct AppState {
     pub review_history_query: Option<CommandId>,
     /// Last-painted review card hit regions: (row, x_start, x_end, review id).
     pub review_hits: Vec<(u16, u16, u16, String)>,
+    /// `/find` — transcript search and turn navigation. A view over the
+    /// transcript this client already holds; it owns no history of its own.
+    pub find: crate::find::FindState,
+    /// The transient transcript highlight after a search result was opened.
+    /// Presentation only: it never changes what an entry says.
+    pub find_highlight: Option<crate::find::FindHighlight>,
+    /// How many older turns the runtime left out of the replayed history.
+    /// The `/find` scope line prints this so a partial corpus is never
+    /// presented as the whole session.
+    pub history_omitted_turns: u32,
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
     /// How many files the diff reported during the current turn named. `diff`
@@ -845,6 +855,9 @@ impl AppState {
             schedule: crate::schedules::ScheduleState::default(),
             memory: crate::memory::MemoryState::default(),
             plan: None,
+            find: crate::find::FindState::default(),
+            find_highlight: None,
+            history_omitted_turns: 0,
             review_report: None,
             review_query: None,
             review_history_query: None,

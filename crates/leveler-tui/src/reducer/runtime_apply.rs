@@ -2492,6 +2492,9 @@ fn restore_history(
         .cloned()
         .collect();
     state.transcript.replace_with(scratch.transcript);
+    // `/find` reports this bound instead of implying that the loaded
+    // transcript is the whole session.
+    state.history_omitted_turns = omitted_turns;
     for row in journal_held {
         if row.state == InputDelivery::Pending {
             state
@@ -2721,6 +2724,17 @@ fn apply_session_with(
         if state.active_screen == crate::screen::Screen::Review {
             state.active_screen = crate::screen::Screen::Conversation;
             state.screen_scroll = 0;
+        }
+        // A search corpus belongs to the session it was built from. Results,
+        // an in-flight scan and an unloaded older-turn count must never cross
+        // into the newly opened session.
+        state.find.reset();
+        state.find_highlight = None;
+        state.history_omitted_turns = 0;
+        if state.active_screen == crate::screen::Screen::Find {
+            state.active_screen = crate::screen::Screen::Conversation;
+            state.screen_scroll = 0;
+            state.workbench_focus = crate::state::WorkbenchFocus::Input;
         }
     }
     // Snapshot is runtime truth. A pending Shift+Tab from the previous

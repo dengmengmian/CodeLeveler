@@ -1213,6 +1213,55 @@ fn dispatch_effects(
                     let _ = tx.send(Action::UserShellOutputCopied(text));
                 });
             }
+            Effect::RunFindTranscript {
+                generation,
+                corpus,
+                query,
+            } => {
+                let tx = completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let (hits, capped) = crate::find::search_corpus(&corpus, &query);
+                    let _ = tx.send(Action::FindTranscriptReady {
+                        generation,
+                        hits,
+                        capped,
+                    });
+                });
+            }
+            Effect::RunFindArtifacts {
+                generation,
+                cancel,
+                requests,
+                query,
+            } => {
+                // One worker walks every artifact: a keystroke starts ONE
+                // scan, and the generation check stops it at the next chunk
+                // when the query moves on. Nothing is loaded whole.
+                let tx = completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    for request in requests {
+                        if cancel.load() != generation {
+                            break;
+                        }
+                        let outcome = crate::find::artifacts::scan_file(
+                            &request.path,
+                            &query,
+                            cancel.atomic(),
+                            generation,
+                        );
+                        let cancelled =
+                            outcome.status == crate::find::artifacts::ArtifactStatus::Cancelled;
+                        let _ = tx.send(Action::FindArtifactReady {
+                            generation,
+                            request,
+                            outcome,
+                        });
+                        if cancelled {
+                            break;
+                        }
+                    }
+                });
+            }
         }
     }
 }

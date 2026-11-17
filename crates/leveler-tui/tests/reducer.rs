@@ -155,7 +155,9 @@ fn output_tool_opens_the_saved_artifact_instead_of_the_preview() {
     let tmp = tempfile::tempdir().unwrap();
     let artifact_dir = tmp.path().join("state").join("artifacts");
     std::fs::create_dir_all(&artifact_dir).unwrap();
-    let artifact = artifact_dir.join("payload.txt");
+    let artifact = artifact_dir.join(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.txt",
+    );
     std::fs::write(&artifact, "FULL TOOL OUTPUT\n").unwrap();
     let mut s = opened_at_state_root(tmp.path());
     reduce(

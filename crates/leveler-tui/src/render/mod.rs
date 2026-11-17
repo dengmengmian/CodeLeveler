@@ -1378,6 +1378,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Memory => unreachable!("memory renders as an overlay over the conversation"),
         Screen::Tools => render_tools_screen(frame, area, state),
         Screen::Diff => render_diff_screen(frame, area, state),
+        Screen::Find => crate::find::render::render_screen(frame, area, state),
         Screen::Sessions => render_sessions_screen(frame, area, state),
         Screen::ForeignSessions => render_foreign_sessions_screen(frame, area, state),
         Screen::Activity => render_activity_screen(frame, area, state),

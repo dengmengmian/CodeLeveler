@@ -763,6 +763,9 @@ pub struct OutputView {
     pub edge_streak: u32,
     /// Last pointer cell while dragging, for edge auto-scroll.
     pub last_mouse: Option<(u16, u16)>,
+    /// Logical line a search result asked to reveal. Applied when the index
+    /// lands; a pending target keeps the page from following the live edge.
+    pub target_line: Option<usize>,
     pub tail_rows: Vec<RenderedRow>,
     /// `(line, row_in_line)` at the viewport top before a reflow.
     pub anchor: Option<(usize, usize)>,
@@ -794,6 +797,7 @@ impl OutputView {
             edge_dir: 0,
             edge_streak: 0,
             last_mouse: None,
+            target_line: None,
             tail_rows,
             anchor: None,
             rect: None,
@@ -894,6 +898,12 @@ impl OutputView {
     /// Install a freshly built index, preserving the reader's line on a
     /// reflow and staying at the live edge otherwise.
     pub fn apply_index(&mut self, index: Arc<OutputIndex>) {
+        if let Some(line) = self.target_line.take() {
+            self.follow = false;
+            self.scroll = index
+                .line_start_row(line.saturating_sub(1))
+                .min(index.total_rows.saturating_sub(1));
+        }
         if let Some((line, row_in_line)) = self.anchor.take() {
             self.follow = false;
             self.scroll = index

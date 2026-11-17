@@ -136,6 +136,18 @@ pub enum Action {
         generation: u64,
         result: Result<std::sync::Arc<crate::output_view::OutputIndex>, String>,
     },
+    /// A transcript search finished. `generation` names the query it answers.
+    FindTranscriptReady {
+        generation: u64,
+        hits: Vec<crate::find::FindHit>,
+        capped: bool,
+    },
+    /// One saved tool output finished scanning (or could not be read).
+    FindArtifactReady {
+        generation: u64,
+        request: crate::find::ArtifactRequest,
+        outcome: crate::find::artifacts::ScanOutcome,
+    },
     /// The full-output pager exited, or could not be started. The terminal has
     /// already been restored by the event loop.
     OutputPagerFinished(Result<(), String>),
@@ -248,6 +260,21 @@ pub enum Effect {
     /// Suspend the TUI and open the complete output in `$PAGER` (default
     /// `less -R`). A capture is paged from disk, never loaded whole.
     OpenOutputPager { source: PagerSource },
+    /// Search the transcript documents off the paint loop. The corpus is a
+    /// shared snapshot; a newer generation cancels this one's workers.
+    RunFindTranscript {
+        generation: u64,
+        corpus: std::sync::Arc<crate::find::FindCorpus>,
+        query: String,
+    },
+    /// Scan the session's saved tool outputs on disk, one bounded window at a
+    /// time. Never loads a whole artifact into memory.
+    RunFindArtifacts {
+        generation: u64,
+        cancel: crate::find::FindCancel,
+        requests: Vec<crate::find::ArtifactRequest>,
+        query: String,
+    },
     /// Tear down the UI and exit.
     Quit,
 }
