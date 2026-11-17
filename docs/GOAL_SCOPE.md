@@ -1,10 +1,8 @@
 # Goal Scope Contract
 
-How a goal's requirements are recorded, changed and enforced. A requirement is
-a **model declaration anchored to a verbatim span of the user's message**: the
-runtime validates identity, provenance, transition legality and order, and never
-re-derives meaning from prose. Chinese, English, Japanese or a mixed message
-work the same way because no word list is involved.
+[中文](GOAL_SCOPE.zh-CN.md) · [Documentation index](README.md)
+
+Suppose you ask the model to create `stage-2.txt`, then tell it to skip that step. The model records the deliverable and later marks it waived. Both declarations cite your words. The runtime checks the source, the target, and whether the change is allowed. It applies changes in order and checks the resulting list when the goal is marked complete. The same process works regardless of the language of the message.
 
 ## Ownership
 
@@ -279,7 +277,7 @@ report, so the old session still replays. A structured object is parsed
 strictly: a malformed report still fails the whole replay instead of silently
 becoming "no report".
 
-The four user-visible outcomes are projections of two facts, not a separate
+The five user-visible outcomes are projections of two facts, not a separate
 computed verdict:
 
 | Outcome | Representation |

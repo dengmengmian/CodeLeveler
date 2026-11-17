@@ -1,6 +1,8 @@
 # Everyday use
 
-[中文](USAGE.zh-CN.md) · [Home](../README.md)
+[中文](USAGE.zh-CN.md) · [Documentation index](README.md)
+
+[Model setup](#configure-a-model) · [Sessions](#sessions-and-background-work) · [Command line](#command-line-runs) · [Review](#review) · [Troubleshooting](#troubleshooting)
 
 ## Configure a model
 
@@ -19,7 +21,6 @@ recovery_seconds = 600  # ceiling for retries (waits and attempts), from the fir
 ```
 
 A permanent error (authentication, an invalid request, a rejected conversation) is never retried. When the budget runs out the failure is reported as resumable: the task and its completed tool work are kept, and sending a new message continues from there.
-
 
 ### Custom OpenAI-compatible discovery
 
@@ -58,15 +59,29 @@ Open background tasks from the footer to inspect output or stop an individual ta
 
 Without `timeout_seconds`, a foreground command still running after 15 seconds moves to the background and returns a `task_id`. With `timeout_seconds`, the call waits for the command: a deadline up to 120 seconds ends it in that call, and a longer deadline is waited for up to 120 seconds before the still-running process moves to the background (the deadline continues to follow it). A move is not a successful exit: observe it with `get_task` / `wait_task` and stop it with `kill_task`. `timeout_seconds` is a process execution deadline counted from process start. Start a long-lived service with `background=true`; its lifetime follows `background_lifetime` (`goal` by default, or `runtime` / `session` / `persistent`), not the wait budget.
 
+Tool summaries show elapsed time from dispatch to completion where reliable timing is available. Reconnecting restores the recorded timing. Approval dialogs start on **Allow once**. Press Esc to deny.
+
 ## Sessions and background work
 
 Use `leveler resume` to continue a session. On macOS and Linux, `leveler serve` also keeps work running in the background. A local background service is not supported on Windows.
 
 If the process that owns background services is lost (crash or kill), `leveler tui` keeps starting: affected tasks become `unknown`, and the startup notice says whether their process was still present. CodeLeveler never signals or re-runs them in that state; use `leveler background list` to inspect what was left, `leveler background logs` for the retained output, and `leveler background journal list` for write reservations that remain unresolved.
 
-`leveler run "task"` runs a task to its end. Add `--collaboration chat` for a single response.
+TUIs in the same project share a runtime. During an upgrade, a client with a compatible protocol and matching configuration can reconnect to a busy runtime. A later startup retries the upgrade once the runtime is idle.
 
-To try multiple candidate implementations, use `leveler run "task" --parallel 3`. This needs a clean, committed Git working tree. It creates branches and worktrees, commits verified candidates, and integrates successful candidates into your current branch.
+A normal TUI exit cancels the active turn and stops background tasks in that session, waits for cleanup, and leaves other sessions running. Tasks in the shared runtime continue when a connection drops or the client is forcibly stopped.
+
+## Command-line runs
+
+`leveler run "task"` runs a task to its end. Add `--collaboration chat` for a single response. Run `leveler run --help` for options.
+
+```sh
+leveler run "add an empty-input regression test for the parser" --parallel 2 --output jsonl
+```
+
+Parallel runs need a clean, committed Git working tree. They create candidate branches and worktrees, commit verified candidates, and integrate successful candidates into your current branch. Candidates inherit the parent run's permission profile, network restrictions, model-step limit, and state directory.
+
+Parallel runs reject `--commit`, `--push`, `--pr`, `--branch`, and `--pr-base` before starting. For single-task runs, shipping failures return a nonzero exit code in both output formats. A candidate setup, execution, or commit failure ends the run before integration and preserves the original cause. If worktree cleanup fails, warnings and the persisted terminal record include the remaining paths. Any completed integration stays in place.
 
 ## Scheduled automation
 
@@ -152,21 +167,25 @@ Or `leveler mcp add devorder --url http://127.0.0.1:8081/mcp --header X-API-Key=
 
 ## Review
 
-`/review` starts a manual, read-only review. It is the only entry: an ordinary message, a completed turn, a commit or a delivery never starts one. A review has its own id, budget, cancellation and durable report; it opens no turn and changes no source.
+In the terminal UI, enter `/review` to start a manual, read-only review. Each review has its own ID, budget, cancellation, and saved report. This feature was added after v1.0.27. See the [changelog](../CHANGELOG.md) for availability.
 
-Bare `/review` opens a scope picker. The default is the current task (its accepted delivery and the files that delivery changed, never every file another session touched). Add the user's own focus after the command:
+### Choose a scope
 
+Enter `/review` on its own to open the scope picker. The default scope is the current task's accepted delivery and the files it changed. To name a scope directly, use one of these forms and add a focus in your own words.
+
+```text
+/review Check error handling in the current task
+/review @workspace Check uncommitted changes
+/review @project Review the project
+/review @session <session-id> Examine this run
+/review @commit <rev> Review this commit
+/review @branch <base> Review this branch against its base
+/review @path src/a.rs,src/b.rs Check the boundaries of these files
 ```
-/review 检查支付模块的安全边界
-/review @workspace 检查当前未提交改动
-/review @project 检查整个项目
-/review @session <session-id> 分析这次执行过程
-/review @commit <rev> 检查这次提交
-/review @branch <base> 检查当前分支相对 base 的提交
-/review @path src/a.rs,src/b.rs 检查这两个文件的边界
-/review @model provider/model 检查...      # this review only
-/review cancel [review-id]                 # stop a running review
-```
+
+Append `@model provider/model` before the focus to select a model for this review. Enter `/review cancel [review-id]` to stop a running review.
+
+### Review evidence
 
 The reviewer reads the objective, the user's own adjustments, the requested object and, where possible, its diff. For a session or an execution question it can also page through the reviewed session's durable record with the read-only `session_history` tool: turns and their terminal states, events and tool results, user/assistant messages, every model request's tokens and latency, goals and requirement changes, and checkpoints. The tool is bound to the reviewed session — the model cannot name another one — and ordinary agents never see it.
 
@@ -174,17 +193,21 @@ The reviewer's read-only investigation surface also includes the code-intelligen
 
 The review's initial context is built only for that review: the source task's objective and recorded requirement changes (with the user's own quotes), project documentation entry points, and — for diff-shaped objects — a bounded relation prefetch of changed symbols and cross-file call sites. When cross-session memory is enabled, it also receives a bounded recall of relevant topics and a read-only `memory_search` tool; memory is historical context, not current fact, and is verified against the source and the user's request. None of this runs in an ordinary turn.
 
+### Investigations and budget
+
 A Lead Reviewer may launch independent read-only investigations with `spawn_agent` when a review is complex enough to benefit. Each investigation starts its own conversation, receives a self-contained objective, and inherits the same reviewed object, read-only tool surface and permission boundary. It cannot write, run commands, change scope, choose a different agent or delegate further. Read tools are confined to the reviewed workspace; host files outside it and credential files are not review evidence. Several investigations can run in parallel, foreground or background; their findings are attributed to the child that reported them, and their structured facts, examined scope, unresolved questions and limitations return to the Lead Reviewer as evidence. The Lead Reviewer remains responsible for verifying and synthesising the single final report — a child's report is not a verdict. A simple review does not need to delegate.
 
-It records findings with an optional dimension (code, business, security, architecture, test, delivery, session), P0–P3 severity, confidence, evidence, impact, a fix direction and whether it reproduced them. It also declares a structured verdict through `report_review`: a conclusion (issues found / none found / inconclusive), per-dimension coverage (reviewed, partial, not reviewed, not applicable), and limitations attributed to the environment, permissions, tool capability or the requested scope. The runtime records what was declared; it never derives these from the report prose or finding counts. A finding is information: it never blocks a goal or changes a turn's terminal.
+A review honors the project configuration's `limits` for tokens and cost and its 20-minute wall bound. Those caps are **shared** by the Lead and every investigation: a child never receives a fresh full budget. When the budget runs out, the review stops issuing new requests, keeps the facts it obtained, and states the incomplete scope honestly.
+
+### Read the report
+
+Once the review ends, click its conversation card to open the saved report. The card shows severity counts, the total number of findings, and whether the source changed. The card and report remain available when you reopen the session. If the reviewed object changed during the run, the report flags it.
+
+The reviewer records findings with an optional dimension (code, business, security, architecture, test, delivery, session), P0–P3 severity, confidence, evidence, impact, a fix direction and whether it reproduced them. It also declares a structured verdict through `report_review`: a conclusion (issues found / none found / inconclusive), per-dimension coverage (reviewed, partial, not reviewed, not applicable), and limitations attributed to the environment, permissions, tool capability or the requested scope. The runtime records what was declared; it never derives these from the report prose or finding counts. A finding is information: it never blocks a goal or changes a turn's terminal state.
+
 Investigator findings arrive at settlement as **candidates**, never as formal defects. The Lead Reviewer alone decides each one with `adjudicate_finding`: `adopted` (a formal finding, optionally with an adjusted severity/confidence/title), `rejected` (evidence against it; never counted), `duplicate` (same root cause; merged into a named finding), or `unresolved` (still undecided). A candidate the Lead does not mention stays unresolved; the runtime never adopts or rejects one implicitly. The formal defect count is the Lead's own findings plus explicitly adopted candidates; pending candidates are reported separately, and rejected or merged candidates remain in the record for traceability without inflating the count. Several investigators reporting one root cause should be merged into one finding.
 
-The `report` field of `report_review` is the **formal report body**: complete, standalone, and explicitly submitted by the model. The final chat message is stored and shown separately and never replaces the report. Every `report_review` is a full revision bound to the evidence revision at submission (the number of settled investigations). If new investigation evidence arrives after submission and the Lead does not submit a new complete report, the review may still be Completed, but the report is explicitly marked as not covering the latest evidence; the runtime never rewrites the model's conclusion for it.
-
-A review honors the repository's existing `[limits]` token and cost caps from `.leveler/config.yaml` and its 20-minute wall bound. Those caps are **shared** by the Lead and every investigation: a child never receives a fresh full budget. When the budget runs out, the review stops issuing new requests, keeps the facts it obtained, and states the incomplete scope honestly.
-
-
-When it settles, the conversation shows a card (`P0/P1/P2/P3`, finding count, whether source was modified). Click the card — or its `查看报告 ↗` — to open the report page; the report is read from the durable review row, so reopening a session shows the same card and report. A review object that changed while the review ran says so instead of presenting a stale report as current.
+The `report` field of `report_review` is the **formal report body**: complete, standalone, and explicitly submitted by the model. The final chat message is stored and shown separately and never replaces the report. Every `report_review` is a full revision bound to the evidence revision at submission. A new investigation result, a finding from the Lead, or a changed adjudication advances that revision. If the report is not resubmitted, the review can still complete and the report is marked as missing newer evidence.
 
 `Completed` means the reviewer reached a clean end, not that no defects exist. A declared coverage of `reviewed` is the reviewer's statement about its own scope, not a runtime proof. `No findings` is not proof of correctness or security. An incomplete or cancelled review keeps whatever it had already established and says what stopped it.
 
