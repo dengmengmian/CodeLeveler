@@ -551,4 +551,22 @@ mod tests {
         assert_eq!(runtime.generation, 3);
         assert_eq!(runtime.protocol.as_deref(), Some("2024-11-05"));
     }
+
+    #[test]
+    fn a_large_catalog_is_bounded_but_keeps_its_true_count() {
+        let tools = (0..(MAX_TOOLS_PER_SERVER + 5))
+            .map(|i| McpToolDescriptor {
+                remote_name: format!("tool-{i}"),
+                exposed_name: format!("mcp__s__tool-{i}"),
+                description: "d".into(),
+                input_schema: serde_json::json!({}),
+                truncated: false,
+                risk: "network".into(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = McpServerRuntime::connected(1, None, tools, MAX_TOOLS_PER_SERVER + 5);
+        assert_eq!(runtime.tools.len(), MAX_TOOLS_PER_SERVER);
+        assert!(runtime.tools_truncated);
+        assert_eq!(runtime.tool_total, MAX_TOOLS_PER_SERVER + 5);
+    }
 }
