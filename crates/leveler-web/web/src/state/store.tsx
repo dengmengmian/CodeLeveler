@@ -609,7 +609,7 @@ function viewFromSnapshot(
   const sameSession = prev !== null && prev.id === snap.id;
   return {
     id: snap.id,
-    title: snap.goal || '未命名会话',
+    title: snap.title || snap.goal || '未命名会话',
     repository: snap.repository ?? null,
     branch: snap.branch ?? null,
     status: snap.status,
@@ -751,7 +751,7 @@ function applySessionMeta(current: SessionView, snap: UiSessionSnapshot): void {
   current.availableModels = snap.available_models ?? [];
   current.permission = snap.mode;
   if (snap.status) current.status = snap.status;
-  if (snap.goal) current.title = snap.goal || current.title;
+  if (snap.title || snap.goal) current.title = snap.title || snap.goal || current.title;
   if (snap.collaboration) current.collaboration = snap.collaboration;
   if (snap.thinking !== undefined && snap.thinking !== null) {
     // 用户词表里的档位；模型不可调时不显示任何档位。
@@ -806,11 +806,13 @@ export function reducer(state: AppState, action: Action): void {
       state.connection = action.status;
       return;
     case 'session_list':
-      state.sessions = action.sessions;
+      // Archived sessions keep their data but leave the default rail; the
+      // runtime includes them so a client that offers an archive view can.
+      state.sessions = action.sessions.filter((s) => !s.archived);
       // 顺手更新当前会话在轨道的标题（goal 以后端为准）
       if (state.current) {
         const row = action.sessions.find((s) => s.id === state.current?.id);
-        if (row?.goal) state.current.title = row.goal;
+        if (row?.title || row?.goal) state.current.title = row.title || row.goal;
       }
       return;
     case 'snapshot': {

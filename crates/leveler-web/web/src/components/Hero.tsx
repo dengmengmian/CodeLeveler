@@ -100,7 +100,7 @@ export function Hero() {
           <div className="h-recent-head">最近会话</div>
           {recent.map((s) => (
             <button key={s.id} className="h-recent-item" onClick={() => bridge.selectSession(s.id)}>
-              <span className="hr-goal">{s.goal || '未命名会话'}</span>
+              <span className="hr-goal">{s.title || s.goal || '未命名会话'}</span>
               <span className="hr-time">{formatRelative(s.updated_at)}</span>
             </button>
           ))}

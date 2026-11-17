@@ -901,7 +901,7 @@ async function archiveTask(task) {
 function archiveCurrent() {
   if (!current) return;
   const task = tasks.find(item => item.id === current.session.id)
-    ?? { id: current.session.id, title: current.session.goal, source_id: currentSource };
+    ?? { id: current.session.id, title: current.session.title || current.session.goal, source_id: currentSource };
   archiveTask(task);
 }
 
@@ -1414,7 +1414,7 @@ function beginTitleEdit() {
   titleEditing = true;
   const title = $('conversation-title');
   const input = el('input', 'title-input');
-  input.value = current.session.goal ?? '';
+  input.value = (current.session.title || current.session.goal) ?? '';
   input.maxLength = 256;
   input.setAttribute('aria-label', '会话标题');
   title.replaceWith(input);
@@ -1429,7 +1429,7 @@ function beginTitleEdit() {
         await action(async () => {
           await deliver(command);
           await refreshMetadata();
-          if (current.session.goal !== command.name) throw new Error('Runtime 尚未返回更新后的标题');
+          if ((current.session.title || current.session.goal) !== command.name) throw new Error('Runtime 尚未返回更新后的标题');
           await refreshTasks();
           toast('标题已更新', { tone: 'success', holdMs: 1600 });
         });
@@ -1482,7 +1482,7 @@ function renderHeader() {
     renderOpenInAppControls();
     return;
   }
-  if (!titleEditing) renderHeaderCrumbs(current.session.goal || '新建会话');
+  if (!titleEditing) renderHeaderCrumbs(current.session.title || current.session.goal || '新建会话');
   // The reference header carries no status sentence; runtime state is shown in
   // the transcript and the composer. Keep the element for assistive tech only.
   $('conversation-status').textContent = current.approvals.length || current.clarifications.length

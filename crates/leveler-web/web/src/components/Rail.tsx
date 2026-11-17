@@ -237,7 +237,7 @@ function WorkspaceGroup({
                     {showStatus ? <i className={`dot ${cue.kind}`} /> : null}
                     {renamingSession === s.id ? (
                       <RenameInput
-                        initial={s.goal}
+                        initial={s.title || s.goal}
                         onSubmit={(value) => {
                           setRenamingSession(null);
                           bridge.renameSession(s.id, value);
@@ -245,13 +245,13 @@ function WorkspaceGroup({
                         onCancel={() => setRenamingSession(null)}
                       />
                     ) : (
-                      <span className="t">{s.goal || '未命名会话'}</span>
+                      <span className="t">{s.title || s.goal || '未命名会话'}</span>
                     )}
                     <span className="ago">
                       {showStatus ? `${cue.label} · ` : ''}
                       {formatRelative(s.updated_at)}
                     </span>
-                    <SessionMenu id={s.id} title={s.goal} onRename={() => setRenamingSession(s.id)} />
+                    <SessionMenu id={s.id} title={s.title || s.goal} onRename={() => setRenamingSession(s.id)} />
                   </button>
                 );
               })}

@@ -1321,6 +1321,23 @@ export class RuntimeBridge {
         this.setModel(hit);
         return;
       }
+      case '/goal': {
+        const sid = needSession();
+        if (!sid) return;
+        if (!arg) {
+          this.sink({ type: 'notice', message: '用法：/goal <目标>' });
+          return;
+        }
+        // The runtime shares one Goal route across clients. This is the same
+        // command the TUI sends, never a client-side mode toggle.
+        this.deliver({
+          type: 'run_goal',
+          session_id: sid,
+          content: arg,
+          require_new_turn: false,
+        });
+        return;
+      }
       case '/collab': {
         if (!arg) return; // 无参数：由 Composer 打开协作弹层
         const collab = arg.toLowerCase();

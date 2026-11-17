@@ -11,6 +11,7 @@ export interface SlashCommand {
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { command: '/model', description: '切换模型', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
+  { command: '/goal', description: '设置目标并开始执行', kind: 'action', group: 'run', groupLabel: 'RUN CONFIGURATION' },
   { command: '/collab', description: '协作档', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
   { command: '/perm', description: '权限档位', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
   { command: '/clear', description: '开始新对话（当前会话留在列表）', kind: 'action', group: 'conversation', groupLabel: 'CONVERSATION' },
