@@ -279,10 +279,11 @@ fn command_identity_word(word: &str) -> String {
 
 /// A stable signature for "approve for the session".
 ///
-/// Bind the complete proposed call, including cwd, environment, script and
-/// argv boundaries. Reuse the action fingerprint rather than maintaining a
-/// second command identity. The proposal does not resolve repository config,
-/// implicit cwd or executable contents, so this is not a resource grant.
+/// Bind the complete proposed call: the tool name and its serialized
+/// arguments (including any explicit cwd, environment and argv text the call
+/// carries). It does not resolve repository config, an implicit cwd, the
+/// contents of an executable or script the call names, or a later replacement
+/// of that file. This is exact-call identity, not a resource grant.
 pub(crate) fn approval_signature(call: &ToolCall) -> String {
     format!("{}:{}", call.name, action_fingerprint(call))
 }

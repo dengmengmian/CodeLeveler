@@ -46,6 +46,10 @@ pub enum RestartReason {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
     /// Read local durable sources; never starts their runtimes.
+    ///
+    /// Reserved for a client-facing global task view. The runtime answers it
+    /// read-only, but no in-tree client sends it yet; current clients build
+    /// their task view from session and background events.
     QueryGlobalTasks {
         requester_session_id: SessionId,
         query_id: String,
@@ -288,6 +292,9 @@ pub enum ClientCommand {
         collaboration: String,
     },
     /// Confirm a collaboration-plan proposal and auto-enter goal mode (K24).
+    ///
+    /// Retained for compatibility: current clients start goal work through
+    /// `RunGoal`, and this handler is not reachable from the TUI or CLI.
     ConfirmPlanToGoal {
         session_id: SessionId,
         /// Optional plan body; empty uses the last assistant proposal text.
@@ -306,6 +313,9 @@ pub enum ClientCommand {
     /// Start a fresh conversation: drop the session's stored message history so
     /// the next turn carries no prior context (a real "new chat", not a screen
     /// clear).
+    ///
+    /// Retained for compatibility: the TUI's `/clear` starts a new session
+    /// instead, and no in-tree client sends this command.
     ClearConversation { session_id: SessionId },
     /// Ask for the list of stored sessions (spec §52).
     RequestSessionList,
@@ -597,6 +607,8 @@ pub enum ClientCommand {
     /// continues one: resume is a policy this runtime has not decided, and a
     /// protocol that can only report is a protocol that cannot accidentally
     /// restart somebody's half-finished mutation.
+    ///
+    /// Reserved: the runtime answers it, but no in-tree client sends it yet.
     ListUnfinishedGoals {
         session_id: SessionId,
         /// Correlation token for [`crate::RuntimeEvent::UnfinishedGoalsLoaded`].
