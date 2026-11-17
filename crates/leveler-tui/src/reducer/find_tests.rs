@@ -506,13 +506,10 @@ fn a_user_shell_capture_result_opens_its_complete_output() {
     }
     let mut s = state_at(Some(&root));
     let id = UserShellId::new("sh1");
-    s.transcript.push_user_shell_started(
-        id.clone(),
-        "cargo test".into(),
-        "/repo".into(),
-        0,
-    );
-    s.transcript.append_user_shell_output(&id, "head tail", false);
+    s.transcript
+        .push_user_shell_started(id.clone(), "cargo test".into(), "/repo".into(), 0);
+    s.transcript
+        .append_user_shell_output(&id, "head tail", false);
     s.transcript
         .set_user_shell_full_output(&id, Some(directory.display().to_string()));
     s.transcript

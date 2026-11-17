@@ -179,8 +179,10 @@ mod tests {
 
     #[test]
     fn a_capture_result_revalidates_to_the_exact_file_it_scanned() {
-        let root =
-            std::env::temp_dir().join(format!("leveler-find-capture-recheck-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "leveler-find-capture-recheck-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let directory = root
             .join("state")
