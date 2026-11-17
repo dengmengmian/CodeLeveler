@@ -156,7 +156,13 @@ pub fn snippet(haystack: &str, matched: TextMatch, context_chars: usize) -> (Str
 
     let flatten = |text: &str| -> String {
         text.chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .map(|ch| {
+                if ch.is_control() || is_bidi_control(ch) {
+                    ' '
+                } else {
+                    ch
+                }
+            })
             .collect()
     };
     let before = flatten(&haystack[win_start..matched.start]);
@@ -175,6 +181,15 @@ pub fn snippet(haystack: &str, matched: TextMatch, context_chars: usize) -> (Str
         out.push('…');
     }
     (out, start, end)
+}
+
+/// Directional overrides and isolates can visually reorder a single result
+/// row. They are format characters, not `is_control`, so a search snippet
+/// neutralises them explicitly; every replacement stays one character, so the
+/// match range is unaffected.
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch,
+        '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
@@ -266,6 +281,18 @@ mod tests {
         assert_eq!(&text[start..end], "REFUND");
         assert!(!text.contains('\n') && !text.contains('\t'), "{text:?}");
         assert!(text.contains("line one") && text.contains("approved"));
+    }
+
+    #[test]
+    fn snippet_neutralises_directional_overrides() {
+        let text = "before \u{202E}evil\u{202C} after";
+        let found = find_all(text, "evil", 1)[0];
+        let (out, start, end) = snippet(text, found, 80);
+        assert!(
+            !out.contains('\u{202E}') && !out.contains('\u{202C}'),
+            "{out:?}"
+        );
+        assert_eq!(&out[start..end], "evil");
     }
 
     #[test]
