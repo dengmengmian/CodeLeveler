@@ -23,7 +23,7 @@ use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
 use leveler_local_transport::{LocalSocketRuntimeClient, LocalSocketServer};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
-use leveler_storage::{TaskStore, TurnRepository};
+use leveler_storage::{SessionRepository, TaskStore, TurnRepository};
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
@@ -2327,4 +2327,62 @@ async fn two_socket_clients_cannot_replace_settings_from_one_snapshot() {
     drop(right);
     shutdown.cancel();
     task.await.unwrap().unwrap();
+}
+
+/// A production delivery envelope for a session-management command must bind
+/// to the session the command targets, not to the client's current session.
+/// The Sessions view manages stored sessions; the runtime rejects a mismatch
+/// before dispatch, which previously made archive/unarchive of any other
+/// session a silent no-op.
+#[test]
+fn delivered_unarchive_restores_a_stored_session() {
+    leveler_test_support::bounded_test(
+        "delivered_unarchive_restores_a_stored_session",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        delivered_unarchive_restores_a_stored_session_body,
+    );
+}
+
+async fn delivered_unarchive_restores_a_stored_session_body() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let db = app.open_database().await.unwrap();
+    let sessions = SessionRepository::new(&db);
+    let envelope = |command: ClientCommand| CommandEnvelope {
+        command_id: CommandId::generate(),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command,
+    };
+
+    client
+        .deliver(envelope(ClientCommand::ArchiveSession {
+            session_id: session_id.clone(),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        sessions.list().await.unwrap().is_empty(),
+        "the archived session left the default list"
+    );
+    assert!(
+        sessions.get(&session_id).await.unwrap().is_some(),
+        "archive did not delete the session"
+    );
+
+    client
+        .deliver(envelope(ClientCommand::UnarchiveSession {
+            session_id: session_id.clone(),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.id == session_id.as_str()),
+        "unarchive restored the session to the default list"
+    );
 }

@@ -265,18 +265,32 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                     if let Some(s) = state.sessions.get(state.sessions_selected)
                         && !s.archived
                     {
-                        return vec![Effect::Send(ClientCommand::ArchiveSession {
-                            session_id: s.id.clone(),
-                        })];
+                        // The archive command's SessionList event is runtime-
+                        // global, but this client listens to its own session
+                        // stream. Request the authoritative list after the
+                        // mutation so the page cannot keep showing a stale row.
+                        return vec![
+                            Effect::Send(ClientCommand::ArchiveSession {
+                                session_id: s.id.clone(),
+                            }),
+                            Effect::Send(ClientCommand::RequestSessionListFor {
+                                requester_session_id: state.session_id.clone(),
+                            }),
+                        ];
                     }
                 }
                 KeyCode::Char('u') => {
                     if let Some(s) = state.sessions.get(state.sessions_selected)
                         && s.archived
                     {
-                        return vec![Effect::Send(ClientCommand::UnarchiveSession {
-                            session_id: s.id.clone(),
-                        })];
+                        return vec![
+                            Effect::Send(ClientCommand::UnarchiveSession {
+                                session_id: s.id.clone(),
+                            }),
+                            Effect::Send(ClientCommand::RequestSessionListFor {
+                                requester_session_id: state.session_id.clone(),
+                            }),
+                        ];
                     }
                 }
                 KeyCode::Char('f') => {
@@ -950,10 +964,13 @@ mod sessions_view_tests {
         let mut state = state(true);
         let effects = handle_screen_key(&mut state, key('u'));
         match effects.as_slice() {
-            [Effect::Send(ClientCommand::UnarchiveSession { session_id })] => {
+            [
+                Effect::Send(ClientCommand::UnarchiveSession { session_id }),
+                Effect::Send(ClientCommand::RequestSessionListFor { .. }),
+            ] => {
                 assert_eq!(session_id.as_str(), "s1");
             }
-            other => panic!("expected UnarchiveSession, got {other:?}"),
+            other => panic!("expected UnarchiveSession + list refresh, got {other:?}"),
         }
     }
 
@@ -962,10 +979,13 @@ mod sessions_view_tests {
         let mut state = state(false);
         let effects = handle_screen_key(&mut state, key('a'));
         match effects.as_slice() {
-            [Effect::Send(ClientCommand::ArchiveSession { session_id })] => {
+            [
+                Effect::Send(ClientCommand::ArchiveSession { session_id }),
+                Effect::Send(ClientCommand::RequestSessionListFor { .. }),
+            ] => {
                 assert_eq!(session_id.as_str(), "s1");
             }
-            other => panic!("expected ArchiveSession, got {other:?}"),
+            other => panic!("expected ArchiveSession + list refresh, got {other:?}"),
         }
     }
 
