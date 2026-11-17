@@ -56,6 +56,16 @@ pub enum ClientCommand {
         #[serde(default)]
         include_archived: bool,
     },
+    /// Read the runtime's structured diagnostics. Safe while a turn runs:
+    /// local, read-only checks that open no provider request and mutate
+    /// nothing. Answers with [`crate::RuntimeEvent::DiagnosticsLoaded`].
+    ///
+    /// Reserved for trusted local clients: the report names configuration
+    /// paths and provider identities, which remote clients must not receive.
+    QueryDiagnostics {
+        requester_session_id: SessionId,
+        query_id: CommandId,
+    },
     /// Manage user-global scheduled automation.
     ///
     /// The schedule store remains the single authority; this command is the
@@ -792,6 +802,10 @@ impl ClientCommand {
             | ClientCommand::ForgetMemory { session_id, .. }
             | ClientCommand::QueryContext { session_id, .. } => Some(session_id),
             ClientCommand::QueryGlobalTasks { requester_session_id, .. }
+            | ClientCommand::QueryDiagnostics {
+                requester_session_id,
+                ..
+            }
             | ClientCommand::ManageSchedule {
                 requester_session_id,
                 ..
@@ -1062,6 +1076,17 @@ mod tests {
                 session_id: SessionId::new("s1"),
             },
             "cancel_task",
+        );
+    }
+
+    #[test]
+    fn query_diagnostics_roundtrips_with_its_requester_and_correlation() {
+        roundtrip(
+            ClientCommand::QueryDiagnostics {
+                requester_session_id: SessionId::new("s1"),
+                query_id: CommandId::new("q1"),
+            },
+            "query_diagnostics",
         );
     }
 

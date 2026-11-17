@@ -147,6 +147,51 @@ export type ConversationStateOwnership =
   /** The provider keeps the conversation state; the client sends a cursor. No supported route constructs this yet. */
   | 'provider_managed';
 
+/** The area a finding belongs to. The overview groups findings by this value. */
+export type DiagnosticCategory = 'runtime' | 'model' | 'mcp' | 'permission' | 'sandbox' | 'terminal' | 'configuration' | 'recovery';
+
+/** One structured diagnostic finding. `evidence` carries observed facts only, already redacted by the producer: never a secret value, never a stack trace, never an instruction. Consumers render it verbatim. */
+export interface DiagnosticFinding {
+  /** Stable key for an existing user action that may help. Never a command the client runs on its own. */
+  action?: string | null;
+  category: DiagnosticCategory;
+  /** When the check ran, from the producer's clock. */
+  checked_at: string;
+  /** Observed facts, redacted. Order is meaningful and stable. */
+  evidence?: string[];
+  /** Stable machine key. See the `finding_id` constants. */
+  id: string;
+  severity: DiagnosticSeverity;
+  status: DiagnosticStatus;
+  /** The instance this finding is about, when one check repeats per resource. */
+  subject?: string | null;
+}
+
+/** The answer to one diagnostics request. */
+export interface DiagnosticReport {
+  findings: DiagnosticFinding[];
+  /** When the report was assembled, from the producer's clock. */
+  generated_at: string;
+}
+
+/** How much a finding matters, independent of what the check established. */
+export type DiagnosticSeverity = 'info' | 'warning' | 'error';
+
+/** What the check actually established. */
+export type DiagnosticStatus =
+  /** The check ran and the condition holds. */
+  | 'pass'
+  /** The check ran and found a confirmed, non-blocking problem. */
+  | 'warn'
+  /** The check ran and found a definite, blocking problem. */
+  | 'fail'
+  /** Authoritative data is insufficient to decide. */
+  | 'unknown'
+  /** The check was not performed. Never a pass. */
+  | 'not_checked'
+  /** The check does not apply to this environment. */
+  | 'not_applicable';
+
 /** What kind of failure this is, in product terms. Vendor error codes are not part of this vocabulary — `Moonshot invalid_request_error`, `OpenAI invalid_request_error` and `Anthropic invalid_request_error` are all just [`FailureCategory::InvalidRequest`] here. */
 export type FailureCategory =
   /** A network/transport failure reaching a provider or service. */
@@ -363,6 +408,8 @@ export type RestartReason =
 /** An event flowing from the runtime to clients. */
 export type RuntimeEvent =
   | { type: 'global_tasks_loaded'; index: UiGlobalTaskIndex; query_id: string; requester_session_id: SessionId }
+  /** The answer to [`crate::ClientCommand::QueryDiagnostics`]. Read-only: the findings are observations from the runtime's own checks, never a client-supplied health claim. */
+  | { type: 'diagnostics_loaded'; query_id: CommandId; report: DiagnosticReport; requester_session_id: SessionId }
   /** The answer to [`crate::ClientCommand::ManageSchedule`]. `response` carries domain failures too; a transport failure is the only case where no answer arrives. */
   | { type: 'schedule_managed'; query_id: CommandId; requester_session_id: SessionId; response: ScheduleResponse }
   /** The runtime finished booting and is ready for commands. */
@@ -2089,8 +2136,10 @@ export type UserShellId = string;
 
 /** A command from a UI client to the runtime. */
 export type ClientCommand =
-  /** Read local durable sources; never starts their runtimes. */
+  /** Read local durable sources; never starts their runtimes. Reserved for a client-facing global task view. The runtime answers it read-only, but no in-tree client sends it yet; current clients build their task view from session and background events. */
   | { type: 'query_global_tasks'; include_archived?: boolean; query_id: string; requester_session_id: SessionId }
+  /** Read the runtime's structured diagnostics. Safe while a turn runs: local, read-only checks that open no provider request and mutate nothing. Answers with [`crate::RuntimeEvent::DiagnosticsLoaded`]. Reserved for trusted local clients: the report names configuration paths and provider identities, which remote clients must not receive. */
+  | { type: 'query_diagnostics'; query_id: CommandId; requester_session_id: SessionId }
   /** Manage user-global scheduled automation. The schedule store remains the single authority; this command is the structured adapter every client uses, so no client parses human-readable CLI output back into state. The answer is [`crate::RuntimeEvent::ScheduleManaged`] carrying the same `query_id`. */
   | { type: 'manage_schedule'; query_id: CommandId; request: ScheduleRequest; requester_session_id: SessionId }
   /** Ask the runtime for one best-effort prediction of the user's next prompt. The request is advisory UI chrome: it starts no task, persists no message, and may produce no event when there is insufficient context. */
@@ -2143,13 +2192,13 @@ export type ClientCommand =
   | { type: 'set_thinking_level'; level?: ThinkingLevel | null; session_id: SessionId }
   /** Set collaboration (`chat | plan | goal`). `work_profile` is a deprecated compatibility field accepted from old clients and ignored by the runtime. */
   | { type: 'set_product_axes'; collaboration: string; session_id: SessionId; work_profile: string }
-  /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). */
+  /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). Retained for compatibility: current clients start goal work through `RunGoal`, and this handler is not reachable from the TUI or CLI. */
   | { type: 'confirm_plan_to_goal'; content: string; session_id: SessionId }
   /** Recompute and return the working-tree diff. */
   | { type: 'request_diff'; query_id?: CommandId | null; session_id: SessionId }
   /** Summarize and compact the conversation history (spec §28, §53). */
   | { type: 'compact_context'; session_id: SessionId }
-  /** Start a fresh conversation: drop the session's stored message history so the next turn carries no prior context (a real "new chat", not a screen clear). */
+  /** Start a fresh conversation: drop the session's stored message history so the next turn carries no prior context (a real "new chat", not a screen clear). Retained for compatibility: the TUI's `/clear` starts a new session instead, and no in-tree client sends this command. */
   | { type: 'clear_conversation'; session_id: SessionId }
   /** Ask for the list of stored sessions (spec §52). */
   | { type: 'request_session_list' }
@@ -2222,7 +2271,7 @@ export type ClientCommand =
   | { type: 'query_child_contribution'; child_id: string; query_id?: CommandId | null; session_id: SessionId }
   /** Cut a durable goal checkpoint for the session's current goal and surface it as a Recap (long-goal P3, `/recap`). This is NOT "summarize the visible transcript": the runtime projects authoritative facts (event log, evidence ledger, goal row) into a persisted GoalCheckpoint and answers with [`crate::RuntimeEvent::GoalRecapCreated`]. Idempotent at the same event boundary — a transport retry returns the same checkpoint. */
   | { type: 'recap'; session_id: SessionId }
-  /** List goals that still owe work (long-goal P2). Read-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation. */
+  /** List goals that still owe work (long-goal P2). Read-only, and there is deliberately no companion command that continues one: resume is a policy this runtime has not decided, and a protocol that can only report is a protocol that cannot accidentally restart somebody's half-finished mutation. Reserved: the runtime answers it, but no in-tree client sends it yet. */
   | { type: 'list_unfinished_goals'; query_id?: CommandId | null; session_id: SessionId }
   /** The session's past turns as clients saw them live: its durable event log projected through the same client projection, with the user's messages in place. Answered by [`crate::RuntimeEvent::SessionHistoryLoaded`]. */
   | { type: 'query_session_history'; query_id?: CommandId | null; session_id: SessionId }

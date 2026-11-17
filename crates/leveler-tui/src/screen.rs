@@ -42,8 +42,14 @@ pub enum Screen {
     /// Full active objective, opened from the bounded header summary.
     Goal,
     Help,
-    /// Local terminal capability diagnostics; never a runtime health claim.
+    /// Structured diagnostics: live client/runtime facts plus the shared
+    /// configuration checks. Terminal capabilities remain one of its
+    /// categories; the page is never a blanket runtime health claim.
     Doctor,
+    /// `/tasks`: one read-only aggregation over session, goal, child agent,
+    /// background task and schedule-run facts. Enter opens the existing detail
+    /// surface for the selected row; this page owns no lifecycle.
+    Tasks,
     /// Durable runtime observatory (`/trace`).
     Trace,
     /// The Context & Usage page. `/context` and `/usage` are two entry points
@@ -67,6 +73,10 @@ pub enum Screen {
     /// the page paints only the visible rows, so a 50 MiB result costs the
     /// same per frame as a 1 KiB one.
     Output,
+    /// `/find` / `/jump`: search this session's transcript and move between
+    /// its user turns. A view over the transcript the client already holds;
+    /// it never changes the turn, the goal or the runtime.
+    Find,
 }
 
 /// Which section of the Context & Usage page an entry point reveals.
@@ -237,6 +247,33 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         &[],
         SlashCategory::View,
         SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    // One aggregation over every task source the runtime already owns. Safe
+    // while busy: the page reads state and sends only read-only queries.
+    slash(
+        "/tasks",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    // Search the conversation the reader is already looking at. Always safe
+    // while busy: it reads the client's transcript and sends no command.
+    slash(
+        "/find",
+        &["/search"],
+        SlashCategory::View,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
+    // The same page's Turns list, or a direct jump. Range validation is the
+    // page's, never a second navigation model.
+    slash(
+        "/jump",
+        &[],
+        SlashCategory::View,
+        SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
     slash(
@@ -619,6 +656,8 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/compact" => s.compact,
         "/copy" => s.copy,
         "/output" => s.output,
+        "/find" | "/search" => s.find,
+        "/jump" => s.jump,
         "/export" | "/save" => s.export,
         "/web" => s.web,
         "/image" | "/attach" => s.attach,
@@ -626,6 +665,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/new" => s.new,
         "/help" => s.help,
         "/exit" | "/quit" => s.exit,
+        "/tasks" => s.tasks,
         "/doctor" => s.doctor,
         "/clean" => s.clean,
         "/schedules" => s.schedules,
@@ -833,6 +873,8 @@ pub fn slash_arg_ghost(text: &str, t: &UiText) -> Option<&'static str> {
         "/btw" => (g.btw, g.btw_spaced),
         "/goal" => (g.goal, g.goal_spaced),
         "/attach" => (g.path, g.path_spaced),
+        "/find" | "/search" => (g.find, g.find_spaced),
+        "/jump" => (g.jump, g.jump_spaced),
         _ => return None,
     };
     if text.ends_with(|c: char| c.is_whitespace()) {
@@ -930,6 +972,9 @@ mod surface_tests {
                 "/skills",
                 "/review",
                 "/diff",
+                "/tasks",
+                "/find",
+                "/jump",
                 "/trace",
                 "/context",
                 "/usage",
@@ -1136,6 +1181,7 @@ mod ghost_tests {
                 "/recap",
                 "/collab",
                 "/diff",
+                "/find",
                 "/compact",
                 "/new",
                 "/help",
@@ -1449,6 +1495,7 @@ mod reachability_tests {
             Screen::Conversation => Some("the default screen"),
             Screen::Tools => Some("Ctrl+T — reducer/mod.rs toggle_screen"),
             Screen::Diff => Some("Ctrl+D / `/diff` — screen_nav::open_diff_screen"),
+            Screen::Find => Some("`/find` / `/jump` — reducer/submit.rs"),
             Screen::Sessions => Some("`/sessions` — screen_nav::open_sessions_screen"),
             Screen::ForeignSessions => {
                 Some("`/resume-claude` / `/resume-codex` — reducer/submit.rs")
@@ -1462,7 +1509,8 @@ mod reachability_tests {
             Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),
             Screen::Goal => Some("Enter or click on the header goal — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
-            Screen::Doctor => Some("`/doctor` — toggle_screen"),
+            Screen::Doctor => Some("`/doctor` — doctor::open"),
+            Screen::Tasks => Some("`/tasks` — tasks::open"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
@@ -1480,6 +1528,7 @@ mod reachability_tests {
             Screen::Conversation,
             Screen::Tools,
             Screen::Diff,
+            Screen::Find,
             Screen::Sessions,
             Screen::ForeignSessions,
             Screen::Activity,
@@ -1489,6 +1538,7 @@ mod reachability_tests {
             Screen::Goal,
             Screen::Help,
             Screen::Doctor,
+            Screen::Tasks,
             Screen::Trace,
             Screen::Context,
             Screen::Review,

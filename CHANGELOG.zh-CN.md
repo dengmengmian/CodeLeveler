@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- `/tasks` 成为统一只读任务工作台：聚合当前会话的目标、子 Agent、后台任务与审查，定时任务定义及最近运行，以及全局存储中的全部会话。进行中 / 最近 / 全部共享一套稳定选择；Enter 进入已有活动、目标或定时任务页，`x` 通过运行时取消当前会话任务，`r` 重新读取快照来源。全局会话行标注快照时间，活任务原地实时更新。
+- `/doctor` 改为与 `leveler doctor` 共享的结构化诊断。每项检查都是带稳定 ID、类型化状态（`pass`、`warn`、`fail`、`unknown`、`not checked`、`not applicable`）、真实证据和可选已有操作的 finding。TUI 补充实时运行时、会话、恢复、权限与终端事实；运行时提供共享的配置、Provider、模型、MCP 配置与沙箱检查。`UNKNOWN` 与 `NOT CHECKED` 永远不会显示为通过，MCP 实时连接状态明确标为未检查/不适用；任务运行期间可用，且不会调用模型。`leveler doctor --json` 输出同一组稳定、机器可读的 finding。
 - 显式 `--deny-network` 现在在 Full 下继续生效。Full 仍然不询问、不施加 CodeLeveler 的围栏，但不会静默撤销用户本次显式设置的运行级限制；后端无法强制执行时明确失败，而不是放开。
 - 精确批准若提升工作区写围栏，提示中会明确说明；并且只有本身会写入的动作（命令、文件修改、无沙箱的 MCP server）才会提升。批准网络请求或定义写入时保留 admission 解析出的写范围。
 - 子 Agent 不再持有 `schedule_inspect` / `schedule_manage`：用户全局定时任务属于顶层工作，在 admission 直接拒绝（Full 也不能绕过）。

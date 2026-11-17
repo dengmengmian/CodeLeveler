@@ -35,7 +35,16 @@ fn clear_resolved_version_notice(state: &mut AppState) {
 
 pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
     match event {
-        RuntimeEvent::GlobalTasksLoaded { .. } => {}
+        RuntimeEvent::GlobalTasksLoaded {
+            requester_session_id,
+            query_id,
+            index,
+        } => crate::tasks::apply_global_tasks(state, &requester_session_id, &query_id, index),
+        RuntimeEvent::DiagnosticsLoaded {
+            requester_session_id,
+            query_id,
+            report,
+        } => crate::doctor::apply_loaded(state, &requester_session_id, &query_id, *report),
         RuntimeEvent::RuntimeReady => {}
         RuntimeEvent::RuntimeBuildObserved { runtime_build } => {
             let was_mismatched = state.runtime_version_mismatch;
@@ -1033,8 +1042,16 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         // response for a request this client did not send matches none of the
         // page's slots and is ignored, exactly like the agents queries above.
         RuntimeEvent::ScheduleManaged {
-            query_id, response, ..
+            requester_session_id,
+            query_id,
+            response,
         } => {
+            crate::tasks::apply_schedule_response(
+                state,
+                &requester_session_id,
+                &query_id,
+                (*response).clone(),
+            );
             crate::schedules::apply_response(state, &query_id, *response);
         }
         RuntimeEvent::AgentsLoaded {
@@ -2489,6 +2506,9 @@ fn restore_history(
         .cloned()
         .collect();
     state.transcript.replace_with(scratch.transcript);
+    // `/find` reports this bound instead of implying that the loaded
+    // transcript is the whole session.
+    state.history_omitted_turns = omitted_turns;
     for row in journal_held {
         if row.state == InputDelivery::Pending {
             state
@@ -2718,6 +2738,17 @@ fn apply_session_with(
         if state.active_screen == crate::screen::Screen::Review {
             state.active_screen = crate::screen::Screen::Conversation;
             state.screen_scroll = 0;
+        }
+        // A search corpus belongs to the session it was built from. Results,
+        // an in-flight scan and an unloaded older-turn count must never cross
+        // into the newly opened session.
+        state.find.reset();
+        state.find_highlight = None;
+        state.history_omitted_turns = 0;
+        if state.active_screen == crate::screen::Screen::Find {
+            state.active_screen = crate::screen::Screen::Conversation;
+            state.screen_scroll = 0;
+            state.workbench_focus = crate::state::WorkbenchFocus::Input;
         }
     }
     // Snapshot is runtime truth. A pending Shift+Tab from the previous

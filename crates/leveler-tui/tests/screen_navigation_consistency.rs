@@ -515,6 +515,7 @@ fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
         (Screen::Sessions, "Sessions"),
         (Screen::Help, "Help"),
         (Screen::Doctor, "Doctor"),
+        (Screen::Tasks, "Tasks"),
         (Screen::Context, "Context"),
         (Screen::Clean, "Clean"),
         (Screen::Tools, "Tools"),
@@ -535,6 +536,7 @@ fn pages_with_clickable_rows() -> Vec<(Screen, &'static str)> {
         (Screen::Diff, "Diff"),
         (Screen::Tools, "Tools"),
         (Screen::Help, "Help"),
+        (Screen::Tasks, "Tasks"),
     ]
 }
 
@@ -545,6 +547,7 @@ fn overflowing_pages() -> Vec<(Screen, &'static str)> {
         (Screen::Plan, "Plan"),
         (Screen::Help, "Help"),
         (Screen::Sessions, "Sessions"),
+        (Screen::Tasks, "Tasks"),
     ]
 }
 
@@ -579,6 +582,16 @@ fn seed(state: &mut AppState, screen: Screen) {
                 state.background_task_labels.insert(
                     format!("bg-{i}"),
                     BackgroundTaskChrome::running(format!("serve --port {i}"), i as u64),
+                );
+            }
+        }
+        Screen::Tasks => {
+            // The task page is a projection over the same live background
+            // map; give it enough rows to overflow a short viewport.
+            for i in 0..8 {
+                state.background_task_labels.insert(
+                    format!("task-bg-{i}"),
+                    BackgroundTaskChrome::running(format!("worker --job {i}"), i as u64),
                 );
             }
         }

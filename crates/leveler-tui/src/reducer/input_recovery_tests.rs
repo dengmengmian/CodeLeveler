@@ -100,7 +100,18 @@ fn input_recovery_doctor_is_local_and_reachable_while_busy() {
     let mut s = state();
     s.status = RuntimeStatus::Busy;
     s.composer.replace("/doctor");
-    assert!(key(&mut s, KeyCode::Enter, KeyModifiers::NONE).is_empty());
+    let effects = key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+    // The page asks the runtime for its shared, read-only checks. It must
+    // never submit, steer or start a model turn.
+    assert!(
+        effects.iter().all(|effect| matches!(
+            effect,
+            crate::action::Effect::Send(
+                leveler_client_protocol::ClientCommand::QueryDiagnostics { .. }
+            )
+        )),
+        "{effects:?}"
+    );
     assert_eq!(s.active_screen, Screen::Doctor);
     assert_eq!(s.status, RuntimeStatus::Busy);
     key(&mut s, KeyCode::Esc, KeyModifiers::NONE);

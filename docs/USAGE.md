@@ -101,6 +101,12 @@ A run that happens with nobody present needs `--grant-unattended`; add `--allow-
 
 In the TUI, `/schedules` opens the definition list, detail and edit form. The agent has the same operations through the `schedule_inspect` and `schedule_manage` tools.
 
+## Task workbench and diagnostics
+
+`/tasks` opens one read-only workbench over the current session's goal, child agents, background tasks and reviews, the schedule definitions and their last runs, and every durable session in the global store. `Tab` switches Active / Recent / All; Enter opens the existing detail page (Activity, Goal, or the Schedules page); `x` cancels a current-session task through the runtime; `r` re-reads the two snapshot sources. Session rows carry a snapshot time; child and background rows update live. Cross-workspace sessions are read-only here because this runtime cannot open another workspace's store.
+
+`/doctor` opens structured diagnostics: runtime connection, build, session validity and crash window; configuration; provider credentials; model reasoning; MCP configuration; permission profile; sandbox capability; and terminal capability. Each row has a stable id, a typed status (`pass`, `warn`, `fail`, `unknown`, `not checked`, `not applicable`), observed evidence and an optional existing action. `UNKNOWN` and `NOT CHECKED` are never shown as a pass. `R` re-runs the shared checks; the page is safe while a turn runs and never calls a provider. Live MCP connection state is not exposed yet, so that row says so. `leveler doctor --json` prints the same findings as a machine-readable report.
+
 ## Native actions and computer use
 
 `leveler native capabilities` reports whether Mail on macOS or Outlook on Windows is installed, running, signed in and allowed to be automated. `leveler native action` runs one deterministic action without a model:

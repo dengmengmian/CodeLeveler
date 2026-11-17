@@ -2119,6 +2119,67 @@ async fn no_workspace_global_query_does_not_create_an_empty_source_store() {
 }
 
 #[tokio::test]
+async fn diagnostics_query_answers_with_typed_findings_and_no_provider_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "http://127.0.0.1:9");
+    let home = leveler_core::LevelerHome::from_root(tmp.path().join("home"));
+    let layout = Layout::no_workspace(home, Some(tmp.path().join("configs")));
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app,
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let requester = SessionId::new("diagnostics");
+    let mut events = runtime.subscribe_session(&requester);
+    let query = CommandId::generate();
+    runtime
+        .send(ClientCommand::QueryDiagnostics {
+            requester_session_id: requester.clone(),
+            query_id: query.clone(),
+        })
+        .await
+        .unwrap();
+    let report = match events.recv().await.unwrap() {
+        RuntimeEvent::DiagnosticsLoaded {
+            requester_session_id,
+            query_id,
+            report,
+        } => {
+            assert_eq!(requester_session_id, requester);
+            assert_eq!(query_id, query);
+            report
+        }
+        other => panic!("unexpected diagnostics event: {other:?}"),
+    };
+    assert!(!report.generated_at.is_empty());
+    // The shared check core ran: config, provider credentials, sandbox and
+    // MCP presence are all typed findings, not prose.
+    for id in [
+        leveler_client_protocol::finding_id::CONFIG_PROVIDERS,
+        leveler_client_protocol::finding_id::CONFIG_MODELS,
+        leveler_client_protocol::finding_id::PROVIDER_API_KEY,
+        leveler_client_protocol::finding_id::SANDBOX_CAPABILITY,
+        leveler_client_protocol::finding_id::MCP_CONNECTION,
+    ] {
+        assert!(
+            report.findings.iter().any(|finding| finding.id == id),
+            "missing {id}: {:?}",
+            report.findings
+        );
+    }
+    for finding in &report.findings {
+        assert!(!finding.id.contains(' '), "ids are stable machine keys");
+        assert!(!finding.checked_at.is_empty());
+        assert!(
+            !finding.evidence.join(" ").contains("sk-live"),
+            "no secret may appear in diagnostics"
+        );
+    }
+}
+
+#[tokio::test]
 async fn settings_require_observed_versions_and_completed_retries_remain_idempotent() {
     let (_tmp, app, client, session_id) = build_client().await;
     let command = ClientCommand::RenameSession {

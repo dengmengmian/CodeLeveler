@@ -119,7 +119,11 @@ pub enum Command {
     },
 
     /// Diagnose the environment, tooling, and configuration.
-    Doctor,
+    Doctor {
+        /// Print the structured findings as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Probe and run deterministic actions over installed system applications.
     ///
@@ -1591,7 +1595,9 @@ mod tests {
     #[test]
     fn global_flags_apply_after_subcommand() {
         let cli = parse(&["leveler", "doctor", "--repo", "/tmp/x", "-vv"]);
-        assert!(matches!(cli.command, Some(Command::Doctor)));
+        assert!(matches!(cli.command, Some(Command::Doctor { json: false })));
+        let json = parse(&["leveler", "doctor", "--json"]);
+        assert!(matches!(json.command, Some(Command::Doctor { json: true })));
         assert_eq!(cli.repo.as_deref(), Some(std::path::Path::new("/tmp/x")));
         assert_eq!(cli.verbose, 2);
     }

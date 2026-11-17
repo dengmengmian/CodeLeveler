@@ -136,3 +136,23 @@ fn doctor_reports_agent_definitions() {
     assert!(line.contains("1 invalid"), "{line}");
     assert!(line.contains("broken"), "{line}");
 }
+
+#[test]
+fn doctor_json_is_structured_with_stable_ids_and_typed_statuses() {
+    let fx = fixture();
+    let (_, out) = run(fx.home.path(), fx.repo.path(), &["doctor", "--json"]);
+    assert!(out.trim_start().starts_with('{'), "pure JSON: {out}");
+    for required in [
+        "\"generated_at\"",
+        "\"findings\"",
+        "\"id\": \"agents.registry\"",
+        "\"id\": \"runtime.connection\"",
+        "\"status\": \"not_checked\"",
+        "\"status\": \"warn\"",
+        "\"category\": \"configuration\"",
+    ] {
+        assert!(out.contains(required), "missing {required}: {out}");
+    }
+    // The JSON path never falls back to human-only prose lines.
+    assert!(!out.contains("No failed checks"), "{out}");
+}

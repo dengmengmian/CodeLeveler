@@ -155,7 +155,8 @@ fn output_tool_opens_the_saved_artifact_instead_of_the_preview() {
     let tmp = tempfile::tempdir().unwrap();
     let artifact_dir = tmp.path().join("state").join("artifacts");
     std::fs::create_dir_all(&artifact_dir).unwrap();
-    let artifact = artifact_dir.join("payload.txt");
+    let artifact =
+        artifact_dir.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.txt");
     std::fs::write(&artifact, "FULL TOOL OUTPUT\n").unwrap();
     let mut s = opened_at_state_root(tmp.path());
     reduce(
@@ -5124,30 +5125,29 @@ fn enter_on_partial_slash_only_completes_before_executing() {
 }
 
 #[test]
-fn info_screens_scroll_with_keys_and_reset_on_exit() {
+fn info_screens_move_the_selection_and_reset_the_offset_on_exit() {
     let mut s = opened();
     reduce(&mut s, key(KeyCode::Esc)); // clear any notification
-    // `/doctor` is the scrollable info screen here; `/help` has its own search
-    // box, so ↑/↓ move the result selection instead of the page offset.
+    // `/doctor` is a list page now: ↑/↓ and PageUp/PageDown move the finding
+    // selection, and the page keeps that selection while it stays open.
     typed(&mut s, "/doctor");
     reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(s.active_screen, Screen::Doctor);
+    let first = s.doctor.selected.clone().expect("a finding is selected");
 
     reduce(&mut s, key(KeyCode::Down));
-    reduce(&mut s, key(KeyCode::Down));
-    assert_eq!(s.screen_scroll, 2, "Down scrolls an info screen");
+    assert_ne!(s.doctor.selected.as_deref(), Some(first.as_str()));
+    let after_down = s.doctor.selected.clone();
     reduce(&mut s, key(KeyCode::PageDown));
-    assert!(s.screen_scroll > 2, "PageDown scrolls a page");
-    reduce(&mut s, key(KeyCode::Up));
-    let before = s.screen_scroll;
+    assert_ne!(s.doctor.selected, after_down, "PageDown moves a page");
     reduce(&mut s, key(KeyCode::PageUp));
-    assert!(s.screen_scroll < before, "PageUp scrolls back");
+    assert!(s.doctor.selected.is_some());
 
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
     typed(&mut s, "/doctor");
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.screen_scroll, 0, "scroll resets when reopening a screen");
+    assert_eq!(s.screen_scroll, 0, "offset resets when reopening a screen");
 }
 
 #[test]

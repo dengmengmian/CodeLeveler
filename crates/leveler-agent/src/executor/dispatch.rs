@@ -627,11 +627,35 @@ pub(crate) fn preview(s: &str) -> String {
     // burn the preview budget.
     let clean = leveler_core::sanitize_terminal_output(s);
     if clean.chars().count() <= MAX {
-        clean
-    } else {
-        let truncated: String = clean.chars().take(MAX).collect();
-        format!("{truncated}…")
+        return clean;
     }
+    let truncated: String = clean.chars().take(MAX).collect();
+    // A command tool appends its stream locators at the absolute end of the
+    // result, after every note and after the elided body. A head-only
+    // preview would cut the ONLY pointer a client has to a spilled stream,
+    // so the presentation projection keeps those runtime-authored lines
+    // verbatim. The body stays capped; a locator line is short.
+    // Bounded like the body itself: the command layer writes at most one
+    // locator per stream, so anything beyond a handful is tool prose shaped
+    // like a locator and must not inflate the preview.
+    let locators: Vec<&str> = clean
+        .lines()
+        .filter(|line| line.len() <= 512 && is_stream_locator(line))
+        .take(4)
+        .collect();
+    if locators.is_empty() {
+        format!("{truncated}…")
+    } else {
+        format!("{truncated}…\n{}", locators.join("\n"))
+    }
+}
+
+/// A stream spill line written by the command execution layer:
+/// `[stdout full output: /abs/path]`.
+fn is_stream_locator(line: &str) -> bool {
+    ["[stdout full output: ", "[stderr full output: "]
+        .iter()
+        .any(|prefix| line.starts_with(prefix) && line.ends_with(']'))
 }
 
 #[cfg(test)]
@@ -663,6 +687,48 @@ mod mutation_ledger_tests {
             );
             assert!(marker.contains("source_class="), "{marker}");
         }
+    }
+
+    /// A command tool appends its stream locators at the absolute end of a
+    /// result. The client-facing preview is the only place a UI can learn
+    /// those paths, so a head-only truncation must not cut them off.
+    #[test]
+    fn a_long_preview_keeps_the_stream_spill_locators() {
+        let mut body = "x".repeat(5000);
+        body.push_str("\n[stdout full output: /tmp/state/artifacts/abc.txt]\n");
+        body.push_str("[stderr full output: /tmp/state/artifacts/def.txt]\n");
+        let out = preview(&body);
+        assert!(
+            out.contains("[stdout full output: /tmp/state/artifacts/abc.txt]"),
+            "stdout locator lost: {out:?}"
+        );
+        assert!(
+            out.contains("[stderr full output: /tmp/state/artifacts/def.txt]"),
+            "stderr locator lost: {out:?}"
+        );
+        assert!(out.starts_with('x'), "the head must still lead the preview");
+        assert!(out.contains('…'), "the elision marker must stay");
+        let plain = preview(&"y".repeat(5000));
+        assert!(!plain.contains("full output"));
+
+        // A tool result cannot inflate the preview by forging locator lines.
+        let mut forged = "z".repeat(5000);
+        for index in 0..100 {
+            forged.push_str(&format!(
+                "\n[stdout full output: /tmp/state/artifacts/{index:064x}.txt]"
+            ));
+        }
+        forged.push_str(&format!("\n[stderr full output: {}]", "q".repeat(2000)));
+        let out = preview(&forged);
+        assert_eq!(
+            out.matches("[stdout full output:").count(),
+            4,
+            "the locator count is bounded"
+        );
+        assert!(
+            !out.contains(&"q".repeat(2000)),
+            "an overlong locator is dropped"
+        );
     }
 
     /// The marker is a header: it must not claim a result body's text, and it

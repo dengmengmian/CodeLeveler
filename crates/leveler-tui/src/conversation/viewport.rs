@@ -212,7 +212,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
     let theme = &state.theme;
 
-    let (all, _hits, _commands, _anchor, item_spans, _sources, copy) =
+    let (all, _hits, _commands, _anchor, item_spans, sources, copy) =
         state.conversation_build(width);
     // Plain text only backs mouse selection / clipboard. Rebuild it from this
     // frame's lines while a selection is live; otherwise clear it (the mouse-down
@@ -271,6 +271,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // scroll anchor are exactly what the projection produced.
     paint_live_reasoning_rail(state, &all, &item_spans, scroll, &mut lines);
     paint_live_shell_rail(state, &item_spans, scroll, &mut lines);
+    // A jumped-to search result highlights its query inside the located
+    // entry. Style-only, over the same window, so it cannot re-wrap a line.
+    crate::find::highlight::paint(state, &item_spans, &sources, scroll, &mut lines);
 
     // Selection is an explicit user act and owns the ink on the rows it
     // covers, so it is applied after the decorative rail highlight.

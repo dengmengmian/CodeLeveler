@@ -149,6 +149,9 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.help.selected = 0;
             return Vec::new();
         }
+        if state.active_screen == Screen::Find {
+            return crate::find::push_text(state, text);
+        }
     }
     match action {
         Action::Runtime(event) => {
@@ -160,6 +163,13 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             // makes the answer the page is waiting for actually arrive.
             let trace_dirty = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
+            // Snapshot-backed pages re-read their source on events that can
+            // change it. Live projections (children, background tasks) need no
+            // query; they are already in state.
+            let tasks_refresh =
+                state.active_screen == Screen::Tasks && crate::tasks::should_refresh(&event);
+            let doctor_reload =
+                state.active_screen == Screen::Doctor && crate::doctor::should_reload(&event);
             let usage_dirty =
                 state.active_screen == Screen::Context && crate::usage::should_refresh(&event);
             if trace_dirty {
@@ -213,6 +223,17 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             apply_runtime(state, event);
             interaction::restore_reading_anchor(state, anchor);
             let mut effects = Vec::new();
+            if opened && state.active_screen == Screen::Tasks {
+                crate::tasks::session_changed(state);
+                effects.extend(crate::tasks::refresh(state));
+            } else if tasks_refresh {
+                effects.extend(crate::tasks::refresh(state));
+            }
+            if opened && state.active_screen == Screen::Doctor {
+                effects.extend(crate::doctor::session_changed(state));
+            } else if doctor_reload {
+                effects.extend(crate::doctor::reload(state));
+            }
             if opened
                 && state
                     .transcript
@@ -471,6 +492,24 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     message,
                 });
             }
+            Vec::new()
+        }
+        // Search results are applied only when they answer the query the page
+        // is showing. A late worker from an older keystroke is discarded.
+        Action::FindTranscriptReady {
+            generation,
+            hits,
+            capped,
+        } => {
+            crate::find::apply_transcript_results(state, generation, hits, capped);
+            Vec::new()
+        }
+        Action::FindArtifactReady {
+            generation,
+            request,
+            outcome,
+        } => {
+            crate::find::apply_artifact_result(state, generation, &request, outcome);
             Vec::new()
         }
         Action::EffectCompleted(completion) => {
@@ -1235,6 +1274,12 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     {
         return screen_nav::back(state);
     }
+    if state.active_screen == Screen::Tasks {
+        return crate::tasks::handle_mouse(state, mouse);
+    }
+    if state.active_screen == Screen::Doctor {
+        return crate::doctor::handle_mouse(state, mouse);
+    }
     if state.active_screen == Screen::Output {
         return output_mouse(state, mouse);
     }
@@ -1676,7 +1721,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 }
 
 /// Content width of the full-output page at the current terminal size.
-fn output_view_width(state: &AppState) -> usize {
+pub(crate) fn output_view_width(state: &AppState) -> usize {
     let cols = state.size.0;
     let pad = crate::secondary::padding_x(cols);
     cols.saturating_sub(pad.saturating_mul(2)).max(1) as usize
@@ -3486,6 +3531,9 @@ mod input_recovery_tests;
 
 #[cfg(test)]
 mod goal_terminal_tests;
+
+#[cfg(test)]
+mod find_tests;
 
 #[cfg(test)]
 mod output_view_tests;

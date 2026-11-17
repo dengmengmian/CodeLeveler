@@ -112,58 +112,6 @@ impl TerminalDiagnostics {
     }
 }
 
-pub fn render_screen(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    state: &mut crate::state::AppState,
-) {
-    let zh = state.locale == crate::i18n::Locale::Zh;
-    let page = crate::secondary::SecondaryPage {
-        title: if zh {
-            "终端诊断"
-        } else {
-            "Terminal diagnostics"
-        },
-        status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint: if zh {
-            "↑↓ / PageUp/Down 滚动 · Esc 返回"
-        } else {
-            "↑↓ / PageUp/Down scroll · Esc back"
-        },
-    };
-    let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
-    let text = format!(
-        "{}\n{}: {} ({})",
-        TerminalDiagnostics::detect().describe_localized(state.locale),
-        if zh { "当前主题" } else { "Active theme" },
-        state.theme.id,
-        if state.theme.is_monochrome() {
-            if zh { "无颜色" } else { "monochrome" }
-        } else if zh {
-            "彩色输出"
-        } else {
-            "color output"
-        }
-    );
-    let lines: Vec<ratatui::text::Line<'static>> = text
-        .lines()
-        .flat_map(|line| crate::render::text::wrap(line, layout.content.width as usize))
-        .map(ratatui::text::Line::from)
-        .collect();
-    let scroll = state
-        .screen_scroll
-        .min(lines.len().saturating_sub(layout.content.height as usize))
-        .min(u16::MAX as usize);
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(lines)
-            .style(ratatui::style::Style::default().fg(state.theme.text.primary))
-            .scroll((scroll as u16, 0)),
-        layout.content,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

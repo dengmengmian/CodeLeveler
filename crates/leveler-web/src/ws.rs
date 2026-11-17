@@ -167,7 +167,7 @@ async fn write_loop(
                 }
             }
             event = events.recv() => match event {
-                Ok(RuntimeEvent::GlobalTasksLoaded { .. }) => {},
+                Ok(RuntimeEvent::GlobalTasksLoaded { .. } | RuntimeEvent::DiagnosticsLoaded { .. }) => {},
                 // Exactly one stream is authoritative for session events: the
                 // per-session one. Once it exists, the global stream
                 // contributes only the cross-project facts — the complement of
@@ -194,7 +194,7 @@ async fn write_loop(
                 session_events = Some(receiver);
             }
             event = recv_opt(&mut session_events) => match event {
-                Ok(RuntimeEvent::GlobalTasksLoaded { .. }) => {},
+                Ok(RuntimeEvent::GlobalTasksLoaded { .. } | RuntimeEvent::DiagnosticsLoaded { .. }) => {},
                 // Cross-project facts (merged lists, readiness) come from the
                 // global stream; a per-session stream that also carries them
                 // (in-process runtimes) must not duplicate them here.
@@ -302,8 +302,11 @@ async fn handle_upstream(
             command,
             expected_version,
         } => {
-            if matches!(&command, ClientCommand::QueryGlobalTasks { .. }) {
-                send_or_ignore(outgoing, error_frame(&ClientError::Runtime("global task discovery is only available through the trusted local runtime transport".into()), Some(command_id))).await;
+            if matches!(
+                &command,
+                ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QueryDiagnostics { .. }
+            ) {
+                send_or_ignore(outgoing, error_frame(&ClientError::Runtime("global task discovery and diagnostics are only available through the trusted local runtime transport".into()), Some(command_id))).await;
                 return;
             }
             follow_session_switch(state, &command, switch).await;

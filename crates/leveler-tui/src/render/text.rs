@@ -29,6 +29,27 @@ pub(crate) fn truncate_display(s: &str, max: usize) -> String {
     out
 }
 
+/// Make runtime/model-provided display text safe for a cell-based row.
+///
+/// C0 controls are flattened and Unicode directional overrides/isolates are
+/// replaced: they are format characters, not `is_control`, and can visually
+/// reorder a session title or a finding subject. One character in, one out, so
+/// display width is unchanged.
+pub(crate) fn sanitize_ui_text(s: &str) -> String {
+    s.chars()
+        .map(|ch| {
+            if ch.is_control()
+                || matches!(ch,
+                    '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 /// Make a raw line safe for cell-based TUI output: expand tabs (terminal tab
 /// stops would desync the ratatui buffer) and neutralise other C0 controls
 /// (`\r` etc. would rewind the cursor when printed by crossterm).
@@ -366,6 +387,20 @@ mod wrap_tests {
         let (rows, caret_row) = wrap_with_caret("a\nb\nc\nd\ne", (4, 0), 8, 0, 0);
         assert_eq!(rows.len(), 5);
         assert_eq!(row_window(rows.len(), caret_row, 3), (2, 3));
+    }
+
+    #[test]
+    fn runtime_display_text_cannot_reorder_or_rewind_a_row() {
+        assert_eq!(
+            super::sanitize_ui_text("safe\u{202E}evil\tc\r"),
+            "safe evil c "
+        );
+        assert_eq!(
+            super::sanitize_ui_text("a\u{2066}b\u{2069}c"),
+            "a b c",
+            "isolates are format characters, not is_control"
+        );
+        assert_eq!(super::sanitize_ui_text("正常标题"), "正常标题");
     }
 
     #[test]

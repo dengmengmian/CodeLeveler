@@ -1,53 +1,109 @@
-//! Environment diagnostics for `leveler doctor` (spec §40).
+//! Environment diagnostics shared by `leveler doctor` and every UI client
+//! (spec §40).
 //!
-//! Checks tool availability, configuration validity, and per-provider API-key
-//! presence. Live provider connectivity is left to `model probe` so `doctor`
-//! stays offline and fast.
+//! Every check produces a [`DiagnosticFinding`]: a stable machine id, a typed
+//! status, observed evidence, and an optional action key. Wording belongs to
+//! the presentation layer, so the CLI and the TUI report the same facts in
+//! their own language and never parse each other's text.
+//!
+//! Checks tool availability, configuration validity, provider key presence,
+//! MCP configuration references and OS sandbox capability. Live provider
+//! connectivity is left to `model probe` so `doctor` stays offline and fast.
+//! Live MCP connection state is not exposed by the runtime yet; that finding
+//! says so instead of claiming a connection.
 
 use std::path::PathBuf;
 
+use leveler_client_protocol::{
+    DiagnosticCategory, DiagnosticFinding, DiagnosticSeverity, DiagnosticStatus, action_id,
+    finding_id,
+};
 use leveler_provider::{ProviderConfig, resolve_api_key};
 
 use crate::LoadedConfig;
 
-/// Severity of a diagnostic check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckStatus {
-    Ok,
-    Warn,
-    Fail,
+fn checked_at() -> String {
+    leveler_core::now().to_rfc3339()
 }
 
-/// A single diagnostic result.
-#[derive(Debug, Clone)]
-pub struct CheckResult {
-    pub name: String,
-    pub status: CheckStatus,
-    pub detail: String,
+fn severity_of(status: DiagnosticStatus) -> DiagnosticSeverity {
+    match status {
+        DiagnosticStatus::Fail => DiagnosticSeverity::Error,
+        DiagnosticStatus::Warn => DiagnosticSeverity::Warning,
+        DiagnosticStatus::Pass
+        | DiagnosticStatus::Unknown
+        | DiagnosticStatus::NotChecked
+        | DiagnosticStatus::NotApplicable => DiagnosticSeverity::Info,
+    }
 }
 
-impl CheckResult {
-    fn ok(name: &str, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            status: CheckStatus::Ok,
-            detail: detail.into(),
-        }
+fn finding(
+    id: &str,
+    subject: Option<String>,
+    category: DiagnosticCategory,
+    status: DiagnosticStatus,
+    evidence: Vec<String>,
+) -> DiagnosticFinding {
+    DiagnosticFinding {
+        id: id.to_string(),
+        subject,
+        category,
+        severity: severity_of(status),
+        status,
+        evidence,
+        action: None,
+        checked_at: checked_at(),
     }
-    fn warn(name: &str, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            status: CheckStatus::Warn,
-            detail: detail.into(),
-        }
-    }
-    fn fail(name: &str, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            status: CheckStatus::Fail,
-            detail: detail.into(),
-        }
-    }
+}
+
+fn pass(
+    id: &str,
+    subject: Option<&str>,
+    category: DiagnosticCategory,
+    evidence: Vec<String>,
+) -> DiagnosticFinding {
+    finding(
+        id,
+        subject.map(str::to_string),
+        category,
+        DiagnosticStatus::Pass,
+        evidence,
+    )
+}
+
+fn warn(
+    id: &str,
+    subject: Option<&str>,
+    category: DiagnosticCategory,
+    evidence: Vec<String>,
+) -> DiagnosticFinding {
+    finding(
+        id,
+        subject.map(str::to_string),
+        category,
+        DiagnosticStatus::Warn,
+        evidence,
+    )
+}
+
+fn fail(
+    id: &str,
+    subject: Option<&str>,
+    category: DiagnosticCategory,
+    evidence: Vec<String>,
+) -> DiagnosticFinding {
+    finding(
+        id,
+        subject.map(str::to_string),
+        category,
+        DiagnosticStatus::Fail,
+        evidence,
+    )
+}
+
+fn with_action(mut finding: DiagnosticFinding, action: &str) -> DiagnosticFinding {
+    finding.action = Some(action.to_string());
+    finding
 }
 
 /// Whether an executable named `name` exists on `PATH`.
@@ -105,23 +161,57 @@ fn path_candidates(name: &str) -> Vec<String> {
 }
 
 /// Run diagnostics against the loaded configuration.
-pub fn run(config: &LoadedConfig) -> Vec<CheckResult> {
+pub fn run(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
     let mut results = Vec::new();
 
     // Required tooling.
     for (tool, required) in [("git", true), ("rg", false)] {
         results.push(match find_in_path(tool) {
-            Some(p) => CheckResult::ok(tool, p.display().to_string()),
-            None if required => CheckResult::fail(tool, "not found on PATH (required)"),
-            None => CheckResult::warn(tool, "not found on PATH (optional; falls back to built-in)"),
+            Some(p) => pass(
+                finding_id::TOOL_AVAILABILITY,
+                Some(tool),
+                DiagnosticCategory::Configuration,
+                vec![p.display().to_string()],
+            ),
+            None if required => with_action(
+                fail(
+                    finding_id::TOOL_AVAILABILITY,
+                    Some(tool),
+                    DiagnosticCategory::Configuration,
+                    vec!["not found on PATH (required)".into()],
+                ),
+                action_id::INSTALL_TOOL,
+            ),
+            None => with_action(
+                warn(
+                    finding_id::TOOL_AVAILABILITY,
+                    Some(tool),
+                    DiagnosticCategory::Configuration,
+                    vec!["not found on PATH (optional; falls back to built-in)".into()],
+                ),
+                action_id::INSTALL_TOOL,
+            ),
         });
     }
 
     // Language toolchains (optional — only needed for that language's projects).
     for tool in ["cargo", "go", "node"] {
         results.push(match find_in_path(tool) {
-            Some(p) => CheckResult::ok(tool, p.display().to_string()),
-            None => CheckResult::warn(tool, "not found on PATH (optional)"),
+            Some(p) => pass(
+                finding_id::TOOL_AVAILABILITY,
+                Some(tool),
+                DiagnosticCategory::Configuration,
+                vec![p.display().to_string()],
+            ),
+            None => with_action(
+                warn(
+                    finding_id::TOOL_AVAILABILITY,
+                    Some(tool),
+                    DiagnosticCategory::Configuration,
+                    vec!["not found on PATH (optional)".into()],
+                ),
+                action_id::INSTALL_TOOL,
+            ),
         });
     }
 
@@ -133,6 +223,7 @@ pub fn run(config: &LoadedConfig) -> Vec<CheckResult> {
     // Surface global-config load failures (incl. MCP plaintext env) even when
     // the rest of doctor runs against a lenient empty LoadedConfig.
     results.push(check_global_config());
+    results.push(check_config_reload());
     results.extend(check_retired_model_instructions());
 
     // Per-provider API key.
@@ -142,21 +233,35 @@ pub fn run(config: &LoadedConfig) -> Vec<CheckResult> {
 
     // MCP env refs: only report keys / validated source names, never raw values.
     results.extend(check_mcp_env_refs());
+    results.push(check_mcp_connection());
 
     // OS sandbox honesty (WS0): never report sandbox=yes when unsupported.
     let sand = leveler_execution::doctor_sandbox_line();
     let caps = leveler_execution::probe_sandbox_capabilities();
     let status =
         if matches!(caps.write, leveler_execution::FsCapability::Unsupported) && cfg!(windows) {
-            CheckStatus::Warn
+            DiagnosticStatus::Warn
         } else {
-            CheckStatus::Ok
+            DiagnosticStatus::Pass
         };
-    results.push(CheckResult {
-        name: "sandbox".into(),
+    results.push(finding(
+        finding_id::SANDBOX_CAPABILITY,
+        None,
+        DiagnosticCategory::Sandbox,
         status,
-        detail: sand,
-    });
+        vec![sand],
+    ));
+    // Capability is not enforcement. No canary ran, so this is never a pass.
+    results.push(finding(
+        finding_id::SANDBOX_VERIFICATION,
+        None,
+        DiagnosticCategory::Sandbox,
+        DiagnosticStatus::NotChecked,
+        vec![
+            "no sandbox canary ran in this session; backend capability does not prove enforcement"
+                .into(),
+        ],
+    ));
 
     results
 }
@@ -164,7 +269,7 @@ pub fn run(config: &LoadedConfig) -> Vec<CheckResult> {
 /// Agent definitions this project resolves: counts by source, and every
 /// invalid definition or unloadable directory by name. Structural only — a
 /// model that is not configured is `leveler agents list`'s business.
-pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> CheckResult {
+pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> DiagnosticFinding {
     use leveler_agent::agent_registry::{AgentRegistry, AgentSource};
     let registry = AgentRegistry::load(roots);
     let count = |source: AgentSource| {
@@ -180,57 +285,78 @@ pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> CheckR
         .filter(|e| e.definition().is_none())
         .map(|e| e.name.as_str())
         .collect();
-    let mut detail = format!(
+    let mut evidence = vec![format!(
         "{} project, {} user, {} built-in",
         count(AgentSource::Project),
         count(AgentSource::User),
         count(AgentSource::Builtin)
-    );
+    )];
     if invalid.is_empty() && registry.problems().is_empty() {
-        return CheckResult::ok("agents", detail);
+        return pass(
+            finding_id::AGENTS_REGISTRY,
+            None,
+            DiagnosticCategory::Configuration,
+            evidence,
+        );
     }
     if !invalid.is_empty() {
-        detail.push_str(&format!(
-            "; {} invalid: {}",
-            invalid.len(),
-            invalid.join(", ")
-        ));
+        evidence.push(format!("{} invalid: {}", invalid.len(), invalid.join(", ")));
     }
     if !registry.problems().is_empty() {
-        detail.push_str(&format!("; {} not loaded", registry.problems().len()));
+        evidence.push(format!("{} not loaded", registry.problems().len()));
     }
-    detail.push_str(" (see `leveler agents list`)");
-    CheckResult::warn("agents", detail)
+    evidence.push("see `leveler agents list`".into());
+    warn(
+        finding_id::AGENTS_REGISTRY,
+        None,
+        DiagnosticCategory::Configuration,
+        evidence,
+    )
 }
 
 /// Check that at least one provider and model exist, and every model points at
 /// a loaded provider. Empty / orphaned configs are Fail so `leveler doctor`
 /// never green-lights a machine that cannot start a turn.
-fn check_model_bundle(config: &LoadedConfig) -> Vec<CheckResult> {
+fn check_model_bundle(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
     let mut results = Vec::new();
-    let setup_hint = "add providers/models in ~/.leveler/config.toml (or $LEVELER_HOME/config.toml); see `leveler doctor` / README";
+    let setup_hint =
+        "add providers/models in ~/.leveler/config.toml (or $LEVELER_HOME/config.toml); see README";
 
     if config.providers.is_empty() {
-        results.push(CheckResult::fail(
-            "config: providers",
-            format!("none loaded — {setup_hint}"),
+        results.push(with_action(
+            fail(
+                finding_id::CONFIG_PROVIDERS,
+                None,
+                DiagnosticCategory::Configuration,
+                vec![format!("none loaded — {setup_hint}")],
+            ),
+            action_id::CONFIGURE_PROVIDER_MODEL,
         ));
     } else {
-        results.push(CheckResult::ok(
-            "config: providers",
-            format!("{} loaded", config.providers.len()),
+        results.push(pass(
+            finding_id::CONFIG_PROVIDERS,
+            None,
+            DiagnosticCategory::Configuration,
+            vec![format!("{} loaded", config.providers.len())],
         ));
     }
 
     if config.models.is_empty() {
-        results.push(CheckResult::fail(
-            "config: models",
-            format!("none loaded — {setup_hint}"),
+        results.push(with_action(
+            fail(
+                finding_id::CONFIG_MODELS,
+                None,
+                DiagnosticCategory::Configuration,
+                vec![format!("none loaded — {setup_hint}")],
+            ),
+            action_id::CONFIGURE_PROVIDER_MODEL,
         ));
     } else {
-        results.push(CheckResult::ok(
-            "config: models",
-            format!("{} loaded", config.models.len()),
+        results.push(pass(
+            finding_id::CONFIG_MODELS,
+            None,
+            DiagnosticCategory::Configuration,
+            vec![format!("{} loaded", config.models.len())],
         ));
         // Orphan models assemble fine but fail at first request with a late
         // "unknown provider" — catch them here for first-install clarity.
@@ -238,15 +364,20 @@ fn check_model_bundle(config: &LoadedConfig) -> Vec<CheckResult> {
             config.providers.iter().map(|p| p.id.as_str()).collect();
         for model in &config.models {
             if !provider_ids.contains(model.profile.provider.as_str()) {
-                results.push(CheckResult::fail(
-                    &format!(
-                        "config: model {}/{}",
-                        model.profile.provider, model.profile.id
+                results.push(with_action(
+                    fail(
+                        finding_id::CONFIG_MODEL_PROVIDER,
+                        Some(&format!(
+                            "{}/{}",
+                            model.profile.provider, model.profile.id
+                        )),
+                        DiagnosticCategory::Configuration,
+                        vec![format!(
+                            "provider `{}` is not configured — add [providers.{}] in ~/.leveler/config.toml",
+                            model.profile.provider, model.profile.provider
+                        )],
                     ),
-                    format!(
-                        "provider `{}` is not configured — add [providers.{}] in ~/.leveler/config.toml",
-                        model.profile.provider, model.profile.provider
-                    ),
+                    action_id::CONFIGURE_PROVIDER_MODEL,
                 ));
             }
         }
@@ -255,12 +386,13 @@ fn check_model_bundle(config: &LoadedConfig) -> Vec<CheckResult> {
     results
 }
 
-fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
+fn check_reasoning(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
     use leveler_model::{ReasoningStyle, resolve_reasoning_effort, validate_reasoning_config};
 
     let mut results = Vec::new();
     for model in &config.models {
         let profile = &model.profile;
+        let subject = format!("{}/{}", profile.provider, profile.id);
         if !profile.capabilities.reasoning {
             // A model that does not reason cannot take a Thinking Level. The
             // global default reaches every model, so this is where a config that
@@ -269,18 +401,30 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
                 .thinking
                 .filter(|level| *level != leveler_model::ThinkingLevel::Auto)
             {
-                results.push(CheckResult::warn(
-                    &format!("thinking: {}/{}", profile.provider, profile.id),
-                    format!(
-                        "thinking = \"{level}\" has no effect: this model does not reason.                          Set this model's thinking to \"auto\" to use its native behavior."
+                results.push(with_action(
+                    warn(
+                        finding_id::MODEL_THINKING,
+                        Some(&subject),
+                        DiagnosticCategory::Model,
+                        vec![format!(
+                            "thinking = \"{level}\" has no effect: this model does not reason; set this model's thinking to \"auto\" to use its native behavior"
+                        )],
                     ),
+                    action_id::FIX_CONFIG,
                 ));
             }
             continue;
         }
-        let name = format!("reasoning: {}/{}", profile.provider, profile.id);
         if let Err(reason) = validate_reasoning_config(true, &profile.reasoning) {
-            results.push(CheckResult::fail(&name, reason));
+            results.push(with_action(
+                fail(
+                    finding_id::MODEL_REASONING,
+                    Some(&subject),
+                    DiagnosticCategory::Model,
+                    vec![reason],
+                ),
+                action_id::FIX_CONFIG,
+            ));
             continue;
         }
         // The user's configured level against what this model can actually
@@ -304,24 +448,27 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
                             .join(", ")
                     )
                 };
-                results.push(CheckResult::warn(
-                    &format!("thinking: {}/{}", profile.provider, profile.id),
-                    format!(
-                        "thinking = \"{level}\" is not available on this model ({available});                          it will use the provider's own default instead"
+                results.push(with_action(
+                    warn(
+                        finding_id::MODEL_THINKING,
+                        Some(&subject),
+                        DiagnosticCategory::Model,
+                        vec![format!(
+                            "thinking = \"{level}\" is not available on this model ({available}); it will use the provider's own default instead"
+                        )],
                     ),
+                    action_id::FIX_CONFIG,
                 ));
             }
         }
         let resolved = resolve_reasoning_effort(None, &profile.reasoning);
-        match profile.reasoning.style {
-            ReasoningStyle::None => results.push(CheckResult::ok(
-                &name,
-                "always-on (no effort knob); CodeLeveler default n/a".to_string(),
-            )),
-            ReasoningStyle::BudgetedThinking { budget_tokens } => results.push(CheckResult::ok(
-                &name,
-                format!("explicit thinking budget={budget_tokens}"),
-            )),
+        let evidence = match profile.reasoning.style {
+            ReasoningStyle::None => {
+                vec!["always-on (no effort knob); CodeLeveler default n/a".to_string()]
+            }
+            ReasoningStyle::BudgetedThinking { budget_tokens } => {
+                vec![format!("explicit thinking budget={budget_tokens}")]
+            }
             ReasoningStyle::OpenAiEffort
             | ReasoningStyle::ThinkingFlag
             | ReasoningStyle::AdaptiveThinking => {
@@ -338,26 +485,38 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
                     .map(|e| e.as_wire())
                     .unwrap_or("missing");
                 match resolved.effective {
-                    Some(effective) => results.push(CheckResult::ok(
-                        &name,
-                        format!(
-                            "supported=[{supported}] default={default} effective={}",
-                            effective.as_wire()
-                        ),
-                    )),
-                    None => results.push(CheckResult::fail(
-                        &name,
-                        format!("reasoning=true but effective effort is unknown (supported=[{supported}])"),
-                    )),
+                    Some(effective) => vec![format!(
+                        "supported=[{supported}] default={default} effective={}",
+                        effective.as_wire()
+                    )],
+                    None => {
+                        results.push(with_action(
+                            fail(
+                                finding_id::MODEL_REASONING,
+                                Some(&subject),
+                                DiagnosticCategory::Model,
+                                vec![format!(
+                                    "reasoning=true but effective effort is unknown (supported=[{supported}])"
+                                )],
+                            ),
+                            action_id::FIX_CONFIG,
+                        ));
+                        continue;
+                    }
                 }
             }
-        }
+        };
+        results.push(pass(
+            finding_id::MODEL_REASONING,
+            Some(&subject),
+            DiagnosticCategory::Model,
+            evidence,
+        ));
     }
     results
 }
 
-fn check_api_key(provider: &ProviderConfig) -> CheckResult {
-    let name = format!("api key: {}", provider.id);
+fn check_api_key(provider: &ProviderConfig) -> DiagnosticFinding {
     match resolve_api_key(provider) {
         Ok(Some(_)) => {
             let via = if provider
@@ -370,38 +529,89 @@ fn check_api_key(provider: &ProviderConfig) -> CheckResult {
             } else {
                 format!("set via ${}", provider.api_key_env)
             };
-            CheckResult::ok(&name, via)
+            pass(
+                finding_id::PROVIDER_API_KEY,
+                Some(&provider.id),
+                DiagnosticCategory::Model,
+                vec![via],
+            )
         }
-        Ok(None) => CheckResult::ok(&name, "no key required"),
-        Err(_) => CheckResult::fail(
-            &name,
-            format!("environment variable ${} is not set", provider.api_key_env),
+        Ok(None) => pass(
+            finding_id::PROVIDER_API_KEY,
+            Some(&provider.id),
+            DiagnosticCategory::Model,
+            vec!["no key required".into()],
+        ),
+        Err(_) => with_action(
+            fail(
+                finding_id::PROVIDER_API_KEY,
+                Some(&provider.id),
+                DiagnosticCategory::Model,
+                vec![format!(
+                    "environment variable ${} is not set",
+                    provider.api_key_env
+                )],
+            ),
+            action_id::SET_PROVIDER_KEY,
         ),
     }
 }
 
-fn check_global_config() -> CheckResult {
+fn check_global_config() -> DiagnosticFinding {
     match crate::global_config::GlobalConfig::load() {
         Ok(_) => {
             // Distinguish "file missing → empty defaults" from "file present".
-            // First install often has no file; still Ok (models check fails),
-            // but the detail must not claim a config exists when it does not.
-            let detail = match crate::global_config::GlobalConfig::path() {
-                Some(path) if path.is_file() => format!("ok ({})", path.display()),
-                Some(path) => format!("not found at {} — using empty defaults", path.display()),
-                None => "no path (set HOME, USERPROFILE, or LEVELER_HOME)".into(),
+            // First install often has no file; still a pass here (the models
+            // check fails), but the evidence must not claim a config exists
+            // when it does not.
+            let evidence = match crate::global_config::GlobalConfig::path() {
+                Some(path) if path.is_file() => vec![format!("ok ({})", path.display())],
+                Some(path) => vec![format!(
+                    "not found at {} — using empty defaults",
+                    path.display()
+                )],
+                None => vec!["no path (set HOME, USERPROFILE, or LEVELER_HOME)".into()],
             };
-            CheckResult::ok("config: global", detail)
+            pass(
+                finding_id::CONFIG_GLOBAL,
+                None,
+                DiagnosticCategory::Configuration,
+                evidence,
+            )
         }
         // Display is key-safe for McpSecretInConfig (names field, not value).
-        Err(e) => CheckResult::fail("config: global", e.to_string()),
+        Err(e) => with_action(
+            fail(
+                finding_id::CONFIG_GLOBAL,
+                None,
+                DiagnosticCategory::Configuration,
+                vec![e.to_string()],
+            ),
+            action_id::FIX_CONFIG,
+        ),
     }
+}
+
+/// Reload generation is not part of the client protocol. The active source
+/// and its parse result are checked above; saying what is not observable is
+/// the honest answer, not a fabricated "reload ok".
+fn check_config_reload() -> DiagnosticFinding {
+    finding(
+        finding_id::CONFIG_RELOAD,
+        None,
+        DiagnosticCategory::Configuration,
+        DiagnosticStatus::NotChecked,
+        vec![
+            "the runtime does not expose a configuration reload generation to clients; the active source and parse result are checked above"
+                .into(),
+        ],
+    )
 }
 
 /// A retired key must not be ignored in silence: an old config that still
 /// carries `instructions` would look like it was applying a per-model prompt
 /// when every model now shares the base prompt.
-fn check_retired_model_instructions() -> Vec<CheckResult> {
+fn check_retired_model_instructions() -> Vec<DiagnosticFinding> {
     let Ok(config) = crate::global_config::GlobalConfig::load() else {
         // `check_global_config` already reports the load failure.
         return Vec::new();
@@ -413,15 +623,23 @@ fn check_retired_model_instructions() -> Vec<CheckResult> {
 /// without process-global `LEVELER_HOME`.
 fn retired_model_instruction_warnings(
     config: &crate::global_config::GlobalConfig,
-) -> Vec<CheckResult> {
+) -> Vec<DiagnosticFinding> {
     config
         .retired_model_instructions()
         .into_iter()
         .map(|id| {
-            CheckResult::warn(
-                &format!("config: model {id}"),
-                "model.instructions is retired and ignored; all models now share the \
-                 CodeLeveler base prompt — remove the key",
+            with_action(
+                warn(
+                    finding_id::CONFIG_RETIRED_INSTRUCTIONS,
+                    Some(&id),
+                    DiagnosticCategory::Configuration,
+                    vec![
+                        "model.instructions is retired and ignored; all models now share the \
+                         CodeLeveler base prompt — remove the key"
+                            .into(),
+                    ],
+                ),
+                action_id::FIX_CONFIG,
             )
         })
         .collect()
@@ -430,7 +648,7 @@ fn retired_model_instruction_warnings(
 /// MCP servers declare env **name** references only. Warn when a referenced
 /// source variable is unset so the server would start without the credential.
 /// Never prints raw config values (legacy plaintext must not be echoed).
-fn check_mcp_env_refs() -> Vec<CheckResult> {
+fn check_mcp_env_refs() -> Vec<DiagnosticFinding> {
     let path = match crate::mcp_config::config_path() {
         Ok(p) => p,
         Err(_) => return Vec::new(),
@@ -439,10 +657,22 @@ fn check_mcp_env_refs() -> Vec<CheckResult> {
 }
 
 /// Path-parameterized MCP env checks (unit-testable without process HOME).
-fn check_mcp_env_refs_at(path: &std::path::Path) -> Vec<CheckResult> {
+fn check_mcp_env_refs_at(path: &std::path::Path) -> Vec<DiagnosticFinding> {
     let servers = match crate::mcp_config::list_at(path) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            // The parse error may quote a legacy plaintext value, so the
+            // evidence states the failure without reproducing it.
+            return vec![with_action(
+                fail(
+                    finding_id::MCP_CONFIG,
+                    None,
+                    DiagnosticCategory::Mcp,
+                    vec!["MCP server configuration could not be read (I/O or parse error)".into()],
+                ),
+                action_id::REVIEW_MCP_CONFIG,
+            )];
+        }
     };
     let mut out = Vec::new();
     for s in servers {
@@ -459,8 +689,14 @@ fn check_mcp_env_refs_at(path: &std::path::Path) -> Vec<CheckResult> {
     out
 }
 
-fn push_mcp_ref(out: &mut Vec<CheckResult>, server: &str, kind: &str, key: &str, source: &str) {
-    let name = format!("mcp {kind}: {server} / {key}");
+fn push_mcp_ref(
+    out: &mut Vec<DiagnosticFinding>,
+    server: &str,
+    kind: &str,
+    key: &str,
+    source: &str,
+) {
+    let subject = format!("{server}/{key}");
     // Never interpolate untrusted config values. Only print source when
     // it is a safe UPPER_SNAKE name reference.
     if !crate::mcp_config::is_env_name_ref(source)
@@ -473,26 +709,121 @@ fn push_mcp_ref(out: &mut Vec<CheckResult>, server: &str, kind: &str, key: &str,
                 "`{key}` is not a valid name reference — replace the value with an UPPER_SNAKE env name"
             )
         };
-        out.push(CheckResult::fail(&name, detail));
+        out.push(with_action(
+            fail(
+                finding_id::MCP_CONFIG,
+                Some(&subject),
+                DiagnosticCategory::Mcp,
+                vec![detail],
+            ),
+            action_id::REVIEW_MCP_CONFIG,
+        ));
         return;
     }
     match std::env::var(source) {
-        Ok(_) => out.push(CheckResult::ok(&name, format!("set via ${source}"))),
-        Err(_) => out.push(CheckResult::warn(
-            &name,
-            format!("environment variable ${source} is not set"),
+        Ok(_) => out.push(pass(
+            finding_id::MCP_CONFIG,
+            Some(&subject),
+            DiagnosticCategory::Mcp,
+            vec![format!("set via ${source}")],
+        )),
+        Err(_) => out.push(with_action(
+            warn(
+                finding_id::MCP_CONFIG,
+                Some(&subject),
+                DiagnosticCategory::Mcp,
+                vec![format!("environment variable ${source} is not set")],
+            ),
+            action_id::REVIEW_MCP_CONFIG,
         )),
     }
 }
 
+/// Live MCP connection state is not part of the protocol yet. Saying so is the
+/// honest answer; the runtime must not fabricate "connected".
+fn check_mcp_connection() -> DiagnosticFinding {
+    let count = crate::mcp_config::config_path()
+        .ok()
+        .and_then(|path| crate::mcp_config::list_at(&path).ok())
+        .map(|servers| servers.len())
+        .unwrap_or(0);
+    if count == 0 {
+        return finding(
+            finding_id::MCP_CONNECTION,
+            None,
+            DiagnosticCategory::Mcp,
+            DiagnosticStatus::NotApplicable,
+            vec!["no MCP servers configured".into()],
+        );
+    }
+    finding(
+        finding_id::MCP_CONNECTION,
+        None,
+        DiagnosticCategory::Mcp,
+        DiagnosticStatus::NotChecked,
+        vec![format!(
+            "{count} server(s) configured; live connection state is not exposed by the runtime"
+        )],
+    )
+}
+
 /// Whether any check failed.
-pub fn has_failure(results: &[CheckResult]) -> bool {
-    results.iter().any(|r| r.status == CheckStatus::Fail)
+pub fn has_failure(results: &[DiagnosticFinding]) -> bool {
+    results
+        .iter()
+        .any(|finding| finding.status == DiagnosticStatus::Fail)
+}
+
+/// English title for one finding id, used by the CLI's text output.
+///
+/// UI clients carry their own localized table; this function exists only so
+/// the CLI does not print bare machine keys.
+pub fn label(id: &str) -> &'static str {
+    match id {
+        finding_id::RUNTIME_CONNECTION => "runtime connection",
+        finding_id::RUNTIME_BUILD => "runtime build",
+        finding_id::RUNTIME_SESSION => "runtime session",
+        finding_id::RUNTIME_RECOVERY => "runtime recovery",
+        finding_id::TOOL_AVAILABILITY => "tool",
+        finding_id::CONFIG_PROVIDERS => "config: providers",
+        finding_id::CONFIG_MODELS => "config: models",
+        finding_id::CONFIG_MODEL_PROVIDER => "config: model provider",
+        finding_id::CONFIG_GLOBAL => "config: global",
+        finding_id::CONFIG_RELOAD => "config: reload",
+        finding_id::CONFIG_RETIRED_INSTRUCTIONS => "config: retired instructions",
+        finding_id::MODEL_REASONING => "reasoning",
+        finding_id::MODEL_THINKING => "thinking",
+        finding_id::PROVIDER_API_KEY => "api key",
+        finding_id::AGENTS_REGISTRY => "agents",
+        finding_id::MCP_CONFIG => "mcp config",
+        finding_id::MCP_CONNECTION => "mcp connection",
+        finding_id::PERMISSION_PROFILE => "permission",
+        finding_id::SANDBOX_CAPABILITY => "sandbox capability",
+        finding_id::SANDBOX_VERIFICATION => "sandbox verification",
+        finding_id::TERMINAL_CAPABILITY => "terminal",
+        _ => "diagnostic",
+    }
+}
+
+/// English sentence for an action key, used by the CLI's text output.
+pub fn action_label(action: &str) -> &'static str {
+    match action {
+        action_id::CONFIGURE_PROVIDER_MODEL => "add a provider and a model in the global config",
+        action_id::SET_PROVIDER_KEY => "set the provider's API key environment variable",
+        action_id::FIX_CONFIG => "review the referenced configuration entry",
+        action_id::INSTALL_TOOL => "install the tool or add it to PATH",
+        action_id::REVIEW_MCP_CONFIG => "review the MCP server configuration",
+        action_id::REVIEW_PERMISSION => "review the session's permission profile",
+        action_id::ACKNOWLEDGE_RECOVERY => "review and acknowledge the crash window",
+        action_id::RESTART_TO_MATCH => "restart the app to match the runtime build",
+        _ => "",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leveler_client_protocol::DiagnosticCategory;
 
     /// Windows resolves `git` through `PATHEXT`; a bare `PATH` join reports
     /// every installed tool as missing.
@@ -520,6 +851,24 @@ mod tests {
         assert_eq!(find_in_path_in(path, "leveler-doctor-missing"), None);
     }
 
+    fn find<'a>(
+        results: &'a [DiagnosticFinding],
+        id: &str,
+        subject: &str,
+    ) -> &'a DiagnosticFinding {
+        results
+            .iter()
+            .find(|finding| finding.id == id && finding.subject.as_deref() == Some(subject))
+            .unwrap_or_else(|| panic!("missing {id}:{subject}: {results:?}"))
+    }
+
+    fn find_any<'a>(results: &'a [DiagnosticFinding], id: &str) -> &'a DiagnosticFinding {
+        results
+            .iter()
+            .find(|finding| finding.id == id)
+            .unwrap_or_else(|| panic!("missing {id}: {results:?}"))
+    }
+
     /// A retired per-model `instructions` key must produce a visible doctor
     /// warning instead of being silently ignored.
     #[test]
@@ -529,8 +878,14 @@ mod tests {
                 .unwrap();
         let warnings = retired_model_instruction_warnings(&config);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(warnings[0].status, CheckStatus::Warn);
-        assert!(warnings[0].detail.contains("retired and ignored"));
+        assert_eq!(warnings[0].id, finding_id::CONFIG_RETIRED_INSTRUCTIONS);
+        assert_eq!(warnings[0].status, DiagnosticStatus::Warn);
+        assert!(
+            warnings[0]
+                .evidence
+                .join(" ")
+                .contains("retired and ignored")
+        );
 
         let clean: crate::global_config::GlobalConfig =
             toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
@@ -608,13 +963,10 @@ mod tests {
         };
         let results = check_reasoning(&loaded);
         for id in ["unsupported", "fixed", "mismatch"] {
-            let warning = results
-                .iter()
-                .find(|result| result.name == format!("thinking: p/{id}"))
-                .unwrap_or_else(|| panic!("missing High diagnostic for {id}: {results:?}"));
-            assert_eq!(warning.status, CheckStatus::Warn);
+            let warning = find(&results, finding_id::MODEL_THINKING, &format!("p/{id}"));
+            assert_eq!(warning.status, DiagnosticStatus::Warn);
             assert!(
-                warning.detail.contains("thinking = \"high\""),
+                warning.evidence.join(" ").contains("thinking = \"high\""),
                 "{warning:?}"
             );
         }
@@ -633,7 +985,7 @@ mod tests {
             assert!(
                 !check_reasoning(&config)
                     .iter()
-                    .any(|r| r.name.starts_with("thinking:")),
+                    .any(|finding| finding.id == finding_id::MODEL_THINKING),
                 "Auto asks for no adjustment"
             );
         }
@@ -646,20 +998,14 @@ mod tests {
             has_failure(&results),
             "first install with no models must not look healthy: {results:?}"
         );
-        let providers = results
-            .iter()
-            .find(|r| r.name == "config: providers")
-            .expect("providers check");
-        let models = results
-            .iter()
-            .find(|r| r.name == "config: models")
-            .expect("models check");
-        assert_eq!(providers.status, CheckStatus::Fail, "{}", providers.detail);
-        assert_eq!(models.status, CheckStatus::Fail, "{}", models.detail);
+        let providers = find_any(&results, finding_id::CONFIG_PROVIDERS);
+        let models = find_any(&results, finding_id::CONFIG_MODELS);
+        assert_eq!(providers.status, DiagnosticStatus::Fail, "{providers:?}");
+        assert_eq!(models.status, DiagnosticStatus::Fail, "{models:?}");
         assert!(
-            models.detail.contains("config.toml") || models.detail.contains("LEVELER_HOME"),
-            "hint must point at global config, not only repo configs/: {}",
-            models.detail
+            models.evidence.join(" ").contains("config.toml")
+                || models.evidence.join(" ").contains("LEVELER_HOME"),
+            "hint must point at global config, not only repo configs/: {models:?}"
         );
     }
 
@@ -672,12 +1018,13 @@ mod tests {
         };
         let results = run(&config);
         assert!(has_failure(&results));
-        let orphan = results
-            .iter()
-            .find(|r| r.name.contains("deepseek/deepseek-chat"))
-            .expect("orphan model check");
-        assert_eq!(orphan.status, CheckStatus::Fail, "{}", orphan.detail);
-        assert!(orphan.detail.contains("provider"), "{}", orphan.detail);
+        let orphan = find(
+            &results,
+            finding_id::CONFIG_MODEL_PROVIDER,
+            "deepseek/deepseek-chat",
+        );
+        assert_eq!(orphan.status, DiagnosticStatus::Fail, "{orphan:?}");
+        assert!(orphan.evidence.join(" ").contains("provider"), "{orphan:?}");
     }
 
     #[test]
@@ -689,7 +1036,7 @@ mod tests {
         };
         let results = check_model_bundle(&config);
         assert!(
-            results.iter().all(|r| r.status == CheckStatus::Ok),
+            results.iter().all(|r| r.status == DiagnosticStatus::Pass),
             "{results:?}"
         );
         assert!(!has_failure(&results));
@@ -716,17 +1063,10 @@ mod tests {
         };
         let results = check_reasoning(&config);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, CheckStatus::Ok);
-        assert!(
-            results[0].detail.contains("default=max"),
-            "{}",
-            results[0].detail
-        );
-        assert!(
-            results[0].detail.contains("effective=max"),
-            "{}",
-            results[0].detail
-        );
+        assert_eq!(results[0].status, DiagnosticStatus::Pass);
+        let evidence = results[0].evidence.join(" ");
+        assert!(evidence.contains("default=max"), "{evidence}");
+        assert!(evidence.contains("effective=max"), "{evidence}");
     }
 
     /// A Thinking Level the model cannot express is reported with the levels it
@@ -753,25 +1093,21 @@ mod tests {
             ..Default::default()
         };
         let results = check_reasoning(&config);
-        let warning = results
-            .iter()
-            .find(|r| r.name.starts_with("thinking:"))
-            .expect("the level is reported");
-        assert_eq!(warning.status, CheckStatus::Warn, "{warning:?}");
+        let warning = find(
+            &results,
+            finding_id::MODEL_THINKING,
+            "deepseek/deepseek-v4-pro",
+        );
+        assert_eq!(warning.status, DiagnosticStatus::Warn, "{warning:?}");
+        let evidence = warning.evidence.join(" ");
+        assert!(evidence.contains("thinking = \"medium\""), "{evidence}");
         assert!(
-            warning.detail.contains("thinking = \"medium\""),
-            "{}",
-            warning.detail
+            evidence.contains("auto, low, max"),
+            "the real options, deduplicated exactly as the selector shows them: {evidence}"
         );
         assert!(
-            warning.detail.contains("auto, low, max"),
-            "the real options, deduplicated exactly as the selector shows them: {}",
-            warning.detail
-        );
-        assert!(
-            warning.detail.contains("provider's own default"),
-            "and what happens instead: {}",
-            warning.detail
+            evidence.contains("provider's own default"),
+            "and what happens instead: {evidence}"
         );
     }
 
@@ -789,11 +1125,10 @@ mod tests {
         };
         let results = check_reasoning(&config);
         assert_eq!(results.len(), 1, "{results:?}");
-        assert_eq!(results[0].status, CheckStatus::Warn);
+        assert_eq!(results[0].status, DiagnosticStatus::Warn);
         assert!(
-            results[0].detail.contains("does not reason"),
-            "{}",
-            results[0].detail
+            results[0].evidence.join(" ").contains("does not reason"),
+            "{results:?}"
         );
     }
 
@@ -811,21 +1146,22 @@ mod tests {
             timeouts: Default::default(),
         };
         let result = check_api_key(&provider);
-        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.status, DiagnosticStatus::Fail);
+        assert_eq!(result.category, DiagnosticCategory::Model);
     }
 
     #[test]
     fn sandbox_doctor_line_never_claims_sandbox_yes() {
         let config = LoadedConfig::default();
         let results = run(&config);
-        let sand = results
-            .iter()
-            .find(|r| r.name == "sandbox")
-            .expect("sandbox check");
+        let sand = find_any(&results, finding_id::SANDBOX_CAPABILITY);
         assert!(
-            !sand.detail.to_lowercase().contains("sandbox=yes"),
-            "{}",
-            sand.detail
+            !sand
+                .evidence
+                .join(" ")
+                .to_lowercase()
+                .contains("sandbox=yes"),
+            "{sand:?}"
         );
     }
 
@@ -834,11 +1170,10 @@ mod tests {
         // When no MCP servers are configured (or config path missing), no crash
         // and no secret material appears in diagnostics.
         let results = check_mcp_env_refs();
-        for r in &results {
+        for finding in &results {
             assert!(
-                !r.detail.to_lowercase().contains("sk-"),
-                "doctor must not echo secrets: {}",
-                r.detail
+                !finding.evidence.join(" ").to_lowercase().contains("sk-"),
+                "doctor must not echo secrets: {finding:?}"
             );
         }
     }
@@ -868,36 +1203,26 @@ env = {{ GITHUB_TOKEN = "{secret}" }}
             !results.is_empty(),
             "expected a failure for the legacy secret source"
         );
-        for r in &results {
+        for finding in &results {
             assert!(
-                !r.name.contains(secret),
-                "check name must not contain secret: {}",
-                r.name
+                !finding.evidence.join(" ").contains(secret),
+                "evidence must not contain secret: {finding:?}"
             );
             assert!(
-                !r.detail.contains(secret),
-                "check detail must not contain secret: {}",
-                r.detail
-            );
-            assert!(
-                !format!("{r:?}").contains(secret),
-                "Debug of CheckResult must not contain secret"
+                !format!("{finding:?}").contains(secret),
+                "Debug of DiagnosticFinding must not contain secret"
             );
         }
-        let legacy = results
-            .iter()
-            .find(|r| r.name.contains("legacy") && r.name.contains("GITHUB_TOKEN"))
-            .expect("legacy mcp env check");
-        assert_eq!(legacy.status, CheckStatus::Fail);
+        let legacy = find(&results, finding_id::MCP_CONFIG, "legacy/GITHUB_TOKEN");
+        assert_eq!(legacy.status, DiagnosticStatus::Fail);
+        let evidence = legacy.evidence.join(" ");
         assert!(
-            legacy.detail.contains("not a valid name reference"),
-            "{}",
-            legacy.detail
+            evidence.contains("not a valid name reference"),
+            "{evidence}"
         );
         assert!(
-            legacy.detail.contains("GITHUB_TOKEN=GITHUB_TOKEN"),
-            "should suggest the key-only form: {}",
-            legacy.detail
+            evidence.contains("GITHUB_TOKEN=GITHUB_TOKEN"),
+            "should suggest the key-only form: {evidence}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -921,13 +1246,57 @@ env = { GITHUB_TOKEN = "GITHUB_TOKEN" }
         )
         .unwrap();
         let results = check_mcp_env_refs_at(&cfg);
-        let line = results
-            .iter()
-            .find(|r| r.name.contains("gh") && r.name.contains("GITHUB_TOKEN"))
-            .expect("gh env check");
+        let line = find(&results, finding_id::MCP_CONFIG, "gh/GITHUB_TOKEN");
         // Unset in this process → warn naming the source (safe UPPER_SNAKE).
-        assert_eq!(line.status, CheckStatus::Warn);
-        assert!(line.detail.contains("$GITHUB_TOKEN"), "{}", line.detail);
+        assert_eq!(line.status, DiagnosticStatus::Warn);
+        assert!(
+            line.evidence.join(" ").contains("$GITHUB_TOKEN"),
+            "{line:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sandbox_capability_never_stands_in_for_enforcement() {
+        let results = run(&LoadedConfig::default());
+        let status = find_any(&results, finding_id::SANDBOX_CAPABILITY).status;
+        assert!(
+            matches!(status, DiagnosticStatus::Pass | DiagnosticStatus::Warn),
+            "{status:?}"
+        );
+        let verification = find_any(&results, finding_id::SANDBOX_VERIFICATION);
+        assert_eq!(verification.status, DiagnosticStatus::NotChecked);
+        assert!(
+            verification
+                .evidence
+                .join(" ")
+                .contains("does not prove enforcement"),
+            "{verification:?}"
+        );
+    }
+
+    #[test]
+    fn every_finding_uses_a_stable_id_and_a_typed_status() {
+        let config = LoadedConfig {
+            providers: vec![sample_provider("deepseek")],
+            models: vec![sample_model("deepseek", "deepseek-chat")],
+            ..Default::default()
+        };
+        let results = run(&config);
+        assert!(!results.is_empty());
+        for finding in &results {
+            assert!(!finding.id.is_empty());
+            assert!(
+                !finding.id.contains(' '),
+                "ids are machine keys, not sentences: {}",
+                finding.id
+            );
+            assert!(!finding.checked_at.is_empty());
+            assert_eq!(
+                finding.severity,
+                severity_of(finding.status),
+                "severity is derived from status, not guessed: {finding:?}"
+            );
+        }
     }
 }

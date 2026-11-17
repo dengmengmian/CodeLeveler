@@ -103,6 +103,7 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
         Screen::Clean => state.clean.move_selection(notches),
         Screen::Schedules => crate::schedules::wheel(state, notches),
         Screen::Memory => crate::memory::wheel(state, notches),
+        Screen::Find => crate::find::wheel(state, notches),
         Screen::Help => {
             let t = state.t();
             state.help.move_selection(notches, t);
@@ -169,6 +170,7 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
         }
         Screen::Schedules => crate::schedules::select_row(state, key),
         Screen::Memory => crate::memory::select_row(state, key),
+        Screen::Find => crate::find::select_row(state, key),
         Screen::Help => {
             if let Ok(index) = key.parse::<usize>() {
                 state.help.select(index, state.t());
@@ -298,6 +300,9 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             _ => {}
         },
         Screen::Output => return super::output_screen_key(state, &key),
+        // The page owns every key: query editing, tab switch, selection and
+        // the jump. Nothing here reaches the composer or the runtime.
+        Screen::Find => return crate::find::handle_key(state, &key),
         Screen::Activity => match key.code {
             KeyCode::Esc => return back(state),
             // `x` stops exactly the open activity; its parent turn keeps
@@ -423,13 +428,10 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 state.help.handle_key(key, t, page);
             }
         }
-        Screen::Doctor => {
-            if key.code == KeyCode::Esc {
-                return back(state);
-            } else {
-                scroll_screen_key(state, &key, true);
-            }
-        }
+        // Both pages own every key while active: they keep their own
+        // selection, filter and detail state.
+        Screen::Doctor => return crate::doctor::handle_key(state, key),
+        Screen::Tasks => return crate::tasks::handle_key(state, key),
         Screen::Trace => {
             use crate::observability::TraceTab;
             match key.code {
@@ -579,6 +581,9 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
             state.output_view = None;
             close_screen(state);
         }
+        // Leaving Find cancels any scan still running and restores the
+        // conversation focus the page was opened from.
+        Screen::Find => crate::find::close(state),
         Screen::ActivityList => {
             // Two levels of back: leave the log first, then the page.
             if state.background_list_focus == crate::activity::BackgroundPane::Output {
@@ -592,6 +597,10 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         // The schedule page's back is one level, not always the whole page:
         // form → detail → list → conversation, the same rule Esc follows.
         Screen::Schedules => crate::schedules::back(state),
+        // Both pages drop their in-flight query on the way out, so a late
+        // answer is not attributed to a later visit.
+        Screen::Tasks => crate::tasks::close(state),
+        Screen::Doctor => crate::doctor::close(state),
         Screen::Memory => crate::memory::back(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
