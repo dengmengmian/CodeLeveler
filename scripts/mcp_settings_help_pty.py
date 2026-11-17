@@ -202,8 +202,16 @@ def scenario_mcp(report, env, python):
         pty.resize(120, 40)
         time.sleep(0.5)
 
-        # Doctor reads the same authority.
+        # Closing the page leaves no residue in the conversation.
         to_conversation(pty)
+        check(
+            report,
+            "mcp",
+            "closing the page leaves no MCP chrome behind",
+            "← MCP" not in pty.screen.text() and "筛选:" not in pty.screen.text(),
+            pty.screen.text()[:700],
+        )
+        # Doctor reads the same authority.
         command(pty, "/doctor")
         ok = wait(pty, "MCP") and wait(pty, "echo", 15)
         # The finding list is sorted problems-first; the connected MCP finding
@@ -294,6 +302,13 @@ def scenario_settings(report, pty, env):
     time.sleep(0.3)
     pty.key("\x1b")
     time.sleep(0.3)
+    check(
+        report,
+        "settings",
+        "closing the page leaves no settings chrome behind",
+        "← 设置" not in pty.screen.text() and "筛选:" not in pty.screen.text(),
+        pty.screen.text()[:700],
+    )
 
 
 def scenario_help(report, pty):
@@ -321,6 +336,13 @@ def scenario_help(report, pty):
     pty.key("\x1b")
     time.sleep(0.3)
     check(report, "help", "Esc returns to the list", "帮助" in pty.screen.text())
+    check(
+        report,
+        "help",
+        "the detail page leaves no residue in the list",
+        "用法:" not in pty.screen.text(),
+        pty.screen.text()[:700],
+    )
     pty.key("\x1b")
     time.sleep(0.3)
 
