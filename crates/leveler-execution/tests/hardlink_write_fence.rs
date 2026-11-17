@@ -117,9 +117,16 @@ async fn a_hardlink_alias_inside_the_workspace_writes_the_outside_inode() {
     }
 
     // Linux and Windows do not make the seatbelt assertion; the call above is
-    // still part of the fixture, but its result has no use there.
+    // still part of the fixture, but its result has no use there. If the
+    // confined shell did create the alias, remove it before step 2: the
+    // pre-existing alias must be created outside the command under test.
     #[cfg(not(target_os = "macos"))]
-    let _ = &created;
+    {
+        let _ = &created;
+        if created.success() {
+            std::fs::remove_file(&link).expect("remove the link the confined shell created");
+        }
+    }
 
     // Step 2: an alias that already exists (created before confinement, by a
     // Full session, or by the user) names the same inode. Path checks cannot
