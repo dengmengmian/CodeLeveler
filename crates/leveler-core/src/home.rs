@@ -12,7 +12,7 @@
 //! <root>/
 //! ├── config.toml                 global user config
 //! ├── memory/                     cross-session memory store
-//! ├── state/   projects/<id>/ · remote/ · web/     durable state
+//! ├── state/   projects/<id>/ · remote/            durable state
 //! ├── run/     sockets/ · locks/ · sandboxes/       ephemeral runtime coordination
 //! ├── cache/   tools/                               disposable, rebuildable
 //! ├── runtimes/                                     managed execution deps (reserved)
@@ -110,22 +110,6 @@ impl LevelerHome {
     /// One project's durable state root: `state/projects/<project_id>/`.
     pub fn project_state_dir(&self, project_id: &str) -> PathBuf {
         self.projects_dir().join(project_id)
-    }
-
-    /// Web aggregation state: `state/web/`.
-    pub fn web_state_dir(&self) -> PathBuf {
-        self.state_dir().join("web")
-    }
-
-    /// Multi-project web registry: `state/web/projects.json`.
-    pub fn web_projects_registry(&self) -> PathBuf {
-        self.web_state_dir().join("projects.json")
-    }
-
-    /// Imported web attachment store: `state/web/uploads/`. Kept out of the
-    /// workspace so importing a file never mutates the repository.
-    pub fn web_uploads_dir(&self) -> PathBuf {
-        self.web_state_dir().join("uploads")
     }
 
     // ── run/ — ephemeral runtime coordination ───────────────────────────────
@@ -241,10 +225,6 @@ mod tests {
         );
         assert_eq!(h.memory_dir(), PathBuf::from("/home/u/.leveler/memory"));
         assert_eq!(
-            h.web_projects_registry(),
-            PathBuf::from("/home/u/.leveler/state/web/projects.json")
-        );
-        assert_eq!(
             h.sockets_dir(),
             PathBuf::from("/home/u/.leveler/run/sockets")
         );
@@ -340,9 +320,6 @@ mod tests {
             h.memory_dir(),
             h.projects_dir(),
             h.project_state_dir("p"),
-            h.web_state_dir(),
-            h.web_projects_registry(),
-            h.web_uploads_dir(),
             h.run_dir(),
             h.sockets_dir(),
             h.locks_dir(),

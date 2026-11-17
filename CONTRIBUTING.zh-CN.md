@@ -12,17 +12,9 @@ cargo build --locked -p leveler-cli --bin leveler
 cargo run --locked -p leveler-cli -- --version
 ```
 
-## 本地运行浏览器界面
+## 本地运行桌面端
 
-先构建前端，再编译并运行 CLI。CI 使用 Node.js 22。
-
-```sh
-npm --prefix crates/leveler-web/web ci
-npm --prefix crates/leveler-web/web run build
-cargo run --locked -p leveler-cli -- web
-```
-
-桌面端见[桌面端构建说明](apps/leveler-desktop/README.md)。
+见[桌面端构建说明](apps/leveler-desktop/README.md)。
 
 ## 修改与验证
 

@@ -6,7 +6,9 @@
   "main": "src/main.cjs",
   "scripts": {
     "start": "electron .",
-    "build": "node scripts/check.mjs",
+    "build": "node scripts/gen-command-policy.mjs --check && node scripts/check.mjs",
+    "gen:protocol": "node scripts/gen-command-policy.mjs",
+    "check:protocol": "node scripts/gen-command-policy.mjs --check",
     "test": "node --test test/*.test.mjs",
     "test:acceptance": "node scripts/acceptance.mjs",
     "postinstall": "install-electron",

@@ -25,7 +25,7 @@ impl std::fmt::Display for DiffError {
 }
 
 /// Compute the working-tree diff vs HEAD via git — staged AND unstaged, the
-/// same yardstick as the web Git panel, so the two views never contradict.
+/// same yardstick as every client view, so the views never contradict.
 /// `with_patch` also loads each file's unified diff hunk.
 ///
 /// Process count is O(1) in the number of changed files, not O(files): tracked
@@ -192,7 +192,7 @@ fn count_lines(bytes: &[u8]) -> u32 {
 /// Render a new file the way `git diff --no-index /dev/null <path>` does:
 /// `new file mode`, `--- /dev/null`, `+++ b/<path>`, and a single all-added
 /// hunk. The `index` blob-hash line is omitted — it carries no change
-/// information, and no consumer here needs it (the web parser skips meta lines).
+/// information, and no consumer here needs it (the client parser skips meta lines).
 fn new_file_patch(path: &str, absolute: &Path, bytes: &[u8]) -> String {
     let mode = file_mode(absolute);
     let mut out = format!("diff --git a/{path} b/{path}\nnew file mode {mode}\n");

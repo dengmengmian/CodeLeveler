@@ -74,6 +74,5 @@ leveler-chat-*.md
 /docs/WELCOME_IMPLEMENTATION_PROMPT.zh-CN.md
 /assets/brand/README.md
 /crates/leveler-storage/migrations/README.md
-/crates/leveler-web/README.md
 /testdata/context_statistics/v1/README.md
 /testdata/conversation_presentation/v1/README.md

@@ -7,8 +7,6 @@
 需要 Rust、Node.js、npm 和 Git。在仓库根目录执行：
 
 ```sh
-npm --prefix crates/leveler-web/web ci
-npm --prefix crates/leveler-web/web run build
 cargo build -p leveler-cli --bin leveler
 cd apps/leveler-desktop
 npm ci

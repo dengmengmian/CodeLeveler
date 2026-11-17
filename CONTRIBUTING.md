@@ -12,17 +12,9 @@ cargo build --locked -p leveler-cli --bin leveler
 cargo run --locked -p leveler-cli -- --version
 ```
 
-## Run the browser UI locally
+## Run the desktop client locally
 
-Build the frontend before compiling and running the CLI. CI uses Node.js 22.
-
-```sh
-npm --prefix crates/leveler-web/web ci
-npm --prefix crates/leveler-web/web run build
-cargo run --locked -p leveler-cli -- web
-```
-
-For desktop work, see the [desktop build instructions](apps/leveler-desktop/README.md).
+See the [desktop build instructions](apps/leveler-desktop/README.md).
 
 ## Make and verify a change
 

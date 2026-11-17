@@ -718,7 +718,7 @@ fn visual_interaction_cards() {
     // 2. Single choice, with the running call row above the card.
     let question = "选择框弹出来了——上一条「弹个窗户」你想让我开哪个？";
     let options = [
-        "CodeLeveler Web UI（浏览器窗口）",
+        "CodeLeveler 桌面端（应用窗口）",
         "新终端窗口，运行 TUI",
         "本机目录（Finder 窗口）",
         "只是测试，什么都不用开",

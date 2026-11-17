@@ -1018,8 +1018,8 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
-        // Mid-turn user text and per-child cancel handles. The chat turn is
-        // the one TUI, Web and phone submit, so without it neither a steer
+        // Mid-turn user text and per-child cancel handles. Every interactive
+        // client submits the chat turn, so without it neither a steer
         // nor a "stop this child" can reach the running turn.
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         task_cancel: Arc<AtomicBool>,

@@ -134,8 +134,8 @@ fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalD
 /// point can reconstruct the transcript from durable state.
 ///
 /// This is the one ACK contract for every interactive client: an in-process
-/// (embedded) TUI, the daemon `serve` exposes, the `/web` UI over its own
-/// in-process runtime, and a connected WebUI all wait on the same acceptance.
+/// (embedded) TUI and the daemon `serve` exposes both wait on the same
+/// acceptance.
 /// It is not a completion signal — only `leveler_engine::EngineEvent::TurnStarted`
 /// reaching this receiver, which the engine emits after `TurnStore::start_owned` has
 /// committed the turn row.
@@ -4868,7 +4868,7 @@ impl InProcessRuntimeClient {
     }
 
     /// Name a placeholder interactive session after its first real message:
-    /// the sidebars (web + TUI resume) show the display title, and a wall of
+    /// the sidebars (desktop + TUI resume) show the display title, and a wall of
     /// "interactive session" rows is unreadable. Only a session with no title
     /// yet is named — a rename always wins.
     async fn retitle_placeholder_session(&self, session_id: &SessionId, content: &str) {
@@ -5522,7 +5522,7 @@ impl InProcessRuntimeClient {
         // path never classifies the text, so any language and phrasing reaches
         // the same machinery.
         // The TUI asks the user about this first, but the reducer is one
-        // client. Every other one — web, headless, a model changed between
+        // client. Every other one — desktop, headless, a model changed between
         // staging and sending — arrives here, and here the answer is the same:
         // a model that cannot read an image is told so, never handed the text
         // with the picture removed.
@@ -8812,7 +8812,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         // Session-less commands (global queries like `RequestSessionList`,
         // `Quit`) carry no session target, so they must not be receipted: the
         // command_receipts.session_id foreign key requires a real session row,
-        // and clients (the WebUI) send these with an empty session id, which
+        // and clients send these with an empty session id, which
         // would violate that FK. They are idempotent global dispatches — run
         // them directly, skipping the per-session dedup machinery.
         if envelope.command.session_id().is_none() {

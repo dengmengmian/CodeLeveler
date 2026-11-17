@@ -161,7 +161,7 @@ pub fn spawn_owned_runtime(exe: &Path, repo: &Path, ready_path: &Path) -> std::i
         .stderr(Stdio::null())
         // Deliberately NOT `kill_on_drop`. The child handle this manager holds
         // is a handle to a PROCESS, not to the work the runtime owns: dropping
-        // it used to SIGKILL the daemon, so closing the Web UI destroyed a
+        // it used to SIGKILL the daemon, so closing a client destroyed a
         // turn that happened to be running. A daemon is a long-lived owner
         // with its own idle eviction, exactly like one started by the terminal,
         // so an exiting shell releases its handle and leaves the runtime alone.

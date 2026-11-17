@@ -421,7 +421,7 @@ fn write_roots_must_be_bounded_repository_relative_paths() {
     for (root, ok) in [
         ("web", true),
         ("web/src/", true),
-        ("crates/leveler-web/web", true),
+        ("crates/leveler-agent", true),
         ("", false),
         (".", false),
         ("/etc", false),

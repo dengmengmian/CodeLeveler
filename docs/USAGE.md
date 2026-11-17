@@ -137,7 +137,7 @@ max_results = 5
 timeout_ms = 15000
 ```
 
-Set the named environment variable before starting CodeLeveler. A key alone does not enable search without `[web.search]`. UI links and `/web` use your system browser.
+Set the named environment variable before starting CodeLeveler. A key alone does not enable search without `[web.search]`. UI links use your system browser.
 
 ## MCP servers
 

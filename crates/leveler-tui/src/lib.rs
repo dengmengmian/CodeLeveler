@@ -96,7 +96,7 @@ mod workbench;
 
 mod run;
 
-pub use action::{CleanHost, UrlOpener, WebLauncher};
+pub use action::{CleanHost, UrlOpener};
 pub use exit::ClientExitScope;
 pub use i18n::Locale;
 pub use observability::LIVE_REFRESH_INTERVAL;

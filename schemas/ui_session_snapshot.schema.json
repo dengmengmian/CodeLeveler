@@ -9534,7 +9534,7 @@
           ]
         },
         "repository": {
-          "description": "Repository root the session belongs to. Filled by the runtime that owns the session and by the WebUI aggregation router (multi-project grouping); omitted on the wire when unknown so old fixtures and clients keep parsing.",
+          "description": "Repository root the session belongs to. Filled by the runtime that owns the session; omitted on the wire when unknown so old fixtures and clients keep parsing.",
           "type": [
             "string",
             "null"
