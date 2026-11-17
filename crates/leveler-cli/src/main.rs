@@ -350,7 +350,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                 .await
                 .map(|()| std::process::ExitCode::SUCCESS)
         }
-        Command::Permissions(pc) => cmd_permissions(layout, pc),
+        Command::Permissions(pc) => cmd_permissions(layout, pc).await,
         Command::Trust { command } => crate::trust_cmds::cmd_trust(layout, command),
         Command::Config(ConfigCommand::Show) => cmd_config_show(layout),
         Command::Theme(ThemeCommand::Preview { id }) => cmd_theme_preview(id),

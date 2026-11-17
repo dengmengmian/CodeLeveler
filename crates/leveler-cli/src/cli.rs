@@ -428,6 +428,20 @@ pub enum PermissionsCommand {
     /// Remove all project rules (delete `<repo>/.leveler/permissions.yaml`).
     /// Global `~/.leveler/permissions.yaml` is left untouched.
     Clear,
+    /// List durable resource grants (exact capability/resource approvals).
+    Grants {
+        /// Only grants effective for this session (plus project-wide grants).
+        #[arg(long)]
+        session: Option<String>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke exactly one stored resource grant by its listed handle.
+    ///
+    /// Already-admitted calls keep their frozen policy; the next admission no
+    /// longer matches the revoked grant.
+    RevokeGrant { id: String },
 }
 
 /// In-repo config trust (`<repo>/.leveler/hooks.yaml`,
@@ -691,6 +705,12 @@ pub enum SessionsCommand {
         /// Print the raw session record as JSON instead of the readable view.
         #[arg(long)]
         json: bool,
+    },
+    /// Change a session's display title (the original request is kept).
+    Rename {
+        id: String,
+        /// New display title.
+        title: String,
     },
     /// Delete a session by id.
     Delete { id: String },

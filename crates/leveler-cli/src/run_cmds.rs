@@ -1159,17 +1159,19 @@ pub(crate) async fn cmd_tui(
             if let Some(explicit) = mode {
                 let requested = map_mode(explicit);
                 if requested.as_str() != snap.mode.as_str() {
-                    client
-                        .send(
-                            leveler_client_protocol::ClientCommand::SetPermissionProfile {
-                                session_id: session_id.clone(),
-                                mode: wire_mode(requested),
-                            },
-                        )
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("cannot apply --permission to session {id}: {e}")
-                        })?;
+                    // A session setting is snapshot-versioned: the daemon
+                    // rejects a raw `send`, so deliver it with the version the
+                    // snapshot above actually observed.
+                    crate::common::deliver_permission_change(
+                        client.as_ref(),
+                        &session_id,
+                        requested,
+                        snap.last_sequence.unwrap_or(0),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("cannot apply --permission to session {id}: {e}")
+                    })?;
                 }
             }
             // The daemon path has no model registry of its own and the
@@ -1330,16 +1332,12 @@ pub(crate) async fn cmd_tui(
     app.recover_memory_captures(&model_ref).await;
     // The created row already carries `mode`; on a resume an explicit flag has
     // to move the persisted row + live cell like any other profile change.
+    // There is no attached client yet, so use the same durable writer a
+    // headless resume uses: one write for the row and the running cell.
     if let Some(persisted) = persisted_mode
         && persisted != mode
     {
-        in_process_client
-            .send(
-                leveler_client_protocol::ClientCommand::SetPermissionProfile {
-                    session_id: session_id.clone(),
-                    mode: wire_mode(mode),
-                },
-            )
+        app.set_persisted_permission_profile(&session_id, mode)
             .await?;
     }
     // `/web` inside the TUI binds the browser Web UI over this same in-process

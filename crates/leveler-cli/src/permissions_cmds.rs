@@ -19,7 +19,7 @@ use leveler_project::Layout;
 use crate::cli::PermissionsCommand;
 use crate::output::Line;
 
-pub(crate) fn cmd_permissions(
+pub(crate) async fn cmd_permissions(
     layout: Layout,
     cmd: PermissionsCommand,
 ) -> anyhow::Result<std::process::ExitCode> {
@@ -72,6 +72,95 @@ pub(crate) fn cmd_permissions(
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
+        PermissionsCommand::Grants { session, json } => {
+            let workspace = layout.require_workspace()?;
+            let project = leveler_execution::resolve_project_identity(workspace)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let app = leveler_app::Application::assemble(layout.clone())?;
+            let db = app.open_database().await?;
+            let grants =
+                leveler_storage::ResourceGrantStore::list(&db, &project, session.as_deref())
+                    .await?;
+            if json {
+                let rows: Vec<serde_json::Value> = grants
+                    .iter()
+                    .map(|grant| {
+                        serde_json::json!({
+                            "id": grant.id,
+                            "scope": match grant.scope {
+                                leveler_core::GrantScope::Session => "session",
+                                leveler_core::GrantScope::Project => "project",
+                                leveler_core::GrantScope::Once => "once",
+                            },
+                            "session": grant.session_identity,
+                            "capability": format!("{:?}", grant.binding.capability),
+                            "resource": resource_summary(&grant.binding.resource),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            if grants.is_empty() {
+                println!("{}", Line::warn("no resource grants"));
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            println!("{}", Line::heading("Resource grants"));
+            for grant in grants {
+                let scope = match grant.scope {
+                    leveler_core::GrantScope::Session => {
+                        format!("session {}", grant.session_identity)
+                    }
+                    leveler_core::GrantScope::Project => "project".to_string(),
+                    leveler_core::GrantScope::Once => "once".to_string(),
+                };
+                println!(
+                    "  {}  [{}]  {:?}  {}",
+                    grant.id,
+                    scope,
+                    grant.binding.capability,
+                    resource_summary(&grant.binding.resource),
+                );
+            }
+            println!();
+            println!("  revoke one: leveler permissions revoke-grant <id>");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        PermissionsCommand::RevokeGrant { id } => {
+            let workspace = layout.require_workspace()?;
+            let project = leveler_execution::resolve_project_identity(workspace)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let app = leveler_app::Application::assemble(layout.clone())?;
+            let db = app.open_database().await?;
+            if leveler_storage::ResourceGrantStore::revoke(&db, &project, &id).await? {
+                println!("{}", Line::ok(&format!("revoked resource grant `{id}`")));
+                println!(
+                    "  already-admitted calls keep their frozen policy; the next admission \
+                     no longer matches this grant"
+                );
+                Ok(std::process::ExitCode::SUCCESS)
+            } else {
+                println!("{}", Line::warn(&format!("no resource grant `{id}`")));
+                Ok(std::process::ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+/// A non-secret rendering of one resolved resource.
+fn resource_summary(resource: &leveler_core::ResourceIdentity) -> String {
+    use leveler_core::ResourceIdentity;
+    match resource {
+        ResourceIdentity::FilesystemPath { canonical_path, .. } => format!("path {canonical_path}"),
+        ResourceIdentity::ConfiguredRemote { remote_name, .. } => {
+            format!("remote {remote_name}")
+        }
+        ResourceIdentity::Repository { .. } => "repository".to_string(),
+        ResourceIdentity::Credential { host, .. } => format!("credential {host}"),
+        ResourceIdentity::BackgroundTask { task_id, .. } => format!("task {task_id}"),
+        ResourceIdentity::ExternalProcess { pid, .. } => format!("pid {pid}"),
     }
 }
 

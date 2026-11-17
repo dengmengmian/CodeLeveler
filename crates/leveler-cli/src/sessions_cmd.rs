@@ -289,11 +289,16 @@ pub(crate) async fn cmd_sessions(
             } else {
                 println!("{}", Line::heading("Sessions"));
                 for s in sessions {
+                    let title = s
+                        .title
+                        .as_deref()
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or(&s.goal);
                     println!(
                         "  {}  [{}]  {}  ({})",
                         s.id,
                         session_list_status(&db, &s).await?,
-                        s.goal,
+                        title,
                         s.model.as_deref().unwrap_or("—")
                     );
                 }
@@ -311,15 +316,69 @@ pub(crate) async fn cmd_sessions(
             }
             render_session_show(&db, &sid, &session).await?;
         }
+        SessionsCommand::Rename { id, title } => {
+            let title = title.trim();
+            if title.is_empty() {
+                println!("{}", Line::warn("The display title must not be empty."));
+                return Ok(std::process::ExitCode::FAILURE);
+            }
+            let sid = leveler_core::SessionId::new(id.clone());
+            match repo.rename(&sid, title, leveler_core::now()).await? {
+                leveler_storage::SessionEditResult::Applied(_) => {
+                    println!(
+                        "{}",
+                        Line::ok(&format!("Renamed session `{id}` to `{title}`."))
+                    );
+                }
+                leveler_storage::SessionEditResult::Conflict(_) => {
+                    println!("{}", Line::warn(&format!("No session `{id}`.")));
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
+            }
+        }
         SessionsCommand::Delete { id } => {
-            app.background_tasks()
-                .kill_session(&id)
+            let sid = leveler_core::SessionId::new(id.clone());
+            // Deleting is not cancellation. A running turn or live background
+            // work must be stopped by its owner first; this CLI cannot prove
+            // it stopped anything, so it refuses rather than killing silently
+            // or deleting the row out from under the work.
+            let turns = leveler_storage::TurnRepository::new(&db).list(&sid).await?;
+            if turns.iter().any(|turn| turn.status == "running") {
+                println!(
+                    "{}",
+                    Line::warn(&format!(
+                        "Session `{id}` still has a running turn; stop it before deleting."
+                    ))
+                );
+                return Ok(std::process::ExitCode::FAILURE);
+            }
+            match app
+                .background_tasks()
+                .try_active_snapshots_for_scope(id.as_str())
                 .await
-                .map_err(anyhow::Error::msg)?;
-            if repo
-                .delete(&leveler_core::SessionId::new(id.clone()))
-                .await?
             {
+                Ok(tasks) if !tasks.is_empty() => {
+                    println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Session `{id}` still has {} running background task(s); stop them before deleting.",
+                            tasks.len()
+                        ))
+                    );
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Cannot confirm that session `{id}` has no running background work: {error}"
+                        ))
+                    );
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
+            }
+            if app.delete_session_storage(&sid).await? {
                 println!("{}", Line::ok(&format!("Deleted session `{id}`.")));
             } else {
                 println!("{}", Line::warn(&format!("No session `{id}`.")));
@@ -475,5 +534,41 @@ mod session_list_tests {
         }
         session.status = leveler_lifecycle::SessionStatus::Running;
         assert_eq!(session_list_status(&db, &session).await.unwrap(), "running");
+    }
+}
+
+#[cfg(test)]
+mod delete_contract_tests {
+    use super::*;
+    use leveler_storage::{SessionRecord, SessionRepository};
+
+    /// D19: a CLI delete of an idle session removes the same storage the
+    /// runtime delete removes. The fixture has no running turn and no live
+    /// execution host, so the deletion is the plain idle path.
+    #[tokio::test]
+    async fn an_idle_session_delete_uses_the_shared_storage_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        );
+        let app = Application::assemble(layout.clone()).unwrap();
+        let db = app.open_database().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record =
+            SessionRecord::without_workspace("original request", "mock/m", leveler_core::now());
+        let id = leveler_core::SessionId::new(record.id.clone());
+        repo.create(&record).await.unwrap();
+        assert!(repo.get(&id).await.unwrap().is_some());
+
+        let exit = cmd_sessions(layout, SessionsCommand::Delete { id: id.to_string() })
+            .await
+            .unwrap();
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert!(
+            repo.get(&id).await.unwrap().is_none(),
+            "the CLI delete must remove the row through the shared cleanup"
+        );
     }
 }

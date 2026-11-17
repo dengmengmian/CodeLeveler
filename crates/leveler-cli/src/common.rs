@@ -174,6 +174,49 @@ pub(crate) fn wire_mode(mode: PermissionProfile) -> leveler_client_protocol::Per
     }
 }
 
+/// The envelope for an explicit `--permission` on an existing session.
+///
+/// `set_permission_profile` is a snapshot-versioned setting: the runtime
+/// rejects a bare `send`, because a setting that replaces a user choice must
+/// carry the version the user observed. `expected_version` comes from the
+/// session snapshot the CLI just read; 0 covers a session with no events yet.
+pub(crate) fn permission_change_envelope(
+    session_id: &leveler_core::SessionId,
+    mode: PermissionProfile,
+    expected_version: i64,
+) -> leveler_client_protocol::CommandEnvelope {
+    leveler_client_protocol::CommandEnvelope {
+        command_id: leveler_client_protocol::CommandId::generate(),
+        session_id: session_id.clone(),
+        expected_version: Some(expected_version),
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: leveler_client_protocol::ClientCommand::SetPermissionProfile {
+            session_id: session_id.clone(),
+            mode: wire_mode(mode),
+        },
+    }
+}
+
+/// Deliver an explicit permission change through the versioned setting path.
+///
+/// The CLI's `--permission` on an existing session is a user setting, not a
+/// raw dispatch: routing it through `send` is exactly the D1 defect (the
+/// runtime answers "snapshot version required" and the flag is lost).
+pub(crate) async fn deliver_permission_change(
+    client: &dyn leveler_client_protocol::InteractiveRuntimeClient,
+    session_id: &leveler_core::SessionId,
+    mode: PermissionProfile,
+    expected_version: i64,
+) -> Result<(), leveler_client_protocol::ClientError> {
+    client
+        .deliver(permission_change_envelope(
+            session_id,
+            mode,
+            expected_version,
+        ))
+        .await
+}
+
 /// The project's configured default permission mode (`.leveler/config.yaml`
 /// `mode:`), else the built-in `assisted`.
 ///
@@ -450,5 +493,73 @@ mod mode_resolution_tests {
             tmp.path().join("state"),
         );
         assert_eq!(project_default_mode(&layout), PermissionProfile::Assisted);
+    }
+
+    struct DeliveryOnly {
+        delivered: std::sync::Mutex<Vec<leveler_client_protocol::CommandEnvelope>>,
+    }
+
+    #[async_trait::async_trait]
+    impl leveler_client_protocol::InteractiveRuntimeClient for DeliveryOnly {
+        async fn send(
+            &self,
+            _command: leveler_client_protocol::ClientCommand,
+        ) -> Result<(), leveler_client_protocol::ClientError> {
+            Err(leveler_client_protocol::ClientError::Runtime(
+                "a versioned setting must not use the raw send path".into(),
+            ))
+        }
+
+        async fn deliver(
+            &self,
+            envelope: leveler_client_protocol::CommandEnvelope,
+        ) -> Result<(), leveler_client_protocol::ClientError> {
+            self.delivered.lock().unwrap().push(envelope);
+            Ok(())
+        }
+
+        fn subscribe(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<leveler_client_protocol::RuntimeEvent> {
+            let (_, receiver) = tokio::sync::broadcast::channel(1);
+            receiver
+        }
+
+        async fn snapshot(
+            &self,
+            session_id: &leveler_core::SessionId,
+        ) -> Result<leveler_client_protocol::UiSessionSnapshot, leveler_client_protocol::ClientError>
+        {
+            Err(leveler_client_protocol::ClientError::SessionNotFound(
+                session_id.clone(),
+            ))
+        }
+    }
+
+    /// D1: `--permission` on an existing session must travel as the
+    /// snapshot-versioned setting, carrying the version the CLI observed.
+    #[tokio::test]
+    async fn an_explicit_permission_change_is_delivered_as_a_versioned_setting() {
+        let client = DeliveryOnly {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
+        let session_id = leveler_core::SessionId::new("session-a");
+        deliver_permission_change(&client, &session_id, PermissionProfile::FullAccess, 7)
+            .await
+            .expect("delivery must use deliver(), not send()");
+        let delivered = client.delivered.lock().unwrap();
+        let envelope = delivered.first().expect("one envelope");
+        assert_eq!(envelope.expected_version, Some(7));
+        assert!(
+            envelope
+                .command
+                .requires_snapshot_version()
+                .expect("wire type"),
+            "set_permission_profile is a snapshot-versioned setting"
+        );
+        assert!(matches!(
+            envelope.command,
+            leveler_client_protocol::ClientCommand::SetPermissionProfile { .. }
+        ));
     }
 }
