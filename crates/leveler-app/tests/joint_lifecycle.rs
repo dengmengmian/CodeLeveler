@@ -1006,7 +1006,7 @@ async fn a_late_old_window_terminal_does_not_rewrite_the_running_window() {
     let (program, args) = if cfg!(windows) {
         (
             "cmd".to_string(),
-            vec!["/c".to_string(), "verify.cmd".to_string()],
+            vec!["/c".to_string(), ".\\verify.cmd".to_string()],
         )
     } else {
         ("sh".to_string(), vec!["verify.sh".to_string()])

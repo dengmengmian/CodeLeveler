@@ -112,6 +112,14 @@ impl Tool for ReadFileTool {
                     &input.path,
                 )));
             }
+            Err(leveler_execution::WorkspaceError::ReadOpen {
+                kind: std::io::ErrorKind::IsADirectory,
+                ..
+            }) => {
+                return Ok(ToolOutput::error(crate::recoverable::path_is_directory(
+                    &input.path,
+                )));
+            }
             Err(error) => return Err(error.into()),
         };
         // A memory file is read through its own policy: excluded or escaping

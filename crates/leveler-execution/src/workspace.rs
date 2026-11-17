@@ -312,6 +312,18 @@ impl Workspace {
     ) -> Result<(PathBuf, std::fs::File), WorkspaceError> {
         let input = input.as_ref();
         let resolved = self.resolve_for_read(input)?;
+        // Windows reports opening a directory as `PermissionDenied`; Unix may
+        // report `IsADirectory` from the open itself. Classify the resolved
+        // entry first so every platform gives read tools the same answer, and
+        // a confined seat does not misreport the directory as a confinement
+        // denial.
+        if resolved.is_dir() {
+            return Err(WorkspaceError::ReadOpen {
+                path: input.display().to_string(),
+                message: "path is a directory".to_string(),
+                kind: std::io::ErrorKind::IsADirectory,
+            });
+        }
         if !self.read_confinement {
             let file =
                 std::fs::File::open(&resolved).map_err(|error| WorkspaceError::ReadOpen {

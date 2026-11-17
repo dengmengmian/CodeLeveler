@@ -942,6 +942,19 @@ fn read_rule_source_in_dir(
             "rule file resolves outside the workspace root",
         ));
     }
+    // Classify the entry before opening it. Windows reports opening a
+    // directory as `PermissionDenied`, while Unix reports `IsADirectory`;
+    // neither is a readable rule source, and a FIFO/device must not be opened
+    // just to discover that. The post-open check stays as defense in depth.
+    let entry_metadata =
+        std::fs::metadata(&canonical).map_err(|error| RuleReadError::from_io(rel, &error))?;
+    if !entry_metadata.is_file() {
+        return Err(RuleReadError::new(
+            rel,
+            RuleReadErrorKind::NotAFile,
+            "rule path is not a regular file",
+        ));
+    }
     // Open the RESOLVED target relative to the capability. Opening `rel`
     // directly would refuse an in-workspace symlink whose target is spelled
     // absolutely (cap-std treats an absolute link as an escape), while opening

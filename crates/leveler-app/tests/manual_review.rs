@@ -1289,9 +1289,19 @@ async fn a_commit_review_cannot_read_a_later_commit_as_evidence() {
 
     let bodies = server.request_bodies().await;
     let second = &bodies[1];
+    // Windows has no per-command network-denial backend, so `git_history`
+    // refuses every query before revision-scope validation. The reviewed
+    // commit still cannot become evidence; the fixed-commit review surface is
+    // a documented Windows limitation rather than a scope bypass.
+    #[cfg(not(windows))]
     assert!(
         second.contains("outside the reviewed object's ancestry"),
         "a later commit must be refused: {second}"
+    );
+    #[cfg(windows)]
+    assert!(
+        second.contains("Windows network deny is not available"),
+        "the fixed-commit history query must fail closed on Windows: {second}"
     );
     assert!(
         !second.contains("pub fn receipt"),

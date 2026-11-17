@@ -1030,6 +1030,19 @@ fn spawn_exit_impact_read(
     });
 }
 
+/// Envelope session for one outgoing command.
+///
+/// The runtime binds an envelope to the command's own `session_id` and rejects
+/// a mismatch. Session management from the Sessions view targets stored
+/// sessions that need not be the client's current one; a command without a
+/// session (a global query) still belongs to the client's current session.
+fn delivery_session_id(command: &ClientCommand, current: &SessionId) -> SessionId {
+    command
+        .session_id()
+        .cloned()
+        .unwrap_or_else(|| current.clone())
+}
+
 /// Carry out the reducer's effects. A failed send means the runtime side is
 /// gone — surface that instead of pretending the action happened.
 #[allow(clippy::too_many_arguments)]
@@ -1067,7 +1080,13 @@ fn dispatch_effects(
                             continue;
                         }
                     };
-                let session_id = state.session_id.clone();
+                // Bind the envelope to the command's own target. The Sessions
+                // view manages stored sessions (archive/unarchive/rename/
+                // delete/fork) that need not be the client's current session;
+                // the runtime rejects an envelope whose session differs from
+                // the command target. Session-less global queries keep the
+                // client's current session.
+                let session_id = delivery_session_id(&command, &state.session_id);
                 let _ = delivery_tx.send(DeliveryJob::Command {
                     session_id,
                     command,
@@ -2387,6 +2406,54 @@ mod tests {
         assert!(
             hint.contains(&format!("leveler resume {id}\x1b[K")),
             "reopen line must clear residue after the id: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn session_management_commands_bind_the_session_they_target() {
+        let current = SessionId::new("current");
+        let target = SessionId::new("stored");
+        let commands = [
+            ClientCommand::ArchiveSession {
+                session_id: target.clone(),
+            },
+            ClientCommand::UnarchiveSession {
+                session_id: target.clone(),
+            },
+            ClientCommand::RenameSession {
+                session_id: target.clone(),
+                name: "renamed".into(),
+            },
+            ClientCommand::DeleteSession {
+                session_id: target.clone(),
+            },
+            ClientCommand::ForkSession {
+                session_id: target.clone(),
+            },
+        ];
+        for command in commands {
+            assert_eq!(
+                delivery_session_id(&command, &current).as_str(),
+                "stored",
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            delivery_session_id(&ClientCommand::RequestSessionList, &current).as_str(),
+            "current"
+        );
+        // A command that acts for the current client keeps the requester as
+        // its envelope even when it names another session to open.
+        assert_eq!(
+            delivery_session_id(
+                &ClientCommand::OpenSessionFor {
+                    requester_session_id: current.clone(),
+                    session_id: target,
+                },
+                &current
+            )
+            .as_str(),
+            "current"
         );
     }
 

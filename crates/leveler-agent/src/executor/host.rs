@@ -2932,6 +2932,17 @@ mod authorize_tests {
                 .await;
             let admitted = match admitted {
                 Ok(admitted) => admitted,
+                // Windows has no per-command network-denial backend. A
+                // run-level denial therefore cannot be frozen onto a
+                // `run_command` admission; the host refuses it instead of
+                // running with the network open. File tools and MCP keep the
+                // platform-independent assertions below/above.
+                #[cfg(windows)]
+                Err(AdmitError::Refused { reason, .. })
+                    if action.name == "run_command" && reason.contains("network") =>
+                {
+                    continue;
+                }
                 Err(AdmitError::Refused { reason, .. }) => panic!("{}: {reason}", action.name),
                 Err(AdmitError::Fatal(error)) => panic!("{error}"),
             };
