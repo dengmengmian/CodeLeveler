@@ -221,6 +221,23 @@ impl Executor {
                 call,
             });
         }
+        // A delegated child never owns the user's global scheduler. Schedules
+        // are user-global: a child that inherited `schedule_manage` could
+        // create, edit or remove automations unrelated to the task it was
+        // given, and `schedule_inspect` would expose the whole store to it.
+        // Refused structurally — before any approval path and before the Full
+        // shortcut — because this is not a question about how much authority
+        // the session has; the tool is simply not part of a child's work.
+        if self.depth > 0 && crate::child_profile::PARENT_ONLY_TOOLS.contains(&call.name.as_str()) {
+            return Err(AdmitError::Refused {
+                reason: format!(
+                    "`{}` manages user-global schedules and is available only to the \
+                     top-level agent; a delegated child cannot inspect or change them",
+                    call.name
+                ),
+                call,
+            });
+        }
         // A reviewer/investigator seat is structurally read-only: FullAccess
         // removes ASK/DENY for the user's own actions, but it must not hand a
         // manual review seat a tool the seat does not hold. Checked BEFORE
@@ -494,12 +511,47 @@ impl Executor {
             });
         }
 
+        // An MCP server is a separate process CodeLeveler launches with no OS
+        // sandbox, so a network denial cannot be applied to it. Refuse rather
+        // than run it under an authority this runtime cannot enforce — the
+        // same reasoning that keeps MCP away from a delegated agent, whose
+        // claimed write scope it also could not honour. Checked BEFORE the
+        // Full shortcut: an explicit run-level denial binds every channel,
+        // including the one Full cannot sandbox.
+        if ctx.policy.network_explicitly_denied() && call.name.starts_with("mcp__") {
+            return PolicyResolution::Deny(PolicyDenial {
+                reason: format!(
+                    "{} is unavailable while network access is denied for this run: an \
+                     MCP server is a separate process outside the sandbox, so the \
+                     denial cannot be enforced on it.",
+                    call.name
+                ),
+            });
+        }
+
         // Highest-priority product contract: Full bypasses CodeLeveler
         // permission rules, hooks, Git gates and sandbox boundaries entirely.
+        // The one retained restriction is a run-level explicit network denial
+        // the user typed: Full turns off questions and CodeLeveler-imposed
+        // confinement, not a boundary the user set for this run.
         if ctx.policy.unrestricted_execution() {
+            let network_scope = if ctx.policy.network_explicitly_denied() {
+                if !self.network_enforceable && self.registry.runs_command(&call.name) {
+                    return PolicyResolution::Deny(PolicyDenial {
+                        reason: format!(
+                            "{} cannot run with network access denied on this host: its \
+                             sandbox backend cannot enforce a network boundary",
+                            call.name
+                        ),
+                    });
+                }
+                leveler_execution::NetworkScope::None
+            } else {
+                leveler_execution::NetworkScope::Internet
+            };
             return PolicyResolution::Allow(ResolvedExecutionPolicy::new(
                 WriteScope::Unrestricted,
-                leveler_execution::NetworkScope::Internet,
+                network_scope,
                 AuthorizationEvidence::Policy {
                     profile: leveler_execution::PermissionProfile::FullAccess,
                 },
@@ -596,19 +648,6 @@ impl Executor {
                 .then(|| "修改其他执行者当前拥有的路径，需要批准本次操作".into())
             });
 
-        // An MCP server is a separate process CodeLeveler launches with no OS
-        // sandbox, so a network denial cannot be applied to it. Refuse rather
-        // than run it under an authority this runtime cannot enforce — the
-        // same reasoning that keeps MCP away from a delegated agent, whose
-        // claimed write scope it also could not honour.
-        if ctx.policy.network_explicitly_denied() && call.name.starts_with("mcp__") {
-            return deny(format!(
-                "{} is unavailable while network access is denied for this run: an \
-                 MCP server is a separate process outside the sandbox, so the \
-                 denial cannot be enforced on it.",
-                call.name
-            ));
-        }
         // The read-only overlay (`leveler plan` / plan collaboration) admits
         // Safe tools only, whatever the profile would otherwise allow. It is
         // orthogonal to the three-tier profile, so it is its own gate.
@@ -684,12 +723,14 @@ impl Executor {
                     command: None,
                     paths: Vec::new(),
                     grant: None,
+                    write_scope_expanded: false,
                 },
                 signature,
                 write,
                 network_scope: network_scope.clone(),
                 command_line: None,
                 scoped_paths: Vec::new(),
+                widens_write: false,
             }));
         }
 
@@ -907,6 +948,15 @@ impl Executor {
                 let network_allowed = network_allowed
                     || network_unenforceable
                     || (network_by_profile_default && needs_internet);
+                // A confined call may be approved so its exact action can
+                // happen. That lifts the filesystem fence only for an action
+                // that can itself write outside the workspace; a network
+                // fetch or a definition write keeps the scope admission
+                // resolved. The prompt says so explicitly.
+                let widens_write = write.root().is_some()
+                    && (self.registry.runs_command(&call.name)
+                        || self.registry.mutates_files(&call.name)
+                        || call.name.starts_with("mcp__"));
                 PolicyResolution::Ask(Box::new(PendingApproval {
                     request: ApprovalRequest {
                         id: ApprovalId::generate(),
@@ -920,6 +970,7 @@ impl Executor {
                         command: command_line.clone(),
                         paths: rule_paths,
                         grant,
+                        write_scope_expanded: widens_write,
                     },
                     signature: approval_signature(call),
                     write,
@@ -930,6 +981,7 @@ impl Executor {
                     },
                     command_line,
                     scoped_paths,
+                    widens_write,
                 }))
             }
         }
@@ -2885,8 +2937,32 @@ mod authorize_tests {
             };
             assert!(admitted.resolved().unrestricted_execution());
             assert_eq!(admitted.resolved().write, WriteScope::Unrestricted);
-            assert_eq!(admitted.resolved().network_scope, NetworkScope::Internet);
+            // Full removes questions and CodeLeveler-imposed confinement, but
+            // a run-level `--deny-network` the user typed still binds. The OS
+            // wrapper is required for that network-only denial.
+            assert_eq!(admitted.resolved().network_scope, NetworkScope::None);
+            assert!(
+                !admitted.resolved().full_execution(),
+                "a frozen network denial needs the confinement wrapper"
+            );
         }
+        // An MCP server is a separate process outside the sandbox. Full cannot
+        // enforce the denial on it, so the call is refused rather than run open.
+        let mcp = call("mcp__srv__fetch", serde_json::json!({}));
+        assert!(
+            matches!(
+                exec.admit(
+                    mcp,
+                    exec.tool_context.clone(),
+                    false,
+                    &mut HashSet::new(),
+                    &CancellationToken::new(),
+                )
+                .await,
+                Err(AdmitError::Refused { .. })
+            ),
+            "Full + --deny-network must refuse an unsandboxable MCP server"
+        );
         assert_eq!(approver.asks(), 0);
     }
 
@@ -3737,6 +3813,23 @@ mod authorize_tests {
         ) -> Result<(), leveler_storage::StorageError> {
             self.writes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(leveler_storage::StorageError::InvalidData(
+                "synthetic unavailable grant store".into(),
+            ))
+        }
+
+        async fn list(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Vec<leveler_storage::StoredResourceGrant>, leveler_storage::StorageError>
+        {
+            Err(leveler_storage::StorageError::InvalidData(
+                "synthetic unavailable grant store".into(),
+            ))
+        }
+
+        async fn revoke(&self, _: &str, _: &str) -> Result<bool, leveler_storage::StorageError> {
             Err(leveler_storage::StorageError::InvalidData(
                 "synthetic unavailable grant store".into(),
             ))

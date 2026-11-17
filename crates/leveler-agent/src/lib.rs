@@ -13,6 +13,7 @@
 
 pub mod agent_registry;
 mod authorization;
+mod budget;
 pub mod capability;
 mod child_profile;
 pub mod coding;

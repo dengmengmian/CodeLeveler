@@ -306,6 +306,10 @@ pub(crate) struct Drive<'a> {
     /// completions with no executable verification. Read by the engine and
     /// persisted on `TaskFinished.warnings`.
     completion_warnings: Vec<String>,
+    /// The in-flight shared-budget hold for the attempt currently being sent.
+    /// Taken before the physical send and settled only after the request row
+    /// is durable (or kept when it cannot be written).
+    budget_reservation: Option<crate::budget::BudgetReservation>,
     /// Whether a clarification tool was actually invoked in this turn. It
     /// decides whether a structured `blocked_kind: "user_decision"` arrived
     /// without the interaction it claims to need. Never inferred from text.
@@ -1186,6 +1190,7 @@ impl Executor {
             registration_refused: false,
             registration_nudged: false,
             completion_warnings: Vec::new(),
+            budget_reservation: None,
             asked_user_this_turn: false,
             work_since_user_ask: false,
             user_decision_repair_issued: false,
@@ -3924,7 +3929,11 @@ impl AgentHarness for Drive<'_> {
             output,
             self.executor.pricing.as_ref(),
         )?;
-        self.executor.check_shared_model_budget(input, output).await
+        self.budget_reservation = self
+            .executor
+            .check_shared_model_budget(input, output)
+            .await?;
+        Ok(())
     }
 
     async fn on_model_attempt(
@@ -3947,7 +3956,19 @@ impl AgentHarness for Drive<'_> {
         // reconstructing the request offline.
         record.projected_reasoning_tokens = self.last_projected_reasoning_tokens;
         self.progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
-        self.persist_request(record).await?;
+        let reservation = self.budget_reservation.take();
+        if let Err(error) = self.persist_request(record).await {
+            // The provider spend happened but its durable row did not. Keep
+            // the hold: releasing it would let the next admission forget real
+            // spend, and this turn is failing anyway.
+            if let Some(reservation) = reservation {
+                reservation.hold();
+            }
+            return Err(error);
+        }
+        if let Some(reservation) = reservation {
+            reservation.release().await;
+        }
         if let Some(text) = &attempt.partial_text {
             // Only the text already shown to the user is recoverable here.
             // Do not turn incomplete tool arguments or reasoning into replay

@@ -405,6 +405,7 @@ mod tests {
                     },
                 }],
             }),
+            write_scope_expanded: false,
         };
         assert_eq!(
             approver.decide(&request).await,

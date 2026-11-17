@@ -239,6 +239,7 @@ mod tests {
                 command: None,
                 paths: Vec::new(),
                 grant: None,
+                write_scope_expanded: false,
             };
             assert!(
                 tokio::time::timeout(
@@ -313,6 +314,7 @@ mod tests {
                 command: None,
                 paths: Vec::new(),
                 grant: None,
+                write_scope_expanded: false,
             };
             let task = tokio::spawn(async move { CliApprover.decide(&request).await });
             // This is a shutdown timing test: let the OS input read begin.
@@ -382,6 +384,7 @@ mod tests {
                     },
                 }],
             }),
+            write_scope_expanded: false,
         };
         let details = request_details(&request);
         assert!(details.contains("push origin"), "{details}");
@@ -424,6 +427,7 @@ mod tests {
             description: "Unrestricted filesystem · git add taskbox/ · reason: local commit".into(),
             command: None,
             paths: Vec::new(),
+            write_scope_expanded: false,
         };
         let details = request_details(&request);
         assert!(details.contains(&request.description), "{details}");

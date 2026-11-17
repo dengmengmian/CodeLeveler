@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use leveler_tools::ToolRegistry;
 
+/// Tools that act on user-global state outside this session and therefore
+/// belong to the top-level agent only.
+///
+/// Schedules are user-global (one store for every project and session). A
+/// delegated child that inherited `schedule_manage` could create, edit or
+/// remove automations the user never attached to this task, and read the whole
+/// schedule store through `schedule_inspect`. Neither is part of the work the
+/// parent delegated, so both are removed from every child class and refused at
+/// admission even when the session profile is Full.
+pub(crate) const PARENT_ONLY_TOOLS: &[&str] = &["schedule_inspect", "schedule_manage"];
+
 /// A sub-agent's role: its toolset and how it is prompted. Delegation is
 /// CC-style star topology — the parent spawns focused workers/explorers and
 /// collects their reports; sub-agents don't talk to each other.
@@ -217,6 +228,7 @@ impl ChildProfile {
         class
             .without_named(crate::agent_registry::AUTHORING_TOOLS)
             .without_named(leveler_tools::tools::SKILL_AUTHORING_TOOLS)
+            .without_named(PARENT_ONLY_TOOLS)
     }
 
     /// The unnamed child `spawn_agent(task)` has always produced.
@@ -716,5 +728,65 @@ mod tests {
             assert_eq!(p.budget_policy.max_duration_secs, CHILD_MAX_DURATION_SECS);
             assert!(p.budget_policy.inherits_residual);
         }
+    }
+
+    /// Schedules belong to the user, not to the task a child was delegated.
+    /// A child that inherited `schedule_manage` could edit or delete unrelated
+    /// automations; the projection must physically remove both scheduler tools
+    /// from every child class.
+    #[test]
+    fn no_delegated_child_holds_the_users_global_scheduler() {
+        struct NamedTool(&'static str);
+
+        #[async_trait::async_trait]
+        impl leveler_tools::Tool for NamedTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "test tool"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn risk(&self) -> leveler_execution::RiskLevel {
+                leveler_execution::RiskLevel::Safe
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: leveler_tools::ToolContext,
+                _cancellation: tokio_util::sync::CancellationToken,
+            ) -> Result<leveler_tools::tool::ToolOutput, leveler_tools::ToolError> {
+                Err(leveler_tools::tool::ToolError::NotFound(
+                    "test tool does not execute".into(),
+                ))
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        for name in ["schedule_inspect", "schedule_manage", "read_file"] {
+            registry.register(std::sync::Arc::new(NamedTool(name)));
+        }
+        for role in [
+            AgentRole::Default,
+            AgentRole::Explorer,
+            AgentRole::Worker,
+            AgentRole::Reviewer,
+            AgentRole::Investigator,
+        ] {
+            let projected = ChildProfile::resolve(role).apply_to_registry(&registry);
+            for name in PARENT_ONLY_TOOLS {
+                assert!(
+                    projected.get(name).is_none(),
+                    "{role:?} must not hold the parent-only tool {name}"
+                );
+            }
+        }
+        let top_level = ChildProfile::default_profile().apply_to_registry(&registry);
+        assert!(
+            top_level.get("read_file").is_some(),
+            "the projection only removes parent-only tools"
+        );
     }
 }

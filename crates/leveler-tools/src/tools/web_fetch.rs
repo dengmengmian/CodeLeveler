@@ -377,36 +377,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_access_tool_fetches_localhost_despite_explicit_network_denial() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = [0u8; 1024];
-            assert!(stream.read(&mut bytes).await.unwrap() > 0);
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .await
-                .unwrap();
-        });
+    async fn full_access_still_honours_an_explicit_run_level_network_denial() {
         let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
         let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess)
             .with_sandbox(true);
         let output = WebFetchTool
             .execute(
-                serde_json::json!({"url": format!("http://localhost:{}/health", address.port())}),
+                serde_json::json!({"url": "http://localhost:1/health"}),
                 ctx.clone(),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
-        if output.is_error {
-            server.abort();
-        }
-        assert!(!output.is_error, "{}", output.content);
-        assert!(output.content.ends_with("ok"));
-        server.await.unwrap();
+        assert!(
+            output.is_error,
+            "an explicit --deny-network must survive Full: {}",
+            output.content
+        );
+        assert!(output.content.contains("禁用网络"), "{}", output.content);
     }
 
     #[tokio::test]

@@ -72,14 +72,15 @@ impl ResolvedExecutionPolicy {
     /// Exact-call consent is deliberately NOT this: it may lift the write fence
     /// for the approved effect, but the process still runs under the frozen
     /// network boundary. The OS backend uses this to decide whether to skip its
-    /// wrapper entirely.
+    /// wrapper entirely. A frozen `None` is an explicit run-level network
+    /// denial, so even Full needs the network-only wrapper in that case.
     pub fn full_execution(&self) -> bool {
         matches!(
             self.authorization,
             AuthorizationEvidence::Policy {
                 profile: PermissionProfile::FullAccess
             }
-        )
+        ) && matches!(self.network_scope, NetworkScope::Internet)
     }
 
     /// Frozen bindings matched by admission for this action only.
@@ -135,16 +136,31 @@ pub struct PendingApproval {
     pub command_line: Option<String>,
     /// Paths the call touches, for a durable "always" rule.
     pub scoped_paths: Vec<String>,
+    /// Whether approving this call lifts the workspace write fence.
+    ///
+    /// Only an action that can itself write (a command, a file mutation, an
+    /// unsandboxed MCP server) needs the fence lifted. Approving a network
+    /// fetch, a native action or a definition write is consent to that exact
+    /// action, not a grant of arbitrary filesystem writes. When false the
+    /// admitted call keeps the scope it was resolved under even though the
+    /// authorization evidence is `ApprovedOnce`.
+    pub widens_write: bool,
 }
 
 impl PendingApproval {
     /// The policy this call runs under once `evidence` says it may.
     pub fn allowed(&self, authorization: AuthorizationEvidence) -> ResolvedExecutionPolicy {
-        ResolvedExecutionPolicy::new(
+        let mut policy = ResolvedExecutionPolicy::new(
             self.write.clone(),
             self.network_scope.clone(),
             authorization,
-        )
+        );
+        if !self.widens_write {
+            // Consent to this call is not consent to the filesystem. Keep the
+            // scope admission already resolved.
+            policy.write = self.write.clone();
+        }
+        policy
     }
 }
 
@@ -266,5 +282,68 @@ mod resource_grant_tests {
             AuthorizationEvidence::ApprovedOnce,
         );
         assert_eq!(policy.network_scope, NetworkScope::Internet);
+    }
+
+    fn pending(widens_write: bool) -> PendingApproval {
+        PendingApproval {
+            request: ApprovalRequest {
+                id: leveler_core::ApprovalId::new("approval-a"),
+                turn_id: None,
+                call_id: "call-a".into(),
+                agent_id: None,
+                action_fingerprint: "fp".into(),
+                tool: "web_fetch".into(),
+                risk: crate::risk::RiskLevel::Network,
+                description: String::new(),
+                command: None,
+                paths: Vec::new(),
+                grant: None,
+                write_scope_expanded: widens_write,
+            },
+            signature: "sig".into(),
+            write: workspace(),
+            network_scope: NetworkScope::Loopback,
+            command_line: None,
+            scoped_paths: Vec::new(),
+            widens_write,
+        }
+    }
+
+    /// Consent to a network fetch is not consent to the filesystem. Only an
+    /// action that can itself write outside the workspace needs the fence
+    /// lifted; everything else keeps the scope admission resolved.
+    #[test]
+    fn exact_call_consent_lifts_the_write_fence_only_for_a_writing_action() {
+        let read_only = pending(false).allowed(AuthorizationEvidence::ApprovedOnce);
+        assert_eq!(read_only.write, workspace());
+        assert_eq!(read_only.network_scope, NetworkScope::Loopback);
+
+        let writer = pending(true).allowed(AuthorizationEvidence::ApprovedOnce);
+        assert_eq!(writer.write, WriteScope::Unrestricted);
+    }
+
+    /// Full skips the wrapper only when it is also allowed to reach the
+    /// network. A frozen `None` is the user's explicit run-level denial: the
+    /// process still needs the network-only confinement wrapper, so the OS
+    /// backend must not treat this call as "no confinement".
+    #[test]
+    fn full_execution_requires_an_open_network_destination() {
+        let open = ResolvedExecutionPolicy::new(
+            WriteScope::Unrestricted,
+            NetworkScope::Internet,
+            AuthorizationEvidence::Policy {
+                profile: PermissionProfile::FullAccess,
+            },
+        );
+        assert!(open.full_execution());
+
+        let denied = ResolvedExecutionPolicy::new(
+            WriteScope::Unrestricted,
+            NetworkScope::None,
+            AuthorizationEvidence::Policy {
+                profile: PermissionProfile::FullAccess,
+            },
+        );
+        assert!(!denied.full_execution());
     }
 }

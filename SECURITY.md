@@ -130,6 +130,37 @@ oversights. Reports that only restate them will be closed as known.
   classification and approval prompts live in the executor layer
   (`leveler-execution` / `leveler-agent`). Embedding the tool registry without
   that layer means no `rm -rf` / `sudo` gate — only the OS sandbox applies.
+- **Hardlink aliases defeat a path-based write fence.** The OS fences confine
+  *paths*, not inodes. On macOS the sandbox refuses to create a hardlink to a
+  file outside the workspace, but an alias that already exists (created before
+  confinement, by a Full session, or by the user) can be written through and
+  changes the outside inode. Linux and Windows behavior is not verified on a
+  real host. The file tools reject hardlink aliases; the shell path model does
+  not claim inode identity. Do not place hostile pre-existing links in a
+  workspace you point an agent at.
+- **Desktop automation is not network-confined.** `computer_act` drives the
+  user's applications outside the process sandbox, so `--deny-network` cannot
+  bound an app it launches. The action still needs per-call approval in
+  restricted modes; this is a product boundary, not a shell/HTTP path.
+- **Tool output artifacts are bounded and redacted, not encrypted.** Large
+  tool results are stored under the state directory's `artifacts/` as
+  content-addressed files; secret values are redacted before writing and the
+  directory is swept to a 512 MiB quota (oldest first). A swept artifact is
+  reported as unavailable rather than silently replaced. A local process that
+  can read the state directory can read retained non-secret output.
+
+## Resource grants
+
+Session- and project-scoped resource grants (exact capability + resource
+identity) are listed and revoked from the CLI:
+
+```
+leveler permissions grants [--session <id>] [--json]
+leveler permissions revoke-grant <id>
+```
+
+Revocation is project-scoped by handle. An already-admitted call keeps its
+frozen policy; the next admission no longer matches the revoked grant.
 
 ## Supported versions
 

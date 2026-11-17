@@ -247,12 +247,15 @@ impl ToolPolicy {
         if let Some(resolved) = &self.resolved {
             return resolved.network_scope.clone();
         }
+        // An explicit run-level denial is the user's own restriction; Full
+        // does not undo it. A network grant remains the only way to lift it.
+        if self.network_explicitly_denied() {
+            return NetworkScope::None;
+        }
         if self.unrestricted_execution() {
             return NetworkScope::Internet;
         }
-        if self.network_explicitly_denied() {
-            NetworkScope::None
-        } else if self.network_granted || self.mode().network_by_default() {
+        if self.network_granted || self.mode().network_by_default() {
             NetworkScope::Internet
         } else {
             NetworkScope::Loopback
@@ -264,7 +267,7 @@ impl ToolPolicy {
     /// (an MCP server) is refused under an explicit denial; under the profile
     /// default it goes to the user like any other network use.
     pub fn network_explicitly_denied(&self) -> bool {
-        !self.unrestricted_execution() && self.deny_network && !self.network_granted
+        self.deny_network && !self.network_granted
     }
 
     /// The frozen per-call policy, when this context belongs to an admitted
@@ -977,8 +980,10 @@ mod write_scope_tests {
     }
 
     /// The network half of the profile: request-approval runs commands with
-    /// the network denied until a grant; the others allow; an explicit
-    /// `--deny-network` is bypassed by Full.
+    /// the network denied until a grant; the others allow. An explicit
+    /// `--deny-network` is a run-level restriction the user typed, so it
+    /// survives Full: choosing Full means "do not ask me", not "undo the
+    /// restriction I just set".
     #[test]
     fn the_effective_network_follows_the_live_profile_and_grants() {
         let (c, _d) = ctx(PermissionProfile::RequestApproval);
@@ -1005,10 +1010,10 @@ mod write_scope_tests {
         let (c, _d) = ctx(PermissionProfile::FullAccess);
         let c = c.with_sandbox(true);
         assert!(
-            !c.policy.network_denied(),
-            "Full bypasses explicit sandbox settings"
+            c.policy.network_denied(),
+            "an explicit run-level denial survives Full"
         );
-        assert!(!c.policy.network_explicitly_denied());
+        assert!(c.policy.network_explicitly_denied());
         let mut c = c;
         c.policy.grant_network();
         assert!(

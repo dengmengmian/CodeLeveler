@@ -17,14 +17,33 @@ pub struct ArtifactRef {
 
 /// A content-addressed text-artifact store rooted at a directory (kept OUTSIDE
 /// the workspace so artifacts never pollute the repo or verification scope).
+///
+/// The store is bounded: writing a new artifact sweeps the oldest files once
+/// the directory exceeds `max_bytes`. A reference to a swept file is honestly
+/// unavailable rather than silently pointing at different bytes (dedup means a
+/// surviving file never changes content).
 #[derive(Debug, Clone)]
 pub struct ArtifactStore {
     root: PathBuf,
+    max_bytes: u64,
 }
+
+/// 512 MiB. Large enough for a long session's paged command output, small
+/// enough that it cannot silently consume a disk.
+pub const DEFAULT_ARTIFACT_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
 
 impl ArtifactStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            max_bytes: DEFAULT_ARTIFACT_QUOTA_BYTES,
+        }
+    }
+
+    /// Set the directory quota (bytes). 0 disables cleanup and is refused.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes.max(1);
+        self
     }
 
     /// Write `content` to a content-addressed file (`<sha256>.txt`). Identical
@@ -45,11 +64,59 @@ impl ArtifactStore {
         if !path.exists() {
             std::fs::write(&path, &content)?;
         }
+        self.sweep(&path);
         Ok(ArtifactRef {
             path,
             sha256,
             size_bytes: content.len(),
         })
+    }
+
+    /// Delete oldest artifacts until the directory fits the quota.
+    ///
+    /// Best-effort by design: a failed delete leaves the directory over quota
+    /// rather than failing the tool call whose output was already produced.
+    /// The file just written is never a deletion candidate — the caller holds a
+    /// live reference to it.
+    fn sweep(&self, keep: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() || path == keep {
+                total = total.saturating_add(meta.len());
+                continue;
+            }
+            total = total.saturating_add(meta.len());
+            files.push((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta.len(),
+                path,
+            ));
+        }
+        if total <= self.max_bytes {
+            return;
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+        for (_, size, path) in files {
+            if total <= self.max_bytes {
+                break;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => total = total.saturating_sub(size),
+                Err(error) => tracing::debug!(
+                    %error,
+                    path = %path.display(),
+                    "artifact quota sweep could not remove a file"
+                ),
+            }
+        }
     }
 }
 
@@ -91,6 +158,36 @@ mod tests {
         assert_eq!(art.size_bytes, 100_000);
         assert!(art.path.starts_with(&root));
         assert_eq!(std::fs::read_to_string(&art.path).unwrap(), content);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The store is bounded: once the quota is exceeded the oldest files are
+    /// removed, and the newly written artifact (the caller's live reference)
+    /// always survives. A swept reference is honestly missing, never a
+    /// different file with the same name.
+    #[test]
+    fn the_artifact_quota_sweeps_oldest_files_but_keeps_the_new_one() {
+        let root = tmp();
+        let store = ArtifactStore::new(&root).with_max_bytes(120);
+        let first = store.write_text(&"a".repeat(60)).unwrap();
+        let second = store.write_text(&"b".repeat(60)).unwrap();
+        let third = store.write_text(&"c".repeat(60)).unwrap();
+        assert!(
+            third.path.is_file(),
+            "the newly written artifact is never a sweep candidate"
+        );
+        assert!(second.path.is_file());
+        assert!(
+            !first.path.is_file(),
+            "the oldest artifact is removed to stay within the quota"
+        );
+        let total: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|meta| meta.len())
+            .sum();
+        assert!(total <= 120, "quota exceeded: {total}");
         std::fs::remove_dir_all(&root).ok();
     }
 

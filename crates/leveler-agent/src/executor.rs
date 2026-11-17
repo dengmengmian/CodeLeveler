@@ -1041,7 +1041,7 @@ pub fn auxiliary_budget_available(
         })
 }
 
-fn model_request_budget_check(
+pub(crate) fn model_request_budget_check(
     limits: StepLimits,
     progress: &ProgressLedger,
     input: u64,
@@ -1713,6 +1713,10 @@ pub struct Executor {
         Arc<dyn leveler_storage::ModelRequestStore>,
         leveler_core::SessionId,
     )>,
+    /// In-flight holds for the shared model budget of this runtime. A child
+    /// shares the parent's cell, so a delegated request cannot slip past an
+    /// admission its parent just reserved.
+    budget_reservations: Arc<crate::budget::BudgetReservations>,
     /// Durable-checkpoint port for context compaction (long-goal P3).
     /// `None` = no durable host; folds keep their pre-checkpoint behavior.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
@@ -1840,6 +1844,7 @@ impl Executor {
             ),
             event_barrier: None,
             model_request_store: None,
+            budget_reservations: Arc::new(crate::budget::BudgetReservations::default()),
             compaction_checkpoint: None,
             execution_fence: None,
             goal_binder: None,
@@ -2570,6 +2575,7 @@ impl Executor {
             // parent one. `agent_id` is stamped by the spawn handler.
             event_barrier: self.event_barrier.clone(),
             model_request_store: self.model_request_store.clone(),
+            budget_reservations: self.budget_reservations.clone(),
             // Children never cut goal checkpoints: the goal belongs to the
             // parent loop, and a child fold summarizing its own scratch
             // context must not write the goal's continuity record.
@@ -3243,26 +3249,36 @@ impl Executor {
         .map_err(|error| AgentError::Persistence(error.to_string()))
     }
 
-    /// Check settled invocation facts immediately before each physical send,
-    /// including retries.
+    /// Check settled invocation facts and take an in-flight hold immediately
+    /// before each physical send, including retries.
     ///
-    /// This is bounded admission, not an atomic ledger reservation: requests
-    /// already in flight when this one is admitted have not settled yet, so
-    /// two concurrent calls can both pass against the same balance. Each call
-    /// reserves its own worst case (estimated input + declared output), which
-    /// bounds the overshoot to `settled + N * per-request estimate`. Actual
-    /// provider usage settles the ledger and the next send sees it.
-    async fn check_shared_model_budget(&self, input: u64, output: u64) -> Result<(), AgentError> {
-        let Some(progress) = self.shared_model_progress().await? else {
-            return Ok(());
+    /// The durable rows remain the source of truth for settled spend. The hold
+    /// closes the all-settled admission window: concurrent requests for the
+    /// same budget scope each count their own worst case (estimated input +
+    /// declared output), and an admission cannot read a balance that has
+    /// already forgotten a request still in flight. The caller settles the
+    /// hold after its request row is durable.
+    async fn check_shared_model_budget(
+        &self,
+        input: u64,
+        output: u64,
+    ) -> Result<Option<crate::budget::BudgetReservation>, AgentError> {
+        let (Some((_, session)), Some(scope)) =
+            (&self.model_request_store, self.model_budget_scope())
+        else {
+            return Ok(None);
         };
-        model_request_budget_check(
-            self.task_model_limits,
-            &progress,
-            input,
-            output,
-            self.pricing.as_ref(),
-        )
+        let key = format!("{}:{scope}", session.as_str());
+        self.budget_reservations
+            .admit(
+                &key,
+                self.shared_model_progress(),
+                self.task_model_limits,
+                input,
+                output,
+                self.pricing.as_ref(),
+            )
+            .await
     }
 
     pub fn with_model_request_store(

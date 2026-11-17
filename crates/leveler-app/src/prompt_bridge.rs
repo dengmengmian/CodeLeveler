@@ -436,6 +436,11 @@ fn consent_bullets(request: &ApprovalRequest) -> Vec<String> {
             bullets.extend(effect_lines(binding));
         }
     }
+    if request.write_scope_expanded {
+        // The approval is about to lift a fence the user may not know exists.
+        // Say it in the prompt, not only in the source.
+        bullets.push("批准后本次执行不受工作区写入围栏限制（可写入任意路径）".to_string());
+    }
     bullets
 }
 
@@ -589,6 +594,23 @@ mod tests {
         assert!(!projected.project_available());
     }
 
+    /// An approval that lifts the workspace write fence must say so. A person
+    /// consents to the action they were shown, not to an unstated filesystem
+    /// boundary change.
+    #[test]
+    fn an_approval_that_widens_the_write_fence_says_so() {
+        let mut request = approval_request();
+        request.risk = RiskLevel::Safe;
+        request.write_scope_expanded = true;
+        assert_eq!(
+            consent_bullets(&request),
+            vec!["批准后本次执行不受工作区写入围栏限制（可写入任意路径）".to_string()]
+        );
+
+        request.write_scope_expanded = false;
+        assert!(consent_bullets(&request).is_empty());
+    }
+
     /// A prompt with no resolved resource shows the risk level and the paths,
     /// and nothing only the engine can read.
     #[test]
@@ -735,6 +757,7 @@ mod tests {
             description: "dangerous".to_string(),
             command: Some("rm file".to_string()),
             paths: Vec::new(),
+            write_scope_expanded: false,
         }
     }
 

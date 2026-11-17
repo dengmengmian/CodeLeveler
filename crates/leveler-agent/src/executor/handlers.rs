@@ -392,6 +392,9 @@ impl Executor {
                 description,
                 command: Some(action.to_string()),
                 paths: Vec::new(),
+                // The description already names the filesystem grant this
+                // request asks for; a second generic bullet would repeat it.
+                write_scope_expanded: false,
             };
             // Through the host's one ask path (PR 5): the reviewer, the human, and
             // the human-vs-headless distinction mean the same here as for a tool
@@ -402,6 +405,7 @@ impl Executor {
                 network_scope: self.tool_context.policy.network_scope(),
                 command_line: Some(action.to_string()),
                 scoped_paths: Vec::new(),
+                widens_write: grants.unrestricted_fs,
                 request,
             };
             match self.ask(&pending, None, None, cancellation).await {

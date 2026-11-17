@@ -95,6 +95,7 @@
 本节定义 CodeLeveler 产品权限实现的顶层契约，具体 Owner、机制和平台支持限制结合相关源码和测试确认；开发代理操作仍遵守“任务与授权”。
 
 - **Full**（`FullAccess`）：完全放开。CodeLeveler MUST NOT ASK、DENY 或施加权限 / sandbox 限制；文件、外部路径、HOME、凭据、Git remote、网络、进程控制及已实现的未来能力均适用，不得逐项补 allow。审批次数必须为 0。
+  - 显式 `--deny-network` 是运行级限制，Full 不撤销；后端无法强制时明确失败。
 - **Auto**（`Assisted`）：普通开发动作默认允许；危险、高风险、敏感凭据或控制其他任务的动作在 admission ASK。批准冻结在本次明确动作上，执行层不再次拒绝同一动作，也不扩大到之后未批准的调用。
 - **Restricted**（`RequestApproval`）：使用目的地和资源边界；无法可靠 enforce 的范围明确 ASK / DENY / Unsupported，永不静默扩权。
 - Full 优先于 NetworkScope、Resource Grant、Credential Broker、Git Effect、进程所有权、只读权限 overlay 与 capability permission。能力不存在、参数无效、OS / 程序 / 外部服务失败仍如实失败；取消、超时、日志持久化和资源回收仍归 Runtime。

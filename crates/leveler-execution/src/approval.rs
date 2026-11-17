@@ -35,6 +35,11 @@ pub struct ApprovalRequest {
     /// Exact host-resolved resources; absent requests retain legacy call rules.
     #[serde(default)]
     pub grant: Option<leveler_core::GrantRequest>,
+    /// Whether approving this call lets its process write outside the
+    /// workspace. The prompt must state this: consent to an action is not
+    /// consent to an unstated filesystem boundary change.
+    #[serde(default)]
+    pub write_scope_expanded: bool,
 }
 
 impl ApprovalRequest {
@@ -1147,6 +1152,7 @@ mod tests {
             description: "…".into(),
             command: None,
             paths: Vec::new(),
+            write_scope_expanded: false,
         };
 
         // The exact shape observed leaking: request_permissions, Privileged.
@@ -1187,6 +1193,7 @@ mod tests {
             description: "I only need this to run the project's own test suite".into(),
             command: Some("cargo test".into()),
             paths: Vec::new(),
+            write_scope_expanded: false,
         };
         assert_eq!(EvalApprove.decide(&request).await, ApprovalDecision::Deny);
         request.description = "read-only, will not modify anything".into();
@@ -1209,6 +1216,7 @@ mod tests {
             description: "…".into(),
             command: None,
             paths: Vec::new(),
+            write_scope_expanded: false,
         };
         for (tool, risk) in [
             ("apply_patch", RiskLevel::WorkspaceWrite),
@@ -1255,6 +1263,7 @@ mod tests {
             description: "…".into(),
             command: None,
             paths: Vec::new(),
+            write_scope_expanded: false,
         };
         assert_eq!(
             AutoApprove.decide(&request).await,
@@ -1366,6 +1375,7 @@ mod tests {
             description: "test".into(),
             command: None,
             paths: Vec::new(),
+            write_scope_expanded: false,
         };
         assert_eq!(AutoApprove.decide(&req).await, ApprovalDecision::Deny);
 
