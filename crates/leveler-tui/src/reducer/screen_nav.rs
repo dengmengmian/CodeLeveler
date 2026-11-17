@@ -782,6 +782,12 @@ pub(super) fn open_diff_screen(state: &mut AppState) -> Vec<Effect> {
     }
     state.active_screen = Screen::Diff;
     state.diff_selected = 0;
+    if !state.runtime_connected {
+        state.diff = None;
+        state.diff_pending = false;
+        state.diff_error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     // The previous diff may belong to another moment; do not show it as the
     // answer while the fresh one is computed.
     state.diff = None;
@@ -814,6 +820,11 @@ pub(super) fn open_trace(
     state.screen_scroll = 0;
     state.trace.inspect = false;
     state.trace.selected = 0;
+    state.trace.error = None;
+    if !state.runtime_connected {
+        state.trace.error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     vec![Effect::Send(crate::observability::issue_query(
         &mut state.trace,
         session_id,
@@ -845,6 +856,11 @@ pub(crate) fn open_stats(
     state.stats_reveal = Some(section);
     state.screen_scroll = 0;
     state.context.selected = 0;
+    state.stats_error = None;
+    if !state.runtime_connected {
+        state.stats_error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     // One page, two sections: BOTH are asked for, whichever section the entry
     // point reveals. Opening `/context` must not leave the Usage section
     // pretending to wait for an answer nobody requested.
@@ -894,6 +910,13 @@ pub(super) fn open_sessions_screen(state: &mut AppState) -> Vec<Effect> {
     }
     state.active_screen = Screen::Sessions;
     state.sessions_selected = 0;
+    if !state.runtime_connected {
+        state.sessions_loading = false;
+        state.sessions_error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
+    state.sessions_loading = true;
+    state.sessions_error = None;
     vec![Effect::Send(ClientCommand::RequestSessionListFor {
         requester_session_id: state.session_id.clone(),
     })]

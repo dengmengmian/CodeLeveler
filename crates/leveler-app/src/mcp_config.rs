@@ -100,8 +100,13 @@ pub fn config_path() -> Result<PathBuf, McpConfigError> {
 
 fn document_at(path: &std::path::Path) -> Result<DocumentMut, McpConfigError> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
-    text.parse::<DocumentMut>()
-        .map_err(|e| McpConfigError::Parse(e.to_string()))
+    text.parse::<DocumentMut>().map_err(|error| {
+        McpConfigError::Parse(crate::global_config::safe_toml_parse_error(
+            &text,
+            error.message(),
+            error.span(),
+        ))
+    })
 }
 
 /// List configured MCP servers.
@@ -841,6 +846,31 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, McpConfigError::SecretValue { .. }));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_config_error_does_not_echo_a_secret_value() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-mcpcfg-parse-secret-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let secret = "sk-e2e-malformed-config-secret";
+        // The value is on the broken line. A parser that quotes the source
+        // line would put it into the error a client shows.
+        std::fs::write(
+            &cfg,
+            format!("[[mcp_servers]]\nname = \"broken\"\nenv = {{ API_KEY = \"{secret}\" \n"),
+        )
+        .unwrap();
+        let error = list_at(&cfg).expect_err("the config is malformed");
+        assert!(
+            !error.to_string().contains(secret),
+            "parse error leaked the value: {error}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -490,11 +490,7 @@ pub async fn run(
                     }
                     Err(RecvError::Closed) => {
                         events_open = false;
-                        state.runtime_connected = false;
-                        state.notification = Some(Notification {
-                            level: NotificationLevel::Error,
-                            message: state.t().connection_lost.to_string(),
-                        });
+                        note_disconnected(&mut state);
                         pending_runtime_paint = true;
                     }
                 },
@@ -1030,6 +1026,58 @@ fn spawn_exit_impact_read(
     });
 }
 
+/// Mark every runtime-owned read as no longer in flight. Without this a
+/// disconnect leaves pages spinning on a latch that only a matching answer
+/// could clear, and a form latched on "saving" with no way to Escape.
+fn note_disconnected(state: &mut AppState) {
+    let message = state.t().connection_lost.to_string();
+    state.runtime_connected = false;
+    state.sessions_loading = false;
+    state.sessions_error = Some(message.clone());
+    state.sessions.clear();
+    state.all_sessions.clear();
+    state.diff = None;
+    state.diff_pending = false;
+    state.diff_error = Some(message.clone());
+    state.stats_error = Some(message.clone());
+    state.context.loaded = None;
+    state.usage.loaded = None;
+    state.trace.loaded = None;
+    state.trace.error = Some(message.clone());
+    state.context.track.reset();
+    state.usage.track.reset();
+    state.trace.track.reset();
+    state.memory.status = None;
+    state.memory.preview = None;
+    state.memory.status_query = None;
+    state.memory.preview_query = None;
+    state.memory.action_query = None;
+    state.memory.preview_loading = false;
+    if state.active_screen == Screen::Memory {
+        state.memory.error = Some(message.clone());
+    }
+    state.foreign_sessions.loading = false;
+    state.foreign_sessions.importing = false;
+    state.foreign_sessions.sessions.clear();
+    if state.foreign_sessions.error.is_none() {
+        state.foreign_sessions.error = Some(message.clone());
+    }
+    match state.active_screen {
+        Screen::Mcp => crate::mcp::observe_command_failure(state, Some(&message)),
+        Screen::Schedules => crate::schedules::observe_command_failure(state, Some(&message)),
+        Screen::Settings => {
+            state.settings.query = None;
+            state.settings.query_started = None;
+            state.settings.error = Some(message.clone());
+        }
+        _ => {}
+    }
+    state.notification = Some(Notification {
+        level: NotificationLevel::Error,
+        message,
+    });
+}
+
 /// Carry out the reducer's effects. A failed send means the runtime side is
 /// gone — surface that instead of pretending the action happened.
 #[allow(clippy::too_many_arguments)]
@@ -1050,10 +1098,7 @@ fn dispatch_effects(
         match effect {
             Effect::Send(command) => {
                 if !state.runtime_connected {
-                    state.notification = Some(Notification {
-                        level: NotificationLevel::Error,
-                        message: state.t().connection_lost.to_string(),
-                    });
+                    note_disconnected(state);
                     continue;
                 }
                 let expected_version =

@@ -485,7 +485,17 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
             .replacen("{}", state.sessions_filter.label(t), 1),
         Style::default().fg(theme.text.secondary),
     )));
-    if state.sessions.is_empty() {
+    if let Some(error) = &state.sessions_error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(theme.status.error),
+        )));
+    } else if state.sessions_loading {
+        lines.push(Line::from(Span::styled(
+            t.sessions_loading,
+            Style::default().fg(theme.text.secondary),
+        )));
+    } else if state.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             t.sessions_empty,
             Style::default().fg(theme.text.secondary),

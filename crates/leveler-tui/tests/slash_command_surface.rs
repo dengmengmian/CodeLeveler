@@ -119,7 +119,26 @@ fn every_idle_only_command_refuses_while_busy() {
             "{} opened an overlay while busy",
             def.name
         );
+        assert_eq!(
+            state.composer.text(),
+            def.name,
+            "{} ate the typed command on a busy refusal",
+            def.name
+        );
     }
+}
+
+#[test]
+fn sessions_while_disconnected_do_not_claim_an_empty_inventory() {
+    let mut state = state();
+    state.runtime_connected = false;
+    run(&mut state, "/sessions");
+    assert_eq!(state.active_screen, leveler_tui::screen::Screen::Sessions);
+    assert!(!state.sessions_loading);
+    assert!(
+        state.sessions_error.is_some(),
+        "a failed read must say so, not show 'No sessions yet'"
+    );
 }
 
 #[test]

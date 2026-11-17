@@ -162,6 +162,10 @@ pub fn open(state: &mut AppState) -> Vec<Effect> {
     state.active_screen = Screen::Memory;
     state.screen_scroll = 0;
     state.memory.last_refresh = Some(Instant::now());
+    if !state.runtime_connected {
+        state.memory.error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     vec![status_effect(state)]
 }
 
@@ -631,7 +635,20 @@ fn clamp_selection(state: &mut AppState) {
 // Keys
 // ---------------------------------------------------------------------------
 
+/// The modal's own minimum. Below it nothing is painted, so no key that can
+/// change or delete a file may be routed from behind the blank frame.
+fn visible(state: &AppState) -> bool {
+    state.size.0 >= 20 && state.size.1 >= 8
+}
+
 pub fn handle_key(state: &mut AppState, key: &KeyEvent) -> Vec<Effect> {
+    if !visible(state) {
+        // Esc is the only action a page that cannot paint may still perform.
+        if key.code == KeyCode::Esc {
+            close(state);
+        }
+        return Vec::new();
+    }
     if state.memory.filter_editing {
         return handle_filter_key(state, key);
     }
@@ -1005,8 +1022,17 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, state: &mut AppState) {
         render_footer(frame, footer, state, &first_hint, &second_hint);
         return;
     }
-    if state.memory.expanded || body.width < SPLIT_MIN_WIDTH {
+    if state.memory.expanded {
         render_preview(frame, body, state);
+        render_memory_status(frame, status_row, state);
+        render_footer(frame, footer, state, &first_hint, &second_hint);
+        return;
+    }
+    if body.width < SPLIT_MIN_WIDTH {
+        // Narrow terminals collapse to the list. Painting the preview here
+        // while the list keys are still routed made arrows move a hidden
+        // selection; Enter is the one way into the preview.
+        render_list(frame, body, state);
         render_memory_status(frame, status_row, state);
         render_footer(frame, footer, state, &first_hint, &second_hint);
         return;
@@ -1098,8 +1124,13 @@ fn render_off(frame: &mut Frame, area: Rect, state: &AppState, status: Option<&U
 fn render_loading(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let t = state.t();
+    let (text, color) = match &state.memory.error {
+        Some(error) => (error.as_str(), theme.status.error),
+        None => (t.memory.loading, theme.text.muted),
+    };
     frame.render_widget(
-        Paragraph::new(t.memory.loading).style(Style::default().fg(theme.text.muted)),
+        Paragraph::new(crate::render::text::sanitize_terminal_line(text))
+            .style(Style::default().fg(color)),
         inset(area, 1, 0),
     );
 }
@@ -1944,6 +1975,27 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_modal_never_routes_a_destructive_key() {
+        let mut state = state_with_status();
+        select(&mut state, MemoryScope::Workspace, "topics/build.md");
+        state.size = (19, 20);
+        for _ in 0..2 {
+            let effects = handle_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            );
+            assert!(
+                effects.is_empty(),
+                "a page that cannot paint must not delete: {effects:?}"
+            );
+            assert!(state.memory.pending_forget.is_none());
+        }
+        // Esc is still the one way out of the blank page.
+        handle_key(&mut state, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(state.active_screen, Screen::Conversation);
+    }
+
+    #[test]
     fn the_first_x_arms_and_a_second_x_inside_the_window_sends_forget() {
         let mut state = state_with_status();
         select(&mut state, MemoryScope::Workspace, "topics/build.md");
@@ -2173,6 +2225,26 @@ mod tests {
         assert!(text.contains("阅读"), "{text}");
         assert!(!text.contains("0 个文件"), "{text}");
         assert!(!text.contains("墓碑"), "{text}");
+    }
+
+    #[test]
+    fn a_narrow_overlay_shows_the_list_until_the_reader_opens_the_preview() {
+        let mut state = state_with_status();
+        state.memory.preview = Some(UiMemoryFileContent {
+            scope: "workspace".to_owned(),
+            path: "topics/build.md".to_owned(),
+            content: "PREVIEW-ONLY-BODY".to_owned(),
+            content_hash: "d".repeat(64),
+            truncated: false,
+            total_bytes: 17,
+            error: None,
+        });
+        let list = rendered(&mut state, 50, 20);
+        assert!(list.contains("build"), "{list}");
+        assert!(!list.contains("PREVIEW-ONLY-BODY"), "{list}");
+        state.memory.expanded = true;
+        let preview = rendered(&mut state, 50, 20);
+        assert!(preview.contains("PREVIEW-ONLY-BODY"), "{preview}");
     }
 
     #[test]

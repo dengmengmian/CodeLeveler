@@ -569,6 +569,10 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         && def.busy == BusyPolicy::IdleOnly
     {
         let primary = def.name.trim_start_matches('/');
+        // The submit path already consumed the composer. A refusal that leaves
+        // a busy turn running must give the typed command back, or the user
+        // loses the focus text they cannot reconstruct.
+        state.composer.replace(format!("/{command}"));
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
             message: state.t().idle_only_cmd.replacen("{}", primary, 1),
@@ -951,6 +955,15 @@ fn copy_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             }
             copy_now(state, &text)
         }
+        "answer" => {
+            let index = command
+                .split_whitespace()
+                .nth(2)
+                .and_then(|index| index.parse::<usize>().ok())
+                .filter(|index| *index > 0)
+                .unwrap_or(1);
+            copy_answer(state, index)
+        }
         "" => copy_answer(state, 1),
         other => match other.parse::<usize>() {
             Ok(index) if index > 0 => copy_answer(state, index),
@@ -1183,7 +1196,15 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
         let _ = std::fs::create_dir_all(parent);
     }
     let md = build_export_markdown(state);
-    match std::fs::write(&path, md) {
+    // `create_new` is the whole safeguard: an existing file is never
+    // truncated, whether the user named it or the timestamped default happens
+    // to collide. A failed export must not destroy a previous one.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, md.as_bytes()));
+    match written {
         Ok(()) => {
             // A persistent transcript note keeps the path on screen (and
             // selectable) rather than a toast that vanishes in a few seconds.
@@ -1197,10 +1218,22 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
                 message: msg,
             });
         }
-        Err(e) => {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: state.t().export_failed.replace("{error}", &e.to_string()),
+                message: state
+                    .t()
+                    .export_exists
+                    .replace("{path}", &leveler_core::path::display_path(&path)),
+            });
+        }
+        Err(error) => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state
+                    .t()
+                    .export_failed
+                    .replace("{error}", &error.to_string()),
             });
         }
     }
@@ -2174,6 +2207,26 @@ mod export_tests {
                 crate::transcript::TranscriptItem::Note(t) if t.contains("已导出")
             )),
             "export path should persist as a transcript note"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_never_overwrites_an_existing_file() {
+        let mut s = state_with_dialogue();
+        let path =
+            std::env::temp_dir().join(format!("leveler-export-existing-{}.md", std::process::id()));
+        std::fs::write(&path, "KEEP-ME").unwrap();
+        export_conversation(&mut s, &format!("export {}", path.display()));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "KEEP-ME",
+            "an existing target must never be truncated"
+        );
+        assert!(
+            matches!(&s.notification, Some(n) if n.message.contains("未覆盖")),
+            "the refusal must say the file was not overwritten: {:?}",
+            s.notification
         );
         let _ = std::fs::remove_file(&path);
     }

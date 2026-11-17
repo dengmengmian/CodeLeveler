@@ -49,11 +49,16 @@ pub(crate) fn short_native_id(id: &str) -> &str {
 pub(crate) fn open(state: &mut AppState, tool: UiForeignTool) -> Vec<Effect> {
     state.foreign_sessions = ForeignSessionsView {
         tool: Some(tool),
-        loading: true,
+        loading: state.runtime_connected,
+        error: (!state.runtime_connected).then(|| state.t().connection_lost.to_string()),
         ..ForeignSessionsView::default()
     };
     state.active_screen = Screen::ForeignSessions;
     state.screen_scroll = 0;
+    if !state.runtime_connected {
+        state.foreign_sessions.loading = false;
+        return Vec::new();
+    }
     vec![Effect::Send(ClientCommand::ListForeignSessionsFor {
         requester_session_id: state.session_id.clone(),
         tool,
@@ -76,6 +81,13 @@ pub(crate) fn import(state: &mut AppState, tool: UiForeignTool, native_id: Strin
     // One import per source session at a time: a second Enter while the first
     // is in flight must not create a second native session.
     if state.foreign_sessions.importing {
+        return Vec::new();
+    }
+    if !state.runtime_connected {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().connection_lost.to_string(),
+        });
         return Vec::new();
     }
     state.foreign_sessions.importing = true;

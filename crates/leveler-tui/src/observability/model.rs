@@ -119,6 +119,9 @@ impl TraceFilter {
 #[derive(Debug, Clone, Default)]
 pub struct TraceView {
     pub loaded: Option<UiObservabilityLoaded>,
+    /// Why the last query did not produce a view. A failed read is not the
+    /// same as an empty observatory.
+    pub error: Option<String>,
     /// Correlation/refresh discipline for the queries this `/trace` view owns.
     /// Foreign, replayed and superseded `ObservabilityLoaded` answers are
     /// ignored; refreshes coalesce to one query in flight.

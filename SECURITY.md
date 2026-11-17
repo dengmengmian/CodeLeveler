@@ -155,10 +155,13 @@ oversights. Reports that only restate them will be closed as known.
   regex, so creating one after admission is denied too. Linux re-binds existing
   paths read-only; a missing protected path is left absent because bwrap can
   only mount an existing destination, so a root `AGENTS.md`, `.git`, or
-  definition directory created after admission is not covered. Materializing
-  those destinations was tried and reverted: it changed the workspace for the
-  duration of every confined command and broke tools that detect VCS metadata
-  from the presence of `.git`. Windows labels existing protected paths
+  definition directory created after admission is not covered. This was
+  reproduced on a real Linux kernel (Ubuntu 22.04 container, privileged bwrap):
+  a confined shell created `AGENTS.md` and `.leveler/agents/...` and both
+  persisted, while existing protected paths survived write, delete and
+  recreate attempts. Materializing those destinations was tried and reverted:
+  it changed the workspace for the duration of every confined command and broke
+  tools that detect VCS metadata from the presence of `.git`. Windows labels existing protected paths
   Medium after lowering the write root (unverified on a real Windows host); a
   protected path created after admission is not covered. The file tools still
   refuse definition edits and require consent through the definition-writing

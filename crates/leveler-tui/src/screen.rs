@@ -640,10 +640,13 @@ pub fn slash_usage(name: &'static str) -> &'static str {
         "/model" => "/model [<provider/model> | default <provider/model>]",
         "/permission" => "/permission [ask|auto|full]",
         "/thinking" => "/thinking [auto|off|minimal|low|medium|high|max|reset]",
-        "/goal" => "/goal <objective>",
+        "/goal" => "/goal <objective> | /goal status | /goal clear",
         "/btw" => "/btw <question>",
         "/collab" => "/collab [chat|plan|goal]",
-        "/review" => "/review [code|business|security|architecture|test|delivery|session] [focus]",
+        "/review" => {
+            "/review [scope] [focus] | /review @commit|@branch|@path|@session <value> [focus] | /review report [id] | /review cancel"
+        }
+        "/dream" => "/dream [batch]",
         "/find" => "/find <query>",
         "/jump" => "/jump [turn]",
         "/rename" => "/rename <title>",
@@ -651,7 +654,7 @@ pub fn slash_usage(name: &'static str) -> &'static str {
         "/resume-codex" => "/resume-codex [session-id]",
         "/attach" => "/attach <path>",
         "/theme" => "/theme [auto|dark|light|high-contrast]",
-        "/copy" => "/copy [answer|command|output|diff] [n]",
+        "/copy" => "/copy [answer|selection|command|output|diff] [n]",
         "/output" => "/output [tool <id>]",
         "/export" => "/export [path]",
         "/remember" => "/remember <text>",

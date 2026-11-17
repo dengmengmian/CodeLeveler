@@ -706,6 +706,12 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             message,
             snapshot,
         } => {
+            let settings_page_error = state.active_screen == Screen::Settings
+                && crate::settings::is_edit_command(&command);
+            let mcp_page_error = state.active_screen == Screen::Mcp
+                && matches!(command, ClientCommand::ManageMcp { .. });
+            let schedules_page_error = state.active_screen == Screen::Schedules
+                && matches!(command, ClientCommand::ManageSchedule { .. });
             if let Some(snapshot) = snapshot {
                 runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
@@ -716,10 +722,20 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                     .transcript
                     .set_tool_stop(call_id, crate::transcript::StopRequest::None);
             }
-            state.notification = Some(Notification {
-                level: NotificationLevel::Error,
-                message,
-            });
+            if settings_page_error {
+                // A full-viewport page does not paint the conversation's notice
+                // row; the rejection belongs in the page's own status line.
+                crate::settings::observe_rejection(state, &message);
+            } else if mcp_page_error {
+                crate::mcp::observe_command_failure(state, Some(&message));
+            } else if schedules_page_error {
+                crate::schedules::observe_command_failure(state, Some(&message));
+            } else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Error,
+                    message,
+                });
+            }
         }
         EffectCompletion::CommandUncertain { command, snapshot } => {
             let resynced = snapshot.is_some();
@@ -747,16 +763,30 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 (false, true) => state.t().command_outcome_unknown_synced,
                 (false, false) => state.t().command_outcome_unknown_unreachable,
             };
+            let settings_page_error = state.active_screen == Screen::Settings
+                && crate::settings::is_edit_command(&command);
+            let mcp_page_error = state.active_screen == Screen::Mcp
+                && matches!(command, ClientCommand::ManageMcp { .. });
+            let schedules_page_error = state.active_screen == Screen::Schedules
+                && matches!(command, ClientCommand::ManageSchedule { .. });
             if !resynced {
                 // Delivery is uncertain: the runtime may already be executing.
                 // Fail closed until reconnect/snapshot establishes authority;
                 // never expose Idle and permit a duplicate turn.
                 state.runtime_connected = false;
             }
-            state.notification = Some(Notification {
-                level: NotificationLevel::Error,
-                message: message.to_string(),
-            });
+            if settings_page_error {
+                crate::settings::observe_uncertain(state);
+            } else if mcp_page_error {
+                crate::mcp::observe_command_failure(state, None);
+            } else if schedules_page_error {
+                crate::schedules::observe_command_failure(state, None);
+            } else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Error,
+                    message: message.to_string(),
+                });
+            }
         }
         EffectCompletion::SubmissionUnconfirmed { command_id } => {
             let mut posted_steer_id = None;

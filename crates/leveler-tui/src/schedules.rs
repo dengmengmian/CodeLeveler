@@ -955,6 +955,22 @@ fn manage_effect(
     vec![send(state, request, Slot::Manage)]
 }
 
+/// The runtime refused a management request (or never answered it). Release
+/// the form latch so Enter is not ignored and Esc is not dead; the reason
+/// belongs on the form that issued it.
+pub fn observe_command_failure(state: &mut AppState, message: Option<&str>) {
+    let message = message
+        .map(str::to_string)
+        .unwrap_or_else(|| state.t().schedules.error_uncertain.to_string());
+    state.schedule.manage_query = None;
+    state.schedule.pending_action = None;
+    state.schedule.error = Some(message.clone());
+    if let Some(form) = state.schedule.form.as_mut() {
+        form.submitting = false;
+        form.error = Some(message);
+    }
+}
+
 /// Open the page, or close it when it is already open. Entering always re-reads
 /// the authoritative list and the background-scheduler status.
 pub fn open(state: &mut AppState) -> Vec<Effect> {
@@ -1436,6 +1452,14 @@ fn submit_form(state: &mut AppState) -> Vec<Effect> {
             ScheduleActionWire::Agent { goal: action_text }
         }
     };
+    // Refuse before latching the form. A latched form whose page-level error
+    // is not painted looks like a hung save and blocks Esc.
+    if state.schedule.manage_query.is_some() {
+        return set_form_error(state, t.schedules.error_in_flight);
+    }
+    if !state.runtime_connected {
+        return set_form_error(state, t.schedules.error_disconnected);
+    }
     let model =
         (form.action_kind == ScheduleActionKind::Agent).then(|| form.model.trim().to_string());
     // An untouched interval trigger carries an anchor the compact text cannot
@@ -2576,6 +2600,35 @@ mod tests {
             Some(state.t().schedules.error_required_workspace)
         );
         assert!(state.schedule.manage_query.is_none());
+    }
+
+    #[test]
+    fn a_disconnected_schedule_submit_does_not_latch_the_form() {
+        let mut state = state();
+        let _ = open(&mut state);
+        let _ = begin_create(&mut state);
+        {
+            let form = state.schedule.form.as_mut().unwrap();
+            form.name = "nightly".into();
+            form.workspace = "/tmp/work".into();
+            form.action_kind = ScheduleActionKind::Shell;
+            form.action_text = "echo ok".into();
+            form.trigger_text = "09:30".into();
+        }
+        state.runtime_connected = false;
+        assert!(submit_form(&mut state).is_empty());
+        let form = state.schedule.form.as_ref().unwrap();
+        assert!(!form.submitting, "a refused submit must not latch");
+        assert!(
+            form.error.as_deref().is_some_and(|error| !error.is_empty()),
+            "the refusal must be visible on the form"
+        );
+        assert!(state.schedule.manage_query.is_none());
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(
+            state.schedule.form.is_none(),
+            "Esc must still close the form"
+        );
     }
 
     /// D20: an Agent schedule without a model could never be stored. The form

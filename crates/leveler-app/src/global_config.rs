@@ -70,6 +70,27 @@ use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
 use leveler_tools::search::SearchProviderKind;
 
+/// A parser message without the source line. TOML errors otherwise quote the
+/// offending line, which can contain a credential in a config the user is
+/// editing; the location and the parser's own message are enough to fix it.
+pub(crate) fn safe_toml_parse_error(
+    text: &str,
+    message: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> String {
+    let Some(span) = span else {
+        return format!("TOML parse error: {message}");
+    };
+    let prefix = text.get(..span.start).unwrap_or("");
+    let line = prefix.matches('\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .map(|line| line.chars().count() + 1)
+        .unwrap_or(1);
+    format!("TOML parse error at line {line}, column {column}: {message}")
+}
+
 /// The parsed global config.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -739,12 +760,14 @@ impl GlobalConfig {
     /// plaintext (local convenience) and/or via `api_key_env`. MCP `env`
     /// values must still be env-name references (never raw secrets).
     pub fn from_toml_str(text: &str) -> Result<Self, GlobalConfigError> {
-        let value: toml::Value =
-            toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
+        let value: toml::Value = toml::from_str(text).map_err(|error| {
+            GlobalConfigError::Parse(safe_toml_parse_error(text, error.message(), error.span()))
+        })?;
         reject_mcp_env_secrets(&value)?;
         reject_mcp_transport(&value)?;
-        let cfg: Self =
-            toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
+        let cfg: Self = toml::from_str(text).map_err(|error| {
+            GlobalConfigError::Parse(safe_toml_parse_error(text, error.message(), error.span()))
+        })?;
         cfg.validate_browser()?;
         cfg.validate_reasoning()?;
         cfg.validate_context_soft_percent()?;
@@ -3012,6 +3035,23 @@ provider = "deepseek"
         );
         let reloaded = GlobalConfig::from_toml_str(&text).unwrap();
         assert_eq!(reloaded.default_model.as_deref(), Some("new/b"));
+    }
+
+    #[test]
+    fn a_parse_error_does_not_quote_the_offending_secret_line() {
+        let secret = "sk-e2e-global-config-secret";
+        let error = GlobalConfig::from_toml_str(&format!(
+            "default_model = \"p/m\"\n[[mcp_servers]]\nname = \"broken\"\nenv = {{ API_KEY = \"{secret}\" \n"
+        ))
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains(secret),
+            "global config parse error leaked the value: {error}"
+        );
+        assert!(
+            error.to_string().contains("line"),
+            "the location was lost: {error}"
+        );
     }
 
     #[test]

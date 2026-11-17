@@ -57,6 +57,20 @@ for line in sys.stdin:
         print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
 '''
 
+LEAKY_SERVER = r'''import json, os, sys
+secret = os.environ.get("E2E_MCP_SECRET", "absent")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    if request.get("method") == "initialize" and "id" in request:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "handshake rejected token=" + secret}}), flush=True)
+        continue
+    if "id" in request:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}), flush=True)
+'''
+
 
 def check(report, scenario, name, ok, detail=""):
     report.check(scenario, name, ok, detail)
@@ -459,6 +473,87 @@ def scenario_i18n(report, python):
         pty.close()
 
 
+def install_leaky_server(env, python):
+    home = env.home
+    script = os.path.join(home, "leaky.py")
+    with open(script, "w") as fh:
+        fh.write(LEAKY_SERVER)
+    with open(os.path.join(home, "config.toml"), "a") as fh:
+        fh.write(
+            "\n[[mcp_servers]]\n"
+            'name = "leaky"\n'
+            f'command = "{python}"\n'
+            'args = ["-u", "%s"]\n'
+            'env = { E2E_MCP_SECRET = "E2E_MCP_SECRET" }\n' % script
+        )
+    secret = "planted-pty-error-secret-4b7e"
+    env.env["E2E_MCP_SECRET"] = secret
+    return secret
+
+
+def scenario_redaction(report, python):
+    """A failing server echoes a secret. Neither `/mcp`, `/doctor`, the TUI
+    detail nor the runtime log may carry the value; the category and server
+    identity must survive."""
+    mock = base.MockProvider()
+    mock.turns = []
+    mock.assist_text = ""
+    env = base.make_env("mock", mock)
+    secret = install_leaky_server(env, python)
+    pty = base.boot(report, env, 120, 42)
+    try:
+        command(pty, "/mcp")
+        ok = wait(pty, "leaky")
+        check(report, "redaction", "the failing server is listed", ok, pty.screen.text()[:700])
+        pty.key("r")
+        ok = wait(pty, "失败", 30)
+        check(report, "redaction", "a real failed attempt is shown as failed", ok, pty.screen.text()[:900])
+        report.dump("redaction-mcp-failed", pty)
+        pty.key("\r")
+        time.sleep(0.5)
+        text = pty.screen.text()
+        check(report, "redaction", "the detail shows the last error", "最近错误" in text, text[:900])
+        check(report, "redaction", "the detail keeps the error category", "handshake rejected" in text, text[:900])
+        check(report, "redaction", "the detail redacts the value", "[redacted]" in text, text[:900])
+        check(report, "redaction", "the detail never shows the secret", secret not in text, text[:900])
+        report.dump("redaction-mcp-detail", pty)
+
+        to_conversation(pty)
+        command(pty, "/doctor")
+        ok = wait(pty, "MCP")
+        time.sleep(0.6)
+        text = pty.screen.text()
+        check(report, "redaction", "doctor reports the same failed server", ok and "leaky" in text, text[:1200])
+        # The finding's evidence panel is open; move the selection to it.
+        pty.key("\x1b[A")
+        time.sleep(0.2)
+        pty.key("\x1b[A")
+        time.sleep(0.5)
+        text = pty.screen.text()
+        check(report, "redaction", "doctor keeps the failure fact", "last attempt failed" in text, text[:1600])
+        check(report, "redaction", "doctor redacts the value", "[redacted]" in text, text[:1600])
+        check(report, "redaction", "doctor never shows the secret", secret not in text, text[:1600])
+        report.dump("redaction-doctor", pty)
+
+        log_path = os.path.join(env.home, "leveler.log")
+        try:
+            with open(log_path, errors="replace") as fh:
+                log_text = fh.read()
+        except OSError as error:
+            log_text = str(error)
+        check(report, "redaction", "the runtime log never shows the secret", secret not in log_text, log_text[-1200:])
+        check(
+            report,
+            "redaction",
+            "the runtime log keeps the redacted diagnosis",
+            "[redacted]" in log_text and "handshake rejected" in log_text,
+            log_text[-1200:],
+        )
+    finally:
+        pty.close()
+        mock.stop()
+
+
 def main():
     report = base.Report("mcp-settings-help")
     python = None
@@ -492,6 +587,7 @@ def main():
             mock.stop()
 
     scenario_i18n(report, python)
+    scenario_redaction(report, python)
     path = report.save()
     print("\nfailures: %d" % report.failures)
     print("report: %s" % path)

@@ -151,9 +151,410 @@ pub struct McpToolInfo {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
 
+/// Values this server already holds, plus shapes that are credentials in any
+/// untrusted text. The server wrote the error; it is not trusted to have kept
+/// the values it received out of it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Redactor {
+    secrets: Vec<String>,
+}
+
+impl Redactor {
+    fn for_config(cfg: &McpServerConfig) -> Self {
+        let mut secrets: Vec<String> = Vec::new();
+        for (_, value) in &cfg.env {
+            secrets.push(value.clone());
+        }
+        for (_, value) in &cfg.headers {
+            secrets.push(value.clone());
+        }
+        if let Some(token) = &cfg.bearer_token {
+            secrets.push(token.clone());
+        }
+        // A short value is more likely an ordinary word than a credential, and
+        // replacing it everywhere would destroy the diagnostic. Four is the
+        // same floor the HTTP client has always used.
+        secrets.retain(|value| value.len() >= 4);
+        // Longest first: a secret that contains another must be removed whole.
+        secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+
+    fn redact(&self, text: &str) -> String {
+        redact_sensitive_text(text, &self.secrets)
+    }
+
+    /// Only the values this server was given. Used on a successful result:
+    /// the caller asked for that content, so a generated-looking token in it
+    /// must not be hidden by the generic error heuristics.
+    fn redact_known(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for secret in &self.secrets {
+            if out.contains(secret) {
+                out = out.replace(secret, "[redacted]");
+            }
+        }
+        out
+    }
+
+    /// Metadata is another channel the server controls. A description or a
+    /// schema default that echoes the value the server was given is the same
+    /// leak as an error message.
+    fn redact_json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = self.redact_known(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.redact_json(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values_mut() {
+                    self.redact_json(item);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Redact credential material from untrusted text while keeping the stable
+/// facts a reader needs: error category, server id, transport, field names.
+///
+/// Three layers, strongest first:
+/// 1. every value this server was actually given (env, headers, bearer token);
+/// 2. assignment shapes (`token=…`, `Authorization: …`, `"api_key": "…"`) and
+///    bearer tokens, whatever their value;
+/// 3. recognizable token prefixes (`ghp_`, `sk-`, `AKIA…`) and credentials in
+///    a URL's userinfo or query.
+///
+/// This cannot recognize an arbitrary secret the server invented and pasted
+/// with no key, prefix or URL around it. Callers must not claim it does.
+pub fn redact_sensitive_text(text: &str, secrets: &[String]) -> String {
+    // URL first: a query value is removed with its URL, before an assignment
+    // rule could put a marker inside the query and leave punctuation behind.
+    let out = redact_url_credentials(text);
+    let mut out = out;
+    let mut known: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|value| value.len() >= 4)
+        .collect();
+    known.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    known.dedup();
+    for secret in known {
+        if out.contains(secret) {
+            out = out.replace(secret, "[redacted]");
+        }
+    }
+    let out = redact_assignments(&out);
+    let out = redact_bearer_tokens(&out);
+    redact_token_prefixes(&out)
+}
+
+const SENSITIVE_KEYS: &[&str] = &[
+    "proxy-authorization",
+    "authorization",
+    "x-api-key",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    "session_token",
+    "api-key",
+    "apikey",
+    "api_key",
+    "api_secret",
+    "secret_key",
+    "private_key",
+    "credential",
+    "password",
+    "passwd",
+    "bearer",
+    "secret",
+    "token",
+];
+
+fn redact_assignments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let Some((key_start, key_len, header)) = match_sensitive_key(text, i) else {
+            i += 1;
+            continue;
+        };
+        let mut j = key_start + key_len;
+        // JSON spells `"token": "…"`.
+        if text[j..].starts_with('"') || text[j..].starts_with('\'') {
+            j += 1;
+        }
+        while j < text.len() && text[j..].starts_with([' ', '\t']) {
+            j += 1;
+        }
+        if !(text[j..].starts_with(':') || text[j..].starts_with('=')) {
+            i = key_start + key_len;
+            continue;
+        }
+        j += 1;
+        while j < text.len() && text[j..].starts_with([' ', '\t']) {
+            j += 1;
+        }
+        let (value_start, value_end) = value_span(text, j, header);
+        if value_end <= value_start {
+            i = j;
+            continue;
+        }
+        // A previous layer already replaced this value.
+        if text[value_start..].starts_with("[redacted") {
+            i = value_end;
+            continue;
+        }
+        out.push_str(&text[copied..value_start]);
+        out.push_str("[redacted]");
+        copied = value_end;
+        i = value_end.max(j);
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Find one sensitive key starting at `at`, case-insensitively, with a real
+/// word boundary on both sides.
+fn match_sensitive_key(text: &str, at: usize) -> Option<(usize, usize, bool)> {
+    let before = text[..at].chars().next_back();
+    if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    for key in SENSITIVE_KEYS {
+        if text
+            .get(at..at + key.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(key))
+            && text
+                .get(at + key.len()..)
+                .and_then(|rest| rest.chars().next())
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        {
+            let header = matches!(*key, "authorization" | "proxy-authorization");
+            return Some((at, key.len(), header));
+        }
+    }
+    None
+}
+
+/// Where a value starts and ends. Quoted values keep their quotes; a header
+/// value runs to the end of its line because `Bearer <token>` has a space.
+fn value_span(text: &str, at: usize, header: bool) -> (usize, usize) {
+    let Some(first) = text.get(at..).and_then(|rest| rest.chars().next()) else {
+        return (at, at);
+    };
+    if first == '"' || first == '\'' {
+        let start = at + first.len_utf8();
+        let mut end = start;
+        while end < text.len() {
+            if !text.is_char_boundary(end) {
+                end += 1;
+                continue;
+            }
+            let Some(c) = text[end..].chars().next() else {
+                break;
+            };
+            if c == first {
+                return (start, end);
+            }
+            end += c.len_utf8();
+        }
+        return (start, end);
+    }
+    let mut end = at;
+    while end < text.len() {
+        if !text.is_char_boundary(end) {
+            end += 1;
+            continue;
+        }
+        let Some(c) = text[end..].chars().next() else {
+            break;
+        };
+        let stops = if header {
+            matches!(c, '\n' | '\r' | ',' | ';' | ')' | ']' | '}' | '"' | '\'')
+        } else {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | ';' | ')' | ']' | '}' | '&' | '"' | '\'' | '\n' | '\r'
+                )
+        };
+        if end > at && stops {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    (at, end)
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let before = text[..i].chars().next_back();
+        let boundary = before.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        if !boundary
+            || text
+                .get(i..i + 6)
+                .is_none_or(|word| !word.eq_ignore_ascii_case("bearer"))
+            || text
+                .get(i + 6..)
+                .and_then(|rest| rest.chars().next())
+                .is_none_or(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            i += 1;
+            continue;
+        }
+        let mut start = i + 6;
+        while start < text.len() && text[start..].starts_with([' ', '\t']) {
+            start += 1;
+        }
+        let mut end = start;
+        while end < text.len() {
+            let c = text[end..].chars().next().unwrap_or(' ');
+            if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/' | '='))
+            {
+                break;
+            }
+            end += c.len_utf8();
+        }
+        if end >= start + 8 {
+            out.push_str(&text[copied..start]);
+            out.push_str("[redacted]");
+            copied = end;
+        }
+        i = end.max(i + 6);
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+const TOKEN_PREFIXES: &[&str] = &[
+    "github_pat_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "sk-",
+    "sk_",
+    "AKIA",
+    "eyJ",
+];
+
+fn redact_token_prefixes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let before = text[..i].chars().next_back();
+        let boundary = before.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        if !boundary {
+            i += 1;
+            continue;
+        }
+        let Some(prefix) = TOKEN_PREFIXES.iter().find(|prefix| {
+            text.get(i..i + prefix.len())
+                .is_some_and(|candidate| candidate.starts_with(*prefix))
+        }) else {
+            i += 1;
+            continue;
+        };
+        let mut end = i + prefix.len();
+        while end < text.len() {
+            let c = text[end..].chars().next().unwrap_or(' ');
+            if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/')) {
+                break;
+            }
+            end += c.len_utf8();
+        }
+        // A bare prefix (`sk-` in prose) is not a credential.
+        if end >= i + prefix.len() + 4 {
+            out.push_str(&text[copied..i]);
+            out.push_str("[redacted]");
+            copied = end;
+        }
+        i = end.max(i + prefix.len());
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Keep the scheme, host and path; drop userinfo, query and fragment. The URL
+/// itself stays readable so the diagnostic still names the destination.
+fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = text[search..].find("://") {
+        let scheme_end = search + relative;
+        let authority_start = scheme_end + 3;
+        let mut url_end = authority_start;
+        while url_end < text.len() {
+            let c = text[url_end..].chars().next().unwrap_or(' ');
+            if c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';') {
+                break;
+            }
+            url_end += c.len_utf8();
+        }
+        let authority_end = text[authority_start..url_end]
+            .find(['/', '?', '#'])
+            .map(|index| authority_start + index)
+            .unwrap_or(url_end);
+        let authority = &text[authority_start..authority_end];
+        let (userinfo, _host) = match authority.rsplit_once('@') {
+            Some((userinfo, host)) => (Some(userinfo), host),
+            None => (None, authority),
+        };
+        let path_start = authority_end;
+        let sensitive_start = text[path_start..url_end]
+            .find(['?', '#'])
+            .map(|index| path_start + index);
+        let (host_start, host_end) = match userinfo {
+            Some(userinfo) => (authority_start + userinfo.len() + 1, authority_end),
+            None => (authority_start, authority_end),
+        };
+        // Copy up to the host (skipping any userinfo), then the host/path up
+        // to the query, then continue after the URL.
+        out.push_str(&text[copied..authority_start]);
+        out.push_str(&text[host_start..host_end]);
+        let keep_end = sensitive_start.unwrap_or(url_end);
+        out.push_str(&text[authority_end..keep_end]);
+        copied = url_end;
+        search = url_end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// A live connection to one MCP server.
 pub struct McpClient {
     config: McpServerConfig,
+    /// The values this server was given. Every error it writes passes through
+    /// this before it can reach a client, the doctor or a log.
+    redactor: Redactor,
     environment: leveler_core::EnvSnapshot,
     unrestricted: bool,
     stdin: Mutex<ChildStdin>,
@@ -182,6 +583,7 @@ impl McpClient {
         environment: &leveler_core::EnvSnapshot,
         unrestricted: bool,
     ) -> Result<Arc<Self>, String> {
+        let redactor = Redactor::for_config(cfg);
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args)
             .stdin(Stdio::piped())
@@ -200,7 +602,7 @@ impl McpClient {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("启动 MCP 服务 `{}` 失败:{e}", cfg.name))?;
+            .map_err(|e| redactor.redact(&format!("启动 MCP 服务 `{}` 失败:{e}", cfg.name)))?;
         let stdin = child.stdin.take().ok_or("MCP: 无 stdin")?;
         let stdout = child.stdout.take().ok_or("MCP: 无 stdout")?;
 
@@ -246,6 +648,7 @@ impl McpClient {
 
         let client = Arc::new(Self {
             config: cfg.clone(),
+            redactor,
             environment: environment.clone(),
             unrestricted,
             stdin: Mutex::new(stdin),
@@ -304,7 +707,9 @@ impl McpClient {
             return Err(e);
         }
         match tokio::time::timeout(request_timeout(), rx).await {
-            Ok(Ok(r)) => r,
+            // The server owns this text. Strip anything it echoed back before
+            // the error can become a state fact, a page row or a log line.
+            Ok(Ok(r)) => r.map_err(|reason| self.redactor.redact(&reason)),
             Ok(Err(_)) => Err(
                 "UNKNOWN_OUTCOME:MCP 响应通道在请求发出后关闭；服务端可能已执行，\
                  结果未知，未自动重试"
@@ -381,7 +786,7 @@ impl McpClient {
                 None => serde_json::json!({}),
             };
             let result = self.request("tools/list", params).await?;
-            for info in parse_tools(&result) {
+            for mut info in parse_tools(&result) {
                 if info.name.is_empty() || info.name.chars().any(|c| c.is_control()) {
                     continue;
                 }
@@ -392,6 +797,8 @@ impl McpClient {
                     );
                     continue;
                 }
+                info.description = self.redactor.redact_known(&info.description);
+                self.redactor.redact_json(&mut info.input_schema);
                 tools.push(info);
             }
             match result.get("nextCursor").and_then(|v| v.as_str()) {
@@ -414,9 +821,10 @@ impl McpClient {
             .await?;
         let content = format_tool_result(&result);
         if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
-            Err(content)
+            Err(self.redactor.redact(&content))
         } else {
-            Ok(content)
+            // The server can echo the environment in a successful result too.
+            Ok(self.redactor.redact_known(&content))
         }
     }
 }
@@ -674,6 +1082,7 @@ pub async fn connect_all_detailed(
 ) -> Vec<McpServerConnection> {
     let mut connections: Vec<McpServerConnection> = Vec::new();
     for cfg in configs {
+        let redactor = Redactor::for_config(cfg);
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let (error, protocol) = if cfg.is_streamable_http() {
             match mcp_http::HttpSession::connect(cfg).await {
@@ -751,7 +1160,9 @@ pub async fn connect_all_detailed(
         connections.push(McpServerConnection {
             server: cfg.name.clone(),
             tools,
-            error,
+            // Second boundary: every error this function returns passes the
+            // same redactor, even one produced before a client existed.
+            error: error.map(|error| redactor.redact(&error)),
             protocol,
         });
     }
@@ -936,6 +1347,7 @@ for line in sys.stdin:
             .unwrap();
         let client = Arc::new(McpClient {
             config: McpServerConfig::stdio("test", "/usr/bin/true", vec![], vec![]),
+            redactor: Redactor::default(),
             environment: leveler_core::EnvSnapshot::default(),
             unrestricted: false,
             stdin: Mutex::new(child.stdin.take().unwrap()),
@@ -1000,6 +1412,69 @@ for line in sys.stdin:
     fn exposed_name_is_prefixed() {
         // A tool from server "fs" named "read" is exposed as mcp__fs__read.
         assert_eq!(exposed_tool_name("fs", "read"), "mcp__fs__read");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_sensitive_text;
+
+    #[test]
+    fn a_url_keeps_its_destination_but_loses_userinfo_and_query() {
+        let redacted = redact_sensitive_text(
+            "connect to https://user:secret@example.com/mcp?token=abc failed",
+            &[],
+        );
+        assert_eq!(redacted, "connect to https://example.com/mcp failed");
+    }
+
+    #[test]
+    fn a_short_configured_value_is_not_replaced_everywhere() {
+        let redacted = redact_sensitive_text("server abc is unavailable", &["abc".into()]);
+        assert_eq!(redacted, "server abc is unavailable");
+    }
+
+    #[test]
+    fn a_configured_value_is_removed_whole_and_keeps_the_category() {
+        let redacted = redact_sensitive_text(
+            "MCP tools/list failed for `github`: upstream said token=e2e-secret-value",
+            &["e2e-secret-value".into()],
+        );
+        assert_eq!(
+            redacted,
+            "MCP tools/list failed for `github`: upstream said token=[redacted]"
+        );
+    }
+
+    #[test]
+    fn multibyte_text_is_scanned_without_splitting_a_character() {
+        let redacted = redact_sensitive_text("MCP 连接已关闭 token=e2e-secret-value", &[]);
+        assert!(redacted.starts_with("MCP 连接已关闭"), "{redacted}");
+        assert!(redacted.contains("token=[redacted]"), "{redacted}");
+    }
+
+    #[test]
+    fn a_successful_result_hides_only_the_configured_value() {
+        let redactor = super::Redactor {
+            secrets: vec!["configured-value".into()],
+        };
+        assert_eq!(
+            redactor.redact_known("configured-value and sk-generated-looking"),
+            "[redacted] and sk-generated-looking"
+        );
+    }
+
+    #[test]
+    fn common_credential_shapes_are_removed_without_a_configured_value() {
+        let redacted = redact_sensitive_text(
+            "Authorization: Bearer abcdef123456789\napi_key=plain-value-9876\nghp_abcdefghijklmnop",
+            &[],
+        );
+        assert!(!redacted.contains("abcdef123456789"), "{redacted}");
+        assert!(!redacted.contains("plain-value-9876"), "{redacted}");
+        assert!(!redacted.contains("ghp_abcdefghijklmnop"), "{redacted}");
+        assert!(redacted.contains("Authorization:"), "{redacted}");
+        assert!(redacted.contains("api_key="), "{redacted}");
     }
 }
 
