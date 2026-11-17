@@ -698,6 +698,7 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             }
         }
         "new" => new_conversation(state),
+        "exit" => super::request_exit(state),
         "help" => toggle_screen(state, Screen::Help),
         "doctor" => toggle_screen(state, Screen::Doctor),
         "update" => start_update(state),

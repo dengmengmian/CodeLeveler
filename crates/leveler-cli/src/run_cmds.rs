@@ -1254,6 +1254,8 @@ pub(crate) async fn cmd_tui(
             Some(make_url_opener()),
             Some(crate::clean_cmd::clean_host()),
             boot,
+            // The daemon owns its work; closing this client does not stop it.
+            leveler_tui::ClientExitScope::DetachesFromRuntime,
         )
         .await;
         // Stop the TUI-owned HTTP server on errors too; the daemon keeps running.
@@ -1397,6 +1399,9 @@ pub(crate) async fn cmd_tui(
         Some(make_url_opener()),
         Some(crate::clean_cmd::clean_host()),
         boot,
+        // The runtime lives in this process; exiting it ends everything the
+        // runtime owns.
+        leveler_tui::ClientExitScope::EndsWithClient,
     )
     .await;
     web_shutdown.cancel();

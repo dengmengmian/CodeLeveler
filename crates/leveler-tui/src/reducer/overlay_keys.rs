@@ -294,6 +294,44 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 })]
             }
         },
+        Overlay::ConfirmExit(mut ov) => match ov.model.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ConfirmExit(ov));
+                Vec::new()
+            }
+            // Esc is the safe choice: nothing was stopped, nothing was left
+            // running, and the dialog simply closes.
+            SelectionOutcome::Cancel => {
+                state.disarm_ctrlc();
+                state.exit.pending_continue = None;
+                Vec::new()
+            }
+            SelectionOutcome::Confirm(key) => match key.as_str() {
+                crate::overlay::exit_confirm::EXIT_OPTION_STOP => vec![Effect::Quit],
+                crate::overlay::exit_confirm::EXIT_OPTION_BACKGROUND => {
+                    // A disabled option cannot confirm, so reaching here means
+                    // the projection said every affected execution can stay
+                    // alive. The effect re-checks a fresh snapshot before the
+                    // client leaves.
+                    state.exit.pending_continue = Some(ov.impact.clone());
+                    state.quit_pending = true;
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Info,
+                        message: state.t().exit_continuing.to_string(),
+                    });
+                    vec![Effect::ContinueExit {
+                        generation: state.exit.generation,
+                    }]
+                }
+                // "Stay" and any future row that is not an action: keep the
+                // session, every task, and the draft untouched.
+                _ => {
+                    state.disarm_ctrlc();
+                    state.exit.pending_continue = None;
+                    Vec::new()
+                }
+            },
+        },
         Overlay::UnsupportedMedia(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::UnsupportedMedia(sel));

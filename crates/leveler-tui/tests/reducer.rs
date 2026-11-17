@@ -1665,17 +1665,22 @@ fn ctrl_j_inserts_newline_not_submit() {
 }
 
 #[test]
-fn ctrl_c_idle_quits_on_second_press() {
+fn ctrl_c_idle_checks_running_work_on_second_press() {
     let mut s = state();
     let first = reduce(&mut s, ctrl('c'));
     assert!(first.is_empty());
     assert!(s.quit_armed);
     assert!(s.notification.is_some());
     let second = reduce(&mut s, ctrl('c'));
-    assert_eq!(second, vec![Effect::Quit]);
+    assert_eq!(
+        second,
+        vec![Effect::InspectExit { generation: 1 }],
+        "the confirmed exit first reads the runtime's own task state"
+    );
+    assert!(s.exit.inspecting);
     assert!(
         s.notification.is_none(),
-        "final quit should not repaint the stale 'press again' prompt"
+        "the confirmation should replace the stale 'press again' prompt"
     );
 }
 
@@ -1683,11 +1688,17 @@ fn ctrl_c_idle_quits_on_second_press() {
 fn ctrl_c_accepts_terminal_variants() {
     let mut s = state();
     assert!(reduce(&mut s, raw_char('\u{3}')).is_empty());
-    assert_eq!(reduce(&mut s, raw_char('\u{3}')), vec![Effect::Quit]);
+    assert_eq!(
+        reduce(&mut s, raw_char('\u{3}')),
+        vec![Effect::InspectExit { generation: 1 }]
+    );
 
     let mut s = state();
     assert!(reduce(&mut s, ctrl('C')).is_empty());
-    assert_eq!(reduce(&mut s, ctrl('C')), vec![Effect::Quit]);
+    assert_eq!(
+        reduce(&mut s, ctrl('C')),
+        vec![Effect::InspectExit { generation: 1 }]
+    );
 }
 
 #[test]
@@ -1708,15 +1719,25 @@ fn non_printing_control_key_does_not_disarm_pending_quit() {
     assert!(s.quit_armed);
     reduce(&mut s, key(KeyCode::Null));
     assert!(s.quit_armed);
-    assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+    assert_eq!(
+        reduce(&mut s, ctrl('c')),
+        vec![Effect::InspectExit { generation: 1 }]
+    );
 }
 
 #[test]
-fn visible_quit_prompt_is_enough_to_confirm_quit() {
+fn a_stale_prompt_message_is_not_a_confirmation() {
     let mut s = state();
     reduce(&mut s, ctrl('c'));
+    // The armed flag is the confirmation; the notification is presentation
+    // only. A prompt string left behind must never act as a control signal.
     s.quit_armed = false;
-    assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+    let effects = reduce(&mut s, ctrl('c'));
+    assert!(
+        effects.is_empty(),
+        "a visible prompt is not a confirmation: {effects:?}"
+    );
+    assert!(s.quit_armed, "the press must re-arm the exit prompt");
 }
 
 #[test]
@@ -1792,9 +1813,12 @@ fn ctrl_c_busy_cancels_once_then_quits() {
         "the repeat press must not promise a force cancel: {note}"
     );
 
-    // Third press while still busy: the turn is still stopping — leave the
-    // client (which does not stop the runtime).
-    assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+    // Third press while still busy: the turn is still stopping — begin the
+    // exit decision (which reads the runtime before leaving).
+    assert_eq!(
+        reduce(&mut s, ctrl('c')),
+        vec![Effect::InspectExit { generation: 1 }]
+    );
 }
 
 #[test]
@@ -3897,8 +3921,6 @@ fn closed_commands_are_unknown_and_send_nothing() {
         "/paste",
         "/editor",
         "/tools",
-        "/quit",
-        "/q",
         "/forget old-id",
         "/consolidate_memory",
     ] {
@@ -8472,7 +8494,10 @@ fn ctrl_c_clears_the_draft_before_it_offers_to_quit() {
     let second = reduce(&mut s, ctrl('c'));
     assert!(second.is_empty());
     assert!(s.quit_armed);
-    assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
+    assert_eq!(
+        reduce(&mut s, ctrl('c')),
+        vec![Effect::InspectExit { generation: 1 }]
+    );
 }
 
 #[test]

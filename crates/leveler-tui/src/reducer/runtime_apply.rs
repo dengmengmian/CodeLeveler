@@ -833,6 +833,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
+            state.turn_cancel_requested = false;
             seal_analysis_segment(state);
             // A recoverable provider failure is a continuation point, not a
             // dead task. The runtime re-checks before it resumes; this only
@@ -915,6 +916,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
+            state.turn_cancel_requested = false;
             state.resumable_task = true;
             // An interrupted turn keeps its goal: the clock freezes and the
             // indicator waits for `继续` instead of disappearing.
@@ -946,6 +948,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.execution_goal = None;
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
+            state.turn_cancel_requested = false;
             state.active_goal = None;
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -1831,6 +1834,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     }
     state.cancel_armed = false;
     state.cancel_repeat_armed = false;
+    state.turn_cancel_requested = false;
     // No usage, no reading. The gauge is hidden until the provider reports one
     // (`footer_context_usage` returns None for zero), because a number derived
     // from the visible transcript is not the window's occupancy: it ignores the
@@ -2096,14 +2100,6 @@ fn cap_background_output(output: &mut String) {
     *output = leveler_core::truncate_tail_bytes(output, BACKGROUND_OUTPUT_CAP, &marker);
 }
 
-fn background_label(program: &str, args: &[String]) -> String {
-    crate::tool_cell::command_detail(
-        "run_command",
-        &serde_json::json!({ "program": program, "args": args }).to_string(),
-    )
-    .unwrap_or_else(|| program.to_string())
-}
-
 /// Apply a durable record's state to a chrome entry. Only the record's own
 /// evidence is used: an absent terminal never becomes success or failure.
 fn apply_background_record(
@@ -2182,7 +2178,7 @@ fn replace_active_background_tasks(
         }
     }
     for task in tasks {
-        let label = background_label(&task.program, &task.args);
+        let label = crate::tool_cell::background_label(&task.program, &task.args);
         // Carry the already-retained output across a reconcile: the runtime's
         // snapshot names the task, not its log, and re-inserting a blank entry
         // would silently drop everything the detail page had shown.
@@ -2230,7 +2226,7 @@ fn replace_active_background_tasks(
                 | UiBackgroundTaskState::Conflict
         ) {
             let mut chrome = crate::state::BackgroundTaskChrome::running(
-                background_label(&record.program, &record.args),
+                crate::tool_cell::background_label(&record.program, &record.args),
                 state.elapsed_secs,
             );
             // No start was observed here, so the run time is unknown rather
@@ -2352,6 +2348,7 @@ pub(super) fn start_turn(state: &mut AppState) {
     // starts with no settlement until the runtime reports one.
     state.settled_turn_usage = None;
     state.status = RuntimeStatus::Busy;
+    state.turn_cancel_requested = false;
     state.resumable_task = false;
     state.finalization_stage = None;
     state.project_rule_sources.clear();
@@ -2740,6 +2737,11 @@ fn apply_session_with(
     } else {
         None
     };
+    if state.status != RuntimeStatus::Busy {
+        // The runtime says this turn is over (or was never live here), so a
+        // cancel this client sent can no longer be pending.
+        state.turn_cancel_requested = false;
+    }
     // A turn input this client sent and the runtime has not answered is work
     // still owed. A snapshot taken before it landed must not reopen the
     // composer for a second one — that is how a retry becomes a second turn.

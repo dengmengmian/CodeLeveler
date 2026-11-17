@@ -410,6 +410,10 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             crate::overlay::Overlay::Approval(_) | crate::overlay::Overlay::Clarification(_) => {
                 return StatusPhase::AwaitingUser;
             }
+            // The exit dialog asks the user what to do, but the runtime keeps
+            // working underneath it. Reporting AwaitingUser would hide the
+            // very work the decision is about, so the ordinary phase stands.
+            crate::overlay::Overlay::ConfirmExit(_) => {}
             // Pickers are also user-blocked, but they are local chrome, not
             // runtime waits — still treat as awaiting-user for honesty.
             crate::overlay::Overlay::ModelPicker(_)
@@ -1408,6 +1412,26 @@ mod tests {
         assert!(
             text.is_empty() || !SPINNER.iter().any(|s| text.contains(s)),
             "idle must not look busy: {text}"
+        );
+    }
+
+    #[test]
+    fn the_exit_dialog_keeps_the_running_phase() {
+        use crate::overlay::Overlay;
+        use crate::overlay::exit_confirm::ExitConfirmOverlay;
+        use crate::overlay::selection::SelectionModel;
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.activity = Some("running tools".into());
+        state.overlay = Some(Overlay::ConfirmExit(Box::new(ExitConfirmOverlay {
+            model: SelectionModel::new("Work is running", Vec::new(), false),
+            impact: crate::exit::ExitImpact::default(),
+            compact: false,
+        })));
+        assert_eq!(
+            status_phase(&state),
+            StatusPhase::Busy,
+            "the runtime keeps working while the exit decision is open"
         );
     }
 

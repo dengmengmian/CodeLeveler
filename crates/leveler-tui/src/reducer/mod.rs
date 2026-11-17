@@ -11,7 +11,12 @@ use leveler_client_protocol::{
 use crate::action::{Action, Effect, EffectCompletion};
 use crate::btw::SurfaceFocus;
 use crate::conversation::interaction::{self, Hit};
+use crate::exit::{ExitContinueBlock, ExitImpact};
 use crate::overlay::Overlay;
+use crate::overlay::exit_confirm::{
+    EXIT_OPTION_BACKGROUND, EXIT_OPTION_STAY, EXIT_OPTION_STOP, ExitConfirmOverlay,
+};
+use crate::overlay::selection::{SelectionModel, SelectionOption};
 use crate::screen::Screen;
 use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
@@ -325,6 +330,87 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             Vec::new()
         }
         Action::ShellCompletionsLoaded(result) => shell::apply_result(state, result),
+        Action::ExitImpactLoaded { generation, result } => {
+            // A snapshot that answers after the dialog was dismissed (or
+            // replaced), or after the terminal itself disappeared, must not
+            // reopen a prompt the user can no longer see.
+            if state.terminal_lost || generation != state.exit.generation {
+                return Vec::new();
+            }
+            state.exit.inspecting = false;
+            match result {
+                Err(message) => {
+                    // Nothing is known about running work, so nothing is
+                    // stopped or left behind by a claim. Staying is the only
+                    // honest outcome.
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Error,
+                        message: state.t().exit_inspect_failed.replace("{}", &message),
+                    });
+                    Vec::new()
+                }
+                // No affected execution: this is the ordinary exit, and the
+                // cleanup path still re-reads the runtime before leaving.
+                Ok(impact) if impact.is_empty() => vec![Effect::Quit],
+                Ok(impact) => open_exit_dialog(state, impact),
+            }
+        }
+        Action::ExitRechecked { generation, result } => {
+            if state.terminal_lost || generation != state.exit.generation {
+                return Vec::new();
+            }
+            state.quit_pending = false;
+            state.notification = None;
+            let confirmed = state.exit.pending_continue.take();
+            match result {
+                Err(message) => {
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Error,
+                        message: state.t().exit_inspect_failed.replace("{}", &message),
+                    });
+                    Vec::new()
+                }
+                Ok(current) => {
+                    let Some(confirmed) = confirmed else {
+                        return Vec::new();
+                    };
+                    if current.continue_block().is_some() || current.has_new_work(&confirmed) {
+                        // The state changed after the user looked at the list:
+                        // new work appeared, or something they were told could
+                        // continue no longer can. Leaving now would do
+                        // something they never agreed to, so ask again with the
+                        // current facts.
+                        state.notification = Some(Notification {
+                            level: NotificationLevel::Warning,
+                            message: state.t().exit_changed.to_string(),
+                        });
+                        return open_exit_dialog(state, current);
+                    }
+                    state.exit.continued_count = current.tasks.len();
+                    state.running = false;
+                    Vec::new()
+                }
+            }
+        }
+        Action::TerminalLost => {
+            if state.terminal_lost {
+                return Vec::new();
+            }
+            // No surface is left to ask. Run the same stop path once, with a
+            // bounded wait, and report after the terminal is restored.
+            state.terminal_lost = true;
+            state.overlay = None;
+            state.exit.inspecting = false;
+            state.exit.pending_continue = None;
+            state.quit_pending = true;
+            let paused = state.t().quit_input_paused.to_string();
+            for input in &mut state.pending_inputs {
+                if input.session_id == state.session_id && input.is_queued() {
+                    input.state = crate::pending_inputs::PendingInputState::Failed(paused.clone());
+                }
+            }
+            vec![Effect::QuitSignal]
+        }
         Action::CleanScanned(result) => {
             match result {
                 Ok(plan) => state.clean.plan_ready(plan),
@@ -560,6 +646,14 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                     });
                 }
             }
+        }
+        EffectCompletion::TerminalLostCleanupFinished(result) => {
+            // The terminal is gone; a failed or timed-out stop is recorded for
+            // the launcher to print, never turned into a successful stop and
+            // never used to keep a headless process alive.
+            state.quit_pending = false;
+            state.exit.stop_unconfirmed = result.err();
+            state.running = false;
         }
         EffectCompletion::CommandDelivered => {}
         EffectCompletion::SteerCommandDelivered(command) => {
@@ -3087,6 +3181,7 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
         return Vec::new();
     }
     state.cancel_armed = true;
+    state.turn_cancel_requested = true;
     state.notification = Some(Notification {
         level: NotificationLevel::Warning,
         message: "正在停止当前任务…".to_string(),
@@ -3238,7 +3333,7 @@ fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
         // client rather than trap the user in cancel-only key handling.
         if state.cancel_repeat_armed {
             state.notification = None;
-            return vec![Effect::Quit];
+            return request_exit(state);
         }
         request_cancel(state)
     } else {
@@ -3250,13 +3345,9 @@ fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
             state.notification = None;
             return Vec::new();
         }
-        let quit_prompt_visible = state
-            .notification
-            .as_ref()
-            .is_some_and(|n| n.message == QUIT_CONFIRM_MESSAGE);
-        if state.quit_armed || quit_prompt_visible {
+        if state.quit_armed {
             state.notification = None;
-            return vec![Effect::Quit];
+            return request_exit(state);
         }
         state.quit_armed = true;
         state.notification = Some(Notification {
@@ -3265,6 +3356,74 @@ fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
         });
         Vec::new()
     }
+}
+
+/// Begin an explicit exit through the one decision path.
+///
+/// Nothing is stopped, left running, or closed here: a fresh runtime snapshot
+/// decides whether there IS affected work, and only the user's confirmed
+/// choice acts on it. Repeated exit keys while that read is in flight are
+/// ignored, so a rapid burst cannot open duplicate dialogs.
+fn request_exit(state: &mut AppState) -> Vec<Effect> {
+    if state.quit_pending || state.terminal_lost || state.exit.inspecting || state.overlay.is_some()
+    {
+        return Vec::new();
+    }
+    state.exit.generation = state.exit.generation.wrapping_add(1);
+    state.exit.inspecting = true;
+    state.disarm_ctrlc();
+    state.notification = None;
+    vec![Effect::InspectExit {
+        generation: state.exit.generation,
+    }]
+}
+
+/// Open the exit confirmation from one authoritative impact.
+///
+/// The safe choice is the default. "Continue" is a real option only when every
+/// affected execution can survive this client; a batch option must never
+/// silently end part of what it claims to continue.
+fn open_exit_dialog(state: &mut AppState, impact: ExitImpact) -> Vec<Effect> {
+    let t = state.t();
+    let total = impact.tasks.len();
+    // A short terminal cannot pay for the supporting descriptions: the
+    // workbench caps the overlay at the available height, and keeping the
+    // title, the affected rows and the safe choice together is what makes the
+    // decision operable. Width is handled at render time so a live resize
+    // recomputes it; labels and any disabled reason are never dropped.
+    let compact = state.size.1 < 30;
+    let background = match impact.continue_block() {
+        None => SelectionOption::new(EXIT_OPTION_BACKGROUND, t.exit_background)
+            .description(t.exit_background_desc),
+        Some(block) => SelectionOption::new(EXIT_OPTION_BACKGROUND, t.exit_background)
+            .description(t.exit_background_desc)
+            .disabled(match block {
+                ExitContinueBlock::RuntimeEndsWithClient => t.exit_block_embedded,
+                ExitContinueBlock::TurnAlreadyStopping => t.exit_block_turn_stopping,
+            }),
+    };
+    let options = vec![
+        SelectionOption::new(EXIT_OPTION_STOP, t.exit_stop).description(t.exit_stop_desc),
+        background,
+        SelectionOption::new(EXIT_OPTION_STAY, t.exit_stay).description(t.exit_stay_desc),
+    ];
+    let summary = if total == 1 {
+        t.exit_summary_one.to_string()
+    } else {
+        t.exit_summary_many.replace("{}", &total.to_string())
+    };
+    let model = SelectionModel::new(t.exit_title, options, false)
+        .with_description(summary)
+        // A destructive confirmation is deliberate: a stray digit must not
+        // stop tasks.
+        .without_quick_select()
+        .focus_key(EXIT_OPTION_STAY);
+    state.overlay = Some(Overlay::ConfirmExit(Box::new(ExitConfirmOverlay {
+        model,
+        impact,
+        compact,
+    })));
+    Vec::new()
 }
 
 /// The queries an open read-only page still owes, in one place.

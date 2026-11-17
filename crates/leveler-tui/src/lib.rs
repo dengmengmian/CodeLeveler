@@ -29,6 +29,7 @@ pub mod context_grid;
 mod context_statistics_contract;
 pub mod conversation;
 mod diff_view;
+pub mod exit;
 pub mod external_editor;
 pub mod fold;
 pub mod foreign_session;
@@ -92,6 +93,7 @@ mod workbench;
 mod run;
 
 pub use action::{CleanHost, UrlOpener, WebLauncher};
+pub use exit::ClientExitScope;
 pub use i18n::Locale;
 pub use observability::LIVE_REFRESH_INTERVAL;
 pub use run::{TuiError, TuiExit, run};

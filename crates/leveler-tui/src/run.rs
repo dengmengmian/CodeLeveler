@@ -38,6 +38,8 @@ use crate::theme::Theme;
 enum DeliveryJob {
     Quit {
         session_id: SessionId,
+        timeout: Duration,
+        terminal_lost: bool,
     },
     Command {
         session_id: SessionId,
@@ -74,6 +76,9 @@ fn observed_command_version(
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// A terminal-loss exit cannot ask the user and must not hold a headless
+/// process open: stop what it can within this bound, then report honestly.
+const QUIT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause between re-deliveries of a submission that got no answer. Grows to
 /// the cap so a runtime that stays away costs a connection attempt every few
 /// seconds, not a busy loop.
@@ -139,12 +144,14 @@ pub async fn run(
     url_opener: Option<UrlOpener>,
     clean_host: Option<CleanHost>,
     boot: Boot,
+    exit_scope: crate::exit::ClientExitScope,
 ) -> Result<TuiExit, TuiError> {
     let (mut guard, mut stdout) = TerminalGuard::enter()?;
     execute!(stdout, Clear(ClearType::Purge), cursor::MoveTo(0, 0))?;
 
     let theme_id = crate::theme_config::load_theme_id().unwrap_or(crate::theme::ThemeId::DEFAULT);
     let mut state = AppState::new(Theme::resolve(theme_id, Theme::env_no_color()), boot);
+    state.runtime_outlives_client = exit_scope == crate::exit::ClientExitScope::DetachesFromRuntime;
     if !state.theme.monochrome {
         match crate::splash::NativeMascot::detect() {
             Ok(image) => state.welcome_image = image,
@@ -187,14 +194,18 @@ pub async fn run(
     tokio::spawn(async move {
         while let Some(job) = delivery_rx.recv().await {
             let completion = match job {
-                DeliveryJob::Quit { session_id } => {
-                    let result = stop_session_before_quit(
-                        &delivery_client,
-                        &session_id,
-                        QUIT_CLEANUP_TIMEOUT,
-                    )
-                    .await;
-                    EffectCompletion::QuitFinished(result)
+                DeliveryJob::Quit {
+                    session_id,
+                    timeout,
+                    terminal_lost,
+                } => {
+                    let result =
+                        stop_session_before_quit(&delivery_client, &session_id, timeout).await;
+                    if terminal_lost {
+                        EffectCompletion::TerminalLostCleanupFinished(result)
+                    } else {
+                        EffectCompletion::QuitFinished(result)
+                    }
                 }
                 DeliveryJob::Command {
                     session_id,
@@ -339,6 +350,16 @@ pub async fn run(
     let mut requests_since_frame: u64 = 0;
     let mut recorder = crate::record::Recorder::from_env();
 
+    // Termination signals are only useful when a client owns the loop: a
+    // closing terminal or a plain `kill` must run the same stop path instead of
+    // leaving goal work running (or the terminal raw) behind a default kill.
+    // A second signal stops waiting for cleanup.
+    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<()>();
+    spawn_termination_forwarder(signal_tx.clone());
+    // Keep a sender alive: with every sender gone, `recv()` would answer `None`
+    // immediately and the select would spin.
+    let _signal_tx = signal_tx;
+
     paint(&mut alt, &mut stdout, &mut state, &mut tab_title)?;
 
     while state.running {
@@ -348,37 +369,53 @@ pub async fn run(
 
         if !effects.is_empty() {
             paint_now = true;
-        } else if let Some(action) = pending_terminal_actions.pop_front() {
+        } else if !state.terminal_lost
+            && let Some(action) = pending_terminal_actions.pop_front()
+        {
             effects = reduce(&mut state, action);
             paint_now = true;
         } else {
             tokio::select! {
-                maybe = term_events.next() => {
-                let ev = match maybe {
-                    Some(Ok(event)) => event,
-                    Some(Err(error)) => return Err(error.into()),
-                    None => return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "terminal input closed",
-                    ).into()),
-                };
-                {
-                    if let CtEvent::Resize(c, r) = ev {
-                        state.size = (c, r);
+                maybe = term_events.next(), if !state.terminal_lost => {
+                match maybe {
+                    Some(Ok(ev)) => {
+                        if let CtEvent::Resize(c, r) = ev {
+                            state.size = (c, r);
+                        }
+                        if let Some(action) = map_terminal_event(ev) {
+                            let action = maybe_coalesce_text_input(
+                                action,
+                                &state,
+                                &mut term_events,
+                                &mut pending_terminal_actions,
+                            )
+                            .await?;
+                            effects = reduce(&mut state, action);
+                        }
+                        paint_now = true;
+                        requests_since_frame += 1;
                     }
-                    if let Some(action) = map_terminal_event(ev) {
-                        let action = maybe_coalesce_text_input(
-                            action,
-                            &state,
-                            &mut term_events,
-                            &mut pending_terminal_actions,
-                        )
-                        .await?;
-                        effects = reduce(&mut state, action);
+                    // A read error is not recoverable here; the terminal is
+                    // gone just as it is on EOF. Run the bounded stop path
+                    // instead of returning while runtime-owned work continues.
+                    other => {
+                        if let Some(Err(error)) = other {
+                            tracing::warn!(%error, "terminal input stream failed");
+                        }
+                        effects = reduce(&mut state, Action::TerminalLost);
+                        paint_now = false;
                     }
-                    paint_now = true;
-                    requests_since_frame += 1;
                 }
+                },
+                Some(()) = signal_rx.recv() => {
+                    if state.terminal_lost {
+                        // The user or the OS asked a second time. Stop waiting
+                        // for cleanup; `guard.restore()` still runs.
+                        state.running = false;
+                    } else {
+                        effects = reduce(&mut state, Action::TerminalLost);
+                    }
+                    paint_now = false;
                 },
                 received = events.recv(), if events_open => match received {
                     Ok(event) => {
@@ -487,6 +524,7 @@ pub async fn run(
         dispatch_effects(
             &mut state,
             effects,
+            &client,
             &completion_tx,
             &delivery_tx,
             &web_launcher,
@@ -549,13 +587,14 @@ pub async fn run(
         // Repaint on input, on runtime updates, and — while busy — on the tick
         // (spinner/elapsed). Idle ticks only repaint when the wall clock minute
         // changes (handled above via paint_now).
-        if paint_now
-            || (ticked && (state.is_busy() || state.running_user_shell().is_some()))
-            || (ticked && pending_runtime_paint)
-            || (!state.is_busy() && pending_immediate_paint)
-            || (!state.is_busy()
-                && pending_background_paint
-                && last_paint.elapsed() >= BACKGROUND_PAINT_INTERVAL)
+        if !state.terminal_lost
+            && (paint_now
+                || (ticked && (state.is_busy() || state.running_user_shell().is_some()))
+                || (ticked && pending_runtime_paint)
+                || (!state.is_busy() && pending_immediate_paint)
+                || (!state.is_busy()
+                    && pending_background_paint
+                    && last_paint.elapsed() >= BACKGROUND_PAINT_INTERVAL))
         {
             if state.active_screen == Screen::Conversation {
                 crate::conversation::sync_scroll(&mut state);
@@ -637,9 +676,31 @@ pub async fn run(
     };
     guard.restore();
     crate::profile::emit_report();
+    // Facts the alternate screen can no longer show. Both are stated after it
+    // is restored, and neither is claimed as a success that was not proved.
+    // Writes are fallible on a terminal that just disappeared; a diagnostic
+    // must not panic on the way out.
+    if let Some(message) = state.exit.stop_unconfirmed.take() {
+        let _ = writeln!(
+            io::stderr(),
+            "{}",
+            state.t().exit_stop_unconfirmed.replace("{}", &message)
+        );
+    }
+    if state.exit.continued_count > 0 {
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            state
+                .t()
+                .exit_continue_hint
+                .replace("{}", &state.exit.continued_count.to_string())
+        );
+    }
     if exit == TuiExit::Quit {
         // After raw mode is off: print full resume command so the user can reconnect.
-        println!("{}", session_exit_hint(session_id.as_str()));
+        // A terminal that just disappeared is a failed write, not a panic.
+        let _ = writeln!(io::stdout(), "{}", session_exit_hint(session_id.as_str()));
     }
     Ok(exit)
 }
@@ -696,6 +757,7 @@ async fn observe_session_cleanup(
     let mut events = client.subscribe_session(session_id);
     let mut turn_cancelled = false;
     let mut requested = std::collections::HashSet::new();
+    let mut requested_shells = std::collections::HashSet::new();
     loop {
         let snapshot = client
             .snapshot(session_id)
@@ -704,7 +766,17 @@ async fn observe_session_cleanup(
         if snapshot.id != *session_id {
             return Err("runtime returned a snapshot for a different session".into());
         }
-        let running = snapshot.status == "running";
+        let running = crate::exit::has_live_turn(&snapshot);
+        // A foreground user shell is the user's own process; exiting stops it
+        // unless the user explicitly chose to leave work running. A shell
+        // already handed to the background is registry-owned and excluded here
+        // by the same predicate the registry uses.
+        let active_shell = snapshot
+            .user_shells
+            .iter()
+            .find(|shell| shell.status == "running" && shell.task_id.is_none())
+            .map(|shell| shell.id.clone());
+        let has_active_shell = active_shell.is_some();
         // A client exit owns only `goal` work. `session`, `runtime` and
         // `persistent` tasks outlive it by contract: a user shell handed to the
         // background stays the Execution Host's, and the next client re-attaches
@@ -712,47 +784,64 @@ async fn observe_session_cleanup(
         let owned: Vec<_> = snapshot
             .active_background_tasks
             .into_iter()
-            .filter(|task| matches!(task.lifetime.as_deref(), None | Some("goal")))
+            .filter(|task| crate::exit::affected_background_lifetime(task.lifetime.as_deref()))
             .collect();
-        if running {
+        let has_owned = !owned.is_empty();
+        let mut issued = false;
+        if let Some(execution_id) = active_shell
+            && requested_shells.insert(execution_id.clone())
+        {
+            issue_quit_command(
+                client,
+                session_id,
+                ClientCommand::CancelUserShell {
+                    session_id: session_id.clone(),
+                    execution_id,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            issued = true;
+        }
+        if running && !turn_cancelled {
             // A cancelling turn may still launch a final background process;
-            // let its lifecycle settle before enumerating what must be stopped.
-            if !turn_cancelled {
+            // the loop re-enumerates after it settles. Known tasks are stopped
+            // in the same pass so a hung turn cannot delay their exit.
+            issue_quit_command(
+                client,
+                session_id,
+                ClientCommand::CancelCurrentTurn {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            turn_cancelled = true;
+            issued = true;
+        }
+        for task in owned {
+            if requested.insert(task.task_id.clone()) {
                 issue_quit_command(
                     client,
                     session_id,
-                    ClientCommand::CancelCurrentTurn {
+                    ClientCommand::CancelBackgroundTask {
                         session_id: session_id.clone(),
+                        task_id: task.task_id,
                     },
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                turn_cancelled = true;
+                issued = true;
             }
-        } else if owned.is_empty() {
+        }
+        if !running && !has_active_shell && !has_owned {
             return Ok(());
-        } else {
-            let mut issued = false;
-            for task in owned {
-                if requested.insert(task.task_id.clone()) {
-                    issue_quit_command(
-                        client,
-                        session_id,
-                        ClientCommand::CancelBackgroundTask {
-                            session_id: session_id.clone(),
-                            task_id: task.task_id,
-                        },
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    issued = true;
-                }
-            }
-            if issued {
-                // An ACK only confirms dispatch. Re-read the registry before
-                // deciding whether a terminal event is still owed.
-                continue;
-            }
+        }
+        if issued {
+            // An ACK only confirms dispatch. Re-read the registry before
+            // deciding whether a terminal event is still owed, and catch a
+            // task the stopping turn launched in the meantime.
+            continue;
         }
         match events.recv().await {
             Ok(_) | Err(RecvError::Lagged(_)) => {}
@@ -912,12 +1001,48 @@ async fn settle_submission(
     }
 }
 
+/// Read one fresh snapshot off the paint loop and project the exit impact.
+///
+/// Both the initial check and the pre-continue re-check use the same read, so
+/// they cannot disagree about the affected set. The answer carries the
+/// request's generation; the reducer drops one whose dialog is gone.
+fn spawn_exit_impact_read(
+    client: Arc<dyn InteractiveRuntimeClient>,
+    state: &AppState,
+    completion_tx: &mpsc::UnboundedSender<Action>,
+    generation: u64,
+    recheck: bool,
+) {
+    let session_id = state.session_id.clone();
+    let scope = if state.runtime_outlives_client {
+        crate::exit::ClientExitScope::DetachesFromRuntime
+    } else {
+        crate::exit::ClientExitScope::EndsWithClient
+    };
+    let turn_cancelled = state.turn_cancel_requested;
+    let tx = completion_tx.clone();
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(DELIVERY_TIMEOUT, client.snapshot(&session_id))
+            .await
+            .map(|answer| answer.map_err(|error| error.to_string()))
+            .unwrap_or_else(|_| Err("timed out reading the session".into()))
+            .map(|snapshot| crate::exit::project(&snapshot, scope, turn_cancelled));
+        let action = if recheck {
+            Action::ExitRechecked { generation, result }
+        } else {
+            Action::ExitImpactLoaded { generation, result }
+        };
+        let _ = tx.send(action);
+    });
+}
+
 /// Carry out the reducer's effects. A failed send means the runtime side is
 /// gone — surface that instead of pretending the action happened.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_effects(
     state: &mut AppState,
     effects: Vec<Effect>,
+    client: &Arc<dyn InteractiveRuntimeClient>,
     completion_tx: &mpsc::UnboundedSender<Action>,
     delivery_tx: &mpsc::UnboundedSender<DeliveryJob>,
     web_launcher: &Option<WebLauncher>,
@@ -1078,6 +1203,28 @@ fn dispatch_effects(
                     let _ = tx.send(Action::UpdateFinished(outcome));
                 });
             }
+            Effect::InspectExit { generation } => {
+                spawn_exit_impact_read(Arc::clone(client), state, completion_tx, generation, false);
+            }
+            Effect::ContinueExit { generation } => {
+                spawn_exit_impact_read(Arc::clone(client), state, completion_tx, generation, true);
+            }
+            Effect::QuitSignal => {
+                if delivery_tx
+                    .send(DeliveryJob::Quit {
+                        session_id: state.session_id.clone(),
+                        timeout: QUIT_SIGNAL_TIMEOUT,
+                        terminal_lost: true,
+                    })
+                    .is_err()
+                {
+                    let _ = completion_tx.send(Action::EffectCompleted(
+                        EffectCompletion::TerminalLostCleanupFinished(Err(
+                            "runtime command queue is closed".into(),
+                        )),
+                    ));
+                }
+            }
             Effect::Quit => {
                 if !state.quit_pending {
                     state.quit_pending = true;
@@ -1095,6 +1242,8 @@ fn dispatch_effects(
                     if delivery_tx
                         .send(DeliveryJob::Quit {
                             session_id: state.session_id.clone(),
+                            timeout: QUIT_CLEANUP_TIMEOUT,
+                            terminal_lost: false,
                         })
                         .is_err()
                     {
@@ -1433,6 +1582,60 @@ fn map_terminal_event(event: CtEvent) -> Option<Action> {
     }
 }
 
+/// Forward handled termination signals into the event loop.
+///
+/// A default SIGTERM/SIGHUP kills the process without restoring the terminal or
+/// stopping the goal work this client owns. The loop receives each signal and
+/// runs the same stop path once; a second signal stops waiting for cleanup.
+/// Windows has no SIGHUP/SIGTERM equivalent for a console close; Ctrl+C is
+/// forwarded when it reaches the process as a signal rather than a raw-mode key.
+fn spawn_termination_forwarder(tx: mpsc::UnboundedSender<()>) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let install = |kind| signal(kind).map_err(|error| error.to_string());
+        let (mut term, mut hup, mut interrupt) = match (
+            install(SignalKind::terminate()),
+            install(SignalKind::hangup()),
+            install(SignalKind::interrupt()),
+        ) {
+            (Ok(term), Ok(hup), Ok(interrupt)) => (term, hup, interrupt),
+            (term, hup, interrupt) => {
+                for error in [term.err(), hup.err(), interrupt.err()]
+                    .into_iter()
+                    .flatten()
+                {
+                    tracing::warn!(%error, "could not install a termination signal handler");
+                }
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+            if tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    #[cfg(windows)]
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            if tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    #[cfg(not(any(unix, windows)))]
+    let _ = tx;
+}
+
 async fn maybe_coalesce_text_input(
     first: Action,
     state: &AppState,
@@ -1553,9 +1756,13 @@ mod tests {
         let mut s = state();
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
         let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(
+            leveler_client_protocol::mock::MockRuntimeClient::new(s.session_id.clone()),
+        );
         dispatch_effects(
             &mut s,
             vec![Effect::Quit],
+            &client,
             &completion_tx,
             &delivery_tx,
             &None,
@@ -1708,6 +1915,102 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_quit_stops_a_foreground_user_shell_only() {
+        let mut snapshot = quit_snapshot().await;
+        snapshot.active_background_tasks.clear();
+        snapshot
+            .user_shells
+            .push(leveler_client_protocol::UiUserShell {
+                id: leveler_core::UserShellId::new("ush-live"),
+                origin_command_id: None,
+                command: "npm run dev".into(),
+                cwd: "/repo".into(),
+                status: "running".into(),
+                elapsed_secs: 3,
+                exit_code: None,
+                output_tail: String::new(),
+                output_truncated: false,
+                full_output: None,
+                task_id: None,
+            });
+        snapshot
+            .user_shells
+            .push(leveler_client_protocol::UiUserShell {
+                id: leveler_core::UserShellId::new("ush-moved"),
+                origin_command_id: None,
+                command: "make watch".into(),
+                cwd: "/repo".into(),
+                status: "background".into(),
+                elapsed_secs: 9,
+                exit_code: None,
+                output_tail: String::new(),
+                output_truncated: false,
+                full_output: None,
+                task_id: Some("bg-hosted".into()),
+            });
+        let runtime = QuitRuntime::new(snapshot.clone(), false);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+        let work = tokio::spawn(async move {
+            stop_session_before_quit(&client, &SessionId::new("s1"), QUIT_CLEANUP_TIMEOUT).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), runtime.command_seen.notified())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                runtime.inner.commands().as_slice(),
+                [ClientCommand::CancelUserShell { session_id, execution_id }]
+                    if session_id.as_str() == "s1" && execution_id.as_str() == "ush-live"
+            ),
+            "the foreground shell is stopped; the already-backgrounded one is untouched"
+        );
+        assert!(
+            !work.is_finished(),
+            "an ACK is not proof the shell has ended"
+        );
+        let mut stopped = snapshot;
+        stopped
+            .user_shells
+            .retain(|shell| shell.id.as_str() != "ush-live");
+        runtime.publish(stopped);
+        tokio::time::timeout(Duration::from_secs(1), work)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_quit_ignores_a_shell_already_handed_to_the_background() {
+        let mut snapshot = quit_snapshot().await;
+        snapshot.active_background_tasks.clear();
+        snapshot
+            .user_shells
+            .push(leveler_client_protocol::UiUserShell {
+                id: leveler_core::UserShellId::new("ush-moved"),
+                origin_command_id: None,
+                command: "make watch".into(),
+                cwd: "/repo".into(),
+                status: "background".into(),
+                elapsed_secs: 9,
+                exit_code: None,
+                output_tail: String::new(),
+                output_truncated: false,
+                full_output: None,
+                task_id: Some("bg-hosted".into()),
+            });
+        let runtime = QuitRuntime::new(snapshot, false);
+        let client: Arc<dyn InteractiveRuntimeClient> = runtime.clone();
+        stop_session_before_quit(&client, &SessionId::new("s1"), QUIT_CLEANUP_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(
+            runtime.inner.commands().is_empty(),
+            "a backgrounded shell's process belongs to its registry lifetime"
+        );
     }
 
     #[tokio::test]

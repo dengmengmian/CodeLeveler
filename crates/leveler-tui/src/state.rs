@@ -93,6 +93,28 @@ pub struct Notification {
     pub message: String,
 }
 
+/// The exit decision's own state. Runtime facts live in the impact it carries;
+/// this is only what the client is doing about them.
+#[derive(Debug, Default)]
+pub struct ExitState {
+    /// Monotonic request id. A snapshot read that finishes after the dialog was
+    /// dismissed (or replaced) is ignored instead of reopening a stale prompt.
+    pub generation: u64,
+    /// An exit-impact snapshot is in flight. Repeated exit keys are ignored
+    /// until it answers, so a rapid burst cannot open two dialogs.
+    pub inspecting: bool,
+    /// The impact the user confirmed "continue" against. After the re-check,
+    /// any execution not in this set makes the earlier decision incomplete.
+    pub pending_continue: Option<crate::exit::ExitImpact>,
+    /// How many executions were left running when the client exited. Read by
+    /// the launcher after the terminal is restored.
+    pub continued_count: usize,
+    /// The stop path could not confirm every task had ended before a forced
+    /// (terminal-loss) exit. Reported after the terminal is restored; never
+    /// presented as a completed stop.
+    pub stop_unconfirmed: Option<String>,
+}
+
 /// Which workbench region owns ↑/↓ and related keys.
 ///
 /// - [`Input`](WorkbenchFocus::Input): history browse, typing
@@ -764,6 +786,19 @@ pub struct AppState {
     pub quit_armed: bool,
     /// An explicit exit is awaiting runtime-owned session cleanup.
     pub quit_pending: bool,
+    /// This client's own cancel request reached the running turn. The turn is
+    /// therefore already stopping, and an exit must not offer to continue it.
+    /// Reset when the turn reaches a terminal.
+    pub turn_cancel_requested: bool,
+    /// The runtime this client is attached to is a separate process that keeps
+    /// running after this client exits. A transport fact supplied by the
+    /// launcher; never inferred from task state.
+    pub runtime_outlives_client: bool,
+    /// The terminal is gone (EOF or a handled termination signal). The loop
+    /// stops painting and terminal input, runs the stop path once, and exits.
+    pub terminal_lost: bool,
+    /// The exit decision in progress.
+    pub exit: ExitState,
 
     /// Monotonic frame counter driving the busy spinner animation.
     pub tick: u64,
@@ -967,6 +1002,10 @@ impl AppState {
             resumable_task: false,
             quit_armed: false,
             quit_pending: false,
+            turn_cancel_requested: false,
+            runtime_outlives_client: false,
+            terminal_lost: false,
+            exit: ExitState::default(),
             tick: 0,
             motion_clock: std::time::Duration::ZERO,
             live_animation: crate::motion::live_animation_enabled(),

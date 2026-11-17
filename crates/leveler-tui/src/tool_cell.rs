@@ -516,6 +516,19 @@ pub(crate) fn command_detail(name: &str, arguments: &str) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// Readable one-line label for a registry background task's own facts.
+///
+/// The registry carries program + args, not a tool-call payload; this is the
+/// same presentation the task's starting row used, so a dialog and the
+/// transcript name one execution the same way.
+pub(crate) fn background_label(program: &str, args: &[String]) -> String {
+    command_detail(
+        "run_command",
+        &serde_json::json!({ "program": program, "args": args }).to_string(),
+    )
+    .unwrap_or_else(|| program.to_string())
+}
+
 pub(crate) fn command_description(arguments: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
     v.get("description")?

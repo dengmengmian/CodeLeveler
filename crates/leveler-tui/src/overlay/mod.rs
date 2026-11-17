@@ -10,6 +10,7 @@
 
 pub mod approval;
 pub mod clarification;
+pub mod exit_confirm;
 pub mod selection;
 
 use ratatui::Frame;
@@ -26,6 +27,7 @@ use crate::theme::Theme;
 
 pub use approval::{ApprovalOutcome, ApprovalOverlay};
 pub use clarification::{ClarificationOutcome, ClarificationOverlay};
+pub use exit_confirm::ExitConfirmOverlay;
 pub use selection::{SelectionModel, SelectionOption, SelectionOutcome};
 
 /// An open overlay. Model and mode pickers share the [`SelectionModel`]; the
@@ -66,6 +68,9 @@ pub enum Overlay {
     /// a target (`commit`, `branch`, `paths`) prefill the composer instead of
     /// launching with an empty target.
     ReviewScopePicker(Box<SelectionModel>),
+    /// The explicit exit confirmation. Its rows are the runtime's affected
+    /// executions, and its default cursor is the safe "stay" choice.
+    ConfirmExit(Box<ExitConfirmOverlay>),
 }
 
 /// A short label for the status line while an overlay is open.
@@ -91,7 +96,8 @@ impl Overlay {
             | Overlay::ConfirmSchedule(_)
             | Overlay::ConfirmRecovery(_)
             | Overlay::ThinkingPicker(_)
-            | Overlay::ReviewScopePicker(_) => None,
+            | Overlay::ReviewScopePicker(_)
+            | Overlay::ConfirmExit(_) => None,
         }
     }
 
@@ -125,9 +131,10 @@ impl Overlay {
                 m.insert_query_text(text);
                 true
             }
-            Overlay::Approval(_) | Overlay::ThinkingPicker(_) | Overlay::ConfirmSchedule(_) => {
-                false
-            }
+            Overlay::Approval(_)
+            | Overlay::ThinkingPicker(_)
+            | Overlay::ConfirmSchedule(_)
+            | Overlay::ConfirmExit(_) => false,
         }
     }
 }
@@ -340,6 +347,7 @@ fn build_content(
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
         Overlay::ConfirmSchedule(ov) => selection_content(&ov.model, theme, width, locale),
+        Overlay::ConfirmExit(ov) => exit_content(ov, theme, width, locale),
     }
 }
 
@@ -1077,6 +1085,21 @@ fn selection_content(
     width: usize,
     locale: crate::i18n::Locale,
 ) -> RawContent {
+    selection_content_with_extra(model, theme, width, locale, Vec::new(), false)
+}
+
+/// A picker plus caller-owned rows between its summary and its options.
+///
+/// The exit dialog puts the affected executions there: they are the evidence
+/// for the choice, so they belong above it, in the picker's own grammar.
+fn selection_content_with_extra(
+    model: &SelectionModel,
+    theme: &Theme,
+    width: usize,
+    locale: crate::i18n::Locale,
+    extra: Vec<Line<'static>>,
+    compact: bool,
+) -> RawContent {
     let t = locale.text();
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor = None;
@@ -1097,8 +1120,11 @@ fn selection_content(
             desc.clone(),
             Style::default().fg(theme.text.secondary),
         )));
-        lines.push(Line::from(""));
+        if !compact {
+            lines.push(Line::from(""));
+        }
     }
+    lines.extend(extra);
     if model.is_searchable() {
         // The search box is this picker's editor, so it is drawn the way every
         // other editor in this TUI is drawn: on its own input surface, with the
@@ -1179,7 +1205,9 @@ fn selection_content(
             ));
         }
         lines.push(Line::from(spans));
-        if let Some(desc) = &opt.description {
+        if let Some(desc) = &opt.description
+            && !compact
+        {
             lines.push(Line::from(Span::styled(
                 format!("     {desc}"),
                 Style::default().fg(theme.text.secondary),
@@ -1201,7 +1229,9 @@ fn selection_content(
 
     // The key hint is chrome: pinned to the bottom while the list scrolls.
     let tail_from = Some(lines.len());
-    lines.push(Line::from(""));
+    if !compact {
+        lines.push(Line::from(""));
+    }
     lines.push(help_line(theme, t.picker_hint));
     RawContent {
         title: model.title.clone(),
@@ -1211,6 +1241,86 @@ fn selection_content(
         focus_block,
         tail_from,
     }
+}
+
+/// At most this many execution rows are listed. The summary keeps the true
+/// count, and the overflow row says how many are not shown: a dialog that
+/// silently clipped the list would understate what the exit affects.
+const EXIT_TASK_ROWS: usize = 8;
+
+/// The exit dialog: the picker grammar, with the affected executions between
+/// its summary and its choices.
+fn exit_content(
+    ov: &ExitConfirmOverlay,
+    theme: &Theme,
+    width: usize,
+    locale: crate::i18n::Locale,
+) -> RawContent {
+    let t = locale.text();
+    let compact = ov.compact || width < 60;
+    // A stable kind column keeps the labels of different task types aligned;
+    // below this width the column costs more than it explains, so it collapses
+    // to a single separator.
+    let kind_width: usize = if width >= 36 { 10 } else { 0 };
+    let total = ov.impact.tasks.len();
+    let max_tasks = if compact { 3 } else { EXIT_TASK_ROWS };
+    let mut extra: Vec<Line<'static>> = Vec::with_capacity(total.min(max_tasks) + 2);
+    for task in ov.impact.tasks.iter().take(max_tasks) {
+        let kind = match task.kind {
+            crate::exit::ExitTaskKind::AgentTurn => t.exit_kind_turn,
+            crate::exit::ExitTaskKind::BackgroundTask => t.exit_kind_background,
+            crate::exit::ExitTaskKind::UserShell => t.exit_kind_shell,
+        };
+        let prefix = if kind_width == 0 {
+            format!("  {kind}  ")
+        } else {
+            format!(
+                "  {kind}{}  ",
+                " ".repeat(kind_width.saturating_sub(UnicodeWidthStr::width(kind)))
+            )
+        };
+        let used = UnicodeWidthStr::width(prefix.as_str());
+        let elapsed = task
+            .elapsed_ms
+            .filter(|_| width >= 48)
+            .map(crate::presentation::disclosure::format_duration);
+        let suffix_width = elapsed
+            .as_deref()
+            .map(|text| UnicodeWidthStr::width(text) + 2)
+            .unwrap_or(0);
+        let label = if task.label.is_empty() {
+            kind.to_string()
+        } else {
+            task.label.clone()
+        };
+        let room = width.saturating_sub(used + suffix_width).max(1);
+        let mut spans = vec![Span::styled(
+            prefix,
+            Style::default().fg(theme.text.secondary),
+        )];
+        spans.push(Span::styled(
+            truncate_display(&label, room),
+            Style::default().fg(theme.text.primary),
+        ));
+        if let Some(elapsed) = elapsed {
+            spans.push(Span::styled(
+                format!("  {elapsed}"),
+                Style::default().fg(theme.text.secondary),
+            ));
+        }
+        extra.push(Line::from(spans));
+    }
+    let hidden = total.saturating_sub(total.min(max_tasks));
+    if hidden > 0 {
+        extra.push(Line::from(Span::styled(
+            format!("  {}", t.exit_more_tasks.replace("{}", &hidden.to_string())),
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    if !compact {
+        extra.push(Line::from(""));
+    }
+    selection_content_with_extra(&ov.model, theme, width, locale, extra, compact)
 }
 
 /// The top edge of every interaction: approval, clarification, and the pickers.

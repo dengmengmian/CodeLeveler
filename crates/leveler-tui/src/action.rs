@@ -18,6 +18,10 @@ use crate::state::PendingInteraction;
 pub enum EffectCompletion {
     /// Explicit client exit waits until its session has stopped executing.
     QuitFinished(Result<(), String>),
+    /// A terminal-loss exit finished its stop path. Unlike [`Self::QuitFinished`]
+    /// the client exits on failure too: the terminal is gone, and reporting is
+    /// all that is left.
+    TerminalLostCleanupFinished(Result<(), String>),
     CommandDelivered,
     SteerCommandDelivered(ClientCommand),
     /// The runtime answered with an error: it is reachable, and it did not
@@ -139,6 +143,22 @@ pub enum Action {
     /// The full-output pager exited, or could not be started. The terminal has
     /// already been restored by the event loop.
     OutputPagerFinished(Result<(), String>),
+    /// The exit-impact snapshot answer. `generation` discards an answer whose
+    /// dialog was dismissed or replaced while the snapshot was in flight.
+    ExitImpactLoaded {
+        generation: u64,
+        result: Result<crate::exit::ExitImpact, String>,
+    },
+    /// The pre-exit re-check for "continue in background". The reducer compares
+    /// the current impact with the confirmed one and refuses to leave silently
+    /// when new work appeared.
+    ExitRechecked {
+        generation: u64,
+        result: Result<crate::exit::ExitImpact, String>,
+    },
+    /// The terminal is gone (EOF or a handled termination signal). There is no
+    /// surface left to ask; run the stop path once and exit.
+    TerminalLost,
 }
 
 /// Where a full-output pager reads from. A capture stays on disk (10 MiB must
@@ -248,6 +268,16 @@ pub enum Effect {
     /// Suspend the TUI and open the complete output in `$PAGER` (default
     /// `less -R`). A capture is paged from disk, never loaded whole.
     OpenOutputPager { source: PagerSource },
+    /// Read one fresh snapshot and project the exit impact from it. The reducer
+    /// opens the confirmation dialog only for this structured answer.
+    InspectExit { generation: u64 },
+    /// Re-read the runtime state before leaving work running. Emitted only
+    /// after the user chose "continue in background and exit".
+    ContinueExit { generation: u64 },
+    /// Stop this session's affected work on a terminal that no longer exists,
+    /// with a bounded wait. Unlike [`Self::Quit`] a failed stop still ends the
+    /// client; the failure is reported after the terminal is restored.
+    QuitSignal,
     /// Tear down the UI and exit.
     Quit,
 }

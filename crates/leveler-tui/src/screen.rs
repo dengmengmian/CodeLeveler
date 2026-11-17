@@ -387,6 +387,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    // The explicit exit path. It always goes through the same exit-impact
+    // snapshot and confirmation dialog as the Ctrl+C escalation; the dialog
+    // itself decides whether there is anything to ask about.
+    slash(
+        "/exit",
+        &["/quit"],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     slash(
         "/doctor",
         &[],
@@ -615,6 +625,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/theme" => s.theme,
         "/new" => s.new,
         "/help" => s.help,
+        "/exit" | "/quit" => s.exit,
         "/doctor" => s.doctor,
         "/clean" => s.clean,
         "/schedules" => s.schedules,
@@ -938,6 +949,7 @@ mod surface_tests {
                 "/theme",
                 "/web",
                 "/help",
+                "/exit",
                 "/doctor",
                 "/clean",
                 "/schedules",
