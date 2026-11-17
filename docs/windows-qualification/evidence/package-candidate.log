@@ -1,9 +1,0 @@
-archive: C:\qlab\artifacts\leveler-v1.0.27-x86_64-pc-windows-msvc.zip
-version: 1.0.27 (0f9a5cbd2d5b)
-completion bytes: 6043
-confine exit: 23
-77248e49aec01c4728872794e1f1910b878d842ac9f3859f9d1b2b626ed4034e  leveler.exe
-4621f07625817faa54ba27ff092e3a282c78701d081de05ea4caadc93c75056a  leveler-confine.exe
-d56333375683882ed0ac8928b607ed71a65bd19562a4181c7e66272c04e0fd2d  README.md
-c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  LICENSE-APACHE
-4b827513942b21307c9118e1c98acbbb12043b1fb2e1b6d8ad4de5fae354f014  leveler-v1.0.27-x86_64-pc-windows-msvc.zip

@@ -1,9 +1,0 @@
-Session 14c28394-3ae9-4817-a687-750163e14177
-  goal:    Scheduled action: 最终候选定时业务 中文
-  model:   —
-  status:  created  state: understand
-  kind:    direct   mode: assisted   sandbox: false   outcome: —
-  created: 2026-11-16T02:22:02.444669400+00:00   updated: 2026-11-16T02:22:02.444669400+00:00
-
-Event log (2)
-  user_shell_started×1  user_shell_finished×1

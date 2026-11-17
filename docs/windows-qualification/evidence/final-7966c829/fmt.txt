@@ -1,1 +1,0 @@
-cargo fmt --all -- --check: PASS (exit 0, no diff)

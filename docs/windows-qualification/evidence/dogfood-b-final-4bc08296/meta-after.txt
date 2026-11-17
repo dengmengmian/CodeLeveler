@@ -1,4 +1,0 @@
-exit=0
-ended=2026-11-15T18:57:55Z
-elapsed_s=70
-"session_id":"64c83b40-d507-4bec-add1-f60acbe07cb4"

@@ -1,8 +1,0 @@
-name=a-final
-started=2026-11-15T15:36:10Z
-binary=/c/qlab/install/archive/leveler-v1.0.27-x86_64-pc-windows-msvc/leveler.exe
-version=1.0.27 (0f9a5cbd2d5b)
-77248e49aec01c4728872794e1f1910b878d842ac9f3859f9d1b2b626ed4034e */c/qlab/install/archive/leveler-v1.0.27-x86_64-pc-windows-msvc/leveler.exe
-repo=/c/qlab/repos/中文 工程
-head_before=d3adf59f708ef76237ee925b56c6b2a3381b0e13
-status_before:

@@ -1,7 +1,0 @@
-NoDefaultCurrentDirectoryInExePath=1
---- bare script ---
-'run-tests.cmd"' 不是内部或外部命令，也不是可运行的程序
-或批处理文件。
-exit=0
---- explicit .\ script ---
-exit=0

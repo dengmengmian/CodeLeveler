@@ -1,8 +1,0 @@
-dogfood a-final-4bc08296 exit=0 evidence=/c/qlab/evidence/dogfood-a-final-4bc08296
-warning: in the working copy of 'src/lib.rs', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'src/main.rs', LF will be replaced by CRLF the next time Git touches it
-dogfood b-final-4bc08296 exit=0 evidence=/c/qlab/evidence/dogfood-b-final-4bc08296
-warning: in the working copy of 'src/lib.rs', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'src/main.rs', LF will be replaced by CRLF the next time Git touches it
-dogfood e-final-4bc08296 exit=0 evidence=/c/qlab/evidence/dogfood-e-final-4bc08296
-DOGFOOD_EXITS a=0 b=0 e=0
