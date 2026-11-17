@@ -65,6 +65,9 @@ leveler-chat-*.md
 /testdata/append-instruction-dogfood/
 
 # Local internal documentation, not part of the public source tree.
+# All newly generated documents go here first; only docs confirmed for
+# publication are moved to their public location.
+/docs/dev/
 /docs/ARCHITECTURE.md
 /docs/ARCHITECTURE.zh-CN.md
 /docs/CUA_IMPLEMENTATION.md
