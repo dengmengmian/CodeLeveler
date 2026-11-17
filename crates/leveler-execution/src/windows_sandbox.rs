@@ -15,6 +15,9 @@
 //! - ACL coordination (`windows_acl`, icacls snapshot/restore/marker)
 //! - Low-integrity write confinement (`windows_confine`): reads unrestricted,
 //!   writes only where a root carries a Low mandatory label
+//! - Medium labels on existing protected policy paths inside a Low root
+//!   (`.git`, agent/skill definitions, `AGENTS.md`), so the child cannot write
+//!   authority it was not admitted to
 //!
 //! Windows has no CodeLeveler backend for per-command network denial. The
 //! platform has the machinery — the Windows Filtering Platform filters at the

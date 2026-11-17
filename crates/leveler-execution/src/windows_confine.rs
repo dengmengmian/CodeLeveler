@@ -71,12 +71,23 @@ fn resolve_launcher() -> Option<PathBuf> {
     None
 }
 
+/// The label a lease wants on a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesiredLabel {
+    /// A writable root: the confined child may write here.
+    Low,
+    /// A protected policy path inside a writable root: the child must not
+    /// write here even though the surrounding root is writable.
+    Medium,
+}
+
 /// A held claim on one write root: how many commands are writing under it, and
 /// the label to put back when the last one finishes.
 #[derive(Debug)]
 struct Held {
     count: usize,
     previous: IntegrityLabel,
+    label: DesiredLabel,
     /// The record this lease owns, so recovery can skip a live root even on a
     /// host whose file locks would not report the conflict in-process.
     record: Option<PathBuf>,
@@ -148,9 +159,16 @@ impl Drop for WriteRootLease {
 /// scratch and per-workspace tool cache exist to be written by confined
 /// commands and nothing else, so they keep their label — relabelling a Cargo
 /// registry twice per command would cost far more than it protects.
+///
+/// `protected` names policy paths inside those roots (`.git`, agent/skill
+/// definitions, `AGENTS.md`). They exist under the Low-labelled root, so the
+/// child could write them unless they are explicitly labelled Medium after the
+/// root. Only an existing path can carry a label; a policy path created after
+/// admission is not covered by this backend.
 pub fn lease_write_roots(
     environment: &leveler_core::EnvSnapshot,
     roots: &[PathBuf],
+    protected: &[PathBuf],
 ) -> io::Result<WriteRootLease> {
     let records = records_dir(environment);
     std::fs::create_dir_all(&records)?;
@@ -166,10 +184,23 @@ pub fn lease_write_roots(
         // and a record for it would tell recovery to undo a label that is
         // supposed to stay.
         let restorable = !is_leveler_owned(root, home.root());
-        let record = acquire_root(root, &records, restorable)?;
+        let record = acquire(root, &records, restorable, DesiredLabel::Low)?;
         if let Some(record) = record {
             lease.roots.push(LeasedRoot {
                 root: root.clone(),
+                record,
+            });
+        }
+    }
+    for path in protected {
+        if !path.exists() {
+            continue;
+        }
+        let restorable = !is_leveler_owned(path, home.root());
+        let record = acquire(path, &records, restorable, DesiredLabel::Medium)?;
+        if let Some(record) = record {
+            lease.roots.push(LeasedRoot {
+                root: path.clone(),
                 record,
             });
         }
@@ -237,22 +268,40 @@ fn try_lock_guard(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// Claim `root`. Returns the record that describes how to put its label back,
-/// or `None` when this root is not one we ever restore.
+/// Claim `path`. Returns the record that describes how to put its label back,
+/// or `None` when this path is not one we ever restore.
 ///
 /// The record is durable **before** the label moves. The other order would
 /// leave a lowered root with nothing on disk saying what it used to be, which
 /// is precisely the state no later run could repair.
-fn acquire_root(root: &Path, records: &Path, restorable: bool) -> io::Result<Option<PathBuf>> {
-    let key = root_key(root);
-    let record = restorable.then(|| record_path(records, root));
+fn acquire(
+    path: &Path,
+    records: &Path,
+    restorable: bool,
+    label: DesiredLabel,
+) -> io::Result<Option<PathBuf>> {
+    let key = root_key(path);
+    let record = restorable.then(|| record_path(records, path));
     let mut map = held().lock().unwrap_or_else(|poison| poison.into_inner());
     if let Some(entry) = map.get_mut(&key) {
+        // A path cannot be both a writable root and a protected path in one
+        // process generation: the second claim would silently keep the first
+        // label. Refuse instead of pretending the stronger boundary applied.
+        if entry.label != label {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is already leased with a different integrity label; \
+                     refusing to overlap a writable root and a protected path",
+                    path.display()
+                ),
+            ));
+        }
         entry.count += 1;
         return Ok(record);
     }
     // Take the guard before reading the old label or writing the new record.
-    // From here until the last lease ends, recovery cannot mistake this root
+    // From here until the last lease ends, recovery cannot mistake this path
     // for a crash leftover.
     let guard = match record.as_deref() {
         Some(record) => {
@@ -262,29 +311,33 @@ fn acquire_root(root: &Path, records: &Path, restorable: bool) -> io::Result<Opt
                     format!(
                         "Windows write root for {} is in use by another live CodeLeveler \
                          process; refusing to relabel it",
-                        root.display()
+                        path.display()
                     ),
                 )
             })?;
             // `ensure_recovered` ran once per process and may have skipped this
-            // root because another process owned it then. Now that the guard
+            // path because another process owned it then. Now that the guard
             // is ours, any record still here is a crash leftover: put its
-            // label back before lowering the root for this command.
+            // label back before lowering the path for this command.
             recover_one_locked(record)?;
             Some(guard)
         }
         None => None,
     };
-    let previous = leveler_win_confine::integrity_label(root)?;
+    let previous = leveler_win_confine::integrity_label(path)?;
     if let Some(record) = record.as_deref() {
-        write_record(record, &Record::new(root, previous.clone()))?;
+        write_record(record, &Record::new(path, previous.clone()))?;
     }
-    leveler_win_confine::apply_low_integrity_label(root)?;
+    match label {
+        DesiredLabel::Low => leveler_win_confine::apply_low_integrity_label(path)?,
+        DesiredLabel::Medium => leveler_win_confine::apply_medium_integrity_label(path)?,
+    };
     map.insert(
         key,
         Held {
             count: 1,
             previous,
+            label,
             record: record.clone(),
             _guard: guard,
         },
@@ -1007,6 +1060,56 @@ mod windows_canaries {
         true
     }
 
+    /// Protected policy paths inside a writable root keep a Medium label while
+    /// the surrounding workspace is Low: a Low child cannot author a
+    /// definition or rewrite `AGENTS.md`, but an ordinary file still works.
+    ///
+    /// This is the Windows counterpart of the Unix `protected_write_paths`
+    /// profile entries. It can only run on a real Windows host; on other hosts
+    /// the launcher is absent and the test reports the skip instead of passing
+    /// vacuously.
+    #[tokio::test]
+    async fn a_confined_command_cannot_write_protected_policy_paths() {
+        if !cfg!(windows) || !launcher_or_skip() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let definitions = workspace.path().join(".leveler").join("agents");
+        std::fs::create_dir_all(&definitions).expect("definition dir");
+        let definition = definitions.join("evil.yaml");
+        let agents_md = workspace.path().join("AGENTS.md");
+        std::fs::write(&definition, "ORIGINAL-DEFINITION").unwrap();
+        std::fs::write(&agents_md, "ORIGINAL-RULES").unwrap();
+
+        let output = host_runner()
+            .run(
+                confined(
+                    "echo PWNED> .leveler\\agents\\evil.yaml & \
+                     echo PWNED> AGENTS.md & \
+                     echo fine> ordinary.txt",
+                    workspace.path(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("confined command must run");
+
+        assert_eq!(
+            std::fs::read_to_string(&definition).unwrap(),
+            "ORIGINAL-DEFINITION",
+            "an agent definition must stay write-denied: {output:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&agents_md).unwrap(),
+            "ORIGINAL-RULES",
+            "AGENTS.md must stay write-denied: {output:?}"
+        );
+        assert!(
+            workspace.path().join("ordinary.txt").is_file(),
+            "an ordinary workspace write must remain allowed: {output:?}"
+        );
+    }
+
     /// The whole point of the backend: a coding agent on Windows must still be
     /// able to run the toolchain that lives outside its workspace.
     #[tokio::test]
@@ -1220,7 +1323,7 @@ mod windows_canaries {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         ));
-        let lease = super::lease_write_roots(&environment, &[PathBuf::from(root)])
+        let lease = super::lease_write_roots(&environment, &[PathBuf::from(root)], &[])
             .expect("the fixture child must lower its root");
         // Hold it, and wait to be killed. If the parent somehow does not, the
         // sleep ends and the lease drops normally rather than hanging CI.
@@ -1252,7 +1355,7 @@ mod windows_canaries {
             std::env::temp_dir(),
         );
         let before = leveler_win_confine::integrity_label(workspace.path()).expect("label before");
-        let lease = super::lease_write_roots(&environment, &[workspace.path().to_path_buf()])
+        let lease = super::lease_write_roots(&environment, &[workspace.path().to_path_buf()], &[])
             .expect("lease the workspace");
         assert!(
             leveler_win_confine::integrity_label(workspace.path())

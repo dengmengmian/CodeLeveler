@@ -27,6 +27,9 @@ mod windows;
 /// S-1-16-4096 — the Low mandatory level.
 pub const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
 
+/// S-1-16-8192 — the Medium mandatory level.
+pub const MEDIUM_INTEGRITY_SID: &str = "S-1-16-8192";
+
 /// The mandatory label on one filesystem object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegrityLabel {
@@ -78,6 +81,25 @@ pub fn apply_low_integrity_label(path: &Path) -> io::Result<IntegrityLabel> {
     #[cfg(windows)]
     {
         windows::apply_low(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(unsupported())
+    }
+}
+
+/// Label `path` Medium (inheritable by new children) and return the label it
+/// had, so the caller can put it back.
+///
+/// This is how a protected file or directory inside a Low-labelled write root
+/// stays unwritable for the confined child: Mandatory Integrity Control denies
+/// the Low subject write-up, so the policy tree keeps the level it had while
+/// the rest of the workspace can be written.
+pub fn apply_medium_integrity_label(path: &Path) -> io::Result<IntegrityLabel> {
+    #[cfg(windows)]
+    {
+        windows::apply_medium(path)
     }
     #[cfg(not(windows))]
     {
@@ -205,6 +227,10 @@ mod tests {
             restore_integrity_label(path, &IntegrityLabel::Inherited)
                 .unwrap_err()
                 .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            apply_medium_integrity_label(path).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
     }

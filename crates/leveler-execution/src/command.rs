@@ -681,33 +681,8 @@ fn macos_sandbox_command(
     // toolchain caches still are, so a build/test can run while every
     // repository mutation fails in the kernel regardless of which program
     // attempts it.
-    let (write_roots, protected) = match scope {
-        WriteScope::ScopedWorkspace { root, excluded, .. } => {
-            let mut protected = git_write_protected_paths(root);
-            protected.extend(definition_write_protected_paths(root));
-            protected.extend(excluded.iter().cloned());
-            (
-                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-                protected,
-            )
-        }
-        WriteScope::Workspace { root } => {
-            let mut protected = git_write_protected_paths(root);
-            protected.extend(definition_write_protected_paths(root));
-            (
-                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-                protected,
-            )
-        }
-        WriteScope::WorkspaceWithGit { root } => (
-            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            definition_write_protected_paths(root),
-        ),
-        _ => (
-            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            Vec::new(),
-        ),
-    };
+    let write_roots = writable_roots_for_scope(scope, scratch_root, cache_write_roots);
+    let protected = protected_write_paths(scope);
     let mut policy = String::from(SEATBELT_BASE);
     policy.push_str(SEATBELT_PROCESS_INSPECTION);
     policy.push_str("\n; unrestricted file reads, writes limited to approved roots\n");
@@ -753,6 +728,12 @@ fn macos_sandbox_command(
             "(deny file-write* (subpath (param \"PROTECTED_WRITE_{i}\")))\n"
         ));
     }
+    // `AGENTS.md` is project instruction text the next turn loads as
+    // authority. The root file is also in `protected`; this rule additionally
+    // covers a nested `AGENTS.md` the workspace has not enumerated and denies
+    // creating one. The filesystem is case-insensitive on macOS, so the match
+    // is too — otherwise `agents.md` would name the same policy file.
+    policy.push_str("(deny file-write* (regex #\"(?i)(^|/)AGENTS\\.md$\"))\n");
     for i in 0..cache_write_roots.len() {
         policy.push_str(&format!(
             "(deny file-write* (literal (param \"CACHE_ROOT_{i}\")))\n"
@@ -784,7 +765,6 @@ fn macos_sandbox_command(
 
 /// Paths under the workspace that remain write-denied while the project root is
 /// writable (`.git` protection).
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     let git = write_root.join(".git");
     // Prefer real path when present so seatbelt matches the vnode.
@@ -799,12 +779,48 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// command would otherwise be a way to author a definition that a later
 /// session loads without the human consent the `save_agent` / `save_skill`
 /// path requires. The OS boundary is the same one `.git` uses.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn definition_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     [".leveler/agents", ".leveler/skills"]
         .iter()
         .map(|relative| write_root.join(relative))
         .collect()
+}
+
+/// Project instruction files under the workspace that stay write-denied while
+/// the project root is writable.
+///
+/// `AGENTS.md` is policy text: the next turn loads it as authority. A shell
+/// command that rewrites it would persist instructions the user never
+/// approved, bypassing the file tool's path check. The same boundary that
+/// protects `.git` and agent/skill definitions applies to it.
+pub fn policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
+    vec![write_root.join("AGENTS.md")]
+}
+
+/// Every path inside a writable scope that stays write-denied. One list feeds
+/// both the Unix profile and the Windows integrity lease, so a path protected
+/// on one backend cannot silently lose its protection on another.
+fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
+    let mut protected = Vec::new();
+    match scope {
+        WriteScope::ScopedWorkspace { root, excluded, .. } => {
+            protected.extend(git_write_protected_paths(root));
+            protected.extend(definition_write_protected_paths(root));
+            protected.extend(policy_write_protected_paths(root));
+            protected.extend(excluded.iter().cloned());
+        }
+        WriteScope::Workspace { root } => {
+            protected.extend(git_write_protected_paths(root));
+            protected.extend(definition_write_protected_paths(root));
+            protected.extend(policy_write_protected_paths(root));
+        }
+        WriteScope::WorkspaceWithGit { root } => {
+            protected.extend(definition_write_protected_paths(root));
+            protected.extend(policy_write_protected_paths(root));
+        }
+        _ => {}
+    }
+    protected
 }
 
 /// Directories a confined process may write to.
@@ -1072,14 +1088,22 @@ fn bwrap_args(
         a.push(p.clone());
         a.push(p);
     }
-    // After writable binds, re-lock .git (and similar) as read-only when present.
+    // After writable binds, re-lock .git (and similar) as read-only when
+    // present. `AGENTS.md` is a file: when absent, bind `/dev/null` over it so
+    // the sandbox sees an empty read-only policy file and cannot create one
+    // that a later turn would load. A directory path still needs to exist.
     for p in protected {
-        if p.exists() {
-            let s = p.display().to_string();
-            a.push("--ro-bind".to_string());
-            a.push(s.clone());
-            a.push(s);
-        }
+        let source = if p.exists() {
+            p.display().to_string()
+        } else if is_policy_file(p) {
+            "/dev/null".to_string()
+        } else {
+            continue;
+        };
+        let s = p.display().to_string();
+        a.push("--ro-bind".to_string());
+        a.push(source);
+        a.push(s);
     }
     if deny_network {
         a.push("--unshare-net".to_string());
@@ -1087,6 +1111,14 @@ fn bwrap_args(
     a.push(program.to_string());
     a.extend_from_slice(args);
     a
+}
+
+/// Whether a protected path is one of the single-file policy files whose
+/// absence must still be fenced (see [`policy_write_protected_paths`]).
+#[cfg(any(target_os = "linux", test))]
+fn is_policy_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
 }
 
 /// Whether the RUNNER completed the execution, independent of what the executed
@@ -1575,12 +1607,13 @@ impl CommandRunner {
                     sandbox_scratch_root,
                     &sandbox_write_roots,
                 );
-                crate::windows_confine::lease_write_roots(&self.environment, &roots)
+                let protected = protected_write_paths(&request.write_scope);
+                crate::windows_confine::lease_write_roots(&self.environment, &roots, &protected)
             })
             .transpose()
             .map_err(|source| {
                 ProcessError::SandboxPolicy(format!(
-                    "label the authorized Windows write roots: {source}"
+                    "label the authorized Windows write roots and protected paths: {source}"
                 ))
             })?;
         let (program, mut args) = if request.unrestricted_execution {
@@ -3455,6 +3488,68 @@ mod tests {
         );
         let go = a.iter().position(|s| s == "go").expect("command present");
         assert_eq!(a[go + 1], "build", "command args follow the program");
+    }
+
+    /// A policy file that does not exist yet must still be fenced. bwrap can
+    /// only re-bind real paths, so the absent `AGENTS.md` is bound to
+    /// `/dev/null`: the child sees an empty read-only file and cannot create
+    /// the one a later turn would load.
+    #[test]
+    fn bwrap_fences_a_missing_agents_file() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let missing = scratch.path().join("AGENTS.md");
+        let existing = scratch.path().join("present.txt");
+        std::fs::write(&existing, "ORIGINAL").unwrap();
+        let a = bwrap_args(
+            "sh",
+            &["-c".into(), "true".into()],
+            false,
+            &[],
+            &[missing.clone(), existing.clone()],
+        );
+        let missing_text = missing.display().to_string();
+        assert!(
+            a.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == missing_text),
+            "an absent AGENTS.md must be bound read-only from /dev/null: {a:?}"
+        );
+        let existing_text = existing.display().to_string();
+        assert!(
+            a.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == existing_text && w[2] == existing_text),
+            "an existing policy file is re-bound read-only: {a:?}"
+        );
+    }
+
+    #[test]
+    fn policy_write_protected_paths_point_at_agents_md() {
+        let root = PathBuf::from("/tmp/proj");
+        let paths = policy_write_protected_paths(&root);
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].ends_with("AGENTS.md"), "{paths:?}");
+    }
+
+    /// One protected list feeds the Unix profile and the Windows label lease.
+    /// The `.git` difference between Workspace and WorkspaceWithGit is the one
+    /// scope that intentionally widens the write set.
+    #[test]
+    fn protected_write_paths_are_shared_by_both_backends() {
+        let root = PathBuf::from("/tmp/proj");
+        let has = |paths: &[PathBuf], suffix: &str| paths.iter().any(|path| path.ends_with(suffix));
+
+        let workspace = protected_write_paths(&WriteScope::Workspace { root: root.clone() });
+        assert!(has(&workspace, ".git"), "{workspace:?}");
+        assert!(has(&workspace, ".leveler/agents"), "{workspace:?}");
+        assert!(has(&workspace, ".leveler/skills"), "{workspace:?}");
+        assert!(has(&workspace, "AGENTS.md"), "{workspace:?}");
+
+        let with_git = protected_write_paths(&WriteScope::WorkspaceWithGit { root: root.clone() });
+        assert!(!has(&with_git, ".git"), "{with_git:?}");
+        assert!(has(&with_git, ".leveler/agents"), "{with_git:?}");
+        assert!(has(&with_git, "AGENTS.md"), "{with_git:?}");
+
+        assert!(protected_write_paths(&WriteScope::Unrestricted).is_empty());
+        assert!(protected_write_paths(&WriteScope::None).is_empty());
     }
 
     /// Which confinement backend a platform actually gets. The policy-text
@@ -5507,6 +5602,10 @@ mod tests {
         assert!(
             policy.contains("PROTECTED_WRITE") && policy.contains("(deny file-write*"),
             "workspace .git must be write-denied: {policy}"
+        );
+        assert!(
+            policy.contains("(regex #\"(?i)(^|/)AGENTS\\.md$\")"),
+            "AGENTS.md is policy text and must be write-denied at every depth: {policy}"
         );
         // The path is a -D param, not inlined into the policy body.
         assert!(

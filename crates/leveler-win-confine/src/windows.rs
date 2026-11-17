@@ -18,7 +18,7 @@ use windows_sys::Win32::Security::{
     SYSTEM_MANDATORY_LABEL_ACE,
 };
 
-use crate::{IntegrityLabel, LOW_INTEGRITY_SID};
+use crate::IntegrityLabel;
 
 /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`. windows-sys exposes it only as part of
 /// the ACE union constants, so name it once here.
@@ -226,21 +226,32 @@ fn write_label(path: &Path, label: Option<(&str, u8, u32)>) -> io::Result<()> {
 }
 
 pub(crate) fn apply_low(path: &Path) -> io::Result<IntegrityLabel> {
-    // Inheritable so files and directories created inside the write root are
-    // writable by the same confined child. Windows propagates an inheritable
-    // SACL entry to existing children that are not protected — which is also
-    // why a root that already carries exactly this label is left alone:
-    // rewriting it would walk a whole Cargo registry to no effect.
-    let desired = (
-        LOW_INTEGRITY_SID,
-        (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
-        SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
-    );
+    apply(path, crate::LOW_INTEGRITY_SID)
+}
+
+pub(crate) fn apply_medium(path: &Path) -> io::Result<IntegrityLabel> {
+    apply(path, crate::MEDIUM_INTEGRITY_SID)
+}
+
+/// Apply `sid` with `NO_WRITE_UP` and return the label `path` had. Stale
+/// inheritance cannot be skipped the way the Low root path can: a protected
+/// file may already carry a Low label inherited from its parent, and the whole
+/// point of this call is to override exactly that.
+fn apply(path: &Path, sid: &str) -> io::Result<IntegrityLabel> {
+    // Inheritable so files and directories created inside the object inherit
+    // the same level. A file does not use the inherit flags: they say what new
+    // children get, and a file has none.
+    let flags = if path.is_dir() {
+        (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
+    } else {
+        0
+    };
+    let desired = (sid, flags, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP);
     let previous = read_label(path)?;
     let already = matches!(
         &previous,
-        IntegrityLabel::Explicit { sid, ace_flags, mask }
-            if sid == desired.0 && *ace_flags == desired.1 && *mask == desired.2
+        IntegrityLabel::Explicit { sid: current, ace_flags, mask }
+            if current == desired.0 && *ace_flags == desired.1 && *mask == desired.2
     );
     if !already {
         write_label(path, Some(desired))?;

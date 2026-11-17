@@ -148,6 +148,18 @@ oversights. Reports that only restate them will be closed as known.
   directory is swept to a 512 MiB quota (oldest first). A swept artifact is
   reported as unavailable rather than silently replaced. A local process that
   can read the state directory can read retained non-secret output.
+- **Policy files created after admission are not covered on every backend.**
+  `AGENTS.md`, `.git`, `.leveler/agents` and `.leveler/skills` stay write-denied
+  for a confined shell while the workspace is writable. On macOS the profile
+  denies any `AGENTS.md` at any depth (case-insensitively) through a path
+  regex, so creating one after admission is denied too. Linux re-binds existing
+  paths read-only and binds a missing root `AGENTS.md` to `/dev/null`; a nested
+  `AGENTS.md` or a new definition directory created later is not covered
+  (unverified on a real Linux host). Windows labels existing protected paths
+  Medium after lowering the write root (unverified on a real Windows host); a
+  protected path created after admission is not covered. The file tools still
+  refuse definition edits and require consent through the definition-writing
+  tools.
 
 ## Resource grants
 
