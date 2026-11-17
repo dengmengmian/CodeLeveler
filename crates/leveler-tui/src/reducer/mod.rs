@@ -1810,34 +1810,43 @@ fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
         ),
         _ => return None,
     };
+    use crate::output_view::OutputCompleteness;
     let root = state.shell_output_root();
-    let source = match full_output.as_deref() {
+    let (source, completeness) = match full_output.as_deref() {
         Some(directory) => {
             match crate::output_view::Capture::open(
                 std::path::Path::new(directory),
                 root.as_deref(),
             ) {
-                Ok(capture) => capture.source(),
-                Err(error) => {
+                Ok(capture) => (capture.source(), OutputCompleteness::Complete),
+                Err(_) => {
                     if truncated {
+                        // The advertised complete capture is gone and the
+                        // retained text lost bytes: never present the tail as
+                        // the whole result.
                         state.notification = Some(Notification {
                             level: NotificationLevel::Warning,
-                            message: error,
+                            message: state.t().output_capture_unavailable.to_string(),
                         });
                         return None;
                     }
-                    // The capture is gone but the retained text is complete:
-                    // page it from memory rather than claiming the whole
-                    // result is unavailable.
-                    crate::output_view::OutputSource::Memory(retained.clone().into())
+                    // The capture is gone but the retained text is complete.
+                    // Page it from memory and say the capture was unavailable.
+                    (
+                        crate::output_view::OutputSource::Memory(retained.clone().into()),
+                        OutputCompleteness::CaptureUnavailable,
+                    )
                 }
             }
         }
-        None if !truncated => crate::output_view::OutputSource::Memory(retained.clone().into()),
+        None if !truncated => (
+            crate::output_view::OutputSource::Memory(retained.clone().into()),
+            OutputCompleteness::Complete,
+        ),
         None => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: state.t().copy_output_unavailable.to_string(),
+                message: state.t().output_capture_unavailable.to_string(),
             });
             return None;
         }
@@ -1849,6 +1858,7 @@ fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
     let title = command.replace('\n', " ");
     let effect_source = source.clone();
     let mut view = crate::output_view::OutputView::new(source, title, width);
+    view.completeness = completeness;
     view.generation = 1;
     state.output_view = Some(view);
     state.active_screen = Screen::Output;

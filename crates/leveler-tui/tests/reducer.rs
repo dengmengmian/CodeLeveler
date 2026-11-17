@@ -241,6 +241,49 @@ fn restoring_a_checkpoint_requires_a_second_explicit_confirmation() {
 }
 
 #[test]
+fn cancelling_the_restore_confirmation_returns_to_the_checkpoint_list() {
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.checkpoints = vec![UiCheckpoint {
+        id: leveler_client_protocol::CheckpointId::new("cp-1"),
+        label: "before the risky edit".into(),
+        ordinal: 3,
+    }];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    typed(&mut s, "/restore");
+    reduce(&mut s, key(KeyCode::Enter));
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(matches!(
+        s.overlay,
+        Some(Overlay::ConfirmCheckpointRestore(_))
+    ));
+
+    // Esc on the confirmation returns to the list and restores nothing.
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty(), "Esc must not restore: {effects:?}");
+    assert!(
+        matches!(s.overlay, Some(Overlay::CheckpointPicker(_))),
+        "the first Esc leaves only the confirmation"
+    );
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty());
+    assert!(s.overlay.is_none(), "the second Esc closes the picker");
+
+    // The Cancel row has the same target as Esc.
+    typed(&mut s, "/restore");
+    reduce(&mut s, key(KeyCode::Enter));
+    reduce(&mut s, key(KeyCode::Enter));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "Cancel must not restore: {effects:?}");
+    assert!(matches!(s.overlay, Some(Overlay::CheckpointPicker(_))));
+    reduce(&mut s, key(KeyCode::Esc));
+    assert!(s.overlay.is_none());
+}
+
+#[test]
 fn reconnect_during_finalization_restores_busy_without_waiting_for_model() {
     let mut state = state();
     let mut snap = snapshot();
@@ -9736,6 +9779,99 @@ fn output_pages_the_capture_file_from_disk() {
             source: leveler_tui::action::PagerSource::File(capture.join("combined.log")),
         }]
     );
+}
+
+/// A shell that is still running is a live tail, never the complete output.
+#[test]
+fn output_marks_a_running_result_as_partial() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-live", "sleep 30");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-live"),
+            stream: "stdout".into(),
+            chunk: "partial line\n".into(),
+        }),
+    );
+    s.composer.replace("/output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [
+        Effect::OpenOutputPager {
+            source: leveler_tui::action::PagerSource::Text(text),
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("a running result pages its partial text: {effects:?}");
+    };
+    let expected = s
+        .t()
+        .output_partial_marker
+        .replacen("{}", s.t().output_partial_running, 1);
+    assert!(text.starts_with(&expected), "{text}");
+    assert!(text.contains("partial line"), "{text}");
+}
+
+/// A command moved to the background has the same rule with its own status.
+#[test]
+fn output_marks_a_background_result_as_partial() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-bg", "sleep 30");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellBackgrounded {
+            execution_id: leveler_core::UserShellId::new("ush-bg"),
+            task_id: "bg-1".into(),
+        }),
+    );
+    s.composer.replace("/output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [
+        Effect::OpenOutputPager {
+            source: leveler_tui::action::PagerSource::Text(text),
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("a background result pages its partial text: {effects:?}");
+    };
+    let expected = s
+        .t()
+        .output_partial_marker
+        .replacen("{}", s.t().output_partial_background, 1);
+    assert!(text.starts_with(&expected), "{text}");
+}
+
+/// A truncated tail whose capture is gone is refused with the capture's own
+/// status, not the copy command's wording.
+#[test]
+fn output_refuses_a_truncated_tail_with_the_capture_status() {
+    let mut s = opened();
+    shell_started(&mut s, "ush-gone", "seq 1 100");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellOutput {
+            execution_id: leveler_core::UserShellId::new("ush-gone"),
+            stream: "stdout".into(),
+            chunk: "100\n".into(),
+        }),
+    );
+    s.transcript
+        .mark_user_shell_output_truncated(&leveler_core::UserShellId::new("ush-gone"));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserShellExited {
+            execution_id: leveler_core::UserShellId::new("ush-gone"),
+            exit_code: Some(0),
+            duration_ms: 10,
+            status: "success".into(),
+        }),
+    );
+    s.composer.replace("/output");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    let note = s.notification.as_ref().expect("a visible refusal");
+    assert_eq!(note.message, s.t().output_capture_unavailable);
+    assert_ne!(note.message, s.t().copy_output_unavailable);
 }
 
 /// A complete retained result without a capture is paged from temporary text.

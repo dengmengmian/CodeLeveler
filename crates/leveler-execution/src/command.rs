@@ -733,7 +733,11 @@ fn macos_sandbox_command(
     // covers a nested `AGENTS.md` the workspace has not enumerated and denies
     // creating one. The filesystem is case-insensitive on macOS, so the match
     // is too — otherwise `agents.md` would name the same policy file.
-    policy.push_str("(deny file-write* (regex #\"(?i)(^|/)AGENTS\\.md$\"))\n");
+    //
+    // Spell the case folding with character classes, not `(?i)`: the Seatbelt
+    // regex engine accepts the inline flag but then fails to match the path,
+    // which silently disabled this rule (found by the nested-AGENTS.md test).
+    policy.push_str("(deny file-write* (regex #\"(^|/)[Aa][Gg][Ee][Nn][Tt][Ss]\\.[Mm][Dd]$\"))\n");
     for i in 0..cache_write_roots.len() {
         policy.push_str(&format!(
             "(deny file-write* (literal (param \"CACHE_ROOT_{i}\")))\n"
@@ -804,7 +808,7 @@ pub fn policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// The macOS Seatbelt profile, the Linux bwrap binds and the Windows
 /// integrity lease all consume this one list, so a resource protected on one
 /// backend cannot silently lose its protection on another.
-fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
+pub(crate) fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
     let mut protected = Vec::new();
     match scope {
         WriteScope::ScopedWorkspace { root, excluded, .. } => {
@@ -1718,10 +1722,58 @@ impl CommandRunner {
             if self.parent_death_signal {
                 set_parent_death_signal(&mut cmd);
             }
+            // A protected path that does not exist yet cannot be bound by
+            // bwrap. Fence its creation in the kernel instead; if that fence
+            // cannot be established, refuse the command rather than run it
+            // unfenced (see `linux_fence`).
+            #[cfg(target_os = "linux")]
+            let fence_launcher = if !request.unrestricted_execution
+                && request.write_scope.confines()
+            {
+                let roots = writable_roots_for_scope(
+                    &request.write_scope,
+                    sandbox_scratch_root,
+                    &sandbox_write_roots,
+                );
+                match crate::linux_fence::prepare(
+                    &request.write_scope,
+                    &roots,
+                    self.environment.var_os("PATH"),
+                ) {
+                    Ok(Some(spec)) => Some(
+                        crate::linux_fence::install(cmd.as_std_mut(), spec).map_err(|error| {
+                            ProcessError::SandboxPolicy(format!(
+                                "the protected-path fence could not be installed: {error}"
+                            ))
+                        })?,
+                    ),
+                    Ok(None) => None,
+                    Err(reason) => {
+                        return Err(ProcessError::SandboxPolicy(format!(
+                            "the protected-path fence is unavailable: {reason}"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
             let mut child = cmd.spawn().map_err(|source| ProcessError::Spawn {
                 program: request.program.clone(),
                 source,
             })?;
+            #[cfg(target_os = "linux")]
+            let fence = match fence_launcher {
+                Some(launcher) => match launcher.activate() {
+                    Ok(fence) => Some(fence),
+                    Err(error) => {
+                        let _ = child.start_kill();
+                        return Err(ProcessError::SandboxPolicy(format!(
+                            "the protected-path fence could not be established: {error}"
+                        )));
+                    }
+                },
+                None => None,
+            };
             let pid = child.id().ok_or_else(|| ProcessError::Io {
                 program: request.program.clone(),
                 source: std::io::Error::other("child has no pid"),
@@ -1738,6 +1790,8 @@ impl CommandRunner {
                 stdout,
                 stderr,
                 sandbox_paths,
+                #[cfg(target_os = "linux")]
+                fence,
             })
         }
         #[cfg(windows)]
@@ -2030,10 +2084,23 @@ pub struct ManagedProcess {
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     sandbox_paths: Option<SandboxPaths>,
+    /// Linux only: the syscall supervisor fencing protected paths that did not
+    /// exist when the sandbox was built.
+    #[cfg(target_os = "linux")]
+    fence: Option<crate::linux_fence::LinuxFence>,
     /// Windows only: the Low integrity labels on this command's write roots,
     /// released when the process is dropped.
     #[cfg(windows)]
     write_roots: Option<crate::windows_confine::WriteRootLease>,
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(fence) = self.fence.take() {
+            fence.shutdown();
+        }
+    }
 }
 
 impl ManagedProcess {
@@ -5581,8 +5648,12 @@ mod tests {
             "workspace .git must be write-denied: {policy}"
         );
         assert!(
-            policy.contains("(regex #\"(?i)(^|/)AGENTS\\.md$\")"),
+            policy.contains("(regex #\"(^|/)[Aa][Gg][Ee][Nn][Tt][Ss]\\.[Mm][Dd]$\")"),
             "AGENTS.md is policy text and must be write-denied at every depth: {policy}"
+        );
+        assert!(
+            !policy.contains("(?i)"),
+            "the Seatbelt regex engine accepts (?i) but does not match with it: {policy}"
         );
         // The path is a -D param, not inlined into the policy body.
         assert!(

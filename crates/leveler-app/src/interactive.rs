@@ -7329,6 +7329,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::QueryDiagnostics {
                 requester_session_id,
                 query_id,
+                locale,
             } => {
                 // Read-only and local: the same checks `leveler doctor` runs,
                 // plus the project's resolved agent registry. No provider
@@ -7344,7 +7345,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let mcp = crate::mcp_service::servers(self.app.as_ref(), mode)
                     .await
                     .ok();
-                let mut findings = crate::doctor::run_with_mcp(&config, mcp.as_deref());
+                let chinese = locale
+                    .as_deref()
+                    .is_some_and(|value| value.trim().to_ascii_lowercase().starts_with("zh"));
+                let mut findings =
+                    crate::doctor::run_with_mcp_locale(&config, mcp.as_deref(), chinese);
                 if let Some(root) = self.app.layout.primary_workspace() {
                     findings.push(crate::doctor::agents_check(
                         &leveler_agent::agent_registry::AgentRoots::for_project(root),

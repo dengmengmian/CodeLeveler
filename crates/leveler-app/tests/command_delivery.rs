@@ -2138,6 +2138,7 @@ async fn diagnostics_query_answers_with_typed_findings_and_no_provider_call() {
         .send(ClientCommand::QueryDiagnostics {
             requester_session_id: requester.clone(),
             query_id: query.clone(),
+            locale: None,
         })
         .await
         .unwrap();

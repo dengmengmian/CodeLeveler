@@ -92,6 +92,11 @@ fn a_large_finished_shell_opens_the_windowed_page() {
     let effects = open_output_view(&mut s, item).expect("large output opens the page");
     assert_eq!(s.active_screen, Screen::Output);
     assert!(s.output_view.is_some());
+    assert_eq!(
+        s.output_view.as_ref().unwrap().completeness,
+        crate::output_view::OutputCompleteness::Complete,
+        "a validated capture is the whole result"
+    );
     assert!(
         effects
             .iter()
@@ -105,6 +110,25 @@ fn a_large_finished_shell_opens_the_windowed_page() {
     assert!(
         !shell.view.follow || shell.view.scroll == 0,
         "the conversation keeps a bounded window, never the full result"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_missing_capture_is_marked_as_partial_on_the_page() {
+    let root = std::env::temp_dir().join(format!("leveler-output-gone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    let mut s = state(&root);
+    let missing = root.join("state/shell-output/ush-1/gone");
+    let output = "x".repeat(300 * 1024);
+    let item = push_finished_shell(&mut s, output, false, Some(missing));
+
+    let _ = open_output_view(&mut s, item).expect("the retained text still opens");
+    assert_eq!(
+        s.output_view.as_ref().unwrap().completeness,
+        crate::output_view::OutputCompleteness::CaptureUnavailable,
+        "a missing capture is never presented as the complete result"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

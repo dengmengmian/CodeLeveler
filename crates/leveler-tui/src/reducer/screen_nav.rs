@@ -601,10 +601,19 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         // form → detail → list → conversation, the same rule Esc follows.
         Screen::Schedules => crate::schedules::back(state),
         // Both pages drop their in-flight query on the way out, so a late
-        // answer is not attributed to a later visit.
-        Screen::Tasks => crate::tasks::close(state),
+        // answer is not attributed to a later visit. Their inner levels are the
+        // same ones Esc leaves: detail/form first, then the page.
+        Screen::Tasks => {
+            if !crate::tasks::back(state) {
+                crate::tasks::close(state);
+            }
+        }
         Screen::Doctor => crate::doctor::close(state),
-        Screen::Mcp => crate::mcp::close(state),
+        Screen::Mcp => {
+            if !crate::mcp::back(state) {
+                crate::mcp::close(state);
+            }
+        }
         Screen::Settings => crate::settings::close(state),
         Screen::Help => {
             if state.help.detail.is_some() {
@@ -617,15 +626,30 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         Screen::Memory => crate::memory::back(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
-        _ => match state.detail_return.take() {
-            Some(parent) => {
-                state.active_screen = parent;
-                state.screen_scroll = 0;
+        // The trace page's inspect panel is its inner level, exactly as Esc
+        // treats it.
+        Screen::Trace => {
+            if state.trace.inspect {
+                state.trace.inspect = false;
+            } else {
+                close_to_opener(state);
             }
-            None => close_screen(state),
-        },
+        }
+        _ => close_to_opener(state),
     }
     Vec::new()
+}
+
+/// Leave a secondary page for the screen that opened it, or the conversation
+/// when it was opened from there.
+fn close_to_opener(state: &mut AppState) {
+    match state.detail_return.take() {
+        Some(parent) => {
+            state.active_screen = parent;
+            state.screen_scroll = 0;
+        }
+        None => close_screen(state),
+    }
 }
 
 /// Keyboard and mouse share the same live-state check and runtime command.

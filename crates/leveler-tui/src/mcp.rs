@@ -124,6 +124,37 @@ pub fn open(state: &mut AppState) -> Vec<Effect> {
     reload(state)
 }
 
+/// One level of back, with the same precedence the Esc key uses: form →
+/// remove confirmation → server/tool detail → filter → the page itself.
+/// Returns `true` when it consumed the level; `false` means the caller should
+/// close the page. A submitting form is inert, exactly like Esc.
+pub fn back(state: &mut AppState) -> bool {
+    if let Some(form) = state.mcp.form.as_ref() {
+        if !form.submitting {
+            state.mcp.form = None;
+        }
+        return true;
+    }
+    if state.mcp.confirm_remove.is_some() {
+        state.mcp.confirm_remove = None;
+        return true;
+    }
+    if state.mcp.detail_open {
+        state.mcp.detail_open = false;
+        state.mcp.tool_scroll = 0;
+        return true;
+    }
+    if state.mcp.filter_focus {
+        state.mcp.filter_focus = false;
+        if !state.mcp.filter.is_empty() {
+            state.mcp.filter.clear();
+            ensure_selection(state);
+        }
+        return true;
+    }
+    false
+}
+
 pub fn close(state: &mut AppState) {
     state.active_screen = crate::screen::Screen::Conversation;
     state.screen_scroll = 0;

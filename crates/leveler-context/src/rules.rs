@@ -958,6 +958,21 @@ fn read_rule_source_in_dir(
     } else {
         relative
     };
+    // Classify the entry before opening it. On Unix a directory opens
+    // successfully with O_RDONLY, but on Windows it fails with
+    // ERROR_ACCESS_DENIED, which would be reported as a permission failure
+    // instead of "not a regular file". The post-open check below still guards
+    // the object actually read.
+    let metadata = root_dir
+        .metadata(relative)
+        .map_err(|error| RuleReadError::from_io(rel, &error))?;
+    if !metadata.is_file() {
+        return Err(RuleReadError::new(
+            rel,
+            RuleReadErrorKind::NotAFile,
+            "rule path is not a regular file",
+        ));
+    }
     let mut file = root_dir
         .open(relative)
         .map_err(|error| RuleReadError::from_io(rel, &error))?;

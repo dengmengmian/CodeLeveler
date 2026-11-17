@@ -65,6 +65,12 @@ pub enum ClientCommand {
     QueryDiagnostics {
         requester_session_id: SessionId,
         query_id: CommandId,
+        /// UI language for user-readable evidence (`zh` or `en`). Absent means
+        /// English, which keeps the CLI's JSON machine contract stable. The
+        /// report structure, finding ids, statuses and raw facts never change
+        /// with this hint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locale: Option<String>,
     },
     /// Manage user-global scheduled automation.
     ///
@@ -1112,6 +1118,7 @@ mod tests {
             ClientCommand::QueryDiagnostics {
                 requester_session_id: SessionId::new("s1"),
                 query_id: CommandId::new("q1"),
+                locale: Some("zh".into()),
             },
             "query_diagnostics",
         );

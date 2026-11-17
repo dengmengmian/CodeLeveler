@@ -149,6 +149,7 @@ impl Fixture {
             .send(ClientCommand::QueryDiagnostics {
                 requester_session_id: self.session.clone(),
                 query_id: query_id.clone(),
+                locale: None,
             })
             .await
             .expect("send QueryDiagnostics");

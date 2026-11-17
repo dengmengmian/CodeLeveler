@@ -1054,11 +1054,12 @@ fn push_user_shell(
                     Some(shell.id.clone()),
                     &capture.combined,
                     format!(
-                        "{} · 输出",
+                        "{} · {}",
                         crate::render::truncate_display(
                             shell.command.lines().next().unwrap_or("").trim(),
                             48
-                        )
+                        ),
+                        state.t().find.source_output
                     )
                     .as_str(),
                     turn,

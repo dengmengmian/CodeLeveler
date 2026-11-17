@@ -113,6 +113,13 @@ pub fn reload(state: &mut AppState) -> Vec<Effect> {
     vec![Effect::Send(ClientCommand::QueryDiagnostics {
         requester_session_id: state.session_id.clone(),
         query_id: query,
+        locale: Some(
+            match state.locale {
+                crate::i18n::Locale::Zh => "zh",
+                crate::i18n::Locale::En => "en",
+            }
+            .to_string(),
+        ),
     })]
 }
 
@@ -207,9 +214,9 @@ pub fn local_findings(state: &AppState) -> Vec<DiagnosticFinding> {
             DiagnosticStatus::Fail
         },
         vec![if state.runtime_connected {
-            "runtime event stream is connected".into()
+            state.t().doctor_page.e_runtime_connected.to_string()
         } else {
-            "runtime event stream is not connected".into()
+            state.t().doctor_page.e_runtime_disconnected.to_string()
         }],
         None,
     ));
@@ -224,10 +231,14 @@ pub fn local_findings(state: &AppState) -> Vec<DiagnosticFinding> {
             } else {
                 DiagnosticStatus::Pass
             },
-            vec![format!(
-                "serving build {} ({})",
-                build.version, build.revision
-            )],
+            vec![
+                state
+                    .t()
+                    .doctor_page
+                    .e_build
+                    .replacen("{}", &build.version, 1)
+                    .replacen("{}", &build.revision, 1),
+            ],
             state
                 .runtime_version_mismatch
                 .then_some(action_id::RESTART_TO_MATCH),
@@ -237,7 +248,7 @@ pub fn local_findings(state: &AppState) -> Vec<DiagnosticFinding> {
             None,
             DiagnosticCategory::Runtime,
             DiagnosticStatus::Unknown,
-            vec!["the runtime has not reported a known build identity".into()],
+            vec![state.t().doctor_page.e_build_unknown.to_string()],
             None,
         ),
     });
@@ -256,16 +267,24 @@ pub fn local_findings(state: &AppState) -> Vec<DiagnosticFinding> {
         },
         if !snapshot_seen {
             vec![
-                format!("session {}", state.session_id),
-                "no session snapshot has been observed yet".into(),
+                state
+                    .t()
+                    .doctor_page
+                    .e_session
+                    .replacen("{}", state.session_id.as_str(), 1),
+                state.t().doctor_page.e_no_snapshot.to_string(),
             ]
         } else {
             vec![
-                format!("session {}", state.session_id),
+                state
+                    .t()
+                    .doctor_page
+                    .e_session
+                    .replacen("{}", state.session_id.as_str(), 1),
                 if state.session_deleted {
-                    "the runtime's session list no longer contains this session".into()
+                    state.t().doctor_page.e_session_gone.to_string()
                 } else {
-                    "session is present on the runtime".into()
+                    state.t().doctor_page.e_session_present.to_string()
                 },
             ]
         },
@@ -285,13 +304,17 @@ pub fn local_findings(state: &AppState) -> Vec<DiagnosticFinding> {
             DiagnosticStatus::Warn
         },
         if !snapshot_seen {
-            vec!["no session snapshot has been observed, so the crash window is unknown".into()]
+            vec![state.t().doctor_page.e_crash_unknown.to_string()]
         } else if interrupted == 0 {
-            vec!["no crash window is pending for this session".into()]
+            vec![state.t().doctor_page.e_crash_none.to_string()]
         } else {
-            vec![format!(
-                "{interrupted} interrupted tool call(s) await acknowledgement; the next turn is gated"
-            )]
+            vec![
+                state
+                    .t()
+                    .doctor_page
+                    .e_crash_pending
+                    .replacen("{}", &interrupted.to_string(), 1),
+            ]
         },
         (interrupted > 0).then_some(action_id::ACKNOWLEDGE_RECOVERY),
     ));
@@ -306,12 +329,15 @@ pub fn local_findings(state: &AppState) -> Vec<DiagnosticFinding> {
             DiagnosticStatus::Pass
         },
         if !snapshot_seen {
-            vec!["the runtime has not reported this session's permission profile yet".into()]
+            vec![state.t().doctor_page.e_profile_unknown.to_string()]
         } else {
             vec![
-                format!("effective profile: {}", state.mode_label),
-                "explicit run-level restrictions, when present, are not revoked by a profile"
-                    .into(),
+                state
+                    .t()
+                    .doctor_page
+                    .e_profile
+                    .replacen("{}", &state.mode_label, 1),
+                state.t().doctor_page.e_profile_restrictions.to_string(),
             ]
         },
         None,

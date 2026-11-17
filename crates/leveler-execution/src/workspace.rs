@@ -296,6 +296,20 @@ impl Workspace {
         self.root_dir.clone()
     }
 
+    /// The directory classification for [`Self::open_read`].
+    ///
+    /// Opening a directory succeeds with `O_RDONLY` on Unix but fails with
+    /// `ERROR_ACCESS_DENIED` on Windows, so the entry is classified from its
+    /// metadata before the open keeps the same error on every host.
+    fn read_open_is_directory(input: &Path) -> WorkspaceError {
+        let error = std::io::Error::from(std::io::ErrorKind::IsADirectory);
+        WorkspaceError::ReadOpen {
+            path: input.display().to_string(),
+            message: error.to_string(),
+            kind: error.kind(),
+        }
+    }
+
     /// Open a file for reading, with the confinement decision bound to the
     /// object actually opened.
     ///
@@ -313,6 +327,9 @@ impl Workspace {
         let input = input.as_ref();
         let resolved = self.resolve_for_read(input)?;
         if !self.read_confinement {
+            if std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err(Self::read_open_is_directory(input));
+            }
             let file =
                 std::fs::File::open(&resolved).map_err(|error| WorkspaceError::ReadOpen {
                     path: input.display().to_string(),
@@ -322,6 +339,13 @@ impl Workspace {
             return Ok((resolved, file));
         }
         let relative = self.confined_relative(&resolved, input)?;
+        if self
+            .root_dir
+            .metadata(relative)
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            return Err(Self::read_open_is_directory(input));
+        }
         let file = self.root_dir.open(relative).map_err(|error| {
             // cap-std refuses a component that resolves outside the root. That
             // is a confinement denial, not an I/O failure, and it is exactly

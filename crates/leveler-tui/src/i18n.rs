@@ -277,6 +277,22 @@ pub struct DoctorText {
     pub a_review_permission: &'static str,
     pub a_acknowledge_recovery: &'static str,
     pub a_restart_to_match: &'static str,
+    /// Evidence sentences the client owns. Runtime-produced evidence is
+    /// localized by the runtime for the requesting locale.
+    pub e_runtime_connected: &'static str,
+    pub e_runtime_disconnected: &'static str,
+    pub e_build: &'static str,
+    pub e_build_unknown: &'static str,
+    pub e_session: &'static str,
+    pub e_no_snapshot: &'static str,
+    pub e_session_gone: &'static str,
+    pub e_session_present: &'static str,
+    pub e_crash_unknown: &'static str,
+    pub e_crash_none: &'static str,
+    pub e_crash_pending: &'static str,
+    pub e_profile_unknown: &'static str,
+    pub e_profile: &'static str,
+    pub e_profile_restrictions: &'static str,
 }
 
 impl DoctorText {
@@ -1208,6 +1224,12 @@ pub struct UiText {
     pub sessions_empty: &'static str,
     /// A `/sessions` read is outstanding.
     pub sessions_loading: &'static str,
+    /// Session row status words. The wire status is typed data; these are the
+    /// only renderings, so a locale never falls back to the other language.
+    pub sessions_status_active: &'static str,
+    pub sessions_status_answered: &'static str,
+    pub sessions_status_declared: &'static str,
+    pub sessions_status_ended: &'static str,
     pub sessions_footer_hint: &'static str,
     /// Cross-agent session import. `{}` placeholders, in order: source agent,
     /// native session id, runtime reason.
@@ -1757,6 +1779,17 @@ pub struct UiText {
     pub copy_no_shell: &'static str,
     /// `/copy output` when only a truncated tail is retained.
     pub copy_output_unavailable: &'static str,
+    /// The windowed output page's completeness markers.
+    pub output_status_partial_running: &'static str,
+    pub output_status_truncated: &'static str,
+    pub output_status_capture_unavailable: &'static str,
+    /// Prefix for the `/output` pager when the shell has not finished.
+    /// `{}` is the command's running state (localized separately).
+    pub output_partial_marker: &'static str,
+    pub output_partial_running: &'static str,
+    pub output_partial_background: &'static str,
+    /// The complete capture is gone or unreadable.
+    pub output_capture_unavailable: &'static str,
     /// `/copy output` while the execution is still producing output.
     pub copy_still_running: &'static str,
     /// `/copy selection` with an empty selection.
@@ -1846,6 +1879,7 @@ pub struct UiText {
     pub export_project: &'static str,
     pub export_you: &'static str,
     pub export_assistant: &'static str,
+    pub export_tools: &'static str,
     pub export_tool_row: &'static str,
     pub export_tool_exit: &'static str,
     pub export_tool_args: &'static str,
@@ -2041,6 +2075,10 @@ pub struct ReviewText {
     pub disposition_reason: &'static str,
     /// `{}` report revision, `{}` evidence revision.
     pub report_revision: &'static str,
+    /// The inline report is folded; clicking the card opens it.
+    pub expand_hint: &'static str,
+    /// The inline report is open; clicking the card folds it.
+    pub collapse_hint: &'static str,
 }
 
 #[derive(Debug)]
@@ -2864,6 +2902,10 @@ static ZH: UiText = UiText {
     diff_footer_hint: "↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回",
     sessions_empty: "暂无会话",
     sessions_loading: "正在读取会话…",
+    sessions_status_active: "进行中",
+    sessions_status_answered: "已回答",
+    sessions_status_declared: "声明完成",
+    sessions_status_ended: "已结束",
     sessions_footer_hint: "↑↓ 选择 · Enter 打开 · f 筛选 · a 归档 · u 恢复 · d 删除 · t 追踪 · Esc 返回",
     foreign_sessions_empty: "未找到该项目下可接续的会话",
     foreign_sessions_loading: "正在读取本机会话…",
@@ -3513,6 +3555,13 @@ static ZH: UiText = UiText {
     copy_usage: "用法: /copy [N] 复制第 N 条完整回答 · /copy diff|output|command|selection",
     copy_no_shell: "当前会话没有本地命令记录",
     copy_output_unavailable: "完整输出不可用（只保留了末尾），未复制",
+    output_status_partial_running: "部分输出 · 命令仍在运行",
+    output_status_truncated: "部分输出 · 已截断",
+    output_status_capture_unavailable: "部分输出 · 完整捕获不可用",
+    output_partial_marker: "（部分输出 — {}；以下是当前已捕获的内容）",
+    output_partial_running: "命令仍在运行",
+    output_partial_background: "命令在后台运行",
+    output_capture_unavailable: "完整输出不可用（捕获已被清理或无法读取）",
     copy_still_running: "命令仍在运行，完整输出尚未结束，未复制",
     copy_selection_empty: "没有选中可复制的文本",
     copy_no_diff: "最近一次编辑没有上报已应用的补丁",
@@ -3666,6 +3715,8 @@ static ZH: UiText = UiText {
         disposition_duplicate: "重复 · 合并到 {}",
         disposition_reason: "裁决依据：{}",
         report_revision: "报告修订 {} · 证据版本 {}",
+        expand_hint: "▸ 点击展开完整报告",
+        collapse_hint: "▾ 完整报告已展开 · 点击折叠",
     },
 
     // Legacy slash-command copy
@@ -3681,6 +3732,7 @@ static ZH: UiText = UiText {
     export_project: "- 项目: {repository}",
     export_you: "## 你",
     export_assistant: "## 助手",
+    export_tools: "## 工具",
     export_tool_row: "- `{name}` · 调用 {call} · 状态 {status}",
     export_tool_exit: " · 退出码 {code}",
     export_tool_args: "  - 参数: `{args}`",
@@ -3867,6 +3919,20 @@ static ZH: UiText = UiText {
         a_review_permission: "检查当前会话的权限档位",
         a_acknowledge_recovery: "查看并确认崩溃恢复窗口",
         a_restart_to_match: "重启应用到与运行时一致的构建",
+        e_runtime_connected: "运行时事件流已连接",
+        e_runtime_disconnected: "运行时事件流未连接",
+        e_build: "正在运行构建 {}（{}）",
+        e_build_unknown: "运行时尚未报告已知的构建标识",
+        e_session: "会话 {}",
+        e_no_snapshot: "尚未观察到会话快照",
+        e_session_gone: "运行时的会话列表已不包含此会话",
+        e_session_present: "会话存在于运行时",
+        e_crash_unknown: "尚未观察到会话快照，崩溃窗口未知",
+        e_crash_none: "此会话没有待处理的崩溃窗口",
+        e_crash_pending: "{} 个中断的工具调用等待确认；下一轮会被阻止",
+        e_profile_unknown: "运行时尚未报告此会话的权限档位",
+        e_profile: "生效档位：{}",
+        e_profile_restrictions: "显式运行级限制（如有）不会被档位撤销",
     },
     help_page: HelpPageText {
         title: "帮助",
@@ -4523,6 +4589,10 @@ static EN: UiText = UiText {
     diff_footer_hint: "↑↓ select file · PgUp/PgDn scroll · Esc back",
     sessions_empty: "No sessions yet",
     sessions_loading: "Reading sessions…",
+    sessions_status_active: "active",
+    sessions_status_answered: "answered",
+    sessions_status_declared: "declared complete",
+    sessions_status_ended: "ended",
     sessions_footer_hint: "↑↓ select · Enter open · f filter · a archive · u unarchive · d delete · t trace · Esc back",
     foreign_sessions_empty: "No resumable sessions for this project were found",
     foreign_sessions_loading: "Reading local sessions…",
@@ -5172,6 +5242,13 @@ static EN: UiText = UiText {
     copy_usage: "usage: /copy [N] copies the Nth complete answer · /copy diff|output|command|selection",
     copy_no_shell: "this session has no local command record",
     copy_output_unavailable: "complete output unavailable (tail only); nothing was copied",
+    output_status_partial_running: "partial output · command still running",
+    output_status_truncated: "partial output · truncated",
+    output_status_capture_unavailable: "partial output · complete capture unavailable",
+    output_partial_marker: "(partial output — {}; this is what has been captured so far)",
+    output_partial_running: "the command is still running",
+    output_partial_background: "the command is running in the background",
+    output_capture_unavailable: "complete output unavailable (capture cleaned up or unreadable)",
     copy_still_running: "the command is still running; its output is not final",
     copy_selection_empty: "no text is selected",
     copy_no_diff: "the latest edit reported no applied patch",
@@ -5325,6 +5402,8 @@ static EN: UiText = UiText {
         disposition_duplicate: "duplicate · merged into {}",
         disposition_reason: "reason: {}",
         report_revision: "report revision {} · evidence revision {}",
+        expand_hint: "▸ click to expand the full report",
+        collapse_hint: "▾ full report shown · click to fold",
     },
 
     // Legacy slash-command copy
@@ -5340,6 +5419,7 @@ static EN: UiText = UiText {
     export_project: "- Project: {repository}",
     export_you: "## You",
     export_assistant: "## Assistant",
+    export_tools: "## Tools",
     export_tool_row: "- `{name}` · call {call} · status {status}",
     export_tool_exit: " · exit code {code}",
     export_tool_args: "  - Args: `{args}`",
@@ -5526,6 +5606,20 @@ static EN: UiText = UiText {
         a_review_permission: "Review this session's permission profile",
         a_acknowledge_recovery: "Review and acknowledge the crash recovery window",
         a_restart_to_match: "Restart the app to match the runtime build",
+        e_runtime_connected: "runtime event stream is connected",
+        e_runtime_disconnected: "runtime event stream is not connected",
+        e_build: "serving build {} ({})",
+        e_build_unknown: "the runtime has not reported a known build identity",
+        e_session: "session {}",
+        e_no_snapshot: "no session snapshot has been observed yet",
+        e_session_gone: "the runtime's session list no longer contains this session",
+        e_session_present: "session is present on the runtime",
+        e_crash_unknown: "no session snapshot has been observed, so the crash window is unknown",
+        e_crash_none: "no crash window is pending for this session",
+        e_crash_pending: "{} interrupted tool call(s) await acknowledgement; the next turn is gated",
+        e_profile_unknown: "the runtime has not reported this session's permission profile yet",
+        e_profile: "effective profile: {}",
+        e_profile_restrictions: "explicit run-level restrictions, when present, are not revoked by a profile",
     },
     help_page: HelpPageText {
         title: "Help",

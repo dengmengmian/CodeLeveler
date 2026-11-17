@@ -163,7 +163,10 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         } else {
             t.output_screen_paused
         };
-        format!("{rows_label} · {follow}")
+        match view.completeness.label(t) {
+            Some(completeness) => format!("{completeness} · {rows_label} · {follow}"),
+            None => format!("{rows_label} · {follow}"),
+        }
     });
     // Copy feedback is otherwise painted only on the Conversation strip; a
     // secondary page must still say whether the clipboard write happened.

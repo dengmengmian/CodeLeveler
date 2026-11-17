@@ -244,6 +244,16 @@ pub fn open(state: &mut AppState) -> Vec<Effect> {
     refresh(state)
 }
 
+/// One level of back: an open task detail, otherwise the page. The same rule
+/// the Esc key follows.
+pub fn back(state: &mut AppState) -> bool {
+    if state.tasks.detail_open {
+        state.tasks.detail_open = false;
+        return true;
+    }
+    false
+}
+
 pub fn close(state: &mut AppState) {
     state.active_screen = crate::screen::Screen::Conversation;
     state.screen_scroll = 0;

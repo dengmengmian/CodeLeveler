@@ -56,6 +56,9 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
+# The audited `unsafe` boundary for the seccomp protected-path fence. It only
+# exists on Linux; `linux_fence` supplies the policy and fail-closed wiring.
+leveler-linux-confine = { workspace = true }
 
 [dev-dependencies]
 leveler-test-support = { workspace = true }

@@ -1062,16 +1062,36 @@ fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 shell.output.clone(),
                 shell.output_truncated,
                 shell.full_output.clone(),
+                shell.status,
             )),
             _ => None,
         });
-    let Some((retained, truncated, full_output)) = latest else {
+    let Some((retained, truncated, full_output, status)) = latest else {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
             message: state.t().copy_no_shell.to_string(),
         });
         return Vec::new();
     };
+    // A shell that has not finished has no complete result, even if it
+    // retained a tail: say so instead of presenting the tail as the whole
+    // output.
+    if !status.is_terminal() {
+        let running = match status {
+            crate::transcript::UserShellStatus::Running => Some(state.t().output_partial_running),
+            crate::transcript::UserShellStatus::Background => {
+                Some(state.t().output_partial_background)
+            }
+            _ => None,
+        };
+        let marker = running
+            .map(|label| state.t().output_partial_marker.replacen("{}", label, 1))
+            .unwrap_or_default();
+        let body = crate::shell_render::copy_text(&retained);
+        return vec![Effect::OpenOutputPager {
+            source: PagerSource::Text(format!("{marker}\n\n{body}")),
+        }];
+    }
     if let Some(directory) = full_output
         && let Ok(capture) = crate::artifact_ref::validated_shell_capture(state, &directory)
     {
@@ -1084,7 +1104,7 @@ fn output_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     if truncated {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: state.t().copy_output_unavailable.to_string(),
+            message: state.t().output_capture_unavailable.to_string(),
         });
         return Vec::new();
     }
@@ -1268,7 +1288,8 @@ fn build_export_markdown(state: &AppState) -> String {
                 out.push_str("\n\n");
             }
             TranscriptItem::UserInput(block) => {
-                out.push_str("## 你\n\n");
+                out.push_str(state.t().export_you);
+                out.push_str("\n\n");
                 out.push_str(block.text.trim());
                 out.push_str("\n\n");
             }
@@ -1348,7 +1369,7 @@ fn exported_tool_evidence(state: &AppState) -> String {
     if rows.is_empty() {
         String::new()
     } else {
-        format!("## Tools\n\n{rows}\n")
+        format!("{}\n\n{rows}\n", state.t().export_tools)
     }
 }
 
@@ -2133,6 +2154,23 @@ mod export_tests {
     #[test]
     fn export_headings_follow_the_ui_locale() {
         let mut s = state_with_dialogue();
+        s.transcript.push_input(
+            MessageId::new("ui-1"),
+            "补充一句：标题也要跟着语言".into(),
+            InputDelivery::Delivered,
+        );
+        let call = leveler_client_protocol::ToolCallId::new("call-export");
+        s.transcript.push_tool_started(
+            call.clone(),
+            "read_file".into(),
+            r#"{"path":"src/lib.rs"}"#.into(),
+            false,
+            0,
+            None,
+            None,
+        );
+        s.transcript
+            .complete_command(&call, true, "ok".into(), 3, None, Some(0), None);
         s.locale = crate::i18n::Locale::En;
         let md = build_export_markdown(&s);
         assert!(
@@ -2142,8 +2180,32 @@ mod export_tests {
         assert!(md.contains("## You\n\n"), "{md}");
         assert!(md.contains("## Assistant\n\n"), "{md}");
         assert!(
+            md.contains(crate::i18n::Locale::En.text().export_tools),
+            "{md}"
+        );
+        assert!(
             !md.contains(crate::i18n::Locale::Zh.text().export_title),
             "the English export must not mix in the Chinese title: {md}"
+        );
+        assert!(
+            !md.contains("## 你") && !md.contains(crate::i18n::Locale::Zh.text().export_tools),
+            "the English export must not mix in Chinese section headings: {md}"
+        );
+        // The structured evidence is preserved, not translated away.
+        assert!(
+            md.contains("read_file") && md.contains("call-export"),
+            "{md}"
+        );
+
+        s.locale = crate::i18n::Locale::Zh;
+        let zh = build_export_markdown(&s);
+        assert!(
+            zh.contains(crate::i18n::Locale::Zh.text().export_tools),
+            "{zh}"
+        );
+        assert!(
+            !zh.contains(crate::i18n::Locale::En.text().export_tools),
+            "the Chinese export must not use the English Tools heading: {zh}"
         );
     }
 
@@ -2172,7 +2234,14 @@ mod export_tests {
         s.transcript
             .complete_command(&id, true, preview, 12, None, Some(0), None);
         let md = build_export_markdown(&s);
-        assert!(md.contains("## Tools"), "{md}");
+        assert!(
+            md.contains(crate::i18n::Locale::Zh.text().export_tools),
+            "{md}"
+        );
+        assert!(
+            !md.contains(crate::i18n::Locale::En.text().export_tools),
+            "the Chinese export must not use the English Tools heading: {md}"
+        );
         assert!(md.contains("read_file"), "{md}");
         assert!(md.contains("call-1"), "{md}");
         assert!(md.contains("退出码 0"), "{md}");

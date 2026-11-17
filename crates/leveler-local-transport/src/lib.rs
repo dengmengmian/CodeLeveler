@@ -3428,6 +3428,7 @@ mod tests {
         let command = ClientCommand::QueryDiagnostics {
             requester_session_id: session.clone(),
             query_id: leveler_client_protocol::CommandId::new("diag-tcp"),
+            locale: None,
         };
         assert!(
             client

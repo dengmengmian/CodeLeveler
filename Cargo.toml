@@ -10,6 +10,7 @@ members = [
     "crates/leveler-project",
     "crates/leveler-execution",
     "crates/leveler-win-confine",
+    "crates/leveler-linux-confine",
     "crates/leveler-tools",
     "crates/leveler-memory",
     "crates/leveler-agent-core",
@@ -57,6 +58,7 @@ leveler-storage = { version = "1.0.27", path = "crates/leveler-storage" }
 leveler-project = { version = "1.0.27", path = "crates/leveler-project" }
 leveler-execution = { version = "1.0.27", path = "crates/leveler-execution" }
 leveler-win-confine = { version = "1.0.27", path = "crates/leveler-win-confine" }
+leveler-linux-confine = { version = "1.0.27", path = "crates/leveler-linux-confine" }
 leveler-win-local-ipc = { version = "1.0.27", path = "crates/leveler-win-local-ipc" }
 leveler-tools = { version = "1.0.27", path = "crates/leveler-tools" }
 leveler-memory = { version = "1.0.27", path = "crates/leveler-memory" }
