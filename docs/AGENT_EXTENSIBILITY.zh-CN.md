@@ -1,14 +1,14 @@
 # 自定义 Agent
 
-[English](AGENT_EXTENSIBILITY.md) · [返回首页](../README.zh-CN.md)
+[English](AGENT_EXTENSIBILITY.md) · [文档索引](README.zh-CN.md)
 
-自定义 Agent 为特定工作提供固定说明，例如只读代码审查或前端开发。
+如果你经常请 CodeLeveler 做同一种工作，可以把要求写进一个自定义 Agent。例如，给安全审查 Agent 写好检查范围，以后在对话里点名调用。
 
 ## 创建
 
-可以直接让 CodeLeveler 创建，也可以在 Web 界面的「设置 → Agents」中创建。通过对话保存或删除定义前，会展示内容并要求你确认。
+在 Web 界面打开「设置 → Agents」，或直接在对话里请 CodeLeveler 创建。通过对话保存或删除时，界面会先展示要改的内容，等你确认。
 
-手动创建时，每个 Agent 是一个目录，包含 `agent.yaml` 和 `instructions.md`：
+也可以自己建目录。每个 Agent 需要两个文件，`agent.yaml` 填设置，`instructions.md` 写工作要求。
 
 | 位置 | 生效范围 |
 | --- | --- |
@@ -35,7 +35,7 @@ capability: read_only
 每条说明影响、触发条件和修复方向；没有发现就直接说明。
 ```
 
-名字需与目录名一致，使用小写字母、数字和连字符，并以字母开头。工作说明不要放凭据，会随请求发送给模型。
+名字需与目录名一致，使用小写字母、数字和连字符，并以字母开头。工作说明会发给模型，请把凭据留在配置引用或环境变量里。
 
 ## 常用设置
 
@@ -63,8 +63,8 @@ workspace:
 
 运行 `leveler agents list` 查看可用 Agent，`leveler agents show <name>` 查看定义，或在终端输入 `/agents`。
 
-在对话中点名即可，例如「让 security-reviewer 检查这次改动」。无效定义、缺失模型或技能会明确报错，可用 `leveler doctor` 排查；缺 API Key 仍可能在实际调用时失败。
+例如，在对话里输入「让 security-reviewer 检查这次改动」。如果报错说定义有问题、找不到模型或技能，用 `leveler doctor` 排查。API Key 缺失也可能到调用模型时才报错。
 
 修改定义只影响之后启动的 Agent。删除定义不会停止已经运行的任务。
 
-项目 Agent 来自仓库；使用不信任的项目之前，请先检查其定义。工作说明不能扩大工具或写入权限。
+打开陌生项目时，先读一下仓库里的 Agent 定义。工作说明只能在已有的工具与写入权限内生效。

@@ -7,13 +7,11 @@
 <p align="center">A coding agent that works in your local repository</p>
 <p align="center"><a href="README.zh-CN.md">中文</a> · <a href="LICENSE-APACHE">Apache 2.0</a></p>
 
-Give CodeLeveler a task to read code, edit files, and run tests. Inspect the changes as it works and resume your session later.
-
-Use the terminal, browser, or command line with BigModel, DeepSeek, Moonshot/Kimi, OpenAI, Anthropic, or other OpenAI-compatible services. Sessions stay on your machine; model requests go to your configured provider.
+CodeLeveler reads code, edits files, and runs tests in your local workspace. Inspect tool output and diffs in the terminal or browser, reopen a session later, or run a task directly from the CLI. Choose BigModel, DeepSeek, Moonshot/Kimi, OpenAI, Anthropic, or another OpenAI-compatible provider.
 
 ## Install
 
-macOS and Linux:
+The installer supports macOS (Apple Silicon and Intel) and Linux x86_64. It verifies the archive’s SHA-256 checksum.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh | sh
@@ -27,62 +25,48 @@ Or use Homebrew (macOS and Linux x86_64):
 brew install dengmengmian/tap/leveler
 ```
 
-On Windows, download the matching archive from [Releases](https://github.com/dengmengmian/CodeLeveler/releases), verify its supplied SHA-256 checksum, extract it, and add the directory to `PATH`. Keep `leveler.exe` and `leveler-confine.exe` together.
+On Windows x86_64, download the matching archive from [Releases](https://github.com/dengmengmian/CodeLeveler/releases), verify its supplied SHA-256 checksum, extract it, and add the directory to `PATH`. Keep `leveler.exe` and `leveler-confine.exe` together.
 
 On Linux, install `bubblewrap` before using restricted commands, for example with `sudo apt install bubblewrap`.
 
-## Get started
+To build from source, see the [contributing guide](CONTRIBUTING.md#build-locally).
+
+## Quickstart
+
+After installing, configure a model provider and open the terminal UI from your project directory.
 
 ```sh
-leveler login              # choose a provider and configure an API key
-cd your-project
+leveler login
+cd /path/to/your/project
 leveler
 ```
 
-Start with a clean Git working tree so changes are easy to review. Run `leveler doctor` to diagnose configuration or environment issues.
+Try asking “Find the test entry points for this project and run the smallest relevant set of tests.” Enter `/help` in the terminal UI for commands, or run `leveler doctor` to diagnose setup issues.
 
-| Task | Command |
+| Task | Entry point |
 | --- | --- |
-| Open the terminal UI | `leveler` |
+| Inspect and edit a project interactively | `leveler` |
 | Open the browser UI | `leveler web` |
-| Run a task directly | `leveler run "find the failing tests and fix them"` |
-| Resume a session | `leveler resume` |
-| Show help | `leveler --help` |
-
-`leveler run --parallel 2` preserves the selected permission profile, network restriction and model-step ceiling, and supports `--output jsonl`. Parallel runs reject shipping flags (`--commit`, `--push`, `--pr`, `--branch`, `--pr-base`) before starting; ship the reviewed integration separately. For single-task runs, shipping works with either output format and shipping failures return a non-zero exit code. Candidate setup, execution or commit errors fail the run with their original cause before integration; the run still records candidate completion and cleans up its worktrees. Parallel candidates inherit the parent state home. Cleanup failures retain their paths in warnings and the persisted terminal record; they do not undo integration or replace the primary task error.
-
-In the terminal, `/goal <task>` runs an explicit goal to completion, with the completion gate deciding when it is done. Use `/help` for commands and shortcuts, and `/thinking` to adjust reasoning intensity.
-
-Multiple TUIs in the same project share its runtime. If an upgrade finds that runtime busy, a client with a compatible protocol and matching configuration opens against the existing runtime; a later startup retries the upgrade once it is idle. Normal TUI exit first cancels any remaining turn and stops background tasks in the current session, leaving other sessions running. Exit waits for cleanup to finish and reports failures instead of silently disconnecting. A lost connection or forcibly terminated client does not stop the shared runtime's tasks.
-
-Tool execution summaries append elapsed time from actual admitted dispatch, update once per second, and freeze at the final execution boundary. Reconnects restore the runtime clock. Old history and detached process lifetimes without reliable execution timing keep their original summaries; unrelated clocks are never combined. Approval dialogs initially select **Allow once**; Esc still denies.
+| Run a task directly from a shell or script | `leveler run "find and fix the failing tests"` |
+| Reopen a session | `leveler resume` |
+| Run a goal with acceptance criteria in the terminal UI | `/goal <task>` |
 
 ## Permissions and privacy
 
-The default Auto mode allows ordinary development actions and asks for approval for dangerous operations. Choose Restricted for stricter approval, or Full to allow all operations in an environment you trust.
+The default Auto mode allows ordinary development actions and asks for approval for risky operations. Restricted applies tighter resource and approval boundaries. Full permits unrestricted filesystem and network access at the CodeLeveler layer.
 
-The model may read workspace content and send relevant material to your provider. Keep secrets outside workspaces accessible to the agent. See the [security policy](SECURITY.md) for permission and platform limitations.
+Session records stay on your machine. Model requests may include workspace content and go to your configured provider. See the [security policy](SECURITY.md) for permissions, data flow, and platform limits.
 
 ## Update
 
-For Homebrew installs:
+For Homebrew installs, run `brew upgrade leveler`. For other installs, run `leveler update` to get the stable release.
 
-```sh
-brew upgrade leveler
-```
+## Documentation, help, and contributing
 
-Other installs check for stable updates automatically. To update manually:
+- [Documentation index](docs/README.md) · [Everyday use and troubleshooting](docs/USAGE.md) · [Version history](CHANGELOG.md)
+- [Contributing guide](CONTRIBUTING.md) · [Coding agent instructions](AGENTS.md)
+- [Report a bug or request a feature](https://github.com/dengmengmian/CodeLeveler/issues/new/choose) · [Report a vulnerability privately](SECURITY.md#reporting-a-vulnerability)
 
-```sh
-leveler update
-```
+## License
 
-## User guides
-
-- [Everyday use](docs/USAGE.md)
-- [Cross-session memory](docs/MEMORY.md)
-- [Custom agents](docs/AGENT_EXTENSIBILITY.md)
-- [Latest release](docs/RELEASE.md)
-- [Version history](CHANGELOG.md)
-
-Report security vulnerabilities privately using the [security policy](SECURITY.md).
+[Apache License 2.0](LICENSE-APACHE).

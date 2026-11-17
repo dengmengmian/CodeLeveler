@@ -7,13 +7,11 @@
 <p align="center">在本地仓库里工作的编程智能体</p>
 <p align="center"><a href="README.md">English</a> · <a href="LICENSE-APACHE">Apache 2.0</a></p>
 
-给 CodeLeveler 一个任务，让它读代码、修改文件、运行测试。你可以随时查看改动，关闭后也能继续会话。
-
-支持终端、浏览器和命令行，以及 BigModel、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic 和其他 OpenAI 兼容服务。会话保存在本机，模型请求发送给你配置的服务商。
+CodeLeveler 在你的本地工作区读取代码、编辑文件并运行测试。你可以在终端或浏览器里查看工具输出和改动，稍后重新打开会话，也可以通过 CLI 直接执行任务。模型可选 BigModel、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic 或其他 OpenAI 兼容服务。
 
 ## 安装
 
-macOS、Linux：
+macOS（Apple Silicon 或 Intel）与 Linux x86_64 可以用安装脚本。脚本会校验下载包的 SHA-256。
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh | sh
@@ -27,62 +25,48 @@ curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/insta
 brew install dengmengmian/tap/leveler
 ```
 
-Windows 请从[发布页](https://github.com/dengmengmian/CodeLeveler/releases)下载对应压缩包，校验附带的 SHA-256，解压后将目录加入 `PATH`。保持 `leveler.exe` 与 `leveler-confine.exe` 在同一目录。
+Windows x86_64 请从[发布页](https://github.com/dengmengmian/CodeLeveler/releases)下载对应压缩包，校验附带的 SHA-256，解压后将目录加入 `PATH`。保持 `leveler.exe` 与 `leveler-confine.exe` 在同一目录。
 
 Linux 使用受限命令前需安装 `bubblewrap`，例如 `sudo apt install bubblewrap`。
 
-## 开始使用
+从源码构建请看[贡献指南](CONTRIBUTING.zh-CN.md#本地构建)。
+
+## 快速开始
+
+安装后，配置模型服务商，再从项目目录打开终端界面。
 
 ```sh
-leveler login              # 选择服务商并配置 API Key
-cd your-project
+leveler login
+cd /path/to/your/project
 leveler
 ```
 
-建议从干净的 Git 工作区开始，方便检查改动。遇到配置或环境问题时运行 `leveler doctor`。
+试着输入「梳理这个项目的测试入口，然后运行最小的一组相关测试」。用 `/help` 查看界面命令，遇到配置或环境问题时运行 `leveler doctor`。
 
-| 想做什么 | 命令 |
+| 任务 | 入口 |
 | --- | --- |
-| 打开终端界面 | `leveler` |
-| 打开浏览器界面 | `leveler web` |
-| 直接执行任务 | `leveler run "找出失败的测试并修好"` |
-| 继续之前的会话 | `leveler resume` |
-| 查看帮助 | `leveler --help` |
-
-`leveler run --parallel 2` 保留指定的权限模式、网络限制和模型步数上限，支持 `--output jsonl`。并行任务会在启动前拒绝 shipping 参数（`--commit`、`--push`、`--pr`、`--branch`、`--pr-base`）；请审查合并结果后单独提交或推送。单任务的 shipping 支持两种输出格式，失败时返回非零退出码。 候选初始化、执行或提交出错时，会在集成前保留原始原因并返回失败，同时记录候选结束并清理本次 worktree。 并行候选继承父任务的状态 home。清理失败会以警告报告残留路径并持久化，不撤销已集成结果，也不覆盖原始任务错误。
-
-终端里可以使用 `/goal <任务>` 显式执行一个目标，并由完成门禁判定何时真正完成。`/help` 查看命令与快捷键，`/thinking` 调整模型思考强度。
-
-同项目的多个 TUI 共用运行时。升级时若现有运行时仍忙，协议兼容且配置一致的客户端会先连接它打开界面；后续启动会在其空闲时再次尝试升级。正常退出 TUI 会先取消本会话尚未结束的轮次并停止后台任务，其他会话继续运行。退出会等待清理完成，失败时明确报错，不静默断开。连接中断或客户端被强制终止不会停止共享运行时中的任务。
-
-工具执行摘要末尾显示实际执行耗时，每秒更新，全部执行结束后冻结；重新连接时恢复运行时计时。缺少可靠时间的旧历史和后台进程生命周期保持原有摘要，不会把不同计时基准拼成耗时。权限确认默认选中**仅允许本次**，Esc 仍然拒绝。
+| 查看项目并交互修改 | `leveler` |
+| 在浏览器打开界面 | `leveler web` |
+| 从脚本或命令行直接执行任务 | `leveler run "找出失败的测试并修复"` |
+| 打开已有会话 | `leveler resume` |
+| 在终端界面运行带验收条件的目标 | `/goal <任务>` |
 
 ## 权限与隐私
 
-默认 Auto 模式允许普通开发操作，危险操作需要批准。需要更严格的审批时选择 Restricted；Full 允许全部操作，请仅在信任的环境中使用。
+默认 Auto 模式允许日常开发操作，危险操作需要批准。Restricted 采用更严格的资源与授权边界。Full 在 CodeLeveler 层开放文件和网络访问。
 
-模型可能读到工作区内容，并将相关内容发送给服务商。不要把密钥放在智能体可访问的工作区。权限与平台限制见[安全说明](SECURITY.md)。
+会话记录保存在本机。模型请求可能包含工作区内容，并发送给你配置的服务商。查看[安全策略](SECURITY.md)了解权限、数据流向及平台限制。
 
 ## 更新
 
-Homebrew 安装：
+Homebrew 安装用 `brew upgrade leveler`。其他安装方式可运行 `leveler update` 获取稳定版。
 
-```sh
-brew upgrade leveler
-```
+## 文档、帮助与贡献
 
-其他安装方式默认自动检查稳定版，也可以手动更新：
+- [文档索引](docs/README.zh-CN.md) · [日常使用与排查](docs/USAGE.zh-CN.md) · [版本历史](CHANGELOG.zh-CN.md)
+- [贡献指南](CONTRIBUTING.zh-CN.md) · [开发代理规则](AGENTS.md)
+- [提交问题或建议](https://github.com/dengmengmian/CodeLeveler/issues/new/choose) · [私下报告安全漏洞](SECURITY.md#reporting-a-vulnerability)
 
-```sh
-leveler update
-```
+## 许可证
 
-## 使用文档
-
-- [日常使用](docs/USAGE.zh-CN.md)
-- [跨会话记忆](docs/MEMORY.zh-CN.md)
-- [自定义 Agent](docs/AGENT_EXTENSIBILITY.zh-CN.md)
-- [本版更新](docs/RELEASE.zh-CN.md)
-- [历史版本](CHANGELOG.zh-CN.md)
-
-安全漏洞请按[安全策略](SECURITY.md)私下报告。
+[Apache License 2.0](LICENSE-APACHE)。

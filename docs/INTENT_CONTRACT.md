@@ -1,9 +1,8 @@
 # User Intent Contract
 
-How one user message changes a goal's execution authorization. The contract
-exists so that "继续", "go ahead", "続けて" and "等一下，先别做阶段 2" are all
-read by the model that is already running the turn — never by a keyword list,
-a second classifier call, or a client-side route.
+[中文](INTENT_CONTRACT.zh-CN.md) · [Documentation index](README.md)
+
+Suppose you say “Keep going, then stop after stage three.” The model running the turn reads that as two operations: continue the current goal, then pause after the specified step. It submits both operations with your original words. The runtime checks the quote, goal, and step before recording the change. The process is the same for messages in other languages.
 
 ## Ownership
 

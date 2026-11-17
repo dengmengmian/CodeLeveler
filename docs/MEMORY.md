@@ -151,12 +151,12 @@ list, pending observations, archives, tombstones and the Dream lease state.
 | `f` | Refresh the index |
 | `Esc` | Back |
 
-`t` affects only the current session: the configured rollout stays the authority,
-the page cannot promote `off`, and nothing is written back to `config.toml`.
-While paused the prompt index is not injected and no new capture job is claimed;
-resuming captures the turns that ended during the pause. The pause lives in
-this process: a new session, and the same session reopened after a restart,
-start from the configuration again.
+Pressing `t` pauses memory for the current session. You can still browse saved
+notes. The model receives no memory index and the runtime claims no new capture
+jobs. Turns that finish while paused are skipped, including after you resume.
+New sessions and sessions reopened after a restart use the configured setting.
+The key leaves `config.toml` alone and cannot enable memory when the configured
+rollout is `off`.
 
 ### CLI
 
@@ -165,7 +165,7 @@ leveler memory status                 # rollout, scopes, counters, files, lease
 leveler memory status --json          # machine-readable
 leveler memory show workspace topics/build.md   # preview; BLAKE3 on stderr
 leveler memory remember "Use pnpm, not npm"     # append a global note
-leveler memory forget workspace topics/build.md --hash <BLAKE3>
+leveler memory forget workspace topics/build.md --hash 'PASTE_BLAKE3_FROM_SHOW'
 ```
 
 Inside a session: `/memory`, `/remember <text>`, `/dream`, `/flush`.
