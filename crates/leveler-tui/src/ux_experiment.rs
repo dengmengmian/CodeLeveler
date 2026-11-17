@@ -60,6 +60,7 @@ fn opened(goal: &str) -> AppState {
         task_status: None,
         task_terminal: None,
         goal: goal.into(),
+        title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/deepseek-flash"),
         mode: PermissionProfile::Assisted,
         branch: Some("main".into()),

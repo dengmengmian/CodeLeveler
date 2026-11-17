@@ -151,6 +151,33 @@ async fn duplicate_command_id_dispatches_once_body() {
     settle_background_turns(&app, &client, &[&session_id]).await;
 }
 
+/// D15: asking to open a session that no longer exists is an answer, not a
+/// silent success. The client must be able to tell the user why nothing
+/// happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_missing_session_reports_an_error() {
+    let (_tmp, _app, client, session_id) = build_client().await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::OpenSessionFor {
+            requester_session_id: session_id.clone(),
+            session_id: SessionId::new("missing-session"),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(RuntimeEvent::Notification {
+                level: leveler_client_protocol::NotificationLevel::Error,
+                message,
+            })) if message.contains("不存在") => break,
+            Ok(Ok(_)) | Err(_) if tokio::time::Instant::now() < deadline => continue,
+            other => panic!("no missing-session error notification: {other:?}"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_title_changes_from_one_snapshot_have_only_one_winner() {
     let (_tmp, app, client, session) = build_client().await;
@@ -187,7 +214,14 @@ async fn concurrent_title_changes_from_one_snapshot_have_only_one_winner() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.goal, if left.is_ok() { "left" } else { "right" });
+    assert_eq!(
+        row.title.as_deref(),
+        Some(if left.is_ok() { "left" } else { "right" })
+    );
+    assert_eq!(
+        row.goal, "goal",
+        "rename must not rewrite the original request"
+    );
     let fresh = client.snapshot(&session).await.unwrap();
     assert!(
         fresh.last_sequence.unwrap_or(0) > version,
@@ -1313,8 +1347,13 @@ async fn first_message_retitles_a_placeholder_session_body() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            record.goal, "帮我修复登录超时的 bug",
-            "placeholder goal must become the first sentence of the first message"
+            record.title.as_deref(),
+            Some("帮我修复登录超时的 bug"),
+            "a placeholder session is named from the first sentence"
+        );
+        assert_eq!(
+            record.goal, "interactive session",
+            "the original request column is untouched by the derived title"
         );
     }
 
@@ -1390,10 +1429,15 @@ async fn session_menu_rename_archive_fork_roundtrip_body() {
         })
         .await
         .unwrap();
+    let renamed = sessions.get(&session_id).await.unwrap().unwrap();
     assert_eq!(
-        sessions.get(&session_id).await.unwrap().unwrap().goal,
-        "登录修复方案",
-        "rename trims and overwrites the title"
+        renamed.title.as_deref(),
+        Some("登录修复方案"),
+        "rename trims and writes the display title"
+    );
+    assert_eq!(
+        renamed.goal, "goal",
+        "rename keeps the verbatim original request"
     );
 
     // Fork: a new session appears with the transcript copied.
@@ -1409,7 +1453,12 @@ async fn session_menu_rename_archive_fork_roundtrip_body() {
         .iter()
         .find(|r| r.id != session_id.as_str())
         .expect("forked session listed");
-    assert_eq!(fork.goal, "登录修复方案 (分叉)");
+    assert_eq!(
+        fork.title.as_deref(),
+        Some("登录修复方案 (分叉)"),
+        "the fork is named after the display title"
+    );
+    assert_eq!(fork.goal, "goal", "the fork keeps the verbatim request");
     let fork_id = SessionId::new(fork.id.clone());
     assert!(
         leveler_storage::TaskStore::task_for_session(&db, &fork_id)
@@ -2107,7 +2156,8 @@ async fn settings_require_observed_versions_and_completed_retries_remain_idempot
     envelope.expected_version = Some(original.last_sequence.unwrap_or(0));
     client.deliver(envelope.clone()).await.unwrap();
     let accepted = client.snapshot(&session_id).await.unwrap();
-    assert_eq!(accepted.goal, "accepted title");
+    assert_eq!(accepted.title.as_deref(), Some("accepted title"));
+    assert_eq!(accepted.goal, original.goal);
     client.deliver(envelope.clone()).await.unwrap();
     assert_eq!(
         client.snapshot(&session_id).await.unwrap().last_sequence,
@@ -2194,7 +2244,7 @@ async fn two_socket_clients_cannot_replace_settings_from_one_snapshot() {
     let ClientCommand::RenameSession { name, .. } = &winner.command else {
         unreachable!()
     };
-    assert_eq!(&fresh.goal, name);
+    assert_eq!(fresh.title.as_deref(), Some(name.as_str()));
     assert!(fresh.last_sequence.unwrap_or(0) > observed.last_sequence.unwrap_or(0));
     left.deliver(winner.clone()).await.unwrap();
     assert_eq!(
@@ -2208,8 +2258,9 @@ async fn two_socket_clients_cannot_replace_settings_from_one_snapshot() {
             .await
             .unwrap()
             .unwrap()
-            .goal,
-        *name
+            .title
+            .as_deref(),
+        Some(name.as_str())
     );
     drop(left);
     drop(right);

@@ -48,6 +48,7 @@ fn snapshot(model: &str) -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "g".into(),
+        title: None,
         model: ModelRef::parse(model),
         mode: PermissionProfile::Assisted,
         branch: None,

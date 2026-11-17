@@ -62,6 +62,7 @@ fn snapshot(
         history: None,
         id: leveler_client_protocol::SessionId::new("s1"),
         goal: "dogfood".into(),
+        title: None,
         thinking: Some(leveler_client_protocol::UiThinkingState {
             configured,
             session_override,
@@ -88,6 +89,7 @@ fn blank() -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "dogfood".into(),
+        title: None,
         model: None,
         mode: leveler_client_protocol::PermissionProfile::Assisted,
         branch: None,

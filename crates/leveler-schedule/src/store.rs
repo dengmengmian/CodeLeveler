@@ -679,6 +679,23 @@ impl ScheduleStore {
             .ok_or_else(|| ScheduleError::NotFound(definition.id.clone()))
     }
 
+    /// Clear a session binding whose session was deleted.
+    ///
+    /// A definition that continues its session would otherwise resume a row
+    /// that no longer exists; the next run starts a fresh session instead.
+    /// Historical run rows keep the old id as evidence.
+    pub async fn clear_session(&self, session_id: &SessionId) -> Result<u64, ScheduleError> {
+        let updated = sqlx::query(
+            "UPDATE schedule_definitions SET session_id = NULL, updated_at = ? \
+             WHERE session_id = ?",
+        )
+        .bind(timestamp(leveler_core::now()))
+        .bind(session_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected())
+    }
+
     /// Bind the definition's durable session. A concurrent winner's value is
     /// returned; a different existing value is a hard error, never replaced.
     pub async fn set_session(
@@ -2699,6 +2716,42 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "s-1"
+        );
+    }
+
+    /// A deleted session's binding is cleared, so the next run starts a fresh
+    /// session instead of trying to resume a row that no longer exists.
+    #[tokio::test]
+    async fn a_deleted_sessions_binding_is_cleared() {
+        let store = store().await;
+        let now = leveler_core::now();
+        let created = store
+            .create_definition(definition(ScheduleTrigger::Once { at: now }))
+            .await
+            .unwrap();
+        store
+            .set_session(&created.id, &session("s-1"))
+            .await
+            .unwrap();
+        assert_eq!(store.clear_session(&session("s-1")).await.unwrap(), 1);
+        assert_eq!(
+            store
+                .definition(&created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id,
+            None
+        );
+        assert_eq!(store.clear_session(&session("s-1")).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .set_session(&created.id, &session("s-2"))
+                .await
+                .unwrap()
+                .as_str(),
+            "s-2",
+            "the definition can bind a fresh session after the old one is gone"
         );
     }
 

@@ -301,6 +301,7 @@ mod tests {
             task_status: None,
             task_terminal: None,
             goal: "interactive session".to_string(),
+            title: None,
             model: None,
             mode: crate::PermissionProfile::Assisted,
             branch: None,

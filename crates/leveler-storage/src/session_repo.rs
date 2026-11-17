@@ -82,7 +82,16 @@ pub struct SessionRecord {
     /// Existing sessions retain their original absolute workspace path.
     pub repository: Option<String>,
     /// The user's original request, stored verbatim.
+    ///
+    /// Rename never writes this column: the record of what the user asked for
+    /// must survive a display-title change. Read [`Self::title`] for display.
     pub goal: String,
+    /// Optional display title (rename / first-message naming).
+    ///
+    /// `None` means "derive from `goal`", which is how every row behaved
+    /// before the column existed.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Lifecycle status. Round-trips through a wire string; an unrecognized
     /// persisted value fails the read rather than defaulting.
     pub status: SessionStatus,
@@ -113,6 +122,7 @@ pub(crate) struct SessionRow {
     id: String,
     repository: Option<String>,
     goal: String,
+    title: Option<String>,
     status: String,
     model: Option<String>,
     state: String,
@@ -128,6 +138,7 @@ impl SessionRow {
             id: self.id,
             repository: self.repository,
             goal: self.goal,
+            title: self.title,
             status: SessionStatus::from_str(&self.status)?,
             model: self.model,
             state: AgentState::from_str(&self.state)?,
@@ -196,7 +207,7 @@ impl<'a> SessionRepository<'a> {
     /// archiving is exactly "hide from the default list".
     pub async fn list(&self) -> Result<Vec<SessionRecord>, StorageError> {
         let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, repository, goal, status, model, state, created_at, updated_at, \
+            "SELECT id, repository, goal, title, status, model, state, created_at, updated_at, \
              collaboration, work_profile \
              FROM sessions WHERE archived_at IS NULL ORDER BY created_at DESC",
         )
@@ -223,7 +234,7 @@ impl<'a> SessionRepository<'a> {
     /// Fetch one session by id.
     pub async fn get(&self, id: &SessionId) -> Result<Option<SessionRecord>, StorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, repository, goal, status, model, state, created_at, updated_at, \
+            "SELECT id, repository, goal, title, status, model, state, created_at, updated_at, \
              collaboration, work_profile \
              FROM sessions WHERE id = ?1",
         )
@@ -244,6 +255,20 @@ impl<'a> SessionRepository<'a> {
         now: Timestamp,
     ) -> Result<SessionEditResult, StorageError> {
         self.edit_metadata(id, Some(expected), edit, now).await
+    }
+
+    /// Rename the display title without touching the original request.
+    ///
+    /// CLI/headless surface of the same metadata edit the TUI and Web send as
+    /// a versioned `RenameSession`.
+    pub async fn rename(
+        &self,
+        id: &SessionId,
+        title: &str,
+        now: Timestamp,
+    ) -> Result<SessionEditResult, StorageError> {
+        self.edit_metadata(id, None, &SessionEdit::Title(title.to_string()), now)
+            .await
     }
 
     /// A goal/plan submission changes only its collaboration axis, preserving
@@ -389,11 +414,11 @@ impl<'a> SessionRepository<'a> {
         }
         let (sql, value, pending, field, column) = match edit {
             SessionEdit::Title(value) => (
-                "UPDATE sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1",
                 Some(value.as_str()),
                 None,
-                "goal",
-                "goal",
+                "title",
+                "title",
             ),
             SessionEdit::Model(value) => (
                 // An explicit model choice pins the session, so a later global
@@ -493,7 +518,7 @@ impl<'a> SessionRepository<'a> {
         id: &SessionId,
     ) -> Result<Option<SessionSettingsSnapshot>, StorageError> {
         let mut tx = self.db.pool().begin().await?;
-        let row: Option<SessionRow> = sqlx::query_as("SELECT id, repository, goal, status, model, state, created_at, updated_at, collaboration, work_profile FROM sessions WHERE id = ?1")
+        let row: Option<SessionRow> = sqlx::query_as("SELECT id, repository, goal, title, status, model, state, created_at, updated_at, collaboration, work_profile FROM sessions WHERE id = ?1")
             .bind(id.as_str()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
@@ -584,6 +609,29 @@ impl<'a> SessionRepository<'a> {
             .execute(self.db.pool())
             .await?;
         Ok(())
+    }
+
+    /// Name a session that has no display title yet.
+    ///
+    /// The `title IS NULL OR trim(title) = ''` half is the compare: a rename
+    /// that landed before a late first-message naming must not be overwritten
+    /// by the derived name.
+    pub async fn set_title_if_absent(
+        &self,
+        id: &SessionId,
+        title: &str,
+        now: Timestamp,
+    ) -> Result<bool, StorageError> {
+        let updated = sqlx::query(
+            "UPDATE sessions SET title = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND (title IS NULL OR trim(title) = '')",
+        )
+        .bind(id.as_str())
+        .bind(title)
+        .bind(now.to_rfc3339())
+        .execute(self.db.pool())
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// Persist the model selected for subsequent turns in this session.
@@ -742,6 +790,9 @@ impl SessionRecord {
             id: SessionId::generate().into_inner(),
             repository,
             goal: goal.into(),
+            // A new session has no user-chosen display title yet; clients
+            // derive one from `goal` until the first message or a rename.
+            title: None,
             status: SessionStatus::Created,
             model,
             state: AgentState::Understand,
@@ -775,6 +826,76 @@ impl SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D4: rename is presentation only. The verbatim request survives, and
+    /// the list still projects a title.
+    #[tokio::test]
+    async fn renaming_a_session_changes_only_its_display_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect(&tmp.path().join("title.db"))
+            .await
+            .unwrap();
+        let record = SessionRecord::without_workspace("original request", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        let repo = SessionRepository::new(&db);
+        repo.create(&record).await.unwrap();
+        repo.edit_at_version(
+            &id,
+            0,
+            &SessionEdit::Title("renamed".into()),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let after = repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            after.goal, "original request",
+            "rename must not rewrite the request"
+        );
+        assert_eq!(after.title.as_deref(), Some("renamed"));
+        let listed = repo.list().await.unwrap();
+        assert_eq!(listed[0].goal, "original request");
+        assert_eq!(listed[0].title.as_deref(), Some("renamed"));
+    }
+
+    /// The first-message naming is a compare-and-set: a rename that already
+    /// landed wins over a late derived name.
+    #[tokio::test]
+    async fn a_derived_title_never_overwrites_a_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect(&tmp.path().join("title-cas.db"))
+            .await
+            .unwrap();
+        let record =
+            SessionRecord::without_workspace("interactive session", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        let repo = SessionRepository::new(&db);
+        repo.create(&record).await.unwrap();
+        assert!(
+            repo.set_title_if_absent(&id, "derived", leveler_core::now())
+                .await
+                .unwrap()
+        );
+        repo.edit_at_version(
+            &id,
+            0,
+            &SessionEdit::Title("renamed".into()),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !repo
+                .set_title_if_absent(&id, "late derived", leveler_core::now())
+                .await
+                .unwrap(),
+            "an explicit rename must not be overwritten by a derived name"
+        );
+        assert_eq!(
+            repo.get(&id).await.unwrap().unwrap().title.as_deref(),
+            Some("renamed")
+        );
+    }
 
     #[tokio::test]
     async fn permission_edit_from_observed_snapshot_survives_answer_events() {
@@ -893,12 +1014,17 @@ mod tests {
         let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
         assert_eq!(snapshot.sequence, Some(1));
         assert_eq!(
-            snapshot.session.goal,
-            if results[0] == SessionEditResult::Applied(1) {
+            snapshot.session.title.as_deref(),
+            Some(if results[0] == SessionEditResult::Applied(1) {
                 "left"
             } else {
                 "right"
-            }
+            }),
+            "rename writes the display title"
+        );
+        assert_eq!(
+            snapshot.session.goal, "original",
+            "rename must not rewrite the original request"
         );
         // The loser cannot change another field or append a phantom version.
         assert_eq!(
@@ -975,10 +1101,18 @@ mod tests {
         let reader = async {
             for _ in 0..80 {
                 let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
-                assert_eq!(
-                    snapshot.session.goal,
-                    format!("title-{}", snapshot.sequence.unwrap_or(0))
-                );
+                let sequence = snapshot.sequence.unwrap_or(0);
+                if sequence == 0 {
+                    assert_eq!(
+                        snapshot.session.title, None,
+                        "before any rename the display title is derived from `goal`"
+                    );
+                } else {
+                    assert_eq!(
+                        snapshot.session.title.as_deref(),
+                        Some(format!("title-{sequence}").as_str())
+                    );
+                }
             }
         };
         tokio::join!(writer, reader);

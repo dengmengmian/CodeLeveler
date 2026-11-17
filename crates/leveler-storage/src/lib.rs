@@ -102,4 +102,4 @@ pub(crate) fn redact_json_payload_for_session(
     })
 }
 
-pub use resource_grant_store::{MemoryResourceGrantStore, ResourceGrantStore};
+pub use resource_grant_store::{MemoryResourceGrantStore, ResourceGrantStore, StoredResourceGrant};

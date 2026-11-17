@@ -87,6 +87,7 @@ fn a_session_snapshot_carries_the_rounds_of_its_running_calls() {
         task_status: None,
         task_terminal: None,
         goal: "g".into(),
+        title: None,
         model: None,
         mode: PermissionProfile::Assisted,
         branch: None,

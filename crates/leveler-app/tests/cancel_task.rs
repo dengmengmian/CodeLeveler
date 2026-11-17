@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
+use leveler_client_protocol::{
+    ClientCommand, InteractiveRuntimeClient, NotificationLevel, RuntimeEvent,
+};
 use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
@@ -764,4 +766,67 @@ async fn cancelling_the_continued_window_ends_the_logical_goal() {
         "cancelled",
         "a refused continuation must not overwrite the user's cancellation"
     );
+}
+
+/// Deleting a session is not a cancellation. While a turn owns the session,
+/// the runtime refuses the delete with a reason and leaves the work alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_running_session_is_refused_and_does_not_cancel_it() {
+    let f = fixture(blocking_work()).await;
+    let client = client(&f);
+    let mut events = client.subscribe();
+    client
+        .send(ClientCommand::RunGoal {
+            session_id: f.session.clone(),
+            content: "finish the inventory work".to_string(),
+            require_new_turn: false,
+        })
+        .await
+        .unwrap();
+    wait_for_running_turn(&f.app, &f.session).await;
+
+    client
+        .send(ClientCommand::DeleteSessionFor {
+            requester_session_id: f.session.clone(),
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut refusal = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+            Ok(Ok(RuntimeEvent::Notification {
+                level: NotificationLevel::Error,
+                message,
+            })) if message.contains("仍在运行") => {
+                refusal = Some(message);
+                break;
+            }
+            Ok(Ok(_)) => {}
+            _ => {}
+        }
+    }
+    assert!(
+        refusal.is_some(),
+        "a delete of a running session must be refused by name"
+    );
+
+    let db = f.app.open_database().await.unwrap();
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert!(
+        turns.iter().any(|turn| turn.status == "running"),
+        "a refused delete must not cancel the running turn: {turns:?}"
+    );
+    drop(db);
+
+    // Stop the blocking command so the test does not wait out its fixture.
+    client
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f.app, &f.session, 1).await;
 }

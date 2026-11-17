@@ -122,6 +122,7 @@ fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionS
         task_status: None,
         task_terminal: None,
         goal: goal.into(),
+        title: None,
         model: leveler_client_protocol::ModelRef::parse(model),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
         branch: Some("main".into()),

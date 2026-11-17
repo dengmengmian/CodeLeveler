@@ -77,6 +77,7 @@ impl AgentRuntime {
             id: session.clone(),
             repository: None,
             goal: GOAL.into(),
+            title: None,
             task_status: state.task_status,
             task_terminal: state.task_terminal.clone(),
             model: None,

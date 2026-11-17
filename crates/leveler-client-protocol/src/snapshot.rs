@@ -156,6 +156,7 @@ mod tests {
             task_status: None,
             task_terminal: None,
             goal: "g".into(),
+            title: None,
             model: None,
             mode: crate::PermissionProfile::Assisted,
             branch: None,
@@ -234,6 +235,7 @@ mod tests {
             task_status: None,
             task_terminal: None,
             goal: "g".into(),
+            title: None,
             model: None,
             mode: crate::PermissionProfile::Assisted,
             branch: None,
@@ -488,8 +490,12 @@ pub enum RuntimeStatus {
     Error,
 }
 
-/// A conversation restore point (spec §68). Restoring truncates the transcript
-/// back to `ordinal` messages; working-tree files are left to the user's git.
+/// A conversation restore point (spec §68).
+///
+/// Restoring truncates the transcript back to `ordinal` AND (for a git
+/// workspace) rolls the working tree back to the checkpoint's captured tree,
+/// including deleting files created after it. Clients must say so before
+/// executing it; see the two-step confirmation in the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiCheckpoint {
@@ -645,6 +651,16 @@ pub struct UiSessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_terminal: Option<crate::UiTaskTerminal>,
     pub goal: String,
+    /// Display title (rename / first-message naming), if one is stored.
+    ///
+    /// Additive: older runtimes omit it and clients fall back to `goal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The user's original request, verbatim. Rename never changes this.
+    ///
+    /// Additive: `goal` remains the derived display value for old clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_request: Option<String>,
     pub status: String,
     /// Latest durable task declaration; absent for legacy or non-declaration endings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -657,6 +673,10 @@ pub struct UiSessionSummary {
     /// clients keep parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Whether this session is archived. Additive: an older runtime omits it
+    /// and clients treat the row as active. Archive never deletes data.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// One background process that is still lifecycle-active in the runtime.
@@ -790,6 +810,10 @@ pub struct UiSessionSnapshot {
     pub id: SessionId,
     pub repository: Option<String>,
     pub goal: String,
+    /// Display title (rename / first-message naming). Additive: an older
+    /// runtime omits it and clients fall back to `goal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_status: Option<crate::UiTaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -4,7 +4,11 @@ use leveler_core::{BootId, BootLiveness, BootLivenessProbe};
 use leveler_storage::SessionFacts;
 
 /// Project a title using the same first-message policy as interactive sessions.
-pub fn project_title(goal: &str, first_user_text: Option<&str>) -> String {
+pub fn project_title(title: Option<&str>, goal: &str, first_user_text: Option<&str>) -> String {
+    // A stored title is a user decision (rename or first-message naming).
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        return title.to_owned();
+    }
     if goal != "interactive session" && !goal.trim().is_empty() {
         return goal.to_owned();
     }

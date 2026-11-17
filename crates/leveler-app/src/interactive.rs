@@ -2298,6 +2298,36 @@ impl InProcessRuntimeClient {
             });
     }
 
+    /// Why this session may not be deleted right now.
+    ///
+    /// Deletion is not cancellation: a session with a running turn or live
+    /// background work must be stopped by its owner first. Silently killing
+    /// that work would leave a task terminal nobody asked for; deleting the
+    /// row while the work continues would leave executables with no session
+    /// identity. Both are worse than asking the user to stop first.
+    async fn session_delete_blocker(&self, session_id: &SessionId) -> Option<String> {
+        if self.active.is_running(session_id) {
+            return Some("会话仍在运行；请先停止当前任务，再删除会话".to_string());
+        }
+        match self
+            .app
+            .background_tasks()
+            .try_active_snapshots_for_scope(session_id.as_str())
+            .await
+        {
+            Ok(tasks) if !tasks.is_empty() => Some(format!(
+                "会话仍有 {} 个运行中的后台任务；请先在后台任务页停止它们，再删除会话",
+                tasks.len()
+            )),
+            Ok(_) => None,
+            // Treat an unreadable execution host as "not proven idle": the
+            // delete would otherwise kill work whose state we could not see.
+            Err(error) => Some(format!(
+                "无法确认会话的后台任务是否已停止，暂不删除：{error}"
+            )),
+        }
+    }
+
     fn forget_session(&self, session_id: &SessionId) {
         if let Some(stream) = self
             .session_events
@@ -2952,7 +2982,7 @@ impl InProcessRuntimeClient {
             .send(RuntimeEvent::SessionUpdated { session });
         if matches!(command, ClientCommand::RenameSession { .. }) {
             let _ = self.events.send(RuntimeEvent::SessionList {
-                sessions: self.list_sessions().await?,
+                sessions: self.list_sessions(true).await?,
             });
         }
         Ok(true)
@@ -3225,7 +3255,7 @@ impl InProcessRuntimeClient {
                 warning,
             });
         let _ = self.events.send(RuntimeEvent::SessionList {
-            sessions: self.list_sessions().await?,
+            sessions: self.list_sessions(true).await?,
         });
         match self.snapshot(&session_id).await {
             Ok(session) => {
@@ -4838,9 +4868,9 @@ impl InProcessRuntimeClient {
     }
 
     /// Name a placeholder interactive session after its first real message:
-    /// the sidebars (web + TUI resume) show the `goal` column, and a wall of
-    /// "interactive session" rows is unreadable. Only the placeholder is ever
-    /// overwritten — user-named goals stay untouched.
+    /// the sidebars (web + TUI resume) show the display title, and a wall of
+    /// "interactive session" rows is unreadable. Only a session with no title
+    /// yet is named — a rename always wins.
     async fn retitle_placeholder_session(&self, session_id: &SessionId, content: &str) {
         let Some(title) = title_from_first_message(content) else {
             return;
@@ -4852,7 +4882,9 @@ impl InProcessRuntimeClient {
         if let Ok(Some(record)) = repo.get(session_id).await
             && (record.goal == PLACEHOLDER_GOAL || record.goal.trim().is_empty())
         {
-            let _ = repo.update_goal(session_id, &title).await;
+            let _ = repo
+                .set_title_if_absent(session_id, &title, leveler_core::now())
+                .await;
         }
     }
 
@@ -4860,14 +4892,17 @@ impl InProcessRuntimeClient {
     /// whose goal is still the interactive placeholder display the first
     /// sentence of their first user message instead — this also names the
     /// history created before placeholder retitling existed.
-    async fn list_sessions(&self) -> Result<Vec<UiSessionSummary>, ClientError> {
+    async fn list_sessions(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<UiSessionSummary>, ClientError> {
         let db = self
             .app
             .open_database()
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let facts = db
-            .session_facts(false)
+            .session_facts(include_archived)
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let probe = crate::runtime_boot::StateDirBootLiveness::new(&self.app.layout.state_dir);
@@ -4902,13 +4937,16 @@ impl InProcessRuntimeClient {
                         _ => None,
                     });
             let goal = crate::session_projection::project_title(
+                facts.session.title.as_deref(),
                 &facts.session.goal,
                 facts.first_user_text.as_deref(),
             );
             let r = facts.session;
             summaries.push(UiSessionSummary {
                 id,
-                goal,
+                goal: goal.clone(),
+                title: Some(goal),
+                original_request: Some(r.goal.clone()),
                 status: session_status_wire(r.status, task_status).into(),
                 task_status: Some(task_status),
                 task_terminal: terminal,
@@ -4918,6 +4956,7 @@ impl InProcessRuntimeClient {
                 model: r.model.unwrap_or_default(),
                 updated_at: facts.last_activity_at,
                 repository: r.repository,
+                archived: facts.archived_at.is_some(),
             });
         }
         Ok(summaries)
@@ -7633,7 +7672,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
             ClientCommand::RequestSessionList => {
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await?,
+                    sessions: self.list_sessions(true).await?,
                 });
                 Ok(())
             }
@@ -7643,7 +7682,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let _ = self
                     .events_for(&requester_session_id)
                     .send(RuntimeEvent::SessionList {
-                        sessions: self.list_sessions().await?,
+                        sessions: self.list_sessions(true).await?,
                     });
                 Ok(())
             }
@@ -7663,8 +7702,16 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .await
             }
             ClientCommand::OpenSession { session_id } => {
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self.events.send(RuntimeEvent::SessionOpened { session });
+                match self.snapshot(&session_id).await {
+                    Ok(session) => {
+                        let _ = self.events.send(RuntimeEvent::SessionOpened { session });
+                    }
+                    Err(_) => {
+                        let _ = self.events.send(RuntimeEvent::Notification {
+                            level: NotificationLevel::Error,
+                            message: format!("无法打开会话 {session_id}：会话不存在或已过期"),
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -7733,7 +7780,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             .events_for(&requester_session_id)
                             .send(RuntimeEvent::SessionOpened { session });
                         let _ = self.events.send(RuntimeEvent::SessionList {
-                            sessions: self.list_sessions().await?,
+                            sessions: self.list_sessions(true).await?,
                         });
                     }
                     Err(error) => {
@@ -7746,23 +7793,35 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 requester_session_id,
                 session_id,
             } => {
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self
-                        .events_for(&requester_session_id)
-                        .send(RuntimeEvent::SessionOpened { session });
+                match self.snapshot(&session_id).await {
+                    Ok(session) => {
+                        let _ = self
+                            .events_for(&requester_session_id)
+                            .send(RuntimeEvent::SessionOpened { session });
+                    }
+                    // A stale id after another client deleted the session is
+                    // a real answer, not a no-op: the user asked to open
+                    // something that no longer exists and must be told.
+                    Err(_) => self.notify_error(
+                        &requester_session_id,
+                        format!("无法打开会话 {session_id}：会话不存在或已过期"),
+                    ),
                 }
                 Ok(())
             }
             ClientCommand::DeleteSession { session_id } => {
-                let deleted: Result<(), anyhow::Error> = async {
-                    let db = self.app.open_database().await?;
-                    self.app
-                        .background_tasks()
-                        .kill_session(session_id.as_str())
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                    SessionRepository::new(&db).delete(&session_id).await?;
-                    Ok(())
+                if let Some(reason) = self.session_delete_blocker(&session_id).await {
+                    let _ = self.events.send(RuntimeEvent::Notification {
+                        level: NotificationLevel::Error,
+                        message: format!("删除会话失败: {reason}"),
+                    });
+                    return Ok(());
+                }
+                let deleted: Result<bool, anyhow::Error> = async {
+                    // The blocker above proved there is no live turn or
+                    // background work. Reuse the same storage cleanup the CLI
+                    // uses, so both paths remove the row and its captures.
+                    Ok(self.app.delete_session_storage(&session_id).await?)
                 }
                 .await;
                 if let Err(error) = deleted {
@@ -7781,7 +7840,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 self.forget_session(&session_id);
                 crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await?,
+                    sessions: self.list_sessions(true).await?,
                 });
                 Ok(())
             }
@@ -7789,15 +7848,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 requester_session_id,
                 session_id,
             } => {
-                let deleted: Result<(), anyhow::Error> = async {
-                    let db = self.app.open_database().await?;
-                    self.app
-                        .background_tasks()
-                        .kill_session(session_id.as_str())
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                    SessionRepository::new(&db).delete(&session_id).await?;
-                    Ok(())
+                if let Some(reason) = self.session_delete_blocker(&session_id).await {
+                    self.notify_error(&requester_session_id, format!("删除会话失败: {reason}"));
+                    return Ok(());
+                }
+                let deleted: Result<bool, anyhow::Error> = async {
+                    // Same storage cleanup as the non-targeted delete and the
+                    // CLI: the blocker proved the session holds no live work.
+                    Ok(self.app.delete_session_storage(&session_id).await?)
                 }
                 .await;
                 if let Err(error) = deleted {
@@ -7808,7 +7866,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 self.forget_session(&session_id);
                 crate::user_shell::remove_session_output(&self.app.layout.state_dir, &session_id);
                 let event = RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await?,
+                    sessions: self.list_sessions(true).await?,
                 };
                 if requester_session_id == session_id {
                     let _ = self.events.send(event);
@@ -7831,7 +7889,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     return Ok(());
                 }
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await?,
+                    sessions: self.list_sessions(true).await?,
+                });
+                Ok(())
+            }
+            ClientCommand::UnarchiveSession { session_id } => {
+                let restored: Result<(), anyhow::Error> = async {
+                    let db = self.app.open_database().await?;
+                    SessionRepository::new(&db)
+                        .set_archived(&session_id, None)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = restored {
+                    self.notify_error(&session_id, format!("恢复归档失败: {error}"));
+                    return Ok(());
+                }
+                let _ = self.events.send(RuntimeEvent::SessionList {
+                    sessions: self.list_sessions(true).await?,
                 });
                 Ok(())
             }
@@ -7849,11 +7925,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         .execution(&session_id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("会话执行配置不存在"))?;
-                    let title = if record.goal == PLACEHOLDER_GOAL {
-                        record.goal.clone()
-                    } else {
-                        format!("{} (分叉)", record.goal)
-                    };
+                    // A fork copies the original request verbatim and gets its
+                    // own display title. Writing "(分叉)" into `goal` would
+                    // claim the user asked for something they did not.
+                    let display_title = crate::session_projection::project_title(
+                        record.title.as_deref(),
+                        &record.goal,
+                        None,
+                    );
+                    let fork_title = (record.goal != PLACEHOLDER_GOAL)
+                        .then(|| format!("{display_title} (分叉)"));
+                    let fork_goal = record.goal.clone();
                     let engine = self.app.task_engine(&db)?;
                     // A fork copies the conversation AND its model choice; it
                     // inherits the source's pin state so a later default change
@@ -7866,7 +7948,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     let fork_id = engine
                         .create_task(&leveler_engine::NewSession {
                             workspace: record.repository.clone(),
-                            goal: title,
+                            goal: fork_goal,
                             model: record.model.clone(),
                             mode,
                             sandbox,
@@ -7877,6 +7959,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             model_pinned,
                         })
                         .await?;
+                    if let Some(fork_title) = fork_title {
+                        SessionRepository::new(&db)
+                            .set_title_if_absent(&fork_id, &fork_title, leveler_core::now())
+                            .await?;
+                    }
                     let messages = MessageRepository::new(&db);
                     let transcript = messages.load(&session_id).await?;
                     messages
@@ -7904,7 +7991,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         self.notify_error(&session_id, format!("分叉会话失败: {error}"));
                     }
                 }
-                let sessions = self.list_sessions().await?;
+                let sessions = self.list_sessions(true).await?;
                 let _ = self
                     .events_for(&session_id)
                     .send(RuntimeEvent::SessionList {
@@ -9184,6 +9271,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?
             .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        let title = crate::session_projection::project_title(
+            facts.session.title.as_deref(),
+            &facts.session.goal,
+            facts.first_user_text.as_deref(),
+        );
         let probe = crate::runtime_boot::StateDirBootLiveness::new(&self.app.layout.state_dir);
         let (task_status, task_terminal) = crate::session_projection::project_task(
             &facts,
@@ -9252,6 +9344,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             task_status: Some(task_status),
             task_terminal,
             goal: record.goal,
+            title: Some(title),
             model,
             mode: protocol_mode(config.mode),
             branch: self
@@ -10639,6 +10732,11 @@ async fn compact_conversation(
             Ok(Some(facts)) => facts,
             Ok(None) | Err(_) => return false,
         };
+        let title = crate::session_projection::project_title(
+            facts.session.title.as_deref(),
+            &facts.session.goal,
+            facts.first_user_text.as_deref(),
+        );
         let probe = crate::runtime_boot::StateDirBootLiveness::new(&app.layout.state_dir);
         let Ok((task_status, task_terminal)) =
             crate::session_projection::project_task(&facts, &probe, false, false)
@@ -10673,6 +10771,7 @@ async fn compact_conversation(
                 task_status: Some(task_status),
                 task_terminal,
                 goal: record.goal,
+                title: Some(title),
                 model: model.clone(),
                 mode: protocol_mode(mode),
                 branch: app.layout.primary_workspace().and_then(detect_branch_label),
@@ -11995,7 +12094,7 @@ mod session_declaration_tests {
             PermissionProfile::Assisted,
             false,
         );
-        let summaries = client.list_sessions().await.unwrap();
+        let summaries = client.list_sessions(true).await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(
             summaries[0].declaration, None,
@@ -12026,7 +12125,7 @@ mod session_declaration_tests {
                 .append(&id, None, &tag, &payload, leveler_core::now())
                 .await
                 .unwrap();
-            let summaries = client.list_sessions().await.unwrap();
+            let summaries = client.list_sessions(true).await.unwrap();
             assert_eq!(
                 summaries[0].declaration, declaration,
                 "latest stop is the only declaration source"

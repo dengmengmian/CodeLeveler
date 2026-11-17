@@ -121,6 +121,9 @@ impl Database {
         // store projects the same values its migration would have written.
         let collaboration = schema.sessions.project("collaboration", "'goal'");
         let work_profile = schema.sessions.project("work_profile", "'balanced'");
+        // An old store predates the separate display title; NULL preserves its
+        // exact previous projection (`goal`).
+        let title = schema.sessions.project("title", "NULL");
         let visibility = if schema.sessions.has("archived_at") {
             "(?1 OR archived_at IS NULL) AND (?2 IS NULL OR id=?2)"
         } else {
@@ -128,7 +131,7 @@ impl Database {
         };
         let selected = format!("SELECT id FROM sessions WHERE {visibility}");
         let rows = sqlx::query_as::<_, crate::session_repo::SessionRow>(&format!(
-            "SELECT id,repository,goal,status,model,state,created_at,updated_at,{collaboration} AS collaboration,{work_profile} AS work_profile FROM sessions WHERE {visibility} ORDER BY updated_at DESC,id"))
+            "SELECT id,repository,goal,{title} AS title,status,model,state,created_at,updated_at,{collaboration} AS collaboration,{work_profile} AS work_profile FROM sessions WHERE {visibility} ORDER BY updated_at DESC,id"))
             .bind(include_archived).bind(id).fetch_all(&mut *tx).await?;
         // A fixed set of batched queries, independent of the session count.
         let mut archived: HashMap<String, Option<String>> = if schema.sessions.has("archived_at") {

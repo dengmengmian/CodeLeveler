@@ -115,6 +115,7 @@ pub async fn query_global_tasks(home: &LevelerHome, include_archived: bool) -> U
                 id: SessionId::new(facts.session.id),
                 source_id: path.display().to_string(),
                 title: crate::session_projection::project_title(
+                    facts.session.title.as_deref(),
                     &facts.session.goal,
                     facts.first_user_text.as_deref(),
                 ),

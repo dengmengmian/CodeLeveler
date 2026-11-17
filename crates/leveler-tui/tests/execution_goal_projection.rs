@@ -64,6 +64,7 @@ fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "会话标题".to_string(),
+        title: None,
         model: ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
         branch: None,

@@ -1014,7 +1014,7 @@ export type UiBackgroundTaskState =
   /** Two durable starts share one task id. Neither the live process nor a terminal record can be attributed to one of them safely, so both stay unclassified rather than guessing. */
   | 'conflict';
 
-/** A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git. */
+/** A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` AND (for a git workspace) rolls the working tree back to the checkpoint's captured tree, including deleting files created after it. Clients must say so before executing it; see the two-step confirmation in the TUI. */
 export interface UiCheckpoint {
   id: CheckpointId;
   label: string;
@@ -1890,6 +1890,8 @@ export interface UiSessionSnapshot {
   task_terminal?: UiTaskTerminal | null;
   /** Runtime-projected Thinking Level state, in the user's own vocabulary. Absent on old runtimes so a new client keeps its boot-time value; a present value with `access: unsupported` means the model cannot be asked, which the client says rather than inventing a level. */
   thinking?: UiThinkingState | null;
+  /** Display title (rename / first-message naming). Additive: an older runtime omits it and clients fall back to `goal`. */
+  title?: string | null;
   /** User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block. */
   user_shells?: UiUserShell[];
   /** Whether the current model accepts image input (spec §42). */
@@ -1900,16 +1902,22 @@ export interface UiSessionSnapshot {
 
 /** A one-line session summary for the Sessions screen (spec §52). */
 export interface UiSessionSummary {
+  /** Whether this session is archived. Additive: an older runtime omits it and clients treat the row as active. Archive never deletes data. */
+  archived?: boolean;
   /** Latest durable task declaration; absent for legacy or non-declaration endings. */
   declaration?: UiTaskDeclaration | null;
   goal: string;
   id: SessionId;
   model: string;
+  /** The user's original request, verbatim. Rename never changes this. Additive: `goal` remains the derived display value for old clients. */
+  original_request?: string | null;
   /** Repository root the session belongs to. Filled by the runtime that owns the session and by the WebUI aggregation router (multi-project grouping); omitted on the wire when unknown so old fixtures and clients keep parsing. */
   repository?: string | null;
   status: string;
   task_status?: UiTaskStatus | null;
   task_terminal?: UiTaskTerminal | null;
+  /** Display title (rename / first-message naming), if one is stored. Additive: older runtimes omit it and clients fall back to `goal`. */
+  title?: string | null;
   updated_at: string;
 }
 
@@ -2163,8 +2171,10 @@ export type ClientCommand =
   | { type: 'delete_session_for'; requester_session_id: SessionId; session_id: SessionId }
   /** Rename a stored session (overwrite its goal/title text). */
   | { type: 'rename_session'; name: string; session_id: SessionId }
-  /** Archive a stored session: it keeps its transcript but leaves the default session list. */
+  /** Archive a stored session: it keeps its transcript but leaves the default session list. Reversible with [`Self::UnarchiveSession`]. */
   | { type: 'archive_session'; session_id: SessionId }
+  /** Restore an archived session to the default list. Its transcript and metadata were never deleted. */
+  | { type: 'unarchive_session'; session_id: SessionId }
   /** Fork a stored session: create a new session with a copy of the transcript, so an alternative direction can be explored without touching the original. */
   | { type: 'fork_session'; session_id: SessionId }
   /** Restore the conversation to a checkpoint (spec §68). */

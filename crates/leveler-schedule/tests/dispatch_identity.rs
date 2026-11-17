@@ -55,6 +55,7 @@ impl ForeignExecutionRuntime {
             id: self.session.clone(),
             repository: None,
             goal: "Scheduled action: identity".into(),
+            title: None,
             task_status: None,
             task_terminal: None,
             model: None,

@@ -56,6 +56,7 @@ fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "interactive session".into(),
+        title: None,
         model: ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
         branch: Some("main".into()),

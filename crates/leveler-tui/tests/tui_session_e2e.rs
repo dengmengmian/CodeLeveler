@@ -61,6 +61,7 @@ fn opened() -> AppState {
                 task_status: None,
                 task_terminal: None,
                 goal: "e2e".into(),
+                title: None,
                 model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
                 mode: PermissionProfile::Assisted,
                 branch: Some("main".into()),

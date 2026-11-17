@@ -3,6 +3,19 @@ use crate::{Database, StorageError};
 use async_trait::async_trait;
 use leveler_core::{GrantBinding, GrantScope};
 
+/// One persisted grant, with the opaque handle a human uses to revoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredResourceGrant {
+    /// Stable handle scoped to one project. Revocation is by this id.
+    pub id: String,
+    /// The session this grant is bound to; empty for a project-scoped grant.
+    pub session_identity: String,
+    /// Whether reuse is limited to this session or this project.
+    pub scope: GrantScope,
+    /// The exact capability/resource pair the user approved.
+    pub binding: GrantBinding,
+}
+
 /// Resource approval persistence port. Callers own mode and admission policy.
 #[async_trait]
 pub trait ResourceGrantStore: Send + Sync {
@@ -21,6 +34,21 @@ pub trait ResourceGrantStore: Send + Sync {
         scope: GrantScope,
         bindings: &[GrantBinding],
     ) -> Result<(), StorageError>;
+    /// Every grant that can currently apply in this project.
+    ///
+    /// `session` restricts the answer to that session's session-scoped grants
+    /// plus the project-scoped ones; `None` lists every session's grants for
+    /// management. Project grants have an empty `session_identity`.
+    async fn list(
+        &self,
+        project: &str,
+        session: Option<&str>,
+    ) -> Result<Vec<StoredResourceGrant>, StorageError>;
+    /// Remove exactly one grant by its project-scoped handle.
+    ///
+    /// Returns whether a row was deleted. An already-admitted call keeps its
+    /// frozen policy; the NEXT admission no longer matches this grant.
+    async fn revoke(&self, project: &str, id: &str) -> Result<bool, StorageError>;
 }
 
 const SCHEMA_VERSION: i64 = 1;
@@ -108,18 +136,79 @@ impl ResourceGrantStore for Database {
             .collect::<Result<Vec<_>, _>>()?;
         let mut tx = self.pool.begin().await?;
         for payload in payloads {
-            sqlx::query("INSERT INTO resource_grants(project_identity, session_identity, scope, schema_version, binding_json) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
-                .bind(project).bind(session).bind(scope).bind(SCHEMA_VERSION).bind(payload).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO resource_grants(project_identity, session_identity, scope, grant_id, schema_version, binding_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(project)
+                .bind(session)
+                .bind(scope)
+                .bind(leveler_core::new_uuid_string())
+                .bind(SCHEMA_VERSION)
+                .bind(payload)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        project: &str,
+        session: Option<&str>,
+    ) -> Result<Vec<StoredResourceGrant>, StorageError> {
+        let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
+            "SELECT grant_id, session_identity, scope, schema_version, binding_json \
+             FROM resource_grants \
+             WHERE project_identity = ?1 \
+               AND (session_identity = '' OR ?2 IS NULL OR session_identity = ?2) \
+             ORDER BY scope, session_identity, grant_id",
+        )
+        .bind(project)
+        .bind(session)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, session_identity, scope, version, payload)| {
+                let scope = match scope.as_str() {
+                    "session" => GrantScope::Session,
+                    "project" => GrantScope::Project,
+                    _ => {
+                        return Err(StorageError::InvalidData(
+                            "unknown resource grant scope".into(),
+                        ));
+                    }
+                };
+                Ok(StoredResourceGrant {
+                    id,
+                    session_identity,
+                    scope,
+                    binding: decode(version, &payload)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn revoke(&self, project: &str, id: &str) -> Result<bool, StorageError> {
+        if project.is_empty() || id.is_empty() {
+            return Err(StorageError::InvalidData(
+                "resource grant revocation requires project and id".into(),
+            ));
+        }
+        let deleted = sqlx::query(
+            "DELETE FROM resource_grants WHERE project_identity = ?1 AND grant_id = ?2",
+        )
+        .bind(project)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected() > 0)
     }
 }
 
 /// In-memory adapter for the same exact matching contract.
 #[derive(Default)]
 pub struct MemoryResourceGrantStore {
-    rows: std::sync::Mutex<Vec<(String, String, GrantScope, GrantBinding)>>,
+    /// (id, project, session, scope, binding)
+    rows: std::sync::Mutex<Vec<(String, String, String, GrantScope, GrantBinding)>>,
 }
 
 #[async_trait]
@@ -136,7 +225,7 @@ impl ResourceGrantStore for MemoryResourceGrantStore {
             .lock()
             .map_err(|_| StorageError::InvalidData("resource grant lock poisoned".into()))?;
         Ok(bindings.iter().all(|binding| {
-            rows.iter().any(|(p, s, scope, b)| {
+            rows.iter().any(|(_, p, s, scope, b)| {
                 p == project && (*scope == GrantScope::Project || s == session) && b == binding
             })
         }))
@@ -165,16 +254,59 @@ impl ResourceGrantStore for MemoryResourceGrantStore {
         };
         for binding in bindings {
             let row = (
+                leveler_core::new_uuid_string(),
                 project.to_owned(),
                 session.to_owned(),
                 scope,
                 binding.clone(),
             );
-            if !rows.contains(&row) {
+            if !rows.iter().any(|(_, p, s, sc, b)| {
+                p == project && s == session && *sc == scope && b == binding
+            }) {
                 rows.push(row);
             }
         }
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        project: &str,
+        session: Option<&str>,
+    ) -> Result<Vec<StoredResourceGrant>, StorageError> {
+        let rows = self
+            .rows
+            .lock()
+            .map_err(|_| StorageError::InvalidData("resource grant lock poisoned".into()))?;
+        Ok(rows
+            .iter()
+            .filter(|(_, p, s, _, _)| {
+                p == project && (s.is_empty() || session.is_none_or(|session| session == s))
+            })
+            .map(
+                |(id, _, session_identity, scope, binding)| StoredResourceGrant {
+                    id: id.clone(),
+                    session_identity: session_identity.clone(),
+                    scope: *scope,
+                    binding: binding.clone(),
+                },
+            )
+            .collect())
+    }
+
+    async fn revoke(&self, project: &str, id: &str) -> Result<bool, StorageError> {
+        if project.is_empty() || id.is_empty() {
+            return Err(StorageError::InvalidData(
+                "resource grant revocation requires project and id".into(),
+            ));
+        }
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| StorageError::InvalidData("resource grant lock poisoned".into()))?;
+        let before = rows.len();
+        rows.retain(|(grant_id, p, _, _, _)| !(p == project && grant_id == id));
+        Ok(rows.len() != before)
     }
 }
 
@@ -349,5 +481,71 @@ mod tests {
             Err(StorageError::Sqlx(_))
         ));
         assert!(!db.covers("p", "s", &[binding("origin")]).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+    use leveler_core::{Capability, ResourceIdentity};
+
+    fn binding(name: &str) -> GrantBinding {
+        GrantBinding {
+            capability: Capability::RemoteRead,
+            resource: ResourceIdentity::ConfiguredRemote {
+                repository: "repo-a".into(),
+                remote_name: name.into(),
+                canonical_url: format!("https://example.test/{name}.git"),
+                transport: "https".into(),
+            },
+        }
+    }
+
+    /// A grant is listed with a stable handle; revoking that handle stops
+    /// future coverage and is idempotent. A handle is project-scoped.
+    #[tokio::test]
+    async fn grants_are_listed_and_revoked_by_handle() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let memory = MemoryResourceGrantStore::default();
+        for store in [&db as &dyn ResourceGrantStore, &memory] {
+            store
+                .grant("p", "s", GrantScope::Session, &[binding("origin")])
+                .await
+                .unwrap();
+            store
+                .grant("p", "s", GrantScope::Project, &[binding("upstream")])
+                .await
+                .unwrap();
+            let grants = store.list("p", Some("s")).await.unwrap();
+            assert_eq!(grants.len(), 2, "session + project grants are effective");
+            assert!(grants.iter().any(|g| g.session_identity == "s"));
+            assert!(grants.iter().any(|g| g.scope == GrantScope::Project));
+
+            let session_grant = grants
+                .iter()
+                .find(|g| g.scope == GrantScope::Session)
+                .unwrap()
+                .clone();
+            assert!(
+                !store
+                    .revoke("other-project", &session_grant.id)
+                    .await
+                    .unwrap(),
+                "an id from one project is not a handle into another"
+            );
+            assert!(store.revoke("p", &session_grant.id).await.unwrap());
+            assert!(
+                !store
+                    .covers("p", "s", std::slice::from_ref(&session_grant.binding))
+                    .await
+                    .unwrap(),
+                "the next admission no longer matches the revoked grant"
+            );
+            assert!(
+                !store.revoke("p", &session_grant.id).await.unwrap(),
+                "revocation is idempotent"
+            );
+            assert_eq!(store.list("p", Some("s")).await.unwrap().len(), 1);
+        }
     }
 }

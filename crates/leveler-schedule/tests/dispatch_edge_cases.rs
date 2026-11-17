@@ -96,6 +96,7 @@ impl ScriptedRuntime {
             id: session.clone(),
             repository: None,
             goal: "Scheduled action: edge".into(),
+            title: None,
             task_status: None,
             task_terminal: None,
             model: None,

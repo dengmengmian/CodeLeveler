@@ -83,6 +83,7 @@ fn snapshot(origin: Option<UiForeignOrigin>) -> leveler_client_protocol::UiSessi
         task_status: None,
         task_terminal: None,
         goal: "g".into(),
+        title: None,
         model: ModelRef::parse("test/model"),
         mode: PermissionProfile::Assisted,
         branch: Some("main".into()),

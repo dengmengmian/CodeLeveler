@@ -35,6 +35,7 @@ impl MockRuntimeClient {
             task_status: None,
             task_terminal: None,
             goal: "interactive session".to_string(),
+            title: None,
             model: None,
             mode: PermissionProfile::Assisted,
             branch: Some("main".to_string()),

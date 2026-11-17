@@ -24,6 +24,7 @@ fn idle_snapshot(status: &str) -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "g".into(),
+        title: None,
         model: None,
         mode: PermissionProfile::Assisted,
         branch: None,

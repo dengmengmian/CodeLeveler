@@ -41,6 +41,7 @@ fn snapshot() -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "修一个 bug".to_string(),
+        title: None,
         model: None,
         mode: PermissionProfile::RequestApproval,
         branch: Some("main".to_string()),

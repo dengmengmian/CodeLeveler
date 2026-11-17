@@ -2681,6 +2681,7 @@ mod tests {
                     task_status: None,
                     task_terminal: None,
                     goal: "interactive session".to_string(),
+                    title: None,
                     model: Some(ModelRef::new("mock", "m")),
                     mode: PermissionProfile::Assisted,
                     branch: None,

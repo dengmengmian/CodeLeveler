@@ -354,8 +354,11 @@ pub enum ClientCommand {
     /// Rename a stored session (overwrite its goal/title text).
     RenameSession { session_id: SessionId, name: String },
     /// Archive a stored session: it keeps its transcript but leaves the
-    /// default session list.
+    /// default session list. Reversible with [`Self::UnarchiveSession`].
     ArchiveSession { session_id: SessionId },
+    /// Restore an archived session to the default list. Its transcript and
+    /// metadata were never deleted.
+    UnarchiveSession { session_id: SessionId },
     /// Fork a stored session: create a new session with a copy of the
     /// transcript, so an alternative direction can be explored without
     /// touching the original.
@@ -744,6 +747,7 @@ impl ClientCommand {
             | ClientCommand::DeleteSession { session_id }
             | ClientCommand::RenameSession { session_id, .. }
             | ClientCommand::ArchiveSession { session_id }
+            | ClientCommand::UnarchiveSession { session_id }
             | ClientCommand::ForkSession { session_id }
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::RunUserShell { session_id, .. }
@@ -963,6 +967,12 @@ mod tests {
                 session_id: SessionId::new("s1"),
             },
             "archive_session",
+        );
+        roundtrip(
+            ClientCommand::UnarchiveSession {
+                session_id: SessionId::new("s1"),
+            },
+            "unarchive_session",
         );
         roundtrip(
             ClientCommand::ForkSession {

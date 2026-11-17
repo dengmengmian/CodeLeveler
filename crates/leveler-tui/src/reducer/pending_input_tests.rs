@@ -883,6 +883,7 @@ fn idle_snapshot() -> leveler_client_protocol::UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "interactive session".into(),
+        title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
         branch: Some("main".into()),

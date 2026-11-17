@@ -710,6 +710,30 @@ impl Application {
         Ok(mode_from_str(&mode))
     }
 
+    /// Delete a session row and the files that belong only to it.
+    ///
+    /// Runtime and CLI deletion must have the same side effects; this is that
+    /// one implementation. Callers that own live work must stop it first —
+    /// this method is storage cleanup, not cancellation.
+    pub async fn delete_session_storage(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<bool, AppError> {
+        // A scheduled definition bound to this session must not resume a row
+        // that no longer exists. Clear the binding FIRST: if this fails,
+        // nothing has been deleted yet, so the caller is not told "delete
+        // failed" after the session is already gone. Historical run rows keep
+        // the id as evidence.
+        let manager = self.schedule_manager().await?;
+        manager.store().clear_session(session_id).await?;
+        let db = self.open_database().await?;
+        let deleted = SessionRepository::new(&db).delete(session_id).await?;
+        if deleted {
+            crate::user_shell::remove_session_output(&self.layout.state_dir, session_id);
+        }
+        Ok(deleted)
+    }
+
     /// Persist an explicit permission-mode choice for an existing session.
     ///
     /// Used by a headless resume (`leveler run --resume <id> --permission …`),

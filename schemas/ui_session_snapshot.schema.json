@@ -251,6 +251,13 @@
         }
       ]
     },
+    "title": {
+      "description": "Display title (rename / first-message naming). Additive: an older runtime omits it and clients fall back to `goal`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "user_shells": {
       "description": "User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block.",
       "default": [],
@@ -5966,7 +5973,7 @@
       ]
     },
     "UiCheckpoint": {
-      "description": "A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git.",
+      "description": "A conversation restore point (spec §68).\n\nRestoring truncates the transcript back to `ordinal` AND (for a git workspace) rolls the working tree back to the checkpoint's captured tree, including deleting files created after it. Clients must say so before executing it; see the two-step confirmation in the TUI.",
       "type": "object",
       "required": [
         "id",
@@ -9285,6 +9292,13 @@
             }
           ]
         },
+        "title": {
+          "description": "Display title (rename / first-message naming). Additive: an older runtime omits it and clients fall back to `goal`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "user_shells": {
           "description": "User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block.",
           "default": [],
@@ -9318,6 +9332,11 @@
         "updated_at"
       ],
       "properties": {
+        "archived": {
+          "description": "Whether this session is archived. Additive: an older runtime omits it and clients treat the row as active. Archive never deletes data.",
+          "default": false,
+          "type": "boolean"
+        },
         "declaration": {
           "description": "Latest durable task declaration; absent for legacy or non-declaration endings.",
           "anyOf": [
@@ -9337,6 +9356,13 @@
         },
         "model": {
           "type": "string"
+        },
+        "original_request": {
+          "description": "The user's original request, verbatim. Rename never changes this.\n\nAdditive: `goal` remains the derived display value for old clients.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "repository": {
           "description": "Repository root the session belongs to. Filled by the runtime that owns the session and by the WebUI aggregation router (multi-project grouping); omitted on the wire when unknown so old fixtures and clients keep parsing.",
@@ -9366,6 +9392,13 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "title": {
+          "description": "Display title (rename / first-message naming), if one is stored.\n\nAdditive: older runtimes omit it and clients fall back to `goal`.",
+          "type": [
+            "string",
+            "null"
           ]
         },
         "updated_at": {

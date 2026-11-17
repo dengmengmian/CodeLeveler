@@ -58,6 +58,7 @@ fn snapshot() -> UiSessionSnapshot {
         task_status: None,
         task_terminal: None,
         goal: "interactive session".into(),
+        title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
         branch: Some("main".into()),
