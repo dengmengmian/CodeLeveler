@@ -70,7 +70,10 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                         // PERSISTED default is the runtime's fact, not this
                         // client's to claim. The runtime says so itself when it
                         // declines (a model only this environment can resolve).
-                        message: format!("已切换模型: {model}"),
+                        message: state
+                            .t()
+                            .model_switched
+                            .replace("{model}", &model.to_string()),
                     });
                     // `/model` switches THIS session. Changing the global
                     // default is a separate, explicit action
@@ -174,12 +177,10 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 let t = state.t();
                 let options = vec![
                     SelectionOption::new(CHECKPOINT_RESTORE_CANCEL, t.approval_deny),
-                    SelectionOption::new(key, "回退对话与工作区"),
+                    SelectionOption::new(key, t.checkpoint_confirm_action),
                 ];
-                let model = SelectionModel::new("确认回退检查点？", options, false)
-                    .with_description(
-                        "对话与工作区文件将一并回退；未提交的改动会丢失（非 git 仓库只回退对话）。此操作不能撤销。",
-                    )
+                let model = SelectionModel::new(t.checkpoint_confirm_title, options, false)
+                    .with_description(t.checkpoint_confirm_body)
                     .without_quick_select();
                 state.overlay = Some(Overlay::ConfirmCheckpointRestore(Box::new(model)));
                 Vec::new()
@@ -394,11 +395,11 @@ pub(super) fn open_unsupported_media(state: &mut AppState) {
     // a menu entry that changes nothing is a question the user has to answer
     // for no reason.
     let options = vec![
-        SelectionOption::new("switch", "切换到支持图片的模型"),
-        SelectionOption::new("text", "去掉图片，只发文字"),
+        SelectionOption::new("switch", state.t().image_switch_model),
+        SelectionOption::new("text", state.t().image_text_only),
     ];
-    let model = SelectionModel::new("当前模型不支持图片", options, false)
-        .with_description("请选择如何继续");
+    let model = SelectionModel::new(state.t().image_unsupported_title, options, false)
+        .with_description(state.t().image_choose_hint);
     state.overlay = Some(Overlay::UnsupportedMedia(Box::new(model)));
 }
 
@@ -406,7 +407,7 @@ pub(super) fn open_model_picker(state: &mut AppState) {
     if state.available_models.is_empty() {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "无可切换的模型".to_string(),
+            message: state.t().no_switchable_model.to_string(),
         });
         return;
     }
@@ -421,7 +422,8 @@ pub(super) fn open_model_picker(state: &mut AppState) {
         })
         .collect();
     let searchable = options.len() > 6;
-    let model = SelectionModel::new("选择模型", options, searchable).focus_key(&current);
+    let model =
+        SelectionModel::new(state.t().choose_model, options, searchable).focus_key(&current);
     state.overlay = Some(Overlay::ModelPicker(Box::new(model)));
 }
 
@@ -429,7 +431,7 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
     if state.checkpoints.is_empty() {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "暂无检查点".to_string(),
+            message: state.t().checkpoint_none.to_string(),
         });
         return;
     }
@@ -442,9 +444,8 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
     // The runtime captures a git tree before every turn and restores it here,
     // so this rolls the working tree back too — including deleting files that
     // did not exist at the checkpoint. Saying otherwise would get work lost.
-    let model = SelectionModel::new("回退到检查点", options, false).with_description(
-        "对话与工作区文件一并回退到此处；未提交的改动会丢失（非 git 仓库只回退对话）",
-    );
+    let model = SelectionModel::new(state.t().checkpoint_picker_title, options, false)
+        .with_description(state.t().checkpoint_picker_body);
     state.overlay = Some(Overlay::CheckpointPicker(Box::new(model)));
 }
 
@@ -787,13 +788,13 @@ pub(super) fn apply_theme_id(state: &mut AppState, raw: &str) {
     let Some(next) = ThemeId::parse(raw) else {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: format!(
-                "未知主题 `{raw}`；可选: {}",
-                ThemeId::ALL
+            message: state.t().theme_unknown.replace("{raw}", raw).replace(
+                "{choices}",
+                &ThemeId::ALL
                     .iter()
                     .map(|id| id.as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
             ),
         });
         return;
@@ -811,7 +812,11 @@ pub(super) fn apply_theme_id(state: &mut AppState, raw: &str) {
     let mono = if no_color { " (NO_COLOR)" } else { "" };
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
-        message: format!("主题: {}{mono}", next.as_str()),
+        message: state
+            .t()
+            .theme_switched
+            .replace("{theme}", next.as_str())
+            .replace("{mono}", mono),
     });
 }
 

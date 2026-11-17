@@ -107,7 +107,7 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
         if !command_text.contains('\n') && looks_like_unknown_slash_command(name) {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: format!("未知命令: /{name}（内容已保留，/help 查看命令）"),
+                message: state.t().unknown_command_kept.replace("{name}", name),
             });
             return Vec::new();
         }
@@ -561,7 +561,7 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
     if let Some(url) = &state.web_url {
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
-            message: format!("Web UI 已在运行：{url}"),
+            message: state.t().web_ui_running.replace("{url}", url),
         });
         // The tab that opened on first launch may be long closed — re-open the
         // browser every time instead of stranding the user with a URL to copy.
@@ -573,7 +573,7 @@ fn start_web(state: &mut AppState) -> Vec<Effect> {
     state.web_starting = true;
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
-        message: "正在启动 Web UI…".to_string(),
+        message: state.t().web_ui_starting.to_string(),
     });
     vec![Effect::StartWeb]
 }
@@ -686,7 +686,7 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             if path.is_empty() {
                 state.notification = Some(Notification {
                     level: NotificationLevel::Warning,
-                    message: "用法: /attach <文件路径>".to_string(),
+                    message: state.t().attach_usage.to_string(),
                 });
                 Vec::new()
             } else {
@@ -704,7 +704,7 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         other => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: format!("未知命令: /{other}"),
+                message: state.t().unknown_command.replace("{name}", other),
             });
             Vec::new()
         }
@@ -1130,7 +1130,7 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
     if !has_dialogue {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "没有可导出的内容".to_string(),
+            message: state.t().export_empty.to_string(),
         });
         return Vec::new();
     }
@@ -1159,7 +1159,10 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
         Ok(()) => {
             // A persistent transcript note keeps the path on screen (and
             // selectable) rather than a toast that vanishes in a few seconds.
-            let msg = format!("已导出对话到 {}", leveler_core::path::display_path(&path));
+            let msg = state
+                .t()
+                .export_done
+                .replace("{path}", &leveler_core::path::display_path(&path));
             state.transcript.push_note(msg.clone());
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -1169,7 +1172,7 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
         Err(e) => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: format!("导出失败: {e}"),
+                message: state.t().export_failed.replace("{error}", &e.to_string()),
             });
         }
     }
@@ -1181,16 +1184,25 @@ fn export_conversation(state: &mut AppState, command: &str) -> Vec<Effect> {
 /// transient chrome are intentionally excluded.
 fn build_export_markdown(state: &AppState) -> String {
     use crate::transcript::TranscriptItem;
-    let mut out = String::from("# CodeLeveler 对话导出\n\n");
-    out.push_str(&format!("- 会话: {}\n", state.session_id.as_str()));
+    let mut out = format!("{}\n\n", state.t().export_title);
+    out.push_str(&format!(
+        "{}\n",
+        state
+            .t()
+            .export_session
+            .replace("{id}", state.session_id.as_str())
+    ));
     if let Some(repository) = state.repository.as_deref() {
-        out.push_str(&format!("- 项目: {repository}\n"));
+        out.push_str(&format!(
+            "{}\n",
+            state.t().export_project.replace("{repository}", repository)
+        ));
     }
     out.push('\n');
     for item in state.transcript.items() {
         match item {
             TranscriptItem::User(text) => {
-                out.push_str("## 你\n\n");
+                out.push_str(&format!("{}\n\n", state.t().export_you));
                 out.push_str(text.trim());
                 out.push_str("\n\n");
             }
@@ -1200,7 +1212,7 @@ fn build_export_markdown(state: &AppState) -> String {
                 out.push_str("\n\n");
             }
             TranscriptItem::Assistant(block) => {
-                out.push_str("## 助手\n\n");
+                out.push_str(&format!("{}\n\n", state.t().export_assistant));
                 out.push_str(block.text.trim());
                 out.push_str("\n\n");
             }
@@ -1223,12 +1235,19 @@ fn exported_tool_evidence(state: &AppState) -> String {
             continue;
         };
         for call in &group.calls {
-            let mut line = format!(
-                "- `{}` · 调用 {} · 状态 {:?}",
-                call.name, call.id, call.status
-            );
+            let mut line = state
+                .t()
+                .export_tool_row
+                .replace("{name}", &call.name)
+                .replace("{call}", &call.id.to_string())
+                .replace("{status}", &format!("{:?}", call.status));
             if let Some(code) = call.exit_code {
-                line.push_str(&format!(" · 退出码 {code}"));
+                line.push_str(
+                    &state
+                        .t()
+                        .export_tool_exit
+                        .replace("{code}", &code.to_string()),
+                );
             }
             if let Some(duration) = call.duration_ms {
                 line.push_str(&format!(" · {duration} ms"));
@@ -1241,7 +1260,7 @@ fn exported_tool_evidence(state: &AppState) -> String {
                 // delivery artifact, not a secret copy.
                 let (safe, _) = leveler_core::sanitize_model_visible(arguments);
                 let summary: String = safe.chars().take(200).collect();
-                rows.push_str(&format!("  - 参数: `{summary}`"));
+                rows.push_str(&state.t().export_tool_args.replace("{args}", &summary));
                 if safe.chars().count() > 200 {
                     rows.push('…');
                 }
@@ -1254,11 +1273,12 @@ fn exported_tool_evidence(state: &AppState) -> String {
                 .and_then(saved_output_path);
             match artifact {
                 Some(path) if std::path::Path::new(&path).is_file() => rows.push_str(&format!(
-                    "  - 完整输出: `{path}`（预览之外的内容以该文件为准）\n"
+                    "{}\n",
+                    state.t().export_tool_artifact.replace("{path}", &path)
                 )),
-                Some(_) => rows.push_str("  - 输出副本: 不可用（已被清理或不在本机）\n"),
+                Some(_) => rows.push_str(&format!("{}\n", state.t().export_tool_artifact_missing)),
                 None if call.output_truncated => {
-                    rows.push_str("  - 输出副本: 不完整（没有保留完整副本）\n")
+                    rows.push_str(&format!("{}\n", state.t().export_tool_artifact_partial))
                 }
                 None => {}
             }
@@ -1445,7 +1465,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             None => {
                 state.notification = Some(Notification {
                     level: NotificationLevel::Info,
-                    message: "当前没有可查看的审查报告".to_string(),
+                    message: state.t().review_no_report.to_string(),
                 });
                 Vec::new()
             }
@@ -1473,7 +1493,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         let Some(review_id) = review_id else {
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
-                message: "当前没有正在运行的审查".to_string(),
+                message: state.t().review_no_running.to_string(),
             });
             return Vec::new();
         };
@@ -1500,7 +1520,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                     None => {
                         state.notification = Some(Notification {
                             level: NotificationLevel::Warning,
-                            message: format!("无效模型: {raw}（格式 provider/model）"),
+                            message: state.t().model_invalid.replace("{model}", raw),
                         });
                         return Vec::new();
                     }
@@ -1571,7 +1591,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             _ => {
                 state.notification = Some(Notification {
                     level: NotificationLevel::Warning,
-                    message: format!("未知的审查范围: {token}"),
+                    message: state.t().review_unknown_scope.replace("{token}", token),
                 });
                 return Vec::new();
             }
@@ -1595,7 +1615,7 @@ fn looks_like_session_id(token: &str) -> bool {
 fn review_usage(state: &mut AppState) -> Vec<Effect> {
     state.notification = Some(Notification {
         level: NotificationLevel::Warning,
-        message: "用法: /review [@workspace|@project|@session [id]|@commit <rev>|@branch <base>|@path <p,...>] [@model provider/model] [审查重点] · /review cancel [审查 ID]".to_string(),
+        message: state.t().review_usage_text.to_string(),
     });
     Vec::new()
 }
@@ -1613,9 +1633,9 @@ pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
     // makes the runtime compute `read_only`. It does NOT change the permission
     // profile, and the TUI must not fabricate one it never sent.
     let message = if collab == "plan" {
-        "协作=计划（只读）。确认后用 /collab goal 或 /goal <任务> 开始执行".to_string()
+        state.t().collab_plan_hint.to_string()
     } else {
-        format!("协作 → {collab}")
+        state.t().collab_switched.replace("{collab}", collab)
     };
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
@@ -1739,7 +1759,10 @@ fn model_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     if !state.available_models.is_empty() && !state.available_models.contains(&model) {
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: format!("模型不可用: {model}"),
+            message: state
+                .t()
+                .model_unavailable
+                .replace("{model}", &model.to_string()),
         });
         return Vec::new();
     }
@@ -2041,6 +2064,25 @@ mod export_tests {
         assert!(
             md.contains("## 助手\n\n好的，已经加上 /export 了。"),
             "{md}"
+        );
+    }
+
+    /// The export is user-facing copy, not a fixed Chinese artifact: the
+    /// headings follow the UI locale like every other command message.
+    #[test]
+    fn export_headings_follow_the_ui_locale() {
+        let mut s = state_with_dialogue();
+        s.locale = crate::i18n::Locale::En;
+        let md = build_export_markdown(&s);
+        assert!(
+            md.contains(crate::i18n::Locale::En.text().export_title),
+            "{md}"
+        );
+        assert!(md.contains("## You\n\n"), "{md}");
+        assert!(md.contains("## Assistant\n\n"), "{md}");
+        assert!(
+            !md.contains(crate::i18n::Locale::Zh.text().export_title),
+            "the English export must not mix in the Chinese title: {md}"
         );
     }
 

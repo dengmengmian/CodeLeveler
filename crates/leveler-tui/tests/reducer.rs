@@ -14533,3 +14533,26 @@ fn the_report_page_labels_a_missing_or_legacy_report() {
     assert!(screen.contains("旧版报告"), "{screen}");
     assert!(screen.contains("旧版最后消息"), "{screen}");
 }
+
+/// D17: legacy slash-command feedback is localized, not hardcoded Chinese.
+/// The same command under the same state must produce the locale's text.
+#[test]
+fn legacy_command_feedback_follows_the_ui_locale() {
+    let mut en = opened();
+    en.locale = leveler_tui::Locale::En;
+    typed(&mut en, "/attach");
+    reduce(&mut en, key(KeyCode::Enter));
+    assert_eq!(
+        en.notification.as_ref().map(|n| n.message.as_str()),
+        Some(leveler_tui::Locale::En.text().attach_usage),
+        "English locale must not show the Chinese usage line"
+    );
+
+    let mut zh = opened();
+    typed(&mut zh, "/attach");
+    reduce(&mut zh, key(KeyCode::Enter));
+    assert_eq!(
+        zh.notification.as_ref().map(|n| n.message.as_str()),
+        Some(leveler_tui::Locale::Zh.text().attach_usage)
+    );
+}
