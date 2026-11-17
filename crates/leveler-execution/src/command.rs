@@ -800,6 +800,12 @@ pub fn policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// Every path inside a writable scope that stays write-denied. One list feeds
 /// both the Unix profile and the Windows integrity lease, so a path protected
 /// on one backend cannot silently lose its protection on another.
+///
+/// The macOS Seatbelt profile and the Windows integrity lease are the two
+/// consumers; Linux has neither, and compiling the list there produced a
+/// dead-code failure under `-D warnings`. Tests still exercise the list on
+/// every platform, so `test` keeps it present.
+#[cfg(any(test, target_os = "macos", windows))]
 fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
     let mut protected = Vec::new();
     match scope {

@@ -4063,18 +4063,20 @@ mod authorize_tests {
              \thelper = \"!f() { echo username=leveler-test; echo password=s3cret; }; f\"\n",
         )
         .unwrap();
-        // HOME only: the install-less test process's `leveler_core::environment()`
-        // carries no PATH, and `resolve_git_grant` refuses an environment whose
-        // PATH differs from it. Git itself is still found through the parent's
-        // PATH at spawn time.
-        let env = EnvSnapshot::new(
-            [(
-                OsString::from("HOME"),
-                OsString::from(home.path().as_os_str()),
-            )],
-            home.path().to_path_buf(),
-            home.path().to_path_buf(),
-        );
+        // The grant path refuses an environment whose PATH differs from the
+        // process-wide one. A HOME-only snapshot is correct when that
+        // environment is empty, but another test in this binary may install a
+        // PATH first; carry the same PATH when it exists so test ORDER cannot
+        // turn this security assertion into an Allow.
+        let mut vars: Vec<(OsString, OsString)> = Vec::new();
+        if let Some(path) = leveler_core::environment().var_os_case_insensitive("PATH") {
+            vars.push((OsString::from("PATH"), path));
+        }
+        vars.push((
+            OsString::from("HOME"),
+            OsString::from(home.path().as_os_str()),
+        ));
+        let env = EnvSnapshot::new(vars, home.path().to_path_buf(), home.path().to_path_buf());
 
         let workspace = Workspace::new(dir.path()).unwrap();
         let tool_context =
