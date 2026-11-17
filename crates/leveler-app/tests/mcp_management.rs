@@ -246,6 +246,32 @@ async fn mcp_management_reads_and_changes_the_runtime_authority() {
             .contains("connected")
     );
 
+    // --- an edit drops the connection the old declaration owned -------------
+    let mut edited_spec = find(&reconnected, "echo").unwrap().spec.clone();
+    edited_spec.args.push("--noop".into());
+    let edited = fixture
+        .manage(McpRequest::Update {
+            original_name: "echo".into(),
+            spec: edited_spec,
+        })
+        .await;
+    let edited_row = find(&edited, "echo").expect("edited server is listed");
+    assert_eq!(
+        edited_row.state,
+        McpConnectionState::NotConnected,
+        "an edited declaration must not keep the old connection: {edited:?}"
+    );
+    assert!(edited_row.tools.is_empty());
+    let reconnected = fixture
+        .manage(McpRequest::Reconnect {
+            server: "echo".into(),
+        })
+        .await;
+    assert_eq!(
+        find(&reconnected, "echo").unwrap().state,
+        McpConnectionState::Connected
+    );
+
     // --- disable, then a reconnect is refused ------------------------------
     let disabled = fixture
         .manage(McpRequest::SetEnabled {

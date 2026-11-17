@@ -799,9 +799,24 @@ impl McpToolSource {
         Ok(state)
     }
 
+    /// Drop every cached fact for one server, so an edited/disabled/removed
+    /// declaration cannot keep presenting the previous connection or catalog.
+    pub(crate) async fn invalidate(&self, name: &str) {
+        let mut guard = self.cache.lock().await;
+        let Some(cache) = guard.as_mut() else {
+            return;
+        };
+        let prefix = format!("mcp__{name}__");
+        cache.servers.remove(name);
+        cache.retry.remove(name);
+        cache.states.remove(name);
+        cache.tools.retain(|tool| !tool.name().starts_with(&prefix));
+    }
+
     /// Drop every connection fact and tool whose server is no longer in the
-    /// enabled configuration. Never connects anything: a reload that added a
-    /// server leaves it `NotConnected` until a turn or an explicit reconnect.
+    /// enabled configuration, or whose declaration changed. Never connects
+    /// anything: a reload that added a server leaves it `NotConnected` until a
+    /// turn or an explicit reconnect.
     pub(crate) async fn sync(&self, configured: &[leveler_tools::mcp::McpServerConfig]) {
         let mut guard = self.cache.lock().await;
         let Some(cache) = guard.as_mut() else {
@@ -811,17 +826,23 @@ impl McpToolSource {
             *guard = None;
             return;
         }
-        let names: std::collections::BTreeSet<&str> = configured
+        let desired: std::collections::BTreeMap<&str, String> = configured
             .iter()
-            .map(|config| config.name.as_str())
+            .map(|config| (config.name.as_str(), mcp_server_digest(config)))
             .collect();
-        cache
+        // A server whose declaration changed is not the connection we hold;
+        // its tools and state are dropped even though the name still exists.
+        let unchanged: std::collections::BTreeSet<String> = cache
             .servers
-            .retain(|name, _| names.contains(name.as_str()));
-        cache.retry.retain(|name, _| names.contains(name.as_str()));
-        cache.states.retain(|name, _| names.contains(name.as_str()));
+            .iter()
+            .filter(|(name, digest)| desired.get(name.as_str()) == Some(digest))
+            .map(|(name, _)| name.clone())
+            .collect();
+        cache.servers.retain(|name, _| unchanged.contains(name));
+        cache.retry.retain(|name, _| unchanged.contains(name));
+        cache.states.retain(|name, _| unchanged.contains(name));
         cache.tools.retain(|tool| {
-            names
+            unchanged
                 .iter()
                 .any(|name| tool.name().starts_with(&format!("mcp__{name}__")))
         });

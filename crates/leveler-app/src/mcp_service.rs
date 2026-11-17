@@ -345,6 +345,7 @@ pub(crate) async fn manage(
                 validate_spec(&spec)?;
                 let path = crate::mcp_config::config_path().map_err(|e| e.to_string())?;
                 crate::mcp_config::add_spec_at(&path, &spec).map_err(|e| e.to_string())?;
+                app.mcp_source().invalidate(&spec.name).await;
                 apply_written_config(app).await
             }
             McpRequest::Update {
@@ -355,17 +356,23 @@ pub(crate) async fn manage(
                 let path = crate::mcp_config::config_path().map_err(|e| e.to_string())?;
                 crate::mcp_config::update_spec_at(&path, &original_name, &spec)
                     .map_err(|e| e.to_string())?;
+                // The old name and the new name both stop describing the
+                // cached connection; a rename must not leave old tools behind.
+                app.mcp_source().invalidate(&original_name).await;
+                app.mcp_source().invalidate(&spec.name).await;
                 apply_written_config(app).await
             }
             McpRequest::Remove { server } => {
                 let path = crate::mcp_config::config_path().map_err(|e| e.to_string())?;
                 crate::mcp_config::remove_at(&path, &server).map_err(|e| e.to_string())?;
+                app.mcp_source().invalidate(&server).await;
                 apply_written_config(app).await
             }
             McpRequest::SetEnabled { server, enabled } => {
                 let path = crate::mcp_config::config_path().map_err(|e| e.to_string())?;
                 crate::mcp_config::set_enabled_at(&path, &server, enabled)
                     .map_err(|e| e.to_string())?;
+                app.mcp_source().invalidate(&server).await;
                 apply_written_config(app).await
             }
         }
