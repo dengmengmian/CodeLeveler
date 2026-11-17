@@ -801,11 +801,9 @@ pub fn policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 /// both the Unix profile and the Windows integrity lease, so a path protected
 /// on one backend cannot silently lose its protection on another.
 ///
-/// The macOS Seatbelt profile and the Windows integrity lease are the two
-/// consumers; Linux has neither, and compiling the list there produced a
-/// dead-code failure under `-D warnings`. Tests still exercise the list on
-/// every platform, so `test` keeps it present.
-#[cfg(any(test, target_os = "macos", windows))]
+/// The macOS Seatbelt profile, the Linux bwrap binds and the Windows
+/// integrity lease all consume this one list, so a resource protected on one
+/// backend cannot silently lose its protection on another.
 fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
     let mut protected = Vec::new();
     match scope {
@@ -1033,34 +1031,22 @@ fn linux_sandbox_command(
     }
     // Pre-claim (`None`): bwrap binds `/` read-only and then re-binds each
     // writable root rw — omitting the workspace leaves it read-only while
-    // scratch and toolchain caches stay usable.
-    let (roots, protected) = match scope {
-        WriteScope::ScopedWorkspace { root, excluded, .. } => {
-            let mut protected = git_write_protected_paths(root);
-            protected.extend(definition_write_protected_paths(root));
-            protected.extend(excluded.iter().cloned());
-            (
-                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-                protected,
-            )
+    // scratch and toolchain caches stay usable. One shared protected list
+    // covers `.git`, definitions and AGENTS.md on every backend.
+    let roots = writable_roots_for_scope(scope, scratch_root, cache_write_roots);
+    let protected = protected_write_paths(scope);
+    // bwrap cannot bind a missing destination. Create only the parent chain
+    // of a protected path (never the protected path itself); the child is
+    // then bound to /dev/null, so a command cannot create the directory or
+    // file that a later session would load as authority.
+    for path in &protected {
+        if path.exists() {
+            continue;
         }
-        WriteScope::Workspace { root } => {
-            let mut protected = git_write_protected_paths(root);
-            protected.extend(definition_write_protected_paths(root));
-            (
-                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-                protected,
-            )
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        WriteScope::WorkspaceWithGit { root } => (
-            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            definition_write_protected_paths(root),
-        ),
-        _ => (
-            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            Vec::new(),
-        ),
-    };
+    }
     (
         "bwrap".to_string(),
         bwrap_args(program, args, deny_network, &roots, &protected),
@@ -1094,17 +1080,15 @@ fn bwrap_args(
         a.push(p.clone());
         a.push(p);
     }
-    // After writable binds, re-lock .git (and similar) as read-only when
-    // present. `AGENTS.md` is a file: when absent, bind `/dev/null` over it so
-    // the sandbox sees an empty read-only policy file and cannot create one
-    // that a later turn would load. A directory path still needs to exist.
+    // After writable binds, re-lock .git and every policy/definition path as
+    // read-only. A missing path is bound to `/dev/null` so the sandbox cannot
+    // create it; this covers a not-yet-existing AGENTS.md and a not-yet-existing
+    // definition directory alike.
     for p in protected {
         let source = if p.exists() {
             p.display().to_string()
-        } else if is_policy_file(p) {
-            "/dev/null".to_string()
         } else {
-            continue;
+            "/dev/null".to_string()
         };
         let s = p.display().to_string();
         a.push("--ro-bind".to_string());
@@ -1117,14 +1101,6 @@ fn bwrap_args(
     a.push(program.to_string());
     a.extend_from_slice(args);
     a
-}
-
-/// Whether a protected path is one of the single-file policy files whose
-/// absence must still be fenced (see [`policy_write_protected_paths`]).
-#[cfg(any(target_os = "linux", test))]
-fn is_policy_file(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
 }
 
 /// Whether the RUNNER completed the execution, independent of what the executed
@@ -3494,6 +3470,25 @@ mod tests {
         );
         let go = a.iter().position(|s| s == "go").expect("command present");
         assert_eq!(a[go + 1], "build", "command args follow the program");
+    }
+
+    /// A definition directory that does not exist yet must be fenced too:
+    /// otherwise a confined shell could create the directory and then author
+    /// an agent/skill definition a later session loads as authority.
+    #[test]
+    fn bwrap_fences_a_missing_definition_directory() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let root = scratch.path();
+        let protected = definition_write_protected_paths(root);
+        let a = bwrap_args("sh", &[], false, &[], &protected);
+        for path in protected {
+            let text = path.display().to_string();
+            assert!(
+                a.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == text),
+                "a missing definition path must be fenced by /dev/null: {path:?} in {a:?}"
+            );
+        }
     }
 
     /// A policy file that does not exist yet must still be fenced. bwrap can
