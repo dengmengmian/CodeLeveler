@@ -13,7 +13,7 @@ fn host_triple() -> &'static str {
     leveler_update::host_target_triple().expect("tests run on a supported host")
 }
 
-/// Build a `.tar.gz` shaped exactly like a release: a top-level
+/// Build a `.tar.xz` shaped exactly like a release: a top-level
 /// `leveler-v{version}-{triple}/` directory holding the `leveler` executable.
 fn fixture_archive(dir: &Path, version: &str, triple: &str) -> std::path::PathBuf {
     let name = format!("leveler-v{version}-{triple}");
@@ -32,9 +32,9 @@ fn fixture_archive(dir: &Path, version: &str, triple: &str) -> std::path::PathBu
     // README inside the archive must never be installed over anything.
     std::fs::write(inner.join("README.md"), "docs").unwrap();
 
-    let archive = dir.join(format!("{name}.tar.gz"));
+    let archive = dir.join(format!("{name}.tar.xz"));
     let status = Command::new("tar")
-        .arg("-czf")
+        .arg("-caf")
         .arg(&archive)
         .arg("-C")
         .arg(dir)
@@ -175,9 +175,9 @@ fn an_archive_without_the_binary_is_refused() {
     let inner = staging.join(format!("leveler-v1.0.1-{triple}"));
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("README.md"), "docs").unwrap();
-    let archive = staging.join("empty.tar.gz");
+    let archive = staging.join("empty.tar.xz");
     let status = Command::new("tar")
-        .arg("-czf")
+        .arg("-caf")
         .arg(&archive)
         .arg("-C")
         .arg(&staging)

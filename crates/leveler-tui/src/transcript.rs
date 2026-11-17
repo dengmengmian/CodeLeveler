@@ -330,6 +330,8 @@ pub struct ReviewBlock {
     pub summary: leveler_client_protocol::UiReviewSummary,
     /// The reviewer's current tool, while it runs. Presentation only.
     pub live_tool: Option<String>,
+    /// Independent investigations this review launched, as runtime facts.
+    pub investigations: Vec<leveler_client_protocol::UiReviewInvestigation>,
 }
 
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
@@ -960,14 +962,17 @@ impl TranscriptState {
             TranscriptItem::Review(block) if block.summary.id == summary.id => Some(block),
             _ => None,
         }) {
+            block.investigations = summary.investigations.clone();
             block.summary = summary;
             block.live_tool = None;
             return;
         }
         self.close_tool_group();
+        let investigations = summary.investigations.clone();
         self.items.push(TranscriptItem::Review(ReviewBlock {
             summary,
             live_tool: None,
+            investigations,
         }));
     }
 
@@ -978,6 +983,7 @@ impl TranscriptState {
         review_id: &str,
         tool: Option<String>,
         status: Option<leveler_client_protocol::UiReviewStatus>,
+        investigations: Vec<leveler_client_protocol::UiReviewInvestigation>,
     ) {
         let Some(block) = self.items.iter_mut().find_map(|item| match item {
             TranscriptItem::Review(block) if block.summary.id == review_id => Some(block),
@@ -991,6 +997,7 @@ impl TranscriptState {
         if let Some(status) = status {
             block.summary.status = status;
         }
+        block.investigations = investigations;
         self.bump();
     }
 

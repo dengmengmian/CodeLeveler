@@ -104,7 +104,10 @@ impl Tool for WebFetchTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let network_scope = context.policy.network_scope();
         let unrestricted = context.policy.unrestricted_execution();
-        if !unrestricted && matches!(network_scope, leveler_execution::NetworkScope::None) {
+        // A frozen `None` is a hard destination denial. Exact-call consent
+        // decides the write fence and the approval prompt; it does not clear
+        // the run owner's `--deny-network`. Full never reaches here with None.
+        if matches!(network_scope, leveler_execution::NetworkScope::None) {
             return Ok(ToolOutput::error(
                 "web_fetch 不可用:当前模式/沙箱已禁用网络。",
             ));
@@ -313,6 +316,32 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    /// An exact-call approval is consent to the action; it does not clear an
+    /// explicit `--deny-network`. The tool must refuse before any socket work.
+    #[tokio::test]
+    async fn an_approved_call_under_explicit_denial_still_refuses_the_network() {
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, ResolvedExecutionPolicy, WriteScope,
+        };
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .with_resolved_policy(ResolvedExecutionPolicy::new(
+                WriteScope::Unrestricted,
+                NetworkScope::None,
+                AuthorizationEvidence::ApprovedOnce,
+            ));
+        let output = WebFetchTool
+            .execute(
+                serde_json::json!({"url": "http://127.0.0.1:9/"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("已禁用网络"), "{}", output.content);
     }
 
     #[tokio::test]

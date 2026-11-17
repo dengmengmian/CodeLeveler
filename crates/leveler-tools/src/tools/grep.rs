@@ -101,7 +101,9 @@ impl Tool for GrepTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.clone().unwrap_or_else(|| ".".to_string());
-        let search_root = context.execution_workspace()?.resolve_for_read(&rel)?;
+        let workspace = context.execution_workspace()?;
+        let search_root = workspace.resolve_for_read(&rel)?;
+        let confine = workspace.reads_confined().then(|| workspace.clone());
         if let Err(reason) = crate::memory_access::validate_read(&context, &search_root) {
             return Ok(ToolOutput::error(reason));
         }
@@ -118,6 +120,7 @@ impl Tool for GrepTool {
             &search_root,
             context.require_workspace()?.root(),
             &query,
+            confine,
             &cancellation,
         )
         .await

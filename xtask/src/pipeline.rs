@@ -3084,7 +3084,10 @@ pub fn expected_artifacts(repo: &Path, version: &str) -> Result<Vec<String>, Fai
         let suffix = if target.contains("windows") {
             "zip"
         } else {
-            "tar.gz"
+            // The `.tar.gz` siblings are compatibility assets for binaries
+            // built before the xz switch; the primary published artifact is
+            // the xz archive, so that is what a release is gated on.
+            "tar.xz"
         };
         let name = format!("leveler-v{version}-{target}.{suffix}");
         names.push(name.clone());

@@ -62,13 +62,22 @@ base="https://github.com/$REPO/releases/download/${tag}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-echo "Downloading ${name}.tar.gz ..."
-curl -fSL "${base}/${name}.tar.gz" -o "$tmp/${name}.tar.gz" || die "download failed"
+# `.tar.xz` is the current release format. Releases published before the
+# switch carry only `.tar.gz`, and `releases/latest` can still name one of
+# them until the first xz release ships, so probe for the primary archive and
+# fall back instead of turning a supported release into a 404.
+ext="tar.xz"
+echo "Downloading ${name}.${ext} ..."
+if ! curl -fSL "${base}/${name}.${ext}" -o "$tmp/${name}.${ext}" 2>/dev/null; then
+  ext="tar.gz"
+  echo "Downloading ${name}.${ext} ..."
+  curl -fSL "${base}/${name}.${ext}" -o "$tmp/${name}.${ext}" || die "download failed"
+fi
 
 # Verification is mandatory: never install an executable when its checksum is
 # missing, malformed, or cannot be calculated on this host.
-checksum="$tmp/${name}.tar.gz.sha256"
-curl -fsSL "${base}/${name}.tar.gz.sha256" -o "$checksum" 2>/dev/null \
+checksum="$tmp/${name}.${ext}.sha256"
+curl -fsSL "${base}/${name}.${ext}.sha256" -o "$checksum" 2>/dev/null \
   || die "checksum download failed; refusing unverified install"
 want="$(cut -d' ' -f1 "$checksum")"
 case "$want" in
@@ -78,10 +87,10 @@ esac
 want="$(printf '%s' "$want" | tr 'A-F' 'a-f')"
 
 if have shasum; then
-  got="$(shasum -a 256 "$tmp/${name}.tar.gz" | cut -d' ' -f1)" \
+  got="$(shasum -a 256 "$tmp/${name}.${ext}" | cut -d' ' -f1)" \
     || die "could not calculate sha256"
 elif have sha256sum; then
-  got="$(sha256sum "$tmp/${name}.tar.gz" | cut -d' ' -f1)" \
+  got="$(sha256sum "$tmp/${name}.${ext}" | cut -d' ' -f1)" \
     || die "could not calculate sha256"
 else
   die "shasum or sha256sum is required; refusing unverified install"
@@ -93,7 +102,8 @@ esac
 got="$(printf '%s' "$got" | tr 'A-F' 'a-f')"
 [ "$want" = "$got" ] || die "sha256 mismatch (want $want, got $got)"
 
-tar -xzf "$tmp/${name}.tar.gz" -C "$tmp"
+# `-xf` auto-detects the format: GNU tar and macOS bsdtar both read xz.
+tar -xf "$tmp/${name}.${ext}" -C "$tmp"
 mkdir -p "$BIN_DIR"
 mv "$tmp/${name}/leveler" "$BIN_DIR/leveler"
 chmod +x "$BIN_DIR/leveler"

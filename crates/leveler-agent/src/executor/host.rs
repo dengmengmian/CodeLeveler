@@ -221,18 +221,23 @@ impl Executor {
                 call,
             });
         }
-        // A reviewer seat is structurally read-only: FullAccess removes
-        // ASK/DENY for the user's own actions, but it must not hand a manual
-        // reviewer a tool the seat does not hold. Checked BEFORE approval and
-        // before the Full shortcut, so no approval path can widen this seat.
-        if self.depth > 0
-            && self.agent_role == crate::sub_agent::AgentRole::Reviewer
+        // A reviewer/investigator seat is structurally read-only: FullAccess
+        // removes ASK/DENY for the user's own actions, but it must not hand a
+        // manual review seat a tool the seat does not hold. Checked BEFORE
+        // approval and before the Full shortcut, so no approval path can widen
+        // this seat.
+        let review_seat = self.depth > 0
+            && matches!(
+                self.agent_role,
+                crate::sub_agent::AgentRole::Reviewer | crate::sub_agent::AgentRole::Investigator
+            );
+        if review_seat
             && self.tool(&call.name).is_some()
             && self.projected_tool_registry().get(&call.name).is_none()
         {
             return Err(AdmitError::Refused {
                 reason: format!(
-                    "`{}` is not part of a read-only review seat; the reviewer may only \
+                    "`{}` is not part of a read-only review seat; the seat may only \
                      read, search and report",
                     call.name
                 ),
@@ -240,10 +245,16 @@ impl Executor {
             });
         }
         if !ctx.policy.unrestricted_execution()
-            && self
-                .capabilities
-                .as_ref()
-                .is_some_and(|state| !state.permits_tool(&call.name))
+            && self.capabilities.as_ref().is_some_and(|state| {
+                // A review seat's investigation packs are role defaults: they
+                // are exposed without the `capability` round trip this seat
+                // cannot perform. Every other pack keeps the normal rule.
+                if review_seat {
+                    !state.permits_tool_for_review(&call.name)
+                } else {
+                    !state.permits_tool(&call.name)
+                }
+            })
         {
             return Err(AdmitError::Refused {
                 reason: format!("tool {} capability is not exposed", call.name),
@@ -887,6 +898,9 @@ impl Executor {
                 }
                 if network_unenforceable {
                     notes.push("此平台无法断网：批准后该命令可以联网运行".to_string());
+                }
+                if ctx.policy.network_explicitly_denied() && command_view.is_some() {
+                    notes.push("本次运行已禁止网络：批准只允许在无网络下执行".to_string());
                 }
                 let description = notes.join("；");
                 // Approving a call whose need is the network grants it.
@@ -2332,6 +2346,99 @@ mod authorize_tests {
             .await
             .unwrap();
         assert_eq!(full_approver.asks(), 0, "Full must not ask");
+    }
+
+    /// A standing `Allow` rule is consent to run the matching call, not a
+    /// grant of the whole filesystem. The admitted call must keep the profile
+    /// boundary it resolved under.
+    #[tokio::test]
+    async fn a_standing_allow_rule_does_not_widen_the_resolved_scope() {
+        use leveler_execution::{
+            NetworkScope, PermissionRule, PermissionRuleSet, RuleEffect, RuleMatch, WriteScope,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let allow = PermissionRule {
+            match_: RuleMatch {
+                tool: Some("run_command".into()),
+                command_exact: Some("ls".into()),
+                ..RuleMatch::default()
+            },
+            effect: RuleEffect::Allow,
+        };
+        let exec = executor_for(dir.path(), approver.clone())
+            .with_permission_rules(PermissionRuleSet::from_rules(vec![allow]));
+        let admitted = match exec
+            .admit(
+                call(
+                    "run_command",
+                    serde_json::json!({"program": "ls", "args": []}),
+                ),
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(AdmitError::Refused { reason, .. }) => panic!("{reason}"),
+            Err(AdmitError::Fatal(error)) => panic!("{error}"),
+        };
+        assert_eq!(approver.asks(), 0);
+        assert!(!admitted.resolved().unrestricted_execution());
+        assert!(
+            matches!(admitted.resolved().write, WriteScope::Workspace { .. }),
+            "{:?}",
+            admitted.resolved().write
+        );
+        assert_eq!(
+            admitted.resolved().network_scope,
+            NetworkScope::Internet,
+            "Assisted reaches the network by profile default"
+        );
+        assert_eq!(admitted.ctx.policy.network_scope(), NetworkScope::Internet);
+        assert!(
+            admitted.ctx.policy.write_scope(dir.path()) == admitted.resolved().write,
+            "the execution context uses the frozen write scope"
+        );
+    }
+
+    /// `--deny-network` is the run owner's decision. A command approval is
+    /// consent to run the command, not a second decision about the network.
+    #[tokio::test]
+    async fn approving_a_command_cannot_lift_an_explicit_network_denial() {
+        use leveler_execution::{NetworkScope, WriteScope};
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut exec = executor_for(dir.path(), approver.clone());
+        exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        let admitted = match exec
+            .admit(
+                rm_rf_call(),
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(AdmitError::Refused { reason, .. }) => panic!("{reason}"),
+            Err(AdmitError::Fatal(error)) => panic!("{error}"),
+        };
+        assert_eq!(approver.asks(), 1);
+        assert_eq!(admitted.resolved().network_scope, NetworkScope::None);
+        assert_eq!(
+            admitted.ctx.policy.network_scope(),
+            NetworkScope::None,
+            "the execution context must read the frozen denial, not the profile"
+        );
+        assert_eq!(
+            admitted.resolved().write,
+            WriteScope::Unrestricted,
+            "the approved effect still runs"
+        );
     }
 
     #[tokio::test]
@@ -3948,5 +4055,32 @@ mod authorize_tests {
             )
             .await;
         assert!(read.is_ok(), "a read tool is still part of the seat");
+
+        let investigator = parent.child_for_role_on(AgentRole::Investigator, Vec::new(), None);
+        for name in ["write_file", "apply_patch", "run_command", "shell_command"] {
+            let refused = investigator
+                .admit(
+                    call(name, serde_json::json!({})),
+                    investigator.tool_context.clone(),
+                    false,
+                    &mut approved,
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                refused.is_err(),
+                "{name} must be refused on an investigation seat"
+            );
+        }
+        let read = investigator
+            .admit(
+                call("read_file", serde_json::json!({"path": "x"})),
+                investigator.tool_context.clone(),
+                false,
+                &mut approved,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(read.is_ok(), "an investigation still reads");
     }
 }

@@ -35,6 +35,7 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "grep",
     "list_files",
     "load_skill",
+    "memory_search",
     "native_capabilities",
     "native_verify",
     "read_file",

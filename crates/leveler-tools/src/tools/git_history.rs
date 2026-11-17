@@ -71,7 +71,32 @@ struct Input {
     line_end: Option<u32>,
 }
 
-pub struct GitHistoryTool;
+pub struct GitHistoryTool {
+    /// When set, only this tip and its ancestors are readable. A fixed-object
+    /// review uses it so a later branch (including the commit that fixed the
+    /// reviewed defect) cannot leak into the evidence set.
+    scope_tip: Option<String>,
+}
+
+impl GitHistoryTool {
+    pub fn new() -> Self {
+        Self { scope_tip: None }
+    }
+
+    /// Bind the tool to one reviewed tip. `tip` is resolved to a commit when
+    /// the tool runs; anything outside its ancestry is refused.
+    pub fn scoped_to(tip: impl Into<String>) -> Self {
+        Self {
+            scope_tip: Some(tip.into()),
+        }
+    }
+}
+
+impl Default for GitHistoryTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn vcs(context: &ToolContext) -> Result<GitWorkflow, ToolError> {
     Ok(GitWorkflow::with_runner(
@@ -249,7 +274,9 @@ impl Tool for GitHistoryTool {
             tool: self.name().to_string(),
             message,
         };
-        let rev = valid_rev(input.rev.as_deref().unwrap_or("HEAD")).map_err(invalid_argument)?;
+        let default_rev = self.scope_tip.as_deref().unwrap_or("HEAD");
+        let rev =
+            valid_rev(input.rev.as_deref().unwrap_or(default_rev)).map_err(invalid_argument)?;
         let path = match input.path.as_deref() {
             Some(raw) => Some(
                 valid_path(raw).map_err(|message| ToolError::InvalidArguments {
@@ -291,6 +318,51 @@ impl Tool for GitHistoryTool {
         let sha = verify.stdout.trim().to_string();
         if sha.is_empty() {
             return Ok(invalid(format!("revision `{rev}` resolved to nothing")));
+        }
+        // A fixed-object review may read the reviewed tip and its history.
+        // A sibling/later ref (for example the branch that fixed this defect)
+        // is outside the object and must not become evidence.
+        if let Some(tip) = &self.scope_tip {
+            let tip_verify = workflow
+                .inspect_history(
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{tip}^{{commit}}"),
+                    ],
+                    cancellation.clone(),
+                )
+                .await
+                .map_err(|error| ToolError::Io(error.to_string()))?;
+            if !tip_verify.success() {
+                return Ok(invalid(format!(
+                    "the review's object revision `{tip}` cannot be resolved"
+                )));
+            }
+            let tip_sha = tip_verify.stdout.trim().to_string();
+            let ancestry = workflow
+                .inspect_history(
+                    &["merge-base", "--is-ancestor", &sha, &tip_sha],
+                    cancellation.clone(),
+                )
+                .await
+                .map_err(|error| ToolError::Io(error.to_string()))?;
+            match ancestry.exit_code {
+                Some(0) => {}
+                Some(1) => {
+                    return Ok(invalid(format!(
+                        "revision `{rev}` is outside the reviewed object's ancestry (`{tip}`); \
+                         a review cannot use a later or sibling commit as evidence for it"
+                    )));
+                }
+                _ => {
+                    return Err(ToolError::Io(format!(
+                        "could not check whether `{rev}` belongs to the reviewed object: {}",
+                        format!("{}{}", ancestry.stdout, ancestry.stderr).trim()
+                    )));
+                }
+            }
         }
 
         let args: Vec<String> = match input.action {
@@ -488,7 +560,7 @@ mod tests {
     }
 
     async fn run(ctx: &ToolContext, input: serde_json::Value) -> ToolOutput {
-        GitHistoryTool
+        GitHistoryTool::new()
             .execute(input, ctx.clone(), CancellationToken::new())
             .await
             .unwrap()
@@ -606,6 +678,55 @@ mod tests {
         std::fs::remove_dir_all(&f.dir).ok();
     }
 
+    /// A fixed-object review must not read a later commit (for example the
+    /// branch that fixed the defect). The scope is ancestry, and the default
+    /// revision is the reviewed tip rather than the live HEAD.
+    #[tokio::test]
+    async fn a_scoped_history_tool_reads_only_the_reviewed_ancestry() {
+        let f = fixture();
+        let ctx = ctx(&f.dir);
+        let tool = GitHistoryTool::scoped_to(f.first.clone());
+        let default_rev = tool
+            .execute(
+                serde_json::json!({"action": "file", "path": "src/a.rs"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!default_rev.is_error, "{}", default_rev.content);
+        assert!(default_rev.content.contains("bug_marker"));
+        assert!(!default_rev.content.contains("fixed_marker"));
+
+        let later = tool
+            .execute(
+                serde_json::json!({"action": "file", "rev": f.second, "path": "src/a.rs"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(later.is_error, "{}", later.content);
+        assert!(
+            later
+                .content
+                .contains("outside the reviewed object's ancestry"),
+            "{}",
+            later.content
+        );
+
+        let same = tool
+            .execute(
+                serde_json::json!({"action": "file", "rev": f.first, "path": "src/a.rs"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!same.is_error, "{}", same.content);
+        assert!(same.content.contains("bug_marker"));
+    }
+
     #[tokio::test]
     async fn an_unknown_revision_or_unsafe_path_is_refused_not_read_from_head() {
         let f = fixture();
@@ -622,7 +743,7 @@ mod tests {
             unknown.content
         );
 
-        let escaped = GitHistoryTool
+        let escaped = GitHistoryTool::new()
             .execute(
                 serde_json::json!({"action": "file", "rev": f.first, "path": "../outside.rs"}),
                 ctx.clone(),

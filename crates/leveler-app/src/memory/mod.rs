@@ -323,6 +323,43 @@ impl MemoryRuntime {
         .map_err(|error| format!("memory promotion task failed: {error}"))?
     }
 
+    /// Whether a review may read memory for this session.
+    ///
+    /// The configured (or per-session paused) rollout is the authority; a
+    /// review never promotes memory that the user turned off.
+    pub fn review_memory_enabled(&self, session_scope: Option<&str>) -> bool {
+        self.config_for(session_scope).can_expose_memory()
+    }
+
+    /// Bounded lexical recall over the memory topics an enabled rollout
+    /// exposes. This reads the existing Markdown store; it creates no second
+    /// index and writes nothing.
+    pub async fn review_recall(
+        &self,
+        session_scope: Option<&str>,
+        query: &str,
+        budget: leveler_memory::recall::RecallBudget,
+    ) -> Result<Vec<leveler_memory::recall::RecallHit>, String> {
+        if !self.review_memory_enabled(session_scope) {
+            return Err("memory is disabled by configuration or paused for this session".into());
+        }
+        let storage = self.storage.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            // A review is a read: unlike an ordinary turn it must not create
+            // the store scaffold. A missing scope is simply an empty recall.
+            leveler_memory::recall::recall_topic_excerpts(
+                storage.global_dir(),
+                storage.workspace_dir(),
+                &query,
+                budget,
+            )
+            .map_err(|error| format!("memory recall failed: {error}"))
+        })
+        .await
+        .map_err(|error| format!("memory recall task failed: {error}"))?
+    }
+
     /// Drop a session's cached index and activity after it is deleted.
     pub fn forget_session(&self, session_scope: &str) {
         self.index_cache

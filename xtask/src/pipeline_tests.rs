@@ -295,8 +295,8 @@ fn layer_document(script: &Script, layer: &str) -> String {
 
 fn published_assets(version: &str) -> Vec<String> {
     let mut names = vec![
-        format!("leveler-v{version}-x86_64-unknown-linux-gnu.tar.gz"),
-        format!("leveler-v{version}-aarch64-apple-darwin.tar.gz"),
+        format!("leveler-v{version}-x86_64-unknown-linux-gnu.tar.xz"),
+        format!("leveler-v{version}-aarch64-apple-darwin.tar.xz"),
     ];
     names.push(format!("{}.sha256", names[0].clone()));
     names.push(format!("{}.sha256", names[1].clone()));
@@ -2944,9 +2944,9 @@ fn artifact_verification_can_be_skipped_but_the_report_says_so() {
 fn the_expected_artifacts_come_from_the_release_workflow_matrix() {
     let world = World::new();
     let names = crate::pipeline::expected_artifacts(&world.repo, "1.0.9").unwrap();
-    assert!(names.contains(&"leveler-v1.0.9-aarch64-apple-darwin.tar.gz".to_string()));
-    assert!(names.contains(&"leveler-v1.0.9-aarch64-apple-darwin.tar.gz.sha256".to_string()));
-    assert!(names.contains(&"leveler-v1.0.9-x86_64-unknown-linux-gnu.tar.gz".to_string()));
+    assert!(names.contains(&"leveler-v1.0.9-aarch64-apple-darwin.tar.xz".to_string()));
+    assert!(names.contains(&"leveler-v1.0.9-aarch64-apple-darwin.tar.xz.sha256".to_string()));
+    assert!(names.contains(&"leveler-v1.0.9-x86_64-unknown-linux-gnu.tar.xz".to_string()));
     assert_eq!(names.len(), 4);
     // A workflow with no matrix cannot be verified, and that is a failure, not
     // a silently empty check.

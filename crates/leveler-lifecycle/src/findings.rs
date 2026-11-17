@@ -308,6 +308,99 @@ pub struct ReviewVerdict {
     pub coverage: Vec<ReviewCoverage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limitations: Vec<ReviewLimitation>,
+    /// The complete formal report body, submitted by the Lead Reviewer through
+    /// `report_review`. This is the report of record; the final chat message is
+    /// never parsed or substituted for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// Revision number, stamped by the runtime on every `report_review` call
+    /// (1-based). The model cannot set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_revision: Option<u32>,
+    /// The evidence revision this submission was based on, stamped by the
+    /// runtime. If the review later receives structured evidence, the report
+    /// no longer covers the latest set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_revision: Option<u64>,
+}
+
+/// One item of evidence an investigation cites. Model-authored: the runtime
+/// records it, attributes it, and never treats it as proof by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvestigationFact {
+    pub statement: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+/// What an independent investigation established, as data rather than prose.
+///
+/// This is the child's own declaration, written only by the
+/// `report_investigation` tool. The parent reviewer reads it in the settlement
+/// notice and decides what to believe; it is evidence, not a verdict, and it
+/// never replaces `ReviewVerdict`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InvestigationRecord {
+    /// The delegated objective, in the child's words.
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_facts: Vec<InvestigationFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub business_constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examined_scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_questions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<String>,
+    /// Global references the child used. Per-fact references live on the fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    /// The fixed reviewed object this investigation was bound to. Stamped by
+    /// the runtime from the review context, never by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_revision: Option<String>,
+}
+
+/// How the Lead Reviewer disposed of a finding that arrived from a child.
+///
+/// Absent means the record was reported by the seat that owns the ledger (a
+/// Lead Reviewer's own finding, or an ordinary child's finding before its
+/// parent adopted it). `Candidate` is an Investigator's finding the Lead has
+/// not adjudicated; it is evidence, never a formal defect. Only `Adopted` (and
+/// an absent disposition) count as formal review findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingDisposition {
+    /// Proposed by an Investigator; the Lead has not decided yet.
+    Candidate,
+    /// Explicitly adopted by the Lead as a formal finding.
+    Adopted,
+    /// Explicitly rejected by the Lead; kept for traceability.
+    Rejected,
+    /// Merged into another finding; `duplicate_of` names the survivor.
+    Duplicate,
+}
+
+impl FindingDisposition {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "candidate" | "unresolved" => Self::Candidate,
+            "adopted" => Self::Adopted,
+            "rejected" => Self::Rejected,
+            "duplicate" => Self::Duplicate,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Adopted => "adopted",
+            Self::Rejected => "rejected",
+            Self::Duplicate => "duplicate",
+        }
+    }
 }
 
 /// Optional review fields on a finding. Every field is defaulted and optional
@@ -332,10 +425,59 @@ pub struct FindingDetails {
     pub recommendation: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub reproduced: bool,
+    /// The Lead Reviewer's disposition of a finding. Absent when the record was
+    /// reported by the seat that owns the ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<FindingDisposition>,
+    /// Why the Lead adopted, rejected or merged the candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_reason: Option<String>,
+    /// The references the Lead used for that decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disposition_evidence: Vec<String>,
+    /// The surviving finding when this one was merged as a duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<String>,
+    /// The Investigator's original finding id, preserved across adoption so
+    /// the candidate can be traced back to its own ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_finding_id: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// The Lead Reviewer's structured decision about one candidate finding.
+///
+/// Parsed from `adjudicate_finding`, applied by the ledger that owns the
+/// record. `Candidate` means "still unresolved": it clears an earlier
+/// decision without adopting or rejecting the finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingAdjudication {
+    pub disposition: FindingDisposition,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    /// Required for [`FindingDisposition::Duplicate`]: the finding that
+    /// represents this root cause.
+    pub duplicate_of: Option<String>,
+    pub severity: Option<FindingSeverity>,
+    pub confidence: Option<FindingConfidence>,
+    pub title: Option<String>,
+}
+
+impl Default for FindingAdjudication {
+    fn default() -> Self {
+        Self {
+            disposition: FindingDisposition::Candidate,
+            reason: None,
+            evidence: Vec::new(),
+            duplicate_of: None,
+            severity: None,
+            confidence: None,
+            title: None,
+        }
+    }
 }
 
 /// One durable finding. Identity is `id`, assigned by the ledger that owns the
@@ -363,6 +505,28 @@ pub struct FindingRecord {
     /// and on ordinary explorer/worker reports.
     #[serde(flatten, default)]
     pub details: FindingDetails,
+}
+
+impl FindingRecord {
+    /// Whether this record belongs to the review's FORMAL finding set.
+    ///
+    /// A Lead Reviewer's own finding and an explicitly adopted candidate are
+    /// formal. A candidate is pending, a rejected one is not a defect, and a
+    /// duplicate is represented by its surviving finding.
+    pub fn is_formal(&self) -> bool {
+        matches!(
+            self.details.disposition,
+            None | Some(FindingDisposition::Adopted)
+        )
+    }
+
+    /// Whether this is an Investigator's proposal the Lead has not decided.
+    pub fn is_candidate(&self) -> bool {
+        matches!(
+            self.details.disposition,
+            Some(FindingDisposition::Candidate)
+        )
+    }
 }
 
 /// How a child's run ended, in the four readings a parent must tell apart.
@@ -512,6 +676,11 @@ mod tests {
             "impact",
             "recommendation",
             "reproduced",
+            "disposition",
+            "disposition_reason",
+            "disposition_evidence",
+            "duplicate_of",
+            "source_finding_id",
         ] {
             assert!(
                 !json.contains(&format!("\"{key}\"")),
@@ -564,6 +733,7 @@ mod tests {
                 impact: Some("跨租户读取".into()),
                 recommendation: Some("按 owner 过滤".into()),
                 reproduced: true,
+                ..FindingDetails::default()
             },
         };
         let json = serde_json::to_string(&rec).unwrap();
@@ -641,6 +811,9 @@ mod tests {
                 kind: ReviewLimitationKind::ToolCapability,
                 detail: "没有命令工具，不能运行测试".into(),
             }],
+            report: Some("完整正式报告".into()),
+            report_revision: Some(1),
+            evidence_revision: Some(0),
         };
         let json = serde_json::to_string(&verdict).unwrap();
         assert_eq!(
@@ -666,5 +839,48 @@ mod tests {
             Some(ReviewLimitationKind::ToolCapability)
         );
         assert_eq!(ReviewLimitationKind::parse("vibes"), None);
+    }
+
+    /// Only the Lead's own findings and explicitly adopted candidates are
+    /// formal. Pending candidates, rejections and merged duplicates never count
+    /// as defects.
+    #[test]
+    fn formal_findings_exclude_candidates_rejections_and_duplicates() {
+        let mut formal = rec("f-1", "");
+        assert!(formal.is_formal(), "a lead-authored finding is formal");
+
+        formal.details.disposition = Some(FindingDisposition::Candidate);
+        assert!(!formal.is_formal() && formal.is_candidate());
+
+        formal.details.disposition = Some(FindingDisposition::Adopted);
+        assert!(formal.is_formal());
+
+        formal.details.disposition = Some(FindingDisposition::Rejected);
+        assert!(!formal.is_formal());
+
+        formal.details.disposition = Some(FindingDisposition::Duplicate);
+        assert!(!formal.is_formal());
+    }
+
+    #[test]
+    fn a_candidate_keeps_its_source_finding_and_disposition_through_serde() {
+        let mut finding = rec("f-2", "agent-1");
+        finding.details = FindingDetails {
+            disposition: Some(FindingDisposition::Adopted),
+            disposition_reason: Some("confirmed against the order state machine".into()),
+            disposition_evidence: vec!["src/settle.rs:42".into()],
+            source_finding_id: Some("f-1".into()),
+            ..FindingDetails::default()
+        };
+        let json = serde_json::to_string(&finding).unwrap();
+        assert_eq!(
+            serde_json::from_str::<FindingRecord>(&json).unwrap(),
+            finding
+        );
+        assert_eq!(
+            FindingDisposition::parse("unresolved"),
+            Some(FindingDisposition::Candidate)
+        );
+        assert_eq!(FindingDisposition::parse("maybe"), None);
     }
 }

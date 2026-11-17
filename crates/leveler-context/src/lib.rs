@@ -26,7 +26,7 @@ pub use rules::{
     RuleDeliveryPlan, RuleDeliveryPolicy, RuleDeliveryReport, RulePolicyAudit, RulePolicySource,
     RuleReadError, RuleReadErrorKind, RuleSection, RuleSourceAudit, RuleSourceRead,
     RuleSourceStatus, ScopedRules, is_rule_document, load_rules, plan_instructions,
-    plan_rule_delivery, read_rule_source, render_instructions, scoped_rule_sources,
-    split_rule_sections,
+    plan_rule_delivery, read_rule_source, read_rule_source_with, render_instructions,
+    scoped_rule_sources, split_rule_sections,
 };
 pub use symbols::{defines, extract_symbols};

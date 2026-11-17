@@ -77,9 +77,9 @@ impl Tool for FindFilesTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let base_label = input.path.as_deref().unwrap_or(".");
-        let base = context
-            .execution_workspace()?
-            .resolve_for_read(base_label)?;
+        let workspace = context.execution_workspace()?;
+        let base = workspace.resolve_for_read(base_label)?;
+        let confine = workspace.reads_confined().then(|| workspace.clone());
         if let Err(reason) = crate::memory_access::validate_read(&context, &base) {
             return Ok(ToolOutput::error(reason));
         }
@@ -90,6 +90,7 @@ impl Tool for FindFilesTool {
             context.require_workspace()?.root(),
             &input.pattern,
             limit,
+            confine,
             &cancellation,
         )
         .await

@@ -1381,6 +1381,13 @@ impl Application {
         ))
     }
 
+    /// The process-side memory owner. Manual review reads through it; ordinary
+    /// turns continue to receive memory only through the prompt index and the
+    /// file-tool policy composed by [`Self::compose_tool_surface`].
+    pub(crate) fn memory_runtime(&self) -> &memory::MemoryRuntime {
+        &self.memory
+    }
+
     /// Compose one turn's model-visible tool surface from what this host can
     /// actually do.
     ///

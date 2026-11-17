@@ -43,8 +43,20 @@ pub struct ReviewFinish<'a> {
     pub object_json: Option<&'a str>,
     /// The review ledger's findings, as JSON.
     pub findings_json: &'a str,
-    /// The reviewer's final report, verbatim.
+    /// The Lead Reviewer's formal report body, verbatim. Empty when none was
+    /// submitted.
     pub report: &'a str,
+    /// `submitted`, `none` or `legacy` (see migration 0062).
+    pub report_source: &'a str,
+    /// The reviewer's last chat message, stored beside the formal report so a
+    /// reader can see what was said when no report was submitted.
+    pub final_message: &'a str,
+    /// The review ledger's evidence revision at settlement.
+    pub evidence_revision: u64,
+    /// Formal report submissions so far (0 when none).
+    pub report_revision: u32,
+    /// The evidence revision the submitted report was bound to.
+    pub report_evidence_revision: u64,
     /// Why the review failed, when it did.
     pub error: Option<&'a str>,
     /// Why a non-completed review stopped (budget, cancellation, abnormal
@@ -63,6 +75,9 @@ pub struct ReviewFinish<'a> {
     /// Whether the read-only reviewer changed product files (a contract
     /// violation, recorded rather than hidden).
     pub modified_source: bool,
+    /// Independent investigations this review launched, as JSON. Empty means
+    /// none were launched.
+    pub investigations_json: &'a str,
     /// Settlement time.
     pub finished_at: Timestamp,
 }
@@ -91,8 +106,18 @@ pub struct ReviewRecord {
     pub object_json: Option<String>,
     /// Findings as JSON.
     pub findings_json: String,
-    /// The reviewer's final report, verbatim.
+    /// The Lead Reviewer's formal report body, verbatim.
     pub report: String,
+    /// `submitted`, `none` or `legacy`.
+    pub report_source: String,
+    /// The reviewer's last chat message, when there was one.
+    pub final_message: String,
+    /// The review ledger's evidence revision at settlement.
+    pub evidence_revision: i64,
+    /// Formal report submissions so far.
+    pub report_revision: i64,
+    /// The evidence revision the submitted report was bound to.
+    pub report_evidence_revision: i64,
     /// Why the review failed, when it did.
     pub error: Option<String>,
     /// Why a non-completed review stopped.
@@ -103,6 +128,8 @@ pub struct ReviewRecord {
     pub verdict_json: Option<String>,
     /// Bounded tool-activity trace, as JSON.
     pub activity_json: String,
+    /// Independent investigations this review launched, as JSON.
+    pub investigations_json: String,
     /// Whether the object moved while the review ran.
     pub object_changed: bool,
     /// Whether the reviewer changed product files.
@@ -130,8 +157,8 @@ impl<'a> ReviewRepository<'a> {
         sqlx::query(
             "INSERT INTO reviews \
              (id, session_id, focus, scope_json, model, status, source_session_id, \
-              source_turn_id, findings_json, report, usage_json, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', '', '{}', ?9)",
+              source_turn_id, findings_json, report, report_source, usage_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', '', 'none', '{}', ?9)",
         )
         .bind(review.id)
         .bind(review.session_id.as_str())
@@ -158,7 +185,9 @@ impl<'a> ReviewRepository<'a> {
             "UPDATE reviews SET status = ?2, object_json = ?3, findings_json = ?4, \
              report = ?5, error = ?6, stop_detail = ?7, usage_json = ?8, \
              verdict_json = ?9, object_changed = ?10, modified_source = ?11, \
-             finished_at = ?12, activity_json = ?13 \
+             finished_at = ?12, activity_json = ?13, investigations_json = ?14, \
+             report_source = ?15, final_message = ?16, evidence_revision = ?17, \
+             report_revision = ?18, report_evidence_revision = ?19 \
              WHERE id = ?1 AND status = 'running'",
         )
         .bind(id)
@@ -174,6 +203,12 @@ impl<'a> ReviewRepository<'a> {
         .bind(finish.modified_source)
         .bind(finish.finished_at.to_rfc3339())
         .bind(finish.activity_json)
+        .bind(finish.investigations_json)
+        .bind(finish.report_source)
+        .bind(finish.final_message)
+        .bind(finish.evidence_revision as i64)
+        .bind(i64::from(finish.report_revision))
+        .bind(finish.report_evidence_revision as i64)
         .execute(self.db.pool())
         .await?;
         Ok(result.rows_affected() > 0)
@@ -185,7 +220,8 @@ impl<'a> ReviewRepository<'a> {
             "SELECT id, session_id, focus, scope_json, model, status, source_session_id, \
              source_turn_id, object_json, findings_json, report, error, stop_detail, \
              usage_json, verdict_json, object_changed, modified_source, created_at, \
-             finished_at, activity_json \
+             finished_at, activity_json, investigations_json, report_source, final_message, \
+             evidence_revision, report_revision, report_evidence_revision \
              FROM reviews WHERE id = ?1",
         )
         .bind(id)
@@ -203,7 +239,8 @@ impl<'a> ReviewRepository<'a> {
             "SELECT id, session_id, focus, scope_json, model, status, source_session_id, \
              source_turn_id, object_json, findings_json, report, error, stop_detail, \
              usage_json, verdict_json, object_changed, modified_source, created_at, \
-             finished_at, activity_json \
+             finished_at, activity_json, investigations_json, report_source, final_message, \
+             evidence_revision, report_revision, report_evidence_revision \
              FROM reviews WHERE session_id = ?1 ORDER BY created_at DESC, id DESC",
         )
         .bind(session_id.as_str())
@@ -227,11 +264,17 @@ fn decode_row(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewRecord, StorageErro
         object_json: row.try_get("object_json")?,
         findings_json: row.try_get("findings_json")?,
         report: row.try_get("report")?,
+        report_source: row.try_get("report_source")?,
+        final_message: row.try_get("final_message")?,
+        evidence_revision: row.try_get("evidence_revision")?,
+        report_revision: row.try_get("report_revision")?,
+        report_evidence_revision: row.try_get("report_evidence_revision")?,
         error: row.try_get("error")?,
         stop_detail: row.try_get("stop_detail")?,
         usage_json: row.try_get("usage_json")?,
         verdict_json: row.try_get("verdict_json")?,
         activity_json: row.try_get("activity_json")?,
+        investigations_json: row.try_get("investigations_json")?,
         object_changed: row.try_get::<i64, _>("object_changed")? != 0,
         modified_source: row.try_get::<i64, _>("modified_source")? != 0,
         created_at: row.try_get("created_at")?,
@@ -277,17 +320,27 @@ mod tests {
         assert_eq!(running.status, "running");
         assert_eq!(running.findings_json, "[]");
         assert_eq!(running.finished_at, None);
+        assert_eq!(
+            running.report_source, "none",
+            "a new review has no legacy report; a crash settles it as `none`"
+        );
 
         let finish = ReviewFinish {
             status: "completed",
             object_json: Some(r#"{"head":"abc"}"#),
             findings_json: r#"[{"id":"f-1"}]"#,
             report: "no defects",
+            report_source: "submitted",
+            final_message: "审查完成。",
+            evidence_revision: 2,
+            report_revision: 1,
+            report_evidence_revision: 2,
             error: None,
             stop_detail: None,
             usage_json: r#"{"input_tokens":10}"#,
             verdict_json: Some(r#"{"conclusion":"no_issues_found"}"#),
             activity_json: r#"[{"tool":"report_review"}]"#,
+            investigations_json: r#"[{"id":"agent-1","title":"order lifecycle","role":"investigator","state":"completed","findings":1,"elapsed_ms":0}]"#,
             object_changed: true,
             modified_source: false,
             finished_at: leveler_core::now(),
@@ -296,6 +349,14 @@ mod tests {
         let settled = repo.get("review-1").await.unwrap().unwrap();
         assert_eq!(settled.status, "completed");
         assert_eq!(settled.report, "no defects");
+        assert_eq!(settled.report_source, "submitted");
+        assert_eq!(settled.final_message, "审查完成。");
+        assert_eq!(settled.evidence_revision, 2);
+        assert_eq!(settled.report_revision, 1);
+        assert!(
+            settled.report_evidence_revision <= settled.evidence_revision,
+            "a report cannot claim evidence the review never received"
+        );
         assert!(settled.object_changed);
         assert!(settled.finished_at.is_some());
 
@@ -305,11 +366,17 @@ mod tests {
             object_json: None,
             findings_json: "[]",
             report: "",
+            report_source: "none",
+            final_message: "",
+            evidence_revision: 0,
+            report_revision: 0,
+            report_evidence_revision: 0,
             error: None,
             stop_detail: Some("late"),
             usage_json: "{}",
             verdict_json: None,
             activity_json: "[]",
+            investigations_json: "[]",
             object_changed: false,
             modified_source: false,
             finished_at: leveler_core::now(),
@@ -361,7 +428,12 @@ mod tests {
             .expect("the old review survives the migration");
         assert_eq!(record.status, "completed");
         assert_eq!(record.report, "old report");
+        assert_eq!(
+            record.report_source, "legacy",
+            "an old row is labelled legacy, not upgraded to a formal report"
+        );
         assert_eq!(record.verdict_json, None);
+        assert_eq!(record.report_revision, 0);
     }
 
     #[tokio::test]

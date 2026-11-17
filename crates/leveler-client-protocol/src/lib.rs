@@ -121,9 +121,10 @@ pub use retirement::{RetireDecision, RetireRequest};
 pub use review::{
     ReviewQueryId, ReviewRequest, UiReviewConclusion, UiReviewConfidence, UiReviewCounts,
     UiReviewCoverage, UiReviewCoverageStatus, UiReviewDimension, UiReviewFinding,
+    UiReviewFindingDisposition, UiReviewInvestigation, UiReviewInvestigationState,
     UiReviewLimitation, UiReviewLimitationKind, UiReviewLimitationSource, UiReviewObject,
-    UiReviewReport, UiReviewScope, UiReviewSeverity, UiReviewStatus, UiReviewSummary,
-    UiReviewUsage, UiReviewVerdict,
+    UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewSeverity, UiReviewStatus,
+    UiReviewSummary, UiReviewUsage, UiReviewVerdict,
 };
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{

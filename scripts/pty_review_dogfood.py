@@ -32,7 +32,7 @@ import pty_dogfood as dog  # noqa: E402
 
 ROOT = dog.ROOT
 BIN = os.environ.get("LEVELER_BIN", os.path.join(ROOT, "target/release/leveler"))
-SETTLED = ("审查完成", "审查未完成", "审查已取消", "审查失败")
+SETTLED = ("查看报告", "审查未完成", "审查已取消", "审查失败")
 
 
 def parse_args() -> argparse.Namespace:

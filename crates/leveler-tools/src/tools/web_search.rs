@@ -107,7 +107,9 @@ impl Tool for WebSearchTool {
         // Socket mediation also protects direct tool calls outside admission.
         let network_scope = context.policy.network_scope();
         let unrestricted = context.policy.unrestricted_execution();
-        if !unrestricted && matches!(network_scope, leveler_execution::NetworkScope::None) {
+        // A frozen `None` is a hard destination denial; exact-call consent
+        // does not clear the run owner's `--deny-network`.
+        if matches!(network_scope, leveler_execution::NetworkScope::None) {
             return Ok(ToolOutput::error(
                 "web_search 不可用:当前模式/沙箱已禁用网络。",
             ));

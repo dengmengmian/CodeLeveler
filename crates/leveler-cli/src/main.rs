@@ -202,7 +202,7 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
     let Some(repo) = layout.primary_workspace() else {
         return;
     };
-    let ignored = leveler_execution::untrusted_project_files(&home, repo);
+    let ignored = crate::trust_cmds::untrusted_notices(&home, repo);
     if ignored.is_empty() {
         return;
     }
@@ -213,7 +213,7 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
             entry.path.display()
         );
     }
-    eprintln!("  它可以执行命令或授予免批准权限。确认内容后运行：leveler trust");
+    eprintln!("  它可以执行命令、授予免批准权限或提高默认权限模式。确认内容后运行：leveler trust");
 }
 
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {

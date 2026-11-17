@@ -226,12 +226,18 @@ pub struct LoadedRulesPolicy {
 }
 
 impl ProjectConfig {
+    /// Parse already-read config bytes. Callers that must interpret the exact
+    /// bytes a trust decision covered use this instead of re-reading the file.
+    pub fn parse(raw: &str) -> Option<Self> {
+        serde_yaml::from_str(raw).ok()
+    }
+
     /// Load `<root>/.leveler/config.yaml`, or `None` if it is absent or invalid
     /// (invalid config is non-fatal — the tool falls back to defaults).
     pub fn load(root: &std::path::Path) -> Option<Self> {
         let path = root.join(".leveler/config.yaml");
         let raw = std::fs::read_to_string(path).ok()?;
-        serde_yaml::from_str(&raw).ok()
+        Self::parse(&raw)
     }
 
     /// The rule delivery policy, with a structured reason when the file exists

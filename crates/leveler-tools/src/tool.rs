@@ -198,6 +198,17 @@ impl ToolPolicy {
         )
     }
 
+    /// Whether the OS backend may skip its confinement wrapper entirely.
+    ///
+    /// Only the Full profile does. An exact-call approval runs sandboxed with
+    /// the write fence lifted and the frozen network boundary in force.
+    pub fn full_execution(&self) -> bool {
+        self.resolved.as_ref().map_or_else(
+            || self.mode() == PermissionProfile::FullAccess,
+            ResolvedExecutionPolicy::full_execution,
+        )
+    }
+
     /// Exact resource bindings frozen by the admission owner.
     pub fn resource_grant(&self) -> Option<&leveler_core::GrantRequest> {
         self.resolved
@@ -228,11 +239,16 @@ impl ToolPolicy {
     /// means unrestricted networking is unavailable; scoped consumers must use
     /// this contract rather than converting it back to an allow-network bool.
     pub fn network_scope(&self) -> NetworkScope {
-        if self.unrestricted_execution() {
-            return NetworkScope::Internet;
-        }
+        // The frozen policy is the authority once a call is admitted, even when
+        // the authorization is an exact-call consent: that consent decides the
+        // write fence, not the destination. Reading the live profile first
+        // would turn every approval into an Internet grant and erase an
+        // explicit `--deny-network`.
         if let Some(resolved) = &self.resolved {
             return resolved.network_scope.clone();
+        }
+        if self.unrestricted_execution() {
+            return NetworkScope::Internet;
         }
         if self.network_explicitly_denied() {
             NetworkScope::None
@@ -648,6 +664,19 @@ impl ToolContext {
         self
     }
 
+    /// Keep path-based read tools inside the workspace. The review and its
+    /// investigation children use this: their object is the reviewed
+    /// workspace, not the host filesystem. The ordinary agent keeps its
+    /// absolute-read contract.
+    pub fn with_workspace_confined_reads(mut self) -> Self {
+        if let Some(workspace) = &self.execution.workspace {
+            self.execution.workspace = Some(std::sync::Arc::new(
+                workspace.as_ref().clone().with_read_confinement(true),
+            ));
+        }
+        self
+    }
+
     pub fn with_foreign_owned_paths(mut self, paths: Vec<String>) -> Self {
         self.policy.command_foreign_paths = Arc::new(paths);
         self
@@ -1025,5 +1054,53 @@ mod write_scope_tests {
             .permission_profile()
             .set(PermissionProfile::FullAccess);
         assert!(!c.write_scope().confines());
+    }
+
+    /// The execution path must read the frozen destination scope, not turn an
+    /// exact-call approval into an Internet grant. This is the check that a
+    /// command actually runs under after `--deny-network`.
+    #[test]
+    fn an_admitted_exact_call_keeps_its_frozen_network_scope() {
+        let (c, dir) = ctx(PermissionProfile::Assisted);
+        let root = dir.path().to_path_buf();
+        let c = c.with_sandbox(true).with_resolved_policy(
+            leveler_execution::ResolvedExecutionPolicy::new(
+                WriteScope::Workspace { root },
+                leveler_execution::NetworkScope::None,
+                leveler_execution::AuthorizationEvidence::ApprovedOnce,
+            ),
+        );
+        assert_eq!(
+            c.policy.network_scope(),
+            leveler_execution::NetworkScope::None
+        );
+        assert!(c.policy.network_denied());
+        assert!(
+            c.policy.unrestricted_execution(),
+            "the exact approved write still runs"
+        );
+        assert!(
+            !c.policy.full_execution(),
+            "exact-call consent must not tell the OS backend to skip the sandbox"
+        );
+    }
+
+    /// A standing rule is not a resource grant: the admitted call keeps the
+    /// profile's write and destination boundaries.
+    #[test]
+    fn an_admitted_standing_rule_keeps_the_profile_scopes() {
+        let (c, dir) = ctx(PermissionProfile::Assisted);
+        let root = dir.path().to_path_buf();
+        let c = c.with_resolved_policy(leveler_execution::ResolvedExecutionPolicy::new(
+            WriteScope::Workspace { root: root.clone() },
+            leveler_execution::NetworkScope::Loopback,
+            leveler_execution::AuthorizationEvidence::Rule,
+        ));
+        assert!(!c.policy.unrestricted_execution());
+        assert_eq!(
+            c.policy.network_scope(),
+            leveler_execution::NetworkScope::Loopback
+        );
+        assert_eq!(c.write_scope(), WriteScope::Workspace { root });
     }
 }

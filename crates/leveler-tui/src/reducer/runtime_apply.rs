@@ -1241,12 +1241,15 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.upsert_review(review);
         }
         RuntimeEvent::ReviewProgress {
-            review_id, tool, ..
+            review_id,
+            tool,
+            investigations,
+            ..
         } => {
             // The card's status stays `running`; the live tool is transient.
             state
                 .transcript
-                .note_review_progress(&review_id, tool, None);
+                .note_review_progress(&review_id, tool, None, investigations);
         }
         RuntimeEvent::ReviewFinished { review } => {
             state.transcript.upsert_review(review);

@@ -20,6 +20,7 @@ pub enum RuleEffect {
 
 /// Match conditions (all set fields must match; empty match matches nothing useful).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleMatch {
     /// Exact tool name (e.g. `run_command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +41,7 @@ pub struct RuleMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionRule {
     #[serde(rename = "match")]
     pub match_: RuleMatch,
@@ -47,6 +49,7 @@ pub struct PermissionRule {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionRulesFile {
     #[serde(default)]
     pub rules: Vec<PermissionRule>,
@@ -185,6 +188,12 @@ fn rule_matches(
         }
     }
     any_constraint
+}
+
+/// Whether a literal path would be interpreted as a glob by
+/// [`path_matches_glob`]. Only `*` and `?` are operators in this matcher.
+fn contains_glob_metacharacter(path: &str) -> bool {
+    path.contains('*') || path.contains('?')
 }
 
 /// Minimal glob: `**` any path segment sequence, `*` within a segment, `?` one char.
@@ -396,15 +405,23 @@ pub fn always_rules_for(
         // An edit tool's "always" covers exactly the paths the user saw —
         // never the whole tool, which would let a later plan step rewrite
         // anything without asking. No paths → nothing durable.
+        //
+        // A path containing a glob metacharacter cannot be written as a
+        // durable path rule: the evaluator would read `*`/`?` as a pattern and
+        // the generated rule would cover paths the person never approved.
+        // Dropping it keeps the grant session-only, which is the safe
+        // direction. User-authored globs are unaffected.
         "apply_patch" | "replace" => paths
             .iter()
-            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .filter(|p| !contains_glob_metacharacter(p))
             .map(|p| {
                 allow(RuleMatch {
                     tool: Some(tool.to_string()),
                     command_prefix: None,
                     command_exact: None,
-                    write_path_glob: Some(p.trim().to_string()),
+                    write_path_glob: Some(p.to_string()),
                 })
             })
             .collect(),
@@ -1142,6 +1159,29 @@ mod write_path_tests {
         );
     }
 
+    /// A misspelled security key must not silently drop a constraint. The
+    /// file becomes degraded, and a degraded set forces a decision instead of
+    /// falling through to the profile's auto-allow.
+    #[test]
+    fn an_unknown_security_key_degrades_the_rule_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.yaml");
+        std::fs::write(
+            &path,
+            "rules:\n  - match: { tool: apply_patch, write_path_globe: \"docs/**\" }\n    effect: allow\n",
+        )
+        .unwrap();
+        assert!(
+            load_rules_file(&path).is_err(),
+            "a misspelled key must be a parse error, not a broader rule"
+        );
+        let merged = load_merged_rules(dir.path(), &path, dir.path());
+        assert!(
+            merged.rules.is_degraded(),
+            "the authorization path must see the file as incomplete"
+        );
+    }
+
     /// "Always" on an edit tool grants the paths the user approved, never
     /// the whole tool: a later edit elsewhere asks again.
     #[test]
@@ -1179,6 +1219,30 @@ mod write_path_tests {
         assert!(
             always_rules_for("replace", None, &[]).is_empty(),
             "no paths → nothing durable; the grant stays session-only"
+        );
+    }
+
+    /// A literal path that happens to contain `*` or `?` must not become a
+    /// durable glob: that would cover files the person never approved.
+    #[test]
+    fn an_approved_path_with_glob_characters_stays_session_only() {
+        for path in ["docs/*.md", "notes/?.txt", "a/**/b.rs"] {
+            assert!(
+                always_rules_for("apply_patch", None, &[path.to_string()]).is_empty(),
+                "{path} must not become a standing path rule"
+            );
+        }
+        // An ordinary literal path still becomes the exact durable rule.
+        let rules = always_rules_for("apply_patch", None, &["docs/report.md".to_string()]);
+        assert_eq!(rules.len(), 1);
+        let set = PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            set.evaluate("apply_patch", None, &[PathBuf::from("docs/report.md")]),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate("apply_patch", None, &[PathBuf::from("docs/other.md")]),
+            RuleDecision::NoMatch
         );
     }
 }

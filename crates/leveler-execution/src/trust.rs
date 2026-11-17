@@ -24,6 +24,22 @@ use sha2::{Digest, Sha256};
 /// Order is the order `leveler trust` presents them.
 pub const TRUSTED_PROJECT_FILES: [&str; 2] = [".leveler/hooks.yaml", ".leveler/permissions.yaml"];
 
+/// The repository's own default permission mode. A repository can tighten its
+/// default without trust (that never widens authority); raising it to Full
+/// needs the same content-keyed trust as the files above.
+pub const PROJECT_CONFIG_RELATIVE: &str = ".leveler/config.yaml";
+
+/// Files `leveler trust` records. The project config is here because its
+/// `mode:` can widen execution; it is deliberately not part of
+/// [`TRUSTED_PROJECT_FILES`], because ordinary project-config edits stay
+/// available to the agent (an edit invalidates the recorded digest, so it
+/// cannot inherit the earlier approval).
+pub const TRUSTABLE_PROJECT_FILES: [&str; 3] = [
+    ".leveler/hooks.yaml",
+    ".leveler/permissions.yaml",
+    PROJECT_CONFIG_RELATIVE,
+];
+
 /// An in-repo config file that was present but not trusted, so it was skipped.
 /// Reported so the user learns it did not take effect — a silent skip looks
 /// identical to "my hooks are broken".
@@ -194,7 +210,7 @@ pub fn read_trusted_project_file(
 /// Every in-repo config file that is present but not trusted, for the startup
 /// notice and `leveler trust`.
 pub fn untrusted_project_files(global_home: &Path, repo_root: &Path) -> Vec<UntrustedConfig> {
-    TRUSTED_PROJECT_FILES
+    TRUSTABLE_PROJECT_FILES
         .iter()
         .filter_map(
             |relative| match read_trusted_project_file(global_home, repo_root, relative) {

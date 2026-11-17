@@ -866,6 +866,10 @@ pub enum RuntimeEvent {
         tool: Option<String>,
         #[serde(default)]
         elapsed_ms: u64,
+        /// The review's independent investigations, as runtime facts. Empty
+        /// when the reviewer launched none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        investigations: Vec<crate::UiReviewInvestigation>,
     },
     /// A manual review settled. `Completed` means the reviewer reached a clean
     /// end — not that no defects exist.
@@ -1975,6 +1979,12 @@ mod tests {
             failure: None,
             stop_detail: None,
             usage: crate::UiReviewUsage::default(),
+            investigations: Vec::new(),
+            report_source: crate::UiReviewReportSource::None,
+            report_evidence_revision: 0,
+            evidence_revision: 0,
+            report_revision: 0,
+            report_stale: false,
         };
         roundtrip(
             RuntimeEvent::ReviewStarted {
@@ -1991,6 +2001,7 @@ mod tests {
                 cached_input_tokens: 4,
                 tool: Some("read_file".into()),
                 elapsed_ms: 120,
+                investigations: Vec::new(),
             },
             "review_progress",
         );
@@ -2023,6 +2034,7 @@ mod tests {
                         }],
                     },
                     report: "无问题".into(),
+                    final_message: String::new(),
                 }),
             },
             "review_report_loaded",

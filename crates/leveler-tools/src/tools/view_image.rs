@@ -70,12 +70,24 @@ impl Tool for ViewImageTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context
-            .execution_workspace()?
-            .resolve_for_read(&input.path)?;
+        // Open under the workspace's confinement decision so the bytes read
+        // are the bytes that were authorised, even if a path is swapped after
+        // resolution.
+        let (_path, file) = match context.execution_workspace()?.open_read(&input.path) {
+            Ok(opened) => opened,
+            Err(leveler_execution::WorkspaceError::ReadOpen {
+                kind: std::io::ErrorKind::NotFound,
+                message,
+                ..
+            }) => {
+                return Ok(ToolOutput::error(format!("读取图片失败:{message}")));
+            }
+            Err(error) => return Err(ToolError::Io(error.to_string())),
+        };
+        let file = tokio::fs::File::from_std(file);
         // Check the size before reading, so a huge file is rejected instead of
         // pulled fully into memory first.
-        match tokio::fs::metadata(&path).await {
+        match file.metadata().await {
             Ok(meta) if meta.len() > MAX_BYTES as u64 => {
                 return Ok(ToolOutput::error(format!(
                     "图片过大({} KB),上限 {} KB。",
@@ -86,9 +98,14 @@ impl Tool for ViewImageTool {
             Ok(_) => {}
             Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
         }
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
+        let bytes = {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            let mut file = file;
+            match file.read_to_end(&mut bytes).await {
+                Ok(_) => bytes,
+                Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
+            }
         };
         let processed = match leveler_media::process_image(&bytes) {
             Ok(processed) => processed,

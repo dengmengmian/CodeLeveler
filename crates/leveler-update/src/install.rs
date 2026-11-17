@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::error::UpdateError;
-use crate::target::{archive_extension, binary_name};
+use crate::target::binary_name;
 use crate::version::Version;
 
 /// Try each candidate URL in order, returning the first body that arrives.
@@ -117,18 +117,10 @@ fn extract_all(
     dest_dir: &Path,
     asset_name: &str,
 ) -> Result<Vec<PathBuf>, UpdateError> {
-    let ext = archive_extension(if asset_name.ends_with(".zip") {
-        "windows"
-    } else {
-        "unix"
-    });
+    // `-xf` lets the system tar detect the format: bsdtar reads both `.tar.xz`
+    // and zip without an explicit flag, and GNU tar detects xz on extract.
     let mut command = Command::new("tar");
-    if ext == "zip" {
-        // Windows 10+ `tar` (bsdtar) reads zip.
-        command.arg("-xf");
-    } else {
-        command.arg("-xzf");
-    }
+    command.arg("-xf");
     let status = command
         .arg(archive)
         .arg("-C")

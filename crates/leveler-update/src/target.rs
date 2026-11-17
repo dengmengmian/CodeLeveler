@@ -1,9 +1,12 @@
-//! Host target and the exact release asset that target expects.
+//! Host target and the exact release assets that target expects.
 //!
-//! There is exactly one asset name for a `(version, host)` pair. The release
-//! workflow, the checksum sibling, and the updater all derive it from
-//! [`release_asset_name`], so an Apple Silicon machine can never be offered an
-//! x86_64 archive or a Windows machine a Unix tarball.
+//! The updater has exactly one preferred asset name for a `(version, host)`
+//! pair. The release workflow, the checksum sibling, and the updater all derive
+//! it from [`release_asset_name`], so an Apple Silicon machine can never be
+//! offered an x86_64 archive or a Windows machine a Unix tarball. Releases also
+//! carry the pre-xz `.tar.gz` sibling: binaries built before the format change
+//! select it through [`release_asset_names`], and new binaries fall back to it
+//! only for releases that predate xz.
 
 use crate::version::Version;
 
@@ -33,22 +36,43 @@ pub fn binary_name(triple: &str) -> &'static str {
 }
 
 /// File extension of the archive for a target triple (Windows ships `.zip`).
+///
+/// Unix archives are `.tar.xz`: about 40% smaller than the `.tar.gz` assets
+/// older releases published. The release workflow still publishes both, so a
+/// binary built before this format change can keep updating itself through the
+/// gzip asset it knows.
 pub fn archive_extension(triple: &str) -> &'static str {
     if triple.contains("windows") {
         "zip"
     } else {
-        "tar.gz"
+        "tar.xz"
     }
 }
 
 /// Expected asset file name for a release (without path), e.g.
-/// `leveler-v1.0.0-aarch64-apple-darwin.tar.gz`.
+/// `leveler-v1.0.0-aarch64-apple-darwin.tar.xz`.
 ///
 /// The release workflow builds exactly this name. Anything else is "no asset
 /// for this host", never a fuzzy match.
 pub fn release_asset_name(version: &Version, triple: &str) -> String {
+    release_asset_names(version, triple)
+        .into_iter()
+        .next()
+        .expect("every target has at least one archive format")
+}
+
+/// Asset names this host may install, most preferred first.
+///
+/// Unix hosts prefer `.tar.xz`; a release published before that format switch
+/// carries only `.tar.gz`, and `leveler update --version <old tag>` must still
+/// resolve it. Windows has one zip.
+pub fn release_asset_names(version: &Version, triple: &str) -> Vec<String> {
     let ext = archive_extension(triple);
-    format!("leveler-v{version}-{triple}.{ext}")
+    let mut names = vec![format!("leveler-v{version}-{triple}.{ext}")];
+    if ext == "tar.xz" {
+        names.push(format!("leveler-v{version}-{triple}.tar.gz"));
+    }
+    names
 }
 
 /// The checksum sibling asset name (`<asset>.sha256`), the frozen contract
@@ -67,12 +91,12 @@ mod tests {
     }
 
     #[test]
-    fn each_shipped_target_maps_to_exactly_one_asset() {
+    fn each_shipped_target_maps_to_exactly_one_primary_asset() {
         for (triple, ext) in [
-            ("aarch64-apple-darwin", "tar.gz"),
-            ("x86_64-apple-darwin", "tar.gz"),
-            ("x86_64-unknown-linux-gnu", "tar.gz"),
-            ("aarch64-unknown-linux-gnu", "tar.gz"),
+            ("aarch64-apple-darwin", "tar.xz"),
+            ("x86_64-apple-darwin", "tar.xz"),
+            ("x86_64-unknown-linux-gnu", "tar.xz"),
+            ("aarch64-unknown-linux-gnu", "tar.xz"),
             ("x86_64-pc-windows-msvc", "zip"),
         ] {
             let name = release_asset_name(&v("1.0.0"), triple);
@@ -86,14 +110,14 @@ mod tests {
         assert_eq!(binary_name("x86_64-pc-windows-msvc"), "leveler.exe");
         assert_eq!(archive_extension("x86_64-pc-windows-msvc"), "zip");
         assert_eq!(binary_name("aarch64-apple-darwin"), "leveler");
-        assert_eq!(archive_extension("aarch64-apple-darwin"), "tar.gz");
+        assert_eq!(archive_extension("aarch64-apple-darwin"), "tar.xz");
     }
 
     #[test]
     fn a_prerelease_tag_keeps_its_identifiers_in_the_asset_name() {
         assert_eq!(
             release_asset_name(&v("1.0.0-beta.2"), "aarch64-apple-darwin"),
-            "leveler-v1.0.0-beta.2-aarch64-apple-darwin.tar.gz"
+            "leveler-v1.0.0-beta.2-aarch64-apple-darwin.tar.xz"
         );
     }
 }

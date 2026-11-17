@@ -524,7 +524,7 @@ export type RuntimeEvent =
   /** A manual review was admitted and is now running. The summary is the durable row's projection at start; later progress and the terminal update the same card by `id`. */
   | { type: 'review_started'; review: UiReviewSummary }
   /** Live activity for one running review. Transient: the durable report is the authority once it settles. */
-  | { type: 'review_progress'; active: boolean; cached_input_tokens: number; elapsed_ms?: number; input_tokens: number; output_tokens: number; review_id: string; tool?: string | null }
+  | { type: 'review_progress'; active: boolean; cached_input_tokens: number; elapsed_ms?: number; input_tokens: number; investigations?: UiReviewInvestigation[]; output_tokens: number; review_id: string; tool?: string | null }
   /** A manual review settled. `Completed` means the reviewer reached a clean end — not that no defects exist. */
   | { type: 'review_finished'; review: UiReviewSummary }
   /** Result of [`crate::ClientCommand::QueryReviewReport`]. The report is the durable row, not a reconstruction from the live event stream. */
@@ -1564,12 +1564,16 @@ export type UiReviewConclusion = 'issues_found' | 'no_issues_found' | 'inconclus
 /** How sure the reviewer is that the finding is real, distinct from how bad it would be if it were real. */
 export type UiReviewConfidence = 'high' | 'medium' | 'low';
 
-/** Counts by severity. `unclassified` is an explicit bucket: a finding without a declared severity is not silently promoted to P2. */
+/** Counts by severity. `unclassified` is an explicit bucket: a finding without a declared severity is not silently promoted to P2. Only FORMAL findings are counted: the Lead Reviewer's own findings and candidates it explicitly adopted. `pending_candidates` is reported separately and never contributes to [`Self::total`]. */
 export interface UiReviewCounts {
+  /** Formal findings the reviewer recorded as observations (`kind: observation`). They remain in their severity bucket, but the count says they are observations rather than confirmed defects. */
+  observations?: number;
   p0: number;
   p1: number;
   p2: number;
   p3: number;
+  /** Investigator candidates the Lead Reviewer has not adjudicated. Evidence, not defects; kept out of the formal total. */
+  pending_candidates?: number;
   /** Findings recorded without a severity (usually a non-review child). */
   unclassified: number;
 }
@@ -1593,6 +1597,12 @@ export type UiReviewDimension = 'code' | 'business' | 'security' | 'architecture
 export interface UiReviewFinding {
   confidence?: UiReviewConfidence | null;
   dimension?: UiReviewDimension | null;
+  /** The Lead Reviewer's disposition of this record. Absent means it was authored by the seat that owns the ledger (a Lead finding). */
+  disposition?: UiReviewFindingDisposition | null;
+  /** Why the Lead adopted, rejected or merged this candidate. */
+  disposition_reason?: string | null;
+  /** The surviving finding when this one was merged as a duplicate. */
+  duplicate_of?: string | null;
   evidence?: string | null;
   file?: string | null;
   id: string;
@@ -1604,11 +1614,38 @@ export interface UiReviewFinding {
   /** Whether the reviewer reproduced the problem, as opposed to reasoning from the code alone. `false` is not a claim that it is wrong. */
   reproduced?: boolean;
   severity?: UiReviewSeverity | null;
+  /** The child agent that reported this candidate finding. Empty for the Lead Reviewer's own findings. Attribution, not a second verdict. */
+  source_child?: string;
+  /** The investigator's original finding id, when this record came from a child. Traceability, not a second verdict. */
+  source_finding_id?: string | null;
   summary: string;
   symbol?: string | null;
   /** One-line title. Falls back to `summary` when the reviewer supplied none. */
   title: string;
 }
+
+/** How the Lead Reviewer disposed of one candidate finding. Absent means the finding was authored by the seat that owns the ledger (a Lead Reviewer's own finding); it is formal. */
+export type UiReviewFindingDisposition = 'candidate' | 'adopted' | 'rejected' | 'duplicate';
+
+/** One independent investigation belonging to a manual review. This is the live/durable projection of a real child agent, not a model-authored label. */
+export interface UiReviewInvestigation {
+  elapsed_ms?: number;
+  /** Findings the child reported, when it settled. */
+  findings?: number;
+  id: string;
+  objective?: string | null;
+  /** The runtime role (`investigator`). */
+  role: string;
+  state: UiReviewInvestigationState;
+  /** The short display title fixed at spawn. */
+  title: string;
+}
+
+/** Lifecycle of one independent investigation under a review. Runtime facts, never inferred from the child's prose. */
+export type UiReviewInvestigationState =
+  | 'running' | 'completed' | 'failed' | 'cancelled'
+  /** Stopped before its own end (budget, wall clock, or an abnormal stop). Distinct from Failed: it may still have handed over partial evidence. */
+  | 'incomplete';
 
 /** One limitation, attributed to whoever observed it. */
 export interface UiReviewLimitation {
@@ -1644,14 +1681,19 @@ export interface UiReviewObject {
 
 /** The full report behind a summary card. */
 export interface UiReviewReport {
+  /** The reviewer's last chat message. Displayed separately when no formal report exists; it is never substituted for one. */
+  final_message?: string;
   findings: UiReviewFinding[];
   object: UiReviewObject;
-  /** The reviewer's final report, verbatim. The runtime does not parse it for control flow; coverage, limitations and the conclusion are the reviewer's own statements and are rendered as written. */
+  /** The reviewer's formal report body, verbatim. Empty when the reviewer submitted none; the runtime does not parse it for control flow. */
   report: string;
   summary: UiReviewSummary;
   /** Structured coverage, limitations and conclusion. Absent fields are "not declared"; the runtime never derives them from the prose below. */
   verdict?: UiReviewVerdict;
 }
+
+/** Where the stored report text came from. `Submitted` is the Lead Reviewer's explicit `report_review` body — the report of record. `None` means no formal report was submitted; the review still carries its findings and verdict, but there is no report body. `Legacy` marks a row written before formal report submission existed, whose `report` column held the reviewer's last chat message. */
+export type UiReviewReportSource = 'submitted' | 'none' | 'legacy';
 
 /** What the review is about. The runtime resolves this into concrete files, a diff and an object identity before the reviewer starts. */
 export type UiReviewScope =
@@ -1685,17 +1727,29 @@ export interface UiReviewSummary {
   conclusion?: UiReviewConclusion | null;
   counts: UiReviewCounts;
   created_at: string;
+  /** The review ledger's latest evidence revision at settlement. */
+  evidence_revision?: number;
   failure?: string | null;
   finished_at?: string | null;
   /** The user's review focus, verbatim. */
   focus: string;
   id: string;
+  /** Independent investigations this review actually launched. Empty means none were launched, never "some ran but were hidden". */
+  investigations?: UiReviewInvestigation[];
   /** The model that performed the review. */
   model: string;
   /** The reviewer changed product files. The read-only seat makes this a contract violation, recorded rather than hidden. */
   modified_source?: boolean;
   /** The object moved between capture and the end of the review. A report that says so is a report about the object as it was, not as it is. */
   object_changed?: boolean;
+  /** The evidence revision the submitted report was bound to. Zero when no formal report exists. */
+  report_evidence_revision?: number;
+  /** How many formal report revisions the reviewer submitted. */
+  report_revision?: number;
+  /** Where the stored report text came from. Absent (a legacy peer) reads as [`UiReviewReportSource::Legacy`]. */
+  report_source?: UiReviewReportSource;
+  /** The submitted report predates the review's latest structured evidence: it does not cover every settlement. Execution may still be Completed; this flag says the report is not a complete synthesis. */
+  report_stale?: boolean;
   scope: UiReviewScope;
   session_id: SessionId;
   status: UiReviewStatus;

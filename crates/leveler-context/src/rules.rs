@@ -763,8 +763,24 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
             return out;
         }
     };
+    // Every read goes through one directory capability, so a symlink or a
+    // component swapped between the containment check and the read cannot
+    // smuggle outside content into the prompt. The canonical checks are kept
+    // for the diagnostic they produce; the capability is what enforces.
+    let root_dir =
+        match cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority()) {
+            Ok(dir) => dir,
+            Err(error) => {
+                out.errors.push(RuleReadError::new(
+                    ".",
+                    RuleReadErrorKind::Io,
+                    format!("workspace root: {error}"),
+                ));
+                return out;
+            }
+        };
     for candidate in ["AGENTS.md", ".leveler/instructions.md"] {
-        match read_rule_source_in(&canonical_root, candidate) {
+        match read_rule_source_in_dir(&root_dir, &canonical_root, candidate) {
             Ok(RuleSourceRead::Loaded(rule)) => out.documents.push(rule),
             Ok(RuleSourceRead::Empty) => out.empty.push(candidate.to_string()),
             Ok(RuleSourceRead::Absent) => {}
@@ -776,7 +792,7 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
     let rules_dir = canonical_root.join(".leveler/rules");
     match rules_dir.canonicalize() {
         Ok(dir) => {
-            if !dir.starts_with(&canonical_root) {
+            if !workspace_contains(&canonical_root, &dir) {
                 out.errors.push(RuleReadError::new(
                     ".leveler/rules",
                     RuleReadErrorKind::OutsideWorkspace,
@@ -792,14 +808,25 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
                 ));
                 return out;
             }
-            match std::fs::read_dir(&dir) {
+            let dir = match root_dir.open_dir(".leveler/rules") {
+                Ok(dir) => dir,
+                Err(error) => {
+                    out.errors
+                        .push(RuleReadError::from_io(".leveler/rules", &error));
+                    return out;
+                }
+            };
+            match dir.read_dir(".") {
                 Ok(entries) => {
-                    let mut paths = Vec::new();
+                    let mut names = Vec::new();
                     for entry in entries {
                         match entry {
                             Ok(entry) => {
-                                if entry.path().extension().and_then(|e| e.to_str()) == Some("md") {
-                                    paths.push(entry.path());
+                                let name = entry.file_name();
+                                if Path::new(&name).extension().and_then(|e| e.to_str())
+                                    == Some("md")
+                                {
+                                    names.push(name);
                                 }
                             }
                             Err(error) => out
@@ -807,28 +834,25 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
                                 .push(RuleReadError::from_io(".leveler/rules", &error)),
                         }
                     }
-                    paths.sort();
-                    for path in paths {
-                        let Some(rel) = path
-                            .strip_prefix(&canonical_root)
-                            .ok()
-                            .and_then(|rel| rel.to_str().map(|_| workspace_relative_identity(rel)))
+                    names.sort();
+                    for name in names {
+                        let Some(rel) = Path::new(".leveler/rules")
+                            .join(&name)
+                            .to_str()
+                            .map(str::to_owned)
                         else {
                             // The failure is diagnosable without logging the
                             // absolute location: the source stays workspace-
                             // relative like every other rule source.
-                            let source = path
-                                .strip_prefix(&canonical_root)
-                                .map(workspace_relative_identity)
-                                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
                             out.errors.push(RuleReadError::new(
-                                source,
+                                format!(".leveler/rules/{}", name.to_string_lossy()),
                                 RuleReadErrorKind::InvalidUtf8,
                                 "rule file name is not UTF-8",
                             ));
                             continue;
                         };
-                        match read_rule_source_in(&canonical_root, &rel) {
+                        let rel = workspace_relative_identity(Path::new(&rel));
+                        match read_rule_source_in_dir(&root_dir, &canonical_root, &rel) {
                             Ok(RuleSourceRead::Loaded(rule)) => out.documents.push(rule),
                             Ok(RuleSourceRead::Empty) => out.empty.push(rel),
                             Ok(RuleSourceRead::Absent) => {}
@@ -860,6 +884,110 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
 /// content into project authority. A missing optional file is `Absent`, not an
 /// error; every other failure is returned, never swallowed.
 pub fn read_rule_source(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleReadError> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        RuleReadError::new(
+            rel,
+            RuleReadErrorKind::Io,
+            format!("workspace root: {error}"),
+        )
+    })?;
+    let root_dir =
+        cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
+            .map_err(|error| RuleReadError::from_io(rel, &error))?;
+    read_rule_source_in_dir(&root_dir, &canonical_root, rel)
+}
+
+/// Read one rule document through a directory capability.
+///
+/// The canonical containment check produces the diagnostic; the capability is
+/// what actually enforces it, so a symlink or a component swapped between the
+/// check and the read cannot escape the workspace.
+fn read_rule_source_in_dir(
+    root_dir: &cap_std::fs::Dir,
+    root: &Path,
+    rel: &str,
+) -> Result<RuleSourceRead, RuleReadError> {
+    if !is_rule_document(rel) {
+        return Err(RuleReadError::new(
+            rel,
+            RuleReadErrorKind::NotARuleDocument,
+            "not a project rule document",
+        ));
+    }
+    // `symlink_metadata` sees the entry itself, so a dangling symlink is
+    // present-but-broken, while a genuinely missing candidate stays absent.
+    match root_dir.symlink_metadata(rel) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RuleSourceRead::Absent);
+        }
+        Err(error) => return Err(RuleReadError::from_io(rel, &error)),
+    }
+    let path = root.join(rel);
+    let canonical = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RuleReadError::new(
+                rel,
+                RuleReadErrorKind::Io,
+                "dangling symlink",
+            ));
+        }
+        Err(error) => return Err(RuleReadError::from_io(rel, &error)),
+    };
+    if !workspace_contains(root, &canonical) {
+        return Err(RuleReadError::new(
+            rel,
+            RuleReadErrorKind::OutsideWorkspace,
+            "rule file resolves outside the workspace root",
+        ));
+    }
+    // Open the RESOLVED target relative to the capability. Opening `rel`
+    // directly would refuse an in-workspace symlink whose target is spelled
+    // absolutely (cap-std treats an absolute link as an escape), while opening
+    // the resolved path keeps the read inside the same capability.
+    let relative = canonical.strip_prefix(root).map_err(|_| {
+        RuleReadError::new(
+            rel,
+            RuleReadErrorKind::OutsideWorkspace,
+            "rule file resolves outside the workspace root",
+        )
+    })?;
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let mut file = root_dir
+        .open(relative)
+        .map_err(|error| RuleReadError::from_io(rel, &error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| RuleReadError::from_io(rel, &error))?;
+    if !metadata.is_file() {
+        return Err(RuleReadError::new(
+            rel,
+            RuleReadErrorKind::NotAFile,
+            "rule path is not a regular file",
+        ));
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| RuleReadError::from_io(rel, &error))?;
+    rule_source_from_bytes(rel, bytes)
+}
+
+/// [`read_rule_source`] with a caller-supplied opener.
+///
+/// A confined review seat passes an opener bound to the workspace capability:
+/// the containment check and the bytes then come from the SAME opened object,
+/// so a path swapped between check and read cannot smuggle outside content.
+pub fn read_rule_source_with(
+    root: &Path,
+    rel: &str,
+    open: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<RuleSourceRead, RuleReadError> {
     if !is_rule_document(rel) {
         return Err(RuleReadError::new(
             rel,
@@ -874,10 +1002,14 @@ pub fn read_rule_source(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleRe
             format!("workspace root: {error}"),
         )
     })?;
-    read_rule_source_in(&canonical_root, rel)
+    read_rule_source_in(&canonical_root, rel, open)
 }
 
-fn read_rule_source_in(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleReadError> {
+fn read_rule_source_in(
+    root: &Path,
+    rel: &str,
+    open: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<RuleSourceRead, RuleReadError> {
     if !is_rule_document(rel) {
         return Err(RuleReadError::new(
             rel,
@@ -922,7 +1054,13 @@ fn read_rule_source_in(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleRea
             "rule path is not a regular file",
         ));
     }
-    let bytes = std::fs::read(&canonical).map_err(|error| RuleReadError::from_io(rel, &error))?;
+    let bytes = open(&canonical).map_err(|error| RuleReadError::from_io(rel, &error))?;
+    rule_source_from_bytes(rel, bytes)
+}
+
+/// The one place bytes become a rule source. Both readers end here, so a
+/// delivered section and a retrieved section keep identical content rules.
+fn rule_source_from_bytes(rel: &str, bytes: Vec<u8>) -> Result<RuleSourceRead, RuleReadError> {
     let content = match String::from_utf8(bytes) {
         Ok(content) => content,
         Err(error) => {
@@ -1025,7 +1163,7 @@ pub fn scoped_rule_sources(root: &Path, paths: &[String]) -> ScopedRules {
             if rel == "AGENTS.md" || out.documents.iter().any(|rule| rule.source == rel) {
                 continue;
             }
-            match read_rule_source_in(&canonical_root, &rel) {
+            match read_rule_source_in(&canonical_root, &rel, &|path| std::fs::read(path)) {
                 Ok(RuleSourceRead::Loaded(rule)) => out.documents.push(rule),
                 Ok(RuleSourceRead::Empty) | Ok(RuleSourceRead::Absent) => {}
                 Err(error) => {

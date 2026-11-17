@@ -75,12 +75,14 @@ impl Tool for ListFilesTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.unwrap_or_else(|| ".".to_string());
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
-        let base = context.execution_workspace()?.resolve_for_read(&rel)?;
+        let workspace = context.execution_workspace()?;
+        let base = workspace.resolve_for_read(&rel)?;
+        let confine = workspace.reads_confined().then(|| workspace.clone());
         if let Err(reason) = crate::memory_access::validate_read(&context, &base) {
             return Ok(ToolOutput::error(reason));
         }
 
-        let listing = match WorkspaceSearch::list_dir(&base, limit) {
+        let listing = match WorkspaceSearch::list_dir(&base, limit, confine.as_ref()) {
             Ok(listing) => listing,
             Err(SearchError::NotDirectory) => {
                 return Ok(ToolOutput::error(crate::recoverable::path_not_directory(
@@ -138,6 +140,24 @@ mod tests {
         assert!(out.content.contains("Cargo.toml"), "{}", out.content);
         assert!(out.content.contains("src/"), "{}", out.content);
         assert!(!out.content.contains("deep.rs"), "{}", out.content);
+    }
+
+    /// The default listing path is the workspace root. A review seat lists it
+    /// through the confinement capability, so the empty relative path must
+    /// resolve to `.` rather than fail as "not found".
+    #[tokio::test]
+    async fn a_confined_review_listing_of_the_root_lists_its_children() {
+        let (dir, ctx) = workspace();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let ctx = ctx.with_workspace_confined_reads();
+        let out = ListFilesTool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.txt"), "{}", out.content);
+        assert!(out.content.contains("src/"), "{}", out.content);
     }
 
     #[tokio::test]

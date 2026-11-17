@@ -173,14 +173,16 @@ impl Tool for BrowserTabTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        if !context.policy.unrestricted_execution()
-            && !matches!(
-                context.policy.network_scope(),
-                leveler_execution::NetworkScope::Internet
-            )
-        {
+        // A browser process cannot enforce a destination subset: only the
+        // unfettered Internet scope is honest. A frozen `None` (including an
+        // explicit `--deny-network`) is refused, and exact-call consent does
+        // not clear it.
+        if !matches!(
+            context.policy.network_scope(),
+            leveler_execution::NetworkScope::Internet
+        ) {
             return Ok(ToolOutput::error(
-                "UnsupportedNetworkScope: browser processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+                "UnsupportedNetworkScope: browser processes require Internet scope; destination confinement is unavailable.",
             ));
         }
         let input: TabInput = super::parse_input(self.name(), input)?;
@@ -361,14 +363,16 @@ impl Tool for BrowserActTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        if !context.policy.unrestricted_execution()
-            && !matches!(
-                context.policy.network_scope(),
-                leveler_execution::NetworkScope::Internet
-            )
-        {
+        // A browser process cannot enforce a destination subset: only the
+        // unfettered Internet scope is honest. A frozen `None` (including an
+        // explicit `--deny-network`) is refused, and exact-call consent does
+        // not clear it.
+        if !matches!(
+            context.policy.network_scope(),
+            leveler_execution::NetworkScope::Internet
+        ) {
             return Ok(ToolOutput::error(
-                "UnsupportedNetworkScope: browser processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+                "UnsupportedNetworkScope: browser processes require Internet scope; destination confinement is unavailable.",
             ));
         }
         let input: ActInput = super::parse_input(self.name(), input)?;
@@ -491,14 +495,16 @@ impl Tool for BrowserInspectTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        if !context.policy.unrestricted_execution()
-            && !matches!(
-                context.policy.network_scope(),
-                leveler_execution::NetworkScope::Internet
-            )
-        {
+        // A browser process cannot enforce a destination subset: only the
+        // unfettered Internet scope is honest. A frozen `None` (including an
+        // explicit `--deny-network`) is refused, and exact-call consent does
+        // not clear it.
+        if !matches!(
+            context.policy.network_scope(),
+            leveler_execution::NetworkScope::Internet
+        ) {
             return Ok(ToolOutput::error(
-                "UnsupportedNetworkScope: browser processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+                "UnsupportedNetworkScope: browser processes require Internet scope; destination confinement is unavailable.",
             ));
         }
         let input: InspectInput = super::parse_input(self.name(), input)?;

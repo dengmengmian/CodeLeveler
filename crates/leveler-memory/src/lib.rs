@@ -35,6 +35,7 @@ pub mod index;
 mod maintenance;
 pub mod observation;
 mod query_expansion;
+pub mod recall;
 pub mod schema;
 pub mod scope;
 pub mod sqlite_journal;

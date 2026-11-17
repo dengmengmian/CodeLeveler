@@ -4,11 +4,23 @@
 
 ## [Unreleased]
 
+- 执行权限与用户的真实授权对齐。命中的常驻 `Allow` 规则或自动审查者不再把调用变成无限制的文件与网络执行：它们只回答“是否可以运行”，并保留当前模式的资源边界。精确调用授权仍会执行用户看到的操作（包括提示中列出的其他执行者路径），但不会清除显式 `--deny-network`。
+- 仓库的 `.leveler/config.yaml` 可以不经信任收紧新会话默认模式；只有精确文件内容被信任时，才能把默认模式提升为 `full_access`。`leveler trust` 会列出并记录该文件，且只记录展示给用户的摘要：确认期间发生变化的内容不会被信任。
+- 权限规则拒绝未知字段而不是静默丢掉约束（`deny_unknown_fields`），拼错的 `write_path_glob` 会变成可见的 degraded 规则集并要求批准，而不是更宽的 `Allow`。批准路径包含 `*` 或 `?` 时不会生成常驻路径授权，该授权保持 session-only。
+- 凭据文件名按 ASCII 大小写不敏感比较（`.ENV`、`SERVER.KEY`、`.SSH`），大小写不敏感卷上不能把受保护名称解析成可写文件。
+- macOS 与 Linux 上的受限 Shell 命令不能写入 `.leveler/agents` 或 `.leveler/skills`；工作区层原本已拒绝编辑工具，现在 OS 写边界覆盖 Shell 路径。
+- 无法表达“仅 loopback”边界的后端（Linux `bwrap`、Windows）把 `Loopback` 当作拒绝全部网络，而不是让每条命令都以 `UnsupportedNetworkScope` 失败；绝不扩大到 Internet。
+- 审查报告会因审查结构化事实的任何后续变化而标记过期，包括 Lead 自己新增的 Finding 或改变裁决的复核；重复完全相同的裁决不会推进版本。未跟踪文件指纹只哈希符号链接自身而不读取目标，初始项目规则加载通过目录能力句柄读取。
 - `/review` 提供手动、只读、证据驱动的审查，范围可以是当前任务交付、当前工作区、整个项目、指定 Session、Commit、分支基线或指定路径。审查者以独立子 Agent 运行，拥有自己的审查 ID、预算、取消和持久化报告；`@model provider/model` 可为本次审查选择其他已配置模型，`/review cancel [id]` 可停止运行中的审查。
+- 复杂审查中，Lead Reviewer 可用 `spawn_agent` 启动独立的只读调查。每个调查者有独立上下文，继承同一审查对象、只读工具和权限边界；不能写入、执行命令、指定其他 Agent 或继续委派。`report_investigation` 返回结构化事实、业务约束、实际范围、未解决问题、限制和证据引用；候选 Finding 保留来源调查者归属。审查卡片和报告展示调查者及其真实状态，审查记录持久化该列表。审查与所有调查共享一个墙钟预算：审查回合 20 分钟，其中 60 秒留给结算；Reviewer 子 Agent 获得剩余 19 分钟，最后 3 分钟用于收尾。
 - Review Finding 可携带维度、P0–P3 严重度、置信度、证据、影响、修复方向和是否复现；Explorer / Worker 仍使用原有 `report_finding` 形状。审查记录独立存储，并以对话摘要卡和报告页回放；审查不开启回合、不结算 Goal、不修改源码。
 - 审查者可用只读工具 `session_history` 按页读取被审查 Session 的持久化记录（回合、事件与工具结果、消息、模型调用、Goal、检查点）。工具绑定在被审查 Session 上，只在审查面注册。
 - 审查通过 `report_review` 写入结构化结论：结论、各维度覆盖和限制（环境、权限、工具能力、审查范围）。运行时只记录声明，不从报告正文或 Finding 数量推导。
+- 调查者的 Finding 在 Lead Reviewer 用 `adjudicate_finding` 裁决前只是**候选**（`adopted` / `rejected` / `duplicate` / `unresolved`）。只有 Lead 自己报告的问题和明确采纳的候选计入正式缺陷；未决候选单独计数，被否定或合并的候选保留在报告里供追溯，但不会虚增缺陷数。
+- 审查的正式报告是 `report_review` 的 `report` 字段所提交的完整正文。审查者最后一条聊天消息单独保存和展示，永不覆盖报告；每次提交都是绑定当时证据版本的完整修订。如果提交后调查才结算、且没有提交修订报告，审查会明确标记报告未覆盖最新证据，而不是把它冒充完整结论。
+- 审查沿用仓库现有的 `[limits]` token / 成本上限，并与所有调查者共享；子调查不会获得新的完整预算。审查读取通过工作区能力句柄打开，解析与打开之间被替换的路径无法逃出被审查工作区。
 - 自动审查退役。旧的 `agents.independent_review: required` 仍可加载，但不再在回合、Goal、Commit 或交付结束时自动启动审查。显式测试/评估设置，以及已经处于未结算状态的审查的崩溃恢复，保持原语义。
+- macOS 与 Linux 发布包改为 `.tar.xz`，比之前的 `.tar.gz` 小约 40%。`install.sh`、Homebrew 公式和 `leveler update` 下载 xz 包；同时保留 `.tar.gz`，使本次变更之前发布的二进制仍能自更新，`install.sh` 与 `leveler update --version <旧 tag>` 也会对更早的发布回退到 gzip 包。
 
 ## [1.0.27] - 2026-11-15
 

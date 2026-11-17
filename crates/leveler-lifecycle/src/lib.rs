@@ -63,9 +63,10 @@ pub use checkpoint::{
     CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint, MAX_EXECUTION_EVIDENCE,
 };
 pub use findings::{
-    ChildResultProjection, ChildStatus, FindingConfidence, FindingDetails, FindingKind,
-    FindingRecord, FindingSeverity, ReviewConclusion, ReviewCoverage, ReviewCoverageStatus,
-    ReviewDimension, ReviewLimitation, ReviewLimitationKind, ReviewVerdict,
+    ChildResultProjection, ChildStatus, FindingAdjudication, FindingConfidence, FindingDetails,
+    FindingDisposition, FindingKind, FindingRecord, FindingSeverity, InvestigationFact,
+    InvestigationRecord, ReviewConclusion, ReviewCoverage, ReviewCoverageStatus, ReviewDimension,
+    ReviewLimitation, ReviewLimitationKind, ReviewVerdict,
 };
 pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};

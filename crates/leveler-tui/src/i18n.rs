@@ -1374,8 +1374,25 @@ pub struct ReviewText {
     pub cancelled: &'static str,
     pub failed: &'static str,
     pub view_report: &'static str,
-    /// `{}` is the total number of findings.
+    /// Section label above the review's independent investigations.
+    pub investigations_section: &'static str,
+    /// Investigation-row states. Deliberately distinct from the review's own
+    /// status words: "审查完成" as a child row must never read as the review
+    /// having settled.
+    pub investigation_running: &'static str,
+    pub investigation_completed: &'static str,
+    pub investigation_incomplete: &'static str,
+    pub investigation_failed: &'static str,
+    pub investigation_cancelled: &'static str,
+    /// `{}` is the child agent id that reported a candidate finding.
+    pub finding_source: &'static str,
+    /// `{}` is the total number of formal findings.
     pub findings: &'static str,
+    /// `{}` is the number of formal findings recorded as observations.
+    pub observations: &'static str,
+    /// `{}` is the number of CANDIDATES an investigation reported. Never the
+    /// formal finding count.
+    pub investigation_findings: &'static str,
     pub none_found: &'static str,
     pub readonly: &'static str,
     /// Shown instead of `readonly` when the read-only seat was violated.
@@ -1431,6 +1448,28 @@ pub struct ReviewText {
     pub limitation_scope: &'static str,
     pub limitation_object_changed: &'static str,
     pub limitation_other: &'static str,
+    /// `{}` is the number of Investigator candidates the Lead has not decided.
+    pub pending_candidates: &'static str,
+    /// The submitted report predates the latest structured evidence.
+    pub report_stale: &'static str,
+    /// A row written before formal report submission existed.
+    pub report_source_legacy: &'static str,
+    /// The reviewer submitted no formal report.
+    pub report_source_none: &'static str,
+    pub final_message_section: &'static str,
+    /// Candidate / rejected / duplicate records and the Lead's decisions.
+    pub candidates_section: &'static str,
+    /// No formal findings, but candidate records exist below.
+    pub no_formal_findings: &'static str,
+    pub disposition_candidate: &'static str,
+    pub disposition_adopted: &'static str,
+    pub disposition_rejected: &'static str,
+    /// `{}` is the surviving finding id.
+    pub disposition_duplicate: &'static str,
+    /// `{}` is the Lead's reason.
+    pub disposition_reason: &'static str,
+    /// `{}` report revision, `{}` evidence revision.
+    pub report_revision: &'static str,
 }
 
 #[derive(Debug)]
@@ -2892,8 +2931,17 @@ static ZH: UiText = UiText {
         cancelled: "审查已取消",
         failed: "审查失败",
         view_report: "查看报告 ↗",
-        findings: "发现 {} 个问题",
-        none_found: "未发现问题（不代表已证明正确）",
+        investigations_section: "独立调查",
+        investigation_running: "进行中",
+        investigation_completed: "已完成",
+        investigation_incomplete: "未完成",
+        investigation_failed: "失败",
+        investigation_cancelled: "已取消",
+        finding_source: "来源：{}",
+        findings: "正式 Finding {}",
+        observations: "观察 {}",
+        investigation_findings: "候选 {}",
+        none_found: "没有正式 Finding（不代表已证明正确）",
         readonly: "未修改源码",
         modified_source: "审查者修改了源码（违反只读契约）",
         unclassified: "未分级 {}",
@@ -2943,6 +2991,19 @@ static ZH: UiText = UiText {
         limitation_scope: "范围",
         limitation_object_changed: "对象变化",
         limitation_other: "其他",
+        pending_candidates: "待核对候选 {}",
+        report_stale: "报告提交后仍收到新证据；未覆盖最新调查结果",
+        report_source_legacy: "旧版报告：最后一条消息，未提交正式报告",
+        report_source_none: "未提交正式报告；以下只有结构化结论",
+        final_message_section: "最后一条说明（不是正式报告）",
+        candidates_section: "候选与裁决",
+        no_formal_findings: "没有正式 Finding；调查者候选与裁决见下节。",
+        disposition_candidate: "候选 · 未裁决",
+        disposition_adopted: "已采纳",
+        disposition_rejected: "已否定",
+        disposition_duplicate: "重复 · 合并到 {}",
+        disposition_reason: "裁决依据：{}",
+        report_revision: "报告修订 {} · 证据版本 {}",
     },
 };
 
@@ -4084,8 +4145,17 @@ static EN: UiText = UiText {
         cancelled: "Review cancelled",
         failed: "Review failed",
         view_report: "View report ↗",
-        findings: "{} finding(s)",
-        none_found: "No findings (not proof of correctness)",
+        investigations_section: "Investigations",
+        investigation_running: "running",
+        investigation_completed: "completed",
+        investigation_incomplete: "incomplete",
+        investigation_failed: "failed",
+        investigation_cancelled: "cancelled",
+        finding_source: "source: {}",
+        findings: "{} formal finding(s)",
+        observations: "observations {}",
+        investigation_findings: "candidates {}",
+        none_found: "No formal findings (not proof of correctness)",
         readonly: "source unchanged",
         modified_source: "reviewer modified source (read-only violation)",
         unclassified: "{} unclassified",
@@ -4135,6 +4205,19 @@ static EN: UiText = UiText {
         limitation_scope: "scope",
         limitation_object_changed: "object changed",
         limitation_other: "other",
+        pending_candidates: "pending candidates {}",
+        report_stale: "new evidence arrived after the report was submitted; it does not cover the latest investigations",
+        report_source_legacy: "legacy report: the last message, not a formal submission",
+        report_source_none: "no formal report was submitted; only the structured result is shown",
+        final_message_section: "final message (not the formal report)",
+        candidates_section: "candidates and dispositions",
+        no_formal_findings: "no formal finding; investigator candidates and the Lead's decisions are listed below.",
+        disposition_candidate: "candidate · unresolved",
+        disposition_adopted: "adopted",
+        disposition_rejected: "rejected",
+        disposition_duplicate: "duplicate · merged into {}",
+        disposition_reason: "reason: {}",
+        report_revision: "report revision {} · evidence revision {}",
     },
 };
 

@@ -42,7 +42,9 @@ use crate::coding::PostEditThroughputMode;
 use crate::coding::policy::ResolvedContextPolicy;
 use crate::nudges::first_user_text;
 use crate::prompt::{PromptBuilder, TurnContext};
-use crate::sub_agent::{AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOTAL_AGENTS};
+use crate::sub_agent::{
+    AgentRole, DEFAULT_MAX_CONCURRENT_AGENTS, DEFAULT_MAX_TOTAL_AGENTS, MAX_SUB_AGENT_DEPTH,
+};
 
 /// Host hook consulted before the executor discards compacted context.
 ///
@@ -1074,6 +1076,33 @@ mod model_budget_tests {
         ));
         assert!(check(100, 75).is_ok(), "an exact fit remains admissible");
     }
+
+    /// Admission checks settled spend, not an atomic in-flight reservation.
+    /// Two requests that read the same balance can both pass; the worst-case
+    /// overshoot is bounded by N x (estimated input + declared output), and
+    /// the provider's actual usage settles the ledger afterwards. This test
+    /// pins the contract so nobody mistakes the check for a hard ledger cap.
+    #[test]
+    fn concurrent_admission_is_bounded_by_the_per_request_estimate() {
+        let limits = StepLimits {
+            max_model_tokens: Some(1_000),
+            ..StepLimits::default()
+        };
+        let settled = ProgressLedger {
+            cumulative_model_tokens: 700,
+            ..ProgressLedger::default()
+        };
+        // Two 200-token requests admitted against the same settled balance.
+        assert!(model_request_budget_check(limits, &settled, 150, 50, None).is_ok());
+        assert!(model_request_budget_check(limits, &settled, 150, 50, None).is_ok());
+        // The bound is 700 + 2*200 = 1100, not a silent rewrite of the cap.
+        // Once either request settles, the next admission sees it.
+        let after_settlement = ProgressLedger {
+            cumulative_model_tokens: 900,
+            ..ProgressLedger::default()
+        };
+        assert!(model_request_budget_check(limits, &after_settlement, 150, 50, None).is_err());
+    }
 }
 
 pub(crate) async fn run_auxiliary_round<O: leveler_agent_core::ModelRoundObserver>(
@@ -1300,9 +1329,9 @@ impl SubAgentExecutionPolicies {
     fn for_role(self, role: AgentRole) -> SubAgentExecutionPolicy {
         match role {
             AgentRole::Default => self.default,
-            // A reviewer is an explorer with a different brief: same read-only
-            // shape, same loop budget.
-            AgentRole::Explorer | AgentRole::Reviewer => self.explorer,
+            // A reviewer/investigator is an explorer with a different brief:
+            // same read-only shape, same loop budget.
+            AgentRole::Explorer | AgentRole::Reviewer | AgentRole::Investigator => self.explorer,
             AgentRole::Worker => self.worker,
         }
     }
@@ -1461,6 +1490,10 @@ pub struct TurnPolicy {
     pub max_concurrent_agents: usize,
     /// Max sub-agents spawned across the whole top-level run.
     pub max_total_agents: usize,
+    /// Whether a review seat may launch independent read-only investigations.
+    /// The eval-only A/B seam; a manual review host sets it once. It is not a
+    /// product permission and never widens what the review seat may do.
+    pub review_investigation: bool,
 }
 
 impl Default for TurnPolicy {
@@ -1480,6 +1513,9 @@ impl Default for TurnPolicy {
             allow_host_input: true,
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
+            // Only the manual `/review` entrance enables investigations; the
+            // retired closure-review path keeps its original surface.
+            review_investigation: false,
         }
     }
 }
@@ -1984,7 +2020,12 @@ impl Executor {
         // switching the session to Full: review may read and report, nothing
         // else. Kept here so advertisement, role admission and `capability`
         // disclosure all read the same projection.
-        if self.depth > 0 && self.agent_role == AgentRole::Reviewer {
+        if self.depth > 0
+            && matches!(
+                self.agent_role,
+                AgentRole::Reviewer | AgentRole::Investigator
+            )
+        {
             let mut registry = crate::sub_agent::ChildProfile::resolve(self.agent_role)
                 .apply_to_registry(&self.registry);
             if self.tool_context.review_revision().is_some() {
@@ -2277,6 +2318,17 @@ impl Executor {
         child
     }
 
+    /// Whether THIS executor may start a child. Depth owns the ordinary rule;
+    /// the Lead Reviewer has one additional, role-scoped level for read-only
+    /// investigations. An investigation is already at that second level and
+    /// never reaches it.
+    pub(crate) fn can_spawn_children(&self) -> bool {
+        if self.depth < MAX_SUB_AGENT_DEPTH {
+            return true;
+        }
+        self.depth == MAX_SUB_AGENT_DEPTH && self.agent_role == AgentRole::Reviewer
+    }
+
     pub(crate) fn child_for_role_on(
         &self,
         role: AgentRole,
@@ -2287,16 +2339,17 @@ impl Executor {
         // for each model request and resolved by ToolHost at admission, so a
         // live switch to Full never needs to reconstruct discarded handles.
         let profile = crate::sub_agent::ChildProfile::resolve(role);
-        // A reviewer must not acquire an indirect execution path (a language
-        // server that can run build scripts) or read host credentials merely
-        // because the parent session is Full. Both are role facts, not
-        // permission profiles: an ordinary read-only explorer keeps the
-        // product's existing behavior.
+        // A reviewer or an investigation child must not acquire an indirect
+        // execution path (a language server that can run build scripts) or
+        // read host credentials merely because the parent session is Full.
+        // Both are role facts, not permission profiles: an ordinary read-only
+        // explorer keeps the product's existing behavior.
         let mut tool_context = self.tool_context.clone();
-        if role == AgentRole::Reviewer {
+        if matches!(role, AgentRole::Reviewer | AgentRole::Investigator) {
             tool_context = tool_context
                 .without_language_servers()
-                .with_confined_sensitive_reads();
+                .with_confined_sensitive_reads()
+                .with_workspace_confined_reads();
         }
         let registry = self.registry.clone();
         let write_allowlist = (!profile.read_only() && !files.is_empty()).then_some(files);
@@ -2371,6 +2424,7 @@ impl Executor {
                 reasoning_retention: self.policy.reasoning_retention,
                 max_concurrent_agents: self.policy.max_concurrent_agents,
                 max_total_agents: self.policy.max_total_agents,
+                review_investigation: self.policy.review_investigation,
                 // Children never advertise spawn_agent (depth already blocks it).
                 allow_delegation: false,
                 // A child is unattended; it has no host to ask (depth blocks
@@ -2439,6 +2493,14 @@ impl Executor {
     pub fn with_agents(mut self, max_concurrent: usize, max_total: usize) -> Self {
         self.policy.max_concurrent_agents = max_concurrent.max(1);
         self.policy.max_total_agents = max_total;
+        self
+    }
+
+    /// Eval seam for the manual-review A/B: the Lead Reviewer's investigation
+    /// tool is the only thing switched. The seat's read-only projection, the
+    /// review object and every permission boundary are unchanged.
+    pub fn with_review_investigation(mut self, enabled: bool) -> Self {
+        self.policy.review_investigation = enabled;
         self
     }
 
@@ -2769,12 +2831,25 @@ impl Executor {
             }
             AgentRole::Reviewer => prompt.push_str(
                 "\n\nYou are a REVIEWER sub-agent. You have read-only tools and CANNOT modify \
-                 files or run commands. The task states the change to judge. `report_finding` \
-                 records a finding for the parent. kind `correctness` records a defect in the \
-                 change; other kinds record observations. When the task asks for a structured \
-                 review, supply the optional fields `title`, `dimension`, `severity`, \
-                 `confidence`, `line`, `evidence`, `impact`, `recommendation` and \
-                 `reproduced`. A clean result is a result.",
+                 files or run commands. Read tools are confined to the reviewed workspace; \
+                 host files outside it and credential files are not review evidence. The task \
+                 states the change to judge. `report_finding` records a finding for the parent. \
+                 kind `correctness` records a defect in the change; other kinds record \
+                 observations. When the task asks for a structured review, supply the optional \
+                 fields `title`, `dimension`, `severity`, `confidence`, `line`, `evidence`, \
+                 `impact`, `recommendation` and `reproduced`. A clean result is a result.",
+            ),
+            AgentRole::Investigator => prompt.push_str(
+                "\n\nYou are an INVESTIGATOR sub-agent. You have read-only tools and CANNOT \
+                 modify files, run commands, or delegate further. Read tools are confined to \
+                 the reviewed workspace; host files outside it and credential files are not \
+                 review evidence. Your task names one independent investigation; it is the \
+                 whole instruction and you do not see the parent's conversation. \
+                 `report_finding` records candidate defects; `report_investigation` records \
+                 what you established as structured facts, constraints, examined scope, \
+                 unresolved questions and limitations. Report source facts even when you find \
+                 no defect: the parent combines your facts with other investigations. A clean \
+                 result is a result, not proof.",
             ),
             AgentRole::Default => {}
         }
@@ -3073,8 +3148,14 @@ impl Executor {
     }
 
     /// Check settled invocation facts immediately before each physical send,
-    /// including retries. Already admitted concurrent calls can still settle;
-    /// their next send sees the new shared balance.
+    /// including retries.
+    ///
+    /// This is bounded admission, not an atomic ledger reservation: requests
+    /// already in flight when this one is admitted have not settled yet, so
+    /// two concurrent calls can both pass against the same balance. Each call
+    /// reserves its own worst case (estimated input + declared output), which
+    /// bounds the overshoot to `settled + N * per-request estimate`. Actual
+    /// provider usage settles the ledger and the next send sees it.
     async fn check_shared_model_budget(&self, input: u64, output: u64) -> Result<(), AgentError> {
         let Some(progress) = self.shared_model_progress().await? else {
             return Ok(());
@@ -4133,7 +4214,17 @@ mod ownership_authority_tests {
             .policy
             .permission_profile()
             .set(leveler_execution::PermissionProfile::FullAccess);
-        let child = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        let child = parent
+            .child_for_role_on(AgentRole::Reviewer, Vec::new(), None)
+            .with_review_investigation(true);
+        assert!(
+            child.tool_context.policy.confine_sensitive_reads,
+            "Full does not lift the review seat's credential-read boundary"
+        );
+        assert!(
+            !child.tool_context.language_servers_enabled(),
+            "the review seat holds no indirect execution path"
+        );
         let names: Vec<String> = child
             .request_tool_definitions()
             .into_iter()
@@ -4144,7 +4235,6 @@ mod ownership_authority_tests {
             "write_file",
             "run_command",
             "shell_command",
-            "spawn_agent",
             "kill_task",
             "wait_task",
             "save_agent",
@@ -4154,6 +4244,26 @@ mod ownership_authority_tests {
                 "{forbidden} must not be advertised on a review seat: {names:?}"
             );
         }
+        let spawn = child
+            .request_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "spawn_agent")
+            .expect("the Lead Reviewer may launch read-only investigations");
+        let properties = spawn.input_schema["properties"]
+            .as_object()
+            .expect("spawn schema properties");
+        for forbidden in ["role", "profile", "agent", "files"] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "a review investigation cannot choose `{forbidden}`: {properties:?}"
+            );
+        }
+        for allowed in ["task", "title", "run_in_background"] {
+            assert!(
+                properties.contains_key(allowed),
+                "the restricted spawn schema must keep `{allowed}`: {properties:?}"
+            );
+        }
         assert!(
             names.iter().any(|name| name == "read_file"),
             "the reviewer keeps its read tools: {names:?}"
@@ -4161,6 +4271,55 @@ mod ownership_authority_tests {
         assert!(
             names.iter().any(|name| name == "report_review"),
             "a reviewer declares its structured verdict: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "report_investigation"),
+            "only an investigation declares investigation evidence: {names:?}"
+        );
+        // An investigation is a leaf: it reports facts and findings, but it
+        // holds no spawn tool and no review verdict.
+        let investigator = parent.child_for_role_on(AgentRole::Investigator, Vec::new(), None);
+        let investigator_names: Vec<String> = investigator
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for forbidden in [
+            "spawn_agent",
+            "apply_patch",
+            "write_file",
+            "run_command",
+            "shell_command",
+            "report_review",
+        ] {
+            assert!(
+                !investigator_names.iter().any(|name| name == forbidden),
+                "{forbidden} must not reach an investigation: {investigator_names:?}"
+            );
+        }
+        assert!(
+            investigator_names
+                .iter()
+                .any(|name| name == "report_investigation"),
+            "an investigator declares structured evidence: {investigator_names:?}"
+        );
+        // The A/B seam withholds only this tool; the rest of the seat is
+        // unchanged.
+        let without = parent
+            .child_for_role_on(AgentRole::Reviewer, Vec::new(), None)
+            .with_review_investigation(false);
+        let without_names: Vec<String> = without
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            !without_names.iter().any(|name| name == "spawn_agent"),
+            "the comparison arm must not receive the investigation tool: {without_names:?}"
+        );
+        assert!(
+            without_names.iter().any(|name| name == "report_review"),
+            "the comparison arm is still a reviewer: {without_names:?}"
         );
         let explorer = parent.child_for_role_on(AgentRole::Explorer, Vec::new(), None);
         let explorer_names: Vec<String> = explorer
@@ -4282,6 +4441,123 @@ mod ownership_authority_tests {
         );
     }
 
+    /// The Lead Reviewer has exactly one extra delegation level, and host
+    /// admission fixes everything about it: the role is Investigator, the
+    /// workspace is read-only, and no argument can name another role, agent or
+    /// write scope.
+    #[tokio::test]
+    async fn a_review_spawn_is_admitted_only_as_a_read_only_investigation() {
+        let parent = executor();
+        let reviewer = parent
+            .child_for_role_on(AgentRole::Reviewer, Vec::new(), None)
+            .with_review_investigation(true);
+        let admitted = reviewer
+            .admit_spawn_call(None, None, None, &[], None)
+            .await
+            .expect("a review investigation is admitted");
+        assert_eq!(admitted.profile.role, AgentRole::Investigator);
+        assert!(admitted.profile.read_only());
+        assert_eq!(
+            admitted.spec.max_rounds,
+            crate::sub_agent::REVIEW_INVESTIGATION_MAX_ROUNDS
+        );
+        for (agent, profile, role) in [
+            (None, Some("worker"), None),
+            (None, None, Some("worker")),
+            (Some("code-explorer"), None, None),
+        ] {
+            let error = reviewer
+                .admit_spawn_call(agent, profile, role, &[], None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("review investigation"),
+                "review spawn must refuse capability widening: {error}"
+            );
+        }
+        assert!(
+            reviewer
+                .admit_spawn_call(None, None, None, &["src/a.rs".into()], None)
+                .await
+                .is_err(),
+            "an investigation can never take a write scope"
+        );
+
+        let investigator = reviewer.child_for_role_on(AgentRole::Investigator, Vec::new(), None);
+        assert!(
+            investigator
+                .admit_spawn_call(None, None, None, &[], None)
+                .await
+                .is_err(),
+            "an investigation is a leaf"
+        );
+
+        let without = reviewer.with_review_investigation(false);
+        assert!(
+            without
+                .admit_spawn_call(None, None, None, &[], None)
+                .await
+                .is_err(),
+            "the comparison arm must refuse a spawn it never advertised"
+        );
+    }
+
+    /// The investigation inherits the review's fixed object and sensitive-read
+    /// confinement. A commit review's child cannot fall back to the worktree.
+    #[test]
+    fn an_investigation_inherits_the_review_object_and_read_confinement() {
+        let mut parent = executor();
+        let mut registry = leveler_tools::default_registry();
+        registry.register(Arc::new(leveler_tools::tools::GitHistoryTool::new()));
+        registry.register(Arc::new(leveler_tools::tools::ReadFileTool));
+        parent.registry = Arc::new(registry);
+        let mut reviewer = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        reviewer.tool_context = reviewer
+            .tool_context
+            .clone()
+            .with_review_revision("0123456789abcdef0123456789abcdef01234567");
+        let investigator = reviewer.child_for_role_on(AgentRole::Investigator, Vec::new(), None);
+        assert_eq!(
+            investigator.tool_context.review_revision(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(
+            investigator.tool_context.policy.confine_sensitive_reads,
+            "an investigation must not read host credentials even in Full"
+        );
+        assert!(
+            !investigator.tool_context.language_servers_enabled(),
+            "an investigation must not start an indirect execution path"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        assert!(
+            investigator
+                .tool_context
+                .require_workspace()
+                .unwrap()
+                .resolve_for_read(&outside_file)
+                .is_err(),
+            "an investigation cannot read outside the reviewed workspace"
+        );
+        let names: Vec<String> = investigator
+            .request_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for worktree_tool in ["read_file", "grep", "git_status", "git_diff"] {
+            assert!(
+                !names.iter().any(|name| name == worktree_tool),
+                "{worktree_tool} must not answer for a fixed review object: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "git_history"),
+            "the revision-scoped evidence path stays: {names:?}"
+        );
+    }
+
     /// A revision-bound review advertises the historical evidence path and
     /// removes the tools that answer from the live worktree. Admission refuses
     /// the same names, so a direct call cannot bypass the projection.
@@ -4289,7 +4565,7 @@ mod ownership_authority_tests {
     fn a_fixed_revision_review_surface_is_revision_scoped() {
         let mut parent = executor();
         let mut registry = leveler_tools::default_registry();
-        registry.register(Arc::new(leveler_tools::tools::GitHistoryTool));
+        registry.register(Arc::new(leveler_tools::tools::GitHistoryTool::new()));
         parent.registry = Arc::new(registry);
         let mut reviewer = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
         reviewer.tool_context = reviewer

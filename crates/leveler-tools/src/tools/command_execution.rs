@@ -242,9 +242,9 @@ impl CommandExecution {
         isolation_write_roots: Vec<std::path::PathBuf>,
     ) -> ProcessRequest {
         let mut req = ProcessRequest::new(program, args, cwd);
-        req.network_scope = context.policy.network_scope();
+        req.network_scope = context.policy.network_scope().enforced_on_this_backend();
         req.deny_network = matches!(req.network_scope, leveler_execution::NetworkScope::None);
-        req.unrestricted_execution = context.policy.unrestricted_execution();
+        req.unrestricted_execution = context.policy.full_execution();
         req.deny_env = context.policy.deny_env.as_ref().clone();
         req.deny_env.extend(isolation_deny);
         req.authority_env = authority_env;
@@ -345,12 +345,12 @@ impl CommandExecution {
         // run forever".
         request.timeout = resolve_timeout(timeout_seconds);
         let foreground_timeout = request.timeout;
-        let network_scope = context.policy.network_scope();
+        let network_scope = context.policy.network_scope().enforced_on_this_backend();
         let network_denied = matches!(network_scope, leveler_execution::NetworkScope::None);
         request.network_scope = network_scope.clone();
         request.deny_network =
             matches!(request.network_scope, leveler_execution::NetworkScope::None);
-        request.unrestricted_execution = context.policy.unrestricted_execution();
+        request.unrestricted_execution = context.policy.full_execution();
         request.deny_env = context.policy.deny_env.as_ref().clone();
         request.deny_env.extend(isolation_deny);
         request.authority_env = authority_env;
@@ -993,6 +993,35 @@ mod exit_taxonomy_tests {
     fn status_of(out: &ToolOutput) -> ToolExecutionStatus {
         serde_json::from_value(out.metadata["execution_status"].clone())
             .unwrap_or_else(|e| panic!("execution_status missing/invalid: {e}; {out:?}"))
+    }
+
+    /// The process request is the last structured fact before the OS backend.
+    /// An exact-call approval may lift the write fence, but it must carry the
+    /// frozen network denial and must still be sandboxed.
+    #[test]
+    fn an_exact_call_request_keeps_the_frozen_network_denial() {
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, ResolvedExecutionPolicy, WriteScope,
+        };
+        let (dir, ctx) = ws();
+        let ctx = ctx.with_resolved_policy(ResolvedExecutionPolicy::new(
+            WriteScope::Workspace { root: dir.clone() },
+            NetworkScope::None,
+            AuthorizationEvidence::ApprovedOnce,
+        ));
+        let req = CommandExecution::background_process_request(
+            "true",
+            vec![],
+            dir,
+            &ctx,
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(!req.unrestricted_execution, "the sandbox must still run");
+        assert!(req.deny_network, "the explicit denial must survive");
+        assert_eq!(req.network_scope, NetworkScope::None);
+        assert_eq!(req.write_scope, WriteScope::Unrestricted);
     }
 
     #[tokio::test]

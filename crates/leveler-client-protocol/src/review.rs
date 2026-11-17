@@ -128,6 +128,10 @@ pub enum UiReviewConfidence {
 
 /// Counts by severity. `unclassified` is an explicit bucket: a finding without
 /// a declared severity is not silently promoted to P2.
+///
+/// Only FORMAL findings are counted: the Lead Reviewer's own findings and
+/// candidates it explicitly adopted. `pending_candidates` is reported
+/// separately and never contributes to [`Self::total`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiReviewCounts {
@@ -137,6 +141,15 @@ pub struct UiReviewCounts {
     pub p3: u32,
     /// Findings recorded without a severity (usually a non-review child).
     pub unclassified: u32,
+    /// Investigator candidates the Lead Reviewer has not adjudicated.
+    /// Evidence, not defects; kept out of the formal total.
+    #[serde(default)]
+    pub pending_candidates: u32,
+    /// Formal findings the reviewer recorded as observations
+    /// (`kind: observation`). They remain in their severity bucket, but the
+    /// count says they are observations rather than confirmed defects.
+    #[serde(default)]
+    pub observations: u32,
 }
 
 impl UiReviewCounts {
@@ -194,6 +207,40 @@ pub struct UiReviewObject {
     pub captured_at: String,
 }
 
+/// How the Lead Reviewer disposed of one candidate finding. Absent means the
+/// finding was authored by the seat that owns the ledger (a Lead Reviewer's own
+/// finding); it is formal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiReviewFindingDisposition {
+    Candidate,
+    Adopted,
+    Rejected,
+    Duplicate,
+}
+
+impl UiReviewFindingDisposition {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "candidate" => Self::Candidate,
+            "adopted" => Self::Adopted,
+            "rejected" => Self::Rejected,
+            "duplicate" => Self::Duplicate,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Adopted => "adopted",
+            Self::Rejected => "rejected",
+            Self::Duplicate => "duplicate",
+        }
+    }
+}
+
 /// One finding in the client-facing report. Stable `id` is the review ledger's
 /// own sequence; the report never re-keys another agent's records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +259,10 @@ pub struct UiReviewFinding {
     /// The `report_finding` kind (`correctness`, `risk`, …).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
+    /// The child agent that reported this candidate finding. Empty for the
+    /// Lead Reviewer's own findings. Attribution, not a second verdict.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_child: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +279,118 @@ pub struct UiReviewFinding {
     /// from the code alone. `false` is not a claim that it is wrong.
     #[serde(default)]
     pub reproduced: bool,
+    /// The Lead Reviewer's disposition of this record. Absent means it was
+    /// authored by the seat that owns the ledger (a Lead finding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<UiReviewFindingDisposition>,
+    /// Why the Lead adopted, rejected or merged this candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition_reason: Option<String>,
+    /// The surviving finding when this one was merged as a duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<String>,
+    /// The investigator's original finding id, when this record came from a
+    /// child. Traceability, not a second verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_finding_id: Option<String>,
+}
+
+/// Lifecycle of one independent investigation under a review. Runtime facts,
+/// never inferred from the child's prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiReviewInvestigationState {
+    Running,
+    Completed,
+    /// Stopped before its own end (budget, wall clock, or an abnormal stop).
+    /// Distinct from Failed: it may still have handed over partial evidence.
+    Incomplete,
+    Failed,
+    Cancelled,
+}
+
+impl UiReviewInvestigationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "incomplete" => Self::Incomplete,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+
+    pub fn settled(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+/// One independent investigation belonging to a manual review. This is the
+/// live/durable projection of a real child agent, not a model-authored label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiReviewInvestigation {
+    pub id: String,
+    /// The short display title fixed at spawn.
+    pub title: String,
+    /// The runtime role (`investigator`).
+    pub role: String,
+    pub state: UiReviewInvestigationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// Findings the child reported, when it settled.
+    #[serde(default)]
+    pub findings: u32,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+/// Where the stored report text came from.
+///
+/// `Submitted` is the Lead Reviewer's explicit `report_review` body — the
+/// report of record. `None` means no formal report was submitted; the review
+/// still carries its findings and verdict, but there is no report body.
+/// `Legacy` marks a row written before formal report submission existed, whose
+/// `report` column held the reviewer's last chat message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiReviewReportSource {
+    Submitted,
+    None,
+    #[default]
+    Legacy,
+}
+
+impl UiReviewReportSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "submitted" => Self::Submitted,
+            "none" => Self::None,
+            "legacy" => Self::Legacy,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::None => "none",
+            Self::Legacy => "legacy",
+        }
+    }
 }
 
 /// The summary a conversation card and history list carry.
@@ -267,6 +430,29 @@ pub struct UiReviewSummary {
     pub stop_detail: Option<String>,
     #[serde(default)]
     pub usage: UiReviewUsage,
+    /// Independent investigations this review actually launched. Empty means
+    /// none were launched, never "some ran but were hidden".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub investigations: Vec<UiReviewInvestigation>,
+    /// Where the stored report text came from. Absent (a legacy peer) reads as
+    /// [`UiReviewReportSource::Legacy`].
+    #[serde(default)]
+    pub report_source: UiReviewReportSource,
+    /// The evidence revision the submitted report was bound to. Zero when no
+    /// formal report exists.
+    #[serde(default)]
+    pub report_evidence_revision: u64,
+    /// The review ledger's latest evidence revision at settlement.
+    #[serde(default)]
+    pub evidence_revision: u64,
+    /// How many formal report revisions the reviewer submitted.
+    #[serde(default)]
+    pub report_revision: u32,
+    /// The submitted report predates the review's latest structured evidence:
+    /// it does not cover every settlement. Execution may still be Completed;
+    /// this flag says the report is not a complete synthesis.
+    #[serde(default)]
+    pub report_stale: bool,
 }
 
 /// How far one dimension was actually covered. `Reviewed` is the reviewer's
@@ -426,10 +612,13 @@ pub struct UiReviewReport {
     /// "not declared"; the runtime never derives them from the prose below.
     #[serde(default)]
     pub verdict: UiReviewVerdict,
-    /// The reviewer's final report, verbatim. The runtime does not parse it
-    /// for control flow; coverage, limitations and the conclusion are the
-    /// reviewer's own statements and are rendered as written.
+    /// The reviewer's formal report body, verbatim. Empty when the reviewer
+    /// submitted none; the runtime does not parse it for control flow.
     pub report: String,
+    /// The reviewer's last chat message. Displayed separately when no formal
+    /// report exists; it is never substituted for one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub final_message: String,
 }
 
 /// Correlation id carried by [`crate::ClientCommand::QueryReviewReport`].
@@ -443,4 +632,39 @@ pub struct ReviewRequest {
     pub focus: String,
     pub scope: UiReviewScope,
     pub model: Option<ModelRef>,
+}
+
+#[cfg(test)]
+mod investigation_projection_tests {
+    use super::*;
+
+    #[test]
+    fn an_investigation_projects_and_round_trips_with_its_terminal_states() {
+        for state in [
+            UiReviewInvestigationState::Running,
+            UiReviewInvestigationState::Completed,
+            UiReviewInvestigationState::Incomplete,
+            UiReviewInvestigationState::Failed,
+            UiReviewInvestigationState::Cancelled,
+        ] {
+            assert_eq!(
+                UiReviewInvestigationState::parse(state.as_str()),
+                Some(state)
+            );
+            let item = UiReviewInvestigation {
+                id: "agent-1".into(),
+                title: "订单状态生命周期".into(),
+                role: "investigator".into(),
+                state,
+                objective: Some("核对终止事实是否会被后续写入覆盖".into()),
+                findings: 1,
+                elapsed_ms: 1234,
+            };
+            let json = serde_json::to_string(&item).unwrap();
+            assert_eq!(
+                serde_json::from_str::<UiReviewInvestigation>(&json).unwrap(),
+                item
+            );
+        }
+    }
 }

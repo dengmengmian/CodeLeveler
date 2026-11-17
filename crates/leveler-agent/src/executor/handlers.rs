@@ -581,6 +581,8 @@ impl Executor {
             modified_files: result.modified_files,
             findings: result.findings,
             review: result.review,
+            investigation: result.investigation,
+            evidence_revision: result.evidence_revision,
         }
     }
 
@@ -747,6 +749,8 @@ async fn run_prepared_sub_agent(
                 modified_files: Vec::new(),
                 findings: Vec::new(),
                 review: None,
+                investigation: None,
+                evidence_revision: 0,
             };
         }
     };
@@ -808,6 +812,8 @@ async fn run_prepared_sub_agent(
                     modified_files: Vec::new(),
                     findings: Vec::new(),
                     review: None,
+                    investigation: None,
+                    evidence_revision: 0,
                 };
             }
         }
@@ -850,6 +856,10 @@ async fn run_prepared_sub_agent(
     let findings_obs = findings.clone();
     let review = std::sync::Arc::new(std::sync::Mutex::new(None));
     let review_obs = review.clone();
+    let investigation = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let investigation_obs = investigation.clone();
+    let evidence_revision = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let evidence_revision_obs = evidence_revision.clone();
     let activity_id = id.clone();
     let activity_tx = progress.clone();
     let mut capture = move |event: AgentEvent| match &event {
@@ -864,6 +874,12 @@ async fn run_prepared_sub_agent(
             }
             if let Ok(mut guard) = review_obs.lock() {
                 *guard = ledger.review.clone();
+            }
+            if let Ok(mut guard) = investigation_obs.lock() {
+                *guard = ledger.investigation.clone();
+            }
+            if let Ok(mut guard) = evidence_revision_obs.lock() {
+                *guard = ledger.evidence_revision;
             }
         }
         AgentEvent::AssistantText { text, .. } if !text.trim().is_empty() => {
@@ -902,6 +918,16 @@ async fn run_prepared_sub_agent(
         // audit cannot distinguish an authorized write from a bypass (the M7
         // measurement failure).
         AgentEvent::DelegationStage { action, .. } if action.starts_with("ownership_") => {
+            let _ = activity_tx.send(event.clone());
+        }
+        // A review child may launch independent investigations. Their
+        // lifecycle is a fact the review UI and the parent's settlement
+        // accounting need; the ordinary capture closure otherwise drops
+        // nested child events. Usage records must travel too: the review's
+        // durable spend is the sum of every request it caused.
+        AgentEvent::SubAgentStarted { .. }
+        | AgentEvent::SubAgentFinished { .. }
+        | AgentEvent::SubAgentModelRequest { .. } => {
             let _ = activity_tx.send(event.clone());
         }
         _ => {}
@@ -953,6 +979,7 @@ async fn run_prepared_sub_agent(
     let said_before_stopping = || said.lock().map(|g| g.clone()).unwrap_or_default();
     let reported_findings = findings.lock().map(|g| g.clone()).unwrap_or_default();
     let reported_review = review.lock().ok().and_then(|g| g.clone());
+    let reported_investigation = investigation.lock().ok().and_then(|g| g.clone());
     match outcome {
         Ok(outcome) => {
             let completed = matches!(
@@ -982,6 +1009,20 @@ async fn run_prepared_sub_agent(
                     "{} structured finding(s) reported.",
                     reported_findings.len()
                 );
+            } else if findings.trim().is_empty()
+                && let Some(investigation) = &reported_investigation
+            {
+                // A structured investigation IS a result even when it found
+                // no candidate defect. Calling it "nothing to report" would
+                // tell the Lead Reviewer the opposite of what it established.
+                findings = format!(
+                    "Structured investigation recorded: {} observed fact(s), {} business \
+                     constraint(s), {} examined-scope entr(ies), {} unresolved question(s).",
+                    investigation.observed_facts.len(),
+                    investigation.business_constraints.len(),
+                    investigation.examined_scope.len(),
+                    investigation.unresolved_questions.len()
+                );
             }
             let stop_reason = if completed {
                 String::new()
@@ -1010,6 +1051,8 @@ async fn run_prepared_sub_agent(
                 modified_files: outcome.modified_files,
                 findings: reported_findings,
                 review: reported_review.clone(),
+                investigation: reported_investigation.clone(),
+                evidence_revision: evidence_revision.lock().map(|guard| *guard).unwrap_or(0),
             }
         }
         Err(AgentError::Cancelled) => {
@@ -1029,6 +1072,8 @@ async fn run_prepared_sub_agent(
                 modified_files: paths,
                 findings: reported_findings,
                 review: reported_review.clone(),
+                investigation: reported_investigation.clone(),
+                evidence_revision: evidence_revision.lock().map(|guard| *guard).unwrap_or(0),
             }
         }
         Err(e) => {
@@ -1042,6 +1087,8 @@ async fn run_prepared_sub_agent(
                 modified_files: paths,
                 findings: reported_findings,
                 review: reported_review.clone(),
+                investigation: reported_investigation.clone(),
+                evidence_revision: evidence_revision.lock().map(|guard| *guard).unwrap_or(0),
             }
         }
     }
@@ -1071,6 +1118,14 @@ pub struct DelegatedChildResult {
     /// declared one. `None` is the honest "not declared"; it is never derived
     /// from findings or prose.
     pub review: Option<leveler_lifecycle::ReviewVerdict>,
+    /// An investigator's structured facts, scope, questions and limitations,
+    /// when it declared them. `None` means it declared nothing; it is never
+    /// inferred from prose.
+    pub investigation: Option<leveler_lifecycle::InvestigationRecord>,
+    /// The reviewer ledger's evidence revision when it stopped. The review
+    /// service compares this with the revision the submitted report was bound
+    /// to, so late settlements are visible instead of silently ignored.
+    pub evidence_revision: u64,
 }
 
 /// Spend + structured result from one sub-agent so the parent can roll up
@@ -1088,6 +1143,11 @@ pub(crate) struct SubAgentRunResult {
     pub findings: Vec<leveler_lifecycle::FindingRecord>,
     /// Structured review declaration captured from the same snapshots.
     pub review: Option<leveler_lifecycle::ReviewVerdict>,
+    /// Structured investigation declaration captured from the same snapshots.
+    pub investigation: Option<leveler_lifecycle::InvestigationRecord>,
+    /// The child ledger's evidence revision at its last snapshot. A review
+    /// binds its formal report to this number.
+    pub evidence_revision: u64,
 }
 
 /// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.

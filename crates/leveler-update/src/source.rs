@@ -8,7 +8,7 @@
 use serde::Deserialize;
 
 use crate::error::UpdateError;
-use crate::target::{checksum_asset_name, release_asset_name};
+use crate::target::{checksum_asset_name, release_asset_names};
 use crate::version::{Version, parse_version};
 
 /// One downloadable file on a release.
@@ -41,36 +41,46 @@ pub struct ReleaseAssets {
 /// `leveler-v{version}-{triple}.{ext}`, so "no asset" is the honest answer for
 /// a host whose name is not that. A duplicate exact name is malformed
 /// metadata, not something to pick from.
+///
+/// The first candidate is the current archive format. When it is absent the
+/// legacy gzip sibling is tried, which keeps `update --version <old tag>`
+/// working across the xz switch. An archive that exists without its checksum
+/// fails closed rather than silently installing a different format.
 pub fn select_asset(release: &Release, triple: &str) -> Result<ReleaseAssets, UpdateError> {
-    let asset_name = release_asset_name(&release.version, triple);
-    let checksum_name = checksum_asset_name(&asset_name);
+    for asset_name in release_asset_names(&release.version, triple) {
+        let checksum_name = checksum_asset_name(&asset_name);
 
-    let mut matching = release.assets.iter().filter(|a| a.name == asset_name);
-    let asset = matching.next().ok_or_else(|| UpdateError::NoAsset {
-        triple: triple.to_string(),
-        tag: release.tag.clone(),
-    })?;
-    if matching.next().is_some() {
-        return Err(UpdateError::Validation(format!(
-            "release {} carries two `{asset_name}` assets",
-            release.tag
-        )));
+        let mut matching = release.assets.iter().filter(|a| a.name == asset_name);
+        let Some(asset) = matching.next() else {
+            continue;
+        };
+        if matching.next().is_some() {
+            return Err(UpdateError::Validation(format!(
+                "release {} carries two `{asset_name}` assets",
+                release.tag
+            )));
+        }
+
+        let checksum_url = release
+            .assets
+            .iter()
+            .find(|a| a.name == checksum_name)
+            .map(|a| a.download_url.clone())
+            .ok_or_else(|| UpdateError::NoChecksum {
+                tag: release.tag.clone(),
+                asset: asset_name.clone(),
+            })?;
+
+        return Ok(ReleaseAssets {
+            asset_name,
+            download_url: asset.download_url.clone(),
+            checksum_url,
+        });
     }
 
-    let checksum_url = release
-        .assets
-        .iter()
-        .find(|a| a.name == checksum_name)
-        .map(|a| a.download_url.clone())
-        .ok_or_else(|| UpdateError::NoChecksum {
-            tag: release.tag.clone(),
-            asset: asset_name.clone(),
-        })?;
-
-    Ok(ReleaseAssets {
-        asset_name,
-        download_url: asset.download_url.clone(),
-        checksum_url,
+    Err(UpdateError::NoAsset {
+        triple: triple.to_string(),
+        tag: release.tag.clone(),
     })
 }
 
@@ -499,7 +509,7 @@ mod candidate_tests {
             vec!["https://atomgit.example/releases/download/v1.0.19/".to_string()]
         );
         // The composed URL and the fetched asset's own name agree on a version.
-        let asset = "leveler-v1.0.19-aarch64-apple-darwin.tar.gz";
+        let asset = "leveler-v1.0.19-aarch64-apple-darwin.tar.xz";
         let urls = candidate_urls_with("https://github.com/o/r/x.tgz", &[], &bases, asset);
         assert_eq!(
             urls[1],
@@ -567,19 +577,19 @@ mod tests {
         let rel = release(
             "v1.0.0",
             &[
-                "leveler-v1.0.0-aarch64-apple-darwin.tar.gz",
-                "leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256",
-                "leveler-v1.0.0-x86_64-unknown-linux-gnu.tar.gz",
-                "leveler-v1.0.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz.sha256",
+                "leveler-v1.0.0-x86_64-unknown-linux-gnu.tar.xz",
+                "leveler-v1.0.0-x86_64-unknown-linux-gnu.tar.xz.sha256",
             ],
         );
         let picked = select_asset(&rel, "aarch64-apple-darwin").unwrap();
         assert_eq!(
             picked.asset_name,
-            "leveler-v1.0.0-aarch64-apple-darwin.tar.gz"
+            "leveler-v1.0.0-aarch64-apple-darwin.tar.xz"
         );
-        assert!(picked.download_url.ends_with(".tar.gz"));
-        assert!(picked.checksum_url.ends_with(".tar.gz.sha256"));
+        assert!(picked.download_url.ends_with(".tar.xz"));
+        assert!(picked.checksum_url.ends_with(".tar.xz.sha256"));
     }
 
     #[test]
@@ -587,7 +597,7 @@ mod tests {
         let rel = release(
             "v1.0.0",
             &[
-                "leveler-v1.0.0-x86_64-unknown-linux-gnu.tar.gz",
+                "leveler-v1.0.0-x86_64-unknown-linux-gnu.tar.xz",
                 "leveler-v1.0.0-x86_64-pc-windows-msvc.zip",
                 "leveler-v1.0.0-x86_64-pc-windows-msvc.zip.sha256",
             ],
@@ -601,14 +611,14 @@ mod tests {
 
     #[test]
     fn a_missing_asset_fails_closed() {
-        let rel = release("v1.0.0", &["leveler-v1.0.0-aarch64-apple-darwin.tar.gz"]);
+        let rel = release("v1.0.0", &["leveler-v1.0.0-aarch64-apple-darwin.tar.xz"]);
         let err = select_asset(&rel, "x86_64-unknown-linux-gnu").unwrap_err();
         assert!(matches!(err, UpdateError::NoAsset { .. }), "{err}");
     }
 
     #[test]
     fn a_missing_checksum_fails_closed() {
-        let rel = release("v1.0.0", &["leveler-v1.0.0-aarch64-apple-darwin.tar.gz"]);
+        let rel = release("v1.0.0", &["leveler-v1.0.0-aarch64-apple-darwin.tar.xz"]);
         let err = select_asset(&rel, "aarch64-apple-darwin").unwrap_err();
         assert!(matches!(err, UpdateError::NoChecksum { .. }), "{err}");
     }
@@ -618,13 +628,66 @@ mod tests {
         let rel = release(
             "v1.0.0",
             &[
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz.sha256",
+            ],
+        );
+        let err = select_asset(&rel, "aarch64-apple-darwin").unwrap_err();
+        assert!(matches!(err, UpdateError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn xz_is_preferred_when_both_formats_are_published() {
+        let rel = release(
+            "v1.0.0",
+            &[
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz.sha256",
                 "leveler-v1.0.0-aarch64-apple-darwin.tar.gz",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256",
+            ],
+        );
+        let picked = select_asset(&rel, "aarch64-apple-darwin").unwrap();
+        assert_eq!(
+            picked.asset_name,
+            "leveler-v1.0.0-aarch64-apple-darwin.tar.xz"
+        );
+    }
+
+    /// Releases published before the xz switch carry only the gzip sibling.
+    /// `leveler update --version <old tag>` still has to resolve them.
+    #[test]
+    fn an_older_release_falls_back_to_the_gzip_sibling() {
+        let rel = release(
+            "v1.0.0",
+            &[
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.gz",
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256",
+            ],
+        );
+        let picked = select_asset(&rel, "aarch64-apple-darwin").unwrap();
+        assert_eq!(
+            picked.asset_name,
+            "leveler-v1.0.0-aarch64-apple-darwin.tar.gz"
+        );
+    }
+
+    /// A release that carries the xz archive but not its checksum is broken.
+    /// Installing the gzip sibling instead would hide that and install bytes
+    /// the caller never selected.
+    #[test]
+    fn a_broken_xz_pair_fails_closed_instead_of_switching_format() {
+        let rel = release(
+            "v1.0.0",
+            &[
+                "leveler-v1.0.0-aarch64-apple-darwin.tar.xz",
                 "leveler-v1.0.0-aarch64-apple-darwin.tar.gz",
                 "leveler-v1.0.0-aarch64-apple-darwin.tar.gz.sha256",
             ],
         );
         let err = select_asset(&rel, "aarch64-apple-darwin").unwrap_err();
-        assert!(matches!(err, UpdateError::Validation(_)), "{err}");
+        assert!(matches!(err, UpdateError::NoChecksum { .. }), "{err}");
     }
 
     #[test]

@@ -230,6 +230,10 @@ jobs:
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/leveler" "dist/${name}/"
           cp README.md LICENSE-APACHE "dist/${name}/"
+          # `.tar.xz` is the primary asset (about 40% smaller). The `.tar.gz`
+          # sibling stays for binaries built before the format change: their
+          # updater selects the exact gzip name and cannot discover xz.
+          tar -C dist -caf "dist/${name}.tar.xz" "${name}"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           # The asset contract the updater depends on: a top-level `<name>/`
           # directory holding an executable `leveler`. Verify it here so a
@@ -237,11 +241,15 @@ jobs:
           # `grep -q` would exit at the first match and GNU tar, still
           # listing, dies on EPIPE — under pipefail that failed v1.0.0's first
           # attempt. Let grep read the whole listing.
-          tar -tzf "dist/${name}.tar.gz" | grep -x "${name}/leveler" >/dev/null \
-            || { echo "::error::archive is missing ${name}/leveler"; exit 1; }
+          for archive in "${name}.tar.xz" "${name}.tar.gz"; do
+            tar -tf "dist/${archive}" | grep -x "${name}/leveler" >/dev/null \
+              || { echo "::error::${archive} is missing ${name}/leveler"; exit 1; }
+          done
           test -x "dist/${name}/leveler" \
             || { echo "::error::${name}/leveler is not executable"; exit 1; }
-          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          (cd dist \
+            && shasum -a 256 "${name}.tar.xz" > "${name}.tar.xz.sha256" \
+            && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -277,14 +285,14 @@ jobs:
           (
             cd dist
             if command -v sha256sum >/dev/null; then
-              sha256sum -c "${archive}.tar.gz.sha256"
+              sha256sum -c "${archive}.tar.xz.sha256"
             else
-              shasum -a 256 -c "${archive}.tar.gz.sha256"
+              shasum -a 256 -c "${archive}.tar.xz.sha256"
             fi
           )
           scratch="$(mktemp -d)"
           trap 'rm -rf "$scratch"' EXIT
-          tar -xzf "dist/${archive}.tar.gz" -C "$scratch"
+          tar -xf "dist/${archive}.tar.xz" -C "$scratch"
           test -x "$scratch/${archive}/leveler"
           mkdir "$scratch/bin"
           install -m 755 "$scratch/${archive}/leveler" "$scratch/bin/leveler"
@@ -345,6 +353,8 @@ jobs:
         with:
           name: leveler-${{ matrix.target }}
           path: |
+            dist/*.tar.xz
+            dist/*.tar.xz.sha256
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/*.zip
@@ -369,7 +379,8 @@ jobs:
       - name: Verify every artifact and its checksum
         run: |
           set -euo pipefail
-          expected=8
+          # 3 unix targets x (xz + gzip archives and their checksums) + Windows.
+          expected=14
           count="$(ls dist | wc -l)"
           if [ "$count" -ne "$expected" ]; then
             echo "::error::expected $expected assets, found $count"

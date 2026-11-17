@@ -580,6 +580,44 @@ fn review_lines(
         head.push(Span::styled(label, accent));
     }
     out.push(Line::from(head));
+    if !block.investigations.is_empty() {
+        push_prefixed(
+            out,
+            "  ",
+            t.review.investigations_section,
+            muted,
+            wrap_width,
+        );
+        for investigation in &block.investigations {
+            let state = match investigation.state {
+                leveler_client_protocol::UiReviewInvestigationState::Running => {
+                    t.review.investigation_running
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Completed => {
+                    t.review.investigation_completed
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Incomplete => {
+                    t.review.investigation_incomplete
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Failed => {
+                    t.review.investigation_failed
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Cancelled => {
+                    t.review.investigation_cancelled
+                }
+            };
+            let mut row = format!("· {} — {state}", investigation.title);
+            if investigation.findings > 0 {
+                row.push_str(" · ");
+                row.push_str(&t.review.investigation_findings.replacen(
+                    "{}",
+                    &investigation.findings.to_string(),
+                    1,
+                ));
+            }
+            push_prefixed(out, "    ", &row, muted, wrap_width);
+        }
+    }
     if summary.status.settled() {
         let counts = &summary.counts;
         let mut facts = format!(
@@ -594,6 +632,14 @@ fn review_lines(
                     .replacen("{}", &counts.unclassified.to_string(), 1)
             ));
         }
+        if counts.observations > 0 {
+            facts.push_str(" · ");
+            facts.push_str(&t.review.observations.replacen(
+                "{}",
+                &counts.observations.to_string(),
+                1,
+            ));
+        }
         let total = counts.total();
         let finding_text = t.review.findings.replacen("{}", &total.to_string(), 1);
         facts.push_str(" · ");
@@ -602,6 +648,14 @@ fn review_lines(
         } else {
             &finding_text
         });
+        if counts.pending_candidates > 0 {
+            facts.push_str(" · ");
+            facts.push_str(&t.review.pending_candidates.replacen(
+                "{}",
+                &counts.pending_candidates.to_string(),
+                1,
+            ));
+        }
         facts.push_str(" · ");
         facts.push_str(review_conclusion_label(summary.conclusion, t));
         facts.push_str(" · ");
@@ -630,6 +684,9 @@ fn review_lines(
     }
     if summary.object_changed {
         push_prefixed(out, "  ", t.review.object_changed, muted, wrap_width);
+    }
+    if summary.report_stale {
+        push_prefixed(out, "  ", t.review.report_stale, muted, wrap_width);
     }
     if let Some(detail) = summary
         .failure

@@ -349,14 +349,20 @@ impl CapabilityDisclosure {
     ///
     /// A review child is never offered `capability` (it must not widen its
     /// own authority), so a pack that requires an explicit enable can never
-    /// reach it. Its role's read-only investigation pack — code intelligence
-    /// — is therefore exposed whenever the host provides and permits it.
-    /// Every other pack keeps the normal exposure rule: the role default is
-    /// not a second authority over what the session activated.
+    /// reach it. Its role's read-only investigation packs — code intelligence
+    /// and the Lead Reviewer's restricted investigation delegation — are
+    /// therefore exposed whenever the host provides and permits them. Every
+    /// other pack keeps the normal exposure rule: the role default is not a
+    /// second authority over what the session activated.
+    ///
+    /// `multi_agent` on a review seat means the restricted investigation tool,
+    /// never the ordinary spawn surface: the review candidate table only ever
+    /// adds the restricted definition. Availability and permission still come
+    /// from the host, so the product delegation switch still removes it.
     pub fn permits_tool_for_review(&self, name: &str) -> bool {
         match tool_capability(name) {
-            Some(CapabilityId::CodeIntelligence) => {
-                self.exposed_for_review(CapabilityId::CodeIntelligence)
+            Some(id @ (CapabilityId::CodeIntelligence | CapabilityId::MultiAgent)) => {
+                self.exposed_for_review(id)
             }
             None => true,
             Some(id) => self.exposed(id),
@@ -851,5 +857,24 @@ mod native_capability_tests {
             CapabilityId::parse("native_actions"),
             Ok(CapabilityId::NativeActions)
         );
+    }
+}
+
+#[cfg(test)]
+mod review_surface_tests {
+    use super::*;
+
+    /// A review seat cannot perform the `capability enable` round trip, so its
+    /// read-only investigation packs are role defaults. The ordinary agent
+    /// keeps the on-demand rule: exposure is not authority and an unenabled
+    /// pack is still absent from its request.
+    #[test]
+    fn a_review_seat_sees_its_investigation_packs_without_an_enable() {
+        let packs = vec![CapabilityId::CodeIntelligence, CapabilityId::MultiAgent];
+        let state = CapabilityDisclosure::new(packs.clone(), packs, vec![]).unwrap();
+        assert!(state.permits_tool_for_review("find_symbol"));
+        assert!(state.permits_tool_for_review("spawn_agent"));
+        assert!(!state.permits_tool("find_symbol"));
+        assert!(!state.permits_tool("spawn_agent"));
     }
 }
