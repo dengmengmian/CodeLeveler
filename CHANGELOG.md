@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+- An explicit `--deny-network` now survives Full. Full still removes prompts and CodeLeveler-imposed confinement, but it does not silently undo a run-level restriction the user typed; a backend that cannot enforce the denial fails instead of running open.
+- An approval that lifts the workspace write fence now says so in the prompt, and only an action that can itself write (a command, a file mutation, an unsandboxed MCP server) lifts it. Approving a network fetch or a definition write keeps the admitted scope.
+- Delegated children no longer hold `schedule_inspect` / `schedule_manage`: user-global schedules are top-level work, refused at admission even under Full.
+- Shared model budgets take an atomic in-flight reservation per request. Concurrent requests can no longer both pass the same settled balance; a reservation is released only after its request row is durable, and an undeliverable row keeps the hold.
+- Deleting a session refuses while a turn or background work is live. The CLI applies the same rule and the same storage cleanup (row + shell captures) as the runtime.
+- Rename is presentation-only. `sessions.title` is separate from the verbatim `goal` request; the TUI `/rename`, `leveler sessions rename`, Web and Desktop show the title, and historical rows keep their previous display through a fallback.
+- Archive is reversible: the Sessions page filters Active/Archived/All, `a` archives, `u` unarchives, and every client receives the archived flag. `leveler sessions delete` refuses live work instead of killing it.
+- Resource grants can be listed and revoked: `leveler permissions grants [--session] [--json]` and `leveler permissions revoke-grant <id>`. Revocation is project-scoped by handle; an admitted call keeps its frozen policy.
+- `/model <ref>` switches only the current session (matching Web and Desktop); `/model default <ref>` is the explicit global-default action. `/permission ask|auto|full` applies immediately. Invalid arguments are refused with usage instead of being ignored.
+- Restoring a checkpoint takes a second confirmation that names the working-tree rollback. `/review report [id]` opens a durable report from the keyboard. Opening a deleted session reports an error instead of silently doing nothing.
+- Large model tool output is addressable: `/output tool [call id]` opens the complete artifact the runtime saved, with a 512 MiB oldest-first quota and secret-value redaction. `/copy` (bare) copies the newest complete answer, `/copy N` the Nth; `/export` now appends a `## Tools` evidence section with call identity, status, exit code, duration and artifact references, never raw stdout.
+- Web `/goal` runs the same Goal command as the TUI instead of being rejected. The dead Ctrl+M binding was removed from Help; `/model` is the reachable entry.
+- Session summaries/snapshots carry additive `title`, `original_request`, `archived` fields; an older client keeps displaying `goal` and treats rows as active.
+
 - Execution authority now matches the person's actual grant. A standing `Allow` rule or an automated reviewer no longer turns a matching call into unrestricted filesystem and network execution; it answers *whether* the call may run and keeps the profile's resource scopes. Exact-call consent still executes the approved effect, but it no longer clears an explicit `--deny-network`.
 - A repository's `.leveler/config.yaml` may tighten the new-session default mode without trust, and may raise it to `full_access` only when the exact file bytes are trusted. `leveler trust` lists and records that file, and records only the digest it displayed: a file that changes while the confirmation is open is not trusted.
 - Permission rules reject unknown keys instead of silently dropping a constraint (`deny_unknown_fields`), so a misspelled `write_path_glob` becomes a visible degraded rule set that asks, not a broader `Allow`. A durable path grant is not generated from an approved path containing `*` or `?`; that grant stays session-only.

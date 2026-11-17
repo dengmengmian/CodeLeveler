@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+- 显式 `--deny-network` 现在在 Full 下继续生效。Full 仍然不询问、不施加 CodeLeveler 的围栏，但不会静默撤销用户本次显式设置的运行级限制；后端无法强制执行时明确失败，而不是放开。
+- 精确批准若提升工作区写围栏，提示中会明确说明；并且只有本身会写入的动作（命令、文件修改、无沙箱的 MCP server）才会提升。批准网络请求或定义写入时保留 admission 解析出的写范围。
+- 子 Agent 不再持有 `schedule_inspect` / `schedule_manage`：用户全局定时任务属于顶层工作，在 admission 直接拒绝（Full 也不能绕过）。
+- 共享模型预算增加按请求的原子在途预留。并发请求不能同时通过同一份已结算余额；请求行持久化后才释放预留，无法落库时保留占用。
+- 会话仍有运行中的回合或后台工作时拒绝删除；CLI 使用与 Runtime 相同的规则和存储清理（行 + shell 捕获）。
+- Rename 只改显示。`sessions.title` 与逐字保存的 `goal` 请求分离；TUI `/rename`、`leveler sessions rename`、Web/Desktop 显示标题，历史行通过回退保持原显示。
+- Archive 可逆：Sessions 页支持 Active/Archived/All，`a` 归档、`u` 取消归档，所有客户端收到 archived 标记。`leveler sessions delete` 拒绝正在运行的工作而不是静默杀掉。
+- 资源授权可查看和撤销：`leveler permissions grants [--session] [--json]` 与 `leveler permissions revoke-grant <id>`。撤销按 project + handle 生效；已 admitted 的调用保留冻结策略。
+- `/model <ref>` 只切换本会话（与 Web/Desktop 一致）；`/model default <ref>` 是明确的全局默认可作。`/permission ask|auto|full` 立即生效；非法参数返回用法而不是静默忽略。
+- 检查点回退需要第二次确认并明确说明工作区回滚；`/review report [id]` 提供键盘入口；打开已删除会话会返回错误而不是静默无动作。
+- 模型工具大输出可寻址：`/output tool [调用 ID]` 打开 Runtime 保存的完整 artifact，目录有 512 MiB 最旧优先配额并在写入前脱敏。裸 `/copy` 复制最近一条完整回答，`/copy N` 复制第 N 条；`/export` 追加 `## Tools` 证据段（调用身份、状态、退出码、耗时、artifact 引用），不内联原始 stdout。
+- Web `/goal` 与 TUI 使用同一条 Goal 命令，不再被拒绝；Help 中移除不可达的 Ctrl+M 绑定，`/model` 是可达入口。
+- Session summary/snapshot 增加 additive 的 `title`、`original_request`、`archived` 字段；旧客户端继续显示 `goal` 并把行视为 active。
+
 - 执行权限与用户的真实授权对齐。命中的常驻 `Allow` 规则或自动审查者不再把调用变成无限制的文件与网络执行：它们只回答“是否可以运行”，并保留当前模式的资源边界。精确调用授权仍会执行用户看到的操作（包括提示中列出的其他执行者路径），但不会清除显式 `--deny-network`。
 - 仓库的 `.leveler/config.yaml` 可以不经信任收紧新会话默认模式；只有精确文件内容被信任时，才能把默认模式提升为 `full_access`。`leveler trust` 会列出并记录该文件，且只记录展示给用户的摘要：确认期间发生变化的内容不会被信任。
 - 权限规则拒绝未知字段而不是静默丢掉约束（`deny_unknown_fields`），拼错的 `write_path_glob` 会变成可见的 degraded 规则集并要求批准，而不是更宽的 `Allow`。批准路径包含 `*` 或 `?` 时不会生成常驻路径授权，该授权保持 session-only。
