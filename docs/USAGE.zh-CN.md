@@ -10,6 +10,8 @@
 
 在终端里用 `/thinking high` 调整当前会话的思考强度，`/thinking reset` 恢复配置默认值。可选值为 `auto`、`off`、`minimal`、`low`、`medium`、`high`、`max`，具体支持情况见 `leveler doctor`。默认是 `high`，`max` 使用当前模型支持的最高档，`auto` 使用服务商默认值。
 
+`--deny-network`（旧别名 `--sandbox`）是运行级限制：它禁止 `run_command` 进程以及网络工具访问网络，Full 权限也不会撤销它。`computer_act` 驱动的桌面自动化运行在进程沙箱之外，**不受**该参数约束；需要保持离线时应避免或拒绝这类动作。后端无法强制断网时会拒绝执行，而不是放开网络运行。
+
 服务商的暂时性故障（连接被拒绝或重置、可重试的超时、429、可重试的 5xx）会自动按指数退避加抖动重试，不需要用户重发原任务。默认预算为 10 分钟内最多 12 次重试；`Ctrl+C` 可取消等待。可在 `~/.leveler/config.toml` 中调整：
 
 ```toml

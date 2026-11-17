@@ -97,7 +97,9 @@ pub enum Command {
         /// Auto-approve risky actions for sessions owned by this daemon.
         #[arg(long)]
         auto_approve: bool,
-        /// Deny network access to run_command processes.
+        /// Deny network access to run_command processes and network tools.
+        /// Desktop automation launched by computer_act runs outside the
+        /// sandbox and is not bounded by this flag.
         #[arg(long = "deny-network", alias = "sandbox")]
         deny_network: bool,
         /// Override the per-repository Unix socket path.
@@ -159,7 +161,9 @@ pub enum Command {
         /// (in-process runtime only).
         #[arg(long)]
         auto_approve: bool,
-        /// Deny network access to run_command processes (in-process runtime only).
+        /// Deny network access to run_command processes and network tools
+        /// (in-process runtime only). Desktop automation launched by
+        /// computer_act runs outside the sandbox and is not bounded.
         #[arg(long = "deny-network", alias = "sandbox")]
         deny_network: bool,
     },
@@ -315,7 +319,9 @@ pub enum Command {
         /// Base branch for the pull request.
         #[arg(long)]
         pr_base: Option<String>,
-        /// Deny network access to run_command processes (OS sandbox).
+        /// Deny network access to run_command processes and network tools
+        /// (OS sandbox). Desktop automation launched by computer_act runs
+        /// outside the sandbox and is not bounded.
         #[arg(long = "deny-network", alias = "sandbox")]
         deny_network: bool,
         /// Model-step safety ceiling for this run: a mechanical circuit

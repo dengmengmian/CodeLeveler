@@ -10,6 +10,8 @@ Configuration is read again while the app runs: editing `~/.leveler/config.toml`
 
 Use `/thinking high` to change reasoning intensity for the session, or `/thinking reset` to return to the configured default. Choices are `auto`, `off`, `minimal`, `low`, `medium`, `high`, and `max`; run `leveler doctor` to check model support. The default is `high`; `max` uses the model's strongest supported level, and `auto` leaves the choice to the provider.
 
+`--deny-network` (`--sandbox` is the legacy alias) is a run-level restriction: it denies the network to `run_command` processes and to the network tools, and Full permission does not undo it. Desktop automation through `computer_act` drives the user's applications outside the process sandbox and is **not** bounded by this flag; approve or avoid those actions when a run must stay offline. A backend that cannot enforce the denial refuses the command instead of running it with the network open.
+
 A transient provider failure (connection refused or reset, a retryable timeout, 429, a retryable 5xx) is retried automatically with exponential backoff and jitter, without resending the original task. The default budget is 12 retries within 10 minutes; `Ctrl+C` cancels the wait. Change it in `~/.leveler/config.toml`:
 
 ```toml
