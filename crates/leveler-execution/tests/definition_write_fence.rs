@@ -103,8 +103,11 @@ async fn a_confined_shell_cannot_write_agent_or_skill_definitions() {
     );
 }
 
-/// The protected directory itself does not exist yet: the shell must not be
-/// able to create it and then write a definition inside.
+/// The protected directory itself does not exist yet: on macOS the seatbelt
+/// path rule denies creating it. Linux cannot name-fence a missing path
+/// without materializing it in the workspace (see SECURITY.md), so this case
+/// is asserted only where the backend can enforce it.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_confined_shell_cannot_create_the_definition_directory() {
     let (home, _root, ws) = workspace();
@@ -143,7 +146,9 @@ async fn a_confined_shell_cannot_modify_an_existing_agents_file() {
 }
 
 /// Creating the policy file from nothing is the same authority as modifying
-/// it: the next session would load the new text.
+/// it: the next session would load the new text. macOS denies it through the
+/// AGENTS.md path rule; the Linux residual is documented in SECURITY.md.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_confined_shell_cannot_create_an_agents_file() {
     let (home, _root, ws) = workspace();
