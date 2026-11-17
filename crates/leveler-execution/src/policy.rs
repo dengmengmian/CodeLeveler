@@ -38,23 +38,48 @@ pub enum AuthorizationEvidence {
 /// The immutable policy an admitted call executes under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedExecutionPolicy {
-    /// Auto and resource-granted calls retain their execution boundaries.
-    /// Full and approval of an entire exact call execute unrestricted; reusable
-    /// resource consent only authorizes its listed capabilities and identities.
+    /// The profile, a matching rule, an automated reviewer and a reusable
+    /// resource grant retain their execution boundaries. Full and consent to
+    /// the entire exact call lift the workspace write fence.
     pub write: WriteScope,
+    /// The destination boundary decided at admission. An approval may widen a
+    /// profile default (the prompt carries that decision) but never clears an
+    /// explicit `--deny-network`.
     pub network_scope: NetworkScope,
     pub authorization: AuthorizationEvidence,
 }
 
 impl ResolvedExecutionPolicy {
-    /// Full and exact-call consent authorize unrestricted execution.
-    /// Reusable resource consent never widens filesystem or network scopes.
+    /// Whether this admitted call carries the user's full-execution authority.
+    ///
+    /// Only the Full profile and a decision on the exact call do. A standing
+    /// rule and an automated reviewer remove the question, but they are not a
+    /// grant of the filesystem or the network: their call keeps the boundary
+    /// it was resolved under.
     pub fn unrestricted_execution(&self) -> bool {
         match self.authorization {
             AuthorizationEvidence::ResourceGrant { .. } => false,
             AuthorizationEvidence::Policy { profile } => profile == PermissionProfile::FullAccess,
-            _ => true,
+            AuthorizationEvidence::Rule | AuthorizationEvidence::Reviewer => false,
+            AuthorizationEvidence::ApprovedOnce
+            | AuthorizationEvidence::SessionGrant { .. }
+            | AuthorizationEvidence::ApprovedAlways => true,
         }
+    }
+
+    /// Whether this call runs with the Full profile's no-confinement contract.
+    ///
+    /// Exact-call consent is deliberately NOT this: it may lift the write fence
+    /// for the approved effect, but the process still runs under the frozen
+    /// network boundary. The OS backend uses this to decide whether to skip its
+    /// wrapper entirely.
+    pub fn full_execution(&self) -> bool {
+        matches!(
+            self.authorization,
+            AuthorizationEvidence::Policy {
+                profile: PermissionProfile::FullAccess
+            }
+        )
     }
 
     /// Frozen bindings matched by admission for this action only.
@@ -86,8 +111,12 @@ impl ResolvedExecutionPolicy {
             authorization,
         };
         if policy.unrestricted_execution() {
+            // Exact-call consent lets the approved effect actually happen,
+            // including a target outside the workspace; Full does the same by
+            // contract. The destination scope is separate and is never
+            // rewritten here: an explicit network denial stays denied, and a
+            // profile-default network grant was already put on the approval.
             policy.write = WriteScope::Unrestricted;
-            policy.network_scope = NetworkScope::Internet;
         }
         policy
     }
@@ -171,5 +200,71 @@ mod resource_grant_tests {
                 }
             ));
         }
+    }
+
+    fn workspace() -> WriteScope {
+        WriteScope::Workspace {
+            root: std::path::PathBuf::from("/repo"),
+        }
+    }
+
+    /// A standing rule removes the question; it does not widen the resource
+    /// boundary the call was resolved under. The old mapping made every
+    /// matching `Allow` an unrestricted filesystem and network grant.
+    #[test]
+    fn a_standing_rule_preserves_the_resolved_resource_boundaries() {
+        let policy = ResolvedExecutionPolicy::new(
+            workspace(),
+            NetworkScope::Loopback,
+            AuthorizationEvidence::Rule,
+        );
+        assert!(!policy.unrestricted_execution());
+        assert_eq!(policy.write, workspace());
+        assert_eq!(policy.network_scope, NetworkScope::Loopback);
+    }
+
+    /// An automated reviewer is not the person. It may skip the prompt, but it
+    /// must not turn a confined call into an unrestricted one.
+    #[test]
+    fn an_automated_reviewer_preserves_the_resolved_resource_boundaries() {
+        let policy = ResolvedExecutionPolicy::new(
+            workspace(),
+            NetworkScope::None,
+            AuthorizationEvidence::Reviewer,
+        );
+        assert!(!policy.unrestricted_execution());
+        assert_eq!(policy.write, workspace());
+        assert_eq!(policy.network_scope, NetworkScope::None);
+    }
+
+    /// Exact-call consent executes the action the person saw, including an
+    /// external write target. It must not also lift an explicit network denial
+    /// the run owner set.
+    #[test]
+    fn exact_call_consent_keeps_an_explicit_network_denial() {
+        for authorization in [
+            AuthorizationEvidence::ApprovedOnce,
+            AuthorizationEvidence::SessionGrant {
+                signature: "s".into(),
+            },
+            AuthorizationEvidence::ApprovedAlways,
+        ] {
+            let policy =
+                ResolvedExecutionPolicy::new(workspace(), NetworkScope::None, authorization);
+            assert_eq!(policy.network_scope, NetworkScope::None, "{policy:?}");
+            assert_eq!(policy.write, WriteScope::Unrestricted, "{policy:?}");
+        }
+    }
+
+    /// A profile-default destination scope is not a denial: the approval prompt
+    /// already decided whether this call may reach the Internet.
+    #[test]
+    fn exact_call_consent_keeps_an_approved_network_destination() {
+        let policy = ResolvedExecutionPolicy::new(
+            workspace(),
+            NetworkScope::Internet,
+            AuthorizationEvidence::ApprovedOnce,
+        );
+        assert_eq!(policy.network_scope, NetworkScope::Internet);
     }
 }

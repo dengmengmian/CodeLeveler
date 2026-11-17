@@ -89,8 +89,8 @@ pub use network::{
     is_local_lan, is_loopback, is_ordinary_destination, normalize_ip, resolve_network_resource,
 };
 pub use permission_rules::{
-    MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet, RuleDecision,
-    RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
+    InvalidRuleFile, MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet,
+    RuleDecision, RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
     clear_project_rules, clear_rules_file, load_merged_rules, load_rules_file, project_rules_path,
 };
 pub use policy::{
@@ -99,8 +99,9 @@ pub use policy::{
 pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile, WriteScope};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
 pub use trust::{
-    TRUSTED_PROJECT_FILES, TrustError, TrustStore, TrustedRead, UntrustedConfig, content_digest,
-    read_trusted_project_file, store_is_outside_repo, trust_store_path, untrusted_project_files,
+    PROJECT_CONFIG_RELATIVE, TRUSTABLE_PROJECT_FILES, TRUSTED_PROJECT_FILES, TrustError,
+    TrustStore, TrustedRead, UntrustedConfig, content_digest, read_trusted_project_file,
+    store_is_outside_repo, trust_store_path, untrusted_project_files,
 };
 pub use url_open::{UrlOpenError, open_url};
 pub use windows_confine::{WriteRootLease, lease_write_roots, recover_stale_write_roots};

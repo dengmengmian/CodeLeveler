@@ -59,6 +59,10 @@ pub enum Overlay {
     /// `/thinking` — the session's Thinking Level, listing only the levels this
     /// model can actually distinguish.
     ThinkingPicker(Box<SelectionModel>),
+    /// `/review` with no argument — which object to review. Options that need
+    /// a target (`commit`, `branch`, `paths`) prefill the composer instead of
+    /// launching with an empty target.
+    ReviewScopePicker(Box<SelectionModel>),
 }
 
 /// A short label for the status line while an overlay is open.
@@ -82,7 +86,8 @@ impl Overlay {
             | Overlay::ConfirmSessionDelete(_)
             | Overlay::ConfirmSchedule(_)
             | Overlay::ConfirmRecovery(_)
-            | Overlay::ThinkingPicker(_) => None,
+            | Overlay::ThinkingPicker(_)
+            | Overlay::ReviewScopePicker(_) => None,
         }
     }
 
@@ -107,7 +112,8 @@ impl Overlay {
             | Overlay::UnsupportedMedia(m)
             | Overlay::CheckpointPicker(m)
             | Overlay::ConfirmSessionDelete(m)
-            | Overlay::ConfirmRecovery(m) => {
+            | Overlay::ConfirmRecovery(m)
+            | Overlay::ReviewScopePicker(m) => {
                 if !m.is_searchable() {
                     return false;
                 }
@@ -323,7 +329,8 @@ fn build_content(
         | Overlay::CheckpointPicker(model)
         | Overlay::ConfirmSessionDelete(model)
         | Overlay::ConfirmRecovery(model)
-        | Overlay::ThinkingPicker(model) => selection_content(model, theme, width, locale),
+        | Overlay::ThinkingPicker(model)
+        | Overlay::ReviewScopePicker(model) => selection_content(model, theme, width, locale),
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
         Overlay::ConfirmSchedule(ov) => selection_content(&ov.model, theme, width, locale),

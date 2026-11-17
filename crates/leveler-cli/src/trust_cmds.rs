@@ -1,16 +1,17 @@
 //! CLI surface for the in-repo config trust gate.
 //!
-//! `<repo>/.leveler/hooks.yaml` runs commands before every tool call and
-//! `<repo>/.leveler/permissions.yaml` can grant standing approval, so both are
-//! inert until the user trusts that repository's exact file contents. This is
-//! where the human does that — the agent has no tool for it, and the workspace
-//! layer refuses writes to either file.
+//! `<repo>/.leveler/hooks.yaml` runs commands before every tool call,
+//! `<repo>/.leveler/permissions.yaml` can grant standing approval, and
+//! `.leveler/config.yaml` can raise the default permission mode to Full; all
+//! three are inert until the user trusts that repository's exact file
+//! contents. This is where the human does that — the agent has no trust tool,
+//! and the workspace layer refuses writes to the first two.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use leveler_execution::{
-    TRUSTED_PROJECT_FILES, TrustStore, TrustedRead, read_trusted_project_file,
+    TRUSTABLE_PROJECT_FILES, TrustStore, TrustedRead, content_digest, read_trusted_project_file,
 };
 use leveler_project::Layout;
 
@@ -110,12 +111,21 @@ pub(crate) fn cmd_trust(
 
             let mut store = TrustStore::load(&home);
             let mut trusted = 0usize;
-            for (relative, _) in &pending {
-                // Re-read at write time so the digest recorded is the file's
-                // current bytes, not a stale one from the listing above.
-                if let Ok(body) = std::fs::read(repo.join(relative)) {
-                    store.trust(&repo, relative, &body);
-                    trusted += 1;
+            let mut changed = Vec::new();
+            for (relative, state) in &pending {
+                let FileState::Untrusted { digest } = state else {
+                    continue;
+                };
+                // Trust exactly the bytes whose digest the person was shown.
+                // Re-reading and recording whatever is current would let a
+                // file swapped between listing and this write inherit an
+                // approval the person never gave those bytes.
+                match read_if_unchanged(&repo.join(relative), digest) {
+                    Some(body) => {
+                        store.trust(&repo, relative, &body);
+                        trusted += 1;
+                    }
+                    None => changed.push(relative.clone()),
                 }
             }
             store.save()?;
@@ -126,6 +136,16 @@ pub(crate) fn cmd_trust(
                     repo.display()
                 ))
             );
+            if !changed.is_empty() {
+                println!(
+                    "{}",
+                    Line::warn(&format!(
+                        "not trusted: {} changed while you were deciding",
+                        changed.join(", ")
+                    ))
+                );
+                println!("  review the current contents and re-run `leveler trust`.");
+            }
             Ok(std::process::ExitCode::SUCCESS)
         }
     }
@@ -140,6 +160,7 @@ pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<Strin
     let home = leveler_home();
     leveler_execution::untrusted_project_files(&home, repo_root)
         .into_iter()
+        .filter(|entry| !is_config(entry) || project_config_widens(repo_root))
         .map(|entry| {
             entry
                 .path
@@ -151,9 +172,36 @@ pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<Strin
         .collect()
 }
 
+/// The startup notice names config files that are ignored. An untrusted
+/// `.leveler/config.yaml` matters only when it would raise the default mode;
+/// otherwise nothing about it is being ignored, and warning on every run in
+/// every repository would train people to dismiss the notice.
+pub(crate) fn untrusted_notices(
+    home: &std::path::Path,
+    repo_root: &std::path::Path,
+) -> Vec<leveler_execution::UntrustedConfig> {
+    leveler_execution::untrusted_project_files(home, repo_root)
+        .into_iter()
+        .filter(|entry| !is_config(entry) || project_config_widens(repo_root))
+        .collect()
+}
+
+fn is_config(entry: &leveler_execution::UntrustedConfig) -> bool {
+    entry
+        .path
+        .ends_with(leveler_execution::PROJECT_CONFIG_RELATIVE)
+}
+
+fn project_config_widens(repo_root: &std::path::Path) -> bool {
+    leveler_project::ProjectConfig::load(repo_root)
+        .and_then(|config| config.mode)
+        .and_then(|raw| leveler_execution::PermissionProfile::parse(&raw))
+        == Some(leveler_execution::PermissionProfile::FullAccess)
+}
+
 /// State of every gated file for a repository, in a stable order.
 pub(crate) fn states(home: &std::path::Path, repo: &std::path::Path) -> Vec<(String, FileState)> {
-    TRUSTED_PROJECT_FILES
+    TRUSTABLE_PROJECT_FILES
         .iter()
         .map(|relative| {
             let state = match read_trusted_project_file(home, repo, relative) {
@@ -195,8 +243,10 @@ fn print_status(home: &std::path::Path, repo: &std::path::Path) {
 fn purpose(relative: &str) -> &'static str {
     if relative.ends_with("hooks.yaml") {
         "runs commands before every tool call"
-    } else {
+    } else if relative.ends_with("permissions.yaml") {
         "can grant standing approval for tool calls"
+    } else {
+        "can raise this repository's default permission mode to full access"
     }
 }
 
@@ -223,4 +273,32 @@ fn leveler_home() -> PathBuf {
     leveler_core::LevelerHome::resolve(leveler_core::environment())
         .root()
         .to_path_buf()
+}
+
+/// Read a file only when it still has the digest the person was shown.
+/// `None` means the bytes changed (or could not be read): the confirmation no
+/// longer covers them, so no trust record may be written.
+fn read_if_unchanged(path: &std::path::Path, expected: &str) -> Option<Vec<u8>> {
+    let body = std::fs::read(path).ok()?;
+    (content_digest(&body) == expected).then_some(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_changed_after_the_prompt_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "mode: assisted\n").unwrap();
+        let shown = content_digest(b"mode: assisted\n");
+        assert_eq!(
+            read_if_unchanged(&path, &shown).as_deref(),
+            Some(b"mode: assisted\n".as_slice())
+        );
+
+        std::fs::write(&path, "mode: full_access\n").unwrap();
+        assert_eq!(read_if_unchanged(&path, &shown), None);
+    }
 }

@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::screen::Screen;
 use crate::state::AppState;
@@ -1385,6 +1386,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Issue => render_issue_screen(frame, area, state),
         Screen::Plan => render_plan_screen(frame, area, state),
         Screen::PendingSteer => crate::pending_steer::render_detail(frame, area, state),
+        Screen::Review => render_review_screen(frame, area, state),
         Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
         Screen::Doctor => crate::terminal_diagnostics::render_screen(frame, area, state),
@@ -1638,6 +1640,534 @@ fn issue_page_view(
 /// same active plan as the summary; if the turn settles while this page is
 /// open, the exact plan just archived in the transcript remains readable until
 /// the user returns.
+fn render_review_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let t = state.t();
+    let page = crate::secondary::SecondaryPage {
+        title: t.review.report_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.review.report_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let theme = &state.theme;
+    let lines = match &state.review_report {
+        Some(report) => review_report_lines(report, body.width as usize, theme, t),
+        None => vec![Line::from(Span::styled(
+            "…",
+            Style::default().fg(theme.text.secondary),
+        ))],
+    };
+    render_scrolled(frame, body, state, lines);
+}
+
+/// Build the report page from the durable review row. Findings are listed
+/// before the reviewer's prose so a reader sees evidence before conclusion;
+/// the prose itself is rendered as Markdown, never parsed for control flow.
+fn review_report_lines(
+    report: &leveler_client_protocol::UiReviewReport,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let summary = &report.summary;
+    let head = Style::default()
+        .fg(theme.text.primary)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.text.secondary);
+    let accent = Style::default()
+        .fg(theme.accent.primary)
+        .add_modifier(Modifier::BOLD);
+
+    out.push(Line::from(vec![
+        Span::styled(
+            crate::render::transcript_lines::review_status_label(summary.status, t),
+            accent,
+        ),
+        Span::styled(
+            format!(
+                " · {}",
+                crate::render::transcript_lines::review_scope_label(&summary.scope, t)
+            ),
+            muted,
+        ),
+    ]));
+    push_report_line(
+        &mut out,
+        &format!("{}: ", t.review.focus),
+        &summary.focus,
+        head,
+        width,
+    );
+    push_report_line(
+        &mut out,
+        &format!("{}: ", t.review.id),
+        &summary.id,
+        muted,
+        width,
+    );
+    push_report_line(
+        &mut out,
+        &format!("{}: ", t.review.time),
+        &format!(
+            "{} → {}",
+            summary.created_at,
+            summary.finished_at.as_deref().unwrap_or("-")
+        ),
+        muted,
+        width,
+    );
+    let usage = t
+        .review
+        .usage
+        .replacen("{}", &summary.usage.input_tokens.to_string(), 1);
+    let usage = usage.replacen("{}", &summary.usage.output_tokens.to_string(), 1);
+    let usage = usage.replacen("{}", &summary.usage.cached_input_tokens.to_string(), 1);
+    push_report_line(
+        &mut out,
+        &format!("{}: ", t.review.model),
+        &format!("{} · {usage}", summary.model),
+        muted,
+        width,
+    );
+    if let Some(workspace) = &report.object.workspace {
+        push_report_line(&mut out, "workspace: ", workspace, muted, width);
+    }
+    if let Some(head) = &report.object.head {
+        let revision = report.object.revision.as_deref().unwrap_or("-");
+        push_report_line(
+            &mut out,
+            "HEAD: ",
+            &format!("{head} · {revision} · dirty={}", report.object.dirty),
+            muted,
+            width,
+        );
+    }
+    if summary.object_changed {
+        push_report_line(&mut out, "!", t.review.object_changed, accent, width);
+    }
+    match summary.report_source {
+        leveler_client_protocol::UiReviewReportSource::Submitted => {
+            push_report_line(
+                &mut out,
+                "",
+                &t.review
+                    .report_revision
+                    .replacen("{}", &summary.report_revision.to_string(), 1)
+                    .replacen("{}", &summary.report_evidence_revision.to_string(), 1),
+                muted,
+                width,
+            );
+        }
+        leveler_client_protocol::UiReviewReportSource::None => {
+            push_report_line(&mut out, "!", t.review.report_source_none, accent, width);
+        }
+        leveler_client_protocol::UiReviewReportSource::Legacy => {
+            push_report_line(&mut out, "!", t.review.report_source_legacy, accent, width);
+        }
+    }
+    if summary.report_stale {
+        push_report_line(&mut out, "!", t.review.report_stale, accent, width);
+    }
+    if !summary.investigations.is_empty() {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            t.review.investigations_section,
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for investigation in &summary.investigations {
+            let state = match investigation.state {
+                leveler_client_protocol::UiReviewInvestigationState::Running => {
+                    t.review.investigation_running
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Completed => {
+                    t.review.investigation_completed
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Incomplete => {
+                    t.review.investigation_incomplete
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Failed => {
+                    t.review.investigation_failed
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Cancelled => {
+                    t.review.investigation_cancelled
+                }
+            };
+            let mut row = format!("· {} — {state}", investigation.title);
+            if investigation.findings > 0 {
+                row.push_str(" · ");
+                row.push_str(&t.review.investigation_findings.replacen(
+                    "{}",
+                    &investigation.findings.to_string(),
+                    1,
+                ));
+            }
+            push_report_line(&mut out, "  ", &row, muted, width);
+            if let Some(objective) = investigation.objective.as_deref() {
+                push_report_line(&mut out, "    ", objective, muted, width);
+            }
+        }
+    }
+    if let Some(detail) = summary
+        .failure
+        .as_deref()
+        .or(summary.stop_detail.as_deref())
+        .filter(|detail| !detail.trim().is_empty())
+    {
+        push_report_line(&mut out, "!", detail, accent, width);
+    }
+
+    // Structured verdict before the prose: conclusion, what was actually
+    // covered, and what stopped the review. Empty declarations say so; they
+    // never become "no issues".
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        t.review.verdict_section.to_string(),
+        head,
+    )));
+    push_report_line(
+        &mut out,
+        "",
+        crate::render::transcript_lines::review_conclusion_label(report.verdict.conclusion, t),
+        head,
+        width,
+    );
+    push_report_line(&mut out, "  ", t.review.verdict_note, muted, width);
+    out.push(Line::from(Span::styled(
+        t.review.coverage_section.to_string(),
+        head,
+    )));
+    if report.verdict.coverage.is_empty() {
+        push_report_line(&mut out, "  ", t.review.coverage_undeclared, muted, width);
+    }
+    for coverage in &report.verdict.coverage {
+        let status = crate::render::transcript_lines::review_coverage_label(coverage.status, t);
+        let dimension = dimension_label(coverage.dimension, t);
+        let mut line = format!("{dimension}: {status}");
+        if let Some(scope) = coverage
+            .scope
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty())
+        {
+            line.push_str(&format!(" · {}: {scope}", t.review.scope));
+        }
+        push_report_line(&mut out, "  ", &line, muted, width);
+        if !coverage.evidence_refs.is_empty() {
+            push_report_line(
+                &mut out,
+                "  ",
+                &format!(
+                    "{}: {}",
+                    t.review.evidence,
+                    coverage.evidence_refs.join(", ")
+                ),
+                muted,
+                width,
+            );
+        }
+        if let Some(limitation) = coverage
+            .limitations
+            .as_deref()
+            .filter(|limitation| !limitation.trim().is_empty())
+        {
+            push_report_line(
+                &mut out,
+                "  ",
+                &format!("{}: {limitation}", t.review.limitations_section),
+                muted,
+                width,
+            );
+        }
+    }
+    if !report.verdict.limitations.is_empty() {
+        out.push(Line::from(Span::styled(
+            t.review.limitations_section.to_string(),
+            head,
+        )));
+        for limitation in &report.verdict.limitations {
+            let source = match limitation.source {
+                leveler_client_protocol::UiReviewLimitationSource::Runtime => {
+                    t.review.limitation_source_runtime
+                }
+                leveler_client_protocol::UiReviewLimitationSource::Reviewer => {
+                    t.review.limitation_source_reviewer
+                }
+            };
+            let kind =
+                crate::render::transcript_lines::review_limitation_kind_label(limitation.kind, t);
+            push_report_line(
+                &mut out,
+                "  ",
+                &format!("[{source}/{kind}] {}", limitation.detail),
+                muted,
+                width,
+            );
+        }
+    }
+
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        t.review.findings_section.to_string(),
+        head,
+    )));
+    let formal: Vec<&leveler_client_protocol::UiReviewFinding> = report
+        .findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.disposition,
+                None | Some(leveler_client_protocol::UiReviewFindingDisposition::Adopted)
+            )
+        })
+        .collect();
+    let undecided_or_rejected: Vec<&leveler_client_protocol::UiReviewFinding> = report
+        .findings
+        .iter()
+        .filter(|finding| {
+            !matches!(
+                finding.disposition,
+                None | Some(leveler_client_protocol::UiReviewFindingDisposition::Adopted)
+            )
+        })
+        .collect();
+    if formal.is_empty() {
+        push_report_line(
+            &mut out,
+            "  ",
+            if undecided_or_rejected.is_empty() {
+                t.review.no_findings_detail
+            } else {
+                t.review.no_formal_findings
+            },
+            muted,
+            width,
+        );
+    }
+    for finding in &formal {
+        let mut label = String::new();
+        if let Some(severity) = finding.severity {
+            label.push_str(&severity_label(severity));
+        }
+        if let Some(dimension) = finding.dimension {
+            label.push_str(&format!(" [{}]", dimension_label(dimension, t)));
+        }
+        if let Some(confidence) = finding.confidence {
+            label.push_str(&format!(" [{}]", confidence_label(confidence)));
+        }
+        if finding.disposition == Some(leveler_client_protocol::UiReviewFindingDisposition::Adopted)
+        {
+            label.push_str(&format!(" [{}]", t.review.disposition_adopted));
+        }
+        let title = if label.is_empty() {
+            finding.title.clone()
+        } else {
+            format!("{label} {}", finding.title)
+        };
+        push_report_line(&mut out, "", &title, head, width);
+        let mut location = finding.file.clone().unwrap_or_default();
+        if let (Some(file), Some(line)) = (&finding.file, finding.line) {
+            location = format!("{file}:{line}");
+        }
+        if !location.is_empty() {
+            push_report_line(&mut out, "  ", &location, muted, width);
+        }
+        if !finding.source_child.is_empty() {
+            // The durable source is the child identity. Present the
+            // investigation's title when this report carries it; a raw UUID
+            // is attribution without a reader.
+            let source = report
+                .summary
+                .investigations
+                .iter()
+                .find(|investigation| investigation.id == finding.source_child)
+                .map(|investigation| investigation.title.as_str())
+                .unwrap_or(finding.source_child.as_str());
+            push_report_line(
+                &mut out,
+                "  ",
+                &t.review.finding_source.replacen("{}", source, 1),
+                muted,
+                width,
+            );
+        }
+        if finding.summary != finding.title {
+            push_report_line(&mut out, "  ", &finding.summary, muted, width);
+        }
+        for (label, value) in [
+            (t.review.evidence, finding.evidence.as_deref()),
+            (t.review.impact, finding.impact.as_deref()),
+            (t.review.recommendation, finding.recommendation.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                push_report_line(&mut out, "  ", &format!("{label}: {value}"), muted, width);
+            }
+        }
+        push_report_line(
+            &mut out,
+            "  ",
+            if finding.reproduced {
+                t.review.reproduced
+            } else {
+                t.review.not_reproduced
+            },
+            muted,
+            width,
+        );
+    }
+
+    // Investigator candidates and the Lead's decisions stay visible without
+    // masquerading as formal defects. A rejected or merged candidate is
+    // evidence history, not a finding count.
+    if !undecided_or_rejected.is_empty() {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            t.review.candidates_section.to_string(),
+            head,
+        )));
+        for finding in &undecided_or_rejected {
+            let disposition = match finding.disposition {
+                Some(leveler_client_protocol::UiReviewFindingDisposition::Candidate) => {
+                    t.review.disposition_candidate.to_string()
+                }
+                Some(leveler_client_protocol::UiReviewFindingDisposition::Adopted) => {
+                    t.review.disposition_adopted.to_string()
+                }
+                Some(leveler_client_protocol::UiReviewFindingDisposition::Rejected) => {
+                    t.review.disposition_rejected.to_string()
+                }
+                Some(leveler_client_protocol::UiReviewFindingDisposition::Duplicate) => t
+                    .review
+                    .disposition_duplicate
+                    .replacen("{}", finding.duplicate_of.as_deref().unwrap_or("-"), 1),
+                None => String::new(),
+            };
+            let source = if finding.source_child.is_empty() {
+                String::new()
+            } else {
+                let source = report
+                    .summary
+                    .investigations
+                    .iter()
+                    .find(|investigation| investigation.id == finding.source_child)
+                    .map(|investigation| investigation.title.as_str())
+                    .unwrap_or(finding.source_child.as_str());
+                format!(" · {}", t.review.finding_source.replacen("{}", source, 1))
+            };
+            push_report_line(
+                &mut out,
+                "",
+                &format!("[{disposition}] {} ({}){source}", finding.title, finding.id),
+                muted,
+                width,
+            );
+            if let Some(reason) = finding
+                .disposition_reason
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+            {
+                push_report_line(
+                    &mut out,
+                    "  ",
+                    &t.review.disposition_reason.replacen("{}", reason, 1),
+                    muted,
+                    width,
+                );
+            }
+        }
+    }
+
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        t.review.report_section.to_string(),
+        head,
+    )));
+    if report.report.trim().is_empty() {
+        push_report_line(&mut out, "  ", "—", muted, width);
+        if !report.final_message.trim().is_empty() {
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(
+                t.review.final_message_section.to_string(),
+                head,
+            )));
+            out.extend(crate::markdown::MdDoc::parse(&report.final_message).to_lines(width, theme));
+        }
+    } else {
+        out.extend(crate::markdown::MdDoc::parse(&report.report).to_lines(width, theme));
+    }
+    out
+}
+
+fn push_report_line(
+    out: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    style: Style,
+    width: usize,
+) {
+    let indent = " ".repeat(UnicodeWidthStr::width(prefix));
+    let inner_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
+    let rows = crate::render::text::wrap(text, inner_width);
+    if rows.is_empty() {
+        out.push(Line::from(prefix.to_string()));
+        return;
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        let lead = if index == 0 {
+            prefix.to_string()
+        } else {
+            indent.clone()
+        };
+        out.push(Line::from(vec![
+            Span::styled(lead, style),
+            Span::styled(row, style),
+        ]));
+    }
+}
+
+fn severity_label(severity: leveler_client_protocol::UiReviewSeverity) -> String {
+    use leveler_client_protocol::UiReviewSeverity;
+    match severity {
+        UiReviewSeverity::P0 => "P0",
+        UiReviewSeverity::P1 => "P1",
+        UiReviewSeverity::P2 => "P2",
+        UiReviewSeverity::P3 => "P3",
+    }
+    .to_string()
+}
+
+fn confidence_label(confidence: leveler_client_protocol::UiReviewConfidence) -> String {
+    use leveler_client_protocol::UiReviewConfidence;
+    match confidence {
+        UiReviewConfidence::High => "high",
+        UiReviewConfidence::Medium => "medium",
+        UiReviewConfidence::Low => "low",
+    }
+    .to_string()
+}
+
+fn dimension_label(
+    dimension: leveler_client_protocol::UiReviewDimension,
+    t: &crate::i18n::UiText,
+) -> &'static str {
+    use leveler_client_protocol::UiReviewDimension;
+    match dimension {
+        UiReviewDimension::Code => t.review.dimension_code,
+        UiReviewDimension::Business => t.review.dimension_business,
+        UiReviewDimension::Security => t.review.dimension_security,
+        UiReviewDimension::Architecture => t.review.dimension_architecture,
+        UiReviewDimension::Test => t.review.dimension_test,
+        UiReviewDimension::Delivery => t.review.dimension_delivery,
+        UiReviewDimension::Session => t.review.dimension_session,
+    }
+}
+
 fn render_plan_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let page = crate::secondary::SecondaryPage {

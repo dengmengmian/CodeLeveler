@@ -230,6 +230,17 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     query_id: Some(query_id),
                 }));
             }
+            // Reviews are durable and independent of the turn log; a reopened
+            // session asks for its stored cards the same way it asks for its
+            // transcript. Read-only and safe to ask while a turn runs.
+            if opened {
+                let query_id = CommandId::generate();
+                state.review_history_query = Some(query_id.clone());
+                effects.push(Effect::Send(ClientCommand::ListReviews {
+                    session_id: state.session_id.clone(),
+                    query_id: Some(query_id),
+                }));
+            }
             // Opening/resuming a session and changing a setting both make the
             // runtime's live accounting current (or, after a model switch or a
             // compaction, explicitly none). Ask for it so the compaction-axis
@@ -1236,6 +1247,13 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     let goal_hit = state
         .goal_hit
         .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
+    // A review card's whole painted row block opens its report. The durable
+    // review id travels with the hit, so a moved card cannot open another.
+    let review_hit = state
+        .review_hits
+        .iter()
+        .find(|(row, x0, x1, _)| mouse.row == *row && (*x0..*x1).contains(&mouse.column))
+        .map(|(_, _, _, id)| id.clone());
     let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
 
     // 待发送 rows: hover reveals an item's actions; a click sends, deletes, or
@@ -1373,6 +1391,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 state.conv.selection.clear();
                 screen_nav::open_goal_screen(state);
                 return Vec::new();
+            }
+            if let Some(review_id) = review_hit {
+                interaction::clear_selection_drag(state);
+                state.conv.selection.clear();
+                return screen_nav::open_review_report(state, &review_id);
             }
             if over_input {
                 state.shell_output_focus = None;

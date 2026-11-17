@@ -505,8 +505,247 @@ pub fn item_render(
             );
         }
         TranscriptItem::GoalRecap(block) => goal_recap_lines(block, theme, wrap_width, &mut out, t),
+        TranscriptItem::Review(block) => review_lines(block, theme, wrap_width, &mut out, t),
     }
     out
+}
+
+/// Manual review card. One bounded summary; the report lives on its own page,
+/// opened from the card's hit region (the whole card is the target).
+fn review_lines(
+    block: &crate::transcript::ReviewBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    out: &mut Vec<Line<'static>>,
+    t: &UiText,
+) {
+    let summary = &block.summary;
+    let accent = Style::default()
+        .fg(theme.accent.primary)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.text.secondary);
+    let status = review_status_label(summary.status, t);
+    let mut head = vec![
+        Span::styled("▌ ", accent),
+        Span::styled(status.to_string(), accent),
+        Span::styled(
+            format!(" · {}", review_scope_label(&summary.scope, t)),
+            muted,
+        ),
+    ];
+    if summary.status.settled() {
+        // The report entry sits on the card's right edge, in the same accent
+        // the plan detail uses. It wraps only when the row truly has no room.
+        let label = t.review.view_report;
+        let used: usize = head
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let label_width = UnicodeWidthStr::width(label);
+        let pad = wrap_width
+            .saturating_sub(used)
+            .saturating_sub(label_width)
+            .max(1);
+        head.push(Span::raw(" ".repeat(pad)));
+        head.push(Span::styled(label, accent));
+    }
+    out.push(Line::from(head));
+    if !block.investigations.is_empty() {
+        push_prefixed(
+            out,
+            "  ",
+            t.review.investigations_section,
+            muted,
+            wrap_width,
+        );
+        for investigation in &block.investigations {
+            let state = match investigation.state {
+                leveler_client_protocol::UiReviewInvestigationState::Running => {
+                    t.review.investigation_running
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Completed => {
+                    t.review.investigation_completed
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Incomplete => {
+                    t.review.investigation_incomplete
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Failed => {
+                    t.review.investigation_failed
+                }
+                leveler_client_protocol::UiReviewInvestigationState::Cancelled => {
+                    t.review.investigation_cancelled
+                }
+            };
+            let mut row = format!("· {} — {state}", investigation.title);
+            if investigation.findings > 0 {
+                row.push_str(" · ");
+                row.push_str(&t.review.investigation_findings.replacen(
+                    "{}",
+                    &investigation.findings.to_string(),
+                    1,
+                ));
+            }
+            push_prefixed(out, "    ", &row, muted, wrap_width);
+        }
+    }
+    if summary.status.settled() {
+        let counts = &summary.counts;
+        let mut facts = format!(
+            "P0 {}  P1 {}  P2 {}  P3 {}",
+            counts.p0, counts.p1, counts.p2, counts.p3
+        );
+        if counts.unclassified > 0 {
+            facts.push_str(&format!(
+                " · {}",
+                t.review
+                    .unclassified
+                    .replacen("{}", &counts.unclassified.to_string(), 1)
+            ));
+        }
+        if counts.observations > 0 {
+            facts.push_str(" · ");
+            facts.push_str(&t.review.observations.replacen(
+                "{}",
+                &counts.observations.to_string(),
+                1,
+            ));
+        }
+        let total = counts.total();
+        let finding_text = t.review.findings.replacen("{}", &total.to_string(), 1);
+        facts.push_str(" · ");
+        facts.push_str(if total == 0 {
+            t.review.none_found
+        } else {
+            &finding_text
+        });
+        if counts.pending_candidates > 0 {
+            facts.push_str(" · ");
+            facts.push_str(&t.review.pending_candidates.replacen(
+                "{}",
+                &counts.pending_candidates.to_string(),
+                1,
+            ));
+        }
+        facts.push_str(" · ");
+        facts.push_str(review_conclusion_label(summary.conclusion, t));
+        facts.push_str(" · ");
+        facts.push_str(if summary.modified_source {
+            t.review.modified_source
+        } else {
+            t.review.readonly
+        });
+        push_prefixed(out, "  ", &facts, muted, wrap_width);
+    } else if let Some(tool) = &block.live_tool {
+        push_prefixed(
+            out,
+            "  ",
+            &format!("{} · {} · {tool}", summary.focus, summary.model),
+            muted,
+            wrap_width,
+        );
+    } else {
+        push_prefixed(
+            out,
+            "  ",
+            &format!("{} · {}", summary.focus, summary.model),
+            muted,
+            wrap_width,
+        );
+    }
+    if summary.object_changed {
+        push_prefixed(out, "  ", t.review.object_changed, muted, wrap_width);
+    }
+    if summary.report_stale {
+        push_prefixed(out, "  ", t.review.report_stale, muted, wrap_width);
+    }
+    if let Some(detail) = summary
+        .failure
+        .as_deref()
+        .or(summary.stop_detail.as_deref())
+        .filter(|detail| !detail.trim().is_empty())
+    {
+        push_prefixed(out, "  ", detail, muted, wrap_width);
+    }
+}
+
+pub(crate) fn review_scope_label(
+    scope: &leveler_client_protocol::UiReviewScope,
+    t: &UiText,
+) -> String {
+    match scope {
+        leveler_client_protocol::UiReviewScope::CurrentTask => {
+            t.review.scope_current_task.to_string()
+        }
+        leveler_client_protocol::UiReviewScope::Workspace => t.review.scope_workspace.to_string(),
+        leveler_client_protocol::UiReviewScope::Project => t.review.scope_project.to_string(),
+        leveler_client_protocol::UiReviewScope::Session { .. } => {
+            t.review.scope_session.to_string()
+        }
+        leveler_client_protocol::UiReviewScope::Commit { rev } => {
+            format!("{} {rev}", t.review.scope_commit)
+        }
+        leveler_client_protocol::UiReviewScope::Branch { base } => {
+            format!("{} {base}", t.review.scope_branch)
+        }
+        leveler_client_protocol::UiReviewScope::Paths { paths } => {
+            format!("{} {}", t.review.scope_paths, paths.join(", "))
+        }
+    }
+}
+
+pub(crate) fn review_conclusion_label(
+    conclusion: Option<leveler_client_protocol::UiReviewConclusion>,
+    t: &UiText,
+) -> &'static str {
+    use leveler_client_protocol::UiReviewConclusion;
+    match conclusion {
+        Some(UiReviewConclusion::IssuesFound) => t.review.conclusion_issues,
+        Some(UiReviewConclusion::NoIssuesFound) => t.review.conclusion_clean,
+        Some(UiReviewConclusion::Inconclusive) => t.review.conclusion_inconclusive,
+        None => t.review.conclusion_undeclared,
+    }
+}
+
+pub(crate) fn review_coverage_label(
+    status: leveler_client_protocol::UiReviewCoverageStatus,
+    t: &UiText,
+) -> &'static str {
+    use leveler_client_protocol::UiReviewCoverageStatus;
+    match status {
+        UiReviewCoverageStatus::Reviewed => t.review.coverage_reviewed,
+        UiReviewCoverageStatus::Partial => t.review.coverage_partial,
+        UiReviewCoverageStatus::NotReviewed => t.review.coverage_not_reviewed,
+        UiReviewCoverageStatus::NotApplicable => t.review.coverage_not_applicable,
+    }
+}
+
+pub(crate) fn review_limitation_kind_label(
+    kind: leveler_client_protocol::UiReviewLimitationKind,
+    t: &UiText,
+) -> &'static str {
+    use leveler_client_protocol::UiReviewLimitationKind;
+    match kind {
+        UiReviewLimitationKind::Environment => t.review.limitation_environment,
+        UiReviewLimitationKind::Permission => t.review.limitation_permission,
+        UiReviewLimitationKind::ToolCapability => t.review.limitation_tool_capability,
+        UiReviewLimitationKind::Scope => t.review.limitation_scope,
+        UiReviewLimitationKind::ObjectChanged => t.review.limitation_object_changed,
+        UiReviewLimitationKind::Other => t.review.limitation_other,
+    }
+}
+
+pub(crate) fn review_status_label(
+    status: leveler_client_protocol::UiReviewStatus,
+    t: &UiText,
+) -> &'static str {
+    use leveler_client_protocol::UiReviewStatus;
+    match status {
+        UiReviewStatus::Queued | UiReviewStatus::Running => t.review.running,
+        UiReviewStatus::Completed => t.review.completed,
+        UiReviewStatus::Incomplete => t.review.incomplete,
+        UiReviewStatus::Cancelled => t.review.cancelled,
+        UiReviewStatus::Failed => t.review.failed,
+    }
 }
 
 /// Render the archived plan with the turn's user boundary applied.

@@ -16,6 +16,10 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 /// source for "may run without a plan / read-only subset" decisions — the
 /// R006 incident came from a second, narrower copy of this list drifting
 /// (git_status missing) and the plan gate refusing a read-only tool.
+///
+/// `session_history` is composed by the APPLICATION and registered only on a
+/// manual review surface; listing it here is what keeps it alive through the
+/// reviewer's read-only projection.
 pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "blast_radius",
     "computer_observe",
@@ -26,15 +30,18 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "find_symbol",
     "get_task",
     "git_diff",
+    "git_history",
     "git_status",
     "grep",
     "list_files",
     "load_skill",
+    "memory_search",
     "native_capabilities",
     "native_verify",
     "read_file",
     "read_project_rules",
     "read_symbol",
+    "session_history",
     "update_plan",
     "view_image",
 ];
@@ -1040,6 +1047,11 @@ mod tests {
             // The runtime already checkpoints before every write and owns
             // rollback and crash recovery.
             "create_checkpoint",
+            // `update_plan` is a harness control registered by
+            // `register_harness_controls`, not a model_surface tool. The
+            // reviewer receives it as a child-local plan; absence here is the
+            // registry's surface, not the review seat's.
+            "update_plan",
             "restore_checkpoint",
             // System customization: the user makes skills, the model loads them.
             "create_skill",

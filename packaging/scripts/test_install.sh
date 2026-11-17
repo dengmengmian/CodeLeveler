@@ -42,14 +42,26 @@ case "$url" in
     fi
     printf '%s\n' '{"tag_name":"v1.2.3"}'
     ;;
-  *.tar.gz.sha256)
+  *.tar.xz.sha256)
     case "$INSTALL_TEST_MODE" in
+      gz-only) exit 22 ;;
       missing) exit 22 ;;
       invalid) printf '%s\n' 'not-a-sha256' >"$out" ;;
       *) printf '%s  %s\n' \
         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-        'leveler-v1.2.3-x86_64-unknown-linux-gnu.tar.gz' >"$out" ;;
+        'leveler-v1.2.3-x86_64-unknown-linux-gnu.tar.xz' >"$out" ;;
     esac
+    ;;
+  *.tar.gz.sha256)
+    printf '%s  %s\n' \
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+      'leveler-v1.2.3-x86_64-unknown-linux-gnu.tar.gz' >"$out"
+    ;;
+  *.tar.xz)
+    if [ "${INSTALL_TEST_MODE:-}" = gz-only ]; then
+      exit 22
+    fi
+    : >"$out"
     ;;
   *.tar.gz)
     : >"$out"
@@ -158,5 +170,16 @@ run_installer "$success" valid >/dev/null
 
 expect_pinned_success pinned-with-v v1.2.3
 expect_pinned_success pinned-without-v 1.2.3
+
+# `releases/latest` still names a release published before the xz switch:
+# only the gzip sibling exists, and the one-line installer must not 404.
+gz_only="$TEST_ROOT/gz-only"
+make_fixture "$gz_only"
+add_hash_tool "$gz_only"
+run_installer "$gz_only" gz-only >/dev/null
+[ -x "$gz_only/install/leveler" ] || {
+  printf 'FAIL: the installer did not fall back to the gzip archive\n' >&2
+  exit 1
+}
 
 printf 'install.sh checksum tests passed\n'

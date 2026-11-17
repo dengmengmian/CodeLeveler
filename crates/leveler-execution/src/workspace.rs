@@ -44,6 +44,14 @@ pub enum WorkspaceError {
     SkillDefinition(String),
     #[error("failed to canonicalize workspace root {0}")]
     Root(String),
+    /// The file could not be opened for reading. `kind` is preserved so a
+    /// model-facing missing-file case stays recoverable.
+    #[error("failed to open `{path}` for reading: {message}")]
+    ReadOpen {
+        path: String,
+        message: String,
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl WorkspaceError {
@@ -53,6 +61,16 @@ impl WorkspaceError {
              to that root (e.g. `src/lib.rs`), or start leveler inside the target \
              repository. Writes outside the write scope are blocked by design; \
              reading any path is allowed.",
+            path.display(),
+            root.display()
+        ))
+    }
+
+    fn review_confined(path: &Path, root: &Path) -> Self {
+        WorkspaceError::OutsideWorkspace(format!(
+            "path `{}` is outside the reviewed workspace `{}`. A review seat may \
+             read the review object and its bound evidence tools only; it cannot \
+             read arbitrary host files.",
             path.display(),
             root.display()
         ))
@@ -74,7 +92,13 @@ pub struct Workspace {
     root: PathBuf,
     #[cfg(unix)]
     root_fd: std::sync::Arc<std::os::fd::OwnedFd>,
-    #[cfg(windows)]
+    /// Capability handle for the root, on every platform.
+    ///
+    /// Confined reads open through this handle instead of re-opening a
+    /// resolved path. `cap_std::fs::Dir` resolves component by component and
+    /// refuses a symlink that leaves the root, so a path swapped between the
+    /// canonicalize check and the open cannot redirect the read. On Windows it
+    /// also denies delete sharing, so the root cannot be renamed beneath it.
     root_dir: std::sync::Arc<cap_std::fs::Dir>,
     /// Extra trees allowed for [`PathAccess::Read`] only (canonicalized).
     /// Whether this root's filesystem treats `Foo.rs` and `foo.rs` as ONE
@@ -86,6 +110,11 @@ pub struct Workspace {
     case_insensitive: bool,
     unrestricted_access: bool,
     resource_bindings: Vec<leveler_core::GrantBinding>,
+    /// A review/investigation seat may read only the review workspace. The
+    /// ordinary agent keeps the product's "absolute reads are allowed" rule;
+    /// a review must not turn read-only into a licence for arbitrary host
+    /// files.
+    read_confinement: bool,
 }
 
 /// Probe the root's actual case semantics WITHOUT writing to the user's
@@ -169,7 +198,6 @@ impl Workspace {
         // lifetime prevents the root from being renamed or deleted beneath
         // descriptor-relative operations. It also gives callers safe
         // component-by-component traversal without in-crate `unsafe`.
-        #[cfg(windows)]
         let root_dir = cap_std::fs::Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())
             .map_err(|_| WorkspaceError::Root(root.display().to_string()))?;
         let case_insensitive = detect_case_insensitive(&canonical);
@@ -177,11 +205,11 @@ impl Workspace {
             root: canonical,
             #[cfg(unix)]
             root_fd: std::sync::Arc::new(root_fd),
-            #[cfg(windows)]
             root_dir: std::sync::Arc::new(root_dir),
             case_insensitive,
             unrestricted_access: false,
             resource_bindings: Vec::new(),
+            read_confinement: false,
         })
     }
 
@@ -200,6 +228,14 @@ impl Workspace {
     /// A filesystem scope alone does not imply unrestricted execution authority.
     pub fn with_unrestricted_access(mut self, unrestricted: bool) -> Self {
         self.unrestricted_access = unrestricted;
+        self
+    }
+
+    /// Keep read resolution inside this workspace. Set only on a review or
+    /// investigation seat; the ordinary agent's absolute-read contract is
+    /// unchanged.
+    pub fn with_read_confinement(mut self, confined: bool) -> Self {
+        self.read_confinement = confined;
         self
     }
 
@@ -260,6 +296,137 @@ impl Workspace {
         self.root_dir.clone()
     }
 
+    /// Open a file for reading, with the confinement decision bound to the
+    /// object actually opened.
+    ///
+    /// Ordinary workspaces keep the path-based contract (`resolve_for_read`
+    /// then open). A confined review/investigation seat opens through the
+    /// workspace's capability handle: cap-std resolves each component and
+    /// refuses any symlink that leaves the root, so the canonicalize check and
+    /// the open cannot disagree because a path was swapped in between. The
+    /// returned path is the captured identity used for fingerprints; the file
+    /// handle is the object actually read.
+    pub fn open_read(
+        &self,
+        input: impl AsRef<Path>,
+    ) -> Result<(PathBuf, std::fs::File), WorkspaceError> {
+        let input = input.as_ref();
+        let resolved = self.resolve_for_read(input)?;
+        if !self.read_confinement {
+            let file =
+                std::fs::File::open(&resolved).map_err(|error| WorkspaceError::ReadOpen {
+                    path: input.display().to_string(),
+                    message: error.to_string(),
+                    kind: error.kind(),
+                })?;
+            return Ok((resolved, file));
+        }
+        let relative = self.confined_relative(&resolved, input)?;
+        let file = self.root_dir.open(relative).map_err(|error| {
+            // cap-std refuses a component that resolves outside the root. That
+            // is a confinement denial, not an I/O failure, and it is exactly
+            // the race this entry point closes.
+            match error.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    WorkspaceError::review_confined(input, &self.root)
+                }
+                kind => WorkspaceError::ReadOpen {
+                    path: input.display().to_string(),
+                    message: error.to_string(),
+                    kind,
+                },
+            }
+        })?;
+        Ok((resolved, file.into_std()))
+    }
+
+    /// Whether this view confines reads to the reviewed workspace.
+    pub fn reads_confined(&self) -> bool {
+        self.read_confinement
+    }
+
+    /// Open one walked path through the workspace capability.
+    ///
+    /// Used by the search tools to turn a path produced by a directory walk
+    /// into an object that is provably under the root. `None` means the path
+    /// is outside the workspace or could not be opened; a search must skip it
+    /// rather than surface it to the model.
+    pub fn open_confined(&self, path: &Path) -> Option<std::fs::File> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let relative = if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        };
+        self.root_dir
+            .open(relative)
+            .ok()
+            .map(cap_std::fs::File::into_std)
+    }
+
+    /// The workspace-relative form of an already-resolved path.
+    ///
+    /// The root itself is `.` for the capability handle: an empty path is not
+    /// a valid component, and `list_files` defaults to the root.
+    fn confined_relative<'a>(
+        &self,
+        resolved: &'a Path,
+        input: &Path,
+    ) -> Result<&'a Path, WorkspaceError> {
+        let relative = resolved
+            .strip_prefix(&self.root)
+            .map_err(|_| WorkspaceError::review_confined(input, &self.root))?;
+        Ok(if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        })
+    }
+
+    /// List one directory through the workspace capability.
+    ///
+    /// The confined variant never enumerates outside the root, even if a
+    /// directory entry is swapped for an escaping symlink between resolution
+    /// and the read. Returns `(name, is_dir)`; `is_dir` follows an
+    /// inside-root symlink and is false for one that escapes.
+    pub fn read_dir_confined(
+        &self,
+        input: impl AsRef<Path>,
+    ) -> Result<Vec<(String, bool)>, WorkspaceError> {
+        let input = input.as_ref();
+        let resolved = self.resolve_for_read(input)?;
+        let relative = self.confined_relative(&resolved, input)?;
+        let dir = self
+            .root_dir
+            .open_dir(relative)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    WorkspaceError::review_confined(input, &self.root)
+                }
+                kind => WorkspaceError::ReadOpen {
+                    path: input.display().to_string(),
+                    message: error.to_string(),
+                    kind,
+                },
+            })?;
+        let mut entries = Vec::new();
+        for entry in dir.entries().map_err(|error| WorkspaceError::ReadOpen {
+            path: input.display().to_string(),
+            message: error.to_string(),
+            kind: error.kind(),
+        })? {
+            let entry = entry.map_err(|error| WorkspaceError::ReadOpen {
+                path: input.display().to_string(),
+                message: error.to_string(),
+                kind: error.kind(),
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = dir.open_dir(&name).is_ok();
+            entries.push((name, is_dir));
+        }
+        Ok(entries)
+    }
+
     /// Resolve for **read**: any path, inside or outside the workspace.
     ///
     /// Relative paths anchor on the workspace root. The result is canonical
@@ -268,6 +435,15 @@ impl Workspace {
     pub fn resolve_for_read(&self, input: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
         let input = input.as_ref();
         let normalized = self.normalize(input);
+        if self.read_confinement {
+            // Check both the lexical form and the real path: a symlink inside
+            // the workspace can point outside it, and canonicalize is the only
+            // reading that sees that.
+            let real = std::fs::canonicalize(&normalized).unwrap_or_else(|_| normalized.clone());
+            if !real.starts_with(&self.root) {
+                return Err(WorkspaceError::review_confined(input, &self.root));
+            }
+        }
         if self.allows_resource_path(leveler_core::Capability::FilesystemRead, input) {
             return self.clone().with_unrestricted_access(true).resolve_bounded(
                 input,
@@ -277,6 +453,9 @@ impl Workspace {
         }
         self.check_sensitive(&normalized, input, PathAccess::Read)?;
         if let Ok(real) = std::fs::canonicalize(&normalized) {
+            if self.read_confinement && !real.starts_with(&self.root) {
+                return Err(WorkspaceError::review_confined(input, &self.root));
+            }
             self.check_sensitive(&real, input, PathAccess::Read)?;
             return Ok(real);
         }
@@ -520,7 +699,11 @@ impl Workspace {
         for comp in normalized.components() {
             if let Component::Normal(os) = comp {
                 let name = os.to_string_lossy();
-                if matches!(name.as_ref(), ".git" | ".ssh" | ".aws") {
+                // The volume may resolve any casing to the same directory.
+                if name.eq_ignore_ascii_case(".git")
+                    || name.eq_ignore_ascii_case(".ssh")
+                    || name.eq_ignore_ascii_case(".aws")
+                {
                     return Err(denied(original));
                 }
             }
@@ -575,17 +758,23 @@ impl Workspace {
 /// extension, SSH private keys by conventional name, and well-known credential
 /// stores. Public halves (`id_rsa.pub`) stay allowed.
 pub fn is_sensitive_file_name(name: &str) -> bool {
-    if name == ".env" || name.starts_with(".env.") {
+    // macOS and Windows resolve `.ENV` to the same file as `.env`, and a
+    // credential's actual identity is the file, not the spelling the tool was
+    // given. Compare ASCII-insensitively on every platform: on a
+    // case-sensitive volume this can over-deny a differently-cased ordinary
+    // file, which is the safe direction.
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
         return true;
     }
     if matches!(
-        Path::new(name).extension().and_then(|e| e.to_str()),
+        Path::new(&lower).extension().and_then(|e| e.to_str()),
         Some("pem") | Some("key")
     ) {
         return true;
     }
     matches!(
-        name,
+        lower.as_str(),
         "credentials.json"
             | ".git-credentials"
             | ".netrc"
@@ -603,8 +792,12 @@ pub fn is_sensitive_file_name(name: &str) -> bool {
 /// Classify raw credential files using the workspace's existing denylist.
 /// This is metadata classification, never credential discovery or loading.
 pub fn is_credential_path(path: &Path) -> bool {
-    path.components().any(|component| matches!(component, Component::Normal(name) if name == ".ssh" || name == ".aws"))
-        || path.file_name().and_then(|name| name.to_str()).is_some_and(is_sensitive_file_name)
+    path.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(".ssh") || name.to_string_lossy().eq_ignore_ascii_case(".aws"))
+    }) || path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_sensitive_file_name)
 }
 
 /// Normalize `.` and `..` components lexically, without touching the filesystem.
@@ -775,7 +968,37 @@ mod tests {
                 .unwrap_err(),
             WorkspaceError::Denied(_)
         ));
+        // A case-insensitive volume resolves these to the same files.
+        for path in [".ENV", ".Env.Local", "ID_RSA", ".GIT/config", ".SSH/id"] {
+            assert!(
+                matches!(
+                    ws.resolve_for_write(path, &ws_scope(&ws)).unwrap_err(),
+                    WorkspaceError::Denied(_) | WorkspaceError::OutsideWorkspace(_)
+                ),
+                "{path} must not be writable"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credential_classification_ignores_case() {
+        for name in [
+            ".env",
+            ".ENV",
+            ".Env.local",
+            "server.PEM",
+            "server.KEY",
+            "ID_RSA",
+            "Credentials.JSON",
+        ] {
+            assert!(is_sensitive_file_name(name), "{name}");
+        }
+        for name in ["environment.md", "keynote.md", "id_rsa.pub", "README.md"] {
+            assert!(!is_sensitive_file_name(name), "{name}");
+        }
+        assert!(is_credential_path(Path::new("/home/u/.SSH/config")));
+        assert!(is_credential_path(Path::new("/tmp/.ENV")));
     }
 
     #[test]
@@ -1345,5 +1568,181 @@ mod resource_path_tests {
             },
         ]);
         assert!(raw.resolve_for_read(&target).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod read_confinement_tests {
+    use super::Workspace;
+
+    #[test]
+    fn a_read_confined_workspace_keeps_reads_inside_the_review_object() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("inside.txt"), "inside").unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+
+        let confined = Workspace::new(root.path())
+            .unwrap()
+            .with_read_confinement(true);
+        assert!(confined.resolve_for_read("inside.txt").is_ok());
+        assert!(
+            confined
+                .resolve_for_read(root.path().join("inside.txt"))
+                .is_ok()
+        );
+        let error = confined.resolve_for_read(&outside_file).unwrap_err();
+        assert!(error.to_string().contains("reviewed workspace"), "{error}");
+        assert!(
+            confined.resolve_for_read("../outside.txt").is_err(),
+            "a lexical escape must not resolve"
+        );
+
+        // The ordinary agent keeps the product's absolute-read contract.
+        let ordinary = Workspace::new(root.path()).unwrap();
+        assert_eq!(
+            ordinary.resolve_for_read(&outside_file).unwrap(),
+            std::fs::canonicalize(&outside_file).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_workspace_cannot_smuggle_an_outside_read() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        std::os::unix::fs::symlink(&outside_file, root.path().join("link.txt")).unwrap();
+        let confined = Workspace::new(root.path())
+            .unwrap()
+            .with_read_confinement(true);
+        let error = confined.resolve_for_read("link.txt").unwrap_err();
+        assert!(error.to_string().contains("reviewed workspace"), "{error}");
+    }
+
+    /// Deterministic check-then-swap: resolve the path while it is a regular
+    /// file, replace it with a symlink that escapes, then open. The open is
+    /// bound to the capability handle, so it refuses the swapped object
+    /// instead of following it. A path-based open would read `outside`.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_swapped_between_resolution_and_open_cannot_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("canary.txt");
+        std::fs::write(&outside_file, "OUTSIDE CANARY").unwrap();
+        let inside = root.path().join("safe.txt");
+        std::fs::write(&inside, "inside").unwrap();
+
+        let confined = Workspace::new(root.path())
+            .unwrap()
+            .with_read_confinement(true);
+        // The authorized observation: this path is a regular file inside.
+        let resolved = confined.resolve_for_read("safe.txt").unwrap();
+        assert_eq!(
+            std::fs::read(&resolved).unwrap(),
+            b"inside",
+            "the pre-swap file is legitimate"
+        );
+
+        // Swap AFTER the check, BEFORE the open.
+        std::fs::remove_file(&resolved).unwrap();
+        std::os::unix::fs::symlink(&outside_file, &resolved).unwrap();
+
+        // The path-based open (what the old reader did) would now read the
+        // canary; the capability open must refuse.
+        assert!(
+            std::fs::read(&resolved).is_ok(),
+            "fixture sanity: the swapped path does resolve outside"
+        );
+        assert!(
+            confined.open_confined(&resolved).is_none(),
+            "a symlink swapped in after resolution must not open through the workspace capability"
+        );
+
+        // The combined entry point refuses as well (it re-checks and then the
+        // capability refuses).
+        let denied = confined.open_read("safe.txt");
+        assert!(denied.is_err(), "the review seat must not read the canary");
+    }
+
+    /// The same swap at a DIRECTORY component: replacing `sub/` with a symlink
+    /// to an outside tree must not let a file beneath it open.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_between_resolution_and_open_cannot_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        let inside = root.path().join("sub/file.txt");
+        std::fs::write(&inside, "inside").unwrap();
+        let outside_file = outside.path().join("file.txt");
+        std::fs::write(&outside_file, "OUTSIDE CANARY").unwrap();
+
+        let confined = Workspace::new(root.path())
+            .unwrap()
+            .with_read_confinement(true);
+        let resolved = confined.resolve_for_read("sub/file.txt").unwrap();
+
+        std::fs::remove_file(&inside).unwrap();
+        std::fs::remove_dir(root.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
+
+        assert!(
+            std::fs::read(&resolved).is_ok(),
+            "fixture sanity: the swapped path now resolves outside"
+        );
+        assert!(
+            confined.open_confined(&resolved).is_none(),
+            "an escaping directory component must not open"
+        );
+    }
+
+    /// The default `list_files` path is `.`; a confined listing of the
+    /// workspace ROOT must work, not fail on an empty relative path.
+    #[test]
+    fn a_confined_listing_of_the_workspace_root_lists_its_children() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "a").unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        let confined = Workspace::new(root.path())
+            .unwrap()
+            .with_read_confinement(true);
+        let mut entries = confined.read_dir_confined(".").unwrap();
+        entries.sort();
+        assert!(
+            entries
+                .iter()
+                .any(|(name, is_dir)| name == "a.txt" && !is_dir)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(name, is_dir)| name == "src" && *is_dir)
+        );
+    }
+
+    /// A legitimate symlink that stays inside the workspace is still readable:
+    /// the capability refuses ESCAPES, not indirection.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_stays_inside_is_still_readable() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink(root.path().join("real.txt"), root.path().join("link.txt"))
+            .unwrap();
+        let confined = Workspace::new(root.path())
+            .unwrap()
+            .with_read_confinement(true);
+        let resolved = confined.resolve_for_read("link.txt").unwrap();
+        let mut file = confined
+            .open_confined(&resolved)
+            .expect("an inside symlink opens");
+        use std::io::Read;
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "inside");
     }
 }

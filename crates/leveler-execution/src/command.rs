@@ -372,7 +372,9 @@ impl ProcessRequest {
         } else if self.deny_network {
             crate::NetworkScope::None
         } else {
-            self.network_scope.clone()
+            // The requested scope is recorded as-is; the boundary this backend
+            // can enforce is what the process actually runs under.
+            self.network_scope.enforced_on_this_backend()
         }
     }
 
@@ -682,19 +684,24 @@ fn macos_sandbox_command(
     let (write_roots, protected) = match scope {
         WriteScope::ScopedWorkspace { root, excluded, .. } => {
             let mut protected = git_write_protected_paths(root);
+            protected.extend(definition_write_protected_paths(root));
             protected.extend(excluded.iter().cloned());
             (
                 writable_roots_for_scope(scope, scratch_root, cache_write_roots),
                 protected,
             )
         }
-        WriteScope::Workspace { root } => (
+        WriteScope::Workspace { root } => {
+            let mut protected = git_write_protected_paths(root);
+            protected.extend(definition_write_protected_paths(root));
+            (
+                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
+                protected,
+            )
+        }
+        WriteScope::WorkspaceWithGit { root } => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            git_write_protected_paths(root),
-        ),
-        WriteScope::WorkspaceWithGit { .. } => (
-            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            Vec::new(),
+            definition_write_protected_paths(root),
         ),
         _ => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
@@ -783,6 +790,21 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     // Prefer real path when present so seatbelt matches the vnode.
     let path = git.canonicalize().unwrap_or(git);
     vec![path]
+}
+
+/// Persistent execution configuration under the workspace that stays
+/// write-denied while the project root is writable.
+///
+/// The workspace layer refuses tool-based edits to these directories; a shell
+/// command would otherwise be a way to author a definition that a later
+/// session loads without the human consent the `save_agent` / `save_skill`
+/// path requires. The OS boundary is the same one `.git` uses.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub fn definition_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
+    [".leveler/agents", ".leveler/skills"]
+        .iter()
+        .map(|relative| write_root.join(relative))
+        .collect()
 }
 
 /// Directories a confined process may write to.
@@ -993,19 +1015,24 @@ fn linux_sandbox_command(
     let (roots, protected) = match scope {
         WriteScope::ScopedWorkspace { root, excluded, .. } => {
             let mut protected = git_write_protected_paths(root);
+            protected.extend(definition_write_protected_paths(root));
             protected.extend(excluded.iter().cloned());
             (
                 writable_roots_for_scope(scope, scratch_root, cache_write_roots),
                 protected,
             )
         }
-        WriteScope::Workspace { root } => (
+        WriteScope::Workspace { root } => {
+            let mut protected = git_write_protected_paths(root);
+            protected.extend(definition_write_protected_paths(root));
+            (
+                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
+                protected,
+            )
+        }
+        WriteScope::WorkspaceWithGit { root } => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            git_write_protected_paths(root),
-        ),
-        WriteScope::WorkspaceWithGit { .. } => (
-            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
-            Vec::new(),
+            definition_write_protected_paths(root),
         ),
         _ => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
@@ -2978,6 +3005,22 @@ mod tests {
             restored.effective_network_scope(),
             crate::NetworkScope::None
         );
+    }
+
+    /// A loopback-only request is enforced as loopback where the backend can
+    /// express it, and as deny-all where it cannot. It is never widened to
+    /// Internet, and it no longer refuses every command with an unsupported
+    /// scope.
+    #[test]
+    fn loopback_is_denied_where_the_backend_cannot_express_it() {
+        let mut request = super::ProcessRequest::new("true", vec![], std::env::temp_dir());
+        request.network_scope = crate::NetworkScope::Loopback;
+        let effective = request.effective_network_scope();
+        if cfg!(target_os = "macos") {
+            assert_eq!(effective, crate::NetworkScope::Loopback);
+        } else {
+            assert_eq!(effective, crate::NetworkScope::None);
+        }
     }
 
     #[tokio::test]
@@ -5714,6 +5757,70 @@ mod tests {
         let paths = git_write_protected_paths(&root);
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with(".git"));
+    }
+
+    #[test]
+    fn definition_write_protected_paths_cover_agents_and_skills() {
+        let root = PathBuf::from("/tmp/proj");
+        let paths = definition_write_protected_paths(&root);
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].ends_with(".leveler/agents"));
+        assert!(paths[1].ends_with(".leveler/skills"));
+    }
+
+    /// A shell command must not be able to author a definition that a later
+    /// session loads without the consent the `save_agent` / `save_skill` path
+    /// requires. The OS write fence is the same one `.git` uses.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_shell_cannot_write_agent_or_skill_definitions() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let base = home.join(format!(
+            ".leveler-def-canary-{}",
+            std::process::id() as u64 * 17 + 5
+        ));
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join(".leveler/agents")).unwrap();
+        std::fs::create_dir_all(ws.join(".leveler/skills")).unwrap();
+        let runner = unix_host_runner();
+
+        for relative in [
+            ".leveler/agents/evil/agent.yaml",
+            ".leveler/skills/evil/SKILL.md",
+        ] {
+            let target = ws.join(relative);
+            let mut request = ProcessRequest::new(
+                "sh",
+                vec![
+                    "-c".into(),
+                    format!(
+                        "mkdir -p \"$(dirname '{}')\" && echo pwn > '{}'",
+                        relative, relative
+                    ),
+                ],
+                ws.clone(),
+            );
+            request.write_scope = WriteScope::Workspace { root: ws.clone() };
+            let out = runner.run(request, CancellationToken::new()).await.unwrap();
+            assert!(
+                !out.success() || !target.exists(),
+                "{relative} must stay write-denied: {out:?}"
+            );
+            let _ = std::fs::remove_file(&target);
+        }
+
+        // An ordinary project file remains writable in the same command run.
+        let mut normal = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "echo fine > ordinary.txt".into()],
+            ws.clone(),
+        );
+        normal.write_scope = WriteScope::Workspace { root: ws.clone() };
+        let out = runner.run(normal, CancellationToken::new()).await.unwrap();
+        assert!(out.success(), "ordinary workspace write: {out:?}");
+        assert!(ws.join("ordinary.txt").exists());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// D4 canary (macOS): confined write_root blocks writes under `.git`;

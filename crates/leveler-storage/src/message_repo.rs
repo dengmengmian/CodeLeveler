@@ -482,6 +482,65 @@ impl<'a> MessageRepository<'a> {
         self.load_timed_since(session_id, None).await
     }
 
+    /// A bounded page of messages after `after_ordinal`, oldest first.
+    ///
+    /// The reviewer reads a session on demand; it must be able to ask for the
+    /// next page without loading the whole transcript first.
+    pub async fn page(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<TimedMessage>, StorageError> {
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT ordinal, created_at, payload, input_id FROM session_messages \
+             WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC LIMIT ?3",
+        )
+        .bind(session_id.as_str())
+        .bind(after_ordinal)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ordinal, created_at, payload, input_id)| TimedMessage {
+                ordinal: ordinal.max(0) as u64,
+                created_at,
+                payload,
+                input_id,
+            })
+            .collect())
+    }
+
+    /// Bounded literal text search over one session's stored messages.
+    ///
+    /// Same contract as the event search: `instr` is a literal substring
+    /// test, so user text is never interpreted as a SQL pattern.
+    pub async fn search(
+        &self,
+        session_id: &SessionId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TimedMessage>, StorageError> {
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT ordinal, created_at, payload, input_id FROM session_messages              WHERE session_id = ?1 AND instr(lower(payload), lower(?2)) > 0              ORDER BY ordinal ASC LIMIT ?3",
+        )
+        .bind(session_id.as_str())
+        .bind(query)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ordinal, created_at, payload, input_id)| TimedMessage {
+                ordinal: ordinal.max(0) as u64,
+                created_at,
+                payload,
+                input_id,
+            })
+            .collect())
+    }
+
     /// A history tail, preserving rows whose timestamp cannot be interpreted.
     pub async fn load_timed_since(
         &self,
@@ -679,6 +738,32 @@ mod tests {
         assert_eq!(rows[0].created_at, first.to_rfc3339());
         assert_eq!(rows[1].created_at, later.to_rfc3339());
         assert_eq!((rows[0].ordinal, rows[1].ordinal), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn a_message_page_is_bounded_and_continues_after_its_last_ordinal() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id);
+        let repo = MessageRepository::new(&db);
+        repo.append(
+            &id,
+            &[
+                r#"{"n":1}"#.into(),
+                r#"{"n":2}"#.into(),
+                r#"{"n":3}"#.into(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let first = repo.page(&id, -1, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].payload, r#"{"n":2}"#);
+        let rest = repo.page(&id, first[1].ordinal as i64, 2).await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].payload, r#"{"n":3}"#);
     }
 
     #[tokio::test]

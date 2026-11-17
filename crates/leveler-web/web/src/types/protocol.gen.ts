@@ -525,6 +525,16 @@ export type RuntimeEvent =
   | { type: 'agent_loaded'; agent?: UiAgentDetail | null; error?: string | null; name: string; query_id?: CommandId | null }
   /** Result of `CreateAgent` / `UpdateAgent` / `DeleteAgent`. On failure nothing was written and `error` is the reason. */
   | { type: 'agent_mutated'; agent?: UiAgentEntry | null; error?: string | null; name: string; ok: boolean; query_id?: CommandId | null }
+  /** A manual review was admitted and is now running. The summary is the durable row's projection at start; later progress and the terminal update the same card by `id`. */
+  | { type: 'review_started'; review: UiReviewSummary }
+  /** Live activity for one running review. Transient: the durable report is the authority once it settles. */
+  | { type: 'review_progress'; active: boolean; cached_input_tokens: number; elapsed_ms?: number; input_tokens: number; investigations?: UiReviewInvestigation[]; output_tokens: number; review_id: string; tool?: string | null }
+  /** A manual review settled. `Completed` means the reviewer reached a clean end — not that no defects exist. */
+  | { type: 'review_finished'; review: UiReviewSummary }
+  /** Result of [`crate::ClientCommand::QueryReviewReport`]. The report is the durable row, not a reconstruction from the live event stream. */
+  | { type: 'review_report_loaded'; query_id?: CommandId | null; report: UiReviewReport }
+  /** Result of [`crate::ClientCommand::ListReviews`], newest first. */
+  | { type: 'review_history_loaded'; query_id?: CommandId | null; reviews?: UiReviewSummary[] }
   /** A transient notification for the status line. */
   | { type: 'notification'; level: NotificationLevel; message: string }
   /** A background process task was started (`run_command` background=true). */
@@ -1571,6 +1581,221 @@ export interface UiRequestObservation {
   retry_count: number;
 }
 
+/** The reviewer's own verdict, independent of execution status and counts. */
+export type UiReviewConclusion = 'issues_found' | 'no_issues_found' | 'inconclusive';
+
+/** How sure the reviewer is that the finding is real, distinct from how bad it would be if it were real. */
+export type UiReviewConfidence = 'high' | 'medium' | 'low';
+
+/** Counts by severity. `unclassified` is an explicit bucket: a finding without a declared severity is not silently promoted to P2. Only FORMAL findings are counted: the Lead Reviewer's own findings and candidates it explicitly adopted. `pending_candidates` is reported separately and never contributes to [`Self::total`]. */
+export interface UiReviewCounts {
+  /** Formal findings the reviewer recorded as observations (`kind: observation`). They remain in their severity bucket, but the count says they are observations rather than confirmed defects. */
+  observations?: number;
+  p0: number;
+  p1: number;
+  p2: number;
+  p3: number;
+  /** Investigator candidates the Lead Reviewer has not adjudicated. Evidence, not defects; kept out of the formal total. */
+  pending_candidates?: number;
+  /** Findings recorded without a severity (usually a non-review child). */
+  unclassified: number;
+}
+
+/** One dimension's declared coverage. */
+export interface UiReviewCoverage {
+  dimension: UiReviewDimension;
+  evidence_refs?: string[];
+  limitations?: string | null;
+  scope?: string | null;
+  status: UiReviewCoverageStatus;
+}
+
+/** How far one dimension was actually covered. `Reviewed` is the reviewer's declaration about its own scope, not a correctness proof. */
+export type UiReviewCoverageStatus = 'not_applicable' | 'not_reviewed' | 'partial' | 'reviewed';
+
+/** Review dimensions. A finding may belong to one dimension; the report also states which dimensions were covered and which were not. */
+export type UiReviewDimension = 'code' | 'business' | 'security' | 'architecture' | 'test' | 'delivery' | 'session';
+
+/** One finding in the client-facing report. Stable `id` is the review ledger's own sequence; the report never re-keys another agent's records. */
+export interface UiReviewFinding {
+  confidence?: UiReviewConfidence | null;
+  dimension?: UiReviewDimension | null;
+  /** The Lead Reviewer's disposition of this record. Absent means it was authored by the seat that owns the ledger (a Lead finding). */
+  disposition?: UiReviewFindingDisposition | null;
+  /** Why the Lead adopted, rejected or merged this candidate. */
+  disposition_reason?: string | null;
+  /** The surviving finding when this one was merged as a duplicate. */
+  duplicate_of?: string | null;
+  evidence?: string | null;
+  file?: string | null;
+  id: string;
+  impact?: string | null;
+  /** The `report_finding` kind (`correctness`, `risk`, …). */
+  kind?: string;
+  line?: number | null;
+  recommendation?: string | null;
+  /** Whether the reviewer reproduced the problem, as opposed to reasoning from the code alone. `false` is not a claim that it is wrong. */
+  reproduced?: boolean;
+  severity?: UiReviewSeverity | null;
+  /** The child agent that reported this candidate finding. Empty for the Lead Reviewer's own findings. Attribution, not a second verdict. */
+  source_child?: string;
+  /** The investigator's original finding id, when this record came from a child. Traceability, not a second verdict. */
+  source_finding_id?: string | null;
+  summary: string;
+  symbol?: string | null;
+  /** One-line title. Falls back to `summary` when the reviewer supplied none. */
+  title: string;
+}
+
+/** How the Lead Reviewer disposed of one candidate finding. Absent means the finding was authored by the seat that owns the ledger (a Lead Reviewer's own finding); it is formal. */
+export type UiReviewFindingDisposition = 'candidate' | 'adopted' | 'rejected' | 'duplicate';
+
+/** One independent investigation belonging to a manual review. This is the live/durable projection of a real child agent, not a model-authored label. */
+export interface UiReviewInvestigation {
+  elapsed_ms?: number;
+  /** Findings the child reported, when it settled. */
+  findings?: number;
+  id: string;
+  objective?: string | null;
+  /** The runtime role (`investigator`). */
+  role: string;
+  state: UiReviewInvestigationState;
+  /** The short display title fixed at spawn. */
+  title: string;
+}
+
+/** Lifecycle of one independent investigation under a review. Runtime facts, never inferred from the child's prose. */
+export type UiReviewInvestigationState =
+  | 'running' | 'completed' | 'failed' | 'cancelled'
+  /** Stopped before its own end (budget, wall clock, or an abnormal stop). Distinct from Failed: it may still have handed over partial evidence. */
+  | 'incomplete';
+
+/** One limitation, attributed to whoever observed it. */
+export interface UiReviewLimitation {
+  detail: string;
+  kind: UiReviewLimitationKind;
+  source: UiReviewLimitationSource;
+}
+
+/** What stopped the review from establishing something. */
+export type UiReviewLimitationKind = 'environment' | 'permission' | 'tool_capability' | 'scope' | 'object_changed' | 'other';
+
+/** Where a limitation came from. `Runtime` is a mechanical fact the runtime observed; `Reviewer` is the model's own statement. */
+export type UiReviewLimitationSource = 'reviewer' | 'runtime';
+
+/** The concrete object a review was performed against. Captured before the reviewer starts and re-checked when it ends, so a report can say whether the workspace moved under it. */
+export interface UiReviewObject {
+  /** RFC 3339 capture time. */
+  captured_at?: string;
+  /** Whether the worktree had uncommitted changes when captured. */
+  dirty?: boolean;
+  /** Files the requested scope resolved to, repository-relative and capped. */
+  files?: string[];
+  /** SHA-256 over the scope, revision, diff, workspace HEAD/status and a bounded sample of untracked files. Used only to detect movement; it is not an identity of the whole repository and a file's middle beyond the sample is not hashed. */
+  fingerprint?: string;
+  /** `git rev-parse HEAD` at capture time, when the workspace is a Git repo. */
+  head?: string | null;
+  /** The commit/branch the request named, when it named one. */
+  revision?: string | null;
+  /** New files not tracked by Git at capture time. */
+  untracked?: string[];
+  workspace?: string | null;
+}
+
+/** The full report behind a summary card. */
+export interface UiReviewReport {
+  /** The reviewer's last chat message. Displayed separately when no formal report exists; it is never substituted for one. */
+  final_message?: string;
+  findings: UiReviewFinding[];
+  object: UiReviewObject;
+  /** The reviewer's formal report body, verbatim. Empty when the reviewer submitted none; the runtime does not parse it for control flow. */
+  report: string;
+  summary: UiReviewSummary;
+  /** Structured coverage, limitations and conclusion. Absent fields are "not declared"; the runtime never derives them from the prose below. */
+  verdict?: UiReviewVerdict;
+}
+
+/** Where the stored report text came from. `Submitted` is the Lead Reviewer's explicit `report_review` body — the report of record. `None` means no formal report was submitted; the review still carries its findings and verdict, but there is no report body. `Legacy` marks a row written before formal report submission existed, whose `report` column held the reviewer's last chat message. */
+export type UiReviewReportSource = 'submitted' | 'none' | 'legacy';
+
+/** What the review is about. The runtime resolves this into concrete files, a diff and an object identity before the reviewer starts. */
+export type UiReviewScope =
+  /** The current task's delivery in this session: its user objective, the files its latest settled delivery touched, and its final claim. */
+  | { kind: 'current_task' }
+  /** Uncommitted changes in the session workspace. */
+  | { kind: 'workspace' }
+  /** The whole project: the reviewer reads the repository itself. */
+  | { kind: 'project' }
+  /** The current session, or another stored session named by id. */
+  | { kind: 'session'; session_id?: SessionId | null }
+  /** One commit, reviewed from `git show`. */
+  | { kind: 'commit'; rev: string }
+  /** The current branch relative to `base` (`git diff base...HEAD`). */
+  | { base: string; kind: 'branch' }
+  /** Explicit files, directories or modules. */
+  | { kind: 'paths'; paths: string[] };
+
+/** Finding severity. P0 is a confirmed critical defect; P3 is a low-impact observation worth recording. */
+export type UiReviewSeverity = 'p0' | 'p1' | 'p2' | 'p3';
+
+/** Lifecycle of one manual review. `Completed` says the reviewer reached a clean end; it never means the object is defect-free. */
+export type UiReviewStatus =
+  | 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'
+  /** The reviewer stopped on a budget or an abnormal stop before finishing. Findings it had established survive. */
+  | 'incomplete';
+
+/** The summary a conversation card and history list carry. */
+export interface UiReviewSummary {
+  /** The reviewer's own verdict, when it declared one. Absent is "not declared", never "no issues". */
+  conclusion?: UiReviewConclusion | null;
+  counts: UiReviewCounts;
+  created_at: string;
+  /** The review ledger's latest evidence revision at settlement. */
+  evidence_revision?: number;
+  failure?: string | null;
+  finished_at?: string | null;
+  /** The user's review focus, verbatim. */
+  focus: string;
+  id: string;
+  /** Independent investigations this review actually launched. Empty means none were launched, never "some ran but were hidden". */
+  investigations?: UiReviewInvestigation[];
+  /** The model that performed the review. */
+  model: string;
+  /** The reviewer changed product files. The read-only seat makes this a contract violation, recorded rather than hidden. */
+  modified_source?: boolean;
+  /** The object moved between capture and the end of the review. A report that says so is a report about the object as it was, not as it is. */
+  object_changed?: boolean;
+  /** The evidence revision the submitted report was bound to. Zero when no formal report exists. */
+  report_evidence_revision?: number;
+  /** How many formal report revisions the reviewer submitted. */
+  report_revision?: number;
+  /** Where the stored report text came from. Absent (a legacy peer) reads as [`UiReviewReportSource::Legacy`]. */
+  report_source?: UiReviewReportSource;
+  /** The submitted report predates the review's latest structured evidence: it does not cover every settlement. Execution may still be Completed; this flag says the report is not a complete synthesis. */
+  report_stale?: boolean;
+  scope: UiReviewScope;
+  session_id: SessionId;
+  status: UiReviewStatus;
+  /** Why a non-completed review stopped (budget, cancellation, abnormal stop), kept separate from `failure`: an incomplete review is not a failed one, and its partial findings are still evidence. */
+  stop_detail?: string | null;
+  usage?: UiReviewUsage;
+}
+
+/** Model spend attributed to this review, read from the runtime's durable model-request ledger. Unknown cost stays `None`, never zero. */
+export interface UiReviewUsage {
+  cached_input_tokens?: number;
+  cost_usd_micros?: number | null;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
+/** Structured coverage, limitations and conclusion. Every collection may be empty; an empty verdict means the reviewer declared nothing. */
+export interface UiReviewVerdict {
+  conclusion?: UiReviewConclusion | null;
+  coverage?: UiReviewCoverage[];
+  limitations?: UiReviewLimitation[];
+}
+
 /** Who authored a message. */
 export type UiRole = 'user' | 'assistant' | 'system' | 'tool';
 
@@ -1955,6 +2180,14 @@ export type ClientCommand =
   | { type: 'btw'; question: string; session_id: SessionId }
   /** Stop the in-flight `/btw` side answer for a session. Deliberately separate from `CancelCurrentTurn`: a side thread's answer has its own lifecycle, and stopping it must never stop the main turn. */
   | { type: 'cancel_btw'; session_id: SessionId }
+  /** Start a manual, read-only review. This is the ONLY entry into review: no ordinary message is classified, and a running turn is never interrupted or silently queued behind it. `focus` is the user's review request in their own words. The reviewer model reads it and decides where to look; `scope` names the object the runtime resolved for it. `model` overrides the session's current model for this review only. */
+  | { type: 'run_review'; focus: string; model?: ModelRef | null; scope: UiReviewScope; session_id: SessionId }
+  /** Cancel one running manual review. Read-only work settles with whatever it already established; the source session's task is untouched. */
+  | { type: 'cancel_review'; review_id: string; session_id: SessionId }
+  /** Load the full report behind a review summary card. A query, not a subscription: the durable review row is the authority. */
+  | { type: 'query_review_report'; query_id?: CommandId | null; review_id: string; session_id: SessionId }
+  /** List this session's stored reviews, newest first, for history replay. */
+  | { type: 'list_reviews'; query_id?: CommandId | null; session_id: SessionId }
   /** Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`]. */
   | { type: 'query_observability'; after?: number; before?: number; center_seq?: number | null; query_id?: CommandId | null; session_id: SessionId }
   /** Read-only context-accounting query. Does not mutate the runtime or the conversation. Answers with [`crate::RuntimeEvent::ContextLoaded`]. */

@@ -118,20 +118,48 @@ impl WorkspaceSearch {
     ///
     /// This is directory inspection, not repository search: it never descends,
     /// and it hides nothing. A build directory is a fact about the directory.
-    pub(crate) fn list_dir(dir: &Path, limit: usize) -> Result<Listing, SearchError> {
-        if !dir.is_dir() {
-            return Err(SearchError::NotDirectory);
-        }
-        let read = std::fs::read_dir(dir).map_err(|e| SearchError::Io(e.to_string()))?;
-        let mut entries: Vec<DirEntry> = read
-            .flatten()
-            .map(|entry| DirEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                // Follows symlinks, so a link to a directory reads as one. It
-                // is still never descended: this lists one level.
-                is_dir: entry.path().is_dir(),
-            })
-            .collect();
+    pub(crate) fn list_dir(
+        dir: &Path,
+        limit: usize,
+        confine: Option<&leveler_execution::Workspace>,
+    ) -> Result<Listing, SearchError> {
+        let mut entries: Vec<DirEntry> = match confine {
+            // A review seat lists through the workspace capability: the
+            // enumeration itself cannot escape, even if a path is swapped.
+            Some(workspace) => workspace
+                .read_dir_confined(dir)
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|(name, is_dir)| DirEntry { name, is_dir })
+                        .collect()
+                })
+                .map_err(|error| match error {
+                    leveler_execution::WorkspaceError::ReadOpen {
+                        kind: std::io::ErrorKind::NotADirectory,
+                        ..
+                    } => SearchError::NotDirectory,
+                    leveler_execution::WorkspaceError::ReadOpen {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    } => SearchError::NotDirectory,
+                    other => SearchError::Io(other.to_string()),
+                })?,
+            None => {
+                if !dir.is_dir() {
+                    return Err(SearchError::NotDirectory);
+                }
+                let read = std::fs::read_dir(dir).map_err(|e| SearchError::Io(e.to_string()))?;
+                read.flatten()
+                    .map(|entry| DirEntry {
+                        name: entry.file_name().to_string_lossy().into_owned(),
+                        // Follows symlinks, so a link to a directory reads as one.
+                        // It is still never descended: this lists one level.
+                        is_dir: entry.path().is_dir(),
+                    })
+                    .collect()
+            }
+        };
         sort_entries(&mut entries);
         let omitted = entries.len().saturating_sub(limit);
         entries.truncate(limit);
@@ -148,6 +176,7 @@ impl WorkspaceSearch {
         relative_to: &Path,
         pattern: &str,
         limit: usize,
+        confine: Option<leveler_execution::Workspace>,
         cancellation: &CancellationToken,
     ) -> Result<FindResult, SearchError> {
         if !root.is_dir() {
@@ -161,6 +190,15 @@ impl WorkspaceSearch {
             let mut paths = Vec::new();
             let mut omitted = 0usize;
             for path in walk(&root, &cancellation) {
+                // A walked path is only a candidate. Under confinement it
+                // must also open through the workspace capability, so a
+                // symlink swapped during the walk cannot list an outside
+                // file to the model.
+                if let Some(workspace) = &confine
+                    && workspace.open_confined(&path).is_none()
+                {
+                    continue;
+                }
                 if !matcher.is_match(&path, &root) {
                     continue;
                 }
@@ -185,6 +223,7 @@ impl WorkspaceSearch {
         root: &Path,
         relative_to: &Path,
         query: &GrepQuery,
+        confine: Option<leveler_execution::Workspace>,
         cancellation: &CancellationToken,
     ) -> Result<GrepResult, SearchError> {
         let expression = if query.literal {
@@ -223,7 +262,15 @@ impl WorkspaceSearch {
                 {
                     continue;
                 }
-                match scan_file(&file, &regex, limit.saturating_sub(matches.len())) {
+                // Confined: the bytes come from the capability-opened handle.
+                let opened = match &confine {
+                    Some(workspace) => workspace.open_confined(&file),
+                    None => std::fs::File::open(&file).ok(),
+                };
+                let Some(opened) = opened else {
+                    continue;
+                };
+                match scan_file(opened, &regex, limit.saturating_sub(matches.len())) {
                     FileScan::Matches(found) => {
                         for (line, text) in found {
                             matches.push(GrepMatch {
@@ -368,12 +415,9 @@ enum FileScan {
 
 /// Scan one file line by line. Bounded in memory by the longest line, and it
 /// stops the moment the file proves not to be text.
-fn scan_file(path: &Path, regex: &regex::Regex, remaining: usize) -> FileScan {
+fn scan_file(file: std::fs::File, regex: &regex::Regex, remaining: usize) -> FileScan {
     use std::io::BufRead;
 
-    let Ok(file) = std::fs::File::open(path) else {
-        return FileScan::Unreadable;
-    };
     let mut reader = std::io::BufReader::new(file);
     let mut raw = Vec::new();
     let mut found = Vec::new();
@@ -444,7 +488,7 @@ mod tests {
     #[test]
     fn list_dir_is_one_level_and_hides_nothing() {
         let dir = fixture();
-        let listing = WorkspaceSearch::list_dir(dir.path(), 100).unwrap();
+        let listing = WorkspaceSearch::list_dir(dir.path(), 100, None).unwrap();
         let names: Vec<String> = listing.entries.iter().map(DirEntry::display).collect();
         assert!(names.contains(&"src/".to_string()), "{names:?}");
         assert!(names.contains(&"target/".to_string()), "{names:?}");
@@ -466,7 +510,7 @@ mod tests {
         for name in ["Zebra", "apple", "Banana"] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
-        let listing = WorkspaceSearch::list_dir(dir.path(), 100).unwrap();
+        let listing = WorkspaceSearch::list_dir(dir.path(), 100, None).unwrap();
         let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["apple", "Banana", "Zebra"]);
     }
@@ -479,6 +523,7 @@ mod tests {
             dir.path(),
             "parser.rs",
             100,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -494,6 +539,7 @@ mod tests {
             dir.path(),
             "src/**/*.rs",
             100,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -515,6 +561,7 @@ mod tests {
             dir.path(),
             "pars",
             100,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -530,6 +577,7 @@ mod tests {
             dir.path(),
             "**/*.rs",
             100,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -549,6 +597,7 @@ mod tests {
             dir.path(),
             "src/[",
             100,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -573,6 +622,7 @@ mod tests {
             dir.path(),
             dir.path(),
             &query("fn {2,}main"),
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -586,9 +636,10 @@ mod tests {
         let dir = fixture();
         let mut q = query("fn {2,}main");
         q.literal = true;
-        let result = WorkspaceSearch::grep(dir.path(), dir.path(), &q, &CancellationToken::new())
-            .await
-            .unwrap();
+        let result =
+            WorkspaceSearch::grep(dir.path(), dir.path(), &q, None, &CancellationToken::new())
+                .await
+                .unwrap();
         assert!(result.matches.is_empty(), "{:?}", result.matches);
     }
 
@@ -599,6 +650,7 @@ mod tests {
             dir.path(),
             dir.path(),
             &query("a(b"),
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -611,9 +663,10 @@ mod tests {
         let dir = fixture();
         let mut q = query("\\w+");
         q.include = Some("*.md".to_string());
-        let result = WorkspaceSearch::grep(dir.path(), dir.path(), &q, &CancellationToken::new())
-            .await
-            .unwrap();
+        let result =
+            WorkspaceSearch::grep(dir.path(), dir.path(), &q, None, &CancellationToken::new())
+                .await
+                .unwrap();
         let paths: Vec<&str> = result.matches.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, vec!["README.md"]);
     }
@@ -630,6 +683,7 @@ mod tests {
             dir.path(),
             dir.path(),
             &query("needle"),
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -651,6 +705,7 @@ mod tests {
             dir.path(),
             dir.path(),
             &query("needle"),
+            None,
             &CancellationToken::new(),
         )
         .await

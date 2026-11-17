@@ -180,13 +180,42 @@ pub(crate) fn wire_mode(mode: PermissionProfile) -> leveler_client_protocol::Per
 /// This is the fallback for a NEW session only. A resumed session uses its
 /// persisted mode as the fallback instead, so a project default can never
 /// overwrite a mode the user already chose for that session.
+///
+/// A repository controls this file. Tightening the default (for example to
+/// `request_approval`) needs no trust, but raising it to Full does: otherwise
+/// cloning a repository would be enough to hand its agent unrestricted
+/// execution. The raising decision reads the exact bytes the trust record
+/// covers, so a swap between the trust check and the read cannot substitute a
+/// different mode.
 pub(crate) fn project_default_mode(layout: &Layout) -> PermissionProfile {
-    layout
-        .primary_workspace()
-        .and_then(leveler_project::ProjectConfig::load)
+    let Some(root) = layout.primary_workspace() else {
+        return PermissionProfile::Assisted;
+    };
+    let trusted = leveler_execution::read_trusted_project_file(
+        layout.home().root(),
+        root,
+        leveler_execution::PROJECT_CONFIG_RELATIVE,
+    );
+    let configured = match &trusted {
+        leveler_execution::TrustedRead::Trusted(raw) => leveler_project::ProjectConfig::parse(raw),
+        leveler_execution::TrustedRead::Untrusted { .. }
+        | leveler_execution::TrustedRead::Absent => leveler_project::ProjectConfig::load(root),
+    };
+    let Some(mode) = configured
         .and_then(|config| config.mode)
         .and_then(|raw| PermissionProfile::parse(&raw))
-        .unwrap_or(PermissionProfile::Assisted)
+    else {
+        return PermissionProfile::Assisted;
+    };
+    if mode == PermissionProfile::FullAccess
+        && !matches!(trusted, leveler_execution::TrustedRead::Trusted(_))
+    {
+        // An untrusted repository may ask for a stricter default, never a
+        // wider one. The explicit `--mode full-access` flag still works: it
+        // is the user's own decision and wins over this fallback.
+        return PermissionProfile::Assisted;
+    }
+    mode
 }
 
 pub(crate) fn build_approver(auto_approve: bool) -> Arc<dyn Approver> {
@@ -345,30 +374,70 @@ mod mode_resolution_tests {
     }
 
     /// Precedence 4: the project config is only a fallback, and only for a new
-    /// session. A project default may not overwrite an explicit flag.
+    /// session. A project default may not overwrite an explicit flag, and an
+    /// untrusted repository may not raise the default above `assisted`.
     #[test]
-    fn the_project_default_is_only_a_fallback() {
+    fn an_untrusted_project_cannot_raise_its_default_mode() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
-        std::fs::write(
-            tmp.path().join(".leveler/config.yaml"),
-            "mode: full_access\n",
-        )
-        .unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".leveler")).unwrap();
+        std::fs::write(repo.join(".leveler/config.yaml"), "mode: full_access\n").unwrap();
         let layout = Layout::from_parts(
-            tmp.path().to_path_buf(),
+            repo.clone(),
             tmp.path().join("configs"),
             tmp.path().join("state"),
         );
-        assert_eq!(project_default_mode(&layout), PermissionProfile::FullAccess);
+        assert_eq!(project_default_mode(&layout), PermissionProfile::Assisted);
         assert_eq!(
             resolve_mode(None, project_default_mode(&layout)),
-            PermissionProfile::FullAccess
+            PermissionProfile::Assisted
         );
         assert_eq!(
             resolve_mode(Some(RunMode::Assisted), project_default_mode(&layout)),
             PermissionProfile::Assisted
         );
+    }
+
+    /// A repository may tighten its own default without trust: that direction
+    /// never widens authority.
+    #[test]
+    fn an_untrusted_project_may_tighten_its_default_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".leveler")).unwrap();
+        std::fs::write(
+            repo.join(".leveler/config.yaml"),
+            "mode: request_approval\n",
+        )
+        .unwrap();
+        let layout = Layout::from_parts(repo, tmp.path().join("configs"), tmp.path().join("state"));
+        assert_eq!(
+            project_default_mode(&layout),
+            PermissionProfile::RequestApproval
+        );
+    }
+
+    /// Trusting the exact project config makes its widening mode the fallback.
+    #[test]
+    fn a_trusted_project_may_raise_its_default_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".leveler")).unwrap();
+        let body = "mode: full_access\n";
+        std::fs::write(repo.join(".leveler/config.yaml"), body).unwrap();
+        let layout = Layout::from_parts(
+            repo.clone(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        );
+        let mut store = leveler_execution::TrustStore::load(layout.home().root());
+        store.trust(
+            &repo,
+            leveler_execution::PROJECT_CONFIG_RELATIVE,
+            body.as_bytes(),
+        );
+        store.save().unwrap();
+        assert_eq!(project_default_mode(&layout), PermissionProfile::FullAccess);
     }
 
     /// No project config (or an unparseable mode) means the built-in default.

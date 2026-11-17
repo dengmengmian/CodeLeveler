@@ -535,14 +535,16 @@ impl Tool for McpTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        if !context.policy.unrestricted_execution()
-            && !matches!(
-                context.policy.network_scope(),
-                leveler_execution::NetworkScope::Internet
-            )
-        {
+        // An MCP server is a separate process with no OS confinement, so only
+        // the unfettered Internet scope is honest. A frozen `None` (including
+        // an explicit `--deny-network`) is refused; exact-call consent does
+        // not clear the run owner's denial.
+        if !matches!(
+            context.policy.network_scope(),
+            leveler_execution::NetworkScope::Internet
+        ) {
             return Ok(ToolOutput::error(
-                "UnsupportedNetworkScope: MCP server processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+                "UnsupportedNetworkScope: MCP server processes require Internet scope; destination confinement is unavailable.",
             ));
         }
         let unrestricted = context.policy.unrestricted_execution();

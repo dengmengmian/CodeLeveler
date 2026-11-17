@@ -16,6 +16,7 @@ use crate::agent_registry::{
 use crate::child_profile::{AgentRole, ChildProfile};
 
 /// What an admitted spawn runs as.
+#[derive(Debug)]
 pub(crate) struct SpawnAdmission {
     pub profile: ChildProfile,
     /// Everything but `files` and `background`, which the call supplies.
@@ -51,6 +52,62 @@ impl Executor {
         files: &[String],
         registry: Option<&AgentRegistry>,
     ) -> Result<SpawnAdmission, String> {
+        // A Lead Reviewer may launch read-only independent investigations.
+        // This is a role-scoped admission, not the ordinary spawn surface:
+        // the advertised schema has no role/agent/files fields, and a call
+        // that supplies one anyway is refused instead of silently downgraded.
+        if self.depth == 1 && self.agent_role == AgentRole::Reviewer {
+            if !self.policy.review_investigation {
+                return Err(
+                    "Independent review investigation is disabled for this review; complete \
+                     the review directly."
+                        .into(),
+                );
+            }
+            if let Some(value) = agent {
+                return Err(format!(
+                    "A review investigation cannot name agent `{value}`. Its role and tool \
+                     surface are fixed by the review; state the objective in `task`."
+                ));
+            }
+            if let Some(value) = profile {
+                return Err(format!(
+                    "A review investigation cannot request profile `{value}`. It always runs \
+                     read-only; state the objective in `task`."
+                ));
+            }
+            if let Some(value) = role {
+                return Err(format!(
+                    "A review investigation cannot request role `{value}`. It always runs \
+                     read-only; state the objective in `task`."
+                ));
+            }
+            if !files.is_empty() {
+                return Err(
+                    "A review investigation cannot take a write scope. It is read-only and \
+                     holds no mutation tool."
+                        .into(),
+                );
+            }
+            return Ok(SpawnAdmission {
+                profile: ChildProfile::investigator(),
+                spec: ChildSpawnSpec {
+                    max_rounds: crate::sub_agent::REVIEW_INVESTIGATION_MAX_ROUNDS,
+                    ..ChildSpawnSpec::default()
+                },
+                brief: None,
+            });
+        }
+        // An investigation is a leaf. This is defense in depth: its candidate
+        // surface already omits spawn_agent, and its depth would also fail the
+        // ordinary gate.
+        if self.agent_role == AgentRole::Investigator {
+            return Err(
+                "An investigation child cannot delegate further. Report what you established \
+                 to the Lead Reviewer."
+                    .into(),
+            );
+        }
         let Some(name) = agent else {
             return ChildProfile::admit_spawn(profile, role, files).map(|profile| SpawnAdmission {
                 profile,

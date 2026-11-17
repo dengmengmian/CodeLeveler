@@ -55,8 +55,8 @@ pub use leveler_lifecycle::{
     ChildLimit, ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource,
     PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase,
 };
+pub use sub_agent::{CHILD_MAX_DURATION, multi_agent_steer_hint, should_inject_delegation_hint};
 pub use sub_agent::{ChildResult, ChildStatus, RUNTIME_NOTICE_HEADERS, SettledChildNotice};
-pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};
 pub use update_plan::{
     HarnessControls, UpdatePlanTool, register_harness_controls, register_harness_controls_with,
 };

@@ -15,11 +15,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-gh release download "$TAG" -R "$REPO" --pattern '*.tar.gz.sha256' -D "$tmp"
+gh release download "$TAG" -R "$REPO" --pattern '*.tar.xz.sha256' -D "$tmp"
 
 sha() {
   # First field of `<sha>  <name>` in the matching .sha256 file.
-  awk '{print $1}' "$tmp/leveler-v${VER}-$1.tar.gz.sha256"
+  awk '{print $1}' "$tmp/leveler-v${VER}-$1.tar.xz.sha256"
 }
 
 SHA_ARM_MAC="$(sha aarch64-apple-darwin)"
@@ -39,10 +39,10 @@ class Leveler < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-aarch64-apple-darwin.tar.xz"
       sha256 "${SHA_ARM_MAC}"
     else
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-x86_64-apple-darwin.tar.xz"
       sha256 "${SHA_X86_MAC}"
     end
   end
@@ -53,11 +53,11 @@ class Leveler < Formula
       # platform branch and rejects the tap when one has no URL, so this branch
       # names the artifact it would use; \`fetch\` then fails there with a plain
       # 404 instead of taking the whole tap down.
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-aarch64-unknown-linux-gnu.tar.xz"
       sha256 :no_check
     end
     on_intel do
-      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/dengmengmian/CodeLeveler/releases/download/v${VER}/leveler-v${VER}-x86_64-unknown-linux-gnu.tar.xz"
       sha256 "${SHA_X86_LINUX}"
     end
   end

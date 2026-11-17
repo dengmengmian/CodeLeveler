@@ -1011,6 +1011,7 @@ mod tests {
             summary: format!("finding {id}"),
             file: None,
             symbol: None,
+            details: Default::default(),
         }
     }
 

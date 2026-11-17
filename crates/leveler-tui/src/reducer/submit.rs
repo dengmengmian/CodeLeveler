@@ -1,4 +1,6 @@
-use leveler_client_protocol::{ClientCommand, CommandId, MessageId, NotificationLevel};
+use leveler_client_protocol::{
+    ClientCommand, CommandId, MessageId, ModelRef, NotificationLevel, UiReviewScope,
+};
 
 use crate::action::Effect;
 use crate::screen::{BusyPolicy, Screen};
@@ -7,7 +9,8 @@ use crate::transcript::InputDelivery;
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
-    open_model_picker, open_recovery_confirm, open_theme_picker, open_unsupported_media,
+    open_model_picker, open_recovery_confirm, open_review_scope_picker, open_theme_picker,
+    open_unsupported_media,
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
@@ -623,6 +626,7 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "collab" => set_collab_cmd(state, command),
         "agents" => agents_slash(state, command),
         "skills" => skills_slash(state, command),
+        "review" => review_slash(state, command),
         "web" => start_web(state),
         "copy" => copy_slash(state, command),
         "output" => output_slash(state),
@@ -1236,6 +1240,171 @@ fn set_collab_cmd(state: &mut AppState, command: &str) -> Vec<Effect> {
         return Vec::new();
     }
     apply_collab(state, &arg)
+}
+
+/// `/review` — explicit structured review intent.
+///
+/// The client parses only the COMMAND it was given (`/review @commit <rev>`);
+/// the remaining words are the user's review focus and go to the reviewer
+/// model verbatim. The runtime never classifies an ordinary message.
+fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let rest = command
+        .strip_prefix("review")
+        .unwrap_or(command)
+        .trim_start()
+        .to_string();
+    if rest.is_empty() {
+        open_review_scope_picker(state);
+        return Vec::new();
+    }
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if tokens.first() == Some(&"cancel") {
+        let running = state
+            .transcript
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                crate::transcript::TranscriptItem::Review(block)
+                    if matches!(
+                        block.summary.status,
+                        leveler_client_protocol::UiReviewStatus::Queued
+                            | leveler_client_protocol::UiReviewStatus::Running
+                    ) =>
+                {
+                    Some(block.summary.id.clone())
+                }
+                _ => None,
+            });
+        let review_id = tokens.get(1).map(|id| (*id).to_string()).or(running);
+        let Some(review_id) = review_id else {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: "当前没有正在运行的审查".to_string(),
+            });
+            return Vec::new();
+        };
+        return vec![Effect::Send(ClientCommand::CancelReview {
+            session_id: state.session_id.clone(),
+            review_id,
+        })];
+    }
+    let mut index = 0;
+    let mut scope = UiReviewScope::CurrentTask;
+    let mut model: Option<ModelRef> = None;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if !token.starts_with('@') {
+            break;
+        }
+        match token {
+            "@model" => {
+                let Some(raw) = tokens.get(index + 1) else {
+                    return review_usage(state);
+                };
+                match ModelRef::parse(raw) {
+                    Some(parsed) => model = Some(parsed),
+                    None => {
+                        state.notification = Some(Notification {
+                            level: NotificationLevel::Warning,
+                            message: format!("无效模型: {raw}（格式 provider/model）"),
+                        });
+                        return Vec::new();
+                    }
+                }
+                index += 2;
+            }
+            "@commit" => {
+                let Some(rev) = tokens.get(index + 1) else {
+                    return review_usage(state);
+                };
+                scope = UiReviewScope::Commit {
+                    rev: (*rev).to_string(),
+                };
+                index += 2;
+                break;
+            }
+            "@branch" => {
+                let Some(base) = tokens.get(index + 1) else {
+                    return review_usage(state);
+                };
+                scope = UiReviewScope::Branch {
+                    base: (*base).to_string(),
+                };
+                index += 2;
+                break;
+            }
+            "@path" => {
+                let Some(raw) = tokens.get(index + 1) else {
+                    return review_usage(state);
+                };
+                let paths: Vec<String> = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if paths.is_empty() {
+                    return review_usage(state);
+                }
+                scope = UiReviewScope::Paths { paths };
+                index += 2;
+                break;
+            }
+            "@session" => {
+                // An id is consumed only when it has the product's session-id
+                // shape (UUID/hex). Otherwise the next words are the review
+                // focus: `/review @session 分析为什么提前停止` must not treat
+                // "分析为什么提前停止" as an id.
+                let target = tokens
+                    .get(index + 1)
+                    .filter(|next| looks_like_session_id(next));
+                scope = UiReviewScope::Session {
+                    session_id: target.map(|id| leveler_core::SessionId::new(*id)),
+                };
+                index += if target.is_some() { 2 } else { 1 };
+                break;
+            }
+            "@project" => {
+                scope = UiReviewScope::Project;
+                index += 1;
+                break;
+            }
+            "@workspace" => {
+                scope = UiReviewScope::Workspace;
+                index += 1;
+                break;
+            }
+            _ => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: format!("未知的审查范围: {token}"),
+                });
+                return Vec::new();
+            }
+        }
+    }
+    let focus = tokens[index..].join(" ");
+    vec![Effect::Send(ClientCommand::RunReview {
+        session_id: state.session_id.clone(),
+        focus,
+        scope,
+        model,
+    })]
+}
+
+/// The product generates UUID session ids; a 32/36-character hex string is
+/// the only token the `@session` directive consumes as an id.
+fn looks_like_session_id(token: &str) -> bool {
+    matches!(token.len(), 32 | 36) && token.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+fn review_usage(state: &mut AppState) -> Vec<Effect> {
+    state.notification = Some(Notification {
+        level: NotificationLevel::Warning,
+        message: "用法: /review [@workspace|@project|@session [id]|@commit <rev>|@branch <base>|@path <p,...>] [@model provider/model] [审查重点] · /review cancel [审查 ID]".to_string(),
+    });
+    Vec::new()
 }
 
 pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {

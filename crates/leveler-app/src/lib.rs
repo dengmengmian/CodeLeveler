@@ -411,11 +411,21 @@ fn combine_independent_review(
 ) -> leveler_agent::coding::IndependentReviewPolicy {
     use leveler_agent::coding::IndependentReviewPolicy as P;
     use leveler_project::IndependentReview as I;
-    // Explicit only: a review runs when either layer requires it.
-    match (global, project) {
-        (I::Required, _) | (_, I::Required) => P::Required,
-        (I::Off, I::Off) => P::Off,
+    // Product contract: review is MANUAL. The old `required` setting still
+    // parses (an existing config must not fail to load), but it no longer
+    // starts a review at turn/goal/commit/delivery settlement. Explicit
+    // factory settings remain available to tests and evals, and an unsettled
+    // historical review is still finished by crash recovery.
+    if matches!(global, I::Required) || matches!(project, I::Required) {
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if WARNED.set(()).is_ok() {
+            tracing::warn!(
+                "agents.independent_review = required is retired; automatic review no longer \
+                 runs. Use the manual /review command."
+            );
+        }
     }
+    P::Off
 }
 
 /// The process-lived MCP connection cache, owned by the application and shared
@@ -1369,6 +1379,13 @@ impl Application {
                 },
             ),
         ))
+    }
+
+    /// The process-side memory owner. Manual review reads through it; ordinary
+    /// turns continue to receive memory only through the prompt index and the
+    /// file-tool policy composed by [`Self::compose_tool_surface`].
+    pub(crate) fn memory_runtime(&self) -> &memory::MemoryRuntime {
+        &self.memory
     }
 
     /// Compose one turn's model-visible tool surface from what this host can
@@ -2379,5 +2396,30 @@ mod canonical_work_profile_tests {
         assert_eq!(canonical_work_profile("economy"), "single");
         // Unknown values fall back to the default, never to a retired value.
         assert_eq!(canonical_work_profile("nonsense"), "single");
+    }
+}
+
+#[cfg(test)]
+mod manual_review_policy_tests {
+    use super::combine_independent_review;
+    use leveler_agent::coding::IndependentReviewPolicy;
+    use leveler_project::IndependentReview;
+
+    /// The product only reviews when a person asks. A legacy `required`
+    /// setting still loads, but it must not reintroduce an automatic review at
+    /// turn, goal, commit or delivery settlement.
+    #[test]
+    fn configured_required_never_turns_automatic_review_on() {
+        for (global, project) in [
+            (IndependentReview::Off, IndependentReview::Off),
+            (IndependentReview::Off, IndependentReview::Required),
+            (IndependentReview::Required, IndependentReview::Off),
+            (IndependentReview::Required, IndependentReview::Required),
+        ] {
+            assert_eq!(
+                combine_independent_review(global, project),
+                IndependentReviewPolicy::Off
+            );
+        }
     }
 }

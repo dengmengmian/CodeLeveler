@@ -57,11 +57,12 @@ pub struct AgentsConfig {
     /// When false, `spawn_agent` is not advertised. Default true when omitted.
     #[serde(default = "default_true")]
     pub delegation: bool,
-    /// Whether the harness launches an independent reviewer at closure.
-    /// `off` (default) never launches; `required` launches after any product
-    /// mutation. Explicit only — the runtime never infers a review from the
-    /// shape of the change. Legacy values `auto` (reads as `off`) and
-    /// `always` (reads as `required`) are still accepted.
+    /// Legacy automatic-review setting. Reviews are manual (`/review`), so
+    /// this no longer starts one at turn, goal, commit or delivery
+    /// settlement. It still parses so an existing configuration keeps
+    /// loading; `required` is accepted and ignored with a warning. Legacy
+    /// spellings `auto` (reads as `off`) and `always` (reads as `required`)
+    /// are accepted too.
     #[serde(default)]
     pub independent_review: IndependentReview,
 }
@@ -75,16 +76,22 @@ impl Default for AgentsConfig {
     }
 }
 
-/// Whether the harness launches an independent reviewer (see [`AgentsConfig`]).
+/// Legacy automatic-review setting (see [`AgentsConfig`]).
+///
+/// Kept as a parse-compatible type; the product's review entry is the manual
+/// `/review` command. `Required` remains usable by explicit test/eval wiring
+/// and by crash recovery of a review that was already unsettled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndependentReview {
-    /// Never. The product default; `auto` (the deleted shape trigger) reads
-    /// as this.
+    /// Never. The product default, and the only value production wiring
+    /// resolves to; `auto` (the deleted shape trigger) reads as this.
     #[default]
     #[serde(alias = "auto")]
     Off,
-    /// After any product mutation. `always` is the legacy spelling.
+    /// Legacy spelling of "review after any product mutation". Accepted for
+    /// compatibility and ignored by production wiring. `always` is the
+    /// legacy spelling.
     #[serde(alias = "always")]
     Required,
 }
@@ -219,12 +226,18 @@ pub struct LoadedRulesPolicy {
 }
 
 impl ProjectConfig {
+    /// Parse already-read config bytes. Callers that must interpret the exact
+    /// bytes a trust decision covered use this instead of re-reading the file.
+    pub fn parse(raw: &str) -> Option<Self> {
+        serde_yaml::from_str(raw).ok()
+    }
+
     /// Load `<root>/.leveler/config.yaml`, or `None` if it is absent or invalid
     /// (invalid config is non-fatal — the tool falls back to defaults).
     pub fn load(root: &std::path::Path) -> Option<Self> {
         let path = root.join(".leveler/config.yaml");
         let raw = std::fs::read_to_string(path).ok()?;
-        serde_yaml::from_str(&raw).ok()
+        Self::parse(&raw)
     }
 
     /// The rule delivery policy, with a structured reason when the file exists

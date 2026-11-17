@@ -788,6 +788,48 @@ pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
 /// The name of the injected sub-agent spawn tool.
 pub(crate) const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 
+/// The review seat's restricted spawn surface. It reuses the spawn tool's
+/// name and lifecycle, but advertises only what a Lead Reviewer may decide:
+/// one self-contained investigation objective. Role, agent definition, write
+/// scope and background mode are fixed by host admission, never by this call.
+pub(crate) fn review_investigation_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: SPAWN_AGENT_TOOL.to_string(),
+        description: "Start an independent read-only investigation child. The child starts a \
+            new conversation: it does not see this one, so `task` must be complete on its own. \
+            It holds the same review object, read-only tools and permission boundary as this \
+            review; it cannot write, run commands, change scope, or delegate further. Calls in \
+            one assistant message run concurrently. `run_in_background` defaults to true: the \
+            call returns the child's id immediately and the runtime reports its structured \
+            investigation when it settles; false waits for that result before returning. Use \
+            `task` to state the objective, the business question, the scope and the evidence \
+            you need; you remain responsible for synthesising the final review.\n\n\
+            This is an independent investigation, not a verdict. The child reports observed \
+            facts, constraints, examined scope, unresolved questions and candidate defects; \
+            read them as evidence, including when it finds no defect."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short display name for the investigation, roughly 3–8 words."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The complete, self-contained investigation objective: what to establish, where to look, and what evidence to return."
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Defaults to true: the call returns the child's id immediately and the runtime reports settlement later. false: wait for the result before this call returns."
+                }
+            },
+            "required": ["task", "title"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 /// The tool the model calls to run a focused sub-agent on a self-contained
 /// subtask, getting back only its final result. Emitting several calls in one
 /// turn runs the sub-agents CONCURRENTLY.
@@ -901,7 +943,10 @@ pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
             when the run stops early.\n\n\
             Arguments: `kind` (required: relevant_file, relevant_symbol, \
             dependency, callsite, risk, test, config, observation, correctness), \
-            `summary` (required text), optional `file`, optional `symbol`."
+            `summary` (required text), optional `file`, optional `symbol`. \
+            Reviewers may also supply `title`, `dimension`, `severity`, \
+            `confidence`, `line`, `evidence`, `impact`, `recommendation` and \
+            `reproduced`; ordinary explorers/workers can omit them."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -920,9 +965,288 @@ pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
                     "description": "One specific, evidence-backed sentence."
                 },
                 "file": { "type": "string", "description": "The file it concerns, if any." },
-                "symbol": { "type": "string", "description": "The symbol it concerns, if any." }
+                "symbol": { "type": "string", "description": "The symbol it concerns, if any." },
+                "title": {
+                    "type": "string",
+                    "description": "Review only: a one-line title. Defaults to summary."
+                },
+                "dimension": {
+                    "type": "string",
+                    "enum": ["code", "business", "security", "architecture", "test", "delivery", "session"],
+                    "description": "Review only: which review lens found this."
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["p0", "p1", "p2", "p3"],
+                    "description": "Review only: impact if real. p0 is critical."
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "Review only: confidence that the finding is real."
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Review only: 1-based line in `file`."
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Review only: the concrete code path, output or test that shows it."
+                },
+                "impact": {
+                    "type": "string",
+                    "description": "Review only: what goes wrong, for whom, under which input/timing."
+                },
+                "recommendation": {
+                    "type": "string",
+                    "description": "Review only: the direction of a fix."
+                },
+                "reproduced": {
+                    "type": "boolean",
+                    "description": "Review only: whether the reviewer actually reproduced it."
+                }
             },
             "required": ["kind", "summary"]
+        }),
+    }
+}
+
+/// The tool a Lead Reviewer calls to adjudicate one candidate finding.
+///
+/// Investigator findings arrive as CANDIDATES. This tool is the only way a
+/// candidate becomes a formal finding, is rejected, is merged into a duplicate
+/// root cause, or is explicitly left unresolved.
+pub(crate) const ADJUDICATE_FINDING_TOOL: &str = "adjudicate_finding";
+
+pub(crate) fn adjudicate_finding_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ADJUDICATE_FINDING_TOOL.to_string(),
+        description: "Decide what happens to one CANDIDATE finding reported by an \
+            independent investigator. Investigator findings are evidence, not defects: \
+            they do not count as this review's findings until you adopt them here. The \
+            finding ids are listed in the settlement notice (for example \
+            `Structured findings adopted: f-4, f-5`; `f-4` is the id you use).\n\n\
+            `disposition`:\n\
+            - `adopted`: you verified it and it is a formal finding of this review.\n\
+            - `rejected`: you found evidence against it; it stays in the record but \
+            never counts as a defect.\n\
+            - `duplicate`: it is the same root cause as `duplicate_of`; name the \
+            surviving finding.\n\
+            - `unresolved`: still unverified; it stays a pending candidate.\n\n\
+            You may adjust `severity`, `confidence` or `title` when adopting. Unmentioned \
+            candidates remain unresolved; they are never adopted or rejected implicitly. \
+            Call this once per candidate you decide."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "finding_id": {
+                    "type": "string",
+                    "description": "The candidate id from the settlement notice, e.g. `f-4`."
+                },
+                "disposition": {
+                    "type": "string",
+                    "enum": ["adopted", "rejected", "unresolved", "duplicate"],
+                    "description": "The Lead Reviewer's decision for this candidate."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "The evidence-based reason for the decision."
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "File:line, symbol or test references supporting the decision."
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["p0", "p1", "p2", "p3"],
+                    "description": "Adoption only: override the candidate's severity."
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "Adoption only: override the candidate's confidence."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Adoption only: a one-line formal title."
+                },
+                "duplicate_of": {
+                    "type": "string",
+                    "description": "Required for `duplicate`: the id of the surviving finding."
+                }
+            },
+            "required": ["finding_id", "disposition"]
+        }),
+    }
+}
+
+/// The tool a REVIEWER calls to declare its coverage, limitations and
+/// conclusion as data.
+pub(crate) const REPORT_REVIEW_TOOL: &str = "report_review";
+
+pub(crate) fn report_review_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_REVIEW_TOOL.to_string(),
+        description: "Submit the review's formal report and structured result. Call it \
+            after the investigation, before the final message. `report` is the COMPLETE, \
+            standalone report body (Markdown); it is the report of record, shown to the \
+            user and persisted, and your final chat message is never substituted for it. \
+            If you submit again, the new call replaces the earlier report as a new \
+            revision. If new investigation evidence arrives after your submission, \
+            adjudicate it and submit a revised complete report; otherwise the runtime \
+            will mark the earlier report as not covering the latest evidence.\n\n\
+            `conclusion` is your verdict: issues_found, no_issues_found or \
+            inconclusive. It is independent of the execution status: a completed \
+            review may be inconclusive, and a review with no findings is not \
+            automatically no_issues_found.\n\n\
+            `coverage` lists one entry per dimension you actually examined. Omit \
+            dimensions outside the requested scope; do not claim `reviewed` for a \
+            dimension you only skimmed. When the brief lists acceptance checks or \
+            requirement IDs, name them in `scope` or `evidence_refs`; a check the \
+            development agent declared is not a user requirement. `limitations` \
+            states what you could not establish and why (`environment`, \
+            `permission`, `tool_capability`, `scope`, `other`)."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "report": {
+                    "type": "string",
+                    "description": "The complete formal report body, in Markdown. It must \
+                        stand alone: scope, what was found and why it matters, coverage, \
+                        limitations and conclusion."
+                },
+                "conclusion": {
+                    "type": "string",
+                    "enum": ["issues_found", "no_issues_found", "inconclusive"],
+                    "description": "The reviewer's verdict for this declared scope."
+                },
+                "coverage": {
+                    "type": "array",
+                    "description": "One entry per dimension actually examined.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "dimension": {
+                                "type": "string",
+                                "enum": ["code", "business", "security", "architecture", "test", "delivery", "session"]
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["not_applicable", "not_reviewed", "partial", "reviewed"]
+                            },
+                            "scope": {
+                                "type": "string",
+                                "description": "The concrete area or files this dimension covered."
+                            },
+                            "evidence_refs": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "File:line, event sequence or command evidence you used."
+                            },
+                            "limitations": {
+                                "type": "string",
+                                "description": "What this dimension could not cover."
+                            }
+                        },
+                        "required": ["dimension", "status"]
+                    }
+                },
+                "limitations": {
+                    "type": "array",
+                    "description": "Review-wide limits on what could be established.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["environment", "permission", "tool_capability", "scope", "other"]
+                            },
+                            "detail": { "type": "string" }
+                        },
+                        "required": ["kind", "detail"]
+                    }
+                }
+            },
+            "required": ["report", "conclusion"]
+        }),
+    }
+}
+
+/// The tool an independent investigator calls to declare what it established
+/// as structured evidence for the Lead Reviewer.
+pub(crate) const REPORT_INVESTIGATION_TOOL: &str = "report_investigation";
+
+pub(crate) fn report_investigation_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_INVESTIGATION_TOOL.to_string(),
+        description: "Record the structured result of this independent investigation. Call it \
+            once, before the final message. The Lead Reviewer receives it with this child's \
+            result, including when the run stops early. It is evidence, not a verdict: report \
+            what you actually established, the business rules you confirmed or treat as \
+            candidate invariants, the scope you examined, what remains unresolved, and what \
+            limited you. Candidate defects belong in `report_finding`; this tool carries the \
+            facts that let the parent combine investigations. Do not fill every field when \
+            the investigation did not need it, but an empty result is not useful.\n\n\
+            `observed_facts` are implementation facts backed by real evidence (each may carry \
+            `evidence_refs`). `business_constraints` are confirmed rules or explicitly marked \
+            candidate invariants. `evidence_refs` are concrete file:line, symbol, commit or \
+            event identities. Never state a guess as an observed fact."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "The investigation objective, in your own words."
+                },
+                "observed_facts": {
+                    "type": "array",
+                    "description": "Implementation facts you established from real evidence.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "statement": { "type": "string" },
+                            "evidence_refs": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        },
+                        "required": ["statement"],
+                        "additionalProperties": false
+                    }
+                },
+                "business_constraints": {
+                    "type": "array",
+                    "description": "Confirmed business rules, or candidate invariants you mark as candidates.",
+                    "items": { "type": "string" }
+                },
+                "examined_scope": {
+                    "type": "array",
+                    "description": "What you actually examined (files, modules, symbols, commits, events).",
+                    "items": { "type": "string" }
+                },
+                "unresolved_questions": {
+                    "type": "array",
+                    "description": "Questions that still need evidence, and why.",
+                    "items": { "type": "string" }
+                },
+                "limitations": {
+                    "type": "array",
+                    "description": "What limited this investigation (tools, time, environment, scope, permissions).",
+                    "items": { "type": "string" }
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "description": "Global concrete references used by this investigation.",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["objective"],
+            "additionalProperties": false
         }),
     }
 }

@@ -110,9 +110,12 @@ pub(crate) async fn read_source(
     max_bytes: Option<usize>,
 ) -> Result<String, ToolError> {
     use tokio::io::AsyncReadExt;
-    let path = workspace.resolve_for_read(path)?;
+    // Open under the workspace's confinement decision: the handle is the
+    // authorised object, so a path swapped after resolution cannot redirect
+    // the read.
+    let (_path, file) = workspace.open_read(path)?;
+    let file = tokio::fs::File::from_std(file);
     let read = async {
-        let file = tokio::fs::File::open(&path).await?;
         if !file.metadata().await?.is_file() {
             return Err(std::io::Error::other("symbol source is not a regular file"));
         }

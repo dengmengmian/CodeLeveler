@@ -99,9 +99,21 @@ impl Tool for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context
-            .execution_workspace()?
-            .resolve_for_read(&input.path)?;
+        // The handle is opened under the workspace's confinement decision, so
+        // a path swapped after resolution cannot redirect the read: a review
+        // seat reads the object it was authorised to read, not a path.
+        let (path, file) = match context.execution_workspace()?.open_read(&input.path) {
+            Ok(opened) => opened,
+            Err(leveler_execution::WorkspaceError::ReadOpen {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => {
+                return Ok(ToolOutput::error(crate::recoverable::missing_file(
+                    &input.path,
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
         // A memory file is read through its own policy: excluded or escaping
         // paths fail here rather than revealing anything, and a successful
         // read records the snapshot a later edit is checked against.
@@ -121,7 +133,7 @@ impl Tool for ReadFileTool {
         let window =
             ReadWindow::rendered(input.start_line, input.end_line, max_bytes, line_overhead);
 
-        let read = match WorkspaceReader::read(&path, window, &cancellation).await {
+        let read = match WorkspaceReader::read(file, window, &cancellation).await {
             Ok(read) => read,
             Err(ReadError::NotFound) => {
                 return Ok(ToolOutput::error(crate::recoverable::missing_file(
@@ -465,5 +477,106 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A review seat gets the workspace's sensitive-name check even when the
+    /// session is Full: "read-only" is not a licence to read host credentials.
+    /// The ordinary Full agent keeps its product contract.
+    #[tokio::test]
+    async fn a_review_seat_cannot_read_a_credential_file_even_in_full_access() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-read-review-confine-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "API_KEY=secret\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "public\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+
+        let ordinary =
+            ToolContext::new(ws.clone(), leveler_execution::PermissionProfile::FullAccess);
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": ".env"}),
+                ordinary,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("secret"), "Full keeps its contract");
+
+        let review = ToolContext::new(ws.clone(), leveler_execution::PermissionProfile::FullAccess)
+            .with_confined_sensitive_reads();
+        let denied = ReadFileTool
+            .execute(
+                serde_json::json!({"path": ".env"}),
+                review,
+                CancellationToken::new(),
+            )
+            .await;
+        match denied {
+            Err(error) => assert!(!error.to_string().contains("secret"), "{error}"),
+            Ok(out) => assert!(
+                out.is_error,
+                "credential read must be refused: {}",
+                out.content
+            ),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A review seat reads the review object, not arbitrary host files. The
+    /// ordinary Full agent keeps its documented absolute-read contract.
+    #[tokio::test]
+    async fn a_review_seat_cannot_read_outside_the_workspace() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-read-review-workspace-{}",
+            super::super::test_ordinal()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "leveler-read-review-outside-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("notes.txt");
+        std::fs::write(&outside_file, "outside evidence\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+
+        let ordinary =
+            ToolContext::new(ws.clone(), leveler_execution::PermissionProfile::FullAccess);
+        let allowed = ReadFileTool
+            .execute(
+                serde_json::json!({"path": outside_file.display().to_string()}),
+                ordinary,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(allowed.content.contains("outside evidence"));
+
+        let review = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess)
+            .with_confined_sensitive_reads()
+            .with_workspace_confined_reads();
+        let denied = ReadFileTool
+            .execute(
+                serde_json::json!({"path": outside_file.display().to_string()}),
+                review,
+                CancellationToken::new(),
+            )
+            .await;
+        match denied {
+            Err(error) => {
+                assert!(error.to_string().contains("reviewed workspace"), "{error}");
+                assert!(!error.to_string().contains("outside evidence"));
+            }
+            Ok(out) => assert!(
+                out.is_error && !out.content.contains("outside evidence"),
+                "review must not read outside its workspace: {}",
+                out.content
+            ),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

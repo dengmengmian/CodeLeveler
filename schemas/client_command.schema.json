@@ -1154,6 +1154,128 @@
       }
     },
     {
+      "description": "Start a manual, read-only review. This is the ONLY entry into review: no ordinary message is classified, and a running turn is never interrupted or silently queued behind it.\n\n`focus` is the user's review request in their own words. The reviewer model reads it and decides where to look; `scope` names the object the runtime resolved for it. `model` overrides the session's current model for this review only.",
+      "type": "object",
+      "required": [
+        "focus",
+        "scope",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "focus": {
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/UiReviewScope"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "run_review"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cancel one running manual review. Read-only work settles with whatever it already established; the source session's task is untouched.",
+      "type": "object",
+      "required": [
+        "review_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "review_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_review"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Load the full report behind a review summary card. A query, not a subscription: the durable review row is the authority.",
+      "type": "object",
+      "required": [
+        "review_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "review_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "query_review_report"
+          ]
+        }
+      }
+    },
+    {
+      "description": "List this session's stored reviews, newest first, for history replay.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "list_reviews"
+          ]
+        }
+      }
+    },
+    {
       "description": "Read-only observatory query. Does not mutate runtime, tools, or verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].",
       "type": "object",
       "required": [
@@ -3002,6 +3124,141 @@
           "enum": [
             "codex"
           ]
+        }
+      ]
+    },
+    "UiReviewScope": {
+      "description": "What the review is about. The runtime resolves this into concrete files, a diff and an object identity before the reviewer starts.",
+      "oneOf": [
+        {
+          "description": "The current task's delivery in this session: its user objective, the files its latest settled delivery touched, and its final claim.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "current_task"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Uncommitted changes in the session workspace.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "workspace"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The whole project: the reviewer reads the repository itself.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "project"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The current session, or another stored session named by id.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "session"
+              ]
+            },
+            "session_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SessionId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "One commit, reviewed from `git show`.",
+          "type": "object",
+          "required": [
+            "kind",
+            "rev"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "commit"
+              ]
+            },
+            "rev": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "The current branch relative to `base` (`git diff base...HEAD`).",
+          "type": "object",
+          "required": [
+            "base",
+            "kind"
+          ],
+          "properties": {
+            "base": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "branch"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Explicit files, directories or modules.",
+          "type": "object",
+          "required": [
+            "kind",
+            "paths"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "paths"
+              ]
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         }
       ]
     },

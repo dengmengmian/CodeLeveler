@@ -221,11 +221,40 @@ impl Executor {
                 call,
             });
         }
+        // A reviewer/investigator seat is structurally read-only: FullAccess
+        // removes ASK/DENY for the user's own actions, but it must not hand a
+        // manual review seat a tool the seat does not hold. Checked BEFORE
+        // approval and before the Full shortcut, so no approval path can widen
+        // this seat.
+        let review_seat = self.depth > 0
+            && matches!(
+                self.agent_role,
+                crate::sub_agent::AgentRole::Reviewer | crate::sub_agent::AgentRole::Investigator
+            );
+        if review_seat
+            && self.tool(&call.name).is_some()
+            && self.projected_tool_registry().get(&call.name).is_none()
+        {
+            return Err(AdmitError::Refused {
+                reason: format!(
+                    "`{}` is not part of a read-only review seat; the seat may only \
+                     read, search and report",
+                    call.name
+                ),
+                call,
+            });
+        }
         if !ctx.policy.unrestricted_execution()
-            && self
-                .capabilities
-                .as_ref()
-                .is_some_and(|state| !state.permits_tool(&call.name))
+            && self.capabilities.as_ref().is_some_and(|state| {
+                // A review seat's investigation packs are role defaults: they
+                // are exposed without the `capability` round trip this seat
+                // cannot perform. Every other pack keeps the normal rule.
+                if review_seat {
+                    !state.permits_tool_for_review(&call.name)
+                } else {
+                    !state.permits_tool(&call.name)
+                }
+            })
         {
             return Err(AdmitError::Refused {
                 reason: format!("tool {} capability is not exposed", call.name),
@@ -449,6 +478,22 @@ impl Executor {
         });
         let command_line = command_line_for_match(call, program.as_deref(), &args);
 
+        // A review bound to a fixed historical object has no live-worktree
+        // authority: those tools answer about a tree that is not the reviewed
+        // object. This is a ROLE boundary, so Full does not lift it (the
+        // product keeps Full's meaning for the tools a seat actually holds).
+        if self.agent_role == crate::child_profile::AgentRole::Reviewer
+            && let Some(revision) = ctx.review_revision()
+            && Self::WORKTREE_ONLY_REVIEW_TOOLS.contains(&call.name.as_str())
+        {
+            return PolicyResolution::Deny(PolicyDenial {
+                reason: format!(
+                    "本次审查对象是固定版本 `{revision}`，`{}` 读取的是当前工作区，不能作为该对象的证据；请使用 `git_history` 查询该版本的源码、历史与搜索。",
+                    call.name
+                ),
+            });
+        }
+
         // Highest-priority product contract: Full bypasses CodeLeveler
         // permission rules, hooks, Git gates and sandbox boundaries entirely.
         if ctx.policy.unrestricted_execution() {
@@ -666,11 +711,16 @@ impl Executor {
         // A poisoned lock only means a rules writer panicked mid-update; the
         // rule set is append-only, so read the latest state instead of turning
         // every future dispatch into a panic.
-        let rule_decision = self
-            .permission_rules
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .evaluate(&call.name, command_line.as_deref(), &rule_paths);
+        let (rule_decision, rules_degraded) = {
+            let rules = self
+                .permission_rules
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                rules.evaluate(&call.name, command_line.as_deref(), &rule_paths),
+                rules.is_degraded(),
+            )
+        };
         match rule_decision {
             leveler_execution::RuleDecision::Deny => {
                 return deny("forbidden by permission rule".to_string());
@@ -684,7 +734,24 @@ impl Executor {
                     AuthorizationEvidence::Rule,
                 ));
             }
-            leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
+            // `ask` is a user-configured boundary. Falling through to the
+            // profile policy erased it whenever that policy would auto-run
+            // the call, so the exact action the user asked to review ran
+            // without a decision.
+            leveler_execution::RuleDecision::Ask => {
+                approval_reason
+                    .get_or_insert_with(|| "permission rule requires approval".to_string());
+            }
+            // A rules source that exists but could not be parsed means the
+            // rules in it are unknown. Falling through to the profile's
+            // auto-allow would silently discard a deny/ask the user wrote.
+            leveler_execution::RuleDecision::NoMatch if rules_degraded => {
+                approval_reason.get_or_insert_with(|| {
+                    "权限规则文件无法解析，无法确认是否存在 deny/ask 规则；本次调用需要批准"
+                        .to_string()
+                });
+            }
+            leveler_execution::RuleDecision::NoMatch => {}
         }
 
         // A destination hint can reduce the prompt only when the execution
@@ -831,6 +898,9 @@ impl Executor {
                 }
                 if network_unenforceable {
                     notes.push("此平台无法断网：批准后该命令可以联网运行".to_string());
+                }
+                if ctx.policy.network_explicitly_denied() && command_view.is_some() {
+                    notes.push("本次运行已禁止网络：批准只允许在无网络下执行".to_string());
                 }
                 let description = notes.join("；");
                 // Approving a call whose need is the network grants it.
@@ -1504,6 +1574,7 @@ mod authorize_tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::sub_agent::AgentRole;
     use leveler_core::ToolCallId;
     use leveler_execution::{Approver, PermissionProfile, Workspace};
     use leveler_model::{
@@ -2195,6 +2266,181 @@ mod authorize_tests {
         }
     }
 
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("r"),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        }
+    }
+
+    /// A user-configured `ask` rule must reach the approver even when the
+    /// profile's own policy would auto-run the call. Losing it is the same
+    /// class of hole as losing a `deny`: the configured boundary disappears.
+    #[tokio::test]
+    async fn a_matching_ask_rule_requires_approval_even_when_policy_would_auto_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let ask = leveler_execution::PermissionRule {
+            match_: leveler_execution::RuleMatch {
+                tool: Some("read_file".into()),
+                command_prefix: None,
+                command_exact: None,
+                write_path_glob: None,
+            },
+            effect: leveler_execution::RuleEffect::Ask,
+        };
+        let executor = executor_for(dir.path(), approver.clone())
+            .with_permission_rules(leveler_execution::PermissionRuleSet::from_rules(vec![ask]));
+        let mut session = HashSet::new();
+
+        executor
+            .authorize(&read_call("a.txt"), &mut session)
+            .await
+            .expect("the user approved the matching call");
+        assert_eq!(
+            approver.asks(),
+            1,
+            "a matching ask rule must force a decision"
+        );
+    }
+
+    /// A rule file that could not be parsed leaves the rule set incomplete.
+    /// The host must not fall through to the profile's auto-allow as if the
+    /// user had configured nothing.
+    #[tokio::test]
+    async fn a_degraded_rule_set_does_not_widen_an_auto_allowed_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut rules = leveler_execution::PermissionRuleSet::default();
+        rules.mark_degraded();
+        let executor = executor_for(dir.path(), approver.clone()).with_permission_rules(rules);
+        let mut session = HashSet::new();
+
+        executor
+            .authorize(&read_call("a.txt"), &mut session)
+            .await
+            .expect("the user approved the call");
+        assert_eq!(
+            approver.asks(),
+            1,
+            "an incomplete rule set must ask instead of silently auto-allowing"
+        );
+
+        // Full remains full: the product contract does not ask or deny.
+        let full_approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let full = executor_at(
+            dir.path(),
+            PermissionProfile::FullAccess,
+            full_approver.clone(),
+        )
+        .with_permission_rules({
+            let mut rules = leveler_execution::PermissionRuleSet::default();
+            rules.mark_degraded();
+            rules
+        });
+        let mut full_session = HashSet::new();
+        full.authorize(&read_call("a.txt"), &mut full_session)
+            .await
+            .unwrap();
+        assert_eq!(full_approver.asks(), 0, "Full must not ask");
+    }
+
+    /// A standing `Allow` rule is consent to run the matching call, not a
+    /// grant of the whole filesystem. The admitted call must keep the profile
+    /// boundary it resolved under.
+    #[tokio::test]
+    async fn a_standing_allow_rule_does_not_widen_the_resolved_scope() {
+        use leveler_execution::{
+            NetworkScope, PermissionRule, PermissionRuleSet, RuleEffect, RuleMatch, WriteScope,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let allow = PermissionRule {
+            match_: RuleMatch {
+                tool: Some("run_command".into()),
+                command_exact: Some("ls".into()),
+                ..RuleMatch::default()
+            },
+            effect: RuleEffect::Allow,
+        };
+        let exec = executor_for(dir.path(), approver.clone())
+            .with_permission_rules(PermissionRuleSet::from_rules(vec![allow]));
+        let admitted = match exec
+            .admit(
+                call(
+                    "run_command",
+                    serde_json::json!({"program": "ls", "args": []}),
+                ),
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(AdmitError::Refused { reason, .. }) => panic!("{reason}"),
+            Err(AdmitError::Fatal(error)) => panic!("{error}"),
+        };
+        assert_eq!(approver.asks(), 0);
+        assert!(!admitted.resolved().unrestricted_execution());
+        assert!(
+            matches!(admitted.resolved().write, WriteScope::Workspace { .. }),
+            "{:?}",
+            admitted.resolved().write
+        );
+        assert_eq!(
+            admitted.resolved().network_scope,
+            NetworkScope::Internet,
+            "Assisted reaches the network by profile default"
+        );
+        assert_eq!(admitted.ctx.policy.network_scope(), NetworkScope::Internet);
+        assert!(
+            admitted.ctx.policy.write_scope(dir.path()) == admitted.resolved().write,
+            "the execution context uses the frozen write scope"
+        );
+    }
+
+    /// `--deny-network` is the run owner's decision. A command approval is
+    /// consent to run the command, not a second decision about the network.
+    #[tokio::test]
+    async fn approving_a_command_cannot_lift_an_explicit_network_denial() {
+        use leveler_execution::{NetworkScope, WriteScope};
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut exec = executor_for(dir.path(), approver.clone());
+        exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        let admitted = match exec
+            .admit(
+                rm_rf_call(),
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(AdmitError::Refused { reason, .. }) => panic!("{reason}"),
+            Err(AdmitError::Fatal(error)) => panic!("{error}"),
+        };
+        assert_eq!(approver.asks(), 1);
+        assert_eq!(admitted.resolved().network_scope, NetworkScope::None);
+        assert_eq!(
+            admitted.ctx.policy.network_scope(),
+            NetworkScope::None,
+            "the execution context must read the frozen denial, not the profile"
+        );
+        assert_eq!(
+            admitted.resolved().write,
+            WriteScope::Unrestricted,
+            "the approved effect still runs"
+        );
+    }
+
     #[tokio::test]
     async fn approve_always_persists_rule_and_auto_allows_next_call() {
         let dir = tempfile::tempdir().unwrap();
@@ -2351,6 +2597,53 @@ mod authorize_tests {
         };
         executor.authorize(&other, &mut fresh).await.unwrap();
         assert_eq!(approver.asks(), 2, "a variant must not ride the exact rule");
+    }
+
+    /// Code intelligence is a legitimate read-only investigation tool for the
+    /// review seat: the host admits it (the surface is the other half of the
+    /// same contract).
+    #[tokio::test]
+    async fn a_review_seat_is_admitted_to_use_code_intelligence() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let parent = executor_for(dir.path(), approver.clone());
+        let reviewer =
+            parent.child_for_role_on(crate::child_profile::AgentRole::Reviewer, Vec::new(), None);
+        let call = ToolCall {
+            id: ToolCallId::new("sym"),
+            name: "find_symbol".to_string(),
+            arguments: serde_json::json!({"symbol": "OrderService"}),
+        };
+        let mut session = HashSet::new();
+        reviewer
+            .authorize(&call, &mut session)
+            .await
+            .expect("a read-only symbol lookup is admitted on a review seat");
+        assert_eq!(approver.asks(), 0, "a Safe observe tool needs no prompt");
+    }
+
+    /// A commit/branch review cannot use a live-worktree tool as evidence,
+    /// and Full does not lift this role boundary.
+    #[tokio::test]
+    async fn a_fixed_revision_review_refuses_live_worktree_tools_even_in_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "worktree\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let parent = executor_at(dir.path(), PermissionProfile::FullAccess, approver.clone());
+        let mut reviewer =
+            parent.child_for_role_on(crate::child_profile::AgentRole::Reviewer, Vec::new(), None);
+        reviewer.tool_context = reviewer
+            .tool_context
+            .clone()
+            .with_review_revision("0123456789abcdef0123456789abcdef01234567");
+        let mut session = HashSet::new();
+        let err = reviewer
+            .authorize(&read_call("a.txt"), &mut session)
+            .await
+            .unwrap_err();
+        assert!(err.contains("固定版本"), "{err}");
+        assert!(err.contains("git_history"), "{err}");
+        assert_eq!(approver.asks(), 0, "this is a refusal, not a prompt");
     }
 
     #[tokio::test]
@@ -3715,5 +4008,79 @@ mod authorize_tests {
                 "an explicit URL with a stored credential must ask before it uses it: {other:?}"
             ),
         }
+    }
+
+    /// A reviewer seat stays read-only in EVERY permission mode. FullAccess
+    /// removes ASK/DENY; it must not re-admit a write or command tool the seat
+    /// does not hold.
+    #[tokio::test]
+    async fn a_reviewer_seat_refuses_tools_outside_its_projection_under_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            ToolContext::new(
+                Workspace::new(dir.path()).unwrap(),
+                PermissionProfile::Assisted,
+            ),
+            ModelRef::new("mock", "m"),
+            0,
+        );
+        parent
+            .tool_context
+            .policy
+            .permission_profile()
+            .set(PermissionProfile::FullAccess);
+        let child = parent.child_for_role_on(AgentRole::Reviewer, Vec::new(), None);
+        let mut approved = HashSet::new();
+        for name in ["write_file", "apply_patch", "run_command"] {
+            let refused = child
+                .admit(
+                    call(name, serde_json::json!({})),
+                    child.tool_context.clone(),
+                    false,
+                    &mut approved,
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(refused.is_err(), "{name} must be refused on a review seat");
+        }
+        let read = child
+            .admit(
+                call("read_file", serde_json::json!({"path": "x"})),
+                child.tool_context.clone(),
+                false,
+                &mut approved,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(read.is_ok(), "a read tool is still part of the seat");
+
+        let investigator = parent.child_for_role_on(AgentRole::Investigator, Vec::new(), None);
+        for name in ["write_file", "apply_patch", "run_command", "shell_command"] {
+            let refused = investigator
+                .admit(
+                    call(name, serde_json::json!({})),
+                    investigator.tool_context.clone(),
+                    false,
+                    &mut approved,
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                refused.is_err(),
+                "{name} must be refused on an investigation seat"
+            );
+        }
+        let read = investigator
+            .admit(
+                call("read_file", serde_json::json!({"path": "x"})),
+                investigator.tool_context.clone(),
+                false,
+                &mut approved,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(read.is_ok(), "an investigation still reads");
     }
 }

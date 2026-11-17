@@ -21,6 +21,8 @@ mod message_store;
 mod model_request_repo;
 mod ownership_store;
 mod resource_grant_store;
+mod review_facts;
+mod review_repo;
 mod session_facts;
 mod session_input_repo;
 mod session_recap_repo;
@@ -58,6 +60,10 @@ pub use model_request_repo::{
 pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,
 };
+pub use review_facts::{
+    ReviewCheckpointFact, ReviewGoalFact, ReviewRequirementFact, ReviewSessionCounts,
+};
+pub use review_repo::{NewReview, ReviewFinish, ReviewRecord, ReviewRepository};
 pub use session_facts::SessionFacts;
 pub use session_input_repo::{
     SessionInputMutation, SessionInputRecord, SessionInputRepository, SessionInputState,

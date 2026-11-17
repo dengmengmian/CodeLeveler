@@ -50,6 +50,8 @@ pub enum Screen {
     /// into this one page; neither has a body of its own. See
     /// [`Screen::context_section`] for which section a command reveals.
     Context,
+    /// One manual review's durable report (`/review` summary card → ↗).
+    Review,
     /// `/clean`: reclaim CodeLeveler-owned local storage. A page over the host's
     /// cleanup plan; scan and cleanup run off-thread.
     Clean,
@@ -219,6 +221,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashCategory::Agent,
         SlashVisibility::Searchable,
         BusyPolicy::Always,
+    ),
+    // Manual, read-only, evidence-driven review. IdleOnly: review is never
+    // silently queued behind a turn that is still modifying the workspace.
+    slash(
+        "/review",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Searchable,
+        BusyPolicy::IdleOnly,
     ),
     // View
     slash(
@@ -572,6 +583,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/agents" => s.agents,
         "/skills" => s.skills,
         "/diff" => s.diff,
+        "/review" => s.review,
         "/trace" => s.trace,
         "/context" => s.context,
         "/usage" => s.usage,
@@ -895,6 +907,7 @@ mod surface_tests {
                 "/collab",
                 "/agents",
                 "/skills",
+                "/review",
                 "/diff",
                 "/trace",
                 "/context",
@@ -1432,6 +1445,7 @@ mod reachability_tests {
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
             Screen::Memory => Some("`/memory` — reducer/submit.rs"),
             Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
+            Screen::Review => Some("clicking a review card's ↗ — reducer/mod.rs"),
             Screen::Output => Some("Enter/click on a finished local command — reducer/mod.rs"),
             Screen::PendingSteer => Some("Alt+S or pending steer controls — pending_steer.rs"),
         }
@@ -1454,6 +1468,7 @@ mod reachability_tests {
             Screen::Doctor,
             Screen::Trace,
             Screen::Context,
+            Screen::Review,
             Screen::Schedules,
             Screen::Memory,
             Screen::Output,

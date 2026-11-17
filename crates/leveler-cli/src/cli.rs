@@ -167,9 +167,10 @@ pub enum Command {
     /// Manage durable permission rules (`.leveler/permissions.yaml`).
     #[command(subcommand)]
     Permissions(PermissionsCommand),
-    /// Trust this repository's in-repo `.leveler/hooks.yaml` /
-    /// `.leveler/permissions.yaml`. Both are ignored until trusted, and trust
-    /// is keyed to the file contents — editing one drops it back to untrusted.
+    /// Trust this repository's in-repo `.leveler/hooks.yaml`,
+    /// `.leveler/permissions.yaml`, and `.leveler/config.yaml`. They are
+    /// ignored, or may only tighten the default mode, until trusted; trust is
+    /// keyed to the file contents — editing one drops it back to untrusted.
     #[command(subcommand_negates_reqs = true)]
     Trust {
         #[command(subcommand)]
@@ -429,7 +430,8 @@ pub enum PermissionsCommand {
     Clear,
 }
 
-/// In-repo config trust (`<repo>/.leveler/hooks.yaml`, `permissions.yaml`).
+/// In-repo config trust (`<repo>/.leveler/hooks.yaml`,
+/// `.leveler/permissions.yaml`, `.leveler/config.yaml`).
 ///
 /// With no subcommand, `leveler trust` lists what is untrusted and asks to
 /// confirm — the same as `leveler trust allow`.

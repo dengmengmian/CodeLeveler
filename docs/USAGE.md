@@ -150,6 +150,44 @@ Or `leveler mcp add devorder --url http://127.0.0.1:8081/mcp --header X-API-Key=
 
 `leveler mcp list` prints the transport, the URL, and header names. `leveler doctor` warns when a referenced variable is unset. The Tools view shows a call after it runs; connection state is in the log (`MCP server connected`, including the negotiated protocol version and tool count).
 
+## Review
+
+`/review` starts a manual, read-only review. It is the only entry: an ordinary message, a completed turn, a commit or a delivery never starts one. A review has its own id, budget, cancellation and durable report; it opens no turn and changes no source.
+
+Bare `/review` opens a scope picker. The default is the current task (its accepted delivery and the files that delivery changed, never every file another session touched). Add the user's own focus after the command:
+
+```
+/review 检查支付模块的安全边界
+/review @workspace 检查当前未提交改动
+/review @project 检查整个项目
+/review @session <session-id> 分析这次执行过程
+/review @commit <rev> 检查这次提交
+/review @branch <base> 检查当前分支相对 base 的提交
+/review @path src/a.rs,src/b.rs 检查这两个文件的边界
+/review @model provider/model 检查...      # this review only
+/review cancel [review-id]                 # stop a running review
+```
+
+The reviewer reads the objective, the user's own adjustments, the requested object and, where possible, its diff. For a session or an execution question it can also page through the reviewed session's durable record with the read-only `session_history` tool: turns and their terminal states, events and tool results, user/assistant messages, every model request's tokens and latency, goals and requirement changes, and checkpoints. The tool is bound to the reviewed session — the model cannot name another one — and ordinary agents never see it.
+
+The reviewer's read-only investigation surface also includes the code-intelligence tools (`find_symbol`, `read_symbol`, `find_references`, `diagnostics`) without a `capability` enable round trip, and `git_history` for committed history (`log`, `show`, `file`, `search`, `list`, `blame`) over the Git object database. Code-intelligence calls on a review seat use the in-process scan fallbacks, not a language-server process. A commit or branch review is tied to the resolved commit SHA: tools that read the live worktree are removed from the surface and refused at admission, so current files cannot be presented as that version's evidence. `git_history` is scoped to the reviewed object and its ancestors; a later or sibling branch cannot be used as evidence about that object.
+
+The review's initial context is built only for that review: the source task's objective and recorded requirement changes (with the user's own quotes), project documentation entry points, and — for diff-shaped objects — a bounded relation prefetch of changed symbols and cross-file call sites. When cross-session memory is enabled, it also receives a bounded recall of relevant topics and a read-only `memory_search` tool; memory is historical context, not current fact, and is verified against the source and the user's request. None of this runs in an ordinary turn.
+
+A Lead Reviewer may launch independent read-only investigations with `spawn_agent` when a review is complex enough to benefit. Each investigation starts its own conversation, receives a self-contained objective, and inherits the same reviewed object, read-only tool surface and permission boundary. It cannot write, run commands, change scope, choose a different agent or delegate further. Read tools are confined to the reviewed workspace; host files outside it and credential files are not review evidence. Several investigations can run in parallel, foreground or background; their findings are attributed to the child that reported them, and their structured facts, examined scope, unresolved questions and limitations return to the Lead Reviewer as evidence. The Lead Reviewer remains responsible for verifying and synthesising the single final report — a child's report is not a verdict. A simple review does not need to delegate.
+
+It records findings with an optional dimension (code, business, security, architecture, test, delivery, session), P0–P3 severity, confidence, evidence, impact, a fix direction and whether it reproduced them. It also declares a structured verdict through `report_review`: a conclusion (issues found / none found / inconclusive), per-dimension coverage (reviewed, partial, not reviewed, not applicable), and limitations attributed to the environment, permissions, tool capability or the requested scope. The runtime records what was declared; it never derives these from the report prose or finding counts. A finding is information: it never blocks a goal or changes a turn's terminal.
+Investigator findings arrive at settlement as **candidates**, never as formal defects. The Lead Reviewer alone decides each one with `adjudicate_finding`: `adopted` (a formal finding, optionally with an adjusted severity/confidence/title), `rejected` (evidence against it; never counted), `duplicate` (same root cause; merged into a named finding), or `unresolved` (still undecided). A candidate the Lead does not mention stays unresolved; the runtime never adopts or rejects one implicitly. The formal defect count is the Lead's own findings plus explicitly adopted candidates; pending candidates are reported separately, and rejected or merged candidates remain in the record for traceability without inflating the count. Several investigators reporting one root cause should be merged into one finding.
+
+The `report` field of `report_review` is the **formal report body**: complete, standalone, and explicitly submitted by the model. The final chat message is stored and shown separately and never replaces the report. Every `report_review` is a full revision bound to the evidence revision at submission (the number of settled investigations). If new investigation evidence arrives after submission and the Lead does not submit a new complete report, the review may still be Completed, but the report is explicitly marked as not covering the latest evidence; the runtime never rewrites the model's conclusion for it.
+
+A review honors the repository's existing `[limits]` token and cost caps from `.leveler/config.yaml` and its 20-minute wall bound. Those caps are **shared** by the Lead and every investigation: a child never receives a fresh full budget. When the budget runs out, the review stops issuing new requests, keeps the facts it obtained, and states the incomplete scope honestly.
+
+
+When it settles, the conversation shows a card (`P0/P1/P2/P3`, finding count, whether source was modified). Click the card — or its `查看报告 ↗` — to open the report page; the report is read from the durable review row, so reopening a session shows the same card and report. A review object that changed while the review ran says so instead of presenting a stale report as current.
+
+`Completed` means the reviewer reached a clean end, not that no defects exist. A declared coverage of `reviewed` is the reviewer's statement about its own scope, not a runtime proof. `No findings` is not proof of correctness or security. An incomplete or cancelled review keeps whatever it had already established and says what stopped it.
+
 ## Troubleshooting
 
 Run `leveler doctor` to check models, terminal support, and system capabilities. Use `leveler trace` to inspect session records. Check for private content before sharing them.

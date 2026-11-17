@@ -26,6 +26,10 @@ pub(crate) enum AgentRole {
     /// Launched by the harness when policy says the change warrants one, so it
     /// is the one role a model cannot ask for.
     Reviewer,
+    /// Read-only independent investigation under a review seat. Harness-only:
+    /// a model cannot request it, it cannot spawn further children, and it
+    /// inherits the review's object and authorisation.
+    Investigator,
 }
 
 impl AgentRole {
@@ -43,6 +47,12 @@ impl AgentRole {
                  cannot request it. Use role='explorer' to investigate, or omit role."
                     .into(),
             ),
+            Some("investigator") => Err(
+                "role='investigator' is harness-launched independent investigation; \
+                 spawn_agent cannot request it. Use role='explorer' to investigate, or \
+                 omit role."
+                    .into(),
+            ),
             Some(other) => Err(format!(
                 "Unknown role `{other}`. Roles: explorer, worker, default (or omit role)."
             )),
@@ -56,6 +66,7 @@ impl AgentRole {
             "explorer" => AgentRole::Explorer,
             "worker" => AgentRole::Worker,
             "reviewer" => AgentRole::Reviewer,
+            "investigator" => AgentRole::Investigator,
             _ => return None,
         })
     }
@@ -66,6 +77,7 @@ impl AgentRole {
             AgentRole::Explorer => "explorer",
             AgentRole::Worker => "worker",
             AgentRole::Reviewer => "reviewer",
+            AgentRole::Investigator => "investigator",
         }
     }
 }
@@ -300,6 +312,35 @@ impl ChildProfile {
         }
     }
 
+    /// Harness-only independent investigation under a review seat. The same
+    /// physical read-only surface as an explorer; the distinct role exists so
+    /// the runtime can give it `report_investigation`, the review's fixed
+    /// object and the review's sensitive-read confinement, and so a resumed
+    /// child keeps those facts. It is deliberately not model-requestable and
+    /// not part of [`Self::builtins`].
+    pub fn investigator() -> Self {
+        Self {
+            id: "investigator".into(),
+            name: "Investigator".into(),
+            role: AgentRole::Investigator,
+            tool_policy: ToolPolicy {
+                access: ToolAccess::ReadSearch,
+            },
+            workspace_policy: WorkspacePolicy {
+                mode: WorkspaceMode::ReadOnly,
+                requires_explicit_scope: false,
+            },
+            runtime_policy: RuntimePolicy {
+                max_rounds: None,
+                serial_tools: false,
+            },
+            budget_policy: BudgetPolicy {
+                inherits_residual: true,
+                max_duration_secs: CHILD_MAX_DURATION_SECS,
+            },
+        }
+    }
+
     /// The three product profiles plus the Default compatibility profile.
     pub fn builtins() -> [Self; 4] {
         [
@@ -323,6 +364,7 @@ impl ChildProfile {
             AgentRole::Explorer => Self::explorer(),
             AgentRole::Worker => Self::worker(),
             AgentRole::Reviewer => Self::reviewer(),
+            AgentRole::Investigator => Self::investigator(),
         };
         debug_assert!(
             profile.validate().is_ok(),
@@ -420,6 +462,15 @@ impl ChildProfile {
         files: &[String],
     ) -> Result<Self, String> {
         if let Some(raw) = profile.map(str::trim).filter(|s| !s.is_empty()) {
+            let key = normalize_profile_id(raw).unwrap_or_default();
+            if key == "investigator" {
+                return Err(
+                    "profile='investigator' is harness-launched independent investigation \
+                     under a review; spawn_agent cannot request it. Use profile='explorer' \
+                     to investigate, or omit profile."
+                        .into(),
+                );
+            }
             let resolved = Self::lookup(raw).ok_or_else(|| unknown_profile_message(raw))?;
             if resolved.role == AgentRole::Reviewer {
                 return Err(
@@ -470,7 +521,7 @@ fn is_safe_profile_id(s: &str) -> bool {
 fn unknown_profile_message(raw: &str) -> String {
     format!(
         "Unknown profile `{raw}`. Built-in: default, explorer, worker. \
-         Reviewer is harness-launched. Omit profile to spawn the default child."
+         Reviewer and investigator are harness-launched. Omit profile to spawn the default child."
     )
 }
 
@@ -627,15 +678,36 @@ mod tests {
         assert!(err.contains("explorr"), "{err}");
     }
 
-    /// `reviewer` is not a model-facing role word, but it IS a valid label
-    /// when the harness resolves one by name.
+    /// `reviewer` and `investigator` are not model-facing role words, but
+    /// they ARE valid labels when the harness resolves one by name.
     #[test]
-    fn role_parsing_keeps_reviewer_harness_only() {
+    fn role_parsing_keeps_review_roles_harness_only() {
         assert!(AgentRole::parse(Some("reviewer")).is_err());
+        assert!(AgentRole::parse(Some("investigator")).is_err());
+        assert!(ChildProfile::admit_spawn(None, Some("investigator"), &[]).is_err());
+        assert!(
+            ChildProfile::admit_spawn(Some("investigator"), None, &[])
+                .unwrap_err()
+                .contains("investigator")
+        );
         assert_eq!(AgentRole::parse(Some("explorer")), Ok(AgentRole::Explorer));
         assert_eq!(AgentRole::parse(None), Ok(AgentRole::Default));
         assert_eq!(AgentRole::from_label("reviewer"), Some(AgentRole::Reviewer));
+        assert_eq!(
+            AgentRole::from_label("investigator"),
+            Some(AgentRole::Investigator)
+        );
         assert_eq!(AgentRole::from_label("nonsense"), None);
+        assert!(
+            !ChildProfile::builtins()
+                .iter()
+                .any(|profile| profile.role == AgentRole::Investigator),
+            "an investigation is launched by a review, never selected like a product profile"
+        );
+        let investigator = ChildProfile::resolve(AgentRole::Investigator);
+        assert!(investigator.read_only());
+        assert!(!investigator.requires_scope());
+        assert!(investigator.validate().is_ok());
     }
 
     #[test]

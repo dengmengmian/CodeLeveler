@@ -407,6 +407,41 @@ pub enum ClientCommand {
     /// separate from `CancelCurrentTurn`: a side thread's answer has its own
     /// lifecycle, and stopping it must never stop the main turn.
     CancelBtw { session_id: SessionId },
+    /// Start a manual, read-only review. This is the ONLY entry into review:
+    /// no ordinary message is classified, and a running turn is never
+    /// interrupted or silently queued behind it.
+    ///
+    /// `focus` is the user's review request in their own words. The reviewer
+    /// model reads it and decides where to look; `scope` names the object the
+    /// runtime resolved for it. `model` overrides the session's current model
+    /// for this review only.
+    RunReview {
+        session_id: SessionId,
+        focus: String,
+        scope: crate::UiReviewScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelRef>,
+    },
+    /// Cancel one running manual review. Read-only work settles with whatever
+    /// it already established; the source session's task is untouched.
+    CancelReview {
+        session_id: SessionId,
+        review_id: String,
+    },
+    /// Load the full report behind a review summary card. A query, not a
+    /// subscription: the durable review row is the authority.
+    QueryReviewReport {
+        session_id: SessionId,
+        review_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// List this session's stored reviews, newest first, for history replay.
+    ListReviews {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Read-only observatory query. Does not mutate runtime, tools, or
     /// verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].
     QueryObservability {
@@ -717,6 +752,10 @@ impl ClientCommand {
             | ClientCommand::CancelBackgroundTask { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
             | ClientCommand::CancelBtw { session_id }
+            | ClientCommand::RunReview { session_id, .. }
+            | ClientCommand::CancelReview { session_id, .. }
+            | ClientCommand::QueryReviewReport { session_id, .. }
+            | ClientCommand::ListReviews { session_id, .. }
             | ClientCommand::Recap { session_id }
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }
@@ -1250,6 +1289,41 @@ mod tests {
                 checkpoint_id: CheckpointId::new("chk-1"),
             },
             "restore_checkpoint",
+        );
+    }
+
+    #[test]
+    fn review_commands_roundtrip_through_serde() {
+        roundtrip(
+            ClientCommand::RunReview {
+                session_id: SessionId::new("s1"),
+                focus: "检查支付模块的安全边界".into(),
+                scope: crate::UiReviewScope::Workspace,
+                model: None,
+            },
+            "run_review",
+        );
+        roundtrip(
+            ClientCommand::CancelReview {
+                session_id: SessionId::new("s1"),
+                review_id: "review-1".into(),
+            },
+            "cancel_review",
+        );
+        roundtrip(
+            ClientCommand::QueryReviewReport {
+                session_id: SessionId::new("s1"),
+                review_id: "review-1".into(),
+                query_id: Some(CommandId::new("q1")),
+            },
+            "query_review_report",
+        );
+        roundtrip(
+            ClientCommand::ListReviews {
+                session_id: SessionId::new("s1"),
+                query_id: None,
+            },
+            "list_reviews",
         );
     }
 

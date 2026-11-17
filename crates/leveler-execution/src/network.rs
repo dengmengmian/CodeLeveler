@@ -85,6 +85,18 @@ impl NetworkResource {
 }
 
 impl NetworkScope {
+    /// The destination boundary this process backend can actually enforce.
+    ///
+    /// Seatbelt can express "loopback outbound, everything else denied". The
+    /// all-or-nothing backends (bwrap, Windows) cannot, so the honest boundary
+    /// there is deny-all — never a silent widening to the Internet.
+    pub fn enforced_on_this_backend(&self) -> Self {
+        match self {
+            Self::Loopback if !cfg!(target_os = "macos") => Self::None,
+            scope => scope.clone(),
+        }
+    }
+
     pub fn validate_resource(&self, resource: &NetworkResource) -> Result<(), NetworkError> {
         resource.validate_destinations()?;
         let allowed = match self {
@@ -382,6 +394,24 @@ mod tests {
             resolve_network_resource("0.0.0.0", 3000, NetworkTransport::Tcp)
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn loopback_is_enforced_only_where_the_backend_can_express_it() {
+        let loopback = NetworkScope::Loopback.enforced_on_this_backend();
+        if cfg!(target_os = "macos") {
+            assert_eq!(loopback, NetworkScope::Loopback);
+        } else {
+            assert_eq!(loopback, NetworkScope::None);
+        }
+        assert_eq!(
+            NetworkScope::Internet.enforced_on_this_backend(),
+            NetworkScope::Internet
+        );
+        assert_eq!(
+            NetworkScope::None.enforced_on_this_backend(),
+            NetworkScope::None
         );
     }
 }

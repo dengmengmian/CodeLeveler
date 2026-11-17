@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::{
-    ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile, UiThinkingAccess,
+    ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile, UiReviewScope,
+    UiThinkingAccess,
 };
 use leveler_model::ThinkingLevel;
 
@@ -112,6 +113,14 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
             }
             SelectionOutcome::Cancel => Vec::new(),
             SelectionOutcome::Confirm(key) => apply_thinking_choice(state, &key),
+        },
+        Overlay::ReviewScopePicker(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ReviewScopePicker(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => apply_review_scope_choice(state, &key),
         },
         Overlay::CollabPicker(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
@@ -499,6 +508,64 @@ pub(super) fn open_collab_picker(state: &mut AppState) {
     ];
     let model = SelectionModel::new(t.overlay_collab, options, false).focus_key(current);
     state.overlay = Some(Overlay::CollabPicker(Box::new(model)));
+}
+
+/// `/review` with no argument: choose what to review. The default is the
+/// current task, which is the narrowest honest object (the latest accepted
+/// delivery's own files, never every file another session touched).
+pub(super) fn open_review_scope_picker(state: &mut AppState) {
+    let t = state.t();
+    let review = &t.review;
+    let options = vec![
+        SelectionOption::new("current_task", review.scope_current_task)
+            .description(review.scope_current_task_desc)
+            .recommended(true)
+            .current(true),
+        SelectionOption::new("workspace", review.scope_workspace)
+            .description(review.scope_workspace_desc),
+        SelectionOption::new("project", review.scope_project)
+            .description(review.scope_project_desc),
+        SelectionOption::new("session", review.scope_session)
+            .description(review.scope_session_desc),
+        SelectionOption::new("commit", review.scope_commit).description(review.scope_commit_desc),
+        SelectionOption::new("branch", review.scope_branch).description(review.scope_branch_desc),
+        SelectionOption::new("paths", review.scope_paths).description(review.scope_paths_desc),
+    ];
+    let model =
+        SelectionModel::new(review.scope_picker_title, options, false).focus_key("current_task");
+    state.overlay = Some(Overlay::ReviewScopePicker(Box::new(model)));
+}
+
+/// Act on the scope picker. Scopes that name a target only PREFILL the
+/// composer: launching a commit review with an empty rev would be a lie about
+/// what was reviewed.
+fn apply_review_scope_choice(state: &mut AppState, key: &str) -> Vec<Effect> {
+    let prefix = match key {
+        "current_task" => return start_review(state, UiReviewScope::CurrentTask),
+        "workspace" => return start_review(state, UiReviewScope::Workspace),
+        "project" => return start_review(state, UiReviewScope::Project),
+        "session" => return start_review(state, UiReviewScope::Session { session_id: None }),
+        "commit" => "/review @commit ",
+        "branch" => "/review @branch ",
+        "paths" => "/review @path ",
+        _ => return Vec::new(),
+    };
+    let message = state.t().review.target_prompt.to_string();
+    state.composer.replace(prefix);
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message,
+    });
+    Vec::new()
+}
+
+fn start_review(state: &mut AppState, scope: UiReviewScope) -> Vec<Effect> {
+    vec![Effect::Send(ClientCommand::RunReview {
+        session_id: state.session_id.clone(),
+        focus: String::new(),
+        scope,
+        model: None,
+    })]
 }
 
 pub(super) fn open_theme_picker(state: &mut AppState) {

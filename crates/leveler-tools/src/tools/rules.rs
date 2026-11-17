@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::{
     READ_PROJECT_RULES_TOOL, RuleReadErrorKind, RuleSourceRead, load_rules, read_rule_source,
-    split_rule_sections,
+    read_rule_source_with, split_rule_sections,
 };
 use leveler_execution::RiskLevel;
 
@@ -74,7 +74,8 @@ impl Tool for ReadProjectRulesTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: ReadRulesInput = super::parse_input(self.name(), input)?;
-        let root: &Path = context.require_workspace()?.root();
+        let workspace = context.execution_workspace()?;
+        let root: &Path = workspace.root();
         let rules = load_rules(root);
 
         let Some(source) = input.source.as_deref() else {
@@ -137,8 +138,30 @@ impl Tool for ReadProjectRulesTool {
             .find(|rule| rule.source == source)
             .cloned()
             .map(|rule| Ok(RuleSourceRead::Loaded(rule)))
-            .unwrap_or_else(|| read_rule_source(root, source))
-        {
+            .unwrap_or_else(|| {
+                // A confined review seat opens the rule document through the
+                // workspace capability, so the containment check and the bytes
+                // describe the same opened object.
+                if workspace.reads_confined() {
+                    read_rule_source_with(root, source, &|path| {
+                        workspace
+                            .open_confined(path)
+                            .map(|file| {
+                                let mut bytes = Vec::new();
+                                std::io::Read::read_to_end(&mut &file, &mut bytes)?;
+                                Ok(bytes)
+                            })
+                            .unwrap_or_else(|| {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "rule document resolves outside the reviewed workspace",
+                                ))
+                            })
+                    })
+                } else {
+                    read_rule_source(root, source)
+                }
+            }) {
             Ok(RuleSourceRead::Loaded(instruction)) => instruction,
             Ok(RuleSourceRead::Empty) => {
                 return Ok(ToolOutput::error(format!(

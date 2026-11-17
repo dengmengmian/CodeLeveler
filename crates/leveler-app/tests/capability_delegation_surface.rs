@@ -254,6 +254,12 @@ async fn a_capability_enabled_in_a_later_turn_exposes_spawn_agent() {
         "delegation is not part of the first surface: {:?}",
         tool_names(before)
     );
+    // Not advertised as a tool is not the same as undiscoverable: the same
+    // request names the multi_agent pack and the enable action.
+    assert!(
+        before.contains("multi_agent"),
+        "the first request must state that delegation is on offer: {before}"
+    );
 
     let after = bodies
         .iter()

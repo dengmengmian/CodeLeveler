@@ -45,6 +45,48 @@ fn show_reports_an_untrusted_in_repo_hooks_file() {
     assert!(out.to_lowercase().contains("untrusted"), "{out}");
 }
 
+/// A repository's default-mode file goes through the same trust surface: an
+/// untrusted `full_access` cannot take effect, and trusting it is an explicit
+/// decision on exact bytes.
+#[test]
+fn the_project_default_mode_file_is_listed_and_trusted() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        &repo.path().join(".leveler/config.yaml"),
+        "mode: full_access\n",
+    );
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("config.yaml"), "{out}");
+    assert!(out.to_lowercase().contains("untrusted"), "{out}");
+    assert!(
+        out.contains("full access"),
+        "the purpose must say why it matters: {out}"
+    );
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "allow", "--yes"]);
+    assert!(ok, "{out}");
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(
+        !out.to_lowercase().contains("untrusted"),
+        "should be trusted now: {out}"
+    );
+
+    write(
+        &repo.path().join(".leveler/config.yaml"),
+        "mode: assisted\n",
+    );
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.to_lowercase().contains("untrusted"),
+        "an edit must drop trust: {out}"
+    );
+}
+
 /// The whole gate in one pass: untrusted → `allow --yes` → trusted → an edit
 /// drops it back to untrusted.
 #[test]

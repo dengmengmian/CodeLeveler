@@ -76,6 +76,14 @@ impl Tool for BlastRadiusTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let max_depth = input.max_depth.unwrap_or(DEFAULT_DEPTH).clamp(1, MAX_DEPTH);
         let root = context.require_workspace()?.root().to_path_buf();
+        if !context.language_servers_enabled() {
+            return Ok(ToolOutput::ok(
+                "(blast_radius unavailable in this read-only review: it needs a language \
+                 server, and review seats do not start server processes; use find_references \
+                 for a scan-based reference list)\n"
+                    .to_string(),
+            ));
+        }
 
         let resolver = LspResolver {
             lsp: &self.lsp,
@@ -364,5 +372,34 @@ mod tests {
             out.contains("TOTAL: 4 impacted symbol(s) across 3 file(s)"),
             "{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_review_seat_reports_blast_radius_unavailable_without_a_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-blast_radius-review-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn f() {}\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess)
+            .without_language_servers();
+        let out = BlastRadiusTool::new(Arc::new(LspSessions::new(Arc::new(
+            leveler_core::environment().clone(),
+        ))))
+        .execute(
+            serde_json::json!({ "symbol": "OrderService" }),
+            ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.content.contains("unavailable in this read-only review"),
+            "{}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use leveler_client_protocol::ClientCommand;
+use leveler_client_protocol::{ClientCommand, CommandId};
 
 use crate::action::Effect;
 use crate::screen::Screen;
@@ -370,7 +370,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 scroll_screen_key(state, &key, false);
             }
         },
-        Screen::Plan => {
+        Screen::Plan | Screen::Review => {
             if key.code == KeyCode::Esc {
                 return back(state);
             } else {
@@ -606,6 +606,28 @@ pub(super) fn open_issue_screen(state: &mut AppState) {
     // Forget where the cursor sat on the previous visit, so the first frame
     // follows it: reopening the page on a row below the fold must show it.
     state.issue_selected_line = None;
+}
+
+/// Open the report page for a settled review card. A running review has no
+/// report yet; that is stated rather than showing an empty page.
+pub(super) fn open_review_report(state: &mut AppState, review_id: &str) -> Vec<Effect> {
+    let Some(block) = state.transcript.review(review_id) else {
+        return Vec::new();
+    };
+    if !block.summary.status.settled() {
+        state.notification = Some(crate::state::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: state.t().review.running.to_string(),
+        });
+        return Vec::new();
+    }
+    let query_id = CommandId::generate();
+    state.review_query = Some(query_id.clone());
+    vec![Effect::Send(ClientCommand::QueryReviewReport {
+        session_id: state.session_id.clone(),
+        review_id: review_id.to_string(),
+        query_id: Some(query_id),
+    })]
 }
 
 pub(super) fn open_plan_screen(state: &mut AppState) {

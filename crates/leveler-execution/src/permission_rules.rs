@@ -20,6 +20,7 @@ pub enum RuleEffect {
 
 /// Match conditions (all set fields must match; empty match matches nothing useful).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleMatch {
     /// Exact tool name (e.g. `run_command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +41,7 @@ pub struct RuleMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionRule {
     #[serde(rename = "match")]
     pub match_: RuleMatch,
@@ -47,6 +49,7 @@ pub struct PermissionRule {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionRulesFile {
     #[serde(default)]
     pub rules: Vec<PermissionRule>,
@@ -56,6 +59,11 @@ pub struct PermissionRulesFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionRuleSet {
     rules: Vec<PermissionRule>,
+    /// A rules file existed but could not be read or parsed. What it would
+    /// have allowed or denied is unknown, so the caller must not read this set
+    /// as "no restrictions" — an empty rule list and a lost rule list are
+    /// different facts.
+    degraded: bool,
 }
 
 /// Result of evaluating rules against one tool call.
@@ -69,7 +77,21 @@ pub enum RuleDecision {
 
 impl PermissionRuleSet {
     pub fn from_rules(rules: Vec<PermissionRule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            degraded: false,
+        }
+    }
+
+    /// Mark this set as missing at least one rule source. The rules collected
+    /// so far remain valid; the absence of the failed source is the fact the
+    /// authorization path must not ignore.
+    pub fn mark_degraded(&mut self) {
+        self.degraded = true;
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
     }
 
     pub fn is_empty(&self) -> bool {
@@ -168,6 +190,12 @@ fn rule_matches(
     any_constraint
 }
 
+/// Whether a literal path would be interpreted as a glob by
+/// [`path_matches_glob`]. Only `*` and `?` are operators in this matcher.
+fn contains_glob_metacharacter(path: &str) -> bool {
+    path.contains('*') || path.contains('?')
+}
+
 /// Minimal glob: `**` any path segment sequence, `*` within a segment, `?` one char.
 fn path_matches_glob(path: &Path, pattern: &str) -> bool {
     let text = path.to_string_lossy().replace('\\', "/");
@@ -246,11 +274,35 @@ pub fn load_rules_file(path: &Path) -> Result<PermissionRuleSet, String> {
     Ok(PermissionRuleSet::from_rules(file.rules))
 }
 
-/// Merged rules plus any in-repo rules file that was skipped for lack of trust.
-#[derive(Debug, Clone, Default)]
+/// One rule source that existed but could not be read or parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRuleFile {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Merged rules plus the rule sources that could not be applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergedRules {
     pub rules: PermissionRuleSet,
     pub untrusted: Vec<crate::hooks::UntrustedConfig>,
+    /// Files that exist but could not be read/parsed. Their rules are NOT in
+    /// `rules`; an authorization path that would have relied on them must not
+    /// silently fall through.
+    pub invalid: Vec<InvalidRuleFile>,
+}
+
+fn load_or_report(path: &Path, invalid: &mut Vec<InvalidRuleFile>) -> PermissionRuleSet {
+    match load_rules_file(path) {
+        Ok(set) => set,
+        Err(error) => {
+            invalid.push(InvalidRuleFile {
+                path: path.to_path_buf(),
+                error,
+            });
+            PermissionRuleSet::default()
+        }
+    }
 }
 
 /// Merge the three rule sources. Order is cosmetic — evaluation is
@@ -261,9 +313,15 @@ pub struct MergedRules {
 ///   rules — never inside the repo;
 /// - in-repo: `<repo>/.leveler/permissions.yaml` (user-authored), applied only
 ///   when the user has trusted its exact contents — see [`crate::trust`].
+///
+/// A source that exists but cannot be read or parsed is reported in
+/// [`MergedRules::invalid`] and marks the merged set degraded. It is never
+/// silently replaced by an empty set: that would discard the user's deny/ask
+/// rules and widen execution authority.
 pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Path) -> MergedRules {
-    let mut set = load_rules_file(&global_home.join("permissions.yaml")).unwrap_or_default();
-    set.extend(load_rules_file(state_rules).unwrap_or_default());
+    let mut invalid = Vec::new();
+    let mut set = load_or_report(&global_home.join("permissions.yaml"), &mut invalid);
+    set.extend(load_or_report(state_rules, &mut invalid));
 
     // The first two sources live under the user's own global home. The in-repo
     // file travels with a clone and its `Allow` short-circuits the approval
@@ -272,8 +330,12 @@ pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Pat
     match crate::trust::read_trusted_project_file(global_home, repo_root, PROJECT_RULES_RELATIVE) {
         crate::trust::TrustedRead::Absent => {}
         crate::trust::TrustedRead::Trusted(raw) => {
-            if let Ok(file) = serde_yaml::from_str::<PermissionRulesFile>(&raw) {
-                set.extend(PermissionRuleSet::from_rules(file.rules));
+            match serde_yaml::from_str::<PermissionRulesFile>(&raw) {
+                Ok(file) => set.extend(PermissionRuleSet::from_rules(file.rules)),
+                Err(error) => invalid.push(InvalidRuleFile {
+                    path: repo_root.join(PROJECT_RULES_RELATIVE),
+                    error: format!("parse trusted in-repo permission rules: {error}"),
+                }),
             }
         }
         crate::trust::TrustedRead::Untrusted { path, digest } => {
@@ -285,9 +347,21 @@ pub fn load_merged_rules(global_home: &Path, state_rules: &Path, repo_root: &Pat
         }
     }
 
+    if !invalid.is_empty() {
+        set.mark_degraded();
+        for entry in &invalid {
+            tracing::warn!(
+                path = %entry.path.display(),
+                error = %entry.error,
+                "permission rules file could not be applied; rule-based decisions are degraded"
+            );
+        }
+    }
+
     MergedRules {
         rules: set,
         untrusted,
+        invalid,
     }
 }
 
@@ -331,15 +405,23 @@ pub fn always_rules_for(
         // An edit tool's "always" covers exactly the paths the user saw —
         // never the whole tool, which would let a later plan step rewrite
         // anything without asking. No paths → nothing durable.
+        //
+        // A path containing a glob metacharacter cannot be written as a
+        // durable path rule: the evaluator would read `*`/`?` as a pattern and
+        // the generated rule would cover paths the person never approved.
+        // Dropping it keeps the grant session-only, which is the safe
+        // direction. User-authored globs are unaffected.
         "apply_patch" | "replace" => paths
             .iter()
-            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .filter(|p| !contains_glob_metacharacter(p))
             .map(|p| {
                 allow(RuleMatch {
                     tool: Some(tool.to_string()),
                     command_prefix: None,
                     command_exact: None,
-                    write_path_glob: Some(p.trim().to_string()),
+                    write_path_glob: Some(p.to_string()),
                 })
             })
             .collect(),
@@ -517,6 +599,45 @@ mod tests {
             set.evaluate("apply_patch", None, &[PathBuf::from("README.md")]),
             RuleDecision::NoMatch
         );
+    }
+
+    #[test]
+    fn an_unparseable_rules_file_is_reported_not_read_as_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("permissions.yaml"), "rules: [ not: yaml\n").unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let merged = load_merged_rules(&home, &root.path().join("state.yaml"), &repo);
+        assert_eq!(merged.invalid.len(), 1, "{merged:?}");
+        assert!(
+            merged.invalid[0].path.ends_with("permissions.yaml"),
+            "{:?}",
+            merged.invalid[0]
+        );
+        assert!(
+            merged.rules.is_degraded(),
+            "an unreadable rule source must not look like a clean empty set"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_valid_empty_rules_file_is_not_degraded() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let merged = load_merged_rules(&home, &root.path().join("state.yaml"), &repo);
+        assert!(merged.invalid.is_empty());
+        assert!(!merged.rules.is_degraded());
+
+        std::fs::write(home.join("permissions.yaml"), "rules: []\n").unwrap();
+        let merged = load_merged_rules(&home, &root.path().join("state.yaml"), &repo);
+        assert!(merged.invalid.is_empty());
+        assert!(!merged.rules.is_degraded());
     }
 
     #[test]
@@ -1038,6 +1159,29 @@ mod write_path_tests {
         );
     }
 
+    /// A misspelled security key must not silently drop a constraint. The
+    /// file becomes degraded, and a degraded set forces a decision instead of
+    /// falling through to the profile's auto-allow.
+    #[test]
+    fn an_unknown_security_key_degrades_the_rule_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.yaml");
+        std::fs::write(
+            &path,
+            "rules:\n  - match: { tool: apply_patch, write_path_globe: \"docs/**\" }\n    effect: allow\n",
+        )
+        .unwrap();
+        assert!(
+            load_rules_file(&path).is_err(),
+            "a misspelled key must be a parse error, not a broader rule"
+        );
+        let merged = load_merged_rules(dir.path(), &path, dir.path());
+        assert!(
+            merged.rules.is_degraded(),
+            "the authorization path must see the file as incomplete"
+        );
+    }
+
     /// "Always" on an edit tool grants the paths the user approved, never
     /// the whole tool: a later edit elsewhere asks again.
     #[test]
@@ -1075,6 +1219,30 @@ mod write_path_tests {
         assert!(
             always_rules_for("replace", None, &[]).is_empty(),
             "no paths → nothing durable; the grant stays session-only"
+        );
+    }
+
+    /// A literal path that happens to contain `*` or `?` must not become a
+    /// durable glob: that would cover files the person never approved.
+    #[test]
+    fn an_approved_path_with_glob_characters_stays_session_only() {
+        for path in ["docs/*.md", "notes/?.txt", "a/**/b.rs"] {
+            assert!(
+                always_rules_for("apply_patch", None, &[path.to_string()]).is_empty(),
+                "{path} must not become a standing path rule"
+            );
+        }
+        // An ordinary literal path still becomes the exact durable rule.
+        let rules = always_rules_for("apply_patch", None, &["docs/report.md".to_string()]);
+        assert_eq!(rules.len(), 1);
+        let set = PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            set.evaluate("apply_patch", None, &[PathBuf::from("docs/report.md")]),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate("apply_patch", None, &[PathBuf::from("docs/other.md")]),
+            RuleDecision::NoMatch
         );
     }
 }

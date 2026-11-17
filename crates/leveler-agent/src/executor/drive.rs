@@ -7,8 +7,9 @@ use leveler_context::{
     FoldRequirement, ProjectInstruction, render_instructions, scoped_rule_sources,
 };
 use leveler_lifecycle::{
-    EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
-    VerificationRecordState, VerificationReport, VerificationStatus,
+    EvidenceLedger, FindingConfidence, FindingDetails, FindingKind, FindingSeverity,
+    ObjectiveAnchor, PlanState, ProgressCaps, ReviewDimension, TurnPhase, VerificationRecordState,
+    VerificationReport, VerificationStatus,
 };
 use leveler_model::{
     CompactionRecord, ContentPart, ControlContext, FinishReason, Message, ModelError,
@@ -35,16 +36,18 @@ use super::{
 use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::executor::scope_gate;
 use crate::injected_tools::{
-    CLAIM_WRITE_SCOPE_TOOL, COMMIT_INVALID_DECLARATION_KIND, COMMIT_TASK_TOOL, DECLARE_INTENT_TOOL,
-    DECLARE_SCOPE_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope, PermissionRequestOutcome,
-    REPORT_FINDING_TOOL, REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants,
-    UPDATE_GOAL_TOOL, advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition,
-    commit_task_tool_definition, declare_intent_tool_definition, declare_scope_tool_definition,
-    escalation_action, escalation_missing_axis_message, get_goal_scope_tool_definition,
-    is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
-    permission_already_denied_message, report_finding_tool_definition,
+    ADJUDICATE_FINDING_TOOL, CLAIM_WRITE_SCOPE_TOOL, COMMIT_INVALID_DECLARATION_KIND,
+    COMMIT_TASK_TOOL, DECLARE_INTENT_TOOL, DECLARE_SCOPE_TOOL, GET_GOAL_SCOPE_TOOL, GrantScope,
+    PermissionRequestOutcome, REPORT_FINDING_TOOL, REPORT_INVESTIGATION_TOOL, REPORT_REVIEW_TOOL,
+    REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
+    adjudicate_finding_tool_definition, advertise_escalation, apply_turn_grants,
+    claim_write_scope_tool_definition, commit_task_tool_definition, declare_intent_tool_definition,
+    declare_scope_tool_definition, escalation_action, escalation_missing_axis_message,
+    get_goal_scope_tool_definition, is_escalatable_tool, is_user_input_tool, parse_escalation,
+    parse_permission_request, permission_already_denied_message, report_finding_tool_definition,
+    report_investigation_tool_definition, report_review_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
-    spawn_agent_tool_definition, update_goal_tool_definition,
+    review_investigation_tool_definition, spawn_agent_tool_definition, update_goal_tool_definition,
 };
 use crate::nudges::{
     goal_continuation_nudge, goal_settled_delivery_nudge, plan_unresolved_nudge,
@@ -731,7 +734,21 @@ impl Executor {
         }
         // A sub-agent shouldn't spawn its own sub-agents; product kill-switch
         // can also hide spawn_agent entirely.
-        if (self.tool_context.policy.unrestricted_execution() || self.policy.allow_delegation)
+        //
+        // The one exception is the Lead Reviewer: it may launch independent
+        // READ-ONLY investigations. That is a different capability from the
+        // ordinary spawn surface — its advertised schema has only the
+        // objective and display title, and host admission fixes the role,
+        // workspace and object. It never receives the ordinary definition, so
+        // a review cannot gain a writer, a declarative agent or a scope.
+        let review_seat = self.depth == 1 && self.agent_role == AgentRole::Reviewer;
+        let investigation_seat = self.depth > 0 && self.agent_role == AgentRole::Investigator;
+        if review_seat {
+            if self.policy.review_investigation {
+                tools.push(review_investigation_tool_definition());
+            }
+        } else if !investigation_seat
+            && (self.tool_context.policy.unrestricted_execution() || self.policy.allow_delegation)
             && self.depth < MAX_SUB_AGENT_DEPTH
         {
             tools.push(spawn_agent_tool_definition());
@@ -745,6 +762,20 @@ impl Executor {
         // settlement notice and decides what to do, in its own words.
         if self.depth > 0 {
             tools.push(report_finding_tool_definition());
+        }
+        // A reviewer additionally declares coverage, limitations and its
+        // conclusion as data. It is advertised only on a review seat: an
+        // explorer/worker has no review verdict to make.
+        if self.depth > 0 && self.agent_role == AgentRole::Reviewer {
+            tools.push(report_review_tool_definition());
+            // Investigator findings are candidates. Only the Lead Reviewer's
+            // explicit adjudication turns one into a formal finding.
+            tools.push(adjudicate_finding_tool_definition());
+        }
+        // An independent investigation declares what it established as data.
+        // The parent reviewer combines that evidence; it is not a verdict.
+        if investigation_seat {
+            tools.push(report_investigation_tool_definition());
         }
         // The one structured entry through which a user message can continue,
         // pause, re-bound or cancel a goal. It is advertised whenever the turn
@@ -806,10 +837,28 @@ impl Executor {
         };
         let mut counts: std::collections::BTreeMap<crate::capability::CapabilityId, usize> =
             std::collections::BTreeMap::new();
+        let review_seat = self.depth > 0
+            && matches!(
+                self.agent_role,
+                AgentRole::Reviewer | AgentRole::Investigator
+            );
         for tool in self.candidate_tool_definitions() {
             let Some(id) = tool_capability(&tool.name) else {
                 continue;
             };
+            // A review seat cannot call `capability`, and its role-default
+            // investigation packs are already on the surface without an
+            // enable. Listing them as "on offer" would tell the model to
+            // enable what it already holds through a tool it does not have.
+            if review_seat
+                && matches!(
+                    id,
+                    crate::capability::CapabilityId::CodeIntelligence
+                        | crate::capability::CapabilityId::MultiAgent
+                )
+            {
+                continue;
+            }
             // Only a pack the host can really give the model: availability and
             // permission are host facts, exposure belongs to this request.
             if !state.available(id) || !state.is_permitted(id) || state.exposed(id) {
@@ -822,13 +871,31 @@ impl Executor {
 
     pub(crate) fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = self.candidate_tool_definitions();
+        let review_seat = self.depth > 0
+            && matches!(
+                self.agent_role,
+                AgentRole::Reviewer | AgentRole::Investigator
+            );
 
         if let Some(state) = &self.capabilities {
             // Exposure is the same in every permission mode: FullAccess
             // removes the ASK/DENY boundary, not the model's ability to
             // discover an optional pack through the catalog.
-            tools.retain(|tool| state.permits_tool(&tool.name));
-            tools.push(crate::capability::control_definition());
+            if review_seat {
+                // A review child cannot call `capability`, so an on-demand
+                // pack would be unreachable to it. Its role's read-only code-
+                // intelligence pack is exposed directly; host availability
+                // and permission still decide whether it exists at all.
+                tools.retain(|tool| state.permits_tool_for_review(&tool.name));
+            } else {
+                tools.retain(|tool| state.permits_tool(&tool.name));
+            }
+            // A reviewer seat's toolset is fixed. Offering `capability` would
+            // let it spend rounds enabling packs that its read-only
+            // projection still cannot hold.
+            if !review_seat {
+                tools.push(crate::capability::control_definition());
+            }
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
@@ -884,7 +951,12 @@ impl Executor {
             tracing::info!(event="capability_available",catalog_tokens=leveler_model::estimate_text(&state.catalog().to_string()),catalog=%state.catalog(),packs_on_offer=?on_offer.iter().map(|(id, n)| format!("{}:{n}", id.as_str())).collect::<Vec<_>>());
             tracing::info!(event="tool_surface_changed",reason="initial",active_capabilities=?state.active(),tool_count=tools.len(),schema_tokens=leveler_model::estimate_tool_definitions(&tools),tool_names=?tools.iter().map(|tool|&tool.name).collect::<Vec<_>>());
         }
-        if self.capabilities.is_some() {
+        let review_seat = self.depth > 0
+            && matches!(
+                self.agent_role,
+                AgentRole::Reviewer | AgentRole::Investigator
+            );
+        if self.capabilities.is_some() && !review_seat {
             control_context.blocks.push(PromptSegment::control(
                 "capability_discovery",
                 PromptSource::ExecutionState,
@@ -1421,7 +1493,7 @@ impl<'a> Drive<'a> {
         rt: &mut LoopContext,
         event: AgentEvent,
     ) -> Result<(), AgentError> {
-        if let AgentEvent::SubAgentModelRequest { record } = event {
+        if let AgentEvent::SubAgentModelRequest { record } = &event {
             self.progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
             // Already priced by the child against its own model.
             if self.executor.model_request_store.is_some() {
@@ -1430,12 +1502,18 @@ impl<'a> Drive<'a> {
                     record.cost_usd_micros,
                     record.estimated_tokens,
                 );
+                // A review's usage projection is built from these records.
+                // Nested investigations are otherwise recorded only in the
+                // reviewer's live budget, so the durable review spend would
+                // omit them. No second persistence: the child's own sink
+                // already wrote the row.
+                if self.executor.agent_role == AgentRole::Reviewer {
+                    (self.observer)(event);
+                }
                 Ok(())
             } else {
-                {
-                    let estimate = record.estimated_tokens;
-                    self.record_request(rt, *record, estimate).await
-                }
+                let estimate = record.estimated_tokens;
+                self.record_request(rt, *record.clone(), estimate).await
             }
         } else {
             (self.observer)(event);
@@ -1888,6 +1966,7 @@ impl<'a> Drive<'a> {
                 &id,
                 &nickname,
                 role,
+                self.executor.agent_role == AgentRole::Reviewer,
                 &result,
             );
             clear_outstanding_child(&mut self.progress, &id);
@@ -1989,6 +2068,9 @@ impl<'a> Drive<'a> {
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
                     findings: Vec::new(),
+                    review: None,
+                    investigation: None,
+                    evidence_revision: 0,
                 };
                 let (content, _) = fold_child_settlement(
                     &mut self.progress,
@@ -1999,6 +2081,7 @@ impl<'a> Drive<'a> {
                     &child.id,
                     &child.nickname,
                     child.role,
+                    self.executor.agent_role == AgentRole::Reviewer,
                     &result,
                 );
                 self.settlements_durable().await?;
@@ -2113,6 +2196,7 @@ impl<'a> Drive<'a> {
                 &child.id,
                 &child.nickname,
                 child.role,
+                self.executor.agent_role == AgentRole::Reviewer,
                 &result,
             );
             clear_outstanding_child(&mut self.progress, &child.id);
@@ -4974,10 +5058,26 @@ impl AgentHarness for Drive<'_> {
                 && !advertised.contains(&call.name)
                 && !(call.name == "ask_user" && advertised.contains("request_user_input"))
             {
-                let content = format!(
-                    "Tool {} is not exposed on this request. Discover and enable its capability first.",
-                    call.name
-                );
+                // A revision-bound review removes live-worktree tools for a
+                // reason that is not capability disclosure. Telling the model
+                // to "enable its capability" would send it looking for a
+                // control that does not exist.
+                let content = match self.executor.tool_context.review_revision() {
+                    Some(revision)
+                        if self.executor.agent_role == AgentRole::Reviewer
+                            && Executor::WORKTREE_ONLY_REVIEW_TOOLS
+                                .contains(&call.name.as_str()) =>
+                    {
+                        format!(
+                            "本次审查对象是固定版本 `{revision}`，`{}` 读取的是当前工作区，不能作为该对象的证据；请使用 `git_history` 查询该版本的源码、历史与搜索。",
+                            call.name
+                        )
+                    }
+                    _ => format!(
+                        "Tool {} is not exposed on this request. Discover and enable its capability first.",
+                        call.name
+                    ),
+                };
                 (self.observer)(AgentEvent::ToolCall {
                     id: call.id.to_string(),
                     name: call.name.clone(),
@@ -5006,6 +5106,37 @@ impl AgentHarness for Drive<'_> {
                 continue;
             }
             if call.name == "capability" && self.executor.capabilities.is_some() {
+                if self.executor.depth > 0 && self.executor.agent_role == AgentRole::Reviewer {
+                    let message = "a read-only review seat cannot enable capability packs; \
+                                   the reviewer's tools are fixed."
+                        .to_string();
+                    (self.observer)(AgentEvent::ToolCall {
+                        id: call.id.to_string(),
+                        name: call.name.clone(),
+                        arguments: compact_json(&call.arguments),
+                        parallel: false,
+                        model_step: Some(model_steps),
+                    });
+                    (self.observer)(AgentEvent::ToolResult {
+                        exit_code: None,
+                        stop: None,
+                        execution_status: None,
+                        id: call.id.to_string(),
+                        name: call.name.clone(),
+                        is_error: true,
+                        preview: preview(&message),
+                        applied_diff: None,
+                    });
+                    results[index] = Some(ContentPart::ToolResult {
+                        result: ToolResultContent {
+                            call_id: call.id,
+                            content: message,
+                            is_error: true,
+                        },
+                    });
+                    denied_calls_this_round += 1;
+                    continue;
+                }
                 (self.observer)(AgentEvent::ToolCall {
                     id: call.id.to_string(),
                     name: call.name.clone(),
@@ -5140,26 +5271,30 @@ impl AgentHarness for Drive<'_> {
                         false,
                         "report_finding requires a non-empty `summary`.".to_string(),
                     ),
-                    Some(kind) => {
-                        let field = |name: &str| {
-                            call.arguments
-                                .get(name)
-                                .and_then(|v| v.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(String::from)
-                        };
-                        let id = self.ledger.record_finding(
-                            kind,
-                            summary,
-                            field("file"),
-                            field("symbol"),
-                        );
-                        (self.observer)(AgentEvent::EvidenceLedgerUpdated {
-                            ledger: self.ledger.clone(),
-                        });
-                        (true, format!("Finding {id} recorded."))
-                    }
+                    Some(kind) => match finding_details_from_args(&call.arguments) {
+                        Err(message) => (false, message),
+                        Ok(details) => {
+                            let field = |name: &str| {
+                                call.arguments
+                                    .get(name)
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                            };
+                            let id = self.ledger.record_finding_with(
+                                kind,
+                                summary,
+                                field("file"),
+                                field("symbol"),
+                                details,
+                            );
+                            (self.observer)(AgentEvent::EvidenceLedgerUpdated {
+                                ledger: self.ledger.clone(),
+                            });
+                            (true, format!("Finding {id} recorded."))
+                        }
+                    },
                 };
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
@@ -5167,6 +5302,170 @@ impl AgentHarness for Drive<'_> {
                     execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: REPORT_FINDING_TOOL.to_string(),
+                    is_error: !ok,
+                    preview: preview(&msg),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content: msg,
+                        is_error: !ok,
+                    },
+                });
+                continue;
+            }
+
+            // A reviewer declares the structured result of the review. The
+            // declaration rides the evidence ledger, so it persists through
+            // the same snapshots as findings and survives an abnormal stop.
+            if call.name == REPORT_REVIEW_TOOL
+                && self.executor.depth > 0
+                && self.executor.agent_role == AgentRole::Reviewer
+            {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: REPORT_REVIEW_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
+                let (ok, msg) = match review_verdict_from_args(&call.arguments) {
+                    Err(message) => (false, message),
+                    Ok(verdict) => {
+                        let coverage = verdict.coverage.len();
+                        let limitations = verdict.limitations.len();
+                        self.ledger.set_review_verdict(verdict);
+                        (self.observer)(AgentEvent::EvidenceLedgerUpdated {
+                            ledger: self.ledger.clone(),
+                        });
+                        (
+                            true,
+                            format!(
+                                "Review verdict recorded: {} coverage dimension(s), \
+                                 {limitations} limitation(s).",
+                                coverage
+                            ),
+                        )
+                    }
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: REPORT_REVIEW_TOOL.to_string(),
+                    is_error: !ok,
+                    preview: preview(&msg),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content: msg,
+                        is_error: !ok,
+                    },
+                });
+                continue;
+            }
+
+            // A reviewer adjudicates one candidate reported by an independent
+            // investigator. The Ledger owns the rule; this boundary only
+            // validates the typed arguments.
+            if call.name == ADJUDICATE_FINDING_TOOL
+                && self.executor.depth > 0
+                && self.executor.agent_role == AgentRole::Reviewer
+            {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: ADJUDICATE_FINDING_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
+                let (ok, msg) = match finding_adjudication_from_args(&call.arguments) {
+                    Err(message) => (false, message),
+                    Ok((finding_id, decision)) => {
+                        let disposition = decision.disposition.label();
+                        match self.ledger.adjudicate_finding(&finding_id, decision) {
+                            Err(message) => (false, message),
+                            Ok(()) => {
+                                (self.observer)(AgentEvent::EvidenceLedgerUpdated {
+                                    ledger: self.ledger.clone(),
+                                });
+                                (
+                                    true,
+                                    format!("Finding {finding_id} recorded as {disposition}."),
+                                )
+                            }
+                        }
+                    }
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: ADJUDICATE_FINDING_TOOL.to_string(),
+                    is_error: !ok,
+                    preview: preview(&msg),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content: msg,
+                        is_error: !ok,
+                    },
+                });
+                continue;
+            }
+
+            // An independent investigator declares what it established. The
+            // record rides the same evidence ledger as findings and the review
+            // verdict, so it persists through the same snapshots and survives
+            // an abnormal stop. It is evidence for the Lead Reviewer, never a
+            // second verdict.
+            if call.name == REPORT_INVESTIGATION_TOOL
+                && self.executor.depth > 0
+                && self.executor.agent_role == AgentRole::Investigator
+            {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.as_str().to_string(),
+                    name: REPORT_INVESTIGATION_TOOL.to_string(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                    model_step: Some(model_steps),
+                });
+                let (ok, msg) = match investigation_record_from_args(
+                    &call.arguments,
+                    self.executor.tool_context.review_revision(),
+                ) {
+                    Err(message) => (false, message),
+                    Ok(record) => {
+                        let facts = record.observed_facts.len();
+                        let constraints = record.business_constraints.len();
+                        let questions = record.unresolved_questions.len();
+                        self.ledger.set_investigation(record);
+                        (self.observer)(AgentEvent::EvidenceLedgerUpdated {
+                            ledger: self.ledger.clone(),
+                        });
+                        (
+                            true,
+                            format!(
+                                "Investigation recorded: {facts} observed fact(s), \
+                                 {constraints} business constraint(s), {questions} unresolved \
+                                 question(s)."
+                            ),
+                        )
+                    }
+                };
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.as_str().to_string(),
+                    name: REPORT_INVESTIGATION_TOOL.to_string(),
                     is_error: !ok,
                     preview: preview(&msg),
                     applied_diff: None,
@@ -7789,7 +8088,7 @@ impl AgentHarness for Drive<'_> {
                         "spawn_agent `{field}` must be a string (or omitted); it was {}.",
                         call.arguments[field]
                     ))
-                } else if self.executor.depth >= MAX_SUB_AGENT_DEPTH {
+                } else if !self.executor.can_spawn_children() {
                     Some("Sub-agents may not spawn their own sub-agents.".to_string())
                 } else if task.is_empty() {
                     Some("spawn_agent requires a non-empty task.".to_string())
@@ -8014,6 +8313,7 @@ impl AgentHarness for Drive<'_> {
                         residual,
                         token.clone(),
                         parent_wall,
+                        None,
                     );
                     let handle = tokio::spawn(fut);
                     self.progress.outstanding_children.push(format!(
@@ -8081,6 +8381,7 @@ impl AgentHarness for Drive<'_> {
                             residual,
                             token,
                             parent_wall,
+                            None,
                         )
                         .await;
                     (index, call_id, id, nickname, role, result)
@@ -8118,6 +8419,7 @@ impl AgentHarness for Drive<'_> {
                             &id,
                             &nickname,
                             role,
+                            self.executor.agent_role == AgentRole::Reviewer,
                             &result,
                         );
                         let content = leveler_tools::registry::cap_output_with(
@@ -9185,6 +9487,9 @@ fn fold_child_settlement(
     id: &str,
     nickname: &str,
     role: AgentRole,
+    // The parent is the review's Lead Reviewer, so this settlement is new
+    // evidence for the review's formal report.
+    settles_review_evidence: bool,
     result: &super::handlers::SubAgentRunResult,
 ) -> (String, bool) {
     // Roll the sub-agent's work into the parent task epoch. Its SPEND does not
@@ -9200,16 +9505,28 @@ fn fold_child_settlement(
     // Adopt the child's typed findings into the parent ledger and persist the
     // snapshot; the parent-facing text names the adopted ids.
     //
+    // An Investigator's findings are CANDIDATES: the Lead Reviewer's
+    // `adjudicate_finding` is the only path to a formal finding. Adopting them
+    // as ordinary findings would let a child's proposal become a defect count
+    // the Lead never decided.
+    //
     // A Worker that did not finish used to also get a host-authored BLOCKING
     // finding here, so completion could be refused over it. The mechanical
     // fact — this child started and did not report — is the `ok: false`
     // terminal below; what to do about it is the model's call.
+    let revision_before = ledger.evidence_revision;
+    if settles_review_evidence {
+        ledger.note_child_settlement(id);
+    }
     let adopted: Vec<String> = result
         .findings
         .iter()
-        .map(|f| ledger.adopt_finding(id, role.label(), f))
+        .map(|f| match role {
+            AgentRole::Investigator => ledger.adopt_candidate(id, role.label(), f),
+            _ => ledger.adopt_finding(id, role.label(), f),
+        })
         .collect();
-    if !adopted.is_empty() {
+    if !adopted.is_empty() || ledger.evidence_revision != revision_before {
         observer(AgentEvent::EvidenceLedgerUpdated {
             ledger: ledger.clone(),
         });
@@ -9217,6 +9534,12 @@ fn fold_child_settlement(
     // N1: the status line leads, so the parent can tell "finished, nothing to
     // flag" from "stopped before it found anything".
     let mut content = result.result.for_parent(nickname);
+    if let Some(investigation) = &result.investigation {
+        content.push_str("\n\n");
+        content.push_str(&crate::sub_agent::investigation_settlement_text(
+            investigation,
+        ));
+    }
     if !result.modified_files.is_empty() {
         content.push_str(&format!(
             "\nFiles touched: {}",
@@ -9224,7 +9547,16 @@ fn fold_child_settlement(
         ));
     }
     if !adopted.is_empty() {
-        let adopted_line = format!("Structured findings adopted: {}.", adopted.join(", "));
+        let adopted_line = if role == AgentRole::Investigator {
+            format!(
+                "Candidate findings recorded: {}. These are NOT formal findings of this \
+                 review: call adjudicate_finding for each one (adopted, rejected, \
+                 duplicate or unresolved). A candidate you do not mention stays unresolved.",
+                adopted.join(", ")
+            )
+        } else {
+            format!("Structured findings adopted: {}.", adopted.join(", "))
+        };
         if let Some(pos) = content.find('\n') {
             content.insert_str(pos + 1, &format!("{adopted_line}\n"));
         } else {
@@ -9280,6 +9612,9 @@ fn join_settlement(
             progress: leveler_lifecycle::ProgressLedger::default(),
             modified_files: Vec::new(),
             findings: Vec::new(),
+            review: None,
+            investigation: None,
+            evidence_revision: 0,
         },
     }
 }
@@ -11313,5 +11648,812 @@ mod workspace_mutation_tests {
             &format!("{root_text}/../outside.txt")
         ));
         assert!(!path_is_within(&root, "/tmp/captured-evidence.txt"));
+    }
+}
+
+/// Parse the optional review fields of `report_finding`.
+///
+/// Absent (or null) is `None`; a PRESENT but invalid value is refused at the
+/// tool boundary rather than silently dropped. Ordinary explorer/worker calls
+/// supply none of these and get the old shape.
+fn finding_details_from_args(arguments: &serde_json::Value) -> Result<FindingDetails, String> {
+    fn text(arguments: &serde_json::Value, name: &str) -> Result<Option<String>, String> {
+        match arguments.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                let trimmed = value.trim();
+                Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+            }
+            Some(_) => Err(format!("report_finding `{name}` must be a string.")),
+        }
+    }
+
+    let dimension = match text(arguments, "dimension")? {
+        None => None,
+        Some(value) => Some(ReviewDimension::parse(&value).ok_or_else(|| {
+            format!(
+                "report_finding `dimension` must be one of code, business, security, \
+                 architecture, test, delivery, session; got `{value}`."
+            )
+        })?),
+    };
+    let severity = match text(arguments, "severity")? {
+        None => None,
+        Some(value) => Some(FindingSeverity::parse(&value).ok_or_else(|| {
+            format!("report_finding `severity` must be one of p0, p1, p2, p3; got `{value}`.")
+        })?),
+    };
+    let confidence = match text(arguments, "confidence")? {
+        None => None,
+        Some(value) => Some(FindingConfidence::parse(&value).ok_or_else(|| {
+            format!("report_finding `confidence` must be one of high, medium, low; got `{value}`.")
+        })?),
+    };
+    let line = match arguments.get("line") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(number)) => {
+            let value = number
+                .as_u64()
+                .filter(|value| (1..=u64::from(u32::MAX)).contains(value))
+                .ok_or_else(|| {
+                    "report_finding `line` must be a positive integer that fits u32.".to_string()
+                })?;
+            Some(value as u32)
+        }
+        Some(_) => {
+            return Err("report_finding `line` must be a positive integer that fits u32.".into());
+        }
+    };
+    let reproduced = match arguments.get("reproduced") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => return Err("report_finding `reproduced` must be a boolean.".into()),
+    };
+    Ok(FindingDetails {
+        title: text(arguments, "title")?,
+        dimension,
+        severity,
+        confidence,
+        line,
+        evidence: text(arguments, "evidence")?,
+        impact: text(arguments, "impact")?,
+        recommendation: text(arguments, "recommendation")?,
+        reproduced,
+        ..FindingDetails::default()
+    })
+}
+
+/// Parse the Lead Reviewer's structured decision about one candidate.
+///
+/// Every value is typed at this boundary; the ledger validates the decision
+/// against the findings it actually holds. The disposition vocabulary never
+/// comes from the model's prose.
+fn finding_adjudication_from_args(
+    arguments: &serde_json::Value,
+) -> Result<(String, leveler_lifecycle::FindingAdjudication), String> {
+    use leveler_lifecycle::{
+        FindingAdjudication, FindingConfidence, FindingDisposition, FindingSeverity,
+    };
+
+    const MAX_ID: usize = 128;
+    const MAX_REASON: usize = 4 * 1024;
+    const MAX_TITLE: usize = 512;
+    const MAX_REFS: usize = 20;
+
+    fn required_text(
+        arguments: &serde_json::Value,
+        field: &str,
+        max: usize,
+    ) -> Result<String, String> {
+        let Some(raw) = arguments.get(field).and_then(|value| value.as_str()) else {
+            return Err(format!("adjudicate_finding `{field}` must be a string."));
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!("adjudicate_finding `{field}` must not be empty."));
+        }
+        if trimmed.len() > max {
+            return Err(format!(
+                "adjudicate_finding `{field}` exceeds the {max}-byte bound."
+            ));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn optional_text(
+        arguments: &serde_json::Value,
+        field: &str,
+        max: usize,
+    ) -> Result<Option<String>, String> {
+        match arguments.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(raw)) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                if trimmed.len() > max {
+                    return Err(format!(
+                        "adjudicate_finding `{field}` exceeds the {max}-byte bound."
+                    ));
+                }
+                Ok(Some(trimmed.to_string()))
+            }
+            Some(_) => Err(format!("adjudicate_finding `{field}` must be a string.")),
+        }
+    }
+
+    let finding_id = required_text(arguments, "finding_id", MAX_ID)?;
+    let disposition_raw = required_text(arguments, "disposition", 32)?;
+    let disposition = FindingDisposition::parse(&disposition_raw).ok_or_else(|| {
+        format!(
+            "adjudicate_finding `disposition` must be adopted, rejected, unresolved or \
+             duplicate; got `{disposition_raw}`."
+        )
+    })?;
+    let reason = optional_text(arguments, "reason", MAX_REASON)?;
+    let evidence = match arguments.get("evidence_refs") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(refs)) => {
+            if refs.len() > MAX_REFS {
+                return Err(format!(
+                    "adjudicate_finding `evidence_refs` may hold at most {MAX_REFS} entries."
+                ));
+            }
+            refs.iter()
+                .map(|reference| required_text_value(reference, "evidence_refs", 1024))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(_) => {
+            return Err("adjudicate_finding `evidence_refs` must be an array of strings.".into());
+        }
+    };
+    let severity = match optional_text(arguments, "severity", 8)? {
+        None => None,
+        Some(value) => Some(FindingSeverity::parse(&value).ok_or_else(|| {
+            format!("adjudicate_finding `severity` must be one of p0, p1, p2, p3; got `{value}`.")
+        })?),
+    };
+    let confidence = match optional_text(arguments, "confidence", 16)? {
+        None => None,
+        Some(value) => Some(FindingConfidence::parse(&value).ok_or_else(|| {
+            format!(
+                "adjudicate_finding `confidence` must be one of high, medium, low; got `{value}`."
+            )
+        })?),
+    };
+    let title = optional_text(arguments, "title", MAX_TITLE)?;
+    let duplicate_of = optional_text(arguments, "duplicate_of", MAX_ID)?;
+    if disposition == FindingDisposition::Duplicate && duplicate_of.is_none() {
+        return Err(
+            "adjudicate_finding `duplicate` requires `duplicate_of` naming the surviving \
+             finding."
+                .to_string(),
+        );
+    }
+    if disposition != FindingDisposition::Duplicate && duplicate_of.is_some() {
+        return Err(
+            "adjudicate_finding `duplicate_of` only applies to disposition `duplicate`."
+                .to_string(),
+        );
+    }
+    Ok((
+        finding_id,
+        FindingAdjudication {
+            disposition,
+            reason,
+            evidence,
+            duplicate_of,
+            severity,
+            confidence,
+            title,
+        },
+    ))
+}
+
+fn required_text_value(
+    value: &serde_json::Value,
+    field: &str,
+    max: usize,
+) -> Result<String, String> {
+    let Some(raw) = value.as_str() else {
+        return Err(format!(
+            "adjudicate_finding `{field}` entries must be strings."
+        ));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "adjudicate_finding `{field}` entries must not be empty."
+        ));
+    }
+    if trimmed.len() > max {
+        return Err(format!(
+            "adjudicate_finding `{field}` entry exceeds the {max}-byte bound."
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Parse the structured `report_review` arguments.
+///
+/// The reviewer supplies meaning; the runtime only enforces the wire shape and
+/// bounds. An absent array is empty, but a PRESENT value of the wrong type or
+/// an unknown enum label is refused at the tool boundary rather than dropped.
+fn review_verdict_from_args(
+    arguments: &serde_json::Value,
+) -> Result<leveler_lifecycle::ReviewVerdict, String> {
+    use leveler_lifecycle::{
+        ReviewConclusion, ReviewCoverage, ReviewCoverageStatus, ReviewLimitation,
+        ReviewLimitationKind, ReviewVerdict,
+    };
+
+    const MAX_TEXT: usize = 4 * 1024;
+    const MAX_REFS: usize = 20;
+    const MAX_LIMITATIONS: usize = 32;
+
+    fn text(value: &serde_json::Value, field: &str) -> Result<String, String> {
+        let Some(raw) = value.as_str() else {
+            return Err(format!("report_review `{field}` must be a string."));
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!("report_review `{field}` must not be empty."));
+        }
+        if trimmed.len() > MAX_TEXT {
+            return Err(format!(
+                "report_review `{field}` exceeds the {MAX_TEXT}-byte bound."
+            ));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn optional_text(
+        value: Option<&serde_json::Value>,
+        field: &str,
+    ) -> Result<Option<String>, String> {
+        match value {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => Ok(Some(text(value, field)?)),
+        }
+    }
+
+    let conclusion_raw = arguments
+        .get("conclusion")
+        .ok_or_else(|| "report_review requires `conclusion`.".to_string())?;
+    let conclusion_text = text(conclusion_raw, "conclusion")?;
+    let conclusion = ReviewConclusion::parse(&conclusion_text).ok_or_else(|| {
+        format!(
+            "report_review `conclusion` must be issues_found, no_issues_found or \
+             inconclusive; got `{conclusion_text}`."
+        )
+    })?;
+
+    let coverage = match arguments.get("coverage") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(entries)) => {
+            if entries.len() > 7 {
+                return Err("report_review `coverage` may hold at most 7 dimensions.".into());
+            }
+            let mut out: Vec<ReviewCoverage> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let dimension_raw = text(
+                    entry
+                        .get("dimension")
+                        .ok_or_else(|| "a coverage entry requires `dimension`.".to_string())?,
+                    "coverage.dimension",
+                )?;
+                let dimension = ReviewDimension::parse(&dimension_raw).ok_or_else(|| {
+                    format!("report_review coverage dimension `{dimension_raw}` is unknown.")
+                })?;
+                if out.iter().any(|coverage| coverage.dimension == dimension) {
+                    return Err(format!(
+                        "report_review lists dimension `{dimension_raw}` more than once."
+                    ));
+                }
+                let status_raw = text(
+                    entry
+                        .get("status")
+                        .ok_or_else(|| "a coverage entry requires `status`.".to_string())?,
+                    "coverage.status",
+                )?;
+                let status = ReviewCoverageStatus::parse(&status_raw).ok_or_else(|| {
+                    format!("report_review coverage status `{status_raw}` is unknown.")
+                })?;
+                let scope = optional_text(entry.get("scope"), "coverage.scope")?;
+                let limitations = optional_text(entry.get("limitations"), "coverage.limitations")?;
+                let evidence_refs = match entry.get("evidence_refs") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(refs)) => {
+                        if refs.len() > MAX_REFS {
+                            return Err(format!(
+                                "report_review coverage `evidence_refs` may hold at most \
+                                 {MAX_REFS} entries."
+                            ));
+                        }
+                        refs.iter()
+                            .map(|reference| text(reference, "coverage.evidence_refs"))
+                            .collect::<Result<Vec<_>, _>>()?
+                    }
+                    Some(_) => {
+                        return Err(
+                            "report_review `coverage.evidence_refs` must be an array.".into()
+                        );
+                    }
+                };
+                out.push(ReviewCoverage {
+                    dimension,
+                    status,
+                    scope,
+                    evidence_refs,
+                    limitations,
+                });
+            }
+            out
+        }
+        Some(_) => return Err("report_review `coverage` must be an array.".into()),
+    };
+
+    let limitations = match arguments.get("limitations") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(entries)) => {
+            if entries.len() > MAX_LIMITATIONS {
+                return Err(format!(
+                    "report_review `limitations` may hold at most {MAX_LIMITATIONS} entries."
+                ));
+            }
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let kind_raw = text(
+                    entry
+                        .get("kind")
+                        .ok_or_else(|| "a limitation requires `kind`.".to_string())?,
+                    "limitations.kind",
+                )?;
+                let kind = ReviewLimitationKind::parse(&kind_raw).ok_or_else(|| {
+                    format!("report_review limitation kind `{kind_raw}` is unknown.")
+                })?;
+                if kind == ReviewLimitationKind::ObjectChanged {
+                    return Err(
+                        "report_review `object_changed` is a runtime observation, not a                          reviewer-declared limitation."
+                            .into(),
+                    );
+                }
+                let detail = text(
+                    entry
+                        .get("detail")
+                        .ok_or_else(|| "a limitation requires `detail`.".to_string())?,
+                    "limitations.detail",
+                )?;
+                out.push(ReviewLimitation { kind, detail });
+            }
+            out
+        }
+        Some(_) => return Err("report_review `limitations` must be an array.".into()),
+    };
+
+    // The complete formal report body. This is the report of record; the
+    // reviewer's final chat message is never used as a substitute.
+    let report_raw = arguments
+        .get("report")
+        .ok_or_else(|| "report_review requires the complete `report` body.".to_string())?;
+    const MAX_REPORT: usize = 64 * 1024;
+    let Some(report_text) = report_raw.as_str() else {
+        return Err("report_review `report` must be a string.".into());
+    };
+    let report_text = report_text.trim();
+    if report_text.is_empty() {
+        return Err("report_review `report` must not be empty.".into());
+    }
+    if report_text.len() > MAX_REPORT {
+        return Err(format!(
+            "report_review `report` exceeds the {MAX_REPORT}-byte bound."
+        ));
+    }
+
+    Ok(ReviewVerdict {
+        conclusion,
+        coverage,
+        limitations,
+        report: Some(report_text.to_string()),
+        report_revision: None,
+        evidence_revision: None,
+    })
+}
+
+/// Parse the model-authored structured investigation result. Every external
+/// input is bounded here; a malformed value is refused instead of being
+/// coerced into an empty reassurance.
+fn investigation_record_from_args(
+    arguments: &serde_json::Value,
+    review_revision: Option<&str>,
+) -> Result<leveler_lifecycle::InvestigationRecord, String> {
+    use leveler_lifecycle::{InvestigationFact, InvestigationRecord};
+
+    const MAX_OBJECTIVE: usize = 2 * 1024;
+    const MAX_TEXT: usize = 1024;
+    const MAX_ITEMS: usize = 16;
+    const MAX_FACT_REFS: usize = 4;
+
+    fn text(value: &serde_json::Value, field: &str, max: usize) -> Result<String, String> {
+        let Some(raw) = value.as_str() else {
+            return Err(format!("report_investigation `{field}` must be a string."));
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!("report_investigation `{field}` must not be empty."));
+        }
+        if trimmed.len() > max {
+            return Err(format!(
+                "report_investigation `{field}` exceeds the {max}-byte bound."
+            ));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn list(
+        arguments: &serde_json::Value,
+        field: &str,
+        max_items: usize,
+        max_text: usize,
+    ) -> Result<Vec<String>, String> {
+        match arguments.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(items)) => {
+                if items.len() > max_items {
+                    return Err(format!(
+                        "report_investigation `{field}` may hold at most {max_items} entries."
+                    ));
+                }
+                items
+                    .iter()
+                    .map(|item| text(item, field, max_text))
+                    .collect()
+            }
+            Some(_) => Err(format!(
+                "report_investigation `{field}` must be an array of strings."
+            )),
+        }
+    }
+
+    let objective_raw = arguments
+        .get("objective")
+        .ok_or_else(|| "report_investigation requires `objective`.".to_string())?;
+    let objective = text(objective_raw, "objective", MAX_OBJECTIVE)?;
+
+    let observed_facts = match arguments.get("observed_facts") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            if items.len() > MAX_ITEMS {
+                return Err(format!(
+                    "report_investigation `observed_facts` may hold at most {MAX_ITEMS} entries."
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let statement = text(
+                    item.get("statement").ok_or_else(|| {
+                        "an observed_fact requires a non-empty `statement`.".to_string()
+                    })?,
+                    "observed_facts.statement",
+                    MAX_TEXT,
+                )?;
+                let evidence_refs = match item.get("evidence_refs") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(refs)) => {
+                        if refs.len() > MAX_FACT_REFS {
+                            return Err(format!(
+                                "an observed_fact may list at most {MAX_FACT_REFS} evidence_refs."
+                            ));
+                        }
+                        refs.iter()
+                            .map(|reference| {
+                                text(reference, "observed_facts.evidence_refs", MAX_TEXT)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    }
+                    Some(_) => {
+                        return Err(
+                            "an observed_fact `evidence_refs` must be an array.".to_string()
+                        );
+                    }
+                };
+                out.push(InvestigationFact {
+                    statement,
+                    evidence_refs,
+                });
+            }
+            out
+        }
+        Some(_) => return Err("report_investigation `observed_facts` must be an array.".into()),
+    };
+
+    let business_constraints = list(arguments, "business_constraints", MAX_ITEMS, MAX_TEXT)?;
+    let examined_scope = list(arguments, "examined_scope", MAX_ITEMS, MAX_TEXT)?;
+    let unresolved_questions = list(arguments, "unresolved_questions", MAX_ITEMS, MAX_TEXT)?;
+    let limitations = list(arguments, "limitations", MAX_ITEMS, MAX_TEXT)?;
+    let evidence_refs = list(arguments, "evidence_refs", MAX_ITEMS * 2, MAX_TEXT)?;
+
+    if observed_facts.is_empty()
+        && business_constraints.is_empty()
+        && examined_scope.is_empty()
+        && unresolved_questions.is_empty()
+    {
+        return Err(
+            "report_investigation would be empty: report at least one observed fact, business \
+             constraint, examined-scope entry or unresolved question."
+                .into(),
+        );
+    }
+
+    Ok(InvestigationRecord {
+        objective,
+        observed_facts,
+        business_constraints,
+        examined_scope,
+        unresolved_questions,
+        limitations,
+        evidence_refs,
+        review_revision: review_revision.map(str::to_string),
+    })
+}
+
+#[cfg(test)]
+mod report_finding_details_tests {
+    use super::finding_details_from_args;
+    use leveler_lifecycle::{FindingConfidence, FindingSeverity, ReviewDimension};
+
+    #[test]
+    fn an_ordinary_finding_carries_no_review_fields() {
+        let details = finding_details_from_args(&serde_json::json!({
+            "kind": "risk",
+            "summary": "note"
+        }))
+        .unwrap();
+        assert_eq!(details, leveler_lifecycle::FindingDetails::default());
+    }
+
+    #[test]
+    fn review_fields_are_parsed_and_bounded() {
+        let details = finding_details_from_args(&serde_json::json!({
+            "title": "owner check missing",
+            "dimension": "security",
+            "severity": "p1",
+            "confidence": "high",
+            "line": 42,
+            "evidence": "src/auth.rs:42",
+            "impact": "cross-tenant read",
+            "recommendation": "filter by owner",
+            "reproduced": true
+        }))
+        .unwrap();
+        assert_eq!(details.dimension, Some(ReviewDimension::Security));
+        assert_eq!(details.severity, Some(FindingSeverity::P1));
+        assert_eq!(details.confidence, Some(FindingConfidence::High));
+        assert_eq!(details.line, Some(42));
+        assert!(details.reproduced);
+    }
+
+    #[test]
+    fn an_invalid_present_value_is_refused_not_ignored() {
+        assert!(
+            finding_details_from_args(&serde_json::json!({"severity": "p9"}))
+                .unwrap_err()
+                .contains("severity")
+        );
+        assert!(
+            finding_details_from_args(&serde_json::json!({"line": 0}))
+                .unwrap_err()
+                .contains("line")
+        );
+        assert!(
+            finding_details_from_args(&serde_json::json!({"reproduced": "yes"}))
+                .unwrap_err()
+                .contains("reproduced")
+        );
+    }
+
+    #[test]
+    fn a_structured_review_verdict_is_parsed_not_inferred() {
+        let verdict = super::review_verdict_from_args(&serde_json::json!({
+            "report": "完整正式报告：范围、发现、覆盖与限制。",
+            "conclusion": "issues_found",
+            "coverage": [
+                {
+                    "dimension": "security",
+                    "status": "partial",
+                    "scope": "支付模块",
+                    "evidence_refs": ["src/auth.rs:42"],
+                    "limitations": "无法访问生产配置"
+                },
+                {"dimension": "test", "status": "reviewed"}
+            ],
+            "limitations": [
+                {"kind": "tool_capability", "detail": "不能运行测试"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            verdict.conclusion,
+            leveler_lifecycle::ReviewConclusion::IssuesFound
+        );
+        assert_eq!(verdict.coverage.len(), 2);
+        assert_eq!(
+            verdict.coverage[0].status,
+            leveler_lifecycle::ReviewCoverageStatus::Partial
+        );
+        assert_eq!(verdict.limitations.len(), 1);
+        assert_eq!(
+            verdict.report.as_deref(),
+            Some("完整正式报告：范围、发现、覆盖与限制。")
+        );
+        assert_eq!(
+            verdict.report_revision, None,
+            "the model cannot stamp the runtime's revision"
+        );
+        assert_eq!(verdict.evidence_revision, None);
+    }
+
+    /// The formal report body is part of the submission, not the final chat
+    /// message. A missing or empty body is refused at the tool boundary.
+    #[test]
+    fn a_review_verdict_without_a_formal_report_is_refused() {
+        let error = super::review_verdict_from_args(&serde_json::json!({
+            "conclusion": "inconclusive"
+        }))
+        .unwrap_err();
+        assert!(error.contains("report"), "{error}");
+        let empty = super::review_verdict_from_args(&serde_json::json!({
+            "report": "   ",
+            "conclusion": "inconclusive"
+        }))
+        .unwrap_err();
+        assert!(empty.contains("report"), "{empty}");
+    }
+
+    #[test]
+    fn an_adjudication_is_typed_and_refuses_a_duplicate_without_a_target() {
+        let (id, decision) = super::finding_adjudication_from_args(&serde_json::json!({
+            "finding_id": "f-4",
+            "disposition": "adopted",
+            "reason": "verified",
+            "severity": "p0",
+            "evidence_refs": ["src/a.rs:1"]
+        }))
+        .unwrap();
+        assert_eq!(id, "f-4");
+        assert_eq!(
+            decision.disposition,
+            leveler_lifecycle::FindingDisposition::Adopted
+        );
+        assert_eq!(
+            decision.severity,
+            Some(leveler_lifecycle::FindingSeverity::P0)
+        );
+
+        let error = super::finding_adjudication_from_args(&serde_json::json!({
+            "finding_id": "f-4",
+            "disposition": "duplicate"
+        }))
+        .unwrap_err();
+        assert!(error.contains("duplicate_of"), "{error}");
+        let error = super::finding_adjudication_from_args(&serde_json::json!({
+            "finding_id": "f-4",
+            "disposition": "approved"
+        }))
+        .unwrap_err();
+        assert!(error.contains("disposition"), "{error}");
+        let error = super::finding_adjudication_from_args(&serde_json::json!({
+            "finding_id": "f-4",
+            "disposition": "adopted",
+            "duplicate_of": "f-1"
+        }))
+        .unwrap_err();
+        assert!(error.contains("only applies"), "{error}");
+    }
+
+    #[test]
+    fn a_bad_verdict_is_refused_instead_of_defaulted() {
+        assert!(
+            super::review_verdict_from_args(&serde_json::json!({}))
+                .unwrap_err()
+                .contains("conclusion")
+        );
+        let duplicate = serde_json::json!({
+            "conclusion": "inconclusive",
+            "coverage": [
+                {"dimension": "code", "status": "reviewed"},
+                {"dimension": "code", "status": "partial"}
+            ]
+        });
+        assert!(
+            super::review_verdict_from_args(&duplicate)
+                .unwrap_err()
+                .contains("more than once")
+        );
+        let unknown = serde_json::json!({
+            "conclusion": "inconclusive",
+            "coverage": [{"dimension": "code", "status": "definitely"}]
+        });
+        assert!(
+            super::review_verdict_from_args(&unknown)
+                .unwrap_err()
+                .contains("status")
+        );
+        let reserved = serde_json::json!({
+            "conclusion": "inconclusive",
+            "limitations": [{"kind": "object_changed", "detail": "moved"}]
+        });
+        assert!(
+            super::review_verdict_from_args(&reserved)
+                .unwrap_err()
+                .contains("runtime observation")
+        );
+        let wrong = serde_json::json!({
+            "conclusion": "inconclusive",
+            "limitations": "none"
+        });
+        assert!(
+            super::review_verdict_from_args(&wrong)
+                .unwrap_err()
+                .contains("limitations")
+        );
+    }
+}
+
+#[cfg(test)]
+mod investigation_record_tests {
+    use super::investigation_record_from_args;
+
+    #[test]
+    fn structured_evidence_is_parsed_and_the_object_is_stamped_by_the_runtime() {
+        let record = investigation_record_from_args(
+            &serde_json::json!({
+                "objective": "核对订单状态写入路径",
+                "observed_facts": [
+                    {"statement": "结算模块会写入订单状态", "evidence_refs": ["src/settle.rs:42"]}
+                ],
+                "business_constraints": ["已终止订单不参与正常状态推进"],
+                "examined_scope": ["src/order.rs", "src/settle.rs"],
+                "unresolved_questions": ["两条写入路径组合后是否覆盖终止事实？"],
+                "limitations": ["只读静态检查"],
+                "evidence_refs": ["src/settle.rs:42"]
+            }),
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .unwrap();
+        assert_eq!(record.objective, "核对订单状态写入路径");
+        assert_eq!(record.observed_facts.len(), 1);
+        assert_eq!(
+            record.observed_facts[0].evidence_refs,
+            vec!["src/settle.rs:42"]
+        );
+        assert_eq!(
+            record.review_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_empty_declaration_is_refused_not_coerced() {
+        for (value, needle) in [
+            (serde_json::json!({}), "objective"),
+            (
+                serde_json::json!({"objective": "x", "observed_facts": [{}]}),
+                "statement",
+            ),
+            (
+                serde_json::json!({"objective": "x", "observed_facts": "not an array"}),
+                "array",
+            ),
+            (
+                serde_json::json!({"objective": "x", "unresolved_questions": [""]}),
+                "empty",
+            ),
+            (serde_json::json!({"objective": "x"}), "empty"),
+        ] {
+            let error = investigation_record_from_args(&value, None).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
     }
 }

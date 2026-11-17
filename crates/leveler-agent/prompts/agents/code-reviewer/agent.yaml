@@ -1,4 +1,4 @@
 version: 1
 name: code-reviewer
-description: 审查改动的正确性、安全与项目规范符合度，只报有把握的问题
+description: 独立审查代码、业务、安全、架构、测试、交付或执行过程，只报告有证据的问题
 capability: read_only

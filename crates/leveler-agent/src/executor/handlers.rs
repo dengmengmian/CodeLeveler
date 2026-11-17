@@ -476,16 +476,73 @@ impl Executor {
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> DelegatedChildResult {
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let parent_wall = reviewer_wall_budget(&self.step_limits, parent_elapsed);
         // R013r: an unbounded reviewer burned the full 100-round turn ceiling
-        // reading a repo it was only asked to judge. The bound now lives on
-        // the role's capability profile; a reviewer that has not concluded by
-        // then returns what it has (INCOMPLETE_PARTIAL keeps its findings)
-        // instead of burning the parent's budget.
+        // reading a repo it was only asked to judge. The bound lives on the
+        // role's capability profile; a reviewer that has not concluded by then
+        // returns what it has (INCOMPLETE_PARTIAL keeps its findings).
         let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
             .max_rounds()
             .unwrap_or(0);
+        self.run_reviewer_child_with_rounds(
+            id,
+            brief,
+            files,
+            parent_elapsed,
+            reviewer_rounds,
+            None,
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    /// The manual-review entrance to the same child primitive.
+    ///
+    /// A closure reviewer is the tail of someone else's task, so its 20-round
+    /// profile bound is right there. A user-requested review owns its own
+    /// investigation and gets an explicit, finite budget from the caller —
+    /// larger than the closure tail, never unbounded. Everything else (read-
+    /// only registry, lifecycle, event attribution, cancellation, findings)
+    /// is the reviewer contract, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_manual_review_child(
+        &self,
+        id: String,
+        brief: String,
+        files: Vec<String>,
+        review_revision: Option<String>,
+        max_rounds: u32,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> DelegatedChildResult {
+        self.run_reviewer_child_with_rounds(
+            id,
+            brief,
+            files,
+            std::time::Duration::ZERO,
+            max_rounds,
+            review_revision,
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_reviewer_child_with_rounds(
+        &self,
+        id: String,
+        brief: String,
+        files: Vec<String>,
+        parent_elapsed: std::time::Duration,
+        reviewer_rounds: u32,
+        review_revision: Option<String>,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> DelegatedChildResult {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let parent_wall = reviewer_wall_budget(&self.step_limits, parent_elapsed);
         let run = self.run_one_sub_agent_on(
             id,
             AgentRole::Reviewer,
@@ -501,6 +558,7 @@ impl Executor {
             self.step_limits,
             cancellation,
             parent_wall,
+            review_revision,
         );
         tokio::pin!(run);
         let result = loop {
@@ -522,6 +580,9 @@ impl Executor {
             progress: result.progress,
             modified_files: result.modified_files,
             findings: result.findings,
+            review: result.review,
+            investigation: result.investigation,
+            evidence_revision: result.evidence_revision,
         }
     }
 
@@ -543,6 +604,7 @@ impl Executor {
         residual_limits: StepLimits,
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
+        review_revision: Option<String>,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + '_ {
         // A child's state machine is as large as the parent's. Polling it
         // inline makes nesting consume another full stack frame, which
@@ -560,6 +622,7 @@ impl Executor {
                 residual_limits,
                 cancellation,
                 parent_wall,
+                review_revision,
             )
             .await
         })
@@ -583,9 +646,10 @@ impl Executor {
         residual_limits: StepLimits,
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
+        review_revision: Option<String>,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
         let prepared_child = self
-            .child_for_spec(role, &spec, brief)
+            .child_for_spec(role, &spec, brief, review_revision)
             .with_agent_id(id.clone());
         let hook_runner = self.hook_runner.clone();
         run_prepared_sub_agent(
@@ -627,7 +691,7 @@ impl Executor {
             .as_ref()
             .and_then(|agent| agent.brief.clone());
         let prepared_child = self
-            .child_for_spec(child.role, &child.spec, brief)
+            .child_for_spec(child.role, &child.spec, brief, None)
             .with_agent_id(child.id.clone());
         run_prepared_sub_agent(
             prepared_child,
@@ -684,6 +748,9 @@ async fn run_prepared_sub_agent(
                 progress: ProgressLedger::default(),
                 modified_files: Vec::new(),
                 findings: Vec::new(),
+                review: None,
+                investigation: None,
+                evidence_revision: 0,
             };
         }
     };
@@ -744,6 +811,9 @@ async fn run_prepared_sub_agent(
                     progress: ProgressLedger::default(),
                     modified_files: Vec::new(),
                     findings: Vec::new(),
+                    review: None,
+                    investigation: None,
+                    evidence_revision: 0,
                 };
             }
         }
@@ -784,6 +854,12 @@ async fn run_prepared_sub_agent(
     // `said` above).
     let findings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let findings_obs = findings.clone();
+    let review = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let review_obs = review.clone();
+    let investigation = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let investigation_obs = investigation.clone();
+    let evidence_revision = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let evidence_revision_obs = evidence_revision.clone();
     let activity_id = id.clone();
     let activity_tx = progress.clone();
     let mut capture = move |event: AgentEvent| match &event {
@@ -795,6 +871,15 @@ async fn run_prepared_sub_agent(
         AgentEvent::EvidenceLedgerUpdated { ledger } => {
             if let Ok(mut guard) = findings_obs.lock() {
                 *guard = ledger.findings.clone();
+            }
+            if let Ok(mut guard) = review_obs.lock() {
+                *guard = ledger.review.clone();
+            }
+            if let Ok(mut guard) = investigation_obs.lock() {
+                *guard = ledger.investigation.clone();
+            }
+            if let Ok(mut guard) = evidence_revision_obs.lock() {
+                *guard = ledger.evidence_revision;
             }
         }
         AgentEvent::AssistantText { text, .. } if !text.trim().is_empty() => {
@@ -833,6 +918,16 @@ async fn run_prepared_sub_agent(
         // audit cannot distinguish an authorized write from a bypass (the M7
         // measurement failure).
         AgentEvent::DelegationStage { action, .. } if action.starts_with("ownership_") => {
+            let _ = activity_tx.send(event.clone());
+        }
+        // A review child may launch independent investigations. Their
+        // lifecycle is a fact the review UI and the parent's settlement
+        // accounting need; the ordinary capture closure otherwise drops
+        // nested child events. Usage records must travel too: the review's
+        // durable spend is the sum of every request it caused.
+        AgentEvent::SubAgentStarted { .. }
+        | AgentEvent::SubAgentFinished { .. }
+        | AgentEvent::SubAgentModelRequest { .. } => {
             let _ = activity_tx.send(event.clone());
         }
         _ => {}
@@ -883,6 +978,8 @@ async fn run_prepared_sub_agent(
     }
     let said_before_stopping = || said.lock().map(|g| g.clone()).unwrap_or_default();
     let reported_findings = findings.lock().map(|g| g.clone()).unwrap_or_default();
+    let reported_review = review.lock().ok().and_then(|g| g.clone());
+    let reported_investigation = investigation.lock().ok().and_then(|g| g.clone());
     match outcome {
         Ok(outcome) => {
             let completed = matches!(
@@ -912,6 +1009,20 @@ async fn run_prepared_sub_agent(
                     "{} structured finding(s) reported.",
                     reported_findings.len()
                 );
+            } else if findings.trim().is_empty()
+                && let Some(investigation) = &reported_investigation
+            {
+                // A structured investigation IS a result even when it found
+                // no candidate defect. Calling it "nothing to report" would
+                // tell the Lead Reviewer the opposite of what it established.
+                findings = format!(
+                    "Structured investigation recorded: {} observed fact(s), {} business \
+                     constraint(s), {} examined-scope entr(ies), {} unresolved question(s).",
+                    investigation.observed_facts.len(),
+                    investigation.business_constraints.len(),
+                    investigation.examined_scope.len(),
+                    investigation.unresolved_questions.len()
+                );
             }
             let stop_reason = if completed {
                 String::new()
@@ -939,6 +1050,9 @@ async fn run_prepared_sub_agent(
                 progress: outcome.progress,
                 modified_files: outcome.modified_files,
                 findings: reported_findings,
+                review: reported_review.clone(),
+                investigation: reported_investigation.clone(),
+                evidence_revision: evidence_revision.lock().map(|guard| *guard).unwrap_or(0),
             }
         }
         Err(AgentError::Cancelled) => {
@@ -957,6 +1071,9 @@ async fn run_prepared_sub_agent(
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
+                review: reported_review.clone(),
+                investigation: reported_investigation.clone(),
+                evidence_revision: evidence_revision.lock().map(|guard| *guard).unwrap_or(0),
             }
         }
         Err(e) => {
@@ -969,6 +1086,9 @@ async fn run_prepared_sub_agent(
                 progress: ledger,
                 modified_files: paths,
                 findings: reported_findings,
+                review: reported_review.clone(),
+                investigation: reported_investigation.clone(),
+                evidence_revision: evidence_revision.lock().map(|guard| *guard).unwrap_or(0),
             }
         }
     }
@@ -994,6 +1114,18 @@ pub struct DelegatedChildResult {
     /// Typed findings the child reported (partial ones survive an abnormal
     /// stop). Still keyed by the CHILD's ids — the consumer adopts them.
     pub findings: Vec<leveler_lifecycle::FindingRecord>,
+    /// The reviewer's structured coverage/limitations/conclusion, when it
+    /// declared one. `None` is the honest "not declared"; it is never derived
+    /// from findings or prose.
+    pub review: Option<leveler_lifecycle::ReviewVerdict>,
+    /// An investigator's structured facts, scope, questions and limitations,
+    /// when it declared them. `None` means it declared nothing; it is never
+    /// inferred from prose.
+    pub investigation: Option<leveler_lifecycle::InvestigationRecord>,
+    /// The reviewer ledger's evidence revision when it stopped. The review
+    /// service compares this with the revision the submitted report was bound
+    /// to, so late settlements are visible instead of silently ignored.
+    pub evidence_revision: u64,
 }
 
 /// Spend + structured result from one sub-agent so the parent can roll up
@@ -1009,6 +1141,13 @@ pub(crate) struct SubAgentRunResult {
     pub modified_files: Vec<String>,
     /// Typed findings captured from the child's ledger snapshots.
     pub findings: Vec<leveler_lifecycle::FindingRecord>,
+    /// Structured review declaration captured from the same snapshots.
+    pub review: Option<leveler_lifecycle::ReviewVerdict>,
+    /// Structured investigation declaration captured from the same snapshots.
+    pub investigation: Option<leveler_lifecycle::InvestigationRecord>,
+    /// The child ledger's evidence revision at its last snapshot. A review
+    /// binds its formal report to this number.
+    pub evidence_revision: u64,
 }
 
 /// Cap UI previews so concurrent sub-agent activity cannot flood the event bus.

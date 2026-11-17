@@ -60,27 +60,60 @@ telemetry.
 
 ## In-repo configuration is inert until trusted
 
-Two files a repository can carry are gated, because both take effect before
+Three files a repository can carry are gated, because each takes effect before
 any approval prompt:
 
 - `<repo>/.leveler/hooks.yaml` — runs commands ahead of every tool call.
 - `<repo>/.leveler/permissions.yaml` — an `Allow` rule here short-circuits the
   approval policy.
+- `<repo>/.leveler/config.yaml` — its `mode:` can raise the default permission
+  profile for a new session.
 
-Cloning a repository is therefore not enough to make either apply. They are
-ignored until you run `leveler trust` for that repository. The skip is always
-visible: a notice on stderr for CLI runs, and in the TUI both the empty-session
-splash and a marker on the composer border. Trust records the SHA-256 of the exact bytes you accepted, so a
-later edit — by a teammate, by `git pull`, or by the agent — drops the file
-back to untrusted. `leveler trust show` reports the current state and
+Cloning a repository is therefore not enough to make them apply. They are
+ignored until you run `leveler trust` for that repository. One direction is
+always safe: a project config may **tighten** its default mode (for example to
+`request_approval`) without trust, because narrowing authority never widens it.
+Raising the default to `full_access` needs a trust record for the exact bytes.
+The skip is always visible: a notice on stderr for CLI runs, and in the TUI
+both the empty-session splash and a marker on the composer border. Trust records
+the SHA-256 of the exact bytes you accepted, so a later edit — by a teammate, by
+`git pull`, or by the agent — drops the file back to untrusted. `leveler trust`
+records the digest it displayed; a file that changes while the confirmation is
+open is not trusted. `leveler trust show` reports the current state and
 `leveler trust revoke` clears it.
 
 The global `~/.leveler/hooks.yaml` and `~/.leveler/permissions.yaml` are your
 own files, outside any repository, and are not gated.
 
-The workspace layer additionally refuses **writes** to both in-repo files, so
-the agent cannot grant itself hooks or standing permissions. Reads stay
-allowed.
+The workspace layer additionally refuses **writes** to the hooks and
+permissions files, so the agent cannot grant itself hooks or standing
+permissions. Reads stay allowed. `.leveler/config.yaml` stays editable as
+ordinary project configuration, but any edit invalidates its trust record, so
+it cannot inherit a mode approval given to different bytes. Confined shell
+commands also cannot write `.leveler/agents` or `.leveler/skills` on macOS
+(the kernel denies the path even when the directory does not exist yet) and on
+Linux when those directories exist: a definition authored that way would be
+loaded by a later session without the confirmation the `save_agent` /
+`save_skill` tools require. Windows has no per-path deny in the current write
+backend, so that shell path remains unenforced there.
+
+## Approval, rules and resource boundaries
+
+An approval decides whether a call may run; it does not silently widen the
+resource boundary the call was admitted under.
+
+- A standing `Allow` rule and an automated reviewer remove the question. They
+  keep the profile's write and network scopes.
+- Consent to the exact call executes the action the person saw. That can lift
+  the workspace write fence for the approved effect, including a foreign-path
+  conflict the prompt named; it never clears an explicit `--deny-network`.
+- When the call itself is a network request (a network-class tool or an MCP
+  tool), the approval prompt carries that destination decision; the sandbox
+  then enforces what the prompt granted. Ordinary commands under a profile
+  that restricts the network run without it, even after approval.
+- `Loopback` is enforced as loopback by seatbelt (macOS). Backends that cannot
+  express a loopback-only boundary deny all network rather than widening to the
+  Internet.
 
 ## Known trade-offs (by design)
 

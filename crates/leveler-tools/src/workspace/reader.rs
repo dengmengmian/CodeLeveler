@@ -109,7 +109,12 @@ pub(crate) enum ReadError {
 pub(crate) struct WorkspaceReader;
 
 impl WorkspaceReader {
-    /// Read `window` from `path`.
+    /// Read `window` from an ALREADY-OPENED file.
+    ///
+    /// The caller owns resolution and confinement, including the
+    /// resolve-then-open race: a review seat passes the handle it opened
+    /// through the workspace capability, so the bytes read are the bytes that
+    /// were authorised.
     ///
     /// The whole file is streamed once, because the fingerprint that guards a
     /// later edit covers the whole file and there is no cheaper way to produce
@@ -117,11 +122,12 @@ impl WorkspaceReader {
     /// bounded window of a very large file is a bounded operation — file size
     /// alone never makes a read impossible.
     pub(crate) async fn read(
-        path: &std::path::Path,
+        file: std::fs::File,
         window: ReadWindow,
         cancellation: &CancellationToken,
     ) -> Result<BoundedRead, ReadError> {
-        let meta = match tokio::fs::metadata(path).await {
+        let file = tokio::fs::File::from_std(file);
+        let meta = match file.metadata().await {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReadError::NotFound),
             Err(e) => return Err(ReadError::Io(e.to_string())),
@@ -130,11 +136,6 @@ impl WorkspaceReader {
             return Err(ReadError::IsDirectory);
         }
 
-        let file = match tokio::fs::File::open(path).await {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReadError::NotFound),
-            Err(e) => return Err(ReadError::Io(e.to_string())),
-        };
         let mut reader = tokio::io::BufReader::new(file);
         let mut raw = Vec::new();
         let mut fingerprint = ContentFingerprint::default();
@@ -247,6 +248,10 @@ fn fit<'a>(text: &'a str, used: usize, max_bytes: usize, overhead: usize) -> Fit
 mod tests {
     use super::*;
 
+    fn open(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).unwrap()
+    }
+
     fn temp(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::Builder::new()
             .prefix("leveler-reader-")
@@ -261,7 +266,7 @@ mod tests {
     async fn reads_a_window_and_counts_the_whole_file() {
         let (_dir, path) = temp("a.txt", b"one\ntwo\nthree\nfour\n");
         let read = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(Some(2), Some(3), 4096),
             &CancellationToken::new(),
         )
@@ -283,7 +288,7 @@ mod tests {
         }
         let (_dir, path) = temp("big.txt", body.as_bytes());
         let read = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(Some(4_998), Some(5_000), 1024),
             &CancellationToken::new(),
         )
@@ -301,7 +306,7 @@ mod tests {
         }
         let (_dir, path) = temp("big.txt", body.as_bytes());
         let read = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(None, None, 900),
             &CancellationToken::new(),
         )
@@ -317,7 +322,7 @@ mod tests {
     async fn one_line_longer_than_the_budget_is_cut_inside_the_line() {
         let (_dir, path) = temp("long.txt", "q".repeat(10_000).as_bytes());
         let read = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(None, None, 512),
             &CancellationToken::new(),
         )
@@ -331,7 +336,7 @@ mod tests {
     async fn invalid_utf8_is_an_error_not_a_replacement_character() {
         let (_dir, path) = temp("bad.txt", b"fine\nbroken \xC3\x28\n");
         let err = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(None, None, 4096),
             &CancellationToken::new(),
         )
@@ -344,7 +349,7 @@ mod tests {
     async fn nul_bytes_are_binary() {
         let (_dir, path) = temp("bin", b"MZ\x00\x00payload\n");
         let err = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(None, None, 4096),
             &CancellationToken::new(),
         )
@@ -357,14 +362,14 @@ mod tests {
     async fn the_fingerprint_covers_the_whole_file_not_the_window() {
         let (_dir, path) = temp("a.txt", b"one\ntwo\nthree\n");
         let narrow = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(Some(1), Some(1), 4096),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
         let whole = WorkspaceReader::read(
-            &path,
+            open(&path),
             ReadWindow::new(None, None, 4096),
             &CancellationToken::new(),
         )

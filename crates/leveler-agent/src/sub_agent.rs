@@ -114,6 +114,58 @@ pub(crate) fn settled_children_redelivery_note(children: &[SettledChildNotice]) 
     out
 }
 
+/// Render an investigator's structured declaration for the Lead Reviewer.
+///
+/// This is evidence, not a verdict. The section is bounded so one child
+/// cannot crowd the parent's context; the durable record remains on the
+/// child's ledger snapshot.
+pub(crate) fn investigation_settlement_text(
+    record: &leveler_lifecycle::InvestigationRecord,
+) -> String {
+    const MAX_BYTES: usize = 12 * 1024;
+    fn push_list(out: &mut String, label: &str, items: &[String]) {
+        if items.is_empty() {
+            return;
+        }
+        out.push_str(&format!("{label}:\n"));
+        for item in items {
+            out.push_str(&format!("- {item}\n"));
+        }
+    }
+    let mut out = String::from("## Independent investigation\n");
+    out.push_str(&format!("- objective: {}\n", record.objective));
+    if let Some(revision) = &record.review_revision {
+        out.push_str(&format!("- reviewed object: `{revision}`\n"));
+    }
+    push_list(&mut out, "- examined scope", &record.examined_scope);
+    if !record.observed_facts.is_empty() {
+        out.push_str("- observed facts:\n");
+        for fact in &record.observed_facts {
+            out.push_str(&format!("  - {}\n", fact.statement));
+            for reference in &fact.evidence_refs {
+                out.push_str(&format!("    - evidence: {reference}\n"));
+            }
+        }
+    }
+    push_list(
+        &mut out,
+        "- business constraints",
+        &record.business_constraints,
+    );
+    push_list(
+        &mut out,
+        "- unresolved questions",
+        &record.unresolved_questions,
+    );
+    push_list(&mut out, "- limitations", &record.limitations);
+    push_list(&mut out, "- evidence refs", &record.evidence_refs);
+    out.push_str(
+        "This is the investigator's structured evidence, not a verdict. Verify what the \
+         final report relies on.\n",
+    );
+    leveler_core::truncate_head_bytes(&out, MAX_BYTES, "\n… (investigation truncated)\n")
+}
+
 /// An interrupted child rebuilt from its durable session, ready for a new
 /// activation under the same identity.
 #[derive(Debug, Clone)]
@@ -224,10 +276,18 @@ pub(crate) fn lost_children_note(outstanding: &[String]) -> String {
 /// cannot strand the parent forever.
 pub(crate) const SUB_AGENT_MAX_DURATION: std::time::Duration =
     std::time::Duration::from_secs(crate::child_profile::CHILD_MAX_DURATION_SECS);
+/// The same single authority, readable by hosts that need to declare a shared
+/// wall budget before the child exists (the manual review turn).
+pub const CHILD_MAX_DURATION: std::time::Duration = SUB_AGENT_MAX_DURATION;
 /// Default cap on concurrently-running sub-agents (including within one batch).
 pub(crate) const DEFAULT_MAX_CONCURRENT_AGENTS: usize = 4;
 /// Default cap on total sub-agents spawned across one top-level run.
 pub(crate) const DEFAULT_MAX_TOTAL_AGENTS: usize = 6;
+
+/// Round window for one independent investigation under a review. The review
+/// itself has 100 rounds; an investigation is a bounded tail of that work, not
+/// a second full review. It is a mechanical ceiling, not a task budget.
+pub(crate) const REVIEW_INVESTIGATION_MAX_ROUNDS: u32 = 40;
 
 /// Display names assigned to sub-agents in spawn order, so the UI can show
 /// "Newton is investigating…" instead of an opaque id. Recycled with an ordinal
