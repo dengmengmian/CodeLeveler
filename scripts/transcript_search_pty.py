@@ -39,11 +39,30 @@ REPORT = base.Report("transcript-search")
 base.EVIDENCE = os.path.join(base.ROOT, "target", "transcript-search-pty")
 
 
+def streamed_text_turn(text: str, pieces: int = 40) -> list[str]:
+    """One answer delivered as many small deltas, so it streams long enough
+    to open `/find` while the turn is still running."""
+    frames = []
+    step = max(1, len(text) // pieces)
+    for at in range(0, len(text), step):
+        frames.append(
+            json.dumps({"choices": [{"delta": {"content": text[at : at + step]}}]})
+        )
+    frames.append(json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    return frames
+
+
 def script():
     command = "seq 1 %d; printf '%s %s\\n'" % (ARTIFACT_LINES, CN, NEEDLE)
+    answer = (
+        "Refund workflow verification completed. "
+        + ("checked the idempotent refund path. " * 12)
+        + "\n\n"
+        + ANSWER
+    )
     return [
         base.tool_turn("shell_command", json.dumps({"cmd": command})),
-        base.text_turn("Refund workflow verification completed.\n\n" + ANSWER),
+        streamed_text_turn(answer),
         base.text_turn("Summary: the refund workflow is verified."),
     ]
 
@@ -129,13 +148,35 @@ def main() -> int:
     mock = base.MockProvider()
     mock.turns = script()
     mock.assist_text = "noop"
+    mock.stream_delay = 0.05
     env = base.Env("mock", mock)
     pty = None
     try:
         pty = base.boot(REPORT, env, 120, 44)
         check("boot", True)
 
-        base.ask(pty, PROMPT_ONE)
+        # Open the search WHILE the real turn is still running. The answer is
+        # streamed in small deltas so the window is deterministic.
+        pty.write(PROMPT_ONE)
+        time.sleep(0.2)
+        pty.key("\r")
+        time.sleep(0.5)
+        answer_not_yet = ANSWER not in pty.screen.text()
+        # No `to_conversation` here: on a busy conversation Esc cancels the
+        # turn, which is exactly what this check must NOT do.
+        pty.write("/find refund")
+        time.sleep(0.25)
+        pty.key("\r")
+        time.sleep(0.5)
+        page_while_busy = "会话查找" in flat(pty)
+        check(
+            "/find opens during a running turn without cancelling it",
+            answer_not_yet and page_while_busy,
+            pty.screen.text()[:800],
+        )
+        REPORT.dump("00-find-while-busy", pty)
+        pty.key("\x1b")  # back to the conversation; the turn keeps running
+        time.sleep(0.3)
         answered = wait(pty, lambda: ANSWER in pty.screen.text(), 180)
         check("a scripted real turn completed", answered, pty.screen.text()[:500])
         REPORT.dump("01-turn-complete", pty)
