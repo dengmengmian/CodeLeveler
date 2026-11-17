@@ -46,7 +46,17 @@ const INPUT_RECEIPT: &str = "verified-inputs.json";
 /// Directory names that are never build inputs: version control metadata,
 /// build output in the default layout, Leveler's own runtime state, and the
 /// dependency trees of other toolchains.
-const SKIPPED_DIRS: &[&str] = &[".git", "target", ".leveler", "node_modules"];
+const SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    // The repository's own shared build target (`scripts/shared-target.sh`,
+    // dogfood harnesses). It is build output under another name; hashing it
+    // would make a local verification walk gigabytes of artifacts that are
+    // not inputs.
+    ".codeleveler-target",
+    ".leveler",
+    "node_modules",
+];
 
 /// The build-state directory this verification check uses.
 ///
@@ -322,12 +332,20 @@ mod tests {
     }
 
     /// Build output and version control metadata are not inputs: walking them
-    /// would make a verification hash its own last build.
+    /// would make a verification hash its own last build. The repository's
+    /// shared target directory uses `.codeleveler-target`; it is the same kind
+    /// of input-less build state.
     #[test]
     fn build_output_and_version_control_are_not_inputs() {
         let (_base, workspace) = fixture();
         std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
         std::fs::write(workspace.join("target/debug/artifact"), "x").unwrap();
+        std::fs::create_dir_all(workspace.join(".codeleveler-target/debug/deps")).unwrap();
+        std::fs::write(
+            workspace.join(".codeleveler-target/debug/deps/artifact"),
+            "x",
+        )
+        .unwrap();
         std::fs::create_dir_all(workspace.join(".git")).unwrap();
         std::fs::write(workspace.join(".git/HEAD"), "ref").unwrap();
         let digests = digest_inputs(&workspace).unwrap();
