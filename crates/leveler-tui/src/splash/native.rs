@@ -4,7 +4,9 @@ use image::{DynamicImage, ImageFormat};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::{StatefulProtocol, StatefulProtocolType};
 
-use crate::input_guard::{DeviceReplyFilter, StartupInput};
+#[cfg(any(windows, test))]
+use crate::input_guard::DeviceReplyFilter;
+use crate::input_guard::StartupInput;
 
 const PNG: &[u8] = include_bytes!("../../../../assets/brand/codeleveler-mascot.png");
 
