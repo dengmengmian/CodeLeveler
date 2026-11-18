@@ -4397,12 +4397,19 @@
           }
         },
         {
-          "description": "Result of [`crate::ClientCommand::ListReviews`], newest first.\n\n`reports` carries the newest settled reports, projected from the same durable rows as `reviews`. A reopened conversation renders those inline instead of asking the user to open each card. Older reports stay available through [`crate::ClientCommand::QueryReviewReport`]; a review with no report here is still a normal, openable card.",
+          "description": "Result of [`crate::ClientCommand::ListReviews`], newest first.\n\n`reports` carries the newest settled reports, projected from the same durable rows as `reviews`. `delivered` names the reviews whose settlement was recorded as a conversation notice — the same durable delivery record the live `ReviewFinished` event accompanies. A client that missed that event (a transport break, a resync, a window that no longer reaches the settlement) delivers the report as its own conversation result for those ids. A review absent from `delivered` was written before that record existed, so its card keeps the legacy inline report. Older reports stay available through [`crate::ClientCommand::QueryReviewReport`]; a review with no report here is still a normal, openable card.",
           "type": "object",
           "required": [
             "type"
           ],
           "properties": {
+            "delivered": {
+              "description": "Durable review ids whose settlement notice exists in this session.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "query_id": {
               "anyOf": [
                 {

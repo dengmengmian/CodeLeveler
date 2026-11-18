@@ -2261,6 +2261,7 @@ fn review_history_attaches_to_the_replayed_card_in_place() {
             query_id: Some(query),
             reviews: vec![summary.clone()],
             reports: vec![review_report(summary)],
+            delivered: Vec::new(),
         }),
     );
     let cards: Vec<_> = s

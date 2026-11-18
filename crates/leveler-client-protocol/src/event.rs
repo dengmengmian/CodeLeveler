@@ -923,10 +923,16 @@ pub enum RuntimeEvent {
     /// Result of [`crate::ClientCommand::ListReviews`], newest first.
     ///
     /// `reports` carries the newest settled reports, projected from the same
-    /// durable rows as `reviews`. A reopened conversation renders those inline
-    /// instead of asking the user to open each card. Older reports stay
-    /// available through [`crate::ClientCommand::QueryReviewReport`]; a review
-    /// with no report here is still a normal, openable card.
+    /// durable rows as `reviews`. `delivered` names the reviews whose
+    /// settlement was recorded as a conversation notice — the same durable
+    /// delivery record the live `ReviewFinished` event accompanies. A client
+    /// that missed that event (a transport break, a resync, a window that no
+    /// longer reaches the settlement) delivers the report as its own
+    /// conversation result for those ids. A review absent from `delivered` was
+    /// written before that record existed, so its card keeps the legacy inline
+    /// report. Older reports stay available through
+    /// [`crate::ClientCommand::QueryReviewReport`]; a review with no report
+    /// here is still a normal, openable card.
     ReviewHistoryLoaded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<leveler_core::CommandId>,
@@ -934,6 +940,9 @@ pub enum RuntimeEvent {
         reviews: Vec<crate::UiReviewSummary>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reports: Vec<crate::UiReviewReport>,
+        /// Durable review ids whose settlement notice exists in this session.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delivered: Vec<String>,
     },
     /// Result of [`crate::ClientCommand::QueryReviewScopes`]. Facts only: no
     /// review was started, and the client still confirms the object with the
@@ -2152,6 +2161,7 @@ mod tests {
                 query_id: None,
                 reviews: Vec::new(),
                 reports: Vec::new(),
+                delivered: Vec::new(),
             },
             "review_history_loaded",
         );

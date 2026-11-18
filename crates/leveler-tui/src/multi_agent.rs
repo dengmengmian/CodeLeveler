@@ -440,6 +440,34 @@ impl TaskTeamView {
         self.restamp_settlement(now_elapsed);
     }
 
+    /// Settle the live roster row of a review from the review's durable
+    /// terminal.
+    ///
+    /// The roster is a client-side projection of child events. A transport
+    /// break can lose the reviewer's own terminal while the review keeps
+    /// running server-side; the reconnect snapshot carries the transcript and
+    /// the review row, not this live row. The review's durable terminal is
+    /// the same execution under the durable review id, so it settles the row.
+    ///
+    /// Unknown ids are ignored: the roster shows live children, never history,
+    /// and a reconnect must not mint a row for a review this view never saw
+    /// run. A row already terminal keeps its own outcome.
+    pub fn settle_review(&mut self, id: &str, ok: bool, now_elapsed: u64) -> bool {
+        let Some(child) = self.children.iter_mut().find(|child| child.id == id) else {
+            return false;
+        };
+        if child.status.is_terminal() {
+            return false;
+        }
+        child.status = if ok {
+            ChildStatus::Completed
+        } else {
+            ChildStatus::Failed
+        };
+        self.restamp_settlement(now_elapsed);
+        true
+    }
+
     /// Retire the previous turn's settled children when a new turn begins.
     ///
     /// A terminal child ([`ChildStatus::is_terminal`]) belongs to the turn that

@@ -1111,6 +1111,122 @@ async fn a_target_session_review_reads_the_target_not_the_requester() {
     );
 }
 
+/// The history answer distinguishes a review whose result was delivered as a
+/// conversation message from a row written before that mechanism. The client
+/// needs the difference: the first is a result it can materialize after a
+/// missed terminal, the second may only keep its legacy inline report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_history_answer_names_reviews_whose_result_was_delivered() {
+    let (_tmp, server, app, client, session) = harness(vec![
+        finding_response(),
+        review_verdict_response(&["f-1"]),
+        final_response("审查完成：发现一个越权读取问题。"),
+    ])
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取的授权边界".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+
+    // A review row that predates result messages: durable and terminal, but
+    // no settlement notice was ever written for it.
+    let db = app.open_database().await.unwrap();
+    let repo = ReviewRepository::new(&db);
+    repo.create(&leveler_storage::NewReview {
+        id: "review-legacy",
+        session_id: &session,
+        focus: "旧审查",
+        scope_json: r#"{"kind":"workspace"}"#,
+        model: "mock/m",
+        status: "completed",
+        source_session_id: Some(session.as_str()),
+        source_turn_id: None,
+        created_at: leveler_core::now(),
+    })
+    .await
+    .unwrap();
+    repo.finish(
+        "review-legacy",
+        &leveler_storage::ReviewFinish {
+            status: "completed",
+            object_json: Some(r#"{"workspace":"/repo"}"#),
+            findings_json: "[]",
+            report: "旧版正式报告。",
+            report_source: "legacy",
+            final_message: "",
+            evidence_revision: 0,
+            report_revision: 0,
+            report_evidence_revision: 0,
+            error: None,
+            stop_detail: None,
+            usage_json: "{}",
+            verdict_json: None,
+            activity_json: "{}",
+            investigations_json: "[]",
+            object_changed: false,
+            modified_source: false,
+            finished_at: leveler_core::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let query = CommandId::new("list-delivery");
+    client
+        .send(ClientCommand::ListReviews {
+            session_id: session.clone(),
+            query_id: Some(query.clone()),
+        })
+        .await
+        .unwrap();
+    let (reviews, reports, delivered) = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("list must answer")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewHistoryLoaded {
+            query_id,
+            reviews,
+            reports,
+            delivered,
+        } = event
+            && query_id.as_ref() == Some(&query)
+        {
+            break (reviews, reports, delivered);
+        }
+    };
+    assert_eq!(
+        delivered,
+        vec![finished.id.clone()],
+        "only the review with a settlement notice was delivered: {delivered:?}"
+    );
+    assert!(
+        delivered.iter().all(|id| id != "review-legacy"),
+        "a pre-mechanism row is not dressed up as a delivered result"
+    );
+    assert_eq!(
+        reviews
+            .iter()
+            .filter(|review| review.status.settled())
+            .count(),
+        2,
+        "both rows are settled facts"
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|report| report.summary.id == finished.id),
+        "the delivered review keeps its durable report in the answer"
+    );
+}
+
 /// A `running` row with no live owner in this process is settled as
 /// Incomplete by the next list; it is never left running forever and never
 /// invented as Failed.

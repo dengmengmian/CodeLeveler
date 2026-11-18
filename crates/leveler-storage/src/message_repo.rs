@@ -577,6 +577,30 @@ impl<'a> MessageRepository<'a> {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
+    /// The payloads of this session's review-settlement notices, in order.
+    ///
+    /// The notice row is the durable record that a settled review's result was
+    /// delivered to the conversation. The review row cannot answer that: a
+    /// review written before the result-message mechanism has the same
+    /// terminal fields, but no notice. The filter reads the structured origin
+    /// this runtime wrote, never prose in the body.
+    pub async fn review_settled_notice_payloads(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload FROM session_messages \
+             WHERE session_id = ?1 \
+               AND json_extract(payload, '$.origin.kind') = 'runtime_notice' \
+               AND json_extract(payload, '$.origin.notice') = 'review_settled' \
+             ORDER BY ordinal ASC",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
     /// Load all message payloads with the accepted-input identity that
     /// produced each one, in order. `None` for messages that were not an
     /// admitted append (seed submits, assistant turns, tool results).
@@ -715,6 +739,45 @@ mod tests {
             repo.load(&id).await.unwrap(),
             vec![r#""a""#, r#""b""#, r#""c""#]
         );
+    }
+
+    /// The delivery record is the structured review settlement notice, not a
+    /// review row or a phrase in some other row.
+    #[tokio::test]
+    async fn only_review_settlement_notices_are_selected() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id.clone());
+        let repo = MessageRepository::new(&db);
+        let plain = r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#;
+        let notice = |kind: &str| {
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": format!("## Review {kind}\n\n- review_id: review-1")}],
+                "origin": {"kind": "runtime_notice", "notice": format!("review_{kind}")},
+            })
+            .to_string()
+        };
+        let started = notice("started");
+        let settled = notice("settled");
+        let protocol_repair = r#"{"role":"user","content":[{"type":"text","text":"repair"}],"origin":{"kind":"protocol_repair","repair":"missing_tool_result"}}"#;
+        repo.append(
+            &id,
+            &[
+                plain.to_string(),
+                started.to_string(),
+                protocol_repair.to_string(),
+                settled.to_string(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+        let payloads = repo.review_settled_notice_payloads(&id).await.unwrap();
+        assert_eq!(payloads.len(), 1, "{payloads:?}");
+        assert_eq!(payloads[0], settled);
     }
 
     /// A history replay interleaves messages with events by record time.

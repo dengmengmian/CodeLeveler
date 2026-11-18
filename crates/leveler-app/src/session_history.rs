@@ -520,6 +520,29 @@ fn transcript_fact(payload: &str, id: MessageId, input_id: Option<&str>) -> Opti
     (!text.is_empty()).then_some(Fact::PartialAssistant(id, text))
 }
 
+/// The review ids whose settlement was recorded as a durable conversation
+/// notice.
+///
+/// That notice is what makes a settled report a delivered conversation
+/// result. A review row written before the result-message mechanism has the
+/// same terminal fields but no notice, so it keeps the legacy inline card.
+pub(crate) async fn settled_review_ids(
+    db: &Database,
+    session_id: &SessionId,
+) -> Result<HashSet<String>, AppError> {
+    let payloads = MessageRepository::new(db)
+        .review_settled_notice_payloads(session_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(payloads
+        .iter()
+        .filter_map(|payload| match review_notice(payload) {
+            Some((id, RuntimeNoticeKind::ReviewSettled)) => Some(id),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The review id and notice kind a runtime review notice names.
 ///
 /// The body is written by this runtime for this purpose, and the id line is

@@ -147,15 +147,21 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 state.history_query = None;
             }
             // Only the answer to this client's own query, for the session on
-            // screen, and never over a turn that is running now.
-            // A user shell still running is live state the log has not closed.
-            if ours
-                && session_id == state.session_id
-                && !state.is_busy()
-                && !state.transcript.has_running_user_shell()
-                && !entries.is_empty()
-            {
-                replay_history(state, entries, omitted_turns);
+            // screen, and never a whole-transcript rebuild over a turn that is
+            // running now. A user shell still running is live state the log has
+            // not closed.
+            //
+            // The review facts in the answer do not have that constraint: a
+            // review is a message-log lifecycle, not a turn, and its reducer is
+            // idempotent by durable review id. Applying them when the rebuild
+            // has to wait is what keeps a reconnect's result from depending on
+            // when the answer happened to arrive.
+            if ours && session_id == state.session_id && !entries.is_empty() {
+                if !state.is_busy() && !state.transcript.has_running_user_shell() {
+                    replay_history(state, entries, omitted_turns);
+                } else {
+                    apply_review_facts(state, entries);
+                }
             }
         }
         RuntimeEvent::SessionUpdated { session } => {
@@ -1348,6 +1354,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // entry at the moment it finished. Finishing never navigates away
             // from the conversation.
             state.live_review = false;
+            settle_review_team(state, &review);
             let elapsed_ms = crate::transcript::review_elapsed_ms(&review);
             let summary = review.clone();
             state.transcript.apply_review_terminal(review);
@@ -1387,13 +1394,46 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             query_id,
             reviews,
             reports,
+            delivered,
         } => {
             let ours = query_id.is_some() && query_id == state.review_history_query;
             if !ours {
                 return;
             }
             state.review_history_query = None;
-            state.transcript.push_review_history(reviews, reports);
+            // A review that settled while this client was away still has its
+            // live roster row; the answer is the durable terminal that settles
+            // it, exactly as the missed event would have.
+            for review in &reviews {
+                settle_review_team(state, review);
+            }
+            let results = state
+                .transcript
+                .push_review_history(reviews, reports, &delivered);
+            // A settlement recorded by this runtime is the same conversation
+            // result the live terminal delivers. This answer is how a client
+            // that missed that event — a transport break, a resync, a replay
+            // window that starts after the settlement — still gets the one
+            // formal entry, with the same identity, body and boundary rule.
+            for (summary, report) in results {
+                let elapsed_ms = crate::transcript::review_elapsed_ms(&summary);
+                let body = crate::review_result::compose(&summary, Some(&report), state.t());
+                if state.transcript.has_open_assistant() {
+                    state
+                        .transcript
+                        .defer_review_result(summary, Some(report), elapsed_ms, body);
+                } else {
+                    state
+                        .transcript
+                        .push_review_result(summary, Some(report), elapsed_ms, body);
+                }
+            }
+            // The live-clock flag is a projection of the transcript's open
+            // reviews. When this answer settles the last one, the clock must
+            // stop even though the terminal event it missed never arrives.
+            if state.transcript.live_review_ids().is_empty() {
+                state.live_review = false;
+            }
         }
         // Nothing was started: the runtime states that this workspace has no
         // unambiguous object, and the person chooses one. This is a question,
@@ -2526,6 +2566,56 @@ fn replay_history(
     omitted_turns: u32,
 ) {
     restore_history(state, entries, omitted_turns, false);
+}
+
+/// Settle the live roster rows of a review whose durable terminal this client
+/// holds.
+///
+/// The roster is built from child events. A reconnect can lose the reviewer's
+/// and an investigator's terminal while the review keeps running server-side,
+/// so the transport snapshot cannot settle those rows: the snapshot carries
+/// the transcript and the review row, and `project_children` does not record
+/// review children as `sub_agent_*` events. The review's durable terminal is
+/// the same execution under the durable id, so it settles them here.
+fn settle_review_team(state: &mut AppState, summary: &leveler_client_protocol::UiReviewSummary) {
+    use leveler_client_protocol::{UiReviewInvestigationState, UiReviewStatus};
+    if !summary.status.settled() {
+        return;
+    }
+    state.team.settle_review(
+        &summary.id,
+        summary.status == UiReviewStatus::Completed,
+        state.elapsed_secs,
+    );
+    for child in &summary.investigations {
+        if child.state == UiReviewInvestigationState::Running {
+            continue;
+        }
+        state.team.settle_review(
+            &child.id,
+            child.state == UiReviewInvestigationState::Completed,
+            state.elapsed_secs,
+        );
+    }
+}
+
+/// Apply only the review lifecycle facts of a history answer.
+///
+/// The full replay rebuilds the whole transcript from the durable log, so it
+/// must not run over a live turn. Review facts are not turn state: their
+/// identity is the durable review id, their reducer converges on it, and the
+/// live event stream applies the very same events. Used when a reconnect's
+/// answer arrives while a turn or a user shell is live, so a missed settlement
+/// still reaches the conversation.
+fn apply_review_facts(state: &mut AppState, entries: Vec<leveler_client_protocol::UiHistoryEntry>) {
+    for entry in entries {
+        if matches!(
+            entry.event,
+            RuntimeEvent::ReviewStarted { .. } | RuntimeEvent::ReviewFinished { .. }
+        ) {
+            apply_runtime(state, entry.event);
+        }
+    }
 }
 
 fn restore_history(

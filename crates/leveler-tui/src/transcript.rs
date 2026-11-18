@@ -1118,16 +1118,35 @@ impl TranscriptState {
         }
         self.close_tool_group();
         let investigations = summary.investigations.clone();
-        self.items.push(TranscriptItem::Review(ReviewBlock {
+        let review_id = summary.id.clone();
+        let elapsed_ms = if summary.status.settled() {
+            review_elapsed_ms(&summary)
+        } else {
+            0
+        };
+        // A result can be known before its started notice (a dropped live
+        // start, an out-of-order resync). The execution record still belongs
+        // BEFORE the result it produced, so insert it there instead of
+        // appending a card that would read as a second, later event. The card
+        // is also told the result exists, so it never advertises a second,
+        // folded copy of a report the conversation already carries.
+        let before_result = self.items.iter().position(|item| {
+            matches!(item, TranscriptItem::ReviewResult(result) if result.summary.id == review_id)
+        });
+        let block = TranscriptItem::Review(ReviewBlock {
             summary,
             live_tool: None,
             investigations,
             report: None,
             expanded: true,
-            elapsed_ms: 0,
+            elapsed_ms,
             native_child: false,
-            report_delivered: false,
-        }));
+            report_delivered: before_result.is_some(),
+        });
+        match before_result {
+            Some(index) => self.items.insert(index, block),
+            None => self.items.push(block),
+        }
     }
 
     /// A native sub-agent row for this review exists in the conversation. The
@@ -1359,30 +1378,45 @@ impl TranscriptState {
     /// runtime lists newest first; history is conversation order, so this
     /// walks backwards. Existing ids are updated in place, never duplicated.
     ///
-    /// A review whose formal report was already delivered as its own
-    /// conversation entry keeps that entry: the report is not attached to the
-    /// card a second time. Rows written before result messages existed have no
-    /// entry, so their inline report remains the readable form.
+    /// A review whose settlement notice exists (`delivered`) is a result this
+    /// conversation already delivered; it is returned for the caller to
+    /// materialize exactly as the live terminal would, so the answer to a
+    /// reconnect produces the same conversation entry as the event it missed.
+    /// Rows written before result messages existed have no notice, so their
+    /// inline report remains the readable form.
     pub fn push_review_history(
         &mut self,
         mut summaries: Vec<leveler_client_protocol::UiReviewSummary>,
         reports: Vec<leveler_client_protocol::UiReviewReport>,
-    ) {
+        delivered: &[String],
+    ) -> Vec<(
+        leveler_client_protocol::UiReviewSummary,
+        leveler_client_protocol::UiReviewReport,
+    )> {
         summaries.reverse();
+        let mut results = Vec::new();
         for summary in summaries {
             let report = reports
                 .iter()
                 .find(|report| report.summary.id == summary.id)
                 .cloned();
-            if self.has_review_result(&summary.id) {
-                // The report is already a conversation entry. This answer may
-                // add a card the replay window omitted, but it must not place
-                // a second card below the report that already landed.
-                self.apply_review_terminal(summary);
+            let is_delivered = delivered.iter().any(|id| id == &summary.id);
+            if is_delivered {
+                // The execution record keeps the terminal it reached whether
+                // or not the result entry still exists in this view. No report
+                // is attached to it: the conversation entry is the one copy.
+                self.attach_review_report(summary.clone(), None);
+                if let Some(report) = report {
+                    results.push((summary, report));
+                }
+                // A repeated answer without the report (the transfer cap, or
+                // a terminal that never had one) must not erase a report this
+                // review already delivered.
                 continue;
             }
             self.attach_review_report(summary, report);
         }
+        results
     }
 
     /// The review card with this id, if the conversation holds one.

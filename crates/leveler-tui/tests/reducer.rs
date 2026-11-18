@@ -6,11 +6,13 @@ use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
     AnswerEffect, ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId,
     NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall,
-    UiApprovalRequest, UiCheckpoint, UiCompletionReport, UiMessage, UiPlan, UiPlanState,
-    UiPlanStep, UiRole, UiSessionSnapshot, UiThinkingAccess, UiThinkingState,
+    UiApprovalRequest, UiCheckpoint, UiCompletionReport, UiHistoryEntry, UiMessage, UiPlan,
+    UiPlanState, UiPlanStep, UiRole, UiSessionHistory, UiSessionSnapshot, UiThinkingAccess,
+    UiThinkingState,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::btw::{BtwToolState, BtwTurnState, SurfaceFocus};
+use leveler_tui::multi_agent::{ChildStatus, ChildUpdate};
 use leveler_tui::overlay::Overlay;
 use leveler_tui::reducer::reduce;
 use leveler_tui::screen::Screen;
@@ -12137,7 +12139,7 @@ fn compaction_leaves_a_line_in_the_conversation() {
 // is running. Durable history rebuilds terminal plan blocks through the same
 // reducer, in scratch state, and only that transcript is adopted.
 
-use leveler_client_protocol::{PlanStepStatus, UiHistoryEntry};
+use leveler_client_protocol::PlanStepStatus;
 
 fn plan_of(steps: &[(&str, PlanStepStatus)]) -> UiPlan {
     UiPlan {
@@ -14645,6 +14647,7 @@ fn review_history_is_idempotent_by_durable_id() {
                 leveler_client_protocol::UiReviewStatus::Completed,
             )],
             reports: Vec::new(),
+            delivered: Vec::new(),
         }),
     );
     let cards = s
@@ -14895,8 +14898,11 @@ fn a_settling_review_does_not_interrupt_a_streaming_answer() {
     );
 }
 
+/// A row written before result messages existed has no settlement notice, so
+/// the history answer keeps the legacy inline report. It is never dressed up
+/// as a delivered conversation result.
 #[test]
-fn review_history_restores_the_inline_report_from_the_durable_projection() {
+fn a_legacy_review_row_keeps_its_inline_report_from_the_history_answer() {
     let mut s = state();
     let query = leveler_client_protocol::CommandId::new("q1");
     s.review_history_query = Some(query.clone());
@@ -14910,6 +14916,7 @@ fn review_history_restores_the_inline_report_from_the_durable_projection() {
             query_id: Some(query),
             reviews: vec![summary.clone()],
             reports: vec![review_report(summary)],
+            delivered: Vec::new(),
         }),
     );
     let screen = rendered(&mut s, 110, 60);
@@ -14939,6 +14946,7 @@ fn review_history_restores_the_durable_elapsed_time() {
             query_id: Some(query),
             reviews: vec![summary],
             reports: Vec::new(),
+            delivered: Vec::new(),
         }),
     );
     let screen = rendered(&mut s, 110, 60);
@@ -15000,6 +15008,7 @@ fn a_delivered_report_is_never_folded_but_a_legacy_card_still_folds() {
             query_id: Some(query),
             reviews: vec![summary],
             reports: vec![report],
+            delivered: Vec::new(),
         }),
     );
     assert!(legacy.transcript.toggle_review_report("review-legacy"));
@@ -16121,6 +16130,7 @@ fn a_live_delivery_supersedes_the_cards_history_copy_of_the_same_report() {
             query_id: Some(query),
             reviews: vec![settled.clone()],
             reports: vec![review_report(settled.clone())],
+            delivered: Vec::new(),
         }),
     );
     assert!(
@@ -16155,6 +16165,772 @@ fn a_live_delivery_supersedes_the_cards_history_copy_of_the_same_report() {
         screen.matches("缺少 owner 过滤").count(),
         1,
         "one report body, one copy: {screen}"
+    );
+}
+
+/// A review whose settlement notice exists is a delivered result. An answer
+/// that only has the durable row (no live terminal: a transport break, a
+/// resync) must deliver it exactly like the terminal would — never as a
+/// folded inline copy on the execution card.
+#[test]
+fn a_delivered_review_answer_is_a_conversation_result_not_an_inline_card() {
+    let mut s = state();
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary.clone()],
+            reports: vec![review_report(summary)],
+            delivered: vec!["review-1".into()],
+        }),
+    );
+    assert!(
+        s.transcript.has_review_result("review-1"),
+        "a delivered settlement becomes a conversation result: {:#?}",
+        s.transcript.items()
+    );
+    let card = s.transcript.review("review-1").expect("execution card");
+    assert!(
+        card.report.is_none() && card.report_delivered,
+        "the card keeps only its execution record"
+    );
+    let screen = rendered(&mut s, 110, 60);
+    assert!(screen.contains("缺少 owner 过滤"), "{screen}");
+    assert!(
+        !screen.contains("点击展开") && !screen.contains("点击折叠"),
+        "a delivered report is never folded: {screen}"
+    );
+    assert_eq!(
+        screen.matches("缺少 owner 过滤").count(),
+        1,
+        "one report body, one copy: {screen}"
+    );
+}
+
+/// The same answer can arrive while an answer is streaming. The result is
+/// complete and durable; only its place waits for the safe boundary.
+#[test]
+fn a_history_answer_holds_a_delivered_result_until_the_streaming_answer_ends() {
+    let mut s = state();
+    let id = MessageId::new("answer-1");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "前半段。".into(),
+        }),
+    );
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary.clone()],
+            reports: vec![review_report(summary)],
+            delivered: vec!["review-1".into()],
+        }),
+    );
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ReviewResult(_))),
+        "the result must not land inside the open answer"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
+    );
+    let items = s.transcript.items();
+    let answer = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::Assistant(_)))
+        .expect("answer");
+    let result = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+        .expect("the result is delivered at the boundary");
+    assert!(result > answer, "the report lands after the answer");
+}
+
+/// A repeated answer (a second reconnect, a resync) updates the one entry.
+#[test]
+fn a_repeated_delivered_answer_keeps_one_result() {
+    let mut s = state();
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    for query in ["q1", "q2"] {
+        let query = leveler_client_protocol::CommandId::new(query);
+        s.review_history_query = Some(query.clone());
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+                query_id: Some(query),
+                reviews: vec![summary.clone()],
+                reports: vec![review_report(summary.clone())],
+                delivered: vec!["review-1".into()],
+            }),
+        );
+    }
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+            .count(),
+        1,
+        "identity is the durable review id, not the answer"
+    );
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Review(_)))
+            .count(),
+        1,
+        "the execution card is not duplicated either"
+    );
+}
+
+/// Two reviews in one answer keep their own report and identity; neither may
+/// borrow the other's body.
+#[test]
+fn two_delivered_reviews_keep_their_own_identity() {
+    let mut s = state();
+    let mut first = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    first.focus = "第一次审查".into();
+    let mut second = review_summary(
+        "review-2",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    second.focus = "第二次审查".into();
+    let mut first_report = review_report(first.clone());
+    first_report.report = "第一份正式报告。".into();
+    let mut second_report = review_report(second.clone());
+    second_report.report = "第二份正式报告。".into();
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![second.clone(), first.clone()],
+            reports: vec![second_report, first_report],
+            delivered: vec!["review-1".into(), "review-2".into()],
+        }),
+    );
+    let results: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::ReviewResult(block) => {
+                Some((block.summary.id.clone(), block.body.text.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "{results:#?}");
+    assert_eq!(results[0].0, "review-1", "oldest review first");
+    assert!(
+        results[0].1.contains("第一份正式报告"),
+        "{:?}",
+        results[0].1
+    );
+    assert_eq!(results[1].0, "review-2");
+    assert!(
+        results[1].1.contains("第二份正式报告"),
+        "{:?}",
+        results[1].1
+    );
+    assert!(
+        !results[0].1.contains("第二份正式报告"),
+        "a report never borrows another review's body"
+    );
+}
+
+/// A history answer can arrive after the client became busy (a turn started
+/// while it was in flight) or while a user shell is live. The whole transcript
+/// must not be rebuilt then, but the review lifecycle is independent of turn
+/// state and must still converge — otherwise the missed settlement would be
+/// lost until a resume.
+#[test]
+fn a_refused_history_replay_still_applies_its_review_results() {
+    let mut s = state();
+    let mut snapshot = snapshot();
+    snapshot.status = "running".to_string();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: Some(query),
+            session_id: SessionId::new("s1"),
+            entries: vec![
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 10,
+                    turn_start: true,
+                    event: RuntimeEvent::UserMessageAdded {
+                        message: UiMessage {
+                            id: MessageId::new("m-1"),
+                            role: UiRole::User,
+                            text: "先解释一下仓库".into(),
+                            ordinal: None,
+                            kind: None,
+                            images: 0,
+                        },
+                    },
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 500,
+                    turn_start: false,
+                    event: RuntimeEvent::ReviewFinished {
+                        review: summary.clone(),
+                        report: Some(Box::new(review_report(summary))),
+                    },
+                },
+            ],
+            omitted_turns: 0,
+        }),
+    );
+    assert!(
+        s.transcript.has_review_result("review-1"),
+        "the settlement is a review fact, not turn state: {:#?}",
+        s.transcript.items()
+    );
+}
+
+/// The transport reconnects during an active turn by sending
+/// `RuntimeReconnected` and then a resynced snapshot. While a turn runs the
+/// snapshot carries the durable history, so a review that settled during the
+/// break is rebuilt at its real position — the same projection a full replay
+/// produces, not a card appended at the bottom.
+#[test]
+fn a_busy_reconnect_replays_a_settled_review_at_its_durable_position() {
+    let mut s = state();
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let mut snap = snapshot();
+    snap.status = "running".to_string();
+    snap.history = Some(UiSessionHistory {
+        entries: vec![
+            UiHistoryEntry {
+                turn_elapsed_ms: 10,
+                turn_start: true,
+                event: RuntimeEvent::UserMessageAdded {
+                    message: UiMessage {
+                        id: MessageId::new("m-1"),
+                        role: UiRole::User,
+                        text: "/review @workspace".into(),
+                        ordinal: None,
+                        kind: None,
+                        images: 0,
+                    },
+                },
+            },
+            UiHistoryEntry {
+                turn_elapsed_ms: 100,
+                turn_start: false,
+                event: RuntimeEvent::ReviewStarted {
+                    review: review_summary(
+                        "review-1",
+                        leveler_client_protocol::UiReviewStatus::Running,
+                    ),
+                },
+            },
+            UiHistoryEntry {
+                turn_elapsed_ms: 900,
+                turn_start: false,
+                event: RuntimeEvent::ReviewFinished {
+                    review: summary.clone(),
+                    report: Some(Box::new(review_report(summary))),
+                },
+            },
+            UiHistoryEntry {
+                turn_elapsed_ms: 1000,
+                turn_start: true,
+                event: RuntimeEvent::UserMessageAdded {
+                    message: UiMessage {
+                        id: MessageId::new("m-2"),
+                        role: UiRole::User,
+                        text: "继续".into(),
+                        ordinal: None,
+                        kind: None,
+                        images: 0,
+                    },
+                },
+            },
+        ],
+        omitted_turns: 0,
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::RuntimeReconnected {
+            runtime_build: Default::default(),
+            runtime_restarted: Some(false),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    assert!(
+        s.transcript.has_review_result("review-1"),
+        "the result the client missed is rebuilt from the durable facts: {:#?}",
+        s.transcript.items()
+    );
+    let items = s.transcript.items();
+    let result = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+        .expect("result");
+    let later = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::User(text) if text == "继续"))
+        .expect("the later turn");
+    assert!(
+        result < later,
+        "the result keeps its settlement place, not the conversation's end"
+    );
+    let card = s.transcript.review("review-1").expect("card");
+    assert!(card.report_delivered && card.report.is_none());
+    assert!(
+        card.summary.status.settled(),
+        "the card shows the terminal it reached"
+    );
+}
+
+/// A reconnect while the reviewer is still running keeps the card running;
+/// the later terminal delivers the result exactly once.
+#[test]
+fn a_busy_reconnect_keeps_a_running_review_running() {
+    let mut s = state();
+    let mut snap = snapshot();
+    snap.status = "running".to_string();
+    snap.history = Some(UiSessionHistory {
+        entries: vec![UiHistoryEntry {
+            turn_elapsed_ms: 10,
+            turn_start: true,
+            event: RuntimeEvent::ReviewStarted {
+                review: review_summary(
+                    "review-1",
+                    leveler_client_protocol::UiReviewStatus::Running,
+                ),
+            },
+        }],
+        omitted_turns: 0,
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    let card = s.transcript.review("review-1").expect("card");
+    assert_eq!(
+        card.summary.status,
+        leveler_client_protocol::UiReviewStatus::Running
+    );
+    assert!(!s.transcript.has_review_result("review-1"));
+
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: summary.clone(),
+            report: Some(Box::new(review_report(summary))),
+        }),
+    );
+    assert!(s.transcript.has_review_result("review-1"));
+}
+
+/// An idle reconnect has no history in the snapshot (the runtime attaches it
+/// while a turn runs). The client must ask for the durable log before it asks
+/// for review rows; otherwise a card answer could land before the replay that
+/// owns the transcript's order.
+#[test]
+fn an_idle_reconnect_asks_for_history_before_review_rows() {
+    let mut s = state();
+    let settled = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: settled.clone(),
+            report: Some(Box::new(review_report(settled))),
+        }),
+    );
+    assert!(!s.transcript.is_empty());
+    // A real resynced snapshot carries the session's message rows; the
+    // rebuild from them is what the replay then owns.
+    let mut snap = snapshot();
+    snap.messages = vec![UiMessage {
+        id: MessageId::new("m-1"),
+        role: UiRole::User,
+        text: "先解释一下仓库".into(),
+        ordinal: Some(0),
+        kind: None,
+        images: 0,
+    }];
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(ClientCommand::QuerySessionHistory { .. })
+        )),
+        "the reconnect asks for the durable log: {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(ClientCommand::ListReviews { .. }))),
+        "review rows wait for the transcript replay: {effects:?}"
+    );
+}
+
+/// The reviewer's investigator children are part of the durable summary. A
+/// busy reconnect rebuilds them from the snapshot history, and a terminal
+/// updates them in place — a completed child never reverts, and no second set
+/// appears.
+#[test]
+fn a_busy_reconnect_restores_the_running_investigators() {
+    fn investigator(
+        id: &str,
+        title: &str,
+        state: leveler_client_protocol::UiReviewInvestigationState,
+    ) -> leveler_client_protocol::UiReviewInvestigation {
+        leveler_client_protocol::UiReviewInvestigation {
+            id: id.into(),
+            title: title.into(),
+            role: "investigator".into(),
+            state,
+            objective: None,
+            findings: 0,
+            elapsed_ms: 12_000,
+        }
+    }
+    use leveler_client_protocol::UiReviewInvestigationState;
+    let mut s = state();
+    let mut running = review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running);
+    running.investigations = vec![
+        investigator("agent-1", "权限调查者", UiReviewInvestigationState::Running),
+        investigator("agent-2", "索引调查者", UiReviewInvestigationState::Running),
+    ];
+    let mut snap = snapshot();
+    snap.status = "running".to_string();
+    snap.history = Some(UiSessionHistory {
+        entries: vec![UiHistoryEntry {
+            turn_elapsed_ms: 10,
+            turn_start: true,
+            event: RuntimeEvent::ReviewStarted { review: running },
+        }],
+        omitted_turns: 0,
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    let card = s.transcript.review("review-1").expect("card");
+    assert_eq!(card.investigations.len(), 2, "{:#?}", card.investigations);
+    assert!(
+        card.investigations
+            .iter()
+            .all(|child| child.state == UiReviewInvestigationState::Running),
+        "the reconnect keeps the live child state"
+    );
+
+    let mut settled = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    settled.investigations = vec![
+        investigator(
+            "agent-1",
+            "权限调查者",
+            UiReviewInvestigationState::Completed,
+        ),
+        investigator(
+            "agent-2",
+            "索引调查者",
+            UiReviewInvestigationState::Completed,
+        ),
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: settled,
+            report: None,
+        }),
+    );
+    let card = s.transcript.review("review-1").expect("card");
+    assert_eq!(card.investigations.len(), 2, "no second child set");
+    assert!(
+        card.investigations
+            .iter()
+            .all(|child| child.state == UiReviewInvestigationState::Completed),
+        "the terminal settles the same children"
+    );
+    assert_eq!(card.investigations[0].id, "agent-1");
+    assert_eq!(card.investigations[1].id, "agent-2");
+}
+
+/// A result that arrives before its started notice (a dropped live start, an
+/// out-of-order resync) still reads as card-then-result, never as a second
+/// later event below its own outcome.
+#[test]
+fn a_result_that_arrives_before_its_started_notice_keeps_the_card_first() {
+    let mut s = state();
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: summary.clone(),
+            report: Some(Box::new(review_report(summary.clone()))),
+        }),
+    );
+    assert!(s.transcript.has_review_result("review-1"));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    let items = s.transcript.items();
+    let card = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::Review(_)))
+        .expect("card");
+    let result = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+        .expect("result");
+    assert!(
+        card < result,
+        "the execution record stays before the result it produced"
+    );
+    let block = match &items[card] {
+        TranscriptItem::Review(block) => block,
+        _ => unreachable!(),
+    };
+    assert!(
+        block.report_delivered,
+        "a card created after its result knows the report is already below"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Review(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+            .count(),
+        1
+    );
+}
+
+/// A reconnect answer is not a reason to move the reader. The parked scroll
+/// and the unsent draft survive the delivered result.
+#[test]
+fn a_delivered_history_answer_does_not_steal_scroll_or_the_draft() {
+    let mut s = state();
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 42;
+    s.composer.replace("半句话");
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary.clone()],
+            reports: vec![review_report(summary)],
+            delivered: vec!["review-1".into()],
+        }),
+    );
+    assert!(s.transcript.has_review_result("review-1"));
+    assert!(!s.conv.auto_scroll, "the reader's parked position is kept");
+    assert_eq!(s.conv.scroll, 42);
+    assert_eq!(s.composer.text(), "半句话");
+}
+
+/// The live roster is built from child events, and a transport break can lose
+/// the reviewer's terminal while the review keeps running server-side. The
+/// review's durable terminal settles the same row instead of leaving a stale
+/// "running" entry at the bottom.
+#[test]
+fn a_reconnecting_client_settles_the_reviewers_stale_roster_row() {
+    fn child(team: &mut leveler_tui::multi_agent::TaskTeamView, id: &str, role: &str) {
+        team.apply_update(ChildUpdate {
+            id: id.into(),
+            nickname: String::new(),
+            role: role.into(),
+            done: false,
+            ok: false,
+            detail: "调查".into(),
+            title: None,
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 0,
+        });
+    }
+    let mut s = state();
+    s.live_review = true;
+    child(&mut s.team, "review-1", "reviewer");
+    child(&mut s.team, "agent-1", "investigator");
+    assert_eq!(s.team.active().count(), 2);
+
+    let mut summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    summary.investigations = vec![leveler_client_protocol::UiReviewInvestigation {
+        id: "agent-1".into(),
+        title: "权限调查者".into(),
+        role: "investigator".into(),
+        state: leveler_client_protocol::UiReviewInvestigationState::Completed,
+        objective: None,
+        findings: 1,
+        elapsed_ms: 1_000,
+    }];
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary.clone()],
+            reports: vec![review_report(summary)],
+            delivered: vec!["review-1".into()],
+        }),
+    );
+    assert_eq!(
+        s.team.active().count(),
+        0,
+        "a settled review and its settled child are not live work"
+    );
+    assert!(
+        !s.live_review,
+        "the live review clock stops when the only open review settles"
+    );
+    let statuses: Vec<_> = s.team.children.iter().map(|c| c.status).collect();
+    assert!(
+        statuses.iter().all(|status| status.is_terminal()),
+        "{statuses:?}"
+    );
+    assert_eq!(s.team.children.len(), 2, "the same rows, settled in place");
+}
+
+/// A live terminal settles the same row too, so the two delivery paths agree.
+#[test]
+fn a_review_terminal_settles_the_roster_row_without_a_child_event() {
+    let mut s = state();
+    s.team.apply_update(ChildUpdate {
+        id: "review-1".into(),
+        nickname: String::new(),
+        role: "reviewer".into(),
+        done: false,
+        ok: false,
+        detail: "审查".into(),
+        title: None,
+        profile_id: None,
+        agent_name: None,
+        read_only: true,
+        contribution: None,
+        stop: None,
+        limit: None,
+        started_elapsed_secs: 0,
+    });
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: summary.clone(),
+            report: Some(Box::new(review_report(summary))),
+        }),
+    );
+    assert_eq!(s.team.active().count(), 0);
+    assert_eq!(s.team.children[0].status, ChildStatus::Completed);
+}
+
+/// A review this client never saw run has no live row to settle — and a
+/// reconnect must not mint one from history.
+#[test]
+fn a_delivered_review_without_a_live_row_does_not_mint_one() {
+    let mut s = state();
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary.clone()],
+            reports: vec![review_report(summary)],
+            delivered: vec!["review-1".into()],
+        }),
+    );
+    assert!(
+        s.team.children.is_empty(),
+        "history does not join the live roster"
     );
 }
 

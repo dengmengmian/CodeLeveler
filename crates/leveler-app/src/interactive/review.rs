@@ -1003,6 +1003,18 @@ pub(super) async fn list(
         }
         reviews.push(summary);
     }
+    // The review row says what the review is; the settlement notice says
+    // whether its result was delivered to the conversation. A client that
+    // missed the live terminal (a transport break, a resync) must deliver the
+    // same result, and must not turn a pre-mechanism row into one.
+    let mut delivered: Vec<String> = crate::session_history::settled_review_ids(&db, &session_id)
+        .await
+        .map_err(|error| ClientError::Runtime(error.to_string()))?
+        .into_iter()
+        .collect();
+    // A stable answer: the set is a membership fact, and two identical
+    // sessions must not produce two different wire payloads.
+    delivered.sort();
     emit(
         client,
         &session_id,
@@ -1010,6 +1022,7 @@ pub(super) async fn list(
             query_id,
             reviews,
             reports,
+            delivered,
         },
     );
     Ok(())
