@@ -7,7 +7,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     SetNamedSecurityInfoW,
@@ -17,8 +17,14 @@ use windows_sys::Win32::Security::{
     InitializeAcl, LABEL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, PSID,
     SYSTEM_MANDATORY_LABEL_ACE,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo, GetDriveTypeW,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
-use crate::IntegrityLabel;
+use crate::{FileObjectIdentity, IntegrityLabel};
 
 /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`. windows-sys exposes it only as part of
 /// the ACE union constants, so name it once here.
@@ -35,11 +41,173 @@ fn wide(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+pub(crate) type RawHandle = HANDLE;
+
+/// A `CreateFileW` handle closed on every return path.
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if self.0 != INVALID_HANDLE_VALUE && !self.0.is_null() {
+            // SAFETY: the handle came from CreateFileW and is owned here.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
 fn win32_error(context: &str, code: u32) -> io::Error {
     io::Error::new(
         io::Error::from_raw_os_error(code as i32).kind(),
         format!("{context}: {}", io::Error::from_raw_os_error(code as i32)),
     )
+}
+
+/// Refuse volumes whose file id is not the filesystem's persistent identity.
+///
+/// NTFS and ReFS keep a file id stable across a rename and allocate a new one
+/// when the object is replaced. The FAT family reuses directory-entry slots,
+/// and a network share's id is the server's to recycle, so neither can prove
+/// the incarnation a grant was bound to.
+fn require_persistent_file_ids(handle: HANDLE) -> io::Result<()> {
+    let mut serial = 0u32;
+    let mut maximum_component = 0u32;
+    let mut flags = 0u32;
+    let mut filesystem = [0u16; 64];
+    // SAFETY: the handle is live; every out-parameter points at writable
+    // storage, and the filesystem buffer is its own length.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            &mut maximum_component,
+            &mut flags,
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = filesystem
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(filesystem.len());
+    let filesystem = String::from_utf16_lossy(&filesystem[..len]);
+    if filesystem.eq_ignore_ascii_case("NTFS") || filesystem.eq_ignore_ascii_case("ReFS") {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("filesystem `{filesystem}` does not provide persistent file ids"),
+        ))
+    }
+}
+
+/// A local volume reachable through a drive letter. UNC shares and device
+/// namespaces are refused: their ids are not the local disk's to prove.
+fn require_local_drive(path: &Path) -> io::Result<()> {
+    use std::path::{Component, Prefix};
+    let prefix = path.components().find_map(|component| match component {
+        Component::Prefix(prefix) => Some(prefix.kind()),
+        _ => None,
+    });
+    let root = match prefix {
+        Some(Prefix::Disk(letter)) | Some(Prefix::VerbatimDisk(letter)) => {
+            wide(Path::new(&format!("{}:\\", char::from(letter))))
+        }
+        Some(Prefix::UNC(_, _))
+        | Some(Prefix::VerbatimUNC(_, _))
+        | Some(Prefix::DeviceNS(_))
+        | Some(Prefix::Verbatim(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "network and device-namespace paths have no local persistent file id",
+            ));
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a relative path cannot prove which volume holds the object",
+            ));
+        }
+    };
+    // SAFETY: `root` is a NUL-terminated drive-root string.
+    let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
+    if drive_type == DRIVE_REMOTE {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "network shares have no local persistent file id",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn file_identity_at(path: &Path) -> io::Result<FileObjectIdentity> {
+    require_local_drive(path)?;
+    let path_w = wide(path);
+    // SAFETY: `path_w` is NUL-terminated; the returned handle is owned by
+    // `owned` and closed on every path. FILE_FLAG_BACKUP_SEMANTICS is what
+    // lets the same call open a directory; reparse points are followed so the
+    // identity is the object the path reaches.
+    let handle = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = OwnedHandle(handle);
+    file_identity_of_handle(owned.0)
+}
+
+pub(crate) fn file_identity_of_handle(handle: HANDLE) -> io::Result<FileObjectIdentity> {
+    require_persistent_file_ids(handle)?;
+    let mut id = FILE_ID_INFO {
+        VolumeSerialNumber: 0,
+        FileId: windows_sys::Win32::Storage::FileSystem::FILE_ID_128 {
+            Identifier: [0u8; 16],
+        },
+    };
+    // SAFETY: the handle is live and `id` is exactly the structure the class
+    // expects for FileIdInfo.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: same live handle; `basic` is FILE_BASIC_INFO for FileBasicInfo.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileObjectIdentity {
+        volume_serial: id.VolumeSerialNumber,
+        file_id: id.FileId.Identifier,
+        creation_time: basic.CreationTime as u64,
+    })
 }
 
 /// An owned `PSID` from `ConvertStringSidToSidW`, freed on drop.

@@ -99,6 +99,105 @@ fn permissions_list_empty_repo_exits_zero() {
     );
 }
 
+/// A grant handle is a stable management key: `grants` lists the exact
+/// capability/resource pair, `revoke-grant` removes it, and a second revoke
+/// reports that nothing was removed. The identity is host-resolved, so this
+/// runs the same on Windows and unix.
+#[tokio::test]
+async fn resource_grants_are_listed_and_revoked_on_windows() {
+    use leveler_core::{Capability, GrantBinding, GrantScope};
+    use leveler_project::Layout;
+
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let layout = Layout::ephemeral(repo.path().to_path_buf(), None, home.path());
+    std::fs::create_dir_all(&layout.state_dir).unwrap();
+    let db = leveler_storage::Database::connect(&layout.database_path())
+        .await
+        .unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("approved.txt");
+    std::fs::write(&target, "original").unwrap();
+    let resource = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+    let binding = GrantBinding {
+        capability: Capability::FilesystemWrite,
+        resource,
+    };
+
+    // The CLI resolves the project from the same environment, minus the
+    // inherited editor override that the identity gate refuses.
+    let values: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| key != "GIT_EDITOR")
+        .collect();
+    let environment =
+        leveler_core::EnvSnapshot::new(values, repo.path().to_path_buf(), std::env::temp_dir());
+    // The CLI composition root installs the same snapshot before resolving
+    // the project; a test process starts with the library's empty default.
+    let _ = leveler_core::install_environment(environment.clone());
+    let project = leveler_execution::resolve_project_identity_with_environment(
+        &repo.path().canonicalize().unwrap(),
+        &environment,
+    )
+    .await
+    .unwrap();
+    leveler_storage::ResourceGrantStore::grant(
+        &db,
+        &project,
+        "session-1",
+        GrantScope::Session,
+        std::slice::from_ref(&binding),
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    let run = |args: &[&str]| {
+        leveler()
+            .env("LEVELER_HOME", home.path())
+            .env_remove("GIT_EDITOR")
+            .args(["--repo"])
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .expect("spawn leveler")
+    };
+    let listed = run(&["permissions", "grants", "--json"]);
+    assert!(
+        listed.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let rows = rows.as_array().expect("a JSON array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let id = rows[0]["id"].as_str().expect("grant handle").to_string();
+    assert_eq!(rows[0]["capability"], "FilesystemWrite");
+    assert!(
+        matches!(
+            rows[0]["resource"].as_str(),
+            Some(summary) if summary.contains("approved.txt")
+        ),
+        "{rows:?}"
+    );
+
+    let revoked = run(&["permissions", "revoke-grant", &id]);
+    assert!(
+        revoked.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let again = run(&["permissions", "revoke-grant", &id]);
+    assert_eq!(
+        again.status.code(),
+        Some(1),
+        "a second revoke reports that the handle no longer exists"
+    );
+    let empty = run(&["permissions", "grants", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 0);
+}
+
 #[test]
 fn permissions_list_shows_project_rule_then_clear_removes_it() {
     let dir = tempfile::tempdir().unwrap();

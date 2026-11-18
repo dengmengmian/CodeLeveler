@@ -1046,9 +1046,10 @@ impl Executor {
     /// Whether every binding is covered by a proven execution boundary, so a
     /// Session/Project grant is safe to offer for this action. A Git request is
     /// anchored by its approved remote; the accompanying repository bindings are
-    /// covered by the same frozen repository identity. Filesystem object binding
-    /// and frozen Git targets exist on unix only; Windows keeps exact-call
-    /// approval rather than pretending the binding holds.
+    /// covered by the same frozen repository identity. Filesystem object
+    /// bindings are re-resolved against the granted incarnation at every use;
+    /// frozen Git targets remain unix-only, so Windows Git commands keep
+    /// exact-call approval rather than pretending the binding holds.
     fn execution_bound_request(request: &leveler_core::GrantRequest) -> bool {
         use leveler_core::{Capability, ResourceIdentity};
         if request.bindings.is_empty() {
@@ -1072,9 +1073,9 @@ impl Executor {
         if all(background) {
             return true;
         }
-        if !cfg!(unix) {
-            return false;
-        }
+        // A filesystem grant is execution-bound on every host: the execution
+        // layer re-resolves the object identity before each use and the
+        // Windows writer checks the opened handle against the frozen identity.
         let filesystem = |capability: &Capability, resource: &ResourceIdentity| {
             matches!(
                 (capability, resource),
@@ -1090,6 +1091,11 @@ impl Executor {
         };
         if all(filesystem) {
             return true;
+        }
+        // Frozen Git targets are built from directory symlinks and a private
+        // git directory, which this execution backend implements on unix only.
+        if !cfg!(unix) {
+            return false;
         }
         let git = |capability: &Capability, resource: &ResourceIdentity| match resource {
             ResourceIdentity::ConfiguredRemote { .. } => matches!(
@@ -2937,6 +2943,17 @@ mod authorize_tests {
                 .await;
             let admitted = match admitted {
                 Ok(admitted) => admitted,
+                // Windows has no per-command network-denial backend. A
+                // run-level denial therefore cannot be frozen onto a
+                // `run_command` admission; the host refuses it instead of
+                // running with the network open. File tools and MCP keep the
+                // platform-independent assertions below/above.
+                #[cfg(windows)]
+                Err(AdmitError::Refused { reason, .. })
+                    if action.name == "run_command" && reason.contains("network") =>
+                {
+                    continue;
+                }
                 Err(AdmitError::Refused { reason, .. }) => panic!("{}: {reason}", action.name),
                 Err(AdmitError::Fatal(error)) => panic!("{error}"),
             };

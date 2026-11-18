@@ -6,9 +6,11 @@
 //! what a user would run by hand.
 #![forbid(unsafe_code)]
 
+pub mod history;
 pub mod parallel;
 mod workflow;
 
+pub use history::{CommitView, HistoryError, RepositoryHistory};
 pub use parallel::{MergeCandidate, MergeOutcome, worktree_path};
 pub use workflow::{GitWorkflow, VcsError, WorkflowOptions, WorkflowOutcome, slugify};
 

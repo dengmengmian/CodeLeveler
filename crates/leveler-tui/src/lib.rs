@@ -39,6 +39,7 @@ pub mod foreign_session;
 pub mod help;
 pub mod history_search;
 pub mod i18n;
+mod input_guard;
 mod issue;
 mod layout;
 pub mod markdown;

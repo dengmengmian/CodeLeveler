@@ -1277,9 +1277,9 @@ async fn a_background_check_running_through_an_edit_cannot_close_the_goal() {
         )
     };
     let (program, args) = if cfg!(windows) {
-        ("cmd", vec!["/c", script_name])
+        ("cmd", vec!["/c", ".\\run-tests.cmd"])
     } else {
-        ("sh", vec![script_name])
+        ("sh", vec!["run-tests.sh"])
     };
     let f = fixture(
         vec![sse(vec![

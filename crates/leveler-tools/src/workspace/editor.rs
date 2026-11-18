@@ -60,7 +60,7 @@ fn editing_workspace(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn descriptor_resource_authority(
     context: &ToolContext,
     resolved: &std::path::Path,
@@ -183,10 +183,23 @@ impl WorkspaceEditor {
                 .to_path_buf();
             let expected = expected.to_string();
             let replacement = replacement.to_string();
+            let resource = descriptor_resource_authority(
+                context,
+                resolved,
+                leveler_core::Capability::FilesystemWrite,
+            );
+            let target = resolved.to_path_buf();
             committed_permissions = tokio::task::spawn_blocking(
                 move || -> std::io::Result<Option<std::fs::Permissions>> {
                     let commit = open_windows_replace_context(&root_dir, &relative)?;
-                    windows_capability_replace(commit, &expected, &replacement)
+                    windows_capability_replace(
+                        commit,
+                        &expected,
+                        &replacement,
+                        resource
+                            .as_ref()
+                            .map(|resource| (target.as_path(), resource)),
+                    )
                 },
             )
             .await
@@ -579,10 +592,15 @@ fn windows_capability_replace(
     context: WindowsReplaceContext,
     expected: &str,
     replacement: &str,
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
 ) -> std::io::Result<Option<std::fs::Permissions>> {
     use std::io::{Read, Write};
 
     let mut target = context.parent.open(&context.target_name)?;
+    // The object the path currently names must be the object the grant froze.
+    // Taking the identity from the opened handle closes the window between the
+    // path-based revalidation and this open.
+    verify_windows_resource_identity(&target, authorization)?;
     // Keep cap-std permissions for the temp write path (TempFile::as_file uses
     // cap_std::fs::Permissions). Map only the readonly bit to std for the
     // checkpoint return type used by the rest of the crate.
@@ -602,17 +620,45 @@ fn windows_capability_replace(
     temp.as_file().sync_all()?;
 
     // Re-read at the commit boundary. This is cooperative CAS for normal
-    // editors; the stable parent capability is the security boundary.
+    // editors; the stable parent capability is the security boundary. The
+    // fresh handle is checked against the frozen identity again so a replaced
+    // entry is refused even when its bytes happen to match.
+    let mut verification = context.parent.open(&context.target_name)?;
+    verify_windows_resource_identity(&verification, authorization)?;
     let mut current = String::new();
-    context
-        .parent
-        .open(&context.target_name)?
-        .read_to_string(&mut current)?;
+    verification.read_to_string(&mut current)?;
+    drop(verification);
     if current != expected {
         return Ok(None);
     }
     temp.replace(&context.target_name)?;
     Ok(Some(std_permissions))
+}
+
+/// Compare the identity of an opened object with the frozen grant.
+///
+/// The identity is read from the handle, not from the path, so a rename or a
+/// case-only spelling change does not break a legitimate grant and a
+/// delete/recreate does not inherit one.
+#[cfg(windows)]
+fn verify_windows_resource_identity(
+    file: &cap_std::fs::File,
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let Some((path, frozen)) = authorization else {
+        return Ok(());
+    };
+    let actual = leveler_execution::filesystem_resource_from_raw_handle(path, file.as_raw_handle())
+        .map_err(std::io::Error::other)?;
+    if &actual != frozen {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "opened object does not match frozen resource authority",
+        ));
+    }
+    Ok(())
 }
 
 /// Build a `std::fs::Permissions` with the given readonly flag (Windows has no
@@ -1048,7 +1094,7 @@ mod tests {
             "an open parent capability must deny the rename needed for a junction swap"
         );
         assert!(
-            windows_capability_replace(context, "old\n", "new\n")
+            windows_capability_replace(context, "old\n", "new\n", None)
                 .unwrap()
                 .is_some(),
             "CAS replace should commit when expected content matches"

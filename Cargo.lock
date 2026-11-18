@@ -2648,8 +2648,14 @@ dependencies = [
 name = "leveler-vcs"
 version = "1.0.27"
 dependencies = [
+ "chrono",
+ "flate2",
+ "ignore",
  "leveler-core",
  "leveler-execution",
+ "regex",
+ "sha1",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -2659,6 +2665,7 @@ dependencies = [
 name = "leveler-win-confine"
 version = "1.0.27"
 dependencies = [
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 

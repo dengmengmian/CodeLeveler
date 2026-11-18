@@ -4761,9 +4761,14 @@ fn archive_and_unarchive_are_reversible_row_actions() {
     let effects = reduce(&mut s, key(KeyCode::Char('a')));
     assert_eq!(
         effects,
-        vec![Effect::Send(ClientCommand::ArchiveSession {
-            session_id: SessionId::new("active"),
-        })]
+        vec![
+            Effect::Send(ClientCommand::ArchiveSession {
+                session_id: SessionId::new("active"),
+            }),
+            Effect::Send(ClientCommand::RequestSessionListFor {
+                requester_session_id: s.session_id.clone(),
+            }),
+        ]
     );
 
     // The filter still hides it until the runtime answers; the archived view
@@ -4785,9 +4790,14 @@ fn archive_and_unarchive_are_reversible_row_actions() {
     let effects = reduce(&mut s, key(KeyCode::Char('u')));
     assert_eq!(
         effects,
-        vec![Effect::Send(ClientCommand::UnarchiveSession {
-            session_id: s.sessions[0].id.clone(),
-        })]
+        vec![
+            Effect::Send(ClientCommand::UnarchiveSession {
+                session_id: s.sessions[0].id.clone(),
+            }),
+            Effect::Send(ClientCommand::RequestSessionListFor {
+                requester_session_id: s.session_id.clone(),
+            }),
+        ]
     );
 }
 

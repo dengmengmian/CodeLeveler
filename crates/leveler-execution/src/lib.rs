@@ -114,6 +114,8 @@ pub use windows_sandbox::{
 };
 pub use workspace::{Workspace, WorkspaceError, is_sensitive_file_name};
 
+#[cfg(windows)]
+pub use resource_identity::filesystem_resource_from_raw_handle;
 pub use resource_identity::{
     filesystem_resource_from_metadata, resolve_filesystem_resource, resolve_git_grant,
     resolve_git_grant_with_environment, resolve_project_identity,

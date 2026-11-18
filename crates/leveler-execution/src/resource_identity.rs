@@ -83,9 +83,58 @@ fn path_string(path: &Path) -> Result<String, String> {
         .ok_or_else(|| "non-UTF8 resource paths are unsupported".into())
 }
 fn object_identity(path: &Path) -> Result<String, String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|_| "cannot read resource object identity".to_string())?;
-    metadata_object_identity(&metadata)
+    #[cfg(windows)]
+    {
+        windows_object_identity(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = std::fs::metadata(path)
+            .map_err(|_| "cannot read resource object identity".to_string())?;
+        metadata_object_identity(&metadata)
+    }
+}
+
+/// Windows object identity comes from an open handle, never from `Metadata`.
+///
+/// `GetFileInformationByHandleEx(FileIdInfo)` reports the volume's own 128-bit
+/// id for the object plus its creation time. The pair survives renames and
+/// case-only spelling changes, and changes when the directory entry is
+/// replaced. The Win32 calls live in `leveler-win-confine`, the audited unsafe
+/// boundary; a filesystem without persistent ids is an error, so a grant is
+/// never derived from a path string.
+#[cfg(windows)]
+fn windows_object_identity(path: &Path) -> Result<String, String> {
+    let identity = crate::windows_confine::file_object_identity(path)
+        .map_err(|error| format!("cannot read resource object identity: {error}"))?;
+    Ok(windows_identity_string(&identity))
+}
+
+#[cfg(windows)]
+fn windows_identity_string(identity: &crate::windows_confine::FileObjectIdentity) -> String {
+    format!(
+        "windows:{}:{}:{}",
+        identity.volume_serial,
+        identity.file_id_hex(),
+        identity.creation_time
+    )
+}
+
+/// Build a filesystem resource from an already-open Windows handle.
+///
+/// The caller has the descriptor it is about to mutate; taking the identity
+/// from that handle is the TOCTOU-free half of grant validation.
+#[cfg(windows)]
+pub fn filesystem_resource_from_raw_handle(
+    canonical_path: &Path,
+    handle: std::os::windows::io::RawHandle,
+) -> Result<ResourceIdentity, String> {
+    let identity = crate::windows_confine::file_object_identity_of_raw_handle(handle)
+        .map_err(|error| format!("cannot read resource object identity: {error}"))?;
+    Ok(ResourceIdentity::FilesystemPath {
+        canonical_path: path_string(canonical_path)?,
+        object_identity: windows_identity_string(&identity),
+    })
 }
 
 fn metadata_object_identity(metadata: &std::fs::Metadata) -> Result<String, String> {
@@ -501,6 +550,72 @@ pub fn resolve_filesystem_resource(path: &Path) -> Result<ResourceIdentity, Stri
         canonical_path: path_string(&canonical)?,
         object_identity: object,
     })
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn case_only_spellings_resolve_to_one_filesystem_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Notes.txt");
+        std::fs::write(&path, "body").unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let identity = resolve_filesystem_resource(&canonical).unwrap();
+        let alternate = dir.path().join("NOTES.TXT");
+        assert_eq!(
+            identity,
+            resolve_filesystem_resource(&alternate).unwrap(),
+            "the volume folds case; the identity must not depend on the spelling"
+        );
+    }
+
+    #[test]
+    fn a_replaced_object_does_not_inherit_the_old_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "old").unwrap();
+        let original = resolve_filesystem_resource(&path).unwrap();
+        let held = std::fs::File::open(&path).unwrap();
+        let held_identity = {
+            use std::os::windows::io::AsRawHandle;
+            filesystem_resource_from_raw_handle(
+                &std::fs::canonicalize(&path).unwrap(),
+                held.as_raw_handle(),
+            )
+            .unwrap()
+        };
+        assert_eq!(original, held_identity);
+        std::fs::rename(&path, dir.path().join("previous.txt")).unwrap();
+        std::fs::write(&path, "new").unwrap();
+        assert_ne!(original, resolve_filesystem_resource(&path).unwrap());
+    }
+
+    #[test]
+    fn a_directory_resource_has_its_own_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let child_identity = resolve_filesystem_resource(&child).unwrap();
+        assert_ne!(
+            resolve_filesystem_resource(dir.path()).unwrap(),
+            child_identity
+        );
+        assert_eq!(child_identity, resolve_filesystem_resource(&child).unwrap());
+    }
+
+    #[tokio::test]
+    async fn project_identity_resolves_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = resolve_project_identity(dir.path()).await.unwrap();
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(
+            first,
+            resolve_project_identity(dir.path()).await.unwrap(),
+            "the same live directory must resolve to the same project identity"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
