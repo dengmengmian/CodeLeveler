@@ -1,9 +1,9 @@
 // Conversation Presentation Contract — the shared presentation rules.
 //
 // ONE implementation of the conversation's presentation semantics, consumed by
-// both JavaScript clients (the Web client and the Desktop renderer). The
-// terminal is the reference implementation; this module and the terminal are
-// both checked against the same corpus (`testdata/conversation_presentation/v1/`).
+// the Desktop renderer. The terminal is the reference implementation; this
+// module and the terminal are both checked against the same corpus
+// (`testdata/conversation_presentation/v1/`).
 //
 // Plain ESM on purpose: the Desktop renderer has no bundler, so the shared
 // rules have to be importable exactly as they are. Nothing here touches React,

@@ -1672,7 +1672,8 @@ fn render_review_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     render_scrolled(frame, body, state, lines);
 }
 
-/// Build the report page from the durable review row. Findings are listed
+/// Build the report body from the durable review row. The same lines serve the
+/// inline conversation block and the explicit report page. Findings are listed
 /// before the reviewer's prose so a reader sees evidence before conclusion;
 /// the prose itself is rendered as Markdown, never parsed for control flow.
 fn review_report_lines(
@@ -1956,6 +1957,14 @@ fn review_report_lines(
             muted,
             width,
         );
+    } else {
+        push_report_line(
+            &mut out,
+            "  ",
+            t.review.findings_identity_note,
+            muted,
+            width,
+        );
     }
     for finding in &formal {
         let mut label = String::new();
@@ -1973,9 +1982,9 @@ fn review_report_lines(
             label.push_str(&format!(" [{}]", t.review.disposition_adopted));
         }
         let title = if label.is_empty() {
-            finding.title.clone()
+            format!("{} · {}", finding.id, finding.title)
         } else {
-            format!("{label} {}", finding.title)
+            format!("{} · {label} {}", finding.id, finding.title)
         };
         push_report_line(&mut out, "", &title, head, width);
         let mut location = finding.file.clone().unwrap_or_default();

@@ -5353,21 +5353,37 @@ impl AgentHarness for Drive<'_> {
                 });
                 let (ok, msg) = match review_verdict_from_args(&call.arguments) {
                     Err(message) => (false, message),
-                    Ok(verdict) => {
+                    Ok((verdict, formal_findings)) => {
                         let coverage = verdict.coverage.len();
                         let limitations = verdict.limitations.len();
-                        self.ledger.set_review_verdict(verdict);
-                        (self.observer)(AgentEvent::EvidenceLedgerUpdated {
-                            ledger: self.ledger.clone(),
-                        });
-                        (
-                            true,
-                            format!(
-                                "Review verdict recorded: {} coverage dimension(s), \
-                                 {limitations} limitation(s).",
-                                coverage
-                            ),
-                        )
+                        let report = verdict.report.as_deref().unwrap_or_default();
+                        // Identity belongs to the ledger. A report that names
+                        // a non-formal or unknown finding, or a declared set
+                        // that differs from the formal records, is refused
+                        // before it can replace the stored report.
+                        match self.ledger.validate_review_report(&formal_findings, report) {
+                            Err(message) => (false, message),
+                            Ok(()) => {
+                                let formal = formal_findings.join(", ");
+                                self.ledger.set_review_verdict(verdict);
+                                (self.observer)(AgentEvent::EvidenceLedgerUpdated {
+                                    ledger: self.ledger.clone(),
+                                });
+                                let formal = if formal.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    formal
+                                };
+                                (
+                                    true,
+                                    format!(
+                                        "Review verdict recorded: {coverage} coverage \
+                                         dimension(s), {limitations} limitation(s), formal \
+                                         findings: {formal}."
+                                    ),
+                                )
+                            }
+                        }
                     }
                 };
                 (self.observer)(AgentEvent::ToolResult {
@@ -11901,9 +11917,12 @@ fn required_text_value(
 /// The reviewer supplies meaning; the runtime only enforces the wire shape and
 /// bounds. An absent array is empty, but a PRESENT value of the wrong type or
 /// an unknown enum label is refused at the tool boundary rather than dropped.
+///
+/// `formal_findings` is returned beside the verdict: the ledger, not this
+/// parser, validates it against the review's durable formal set.
 fn review_verdict_from_args(
     arguments: &serde_json::Value,
-) -> Result<leveler_lifecycle::ReviewVerdict, String> {
+) -> Result<(leveler_lifecycle::ReviewVerdict, Vec<String>), String> {
     use leveler_lifecycle::{
         ReviewConclusion, ReviewCoverage, ReviewCoverageStatus, ReviewLimitation,
         ReviewLimitationKind, ReviewVerdict,
@@ -12053,6 +12072,55 @@ fn review_verdict_from_args(
         Some(_) => return Err("report_review `limitations` must be an array.".into()),
     };
 
+    // The formal findings this report presents. These are durable ledger ids,
+    // not a second numbering: the ledger refuses a set that differs from its
+    // own formal records.
+    const MAX_FORMAL_FINDINGS: usize = 128;
+    let formal_findings = match arguments.get("formal_findings") {
+        None | Some(serde_json::Value::Null) => {
+            return Err(
+                "report_review requires `formal_findings`: the durable ids of the \
+                 review's formal findings (an empty array when there are none)."
+                    .into(),
+            );
+        }
+        Some(serde_json::Value::Array(entries)) => {
+            if entries.len() > MAX_FORMAL_FINDINGS {
+                return Err(format!(
+                    "report_review `formal_findings` may hold at most \
+                     {MAX_FORMAL_FINDINGS} ids."
+                ));
+            }
+            entries
+                .iter()
+                .map(|entry| {
+                    let Some(raw) = entry.as_str() else {
+                        return Err(
+                            "report_review `formal_findings` entries must be finding id \
+                             strings."
+                                .to_string(),
+                        );
+                    };
+                    let id = raw.trim();
+                    let digits = id.strip_prefix("f-").unwrap_or_default();
+                    if id.len() > 64
+                        || digits.is_empty()
+                        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+                    {
+                        return Err(format!(
+                            "report_review `formal_findings` entry `{id}` is not a \
+                             finding id (expected `f-<number>`)."
+                        ));
+                    }
+                    Ok(id.to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        }
+        Some(_) => {
+            return Err("report_review `formal_findings` must be an array of finding ids.".into());
+        }
+    };
+
     // The complete formal report body. This is the report of record; the
     // reviewer's final chat message is never used as a substitute.
     let report_raw = arguments
@@ -12072,14 +12140,17 @@ fn review_verdict_from_args(
         ));
     }
 
-    Ok(ReviewVerdict {
-        conclusion,
-        coverage,
-        limitations,
-        report: Some(report_text.to_string()),
-        report_revision: None,
-        evidence_revision: None,
-    })
+    Ok((
+        ReviewVerdict {
+            conclusion,
+            coverage,
+            limitations,
+            report: Some(report_text.to_string()),
+            report_revision: None,
+            evidence_revision: None,
+        },
+        formal_findings,
+    ))
 }
 
 /// Parse the model-authored structured investigation result. Every external
@@ -12276,8 +12347,9 @@ mod report_finding_details_tests {
 
     #[test]
     fn a_structured_review_verdict_is_parsed_not_inferred() {
-        let verdict = super::review_verdict_from_args(&serde_json::json!({
+        let (verdict, formal_findings) = super::review_verdict_from_args(&serde_json::json!({
             "report": "完整正式报告：范围、发现、覆盖与限制。",
+            "formal_findings": ["f-1", "f-4"],
             "conclusion": "issues_found",
             "coverage": [
                 {
@@ -12308,6 +12380,7 @@ mod report_finding_details_tests {
             verdict.report.as_deref(),
             Some("完整正式报告：范围、发现、覆盖与限制。")
         );
+        assert_eq!(formal_findings, vec!["f-1", "f-4"]);
         assert_eq!(
             verdict.report_revision, None,
             "the model cannot stamp the runtime's revision"
@@ -12315,18 +12388,56 @@ mod report_finding_details_tests {
         assert_eq!(verdict.evidence_revision, None);
     }
 
+    /// The formal set is part of the submission. A missing, malformed or
+    /// empty-id declaration is refused at the tool boundary; the ledger then
+    /// checks it against the review's own records.
+    #[test]
+    fn a_review_verdict_requires_a_well_formed_formal_finding_set() {
+        let missing = super::review_verdict_from_args(&serde_json::json!({
+            "report": "report",
+            "conclusion": "inconclusive"
+        }))
+        .unwrap_err();
+        assert!(missing.contains("formal_findings"), "{missing}");
+        let wrong = super::review_verdict_from_args(&serde_json::json!({
+            "report": "report",
+            "formal_findings": "f-1",
+            "conclusion": "inconclusive"
+        }))
+        .unwrap_err();
+        assert!(wrong.contains("array"), "{wrong}");
+        for malformed in ["1", "f-", "f-one", "f-1x", ""] {
+            let error = super::review_verdict_from_args(&serde_json::json!({
+                "report": "report",
+                "formal_findings": [malformed],
+                "conclusion": "inconclusive"
+            }))
+            .unwrap_err();
+            assert!(error.contains("not a finding id"), "{malformed}: {error}");
+        }
+        let (_, empty) = super::review_verdict_from_args(&serde_json::json!({
+            "report": "report",
+            "formal_findings": [],
+            "conclusion": "no_issues_found"
+        }))
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
     /// The formal report body is part of the submission, not the final chat
     /// message. A missing or empty body is refused at the tool boundary.
     #[test]
     fn a_review_verdict_without_a_formal_report_is_refused() {
         let error = super::review_verdict_from_args(&serde_json::json!({
-            "conclusion": "inconclusive"
+            "conclusion": "inconclusive",
+            "formal_findings": []
         }))
         .unwrap_err();
         assert!(error.contains("report"), "{error}");
         let empty = super::review_verdict_from_args(&serde_json::json!({
             "report": "   ",
-            "conclusion": "inconclusive"
+            "conclusion": "inconclusive",
+            "formal_findings": []
         }))
         .unwrap_err();
         assert!(empty.contains("report"), "{empty}");

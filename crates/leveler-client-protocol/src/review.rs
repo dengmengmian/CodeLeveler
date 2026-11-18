@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiReviewScope {
+    /// The runtime picks the object a bare `/review` should mean: uncommitted
+    /// workspace changes when there are any, otherwise the commits this branch
+    /// has over its recorded upstream. When neither exists the runtime asks
+    /// the client to choose instead of guessing.
+    Auto,
     /// The current task's delivery in this session: its user objective, the
     /// files its latest settled delivery touched, and its final claim.
     CurrentTask,

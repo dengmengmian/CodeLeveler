@@ -33,6 +33,7 @@ pub mod observability;
 mod parallel;
 mod prompt_assist;
 mod prompt_bridge;
+mod review_live;
 pub mod runtime_boot;
 mod runtime_identity;
 mod schedule_tools;
@@ -978,6 +979,13 @@ pub struct Application {
     /// "a receipt of this boot that is not in flight" is a fact about the
     /// boot, not about one client of it.
     in_flight_commands: interactive::InFlightCommands,
+    /// Manual reviews that are running right now, by session and review id.
+    ///
+    /// A review is not a turn, so the running projection the agent reads
+    /// (`review_status`) cannot come from the turn table. This is the same
+    /// live fact the client's `ReviewProgress` carries, kept where the next
+    /// turn's tool can read it. Settled rows are read from the database.
+    review_live: interactive::LiveReviews,
     /// Cross-session memory: the process-side Capture/Dream workers, the host
     /// access policy and the turn-stable prompt index. Memory is inert unless
     /// the loaded `[memory].rollout` opts in.
@@ -1197,6 +1205,7 @@ impl Application {
             schedule: tokio::sync::Mutex::new(None),
             boot: std::sync::Mutex::new(None),
             in_flight_commands: Default::default(),
+            review_live: Default::default(),
             memory,
             default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),

@@ -3,8 +3,12 @@
 //! Review is an explicit, user-started, read-only investigation with its own
 //! identity, budget and durable report. It is not a turn: this module never
 //! calls `TaskEngine::start_task`, never opens a goal, and never writes to the
-//! source session's task terminal. The only durable writes are the review row
-//! and the reviewer's ordinary model-request accounting.
+//! source session's task terminal. It lives IN the conversation: the user's
+//! `/review` command, the runtime's started/settled notices and the formal
+//! report are written to the source session's message store, so the same
+//! timeline sees the review and the parent agent can cite its structured
+//! result on the next turn. Those rows are conversation context, not task
+//! state.
 //!
 //! The runtime resolves the REQUESTED OBJECT (scope → files/diff/revision) and
 //! records its identity. The reviewer model reads the user's focus and decides
@@ -19,18 +23,19 @@ use std::time::Duration;
 use leveler_agent::coding::TurnProfile;
 use leveler_agent::{AgentEvent, AutoClarify, ContinuationPolicy, StepLimits};
 use leveler_client_protocol::{
-    ClientError, RuntimeEvent, UiReviewConclusion, UiReviewConfidence, UiReviewCounts,
-    UiReviewCoverage, UiReviewCoverageStatus, UiReviewDimension, UiReviewFinding,
-    UiReviewInvestigation, UiReviewInvestigationState, UiReviewLimitation, UiReviewLimitationKind,
-    UiReviewLimitationSource, UiReviewObject, UiReviewReport, UiReviewReportSource, UiReviewScope,
-    UiReviewSeverity, UiReviewStatus, UiReviewSummary, UiReviewUsage, UiReviewVerdict,
+    ClientError, MessageId, RuntimeEvent, UiMessage, UiReviewConclusion, UiReviewConfidence,
+    UiReviewCounts, UiReviewCoverage, UiReviewCoverageStatus, UiReviewDimension, UiReviewFinding,
+    UiReviewFindingDisposition, UiReviewInvestigation, UiReviewInvestigationState,
+    UiReviewLimitation, UiReviewLimitationKind, UiReviewLimitationSource, UiReviewObject,
+    UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewSeverity, UiReviewStatus,
+    UiReviewSummary, UiReviewUsage, UiReviewVerdict, UiRole,
 };
 use leveler_core::{RequestId, SessionId};
 use leveler_execution::PermissionProfile;
 use leveler_lifecycle::{
     ChildStop, FindingConfidence, FindingRecord, FindingSeverity, ReviewDimension,
 };
-use leveler_model::{Message, ModelRef, ModelRuntime, Role};
+use leveler_model::{Message, ModelRef, ModelRuntime, Role, RuntimeNoticeKind, TranscriptOrigin};
 use leveler_storage::{
     Database, EventRepository, MessageRepository, NewReview, ReviewFinish, ReviewRecord,
     ReviewRepository, SessionRepository,
@@ -227,7 +232,7 @@ pub(super) async fn start(
     }
     let focus = validate_focus(focus)?;
     let config = client.runtime_config(&session_id).await?;
-    let model = match model_override.or_else(|| config.model.clone()) {
+    let model = match model_override.clone().or_else(|| config.model.clone()) {
         Some(model) => model,
         None => {
             return Err(ClientError::Runtime(
@@ -308,11 +313,48 @@ pub(super) async fn start(
     // blocking thread so a large repository cannot occupy an async worker.
     let scope_for_resolve = scope.clone();
     let context_for_resolve = context.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
+    let (scope, resolved) = match tokio::task::spawn_blocking(move || {
         resolve_scope(&context_for_resolve, &scope_for_resolve)
     })
     .await
-    .map_err(|error| ClientError::Runtime(format!("审查范围解析失败: {error}")))??;
+    .map_err(|error| ClientError::Runtime(format!("审查范围解析失败: {error}")))?
+    {
+        Ok(resolved) => resolved,
+        // A bare `/review` with nothing to review is a question for the
+        // person, not a failed command. Nothing was persisted, and the words
+        // they typed ride along so a choice re-issues the same request.
+        Err(ScopeError::NeedsChoice) => {
+            emit(
+                client,
+                &session_id,
+                RuntimeEvent::ReviewScopeRequired {
+                    session_id: session_id.clone(),
+                    focus: focus.clone(),
+                },
+            );
+            return Ok(());
+        }
+        Err(ScopeError::Failed(error)) => return Err(error),
+    };
+    // The recorded command names the object that was actually reviewed, so a
+    // replayed conversation never says "auto" about a concrete branch.
+    let command_text = review_command_text(&focus, &scope, model_override.as_ref());
+
+    append_review_message(&db, &session_id, &command_text, TranscriptOrigin::UserInput).await;
+    emit(
+        client,
+        &session_id,
+        RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new(leveler_core::new_uuid_string()),
+                role: UiRole::User,
+                text: command_text,
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        },
+    );
 
     let review_id = format!("review-{}", RequestId::generate());
     let created_at = leveler_core::now();
@@ -373,6 +415,38 @@ pub(super) async fn start(
         report_revision: 0,
         report_stale: false,
     };
+    // The parent agent must be able to answer "is it done?" while the review
+    // runs. This notice is harness context only; the conversation shows the
+    // reviewer row, so it is not projected into the client transcript.
+    append_review_message(
+        &db,
+        &session_id,
+        &review_started_notice(&summary),
+        TranscriptOrigin::RuntimeNotice {
+            notice: RuntimeNoticeKind::ReviewStarted,
+        },
+    )
+    .await;
+    // Register liveness before the client hears about it: a turn that starts
+    // the instant the card appears must already be able to read this review.
+    {
+        let mut guard = client
+            .app
+            .review_live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entry(session_id.clone()).or_default().insert(
+            review_id.clone(),
+            crate::review_live::LiveReview {
+                summary: summary.clone(),
+                tool: None,
+                elapsed_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+            },
+        );
+    }
     emit(
         client,
         &session_id,
@@ -434,6 +508,398 @@ pub(super) async fn start(
     });
 
     Ok(())
+}
+
+/// The canonical `/review` line recorded as the user's message.
+///
+/// It preserves the reviewer focus verbatim and the structured directives the
+/// user chose. Reconstructing from the parsed command (instead of trusting free
+/// text) keeps the durable row and the runtime's actual scope identical.
+fn review_command_text(focus: &str, scope: &UiReviewScope, model: Option<&ModelRef>) -> String {
+    let mut text = String::from("/review");
+    if let Some(model) = model {
+        text.push_str(&format!(" @model {model}"));
+    }
+    match scope {
+        // Resolution replaces `Auto` with the object it picked, so this arm
+        // only preserves a client that recorded the request verbatim.
+        UiReviewScope::Auto => {}
+        UiReviewScope::CurrentTask => {}
+        UiReviewScope::Workspace => text.push_str(" @workspace"),
+        UiReviewScope::Project => text.push_str(" @project"),
+        UiReviewScope::Session {
+            session_id: Some(id),
+        } => text.push_str(&format!(" @session {id}")),
+        UiReviewScope::Session { session_id: None } => text.push_str(" @session"),
+        UiReviewScope::Commit { rev } => text.push_str(&format!(" @commit {rev}")),
+        UiReviewScope::Branch { base } => text.push_str(&format!(" @branch {base}")),
+        UiReviewScope::Paths { paths } => {
+            text.push_str(&format!(" @path {}", paths.join(",")));
+        }
+    }
+    if !focus.trim().is_empty() {
+        text.push(' ');
+        text.push_str(focus);
+    }
+    text
+}
+
+/// Append one review conversation row under the session's message store.
+///
+/// A failure is logged rather than propagated: the durable review row is still
+/// the authority for the review, and losing a notice must not lose the review.
+async fn append_review_message(
+    db: &Database,
+    session_id: &SessionId,
+    text: &str,
+    origin: TranscriptOrigin,
+) -> bool {
+    let message = Message::user(text, origin);
+    let payload = match serde_json::to_string(&message) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::error!(%error, %session_id, "could not serialize a review conversation row");
+            return false;
+        }
+    };
+    match MessageRepository::new(db)
+        .append(session_id, &[payload], leveler_core::now())
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, %session_id, "could not persist a review conversation row");
+            false
+        }
+    }
+}
+
+const REVIEW_NOTICE_MAX_BYTES: usize = 16 * 1024;
+const REVIEW_NOTICE_FINDINGS_MAX: usize = 20;
+const REVIEW_NOTICE_COVERAGE_MAX: usize = 20;
+const REVIEW_NOTICE_LIMITATIONS_MAX: usize = 10;
+
+/// What the parent agent reads while the reviewer runs. It says only what the
+/// runtime knows; the result is unknown until the terminal notice.
+fn review_started_notice(summary: &UiReviewSummary) -> String {
+    format!(
+        "## Review started\n\n\
+         - review_id: {}\n\
+         - target: {}\n\
+         - status: running\n\
+         - model: {}\n\
+         - focus: {}\n\n\
+         The review is running in this conversation. Do not state its result \
+         until a `## Review settled` notice carries the same id. This is a \
+         runtime fact, not a user instruction.",
+        summary.id,
+        review_target_text(&summary.scope),
+        summary.model,
+        cap(summary.focus.trim(), 2 * 1024),
+    )
+}
+
+/// The structured terminal the parent agent can cite. It is projected from the
+/// durable review row (the same row the TUI renders), never from model prose.
+fn review_settled_notice(summary: &UiReviewSummary, report: Option<&UiReviewReport>) -> String {
+    let counts = &summary.counts;
+    let mut text = format!(
+        "## Review settled\n\n\
+         - review_id: {}\n\
+         - target: {}\n\
+         - status: {}\n\
+         - conclusion: {}\n\
+         - report_source: {}\n\
+         - report_revision: {}\n\
+         - evidence_revision: {}\n\
+         - report_stale: {}\n\
+         - findings: p0={} p1={} p2={} p3={} unclassified={} observations={} \
+         pending_candidates={}\n",
+        summary.id,
+        review_target_text(&summary.scope),
+        summary.status.as_str(),
+        summary
+            .conclusion
+            .map(UiReviewConclusion::as_str)
+            .unwrap_or("undeclared"),
+        summary.report_source.as_str(),
+        summary.report_revision,
+        summary.evidence_revision,
+        summary.report_stale,
+        counts.p0,
+        counts.p1,
+        counts.p2,
+        counts.p3,
+        counts.unclassified,
+        counts.observations,
+        counts.pending_candidates,
+    );
+    if let Some(report) = report {
+        let formal: Vec<&UiReviewFinding> = report
+            .findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.disposition,
+                    None | Some(UiReviewFindingDisposition::Adopted)
+                )
+            })
+            .collect();
+        text.push_str(&format!(
+            "- formal_finding_ids: {}\n",
+            if formal.is_empty() {
+                "none".to_string()
+            } else {
+                formal
+                    .iter()
+                    .map(|finding| finding.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        text.push_str(
+            "- formal_finding_identity: only the ids above are formal findings of this \
+             review, scoped to this review_id. Resolve a user's `f-N` against this list; \
+             never map a missing or non-formal id onto another finding. Id tokens in the \
+             reviewer's narrative are prose, not identities.\n",
+        );
+        text.push_str("- coverage: ");
+        if report.verdict.coverage.is_empty() {
+            text.push_str("undeclared");
+        } else {
+            for (index, coverage) in report
+                .verdict
+                .coverage
+                .iter()
+                .take(REVIEW_NOTICE_COVERAGE_MAX)
+                .enumerate()
+            {
+                if index > 0 {
+                    text.push_str("; ");
+                }
+                text.push_str(&format!(
+                    "{}={}",
+                    review_dimension_name(coverage.dimension),
+                    coverage.status.as_str()
+                ));
+                if let Some(scope) = coverage
+                    .scope
+                    .as_deref()
+                    .filter(|scope| !scope.trim().is_empty())
+                {
+                    text.push_str(&format!(" ({})", cap(scope.trim(), 200)));
+                }
+            }
+            if report.verdict.coverage.len() > REVIEW_NOTICE_COVERAGE_MAX {
+                text.push_str(&format!(
+                    "; +{} more",
+                    report.verdict.coverage.len() - REVIEW_NOTICE_COVERAGE_MAX
+                ));
+            }
+        }
+        text.push('\n');
+        text.push_str("- limitations: ");
+        if report.verdict.limitations.is_empty() {
+            text.push_str("none declared");
+        } else {
+            for (index, limitation) in report
+                .verdict
+                .limitations
+                .iter()
+                .take(REVIEW_NOTICE_LIMITATIONS_MAX)
+                .enumerate()
+            {
+                if index > 0 {
+                    text.push_str("; ");
+                }
+                text.push_str(&format!(
+                    "[{}/{}] {}",
+                    review_limitation_source_name(limitation.source),
+                    limitation.kind.as_str(),
+                    cap(limitation.detail.trim(), 300)
+                ));
+            }
+            if report.verdict.limitations.len() > REVIEW_NOTICE_LIMITATIONS_MAX {
+                text.push_str(&format!(
+                    "; +{} more",
+                    report.verdict.limitations.len() - REVIEW_NOTICE_LIMITATIONS_MAX
+                ));
+            }
+        }
+        text.push('\n');
+        if !formal.is_empty() {
+            text.push_str("\nFormal findings (durable ids, verbatim evidence and guidance):\n");
+            for finding in formal.iter().take(REVIEW_NOTICE_FINDINGS_MAX) {
+                let severity = finding
+                    .severity
+                    .map(|severity| match severity {
+                        UiReviewSeverity::P0 => "P0",
+                        UiReviewSeverity::P1 => "P1",
+                        UiReviewSeverity::P2 => "P2",
+                        UiReviewSeverity::P3 => "P3",
+                    })
+                    .unwrap_or("unclassified");
+                let location = match (&finding.file, finding.line) {
+                    (Some(file), Some(line)) => format!(" ({file}:{line})"),
+                    (Some(file), None) => format!(" ({file})"),
+                    _ => String::new(),
+                };
+                text.push_str(&format!(
+                    "- [{severity}] {} {}{}\n",
+                    finding.id,
+                    cap(finding.title.trim(), 300),
+                    location
+                ));
+                if !finding.summary.trim().is_empty()
+                    && finding.summary.trim() != finding.title.trim()
+                {
+                    text.push_str(&format!(
+                        "  summary: {}\n",
+                        cap(finding.summary.trim(), 400)
+                    ));
+                }
+                if finding.disposition == Some(UiReviewFindingDisposition::Adopted) {
+                    text.push_str("  disposition: adopted by the lead reviewer\n");
+                }
+                for (label, value) in [
+                    ("evidence", finding.evidence.as_deref()),
+                    ("impact", finding.impact.as_deref()),
+                    ("recommendation", finding.recommendation.as_deref()),
+                ] {
+                    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                        text.push_str(&format!("  {label}: {}\n", cap(value.trim(), 500)));
+                    }
+                }
+            }
+            if formal.len() > REVIEW_NOTICE_FINDINGS_MAX {
+                text.push_str(&format!(
+                    "- +{} more formal findings; read the report by id\n",
+                    formal.len() - REVIEW_NOTICE_FINDINGS_MAX
+                ));
+            }
+        }
+        let candidates: Vec<&UiReviewFinding> = report
+            .findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.disposition,
+                    Some(
+                        UiReviewFindingDisposition::Candidate
+                            | UiReviewFindingDisposition::Rejected
+                            | UiReviewFindingDisposition::Duplicate
+                    )
+                )
+            })
+            .collect();
+        if !candidates.is_empty() {
+            text.push_str("\nCandidate findings and the lead's decisions (NOT formal defects):\n");
+            for finding in candidates.iter().take(REVIEW_NOTICE_FINDINGS_MAX) {
+                let disposition = match finding.disposition {
+                    Some(UiReviewFindingDisposition::Candidate) => "candidate/pending",
+                    Some(UiReviewFindingDisposition::Rejected) => "rejected",
+                    Some(UiReviewFindingDisposition::Duplicate) => "duplicate",
+                    _ => "unclassified",
+                };
+                let location = match (&finding.file, finding.line) {
+                    (Some(file), Some(line)) => format!(" ({file}:{line})"),
+                    (Some(file), None) => format!(" ({file})"),
+                    _ => String::new(),
+                };
+                text.push_str(&format!(
+                    "- [{disposition}] {} {}{}\n",
+                    finding.id,
+                    cap(finding.title.trim(), 300),
+                    location
+                ));
+                if let Some(target) = finding
+                    .duplicate_of
+                    .as_deref()
+                    .filter(|target| !target.trim().is_empty())
+                {
+                    text.push_str(&format!(
+                        "  duplicate_of: {} (the surviving formal finding)\n",
+                        cap(target.trim(), 128)
+                    ));
+                }
+                if let Some(reason) = finding
+                    .disposition_reason
+                    .as_deref()
+                    .filter(|reason| !reason.trim().is_empty())
+                {
+                    text.push_str(&format!("  reason: {}\n", cap(reason.trim(), 400)));
+                }
+            }
+        }
+        if !report.report.trim().is_empty() {
+            text.push_str(
+                "\nReviewer's narrative (verbatim, bounded). Its prose is evidence of what \
+                 the reviewer wrote, not a finding index: the durable ids above are the \
+                 only formal identities.\n",
+            );
+            text.push_str(&cap(report.report.trim(), 4 * 1024));
+            text.push('\n');
+        }
+    } else {
+        text.push_str(
+            "- formal_finding_ids: unavailable (the durable report projection could not be read)\n",
+        );
+    }
+    text.push_str(&format!(
+        "- report_reference: {} (the full formal report is rendered in this \
+         conversation; the durable review row is authoritative)\n",
+        summary.id
+    ));
+    if let Some(detail) = summary
+        .failure
+        .as_deref()
+        .or(summary.stop_detail.as_deref())
+        .filter(|detail| !detail.trim().is_empty())
+    {
+        text.push_str(&format!("- failure: {}\n", cap(detail.trim(), 2 * 1024)));
+    }
+    text.push_str(
+        "\nThis notice delivers the reviewer's durable result to the parent \
+         agent as evidence. It is not a user instruction and does not authorize \
+         a fix; the user decides what happens next.",
+    );
+    cap(&text, REVIEW_NOTICE_MAX_BYTES)
+}
+
+fn review_target_text(scope: &UiReviewScope) -> String {
+    match scope {
+        // A settled review always records the object `Auto` resolved to.
+        UiReviewScope::Auto => "auto".to_string(),
+        UiReviewScope::CurrentTask => "current task".to_string(),
+        UiReviewScope::Workspace => "workspace".to_string(),
+        UiReviewScope::Project => "project".to_string(),
+        UiReviewScope::Session {
+            session_id: Some(id),
+        } => format!("session {id}"),
+        UiReviewScope::Session { session_id: None } => "this conversation".to_string(),
+        UiReviewScope::Commit { rev } => format!("commit {rev}"),
+        UiReviewScope::Branch { base } => format!("branch {base}"),
+        UiReviewScope::Paths { paths } => format!("paths {}", paths.join(",")),
+    }
+}
+
+fn review_dimension_name(dimension: UiReviewDimension) -> &'static str {
+    match dimension {
+        UiReviewDimension::Code => "code",
+        UiReviewDimension::Business => "business",
+        UiReviewDimension::Security => "security",
+        UiReviewDimension::Architecture => "architecture",
+        UiReviewDimension::Test => "test",
+        UiReviewDimension::Delivery => "delivery",
+        UiReviewDimension::Session => "session",
+    }
+}
+
+fn review_limitation_source_name(source: UiReviewLimitationSource) -> &'static str {
+    match source {
+        UiReviewLimitationSource::Reviewer => "reviewer",
+        UiReviewLimitationSource::Runtime => "runtime",
+    }
 }
 
 /// Cancel one running review. A review that has already settled is a visible
@@ -506,17 +972,51 @@ pub(super) async fn list(
         .await
         .map_err(|error| ClientError::Runtime(error.to_string()))?;
     let mut reviews = Vec::with_capacity(rows.len());
+    let mut reports = Vec::new();
+    let mut report_bytes = 0usize;
     for row in rows {
         let row = settle_if_stale(client, &db, row).await?;
-        reviews.push(summary_from_record(&row)?);
+        let summary = summary_from_record(&row)?;
+        // Inline reports make a reopened conversation whole. They are bounded
+        // by count and bytes so a long history cannot turn session open into
+        // an unbounded transfer; older reports stay openable by id.
+        if reports.len() < REVIEW_HISTORY_REPORTS_MAX
+            && summary.status.settled()
+            && summary.report_source != UiReviewReportSource::None
+            && report_bytes < REVIEW_HISTORY_REPORT_BYTES_MAX
+        {
+            match report_from_record(&row) {
+                Ok(report) => {
+                    report_bytes = report_bytes
+                        .saturating_add(report.report.len())
+                        .saturating_add(report.findings.len().saturating_mul(512));
+                    reports.push(report);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        review_id = %row.id,
+                        "could not project a historical review report; the card stays openable"
+                    );
+                }
+            }
+        }
+        reviews.push(summary);
     }
     emit(
         client,
         &session_id,
-        RuntimeEvent::ReviewHistoryLoaded { query_id, reviews },
+        RuntimeEvent::ReviewHistoryLoaded {
+            query_id,
+            reviews,
+            reports,
+        },
     );
     Ok(())
 }
+
+const REVIEW_HISTORY_REPORTS_MAX: usize = 20;
+const REVIEW_HISTORY_REPORT_BYTES_MAX: usize = 2 * 1024 * 1024;
 
 /// One review, verified to belong to the requesting session, with a stale
 /// `running` row settled as incomplete instead of being shown as live.
@@ -592,10 +1092,25 @@ async fn settle_if_stale(
     }
     let mut summary = summary_from_record(&settled)?;
     summary.stop_detail = Some(detail.to_string());
+    // A crash-interrupted review has no report to render, but the parent
+    // agent still needs the terminal fact. This write happens once: the
+    // `changed` guard above means only the writer that settled the row emits.
+    append_review_message(
+        db,
+        &record.session_id,
+        &review_settled_notice(&summary, None),
+        TranscriptOrigin::RuntimeNotice {
+            notice: RuntimeNoticeKind::ReviewSettled,
+        },
+    )
+    .await;
     emit(
         client,
         &record.session_id,
-        RuntimeEvent::ReviewFinished { review: summary },
+        RuntimeEvent::ReviewFinished {
+            review: summary,
+            report: None,
+        },
     );
     Ok(settled)
 }
@@ -690,6 +1205,16 @@ impl Drop for ReviewCancelGuard {
                 "review task ended without settling; releasing its liveness handle"
             );
             release_review_cancel(&self.client, &self.session_id, &self.review_id);
+            // A panicked task never settles; leaving the live entry behind
+            // would make `review_status` report a review that cannot exist.
+            if let Ok(mut guard) = self.client.app.review_live.lock()
+                && let Some(reviews) = guard.get_mut(&self.session_id)
+            {
+                reviews.remove(&self.review_id);
+                if reviews.is_empty() {
+                    guard.remove(&self.session_id);
+                }
+            }
         }
     }
 }
@@ -888,6 +1413,10 @@ async fn run_review(
     let investigation_started_obs = investigation_started.clone();
     let events = client.events_for(session_id);
     let review_id_for_events = review_id.to_string();
+    // A terminal event does not restate the role; the client needs the one the
+    // start carried, exactly like the turn bridge's own `child_roles`.
+    let mut child_roles: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut observer = |event: AgentEvent| {
         match &event {
             AgentEvent::SubAgentStarted {
@@ -895,13 +1424,40 @@ async fn run_review(
                 nickname,
                 role,
                 task,
+                profile_id,
+                profile_role,
+                read_only,
                 spec,
-                ..
             } => {
+                // Every child the review starts is a real child in the
+                // session's execution: its lifecycle reaches the same client
+                // stream an ordinary `spawn_agent` child uses, so the review is
+                // observed rather than narrated.
+                let spec = spec.clone().unwrap_or_default();
+                child_roles.insert(id.clone(), role.clone());
+                let _ = events.send(RuntimeEvent::SubAgentUpdated {
+                    id: id.clone(),
+                    nickname: nickname.clone(),
+                    role: role.clone(),
+                    title: spec.title.clone(),
+                    done: false,
+                    ok: false,
+                    detail: leveler_core::truncate_head_bytes(task, 2 * 1024, "…"),
+                    profile_id: profile_id.clone(),
+                    profile_role: profile_role.clone(),
+                    read_only: *read_only,
+                    agent: None,
+                    contribution: None,
+                    outcome: None,
+                    stop: None,
+                    limit: None,
+                    background: Some(true),
+                    scope: spec.files.clone(),
+                });
                 if role == "investigator" {
                     let title = spec
-                        .as_ref()
-                        .and_then(|spec| spec.title.as_deref())
+                        .title
+                        .as_deref()
                         .filter(|title| !title.trim().is_empty())
                         .unwrap_or(nickname)
                         .replace(['\n', '\r'], " ");
@@ -925,22 +1481,41 @@ async fn run_review(
             }
             AgentEvent::SubAgentFinished {
                 id,
+                nickname,
                 ok,
+                summary,
                 contribution,
+                outcome,
                 stop,
-                ..
+                limit,
             } => {
+                let projected = contribution
+                    .as_ref()
+                    .map(crate::event_bridge::project_contribution);
+                let role = child_roles.remove(id).unwrap_or_default();
+                let _ = events.send(RuntimeEvent::SubAgentUpdated {
+                    id: id.clone(),
+                    nickname: nickname.clone(),
+                    role,
+                    title: None,
+                    done: true,
+                    ok: *ok,
+                    detail: summary.clone(),
+                    profile_id: projected.as_ref().and_then(|c| c.profile_id.clone()),
+                    profile_role: projected.as_ref().and_then(|c| c.profile_role.clone()),
+                    read_only: projected.as_ref().is_some_and(|c| c.read_only),
+                    agent: None,
+                    contribution: projected,
+                    outcome: outcome.map(crate::event_bridge::project_child_outcome),
+                    stop: stop.map(crate::event_bridge::project_child_stop),
+                    limit: limit.map(crate::event_bridge::project_child_limit),
+                    background: None,
+                    scope: Vec::new(),
+                });
                 if let Ok(mut guard) = investigations_obs.lock()
                     && let Some(investigation) = guard.iter_mut().find(|item| &item.id == id)
                 {
-                    investigation.state = match stop {
-                        Some(ChildStop::Cancelled) => UiReviewInvestigationState::Cancelled,
-                        _ if *ok => UiReviewInvestigationState::Completed,
-                        Some(ChildStop::Incomplete | ChildStop::Budget) => {
-                            UiReviewInvestigationState::Incomplete
-                        }
-                        _ => UiReviewInvestigationState::Failed,
-                    };
+                    investigation.state = investigation_state(*stop, *ok);
                     investigation.findings = contribution
                         .as_ref()
                         .map_or(0, |contribution| contribution.findings_total);
@@ -955,11 +1530,19 @@ async fn run_review(
                 }
             }
             AgentEvent::SubAgentProgress {
+                id,
+                active,
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
-                ..
             } => {
+                let _ = events.send(RuntimeEvent::SubAgentProgress {
+                    id: id.clone(),
+                    active: *active,
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    cached_input_tokens: *cached_input_tokens,
+                });
                 last_input = *input_tokens;
                 last_output = *output_tokens;
                 last_cached = *cached_input_tokens;
@@ -971,6 +1554,15 @@ async fn run_review(
                 preview,
                 is_error,
             } => {
+                // The same attributed activity an ordinary child emits: one
+                // execution identity, one activity channel.
+                let _ = events.send(RuntimeEvent::SubAgentActivity {
+                    id: id.clone(),
+                    phase: phase.clone(),
+                    tool: tool.clone(),
+                    preview: preview.clone(),
+                    is_error: *is_error,
+                });
                 if let Ok(mut trace) = activity_obs.lock() {
                     trace.push(ReviewActivityRecord {
                         review_id: review_id_for_events.clone(),
@@ -1004,6 +1596,25 @@ async fn run_review(
             }
             _ => return,
         }
+        let investigations_now = investigations_obs
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        // The same progress the client sees is what the next turn's
+        // `review_status` reads: one live fact, two consumers.
+        if let Ok(mut guard) = client.app.review_live.lock()
+            && let Some(live) = guard
+                .get_mut(session_id)
+                .and_then(|reviews| reviews.get_mut(&review_id_for_events))
+        {
+            live.tool = last_tool.clone();
+            live.elapsed_ms = elapsed_ms;
+            live.input_tokens = last_input;
+            live.output_tokens = last_output;
+            live.cached_input_tokens = last_cached;
+            live.summary.investigations = investigations_now.clone();
+        }
         let _ = events.send(RuntimeEvent::ReviewProgress {
             review_id: review_id_for_events.clone(),
             active: true,
@@ -1011,14 +1622,41 @@ async fn run_review(
             output_tokens: last_output,
             cached_input_tokens: last_cached,
             tool: last_tool.clone(),
-            elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            investigations: investigations_obs
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default(),
+            elapsed_ms,
+            investigations: investigations_now,
         });
     };
 
+    // The reviewer is a real child of this session's execution. Its lifecycle
+    // is announced on the same client channel an ordinary `spawn_agent` child
+    // uses — one execution identity, one projection — and the review card is
+    // reserved for the durable report.
+    let reviewer_title = leveler_core::truncate_head_bytes(
+        &scope_description(scope, target_session, context),
+        120,
+        "…",
+    );
+    let _ = client
+        .events_for(session_id)
+        .send(RuntimeEvent::SubAgentUpdated {
+            id: review_id.to_string(),
+            nickname: "Reviewer".to_string(),
+            role: "reviewer".to_string(),
+            title: Some(reviewer_title),
+            done: false,
+            ok: false,
+            detail: leveler_core::truncate_head_bytes(focus, 2 * 1024, "…"),
+            profile_id: Some("reviewer".to_string()),
+            profile_role: Some("reviewer".to_string()),
+            read_only: true,
+            agent: None,
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+            background: Some(true),
+            scope: resolved.files.clone(),
+        });
     let result = executor
         .run_manual_review_child(
             review_id.to_string(),
@@ -1122,6 +1760,32 @@ async fn run_review(
         tracing::warn!(%error, review_id, "could not serialize the review activity trace");
         "[]".to_string()
     });
+    // The reviewer's terminal, on the same channel and under the same id as
+    // its start. A cancelled or failed reviewer is named as such; only a run
+    // that actually completed is `ok`.
+    let _ = client
+        .events_for(session_id)
+        .send(RuntimeEvent::SubAgentUpdated {
+            id: review_id.to_string(),
+            nickname: "Reviewer".to_string(),
+            role: "reviewer".to_string(),
+            title: None,
+            done: true,
+            ok: result.ok,
+            detail: leveler_core::truncate_head_bytes(&final_message, 4 * 1024, "…"),
+            profile_id: Some("reviewer".to_string()),
+            profile_role: Some("reviewer".to_string()),
+            read_only: true,
+            agent: None,
+            contribution: None,
+            outcome: Some(crate::event_bridge::project_child_outcome(
+                result.result.status,
+            )),
+            stop: Some(crate::event_bridge::project_child_stop(result.stop)),
+            limit: result.limit.map(crate::event_bridge::project_child_limit),
+            background: None,
+            scope: Vec::new(),
+        });
     ReviewOutcome {
         status,
         report,
@@ -1182,6 +1846,7 @@ async fn settle(
         });
     let mut persist_error = None;
     let mut persist_row_gone = false;
+    let mut persisted = false;
     match ReviewRepository::new(db)
         .finish(
             review_id,
@@ -1208,7 +1873,7 @@ async fn settle(
         )
         .await
     {
-        Ok(true) => {}
+        Ok(true) => persisted = true,
         Ok(false) => {
             // The row is gone (its session was deleted, or the row was
             // removed). Emitting Completed here would promise a report no
@@ -1222,6 +1887,16 @@ async fn settle(
         }
     }
     release_review_cancel(client, session_id, review_id);
+    // The durable row is the authority now. A later `review_status` reads it
+    // from the database instead of a stale live entry.
+    if let Ok(mut guard) = client.app.review_live.lock()
+        && let Some(reviews) = guard.get_mut(session_id)
+    {
+        reviews.remove(review_id);
+        if reviews.is_empty() {
+            guard.remove(session_id);
+        }
+    }
     summary.status = outcome.status;
     summary.finished_at = Some(finished_at.to_rfc3339());
     summary.counts = counts(&outcome.findings);
@@ -1257,13 +1932,70 @@ async fn settle(
             summary.stop_detail = Some("审查结果未能持久化；运行时的终态未写入数据库".to_string());
         }
     }
+    // The report the client renders inline is projected from the row that was
+    // just written, not from the live run: a reader must see exactly what a
+    // later `/review report` would return. When the terminal could not be
+    // persisted there is no authoritative report to promise.
+    // A review that submitted no formal report has nothing to open. Sending
+    // the empty projection would let the client claim a "complete report" the
+    // reviewer never wrote; the structured summary on the card stays honest,
+    // and `/review report` still shows the declared no-report state.
+    let report = if persisted && summary.report_source != UiReviewReportSource::None {
+        match ReviewRepository::new(db).get(review_id).await {
+            Ok(Some(record)) => match report_from_record(&record) {
+                Ok(report) => Some(Box::new(report)),
+                Err(error) => {
+                    tracing::error!(
+                        %error, review_id,
+                        "could not project the settled review report"
+                    );
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                tracing::error!(%error, review_id, "could not re-read the settled review row");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Deliver the structured result to the conversation before the terminal
+    // event: a parent turn that starts as soon as the review settles must see
+    // it. The row is harness context, so clients project the review row, not
+    // this notice, into their transcript.
+    append_review_message(
+        db,
+        session_id,
+        &review_settled_notice(summary, report.as_deref()),
+        TranscriptOrigin::RuntimeNotice {
+            notice: RuntimeNoticeKind::ReviewSettled,
+        },
+    )
+    .await;
     emit(
         client,
         session_id,
         RuntimeEvent::ReviewFinished {
             review: summary.clone(),
+            report,
         },
     );
+}
+
+/// The durable state one investigation settlement projects.
+///
+/// A cancellation is named as such; a stopped child that ran out of budget or
+/// ended incomplete is Incomplete; anything else that did not succeed is
+/// Failed. `ok` alone never turns a cancelled child into Completed.
+fn investigation_state(stop: Option<ChildStop>, ok: bool) -> UiReviewInvestigationState {
+    match stop {
+        Some(ChildStop::Cancelled) => UiReviewInvestigationState::Cancelled,
+        _ if ok => UiReviewInvestigationState::Completed,
+        Some(ChildStop::Incomplete | ChildStop::Budget) => UiReviewInvestigationState::Incomplete,
+        _ => UiReviewInvestigationState::Failed,
+    }
 }
 
 /// One bounded tool-activity row for the durable review trace.
@@ -1628,25 +2360,55 @@ fn digest_payloads(payloads: &[String]) -> String {
 /// Resolve the requested scope to concrete files, diff and identity. All git
 /// access is argument-array based; no shell and no path is interpreted by a
 /// shell.
+/// Why a requested scope did not become a review object.
+#[derive(Debug)]
+enum ScopeError {
+    /// Nothing in this workspace is unambiguously reviewable, so the person
+    /// has to name the object. Not a failure: it is the honest answer to a
+    /// bare `/review`.
+    NeedsChoice,
+    Failed(ClientError),
+}
+
+impl From<ClientError> for ScopeError {
+    fn from(error: ClientError) -> Self {
+        ScopeError::Failed(error)
+    }
+}
+
+impl std::fmt::Display for ScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopeError::NeedsChoice => f.write_str("当前工作区没有可直接审查的变更"),
+            ScopeError::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
 fn resolve_scope(
     context: &SessionContext,
     scope: &UiReviewScope,
-) -> Result<ResolvedScope, ClientError> {
+) -> Result<(UiReviewScope, ResolvedScope), ScopeError> {
+    if *scope == UiReviewScope::Auto {
+        return resolve_auto(context);
+    }
     let repo = context
         .repository
         .as_deref()
         .ok_or_else(|| ClientError::Runtime("当前会话没有工作区，无法定位审查对象".to_string()))?;
-    match scope {
+    let resolved = match scope {
+        UiReviewScope::Auto => unreachable!("handled above"),
         UiReviewScope::CurrentTask => {
             if context.source_turn_id.is_none() && context.delivery_text.is_none() {
                 return Err(ClientError::Runtime(
                     "无法确定当前任务的修改边界；请选择“当前工作区变更”、指定路径或整个项目。"
                         .to_string(),
-                ));
+                )
+                .into());
             }
-            resolve_task(context, repo)
+            resolve_task(context, repo)?
         }
-        UiReviewScope::Session { .. } => resolve_task_or_session(context, repo),
+        UiReviewScope::Session { .. } => resolve_task_or_session(context, repo)?,
         UiReviewScope::Workspace => {
             let mut scope = resolve_live(repo, None, "workspace")?;
             if scope
@@ -1657,13 +2419,75 @@ fn resolve_scope(
             {
                 scope.limitation = Some("当前工作区没有未提交变更。".to_string());
             }
-            Ok(scope)
+            scope
         }
-        UiReviewScope::Project => resolve_project(repo),
-        UiReviewScope::Commit { rev } => resolve_commit(repo, rev),
-        UiReviewScope::Branch { base } => resolve_branch(repo, base),
-        UiReviewScope::Paths { paths } => resolve_paths(repo, paths),
+        UiReviewScope::Project => resolve_project(repo)?,
+        UiReviewScope::Commit { rev } => resolve_commit(repo, rev)?,
+        UiReviewScope::Branch { base } => resolve_branch(repo, base)?,
+        UiReviewScope::Paths { paths } => resolve_paths(repo, paths)?,
+    };
+    Ok((scope.clone(), resolved))
+}
+
+/// A bare `/review`: review what the person is actually working on.
+///
+/// 1. Uncommitted change — staged, unstaged or untracked — is the workspace.
+/// 2. Otherwise, the commits this branch has over the upstream its own Git
+///    configuration records. That remote-tracking ref is the only remote
+///    state read: nothing is fetched, and no upstream is assumed (a repository
+///    whose default remote is `upstream` must not be reviewed against
+///    `origin/main`).
+/// 3. Otherwise ask. A clean tree with no recorded upstream has no defensible
+///    default; silently reviewing the whole project would review an object
+///    nobody asked for.
+fn resolve_auto(context: &SessionContext) -> Result<(UiReviewScope, ResolvedScope), ScopeError> {
+    let repo = context
+        .repository
+        .as_deref()
+        .ok_or_else(|| ClientError::Runtime("当前会话没有工作区，无法确定审查对象".to_string()))?;
+    // A failed `git status` is not "clean": unknown must be stated, never
+    // turned into an empty change set.
+    let status = git(repo, &["status", "--porcelain"]).ok_or_else(|| {
+        ClientError::Runtime(format!(
+            "无法读取工作区 Git 状态：{}（目录不是 Git 仓库或 git 不可用）",
+            repo.display()
+        ))
+    })?;
+    if !status.trim().is_empty() {
+        let scope = UiReviewScope::Workspace;
+        return Ok((scope.clone(), resolve_live(repo, None, "workspace")?));
     }
+    // `--symbolic-full-name @{upstream}` fails (no output) for a detached HEAD
+    // or a branch without an upstream. Unknown is not `origin/main`.
+    let upstream = git_trim(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .filter(|name| !name.trim().is_empty());
+    let Some(upstream) = upstream else {
+        return Err(ScopeError::NeedsChoice);
+    };
+    let ahead = git_trim(repo, &["rev-list", "--count", &format!("{upstream}..HEAD")])
+        .and_then(|count| count.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if ahead == 0 {
+        return Err(ScopeError::NeedsChoice);
+    }
+    let mut resolved = resolve_branch(repo, &upstream)?;
+    let note = format!(
+        "默认范围为当前分支相对上游 `{upstream}` 的 {ahead} 个提交。上游是本地远程跟踪引用\
+         （上次 fetch 的状态），本次没有联网校验远端。"
+    );
+    resolved.limitation = Some(match resolved.limitation.take() {
+        Some(existing) => format!("{note}\n\n{existing}"),
+        None => note,
+    });
+    Ok((UiReviewScope::Branch { base: upstream }, resolved))
 }
 
 fn resolve_task(context: &SessionContext, repo: &Path) -> Result<ResolvedScope, ClientError> {
@@ -2262,6 +3086,18 @@ fn object_after(
         return Ok(resolved.object.clone());
     };
     let object = match scope {
+        // `Auto` is replaced by the object it resolved to before the review
+        // runs; this replay guard keeps the captured object instead of
+        // inventing a new one.
+        UiReviewScope::Auto => Ok::<ResolvedScope, ClientError>(ResolvedScope {
+            object: resolved.object.clone(),
+            files: resolved.files.clone(),
+            diff: resolved.diff.clone(),
+            diff_truncated: resolved.diff_truncated,
+            fingerprint_truncated: resolved.fingerprint_truncated,
+            fingerprint_unreadable: resolved.fingerprint_unreadable,
+            limitation: resolved.limitation.clone(),
+        }),
         // The commit is immutable, but the worktree the reviewer reads it
         // through is not; re-read so a moved HEAD is visible.
         UiReviewScope::Commit { rev } => resolve_commit(repo, rev),
@@ -2898,6 +3734,12 @@ fn build_brief(
            `coverage`（维度 + reviewed/partial/not_reviewed/not_applicable + 证据引用）以及\n\
            `limitations`（环境/权限/工具能力/范围）。只声明你真正做过的检查；\n\
            没有覆盖的维度不要声明为 reviewed。\n\
+         - `report_review.formal_findings` 必须列出本次审查正式 Finding 的真实持久化 ID\n\
+           （你自己 `report_finding` 的记录，以及经 `adjudicate_finding` 采纳的候选），\n\
+           且必须与运行时返回的正式集合完全一致。不要按顺序重新编号；ID 允许缺号。\n\
+           候选、已否定、重复的 ID 不是正式 Finding，不得写入 `formal_findings`，\n\
+           也不得作为正式引用写进报告正文——运行时已按结构化记录展示它们。\n\
+           正式 ID 只来自工具结果，不来自你的编号习惯。\n\
          - 区分：确认缺陷、高置信度风险、证据不足、有价值的优化建议。不要为了填满报告制造 finding。\n",
     );
     if blocks.memory_available {
@@ -2922,6 +3764,7 @@ fn scope_description(
     context: &SessionContext,
 ) -> String {
     match scope {
+        UiReviewScope::Auto => "当前工作区可审查的变更（自动选择）".to_string(),
         UiReviewScope::CurrentTask => format!(
             "当前任务的交付（Session {}，来源 turn {}）",
             context.session_id.as_str(),
@@ -3051,7 +3894,7 @@ fn counts(findings: &[FindingRecord]) -> UiReviewCounts {
     counts
 }
 
-fn summary_from_record(record: &ReviewRecord) -> Result<UiReviewSummary, ClientError> {
+pub(crate) fn summary_from_record(record: &ReviewRecord) -> Result<UiReviewSummary, ClientError> {
     let scope: UiReviewScope = serde_json::from_str(&record.scope_json).map_err(|error| {
         ClientError::Runtime(format!("审查 {} 的范围记录损坏: {error}", record.id))
     })?;
@@ -3371,6 +4214,159 @@ mod tests {
         dir
     }
 
+    /// The resolved object, for tests that do not care which concrete scope
+    /// `Auto` selected.
+    fn resolve_for_test(
+        context: &SessionContext,
+        scope: &UiReviewScope,
+    ) -> Result<ResolvedScope, ScopeError> {
+        resolve_scope(context, scope).map(|(_, resolved)| resolved)
+    }
+
+    /// A bare repository plus a remote named `name` pointing at it, with the
+    /// current branch pushed and its upstream recorded. The returned handle
+    /// keeps the remote directory alive.
+    fn with_upstream(dir: &Path, name: &str) -> tempfile::TempDir {
+        let bare = tempfile::tempdir().unwrap();
+        git(bare.path(), &["init", "-q", "--bare"]);
+        git(dir, &["branch", "-M", "main"]);
+        let url = bare.path().to_str().unwrap();
+        git(dir, &["remote", "add", name, url]);
+        git(dir, &["push", "-q", "-u", name, "main"]);
+        bare
+    }
+
+    /// A bare `/review` reviews what the person is working on. Uncommitted
+    /// work — staged, unstaged or untracked — is that object.
+    #[test]
+    fn auto_reviews_the_workspace_when_it_has_uncommitted_changes() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.rs"), "fn a() { changed(); }\n").unwrap();
+        let (scope, resolved) =
+            resolve_scope(&task_context(dir.path(), &[]), &UiReviewScope::Auto).unwrap();
+        assert_eq!(scope, UiReviewScope::Workspace);
+        assert!(
+            resolved.files.iter().any(|f| f == "a.rs"),
+            "{:?}",
+            resolved.files
+        );
+        assert!(
+            resolved
+                .diff
+                .as_deref()
+                .is_some_and(|diff| diff.contains("changed()")),
+            "the unstaged edit must be in the diff"
+        );
+
+        // Staged-only and untracked-only are the same object.
+        git(dir.path(), &["add", "a.rs"]);
+        let (scope, resolved) =
+            resolve_scope(&task_context(dir.path(), &[]), &UiReviewScope::Auto).unwrap();
+        assert_eq!(scope, UiReviewScope::Workspace);
+        assert!(
+            resolved
+                .diff
+                .as_deref()
+                .is_some_and(|diff| diff.contains("changed()")),
+            "a staged edit is still uncommitted work"
+        );
+
+        let other = repo();
+        std::fs::write(other.path().join("new.rs"), "fn new() {}\n").unwrap();
+        let (scope, resolved) =
+            resolve_scope(&task_context(other.path(), &[]), &UiReviewScope::Auto).unwrap();
+        assert_eq!(scope, UiReviewScope::Workspace);
+        assert!(
+            resolved.object.untracked.iter().any(|f| f == "new.rs"),
+            "{:?}",
+            resolved.object.untracked
+        );
+    }
+
+    /// Clean worktree with commits over the recorded upstream: those commits
+    /// are the object, and the scope records their exact identity.
+    #[test]
+    fn auto_reviews_the_commits_ahead_of_the_recorded_upstream() {
+        let dir = repo();
+        let _remote = with_upstream(dir.path(), "origin");
+        std::fs::write(dir.path().join("a.rs"), "fn a() { v2(); }\n").unwrap();
+        git(dir.path(), &["commit", "-qam", "one"]);
+        std::fs::write(dir.path(), "").ok();
+        std::fs::write(dir.path().join("b.rs"), "fn b() { v2(); }\n").unwrap();
+        git(dir.path(), &["commit", "-qam", "two"]);
+
+        let (scope, resolved) =
+            resolve_scope(&task_context(dir.path(), &[]), &UiReviewScope::Auto).unwrap();
+        assert_eq!(
+            scope,
+            UiReviewScope::Branch {
+                base: "origin/main".into()
+            }
+        );
+        assert!(
+            resolved.object.revision.is_some(),
+            "a branch review must record the commit range it reviewed"
+        );
+        assert!(
+            resolved.files.iter().any(|f| f == "a.rs"),
+            "{:?}",
+            resolved.files
+        );
+        assert!(
+            resolved
+                .limitation
+                .as_deref()
+                .is_some_and(|text| text.contains("2 个提交")),
+            "{:?}",
+            resolved.limitation
+        );
+    }
+
+    /// The upstream is whatever this repository records. A repository whose
+    /// remote is `upstream` must not be reviewed against an invented
+    /// `origin/main`.
+    #[test]
+    fn auto_never_assumes_origin_main() {
+        let dir = repo();
+        let _remote = with_upstream(dir.path(), "upstream");
+        std::fs::write(dir.path().join("a.rs"), "fn a() { v2(); }\n").unwrap();
+        git(dir.path(), &["commit", "-qam", "one"]);
+        let (scope, _) =
+            resolve_scope(&task_context(dir.path(), &[]), &UiReviewScope::Auto).unwrap();
+        assert_eq!(
+            scope,
+            UiReviewScope::Branch {
+                base: "upstream/main".into()
+            }
+        );
+    }
+
+    /// Clean, level with its upstream: there is no defensible default, so the
+    /// runtime asks instead of reviewing the whole project.
+    #[test]
+    fn auto_asks_when_nothing_is_unambiguously_reviewable() {
+        let dir = repo();
+        let _remote = with_upstream(dir.path(), "origin");
+        let error =
+            resolve_for_test(&task_context(dir.path(), &[]), &UiReviewScope::Auto).unwrap_err();
+        assert!(matches!(error, ScopeError::NeedsChoice), "{error:?}");
+
+        // A branch without an upstream is equally ambiguous.
+        let bare = repo();
+        let error =
+            resolve_for_test(&task_context(bare.path(), &[]), &UiReviewScope::Auto).unwrap_err();
+        assert!(matches!(error, ScopeError::NeedsChoice), "{error:?}");
+    }
+
+    /// A non-repository is not silently "nothing to review".
+    #[test]
+    fn auto_fails_loudly_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            resolve_for_test(&task_context(dir.path(), &[]), &UiReviewScope::Auto).unwrap_err();
+        assert!(matches!(error, ScopeError::Failed(_)), "{error:?}");
+    }
+
     fn task_context(dir: &Path, files: &[&str]) -> SessionContext {
         SessionContext {
             session_id: SessionId::new("s1"),
@@ -3393,7 +4389,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() { changed(); }\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() { other_session(); }\n").unwrap();
         let ctx = task_context(dir.path(), &["a.rs"]);
-        let resolved = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         assert_eq!(resolved.files, vec!["a.rs"]);
         let diff = resolved.diff.unwrap_or_default();
         assert!(diff.contains("a.rs"), "{diff}");
@@ -3410,13 +4406,13 @@ mod tests {
         let dir = repo();
         std::fs::write(dir.path().join("a.rs"), "fn a() { one(); }\n").unwrap();
         let ctx = task_context(dir.path(), &["a.rs"]);
-        let first = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let first = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() { unrelated(); }\n").unwrap();
-        let second = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let second = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         assert_eq!(first.object.fingerprint, second.object.fingerprint);
 
         std::fs::write(dir.path().join("a.rs"), "fn a() { two(); }\n").unwrap();
-        let third = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let third = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         assert_ne!(first.object.fingerprint, third.object.fingerprint);
     }
 
@@ -3427,10 +4423,10 @@ mod tests {
     fn a_fileness_task_still_reports_workspace_dirt_and_movement() {
         let dir = repo();
         let ctx = task_context(dir.path(), &[]);
-        let first = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let first = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         assert!(!first.object.dirty, "a fresh repository is clean");
         std::fs::write(dir.path().join("b.rs"), "fn b() { changed(); }\n").unwrap();
-        let second = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let second = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         assert!(second.object.dirty, "the workspace is not clean any more");
         assert_ne!(
             first.object.fingerprint, second.object.fingerprint,
@@ -3447,7 +4443,7 @@ mod tests {
         git(dir.path(), &["add", "a.rs"]);
         git(dir.path(), &["commit", "-qm", "delivery"]);
         let ctx = task_context(dir.path(), &["a.rs"]);
-        let resolved = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         assert!(resolved.diff.as_deref().unwrap_or("").trim().is_empty());
         assert!(
             resolved
@@ -3468,7 +4464,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("draft-{index}.txt")), "x").unwrap();
         }
         let ctx = task_context(dir.path(), &[]);
-        let resolved = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap();
         assert!(resolved.fingerprint_truncated);
         let verdict = compose_verdict(None, &resolved, false, true, false).unwrap();
         assert!(
@@ -3487,7 +4483,7 @@ mod tests {
         let dir = repo();
         std::os::unix::fs::symlink("missing-target", dir.path().join("broken-link")).unwrap();
         let ctx = task_context(dir.path(), &[]);
-        let resolved = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap();
         assert!(resolved.fingerprint_unreadable);
         let verdict = compose_verdict(None, &resolved, false, true, false).unwrap();
         assert!(
@@ -3507,11 +4503,11 @@ mod tests {
         let dir = repo();
         let ctx = task_context(dir.path(), &[]);
         std::fs::write(dir.path().join("draft.txt"), "one\n").unwrap();
-        let project_first = resolve_scope(&ctx, &UiReviewScope::Project)
+        let project_first = resolve_for_test(&ctx, &UiReviewScope::Project)
             .unwrap()
             .object
             .fingerprint;
-        let branch_first = resolve_scope(
+        let branch_first = resolve_for_test(
             &ctx,
             &UiReviewScope::Branch {
                 base: "HEAD".into(),
@@ -3521,11 +4517,11 @@ mod tests {
         .object
         .fingerprint;
         std::fs::write(dir.path().join("draft.txt"), "two\n").unwrap();
-        let project_second = resolve_scope(&ctx, &UiReviewScope::Project)
+        let project_second = resolve_for_test(&ctx, &UiReviewScope::Project)
             .unwrap()
             .object
             .fingerprint;
-        let branch_second = resolve_scope(
+        let branch_second = resolve_for_test(
             &ctx,
             &UiReviewScope::Branch {
                 base: "HEAD".into(),
@@ -3547,7 +4543,7 @@ mod tests {
         content.push(b'X');
         std::fs::write(dir.path().join("large.bin"), &content).unwrap();
         let ctx = task_context(dir.path(), &[]);
-        let first = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap();
+        let first = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap();
         assert!(
             first
                 .object
@@ -3560,7 +4556,7 @@ mod tests {
         let len = content.len();
         content[len - 1] = b'Y';
         std::fs::write(dir.path().join("large.bin"), &content).unwrap();
-        let second = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap();
+        let second = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap();
         assert_ne!(
             first.object.fingerprint, second.object.fingerprint,
             "a tail-only change must not be invisible"
@@ -3579,7 +4575,7 @@ mod tests {
         std::fs::write(dir.path().join("src/tracked.rs"), "fn t() { changed(); }\n").unwrap();
         std::fs::write(dir.path().join("src/new.rs"), "fn n() {}\n").unwrap();
         let ctx = task_context(dir.path(), &[]);
-        let resolved = resolve_scope(
+        let resolved = resolve_for_test(
             &ctx,
             &UiReviewScope::Paths {
                 paths: vec!["src/".into()],
@@ -3606,7 +4602,7 @@ mod tests {
 
         let first = resolved.object.fingerprint;
         std::fs::write(dir.path().join("src/new.rs"), "fn n() { changed(); }\n").unwrap();
-        let second = resolve_scope(
+        let second = resolve_for_test(
             &ctx,
             &UiReviewScope::Paths {
                 paths: vec!["src/".into()],
@@ -3640,7 +4636,7 @@ mod tests {
         );
         // A dirty worktree must not overwrite the merge explanation.
         std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
-        let resolved = resolve_scope(
+        let resolved = resolve_for_test(
             &task_context(dir.path(), &[]),
             &UiReviewScope::Commit { rev: "HEAD".into() },
         )
@@ -3679,7 +4675,7 @@ mod tests {
     fn an_untracked_delivery_file_states_the_missing_diff() {
         let dir = repo();
         std::fs::write(dir.path().join("new.rs"), "fn new() {}\n").unwrap();
-        let resolved = resolve_scope(
+        let resolved = resolve_for_test(
             &task_context(dir.path(), &["new.rs"]),
             &UiReviewScope::CurrentTask,
         )
@@ -3699,7 +4695,7 @@ mod tests {
     #[test]
     fn an_invalid_commit_is_an_explicit_error() {
         let dir = repo();
-        let error = resolve_scope(
+        let error = resolve_for_test(
             &task_context(dir.path(), &[]),
             &UiReviewScope::Commit {
                 rev: "does-not-exist".into(),
@@ -3715,7 +4711,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         let ctx = task_context(dir.path(), &["a.rs"]);
-        let error = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap_err();
+        let error = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap_err();
         assert!(error.to_string().contains("Git"), "{error}");
     }
 
@@ -3729,7 +4725,7 @@ mod tests {
         let mut ctx = task_context(dir.path(), &["a.rs"]);
         ctx.delivery_text = Some("实现已经完成并且测试通过".into());
         ctx.transcript_digest = "用户补充：只检查读取路径".into();
-        let resolved = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap();
         let brief = build_brief(
             "persona",
             &ctx,
@@ -3754,7 +4750,7 @@ mod tests {
             dir.path(),
             &["commit", "-q", "--allow-empty", "-m", "empty"],
         );
-        let resolved = resolve_scope(
+        let resolved = resolve_for_test(
             &task_context(dir.path(), &[]),
             &UiReviewScope::Commit { rev: "HEAD".into() },
         )
@@ -3777,7 +4773,7 @@ mod tests {
         let mut ctx = task_context(dir.path(), &[]);
         ctx.source_turn_id = None;
         ctx.delivery_text = None;
-        let error = resolve_scope(&ctx, &UiReviewScope::CurrentTask).unwrap_err();
+        let error = resolve_for_test(&ctx, &UiReviewScope::CurrentTask).unwrap_err();
         assert!(error.to_string().contains("修改边界"), "{error}");
     }
 
@@ -3879,7 +4875,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() { later(); }\n").unwrap();
         git(dir.path(), &["add", "a.rs"]);
         git(dir.path(), &["commit", "-qm", "later"]);
-        let resolved = resolve_scope(
+        let resolved = resolve_for_test(
             &task_context(dir.path(), &[]),
             &UiReviewScope::Commit {
                 rev: "HEAD~1".into(),
@@ -3909,7 +4905,7 @@ mod tests {
     fn a_commit_review_reads_the_commit_not_the_worktree() {
         let dir = repo();
         std::fs::write(dir.path().join("a.rs"), "fn a() { later(); }\n").unwrap();
-        let resolved = resolve_scope(
+        let resolved = resolve_for_test(
             &task_context(dir.path(), &[]),
             &UiReviewScope::Commit { rev: "HEAD".into() },
         )
@@ -3953,7 +4949,7 @@ mod tests {
                 }],
             }],
         };
-        let resolved = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap();
         let brief = build_brief(
             "persona",
             &ctx,
@@ -3984,7 +4980,7 @@ mod tests {
         let dir = repo();
         let mut ctx = task_context(dir.path(), &[]);
         ctx.intent_error = Some("读取 Goal 失败".into());
-        let resolved = resolve_scope(&ctx, &UiReviewScope::Workspace).unwrap();
+        let resolved = resolve_for_test(&ctx, &UiReviewScope::Workspace).unwrap();
         let brief = build_brief(
             "persona",
             &ctx,
@@ -4124,5 +5120,47 @@ mod untracked_sample_tests {
         std::os::unix::fs::symlink(outside.path().join("other"), repo.path().join("link")).unwrap();
         let repointed = hash_untracked_sample(repo.path(), &["link".to_string()]);
         assert_ne!(after.digest, repointed.digest);
+    }
+
+    /// An investigation's card state is the child's mechanical terminal, not
+    /// a success flag read alone. A cancelled child stays cancelled; a budget
+    /// stop is incomplete; a broken run is failed.
+    #[test]
+    fn an_investigation_terminal_is_projected_from_its_mechanical_stop() {
+        for (stop, ok, expected) in [
+            (
+                Some(ChildStop::Completed),
+                true,
+                UiReviewInvestigationState::Completed,
+            ),
+            (
+                Some(ChildStop::Cancelled),
+                false,
+                UiReviewInvestigationState::Cancelled,
+            ),
+            (
+                Some(ChildStop::Cancelled),
+                true,
+                UiReviewInvestigationState::Cancelled,
+            ),
+            (
+                Some(ChildStop::Budget),
+                false,
+                UiReviewInvestigationState::Incomplete,
+            ),
+            (
+                Some(ChildStop::Incomplete),
+                false,
+                UiReviewInvestigationState::Incomplete,
+            ),
+            (
+                Some(ChildStop::Failed),
+                false,
+                UiReviewInvestigationState::Failed,
+            ),
+            (None, false, UiReviewInvestigationState::Failed),
+        ] {
+            assert_eq!(investigation_state(stop, ok), expected, "{stop:?} ok={ok}");
+        }
     }
 }

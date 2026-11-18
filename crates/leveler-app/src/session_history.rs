@@ -6,15 +6,17 @@
 //! the same [`EventBridge`] a live client received, so a reopened session reads
 //! the way it did while it ran instead of a second, drifting dialect.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use leveler_client_protocol::{MessageId, RuntimeEvent, UiHistoryEntry, UiMessage, UiRole};
+use leveler_client_protocol::{
+    MessageId, RuntimeEvent, UiHistoryEntry, UiMessage, UiReviewSummary, UiRole,
+};
 use leveler_core::{SessionId, Timestamp, TurnId};
 use leveler_engine::{EngineEvent, TurnUsage};
-use leveler_model::{ContentPart, Message, TranscriptOrigin};
+use leveler_model::{ContentPart, Message, RuntimeNoticeKind, TranscriptOrigin};
 use leveler_storage::{
-    Database, EventRepository, MessageRepository, ModelRequestRepository, SessionRecapRepository,
-    TurnRecord, TurnRepository,
+    Database, EventRepository, MessageRepository, ModelRequestRepository, ReviewRepository,
+    SessionRecapRepository, TurnRecord, TurnRepository,
 };
 use tokio::sync::broadcast;
 
@@ -37,6 +39,13 @@ enum Fact {
     PartialAssistant(MessageId, String),
     /// The durable review of the turn this fact sits in (`※ 回顾`).
     Recap(String),
+    /// A `/review` notice row names a durable review. Its record time is the
+    /// place the review card occupied in this conversation; the review row is
+    /// the authority for what the card says.
+    ReviewNotice(String),
+    /// The review row a notice named, projected by the same function a live
+    /// client's summary uses.
+    Review(Box<UiReviewSummary>),
 }
 
 /// The latest [`HISTORY_TURNS_MAX`] turns of a session, and how many older
@@ -54,6 +63,28 @@ pub async fn load_session_history(
     {
         return Ok((Vec::new(), 0));
     }
+    // A review is not a turn, so its position lives in the message rows the
+    // runtime wrote when it started. Replaying those rows needs the durable
+    // review the notice names; a notice whose row is gone draws nothing.
+    let review_rows: HashMap<String, UiReviewSummary> = ReviewRepository::new(db)
+        .list_for_session(session_id)
+        .await
+        .map_err(AppError::from)?
+        .into_iter()
+        .filter_map(
+            |record| match crate::interactive::review::summary_from_record(&record) {
+                Ok(summary) => Some((summary.id.clone(), summary)),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        review_id = %record.id,
+                        "could not project a review row for conversation replay"
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
     // Group using ordering metadata first; old snapshots and tool payloads are
     // never materialized merely to discard their turns afterward.
     let mut groups = Vec::new();
@@ -132,12 +163,18 @@ pub async fn load_session_history(
         .map_err(AppError::from)?
         .into_iter()
         .filter_map(|m| {
-            transcript_fact(
+            let fact = transcript_fact(
                 &m.payload,
                 MessageId::new(format!("{session_id}-partial-{}", m.ordinal)),
                 m.input_id.as_deref(),
-            )
-            .map(|fact| (parse_time(&m.created_at), fact))
+            )?;
+            let fact = match fact {
+                // Without its durable row there is no review to draw. The
+                // notice is harness context, never a user message.
+                Fact::ReviewNotice(id) => Fact::Review(Box::new(review_rows.get(&id)?.clone())),
+                other => other,
+            };
+            Some((parse_time(&m.created_at), fact))
         })
         .collect();
 
@@ -192,6 +229,15 @@ pub async fn load_session_history(
             .unwrap_or(facts.len());
         facts.insert(position, (at, Fact::Recap(recap.text)));
     }
+
+    // Started and settled are two rows for one review; the card belongs to
+    // the first. Duplicates are dropped here, before they can become a second
+    // replay event in a later turn.
+    let mut seen_reviews: HashSet<String> = HashSet::new();
+    facts.retain(|(_, fact)| match fact {
+        Fact::Review(review) => seen_reviews.insert(review.id.clone()),
+        _ => true,
+    });
 
     // A turn is everything from one TurnStarted to the next.
     //
@@ -286,6 +332,11 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
                 },
             }],
             Fact::Recap(text) => vec![RuntimeEvent::AwaySummary { text }],
+            // The reducer converges both notices on one card by durable id, so
+            // a started+settled pair still lands once, at the start position.
+            Fact::Review(summary) => vec![RuntimeEvent::ReviewStarted { review: *summary }],
+            // Resolved before replay; a bare id never reaches this point.
+            Fact::ReviewNotice(_) => Vec::new(),
             Fact::PartialAssistant(id, text) => vec![
                 RuntimeEvent::AssistantMessageStarted {
                     message_id: id.clone(),
@@ -376,6 +427,9 @@ fn is_live_only(event: &RuntimeEvent) -> bool {
 /// display block, leaving the authoritative turn terminal unchanged. The host-owned JSON boolean,
 /// never a phrase in the body, distinguishes this path from normal messages.
 fn transcript_fact(payload: &str, id: MessageId, input_id: Option<&str>) -> Option<Fact> {
+    if let Some(review_id) = review_notice_id(payload) {
+        return Some(Fact::ReviewNotice(review_id));
+    }
     if let Some((text, images)) = user_text(payload) {
         return Some(Fact::User(text, images, input_id.map(MessageId::new)));
     }
@@ -392,6 +446,31 @@ fn transcript_fact(payload: &str, id: MessageId, input_id: Option<&str>) -> Opti
     }
     let text = message.text_content();
     (!text.is_empty()).then_some(Fact::PartialAssistant(id, text))
+}
+
+/// The review id a runtime review notice names.
+///
+/// The body is written by this runtime for this purpose, and the id line is
+/// its stable field. The header text alone is not enough: legacy runtime
+/// notices are user-transport rows too, and only these two kinds name a
+/// durable review.
+fn review_notice_id(payload: &str) -> Option<String> {
+    let message: Message = serde_json::from_str(payload).ok()?;
+    let Some(TranscriptOrigin::RuntimeNotice { notice }) = message.origin.as_ref() else {
+        return None;
+    };
+    if !matches!(
+        notice,
+        RuntimeNoticeKind::ReviewStarted | RuntimeNoticeKind::ReviewSettled
+    ) {
+        return None;
+    }
+    let text = message.text_content();
+    let id = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- review_id:"))?
+        .trim();
+    (!id.is_empty() && id.len() <= 128 && id.starts_with("review-")).then(|| id.to_string())
 }
 
 /// The text of a message the user sent. Runtime notices and compaction
@@ -609,10 +688,10 @@ mod tests {
     use leveler_core::{Timestamp, TurnId, now};
     use leveler_engine::{EngineEvent, TurnKind};
     use leveler_lifecycle::{StopReason, TaskOutcome};
-    use leveler_model::{Message, ProtocolRepairKind, Role, TranscriptOrigin};
+    use leveler_model::{Message, ProtocolRepairKind, Role, RuntimeNoticeKind, TranscriptOrigin};
     use leveler_storage::{
-        EventRepository, EventStore, MessageRepository, SessionRecord, SessionRepository,
-        TurnRepository,
+        EventRepository, EventStore, MessageRepository, NewReview, ReviewRepository, SessionRecord,
+        SessionRepository, TurnRepository,
     };
 
     #[tokio::test]
@@ -1192,6 +1271,194 @@ mod tests {
             },
         )
         .await;
+    }
+
+    /// The two conversation rows `/review` writes: the user's command and the
+    /// runtime's structured notice. They are ordinary message rows, so their
+    /// record time is the position the review occupied in the conversation.
+    async fn review_notice(
+        db: &Database,
+        sid: &SessionId,
+        at: Timestamp,
+        review_id: &str,
+        kind: RuntimeNoticeKind,
+    ) {
+        let header = match kind {
+            RuntimeNoticeKind::ReviewStarted => "## Review started",
+            RuntimeNoticeKind::ReviewSettled => "## Review settled",
+            other => panic!("not a review notice: {other:?}"),
+        };
+        let payload = serde_json::to_string(&Message::user(
+            format!("{header}\n\n- review_id: {review_id}\n- status: running\n"),
+            TranscriptOrigin::RuntimeNotice { notice: kind },
+        ))
+        .unwrap();
+        MessageRepository::new(db)
+            .append(sid, &[payload], at)
+            .await
+            .unwrap();
+    }
+
+    async fn review_row(db: &Database, sid: &SessionId, id: &str, at: Timestamp, status: &str) {
+        ReviewRepository::new(db)
+            .create(&NewReview {
+                id,
+                session_id: sid,
+                focus: "审查账单授权边界",
+                scope_json: r#"{"kind":"workspace"}"#,
+                model: "m/x",
+                status,
+                source_session_id: Some(sid.as_str()),
+                source_turn_id: None,
+                created_at: at,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A review is not a turn, so the turn log alone cannot place its card.
+    /// The durable `ReviewStarted` notice IS a session message: replaying it
+    /// at its own record time is what keeps a reopened conversation in the
+    /// order it actually happened.
+    #[tokio::test]
+    async fn review_notices_replay_at_their_own_conversation_position() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        turn(&db, &sid, t0, "先看账单", "看完了").await;
+        let at_review = t0 + ms(5_000);
+        let command =
+            serde_json::to_string(&Message::user_input("/review @workspace 审查账单授权边界"))
+                .unwrap();
+        MessageRepository::new(&db)
+            .append(&sid, &[command], at_review)
+            .await
+            .unwrap();
+        review_notice(
+            &db,
+            &sid,
+            at_review + ms(1),
+            "review-placed",
+            RuntimeNoticeKind::ReviewStarted,
+        )
+        .await;
+        review_row(&db, &sid, "review-placed", at_review, "running").await;
+        turn(&db, &sid, t0 + ms(10_000), "第二个问题", "第二个回答").await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let position = |needle: &str| {
+            entries
+                .iter()
+                .position(|entry| match &entry.event {
+                    RuntimeEvent::UserMessageAdded { message } => message.text == needle,
+                    RuntimeEvent::ReviewStarted { review } => review.id == needle,
+                    _ => false,
+                })
+                .unwrap_or_else(|| panic!("missing replay fact `{needle}`"))
+        };
+        let first = position("先看账单");
+        let review = position("review-placed");
+        let second = position("第二个问题");
+        assert!(
+            first < review && review < second,
+            "the review card must keep its own place: first={first} review={review} second={second}"
+        );
+    }
+
+    /// The started and settled notices are two rows for one review. A reopen
+    /// draws one card, not a second copy at the settlement time.
+    #[tokio::test]
+    async fn both_review_notices_replay_as_one_card() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        turn(&db, &sid, t0, "先看账单", "看完了").await;
+        let at_review = t0 + ms(5_000);
+        review_notice(
+            &db,
+            &sid,
+            at_review,
+            "review-once",
+            RuntimeNoticeKind::ReviewStarted,
+        )
+        .await;
+        review_notice(
+            &db,
+            &sid,
+            at_review + ms(4_000),
+            "review-once",
+            RuntimeNoticeKind::ReviewSettled,
+        )
+        .await;
+        review_row(&db, &sid, "review-once", at_review, "completed").await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let cards: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.event, RuntimeEvent::ReviewStarted { review } if review.id == "review-once")
+            })
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "one review has one conversation card, whatever notices it wrote"
+        );
+    }
+
+    /// Several reviews in one conversation keep their own order: the card
+    /// belongs where its notice was written, not at the end of the replay.
+    #[tokio::test]
+    async fn multiple_reviews_replay_in_their_own_order() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        for (index, offset) in [(1, 0), (2, 20_000)] {
+            let at = t0 + ms(offset);
+            turn(&db, &sid, at, &format!("第 {index} 个问题"), "回答").await;
+            let id = format!("review-{index}");
+            review_notice(
+                &db,
+                &sid,
+                at + ms(3_000),
+                &id,
+                RuntimeNoticeKind::ReviewStarted,
+            )
+            .await;
+            review_row(&db, &sid, &id, at + ms(3_000), "completed").await;
+        }
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                RuntimeEvent::ReviewStarted { review } => Some(review.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["review-1", "review-2"]);
+    }
+
+    /// A notice without its durable review row (deleted session data) must not
+    /// be presented as a review. The row is the authority for the card.
+    #[tokio::test]
+    async fn a_review_notice_without_its_row_draws_nothing() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        turn(&db, &sid, t0, "先看账单", "看完了").await;
+        review_notice(
+            &db,
+            &sid,
+            t0 + ms(5_000),
+            "review-gone",
+            RuntimeNoticeKind::ReviewStarted,
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(&entry.event, RuntimeEvent::ReviewStarted { .. })),
+            "no durable review row means no review to draw"
+        );
     }
 
     /// A refused declaration replays as the same structured terminal a live

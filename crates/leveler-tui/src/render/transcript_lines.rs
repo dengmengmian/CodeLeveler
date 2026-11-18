@@ -510,8 +510,15 @@ pub fn item_render(
     out
 }
 
-/// Manual review card. One bounded summary; the report lives on its own page,
-/// opened from the card's hit region (the whole card is the target).
+/// One review in the conversation, drawn with the same grammar as a delegated
+/// child: state glyph, role, elapsed time and the current step. A settled
+/// review renders its durable report in place; the whole card folds it.
+///
+/// A review that is still running draws nothing here. Its execution is a real
+/// sub-agent row (same id, same activity channel), and a second running
+/// projection for one execution is exactly the duplication this replaced. The
+/// durable item stays in the transcript so the report lands where the review
+/// was asked for.
 fn review_lines(
     block: &crate::transcript::ReviewBlock,
     theme: &Theme,
@@ -520,22 +527,52 @@ fn review_lines(
     t: &UiText,
 ) {
     let summary = &block.summary;
+    if block.report.is_none() && !summary.status.settled() && block.native_child {
+        return;
+    }
     let accent = Style::default()
         .fg(theme.accent.primary)
         .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(theme.text.secondary);
-    let status = review_status_label(summary.status, t);
+    // The review is a delegated child in this conversation, so its head uses
+    // the same grammar as every other child: glyph, role, state, elapsed, and
+    // the step it is on right now.
+    let (glyph, glyph_color) = match summary.status {
+        leveler_client_protocol::UiReviewStatus::Queued
+        | leveler_client_protocol::UiReviewStatus::Running => ("◌", theme.accent.primary),
+        leveler_client_protocol::UiReviewStatus::Completed => ("✓", theme.status.success),
+        leveler_client_protocol::UiReviewStatus::Incomplete
+        | leveler_client_protocol::UiReviewStatus::Cancelled => ("?", theme.status.warning),
+        leveler_client_protocol::UiReviewStatus::Failed => ("✗", theme.status.error),
+    };
     let mut head = vec![
-        Span::styled("▌ ", accent),
-        Span::styled(status.to_string(), accent),
+        Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+        Span::styled(t.sub_agent_reviewer.to_string(), accent),
         Span::styled(
-            format!(" · {}", review_scope_label(&summary.scope, t)),
+            format!(
+                " · {} · {}",
+                review_status_label(summary.status, t),
+                review_scope_label(&summary.scope, t)
+            ),
             muted,
         ),
     ];
-    if summary.status.settled() {
-        // The report entry sits on the card's right edge, in the same accent
-        // the plan detail uses. It wraps only when the row truly has no room.
+    if block.elapsed_ms > 0 {
+        head.push(Span::styled(
+            format!(
+                " · {}",
+                crate::status_line::fmt_elapsed(block.elapsed_ms / 1000)
+            ),
+            muted,
+        ));
+    }
+    if let Some(tool) = block.live_tool.as_deref().filter(|tool| !tool.is_empty()) {
+        head.push(Span::styled(format!(" · {tool}"), accent));
+    }
+    if summary.status.settled() && block.report.is_none() {
+        // The report page is still a fallback for rows without a fetched
+        // report. The entry sits on the card's right edge; it wraps only when
+        // the row truly has no room.
         let label = t.review.view_report;
         let used: usize = head
             .iter()
@@ -550,6 +587,46 @@ fn review_lines(
         head.push(Span::styled(label, accent));
     }
     out.push(Line::from(head));
+    if let Some(report) = block.report.as_ref() {
+        // The durable row is the only source of this report: it was projected
+        // from `report_review` and delivered with the terminal event. The
+        // conversation renders it in place; there is no second, agent-written
+        // copy and no separate page to visit.
+        if block.expanded {
+            let mut lines = super::review_report_lines(report, wrap_width, theme, t);
+            // The block head already carries the state and scope this first
+            // report line restates.
+            if !lines.is_empty() {
+                lines.remove(0);
+            }
+            out.extend(lines);
+            out.push(Line::from(Span::styled(
+                format!("  {}", t.review.collapse_hint),
+                Style::default().fg(theme.text.muted),
+            )));
+        } else {
+            push_prefixed(
+                out,
+                "  ",
+                &review_counts_line(summary, t),
+                muted,
+                wrap_width,
+            );
+            out.push(Line::from(Span::styled(
+                format!("  {}", t.review.expand_hint),
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+        if let Some(detail) = summary
+            .failure
+            .as_deref()
+            .or(summary.stop_detail.as_deref())
+            .filter(|detail| !detail.trim().is_empty())
+        {
+            push_prefixed(out, "  ", detail, muted, wrap_width);
+        }
+        return;
+    }
     if !block.investigations.is_empty() {
         push_prefixed(
             out,
@@ -589,57 +666,10 @@ fn review_lines(
         }
     }
     if summary.status.settled() {
-        let counts = &summary.counts;
-        let mut facts = format!(
-            "P0 {}  P1 {}  P2 {}  P3 {}",
-            counts.p0, counts.p1, counts.p2, counts.p3
-        );
-        if counts.unclassified > 0 {
-            facts.push_str(&format!(
-                " · {}",
-                t.review
-                    .unclassified
-                    .replacen("{}", &counts.unclassified.to_string(), 1)
-            ));
-        }
-        if counts.observations > 0 {
-            facts.push_str(" · ");
-            facts.push_str(&t.review.observations.replacen(
-                "{}",
-                &counts.observations.to_string(),
-                1,
-            ));
-        }
-        let total = counts.total();
-        let finding_text = t.review.findings.replacen("{}", &total.to_string(), 1);
-        facts.push_str(" · ");
-        facts.push_str(if total == 0 {
-            t.review.none_found
-        } else {
-            &finding_text
-        });
-        if counts.pending_candidates > 0 {
-            facts.push_str(" · ");
-            facts.push_str(&t.review.pending_candidates.replacen(
-                "{}",
-                &counts.pending_candidates.to_string(),
-                1,
-            ));
-        }
-        facts.push_str(" · ");
-        facts.push_str(review_conclusion_label(summary.conclusion, t));
-        facts.push_str(" · ");
-        facts.push_str(if summary.modified_source {
-            t.review.modified_source
-        } else {
-            t.review.readonly
-        });
-        push_prefixed(out, "  ", &facts, muted, wrap_width);
-    } else if let Some(tool) = &block.live_tool {
         push_prefixed(
             out,
             "  ",
-            &format!("{} · {} · {tool}", summary.focus, summary.model),
+            &review_counts_line(summary, t),
             muted,
             wrap_width,
         );
@@ -668,11 +698,66 @@ fn review_lines(
     }
 }
 
+/// One line of formal-finding counts. Candidate records are reported
+/// separately: they are not formal findings until the Lead adopts them.
+fn review_counts_line(summary: &leveler_client_protocol::UiReviewSummary, t: &UiText) -> String {
+    let counts = &summary.counts;
+    let mut facts = format!(
+        "P0 {}  P1 {}  P2 {}  P3 {}",
+        counts.p0, counts.p1, counts.p2, counts.p3
+    );
+    if counts.unclassified > 0 {
+        facts.push_str(&format!(
+            " · {}",
+            t.review
+                .unclassified
+                .replacen("{}", &counts.unclassified.to_string(), 1)
+        ));
+    }
+    if counts.observations > 0 {
+        facts.push_str(" · ");
+        facts.push_str(
+            &t.review
+                .observations
+                .replacen("{}", &counts.observations.to_string(), 1),
+        );
+    }
+    let total = counts.total();
+    let finding_text = t.review.findings.replacen("{}", &total.to_string(), 1);
+    facts.push_str(" · ");
+    facts.push_str(if total == 0 {
+        t.review.none_found
+    } else {
+        &finding_text
+    });
+    if counts.pending_candidates > 0 {
+        facts.push_str(" · ");
+        facts.push_str(&t.review.pending_candidates.replacen(
+            "{}",
+            &counts.pending_candidates.to_string(),
+            1,
+        ));
+    }
+    facts.push_str(" · ");
+    facts.push_str(review_conclusion_label(summary.conclusion, t));
+    facts.push_str(" · ");
+    facts.push_str(if summary.modified_source {
+        t.review.modified_source
+    } else {
+        t.review.readonly
+    });
+    facts
+}
+
 pub(crate) fn review_scope_label(
     scope: &leveler_client_protocol::UiReviewScope,
     t: &UiText,
 ) -> String {
     match scope {
+        // Resolution records the concrete object, so a settled card never
+        // shows this. It exists so a client that painted the request before
+        // the runtime answered still names what was asked.
+        leveler_client_protocol::UiReviewScope::Auto => t.review.scope_auto.to_string(),
         leveler_client_protocol::UiReviewScope::CurrentTask => {
             t.review.scope_current_task.to_string()
         }

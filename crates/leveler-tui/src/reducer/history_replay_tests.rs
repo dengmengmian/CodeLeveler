@@ -2063,3 +2063,335 @@ fn a_replayed_blocked_turn_keeps_its_typed_panel_and_continuation() {
         "the model-declared reason survives replay"
     );
 }
+
+fn review_summary(
+    id: &str,
+    status: leveler_client_protocol::UiReviewStatus,
+) -> leveler_client_protocol::UiReviewSummary {
+    leveler_client_protocol::UiReviewSummary {
+        id: id.into(),
+        session_id: SessionId::new("s1"),
+        focus: "检查账单授权边界".into(),
+        scope: leveler_client_protocol::UiReviewScope::Workspace,
+        model: "mock/m".into(),
+        status,
+        created_at: "2026-11-16T00:00:00Z".into(),
+        finished_at: None,
+        counts: leveler_client_protocol::UiReviewCounts::default(),
+        conclusion: None,
+        object_changed: false,
+        modified_source: false,
+        failure: None,
+        stop_detail: None,
+        usage: leveler_client_protocol::UiReviewUsage::default(),
+        investigations: Vec::new(),
+        report_source: leveler_client_protocol::UiReviewReportSource::Submitted,
+        report_evidence_revision: 0,
+        evidence_revision: 0,
+        report_revision: 1,
+        report_stale: false,
+    }
+}
+
+fn review_report(
+    summary: leveler_client_protocol::UiReviewSummary,
+) -> leveler_client_protocol::UiReviewReport {
+    leveler_client_protocol::UiReviewReport {
+        summary,
+        object: leveler_client_protocol::UiReviewObject::default(),
+        findings: Vec::new(),
+        verdict: leveler_client_protocol::UiReviewVerdict::default(),
+        report: "审查完成：发现一个越权读取问题。".into(),
+        final_message: String::new(),
+    }
+}
+
+/// The replay owns conversation order. A review event sitting between two
+/// turns must render there — not appended after the last answer because the
+/// review row was fetched separately.
+#[test]
+fn a_replayed_review_keeps_its_conversation_position() {
+    let mut s = state();
+    let effects = open(
+        &mut s,
+        vec![
+            message(UiRole::User, "先看账单"),
+            message(UiRole::Assistant, "看完了"),
+        ],
+    );
+    let answer = MessageId::new("a1");
+    let entries = vec![
+        entry(
+            0,
+            true,
+            RuntimeEvent::UserMessageAdded {
+                message: message(UiRole::User, "先看账单"),
+            },
+        ),
+        entry(
+            1000,
+            false,
+            RuntimeEvent::AssistantMessageStarted {
+                message_id: answer.clone(),
+            },
+        ),
+        entry(
+            1000,
+            false,
+            RuntimeEvent::AssistantTextDelta {
+                message_id: answer.clone(),
+                delta: "看完了".into(),
+            },
+        ),
+        entry(
+            1000,
+            false,
+            RuntimeEvent::AssistantMessageCompleted { message_id: answer },
+        ),
+        entry(1500, false, RuntimeEvent::TurnAnswered),
+        entry(
+            5000,
+            false,
+            RuntimeEvent::ReviewStarted {
+                review: review_summary(
+                    "review-1",
+                    leveler_client_protocol::UiReviewStatus::Running,
+                ),
+            },
+        ),
+        entry(
+            9000,
+            true,
+            RuntimeEvent::UserMessageAdded {
+                message: message(UiRole::User, "第二个问题"),
+            },
+        ),
+        entry(9500, false, RuntimeEvent::TurnAnswered),
+    ];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let items = s.transcript.items();
+    let review = items
+        .iter()
+        .position(
+            |item| matches!(item, TranscriptItem::Review(block) if block.summary.id == "review-1"),
+        )
+        .expect("review card");
+    let second = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::User(text) if text == "第二个问题"))
+        .expect("the second turn's question");
+    assert!(
+        review < second,
+        "the review card stays between the turns:\n{items:#?}"
+    );
+}
+
+/// The durable review response fills the card the replay placed; it must not
+/// append a second copy after the newest answer.
+#[test]
+fn review_history_attaches_to_the_replayed_card_in_place() {
+    let mut s = state();
+    let effects = open(
+        &mut s,
+        vec![
+            message(UiRole::User, "先看账单"),
+            message(UiRole::Assistant, "看完了"),
+        ],
+    );
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries: vec![
+                entry(
+                    0,
+                    true,
+                    RuntimeEvent::UserMessageAdded {
+                        message: message(UiRole::User, "先看账单"),
+                    },
+                ),
+                entry(1000, false, RuntimeEvent::TurnAnswered),
+                entry(
+                    5000,
+                    false,
+                    RuntimeEvent::ReviewStarted {
+                        review: review_summary(
+                            "review-1",
+                            leveler_client_protocol::UiReviewStatus::Running,
+                        ),
+                    },
+                ),
+                entry(
+                    9000,
+                    true,
+                    RuntimeEvent::UserMessageAdded {
+                        message: message(UiRole::User, "继续"),
+                    },
+                ),
+            ],
+            omitted_turns: 0,
+        }),
+    );
+    let before = s
+        .transcript
+        .items()
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::Review(_)))
+        .expect("replayed card");
+
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary.clone()],
+            reports: vec![review_report(summary)],
+        }),
+    );
+    let cards: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item, TranscriptItem::Review(_)))
+        .collect();
+    assert_eq!(cards.len(), 1, "one durable review, one card");
+    assert_eq!(cards[0].0, before, "the card must not move");
+    let TranscriptItem::Review(block) = cards[0].1 else {
+        unreachable!()
+    };
+    assert!(
+        block.report.is_some(),
+        "the durable report fills the replayed card"
+    );
+}
+
+/// The transcript replay replaces the whole transcript. Asking for review
+/// rows at the same moment would let an earlier answer be thrown away by the
+/// rebuild, so the request waits for the replay to land.
+#[test]
+fn the_review_request_waits_for_the_transcript_replay() {
+    let mut s = state();
+    let effects = open(
+        &mut s,
+        vec![
+            message(UiRole::User, "运行 soak"),
+            message(UiRole::Assistant, "停在第 3 个 tick。"),
+        ],
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(ClientCommand::ListReviews { .. }))),
+        "the review rows must not race the replay: {effects:?}"
+    );
+    let query = history_query(&effects);
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: query,
+            session_id: SessionId::new("s1"),
+            entries: stopped_turn(),
+            omitted_turns: 0,
+        }),
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(ClientCommand::ListReviews { .. }))),
+        "the replay's answer chains the review request: {effects:?}"
+    );
+}
+
+/// A session that had no transcript to replay still asks for its review rows
+/// immediately. Reviews are not turns and do not depend on the turn log.
+#[test]
+fn an_empty_conversation_still_asks_for_its_review_rows() {
+    let mut s = state();
+    let effects = open(&mut s, Vec::new());
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(ClientCommand::ListReviews { .. }))),
+        "{effects:?}"
+    );
+    assert!(history_query(&effects).is_none());
+}
+
+/// Loading the same session history twice must not grow a second card.
+#[test]
+fn replaying_the_same_history_twice_keeps_one_review_card() {
+    let mut s = state();
+    let effects = open(
+        &mut s,
+        vec![
+            message(UiRole::User, "先看账单"),
+            message(UiRole::Assistant, "看完了"),
+        ],
+    );
+    let entries = || {
+        vec![
+            entry(
+                0,
+                true,
+                RuntimeEvent::UserMessageAdded {
+                    message: message(UiRole::User, "先看账单"),
+                },
+            ),
+            entry(1000, false, RuntimeEvent::TurnAnswered),
+            entry(
+                5000,
+                false,
+                RuntimeEvent::ReviewStarted {
+                    review: review_summary(
+                        "review-1",
+                        leveler_client_protocol::UiReviewStatus::Completed,
+                    ),
+                },
+            ),
+        ]
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries: entries(),
+            omitted_turns: 0,
+        }),
+    );
+    let query = leveler_client_protocol::CommandId::new("again");
+    s.history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: Some(query),
+            session_id: SessionId::new("s1"),
+            entries: entries(),
+            omitted_turns: 0,
+        }),
+    );
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Review(_)))
+            .count(),
+        1
+    );
+}

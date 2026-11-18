@@ -483,6 +483,18 @@ pub struct AppState {
     pub review_history_query: Option<CommandId>,
     /// Last-painted review card hit regions: (row, x_start, x_end, review id).
     pub review_hits: Vec<(u16, u16, u16, String)>,
+    /// The focus text a `/review` carried when the runtime asked which object
+    /// to review. It is restored onto the next `/review` so choosing a scope
+    /// does not discard what the person wrote.
+    pub review_scope_focus: Option<String>,
+    /// A manual review is running in this session (no turn owns it).
+    pub live_review: bool,
+    /// The message of the notice a REJECTED COMMAND produced, when that notice
+    /// is still the one on screen. A rejection is about one invocation: the
+    /// next command, the turn it starts, or a successful start retires it. The
+    /// durable record of the same failure lives in the transcript, so nothing
+    /// is lost by letting the row go.
+    pub command_notice: Option<String>,
     /// `/find` — transcript search and turn navigation. A view over the
     /// transcript this client already holds; it owns no history of its own.
     pub find: crate::find::FindState,
@@ -962,6 +974,9 @@ impl AppState {
             reconnecting: None,
             reconnected_until: None,
             notification: None,
+            review_scope_focus: None,
+            command_notice: None,
+            live_review: false,
             update: None,
             restart_requested: false,
             available_models: Vec::new(),
@@ -1122,6 +1137,16 @@ impl AppState {
 
     pub fn is_busy(&self) -> bool {
         self.status == RuntimeStatus::Busy
+    }
+
+    /// Something is executing in this session, even though no turn is.
+    ///
+    /// A manual review is a session-level child: the conversation stays
+    /// usable, but an elapsed clock that froze at 0s would report a review
+    /// every bit as long as it is not. This is the clock's question, not the
+    /// input's — `is_busy()` still decides whether Enter sends or queues.
+    pub fn is_executing(&self) -> bool {
+        self.is_busy() || self.live_review
     }
 
     /// The one live user shell execution, if any. The runtime admits at most

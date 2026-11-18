@@ -154,7 +154,12 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 state.overlay = Some(Overlay::ReviewScopePicker(sel));
                 Vec::new()
             }
-            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Cancel => {
+                // The question is gone, so the words it carried are no longer
+                // pending anything.
+                state.review_scope_focus = None;
+                Vec::new()
+            }
             SelectionOutcome::Confirm(key) => apply_review_scope_choice(state, &key),
         },
         Overlay::CollabPicker(mut sel) => match sel.on_key(effective) {
@@ -726,9 +731,12 @@ fn apply_review_scope_choice(state: &mut AppState, key: &str) -> Vec<Effect> {
 }
 
 fn start_review(state: &mut AppState, scope: UiReviewScope) -> Vec<Effect> {
+    // A focus typed before the runtime asked for a scope is part of the same
+    // request: choosing the OBJECT must not drop it.
+    let focus = state.review_scope_focus.take().unwrap_or_default();
     vec![Effect::Send(ClientCommand::RunReview {
         session_id: state.session_id.clone(),
-        focus: String::new(),
+        focus,
         scope,
         model: None,
     })]

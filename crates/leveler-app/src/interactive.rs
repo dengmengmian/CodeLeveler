@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-mod review;
+pub(crate) mod review;
 mod review_memory;
 mod review_prefetch;
 mod session_history;
@@ -701,6 +701,10 @@ pub struct InProcessRuntimeClient {
 }
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
+
+/// Manual reviews that are running right now, by session and review id.
+pub(crate) type LiveReviews =
+    Arc<Mutex<HashMap<SessionId, HashMap<String, crate::review_live::LiveReview>>>>;
 
 /// Per-session ownership of optional model chrome. A recap and a next-step
 /// suggestion are different calls and keep their own slots. A real user turn
@@ -8209,10 +8213,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     // The child observes its token, stops, and settles as
                     // cancelled through the ordinary settlement path.
                     Some(token) => token.cancel(),
-                    None => self.notify_error(
-                        &session_id,
-                        format!("子 Agent {child_id} 已结束或不存在,无需停止"),
-                    ),
+                    // A manual review is a session-level child, not a child of
+                    // the current turn. Stopping it by the id the UI shows must
+                    // work through the same command, or the one execution
+                    // identity would have two cancellation rules.
+                    None => match take_cancel(&self.review_cancels, &session_id, &child_id) {
+                        Some(token) => token.cancel(),
+                        None => self.notify_error(
+                            &session_id,
+                            format!("子 Agent {child_id} 已结束或不存在,无需停止"),
+                        ),
+                    },
                 }
                 Ok(())
             }
@@ -11125,6 +11136,19 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>, input_id: Option<&str>) ->
     if message.is_protocol_repair() {
         return None;
     }
+    // Review notices are harness context. The durable review row is the
+    // client's projection of them (reviewer card, status, report), so a
+    // reopened conversation must not grow a second, prose-shaped copy. The
+    // live path does not emit these rows either.
+    if matches!(
+        message.origin.as_ref(),
+        Some(TranscriptOrigin::RuntimeNotice {
+            notice: leveler_model::RuntimeNoticeKind::ReviewStarted
+                | leveler_model::RuntimeNoticeKind::ReviewSettled,
+        })
+    ) {
+        return None;
+    }
     let role = match message.role {
         Role::User => UiRole::User,
         Role::Assistant => UiRole::Assistant,
@@ -11303,6 +11327,35 @@ mod runtime_notice_tests {
             ui_message(&other_repair).is_none(),
             "every protocol repair is harness control, not a user turn"
         );
+    }
+
+    /// The review notices are harness context the model reads. A client draws
+    /// the review row instead, so these must not become extra user bubbles.
+    /// The `/review` command the person typed is a real user message.
+    #[test]
+    fn review_notices_are_not_snapshot_user_rows() {
+        for notice in [
+            leveler_model::RuntimeNoticeKind::ReviewStarted,
+            leveler_model::RuntimeNoticeKind::ReviewSettled,
+        ] {
+            let raw = serde_json::to_string(&leveler_model::Message::user(
+                "## Review settled\n\n- review_id: review-1",
+                TranscriptOrigin::RuntimeNotice { notice },
+            ))
+            .unwrap();
+            assert!(
+                ui_message(&raw).is_none(),
+                "the durable review row is the client's projection: {notice:?}"
+            );
+        }
+
+        let command = serde_json::to_string(&leveler_model::Message::user_input(
+            "/review @workspace 检查这次交付",
+        ))
+        .unwrap();
+        let shown = ui_message(&command).expect("the command is the user's own row");
+        assert_eq!(shown.role, UiRole::User);
+        assert!(shown.text.starts_with("/review @workspace"));
     }
 }
 

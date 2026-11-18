@@ -4,7 +4,7 @@ use image::{DynamicImage, ImageFormat};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::{StatefulProtocol, StatefulProtocolType};
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use crate::input_guard::DeviceReplyFilter;
 use crate::input_guard::StartupInput;
 

@@ -3452,6 +3452,21 @@
       "description": "What the review is about. The runtime resolves this into concrete files, a diff and an object identity before the reviewer starts.",
       "oneOf": [
         {
+          "description": "The runtime picks the object a bare `/review` should mean: uncommitted workspace changes when there are any, otherwise the commits this branch has over its recorded upstream. When neither exists the runtime asks the client to choose instead of guessing.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "auto"
+              ]
+            }
+          }
+        },
+        {
           "description": "The current task's delivery in this session: its user objective, the files its latest settled delivery touched, and its final claim.",
           "type": "object",
           "required": [

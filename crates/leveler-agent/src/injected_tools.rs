@@ -1098,6 +1098,13 @@ pub(crate) fn report_review_tool_definition() -> ToolDefinition {
             revision. If new investigation evidence arrives after your submission, \
             adjudicate it and submit a revised complete report; otherwise the runtime \
             will mark the earlier report as not covering the latest evidence.\n\n\
+            `formal_findings` is the exact set of durable formal finding ids this report \
+            presents: your own `report_finding` records and the candidates you explicitly \
+            adopted with `adjudicate_finding`. List their real ids (for example `f-4`), \
+            never a re-numbered sequence; a missing or extra id is refused. Candidate, \
+            rejected and duplicate ids are NOT formal findings and may not be cited in \
+            `formal_findings` or in the report body; the runtime renders those records \
+            from structured data.\n\n\
             `conclusion` is your verdict: issues_found, no_issues_found or \
             inconclusive. It is independent of the execution status: a completed \
             review may be inconclusive, and a review with no findings is not \
@@ -1117,7 +1124,16 @@ pub(crate) fn report_review_tool_definition() -> ToolDefinition {
                     "type": "string",
                     "description": "The complete formal report body, in Markdown. It must \
                         stand alone: scope, what was found and why it matters, coverage, \
-                        limitations and conclusion."
+                        limitations and conclusion. Cite formal finding ids only; ids of \
+                        candidates, duplicates or rejected findings are not identities."
+                },
+                "formal_findings": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The durable ids of this report's formal findings, \
+                        exactly as recorded by `report_finding` / `adjudicate_finding` \
+                        (empty when there are none). The runtime refuses a set that does \
+                        not match the review's formal records."
                 },
                 "conclusion": {
                     "type": "string",
@@ -1171,7 +1187,7 @@ pub(crate) fn report_review_tool_definition() -> ToolDefinition {
                     }
                 }
             },
-            "required": ["report", "conclusion"]
+            "required": ["report", "formal_findings", "conclusion"]
         }),
     }
 }

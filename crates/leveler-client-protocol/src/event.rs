@@ -903,8 +903,16 @@ pub enum RuntimeEvent {
         investigations: Vec<crate::UiReviewInvestigation>,
     },
     /// A manual review settled. `Completed` means the reviewer reached a clean
-    /// end — not that no defects exist.
-    ReviewFinished { review: crate::UiReviewSummary },
+    /// end — not that no defects exist. `report` is projected from the durable
+    /// review row after its terminal was written, so a client can render the
+    /// formal report in the conversation without a second query. It is `None`
+    /// when the terminal could not be persisted (there is no authoritative
+    /// report to show).
+    ReviewFinished {
+        review: crate::UiReviewSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<Box<crate::UiReviewReport>>,
+    },
     /// Result of [`crate::ClientCommand::QueryReviewReport`]. The report is the
     /// durable row, not a reconstruction from the live event stream.
     ReviewReportLoaded {
@@ -913,11 +921,30 @@ pub enum RuntimeEvent {
         report: Box<crate::UiReviewReport>,
     },
     /// Result of [`crate::ClientCommand::ListReviews`], newest first.
+    ///
+    /// `reports` carries the newest settled reports, projected from the same
+    /// durable rows as `reviews`. A reopened conversation renders those inline
+    /// instead of asking the user to open each card. Older reports stay
+    /// available through [`crate::ClientCommand::QueryReviewReport`]; a review
+    /// with no report here is still a normal, openable card.
     ReviewHistoryLoaded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<leveler_core::CommandId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reviews: Vec<crate::UiReviewSummary>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reports: Vec<crate::UiReviewReport>,
+    },
+    /// A bare `/review` reached the runtime, but nothing in this workspace is
+    /// unambiguously reviewable: no uncommitted change and no upstream this
+    /// branch is ahead of. Nothing was started. The client asks the person to
+    /// choose an object; `focus` carries the words they typed so a choice can
+    /// re-issue the same request without retyping.
+    ReviewScopeRequired {
+        /// The session the request came from. A choice is only valid for it.
+        session_id: leveler_core::SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        focus: String,
     },
     /// A transient notification for the status line.
     Notification {
@@ -2079,6 +2106,7 @@ mod tests {
         roundtrip(
             RuntimeEvent::ReviewFinished {
                 review: summary.clone(),
+                report: None,
             },
             "review_finished",
         );
@@ -2114,6 +2142,7 @@ mod tests {
             RuntimeEvent::ReviewHistoryLoaded {
                 query_id: None,
                 reviews: Vec::new(),
+                reports: Vec::new(),
             },
             "review_history_loaded",
         );

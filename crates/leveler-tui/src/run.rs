@@ -529,7 +529,7 @@ pub async fn run(
         // Busy spinner + elapsed clock.
         state.tick = state.tick.wrapping_add(1);
         state.motion_clock = motion_origin.elapsed();
-        if state.is_busy() {
+        if state.is_executing() {
             let start = *state.turn_started_at.get_or_insert_with(Instant::now);
             state.elapsed_secs = start.elapsed().as_secs();
         } else {

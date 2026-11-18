@@ -93,13 +93,14 @@ fn finding_response() -> MockResponse {
     ])
 }
 
-fn review_verdict_response() -> MockResponse {
+fn review_verdict_response(formal_findings: &[&str]) -> MockResponse {
     sse(&[
         tool_call_frame(
             "call_verdict",
             "report_review",
             serde_json::json!({
                 "report": "审查完成：发现一个越权读取问题——账单读取缺少 owner 过滤，另一个租户可能读到账单。",
+                "formal_findings": formal_findings,
                 "conclusion": "issues_found",
                 "coverage": [{
                     "dimension": "security",
@@ -122,13 +123,14 @@ fn final_response(text: &str) -> MockResponse {
     sse(&[text_frame(text), finish_frame("stop")])
 }
 
-fn report_response(report: &str) -> MockResponse {
+fn report_response(report: &str, formal_findings: &[&str]) -> MockResponse {
     sse(&[
         tool_call_frame(
             "call_verdict",
             "report_review",
             serde_json::json!({
                 "report": report,
+                "formal_findings": formal_findings,
                 "conclusion": "issues_found",
                 "coverage": [{
                     "dimension": "security",
@@ -326,7 +328,7 @@ async fn next_review_finished(
                 );
             }
         };
-        if let RuntimeEvent::ReviewFinished { review } = event {
+        if let RuntimeEvent::ReviewFinished { review, .. } = event {
             return review;
         }
     }
@@ -336,7 +338,7 @@ async fn next_review_finished(
 async fn a_manual_review_runs_persists_and_does_not_open_a_turn() {
     let (_tmp, server, app, client, session) = harness(vec![
         finding_response(),
-        review_verdict_response(),
+        review_verdict_response(&["f-1"]),
         final_response("审查完成：发现一个越权读取问题。"),
     ])
     .await;
@@ -580,7 +582,7 @@ async fn cancelling_a_review_settles_it_as_cancelled_without_a_turn() {
             .await
             .expect("cancelled review must settle")
             .expect("event stream");
-        if let RuntimeEvent::ReviewFinished { review } = event
+        if let RuntimeEvent::ReviewFinished { review, .. } = event
             && review.id == review_id
         {
             terminal_statuses.push(review.status);
@@ -695,7 +697,9 @@ async fn a_reviewer_reads_the_reviewed_session_through_the_bound_tool() {
         "the summary must name the reviewed session: {second}"
     );
 
-    // Reading is read-only: the session's narrative rows are unchanged.
+    // Reading is read-only: no turn, no assistant row, no rewritten history.
+    // What the review does add is the conversation's own record — the user's
+    // command and the two runtime notices the next parent turn reads.
     assert_eq!(
         leveler_storage::TurnRepository::new(&db)
             .list(&session)
@@ -703,12 +707,38 @@ async fn a_reviewer_reads_the_reviewed_session_through_the_bound_tool() {
             .unwrap(),
         before_turns
     );
+    let after_messages = leveler_storage::MessageRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
     assert_eq!(
-        leveler_storage::MessageRepository::new(&db)
-            .load(&session)
-            .await
-            .unwrap(),
-        before_messages
+        &after_messages[..before_messages.len()],
+        &before_messages[..]
+    );
+    let origins: Vec<_> = after_messages[before_messages.len()..]
+        .iter()
+        .map(|raw| serde_json::from_str::<leveler_model::Message>(raw).unwrap())
+        .map(|message| message.origin)
+        .collect();
+    assert_eq!(
+        origins,
+        vec![
+            Some(leveler_model::TranscriptOrigin::UserInput),
+            Some(leveler_model::TranscriptOrigin::RuntimeNotice {
+                notice: leveler_model::RuntimeNoticeKind::ReviewStarted,
+            }),
+            Some(leveler_model::TranscriptOrigin::RuntimeNotice {
+                notice: leveler_model::RuntimeNoticeKind::ReviewSettled,
+            }),
+        ]
+    );
+    assert!(
+        after_messages[before_messages.len() + 1].contains(&finished.id),
+        "both notices name the durable review id"
+    );
+    assert!(
+        after_messages[before_messages.len() + 2].contains(&finished.id),
+        "both notices name the durable review id"
     );
 }
 
@@ -1386,7 +1416,7 @@ async fn a_reviewer_autonomously_investigates_and_synthesizes_structured_evidenc
         investigation_response(),
         investigator_finding_response(),
         final_response("调查完成：读取路径缺少 owner 条件。"),
-        review_verdict_response(),
+        review_verdict_response(&[]),
         final_response("审查完成：发现一个跨租户读取风险。"),
     ];
     let (tmp, server, app, client, session) = harness(responses).await;
@@ -1633,7 +1663,7 @@ async fn a_review_spawn_cannot_request_a_writer() {
             ),
             finish_frame("tool_calls"),
         ]),
-        review_verdict_response(),
+        review_verdict_response(&[]),
         final_response("审查完成。"),
     ];
     let (_tmp, server, _app, client, session) = harness(responses).await;
@@ -1695,7 +1725,7 @@ async fn two_review_investigations_run_concurrently_and_both_return() {
         investigator_finding_response(),
         final_response("调查 A 完成。"),
         final_response("调查 B 完成。"),
-        review_verdict_response(),
+        review_verdict_response(&[]),
         final_response("审查完成。"),
     ];
     let (_tmp, server, _app, client, session) = harness(responses).await;
@@ -1736,7 +1766,7 @@ async fn an_investigation_with_facts_and_no_finding_is_still_a_result() {
         spawn_investigation_response(),
         investigation_response(),
         final_response("调查完成，没有形成候选缺陷。"),
-        review_verdict_response(),
+        review_verdict_response(&[]),
         final_response("审查完成：调查提供了事实，但没有确认缺陷。"),
     ];
     let (_tmp, server, _app, client, session) = harness(responses).await;
@@ -1849,7 +1879,7 @@ async fn an_investigator_candidate_is_never_a_formal_finding_until_the_lead_deci
         spawn_investigation_response(),
         investigator_finding_response(),
         final_response("调查完成。"),
-        report_response("正式报告：调查者提出一条候选，Lead 尚未裁决。"),
+        report_response("正式报告：调查者提出一条候选，Lead 尚未裁决。", &[]),
         final_response("补充说明：候选仍未裁决。"),
     ];
     let (_tmp, server, app, client, session) = harness(responses).await;
@@ -1899,7 +1929,10 @@ async fn the_lead_can_adopt_a_candidate_as_a_formal_finding() {
                 "confidence": "high"
             }),
         ),
-        report_response("正式报告：采纳调查者的越权读取候选，严重程度上调为 P0。"),
+        report_response(
+            "正式报告：采纳调查者的越权读取候选，严重程度上调为 P0。",
+            &["f-1"],
+        ),
         final_response("审查完成。"),
     ];
     let (_tmp, server, app, client, session) = harness(responses).await;
@@ -1950,7 +1983,7 @@ async fn the_lead_can_reject_a_candidate_and_it_does_not_count() {
                 "evidence_refs": ["src/billing.rs:1"]
             }),
         ),
-        report_response("正式报告：调查者的越权读取主张经复核不成立。"),
+        report_response("正式报告：调查者的越权读取主张经复核不成立。", &[]),
         final_response("审查完成。"),
     ];
     let (_tmp, server, app, client, session) = harness(responses).await;
@@ -2000,7 +2033,7 @@ async fn the_lead_can_merge_a_duplicate_root_cause() {
             "duplicate",
             serde_json::json!({"duplicate_of": "f-1"}),
         ),
-        report_response("正式报告：两路调查指向同一根因，合并为一条。"),
+        report_response("正式报告：两路调查指向同一根因，合并为一条。", &["f-1"]),
         final_response("审查完成。"),
     ];
     let (_tmp, server, app, client, session) = harness(responses).await;
@@ -2037,7 +2070,7 @@ async fn the_lead_can_merge_a_duplicate_root_cause() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_later_chat_message_does_not_overwrite_the_submitted_report() {
     let responses = vec![
-        report_response("完整正式报告：范围、发现、覆盖与限制。"),
+        report_response("完整正式报告：范围、发现、覆盖与限制。", &[]),
         final_response("补充说明：定稿后又想到一句话。"),
     ];
     let (_tmp, _server, app, client, session) = harness(responses).await;
@@ -2070,7 +2103,7 @@ async fn a_later_chat_message_does_not_overwrite_the_submitted_report() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_evidence_marks_the_submitted_report_stale() {
     let responses = vec![
-        report_response("初版正式报告：提交时还没有调查结果。"),
+        report_response("初版正式报告：提交时还没有调查结果。", &[]),
         spawn_investigation_response(),
         investigator_finding_response(),
         final_response("调查完成。"),
@@ -2125,7 +2158,7 @@ async fn late_evidence_marks_the_submitted_report_stale() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revised_report_is_bound_to_the_evidence_it_saw() {
     let responses = vec![
-        report_response("初版报告。"),
+        report_response("初版报告。", &[]),
         spawn_investigation_response(),
         investigator_finding_response(),
         final_response("调查完成。"),
@@ -2134,7 +2167,7 @@ async fn a_revised_report_is_bound_to_the_evidence_it_saw() {
             "adopted",
             serde_json::json!({"reason": "已复核", "severity": "p1"}),
         ),
-        report_response("修订报告：已综合调查者证据并采纳候选。"),
+        report_response("修订报告：已综合调查者证据并采纳候选。", &["f-1"]),
         final_response("审查完成。"),
     ];
     let (_tmp, _server, app, client, session) = harness(responses).await;
@@ -2245,4 +2278,960 @@ async fn the_review_token_cap_is_shared_by_the_lead_and_its_investigations() {
         stored.report_source, "none",
         "the row says no formal report was submitted"
     );
+}
+
+/// The terminal event carries the report projected from the durable row. A
+/// client renders that projection; it never asks the parent agent to restate
+/// the report in its own words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_finished_delivers_the_durable_report_projection() {
+    let responses = vec![
+        report_response("完整正式报告：范围、发现、覆盖与限制。", &[]),
+        final_response("补充说明：定稿后又想到一句话。"),
+    ];
+    let (_tmp, _server, app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let mut finished = None;
+    let mut command = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while finished.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("review must settle")
+            .expect("event stream");
+        match event {
+            RuntimeEvent::UserMessageAdded { message } => {
+                command = Some(message.text);
+            }
+            RuntimeEvent::ReviewFinished { review, report } => {
+                finished = Some((review, report));
+            }
+            _ => {}
+        }
+    }
+    let (review, report) = finished.unwrap();
+    assert_eq!(review.status, UiReviewStatus::Completed);
+    assert!(
+        command
+            .as_deref()
+            .is_some_and(|text| text.starts_with("/review @workspace ")),
+        "the user's command is part of the conversation: {command:?}"
+    );
+
+    let report = report.expect("a persisted settled review carries its report");
+    assert_eq!(report.summary.id, review.id);
+    assert_eq!(report.summary.report_revision, review.report_revision);
+    assert_eq!(report.report, "完整正式报告：范围、发现、覆盖与限制。");
+
+    let db = app.open_database().await.unwrap();
+    let stored = ReviewRepository::new(&db)
+        .get(&review.id)
+        .await
+        .unwrap()
+        .expect("review row");
+    assert_eq!(
+        report.report, stored.report,
+        "the inline report is the durable row, not the live run"
+    );
+    assert_eq!(report.summary.focus, stored.focus);
+}
+
+/// A review that settles while the user keeps chatting leaves the structured
+/// result in the conversation. The next ordinary turn's request carries it
+/// without the user repeating anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_next_parent_turn_sees_the_settled_review_notice() {
+    let responses = vec![
+        final_response("审查完成：没有正式 Finding。"),
+        final_response("已经收到审查结果。"),
+    ];
+    let (_tmp, server, _app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "审完了吗？".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while server.request_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ordinary turn must reach the provider: {:?}",
+            server.request_bodies().await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let bodies = server.request_bodies().await;
+    let parent = &bodies[1];
+    assert!(
+        parent.contains("## Review settled"),
+        "the parent turn receives the structured result: {parent}"
+    );
+    assert!(
+        parent.contains(&finished.id),
+        "the notice names the durable review id: {parent}"
+    );
+    assert!(
+        parent.contains("report_source: none"),
+        "the notice states that no formal report was submitted: {parent}"
+    );
+    assert!(
+        parent.contains("## Review started"),
+        "the running state was part of the same conversation: {parent}"
+    );
+}
+
+/// A reviewer that cannot reach its model still reaches a durable terminal:
+/// Failed, with the runtime's reason and no report. The card never claims a
+/// result it did not get.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_review_that_cannot_reach_the_model_settles_failed_without_a_report() {
+    let body = serde_json::json!({
+        "error": {"message": "invalid request", "type": "invalid_request_error"}
+    })
+    .to_string();
+    let (_tmp, _server, app, client, session) =
+        harness(vec![MockResponse::Status { code: 400, body }]).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = loop {
+        let event = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("the failed review must still settle")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewFinished { review, report } = event {
+            assert!(report.is_none(), "a failed review has no report to render");
+            break review;
+        }
+    };
+    assert_eq!(finished.status, UiReviewStatus::Failed);
+    assert!(
+        finished
+            .failure
+            .as_deref()
+            .is_some_and(|failure| !failure.trim().is_empty()),
+        "the failure reason is kept: {finished:?}"
+    );
+    assert_eq!(finished.counts.total(), 0);
+
+    let db = app.open_database().await.unwrap();
+    let stored = ReviewRepository::new(&db)
+        .get(&finished.id)
+        .await
+        .unwrap()
+        .expect("the failed review is durable");
+    assert_eq!(stored.status, "failed");
+    assert!(stored.report.is_empty());
+    assert_eq!(stored.report_source, "none");
+}
+
+/// The settled notice is the parent conversation's copy of the formal
+/// result. A parent that is asked "what did it find?" must be able to answer
+/// from the durable evidence — not just the count and the title.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settled_notice_carries_the_formal_finding_evidence() {
+    let responses = vec![
+        finding_response(),
+        review_verdict_response(&["f-1"]),
+        final_response("审查完成：发现一个越权读取问题。"),
+        final_response("我已经看过正式报告。"),
+    ];
+    let (_tmp, server, _app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取的授权边界".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.counts.p1, 1);
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "这个报告能简单说下吗？".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let parent = loop {
+        let bodies = server.request_bodies().await;
+        if let Some(body) = bodies
+            .iter()
+            .find(|body| body.contains("这个报告能简单说下吗？"))
+        {
+            break body.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ordinary turn must reach the provider: {bodies:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    for expected in [
+        "## Review settled",
+        "src/billing.rs:42",
+        "另一个租户可以读到账单",
+        "查询条件加入 owner/tenant",
+        "审查完成：发现一个越权读取问题",
+    ] {
+        assert!(
+            parent.contains(expected),
+            "the settled notice must carry `{expected}`: {parent}"
+        );
+    }
+}
+
+/// A running review is a sibling of the conversation, not a lock on it. An
+/// ordinary turn dispatches and answers while the reviewer is still working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_turn_runs_while_a_review_is_still_running() {
+    let slow_review = MockResponse::SilentThenJson {
+        silent_ms: 2500,
+        body: serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "审查结束，没有发现问题"}, "finish_reason": "stop"}]
+        })
+        .to_string(),
+    };
+    let (_tmp, server, _app, client, session) =
+        harness(vec![slow_review, final_response("父 Agent 正常回答。")]).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    // Wait until the reviewer's own request is being held by the mock.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.request_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the review must reach the provider first"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "先回答我这个问题".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while server.request_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ordinary turn must not wait for the review to settle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let bodies = server.request_bodies().await;
+    assert!(
+        bodies[1].contains("先回答我这个问题"),
+        "the second request is the parent turn: {}",
+        bodies[1]
+    );
+
+    // The review still settles on its own schedule.
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.status, UiReviewStatus::Completed);
+}
+
+/// A report that presents an unresolved candidate as a formal finding is
+/// refused at the tool boundary, and the refusal does not count as a report
+/// revision. The reviewer can then submit a corrected report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_that_presents_a_candidate_as_formal_is_refused_then_corrected() {
+    let refused_body = "## 正式发现\n\n### f-1（p1）候选被当成正式发现\n";
+    let corrected_body = "正式报告：调查者提出一条候选，Lead 尚未裁决，因此没有正式 Finding。";
+    let responses = vec![
+        spawn_investigation_response(),
+        investigator_finding_response(),
+        final_response("调查完成。"),
+        report_response(refused_body, &["f-1"]),
+        report_response(corrected_body, &[]),
+        final_response("审查完成。"),
+    ];
+    let (_tmp, server, app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取的授权边界".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.status, UiReviewStatus::Completed);
+    assert_eq!(finished.counts.total(), 0);
+    assert_eq!(finished.counts.pending_candidates, 1);
+    assert_eq!(
+        finished.report_revision, 1,
+        "the refused submission is not a report revision"
+    );
+
+    let db = app.open_database().await.unwrap();
+    let stored = ReviewRepository::new(&db)
+        .get(&finished.id)
+        .await
+        .unwrap()
+        .expect("review row");
+    assert_eq!(stored.report, corrected_body);
+    assert_eq!(stored.report_source, "submitted");
+
+    let bodies = server.request_bodies().await;
+    let refusal = bodies
+        .iter()
+        .find(|body| body.contains("not a formal finding"))
+        .expect("the refusal reaches the reviewer");
+    assert!(
+        refusal.contains("f-1"),
+        "the refusal names the offending id: {refusal}"
+    );
+    assert!(
+        refusal.contains("This review has no formal findings."),
+        "the refusal names the authoritative formal set: {refusal}"
+    );
+}
+
+/// The settled notice gives the parent one authoritative identity list: the
+/// durable formal ids, with duplicate candidates explicitly linked to their
+/// surviving finding. The reviewer's prose is labelled as narrative.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settled_notice_names_gapped_formal_ids_and_duplicate_links() {
+    let responses = vec![
+        spawn_investigation_response(),
+        investigator_finding_response(),
+        final_response("第一路调查完成。"),
+        spawn_investigation_response(),
+        investigator_finding_response(),
+        final_response("第二路调查完成。"),
+        adjudicate_response("f-1", "adopted", serde_json::json!({})),
+        adjudicate_response(
+            "f-2",
+            "duplicate",
+            serde_json::json!({"duplicate_of": "f-1"}),
+        ),
+        report_response("正式报告：一条正式发现。", &["f-1"]),
+        final_response("审查完成。"),
+    ];
+    let (_tmp, server, app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取的授权边界".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.counts.total(), 1);
+    assert_eq!(finished.counts.pending_candidates, 0);
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "正式发现有哪些？".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let parent = loop {
+        let bodies = server.request_bodies().await;
+        if let Some(body) = bodies.iter().find(|body| body.contains("正式发现有哪些？")) {
+            break body.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ordinary turn must reach the provider: {bodies:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(parent.contains("- formal_finding_ids: f-1"), "{parent}");
+    assert!(
+        parent.contains("only the ids above are formal findings"),
+        "{parent}"
+    );
+    assert!(
+        parent.contains("never map a missing or non-formal id onto another finding"),
+        "{parent}"
+    );
+    assert!(parent.contains("- [duplicate] f-2"), "{parent}");
+    assert!(parent.contains("duplicate_of: f-1"), "{parent}");
+    assert!(parent.contains("not a finding index"), "{parent}");
+    assert!(
+        app.open_database().await.is_ok(),
+        "the durable store stays usable"
+    );
+}
+
+fn legacy_review_row<'a>(
+    review_id: &'a str,
+    session: &'a leveler_core::SessionId,
+) -> leveler_storage::NewReview<'a> {
+    leveler_storage::NewReview {
+        id: review_id,
+        session_id: session,
+        focus: "历史审查",
+        scope_json: r#"{"kind":"workspace"}"#,
+        model: "mock/m",
+        status: "running",
+        source_session_id: Some(session.as_str()),
+        source_turn_id: None,
+        created_at: leveler_core::now(),
+    }
+}
+
+/// A durable row written before this contract keeps its original body and its
+/// structured ids. The report is never rewritten to "fix" a historical
+/// conflict; the structured findings remain the authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_historical_report_keeps_its_body_and_structured_ids() {
+    use leveler_storage::ReviewFinish;
+
+    let (_tmp, _server, app, client, session) = harness(Vec::new()).await;
+    let db = app.open_database().await.unwrap();
+    let repo = ReviewRepository::new(&db);
+    let findings_json = r#"[
+        {"id":"f-1","kind":"correctness","summary":"missing owner filter",
+         "title":"owner filter missing","severity":"p1","disposition":"adopted"},
+        {"id":"f-3","kind":"correctness","summary":"same root cause",
+         "title":"duplicate candidate","severity":"p1","disposition":"duplicate",
+         "duplicate_of":"f-1"}
+    ]"#;
+    let body = "# 旧报告\n\n### f-3（p1，旧编号）历史正文里的冲突编号。\n";
+    repo.create(&legacy_review_row("review-legacy", &session))
+        .await
+        .unwrap();
+    repo.finish(
+        "review-legacy",
+        &ReviewFinish {
+            status: "completed",
+            object_json: Some(r#"{"workspace":"/repo","dirty":false,"files":[]}"#),
+            findings_json,
+            report: body,
+            report_source: "submitted",
+            final_message: "",
+            evidence_revision: 0,
+            report_revision: 1,
+            report_evidence_revision: 0,
+            error: None,
+            stop_detail: None,
+            usage_json: "{}",
+            verdict_json: Some(r#"{"conclusion":"issues_found"}"#),
+            activity_json: "[]",
+            object_changed: false,
+            modified_source: false,
+            investigations_json: "[]",
+            finished_at: leveler_core::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut rx = client.subscribe();
+    let query = CommandId::new("legacy-report");
+    client
+        .send(ClientCommand::QueryReviewReport {
+            session_id: session.clone(),
+            review_id: "review-legacy".into(),
+            query_id: Some(query.clone()),
+        })
+        .await
+        .unwrap();
+    let report = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("report must answer")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewReportLoaded {
+            query_id, report, ..
+        } = event
+            && query_id.as_ref() == Some(&query)
+        {
+            break report;
+        }
+    };
+    assert_eq!(report.report, body, "the historical body stays verbatim");
+    let ids: Vec<&str> = report
+        .findings
+        .iter()
+        .map(|finding| finding.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["f-1", "f-3"]);
+    assert_eq!(report.findings[1].duplicate_of.as_deref(), Some("f-1"));
+    assert_eq!(report.summary.counts.total(), 1);
+
+    // A second read (a resume opens the same durable row) returns the same
+    // identities and the same body.
+    let query = CommandId::new("legacy-report-again");
+    client
+        .send(ClientCommand::QueryReviewReport {
+            session_id: session.clone(),
+            review_id: "review-legacy".into(),
+            query_id: Some(query.clone()),
+        })
+        .await
+        .unwrap();
+    let again = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("report must answer")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewReportLoaded {
+            query_id, report, ..
+        } = event
+            && query_id.as_ref() == Some(&query)
+        {
+            break report;
+        }
+    };
+    assert_eq!(again.report, report.report);
+    assert_eq!(again.findings, report.findings);
+}
+
+/// `f-1` in two reviews is two different findings. Each read is scoped by the
+/// durable review id, never by the bare finding id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_finding_id_in_two_reviews_stays_scoped() {
+    use leveler_storage::ReviewFinish;
+
+    let (_tmp, _server, app, client, session) = harness(Vec::new()).await;
+    let db = app.open_database().await.unwrap();
+    let repo = ReviewRepository::new(&db);
+    for (review_id, title, body) in [
+        ("review-a", "review A finding", "报告 A：f-1"),
+        ("review-b", "review B finding", "报告 B：f-1"),
+    ] {
+        let findings_json = format!(
+            r#"[{{"id":"f-1","kind":"correctness","summary":"s","title":"{title}","severity":"p1","disposition":"adopted"}}]"#
+        );
+        repo.create(&legacy_review_row(review_id, &session))
+            .await
+            .unwrap();
+        repo.finish(
+            review_id,
+            &ReviewFinish {
+                status: "completed",
+                object_json: Some(r#"{"workspace":"/repo","dirty":false,"files":[]}"#),
+                findings_json: &findings_json,
+                report: body,
+                report_source: "submitted",
+                final_message: "",
+                evidence_revision: 0,
+                report_revision: 1,
+                report_evidence_revision: 0,
+                error: None,
+                stop_detail: None,
+                usage_json: "{}",
+                verdict_json: Some(r#"{"conclusion":"issues_found"}"#),
+                activity_json: "[]",
+                object_changed: false,
+                modified_source: false,
+                investigations_json: "[]",
+                finished_at: leveler_core::now(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut rx = client.subscribe();
+    for (review_id, expected) in [
+        ("review-a", "review A finding"),
+        ("review-b", "review B finding"),
+    ] {
+        let query = CommandId::new(format!("query-{review_id}"));
+        client
+            .send(ClientCommand::QueryReviewReport {
+                session_id: session.clone(),
+                review_id: review_id.into(),
+                query_id: Some(query.clone()),
+            })
+            .await
+            .unwrap();
+        let report = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("report must answer")
+                .expect("event stream");
+            if let RuntimeEvent::ReviewReportLoaded {
+                query_id, report, ..
+            } = event
+                && query_id.as_ref() == Some(&query)
+            {
+                break report;
+            }
+        };
+        assert_eq!(report.summary.id, review_id);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].id, "f-1");
+        assert_eq!(report.findings[0].title, expected);
+    }
+}
+
+/// A bare `/review` with uncommitted work reviews the workspace: the object
+/// the person is actually working on, resolved by the runtime from real Git
+/// state instead of from a task boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auto_review_resolves_the_working_tree() {
+    let (_tmp, server, app, client, session) = harness(vec![
+        finding_response(),
+        review_verdict_response(&["f-1"]),
+        final_response("审查完成：发现一个越权读取问题。"),
+    ])
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: String::new(),
+            scope: UiReviewScope::Auto,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.status, UiReviewStatus::Completed);
+    // The durable record names the object that was reviewed, never `auto`.
+    assert_eq!(finished.scope, UiReviewScope::Workspace);
+    let db = app.open_database().await.unwrap();
+    let stored = ReviewRepository::new(&db)
+        .get(&finished.id)
+        .await
+        .unwrap()
+        .expect("the review row is durable");
+    let scope_json = stored.scope_json;
+    assert!(scope_json.contains("workspace"), "{scope_json}");
+    assert!(!scope_json.contains("auto"), "{scope_json}");
+}
+
+/// A bare `/review` with nothing to review asks the person which object they
+/// meant. It is not a rejected command, it starts nothing, and it writes no
+/// review row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_auto_review_with_nothing_to_review_asks_for_a_scope() {
+    let (tmp, server, app, client, session) = harness(Vec::new()).await;
+    // The runtime's own state directory lives inside the worktree; it is not
+    // part of what a review may treat as a change.
+    std::fs::write(tmp.path().join(".gitignore"), "state/\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "clean"]);
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "只看并发".into(),
+            scope: UiReviewScope::Auto,
+            model: None,
+        })
+        .await
+        .expect("asking for a scope is not a command failure");
+
+    let asked = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the runtime must answer")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewScopeRequired { focus, .. } = event {
+            break focus;
+        }
+        assert!(
+            !matches!(
+                event,
+                RuntimeEvent::ReviewStarted { .. } | RuntimeEvent::ReviewFinished { .. }
+            ),
+            "nothing may start before the person chooses: {event:?}"
+        );
+    };
+    assert_eq!(asked, "只看并发");
+    let db = app.open_database().await.unwrap();
+    let rows = ReviewRepository::new(&db)
+        .list_for_session(&session)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(
+        server.request_heads().await.is_empty(),
+        "no model request may be made for a question"
+    );
+}
+
+/// The reviewer is a real child on the session's execution stream: the same
+/// `SubAgentUpdated` / `SubAgentActivity` events an ordinary `spawn_agent`
+/// child emits, attributed to the review's own id, ending in a terminal that
+/// says how the child actually stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reviewer_is_a_native_child_on_the_session_event_stream() {
+    let (_tmp, _server, _app, client, session) = harness(vec![
+        finding_response(),
+        review_verdict_response(&["f-1"]),
+        final_response("审查完成：发现一个越权读取问题。"),
+    ])
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取的授权边界".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let mut started = None;
+    let mut saw_activity = false;
+    let mut terminal = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while terminal.is_none() {
+        let event = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("the review must settle")
+            .expect("event stream");
+        match event {
+            RuntimeEvent::SubAgentUpdated {
+                id,
+                role,
+                done: false,
+                read_only,
+                background,
+                ..
+            } if role == "reviewer" => {
+                started = Some((id, read_only, background));
+            }
+            RuntimeEvent::SubAgentActivity { id, .. } => {
+                if started
+                    .as_ref()
+                    .is_some_and(|(review_id, _, _)| review_id == &id)
+                {
+                    saw_activity = true;
+                }
+            }
+            RuntimeEvent::SubAgentUpdated {
+                id,
+                role,
+                done: true,
+                ok,
+                outcome,
+                stop,
+                ..
+            } if role == "reviewer" => {
+                terminal = Some((id, ok, outcome, stop));
+            }
+            _ => {}
+        }
+    }
+    let (review_id, read_only, background) = started.expect("the reviewer announces itself");
+    assert!(read_only, "the reviewer is physically read-only");
+    assert_eq!(background, Some(true), "the review outlives the turn");
+    assert!(saw_activity, "the reviewer's tools are observable");
+    let (terminal_id, ok, outcome, stop) = terminal.expect("the reviewer terminates");
+    assert_eq!(terminal_id, review_id, "one execution identity");
+    assert!(ok, "a completed review with findings still completed");
+    assert_eq!(
+        outcome,
+        Some(leveler_client_protocol::ChildOutcome::CompletedWithFindings)
+    );
+    assert_eq!(
+        stop,
+        Some(leveler_client_protocol::ChildStop::Completed),
+        "a clean end is not a budget stop"
+    );
+}
+
+/// The ordinary agent can answer "what is the review doing?" from a native
+/// tool, while the review keeps running. This is the mid-run question the old
+/// architecture could only answer with "no settlement notice yet".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agent_reads_a_running_review_through_a_native_tool() {
+    let slow_review = MockResponse::SilentThenJson {
+        silent_ms: 2500,
+        body: serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "审查结束，没有发现问题"}, "finish_reason": "stop"}]
+        })
+        .to_string(),
+    };
+    let status_turn = sse(&[
+        tool_call_frame("call-status", "review_status", serde_json::json!({})),
+        finish_frame("tool_calls"),
+    ]);
+    let (_tmp, server, _app, client, session) = harness(vec![
+        slow_review,
+        status_turn,
+        final_response("Reviewer 还在运行。"),
+    ])
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let review_id = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the review must start")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewStarted { review } = event {
+            break review.id;
+        }
+    };
+    // Wait until the reviewer's own request is held by the mock.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.request_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the review must reach the provider first"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "什么进度了？".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // The parent turn issued `review_status`; its second request carries the
+    // tool result the model actually read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let bodies = loop {
+        let bodies = server.request_bodies().await;
+        if bodies.len() >= 3 {
+            break bodies;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the parent turn must finish its tool round; got {} requests",
+            bodies.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let after_tool = &bodies[2];
+    assert!(
+        after_tool.contains("### Running"),
+        "the tool result must describe the running review: {after_tool}"
+    );
+    assert!(
+        after_tool.contains(&review_id),
+        "the tool result must name the real review id: {after_tool}"
+    );
+    assert!(
+        after_tool.contains("workspace"),
+        "the tool result must name the reviewed object: {after_tool}"
+    );
+
+    // The review still settles on its own schedule.
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.status, UiReviewStatus::Completed);
+}
+
+/// A review is a session-level child. The same `CancelChild` command that
+/// stops an ordinary delegated child stops it by the id the UI shows — one
+/// execution identity, one cancellation rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_review_is_cancellable_through_the_native_child_command() {
+    let slow_review = MockResponse::SilentThenJson {
+        silent_ms: 2500,
+        body: serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "审查结束"}, "finish_reason": "stop"}]
+        })
+        .to_string(),
+    };
+    let (_tmp, server, _app, client, session) = harness(vec![slow_review]).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let review_id = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the review must start")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewStarted { review } = event {
+            break review.id;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.request_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reviewer must reach the provider"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client
+        .send(ClientCommand::CancelChild {
+            session_id: session.clone(),
+            child_id: review_id.clone(),
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.id, review_id);
+    assert_eq!(finished.status, UiReviewStatus::Cancelled);
 }

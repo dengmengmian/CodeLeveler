@@ -244,6 +244,18 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             } else if doctor_reload {
                 effects.extend(crate::doctor::reload(state));
             }
+            if restored_history {
+                // The replay owns the transcript's order; the durable review
+                // rows fill the cards the replay placed, and add any review
+                // the replay window no longer carries. Asking here is what
+                // makes the two answers converge on one card per review.
+                let query_id = CommandId::generate();
+                state.review_history_query = Some(query_id.clone());
+                effects.push(Effect::Send(ClientCommand::ListReviews {
+                    session_id: state.session_id.clone(),
+                    query_id: Some(query_id),
+                }));
+            }
             if let Some((outcome, error)) = config_reload {
                 crate::settings::observe_config_reloaded(state, &outcome, error.as_deref());
             }
@@ -271,7 +283,8 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             // A reopened conversation shows its text from the snapshot at
             // once; what ran in it comes from the durable history.
-            if opened && !state.is_busy() && !state.transcript.is_empty() {
+            let history_requested = opened && !state.is_busy() && !state.transcript.is_empty();
+            if history_requested {
                 let query_id = CommandId::generate();
                 state.history_query = Some(query_id.clone());
                 effects.push(Effect::Send(ClientCommand::QuerySessionHistory {
@@ -279,10 +292,12 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     query_id: Some(query_id),
                 }));
             }
-            // Reviews are durable and independent of the turn log; a reopened
-            // session asks for its stored cards the same way it asks for its
-            // transcript. Read-only and safe to ask while a turn runs.
-            if opened {
+            // Reviews are durable and independent of the turn log. When the
+            // transcript is replayed, the review rows must land AFTER it: the
+            // replay rebuilds the whole transcript, and a review response
+            // that arrived first would be replaced by that rebuild. The
+            // history answer chains the request below; without one, ask now.
+            if opened && !history_requested {
                 let query_id = CommandId::generate();
                 state.review_history_query = Some(query_id.clone());
                 effects.push(Effect::Send(ClientCommand::ListReviews {
@@ -674,6 +689,25 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
     }
 }
 
+/// Retire the notice a rejected command left above the input.
+///
+/// Only the exact notice that rejection produced is cleared: a later,
+/// unrelated warning on the same row is left alone. The failure itself is not
+/// erased — `RuntimeEvent::Notification` already recorded it as a durable
+/// `TranscriptItem::Error` when it arrived.
+pub(crate) fn clear_command_notice(state: &mut AppState) {
+    let Some(message) = state.command_notice.take() else {
+        return;
+    };
+    if state
+        .notification
+        .as_ref()
+        .is_some_and(|notice| notice.message == message)
+    {
+        state.notification = None;
+    }
+}
+
 fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
     match completion {
         EffectCompletion::QuitFinished(result) => {
@@ -697,7 +731,11 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             state.exit.stop_unconfirmed = result.err();
             state.running = false;
         }
-        EffectCompletion::CommandDelivered => {}
+        EffectCompletion::CommandDelivered => {
+            // The rejected invocation's notice no longer describes anything
+            // that is still true about this client.
+            clear_command_notice(state);
+        }
         EffectCompletion::SteerCommandDelivered(command) => {
             crate::pending_steer::completed(state, &command, true)
         }
@@ -731,6 +769,11 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             } else if schedules_page_error {
                 crate::schedules::observe_command_failure(state, Some(&message));
             } else {
+                // One durable fact in the conversation, one transient row
+                // above the input. The row retires when this invocation stops
+                // being the last thing the person did; the record stays.
+                state.transcript.push_error(message.clone());
+                state.command_notice = Some(message.clone());
                 state.notification = Some(Notification {
                     level: NotificationLevel::Error,
                     message,
@@ -1576,6 +1619,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             if let Some(review_id) = review_hit {
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
+                // A report already in the conversation folds in place. Only a
+                // row without one falls back to the report page.
+                if state.transcript.toggle_review_report(&review_id) {
+                    return Vec::new();
+                }
                 return screen_nav::open_review_report(state, &review_id);
             }
             if over_input {

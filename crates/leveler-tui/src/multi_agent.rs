@@ -463,10 +463,16 @@ impl TaskTeamView {
 
     /// A turn ended: a child this view still shows as working got no terminal
     /// here. Say exactly that — not failed, not interrupted.
-    pub fn mark_unreported_at_turn_end(&mut self, now_elapsed: u64) {
+    /// A turn ended. Every child THIS turn owned that never reported a
+    /// terminal is not "failed" — say only that no terminal arrived. A
+    /// session-level review child is skipped: the turn ending says nothing
+    /// about it, and its own terminal will arrive.
+    pub fn mark_unreported_at_turn_end(&mut self, now_elapsed: u64, keep_running: &[String]) {
         let mut changed = false;
         for c in &mut self.children {
-            if matches!(c.status, ChildStatus::Running | ChildStatus::Waiting) {
+            if matches!(c.status, ChildStatus::Running | ChildStatus::Waiting)
+                && !keep_running.contains(&c.id)
+            {
                 c.status = ChildStatus::Unreported;
                 changed = true;
             }

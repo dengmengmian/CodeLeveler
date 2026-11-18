@@ -323,8 +323,9 @@ pub struct GoalRecapBlock {
     pub expanded: bool,
 }
 
-/// One manual review in the conversation. The card is a bounded summary; the
-/// report itself is a separate page read from the durable review row.
+/// One manual review in the conversation. The card is the reviewer's live
+/// row; once settled, `report` carries the durable formal report and the same
+/// block renders it inline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewBlock {
     pub summary: leveler_client_protocol::UiReviewSummary,
@@ -332,6 +333,22 @@ pub struct ReviewBlock {
     pub live_tool: Option<String>,
     /// Independent investigations this review launched, as runtime facts.
     pub investigations: Vec<leveler_client_protocol::UiReviewInvestigation>,
+    /// The formal report, projected from the durable review row. `None` while
+    /// running and when the terminal could not be persisted. Boxed so one
+    /// transcript item stays small even when the report holds many findings.
+    pub report: Option<Box<leveler_client_protocol::UiReviewReport>>,
+    /// Whether the inline report is expanded. Defaults to expanded; clicking
+    /// the card folds a long report.
+    pub expanded: bool,
+    /// Reviewer wall time as reported by the runtime. Real elapsed time, never
+    /// a fabricated percentage.
+    pub elapsed_ms: u64,
+    /// A native sub-agent row is showing this execution right now. While it
+    /// does, the running review draws no card of its own: one execution, one
+    /// projection. A client that reconnects mid-run has no child row (the
+    /// child lives in the runtime, not the transcript), so its card is the
+    /// only thing that can state the review is still going.
+    pub native_child: bool,
 }
 
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
@@ -625,15 +642,18 @@ fn two_state(expanded: bool) -> DisplayMode {
 
 /// Whether a transcript entry can be folded at all.
 fn is_foldable_item(item: &TranscriptItem) -> bool {
-    matches!(
-        item,
+    match item {
         TranscriptItem::Thought(_)
-            | TranscriptItem::ToolGroup(_)
-            | TranscriptItem::SubAgent(_)
-            | TranscriptItem::UserShell(_)
-            | TranscriptItem::GoalRecap(_)
-            | TranscriptItem::Failure(_)
-    )
+        | TranscriptItem::ToolGroup(_)
+        | TranscriptItem::SubAgent(_)
+        | TranscriptItem::UserShell(_)
+        | TranscriptItem::GoalRecap(_)
+        | TranscriptItem::Failure(_) => true,
+        // A review becomes foldable only when its formal report exists; the
+        // running row has no long body to hide.
+        TranscriptItem::Review(block) => block.report.is_some(),
+        _ => false,
+    }
 }
 
 /// The ordered list of transcript blocks.
@@ -649,6 +669,26 @@ pub struct TranscriptState {
     /// `&mut self` method calls [`Self::bump`]; over-bumping is safe (a wasted
     /// rebuild), under-bumping is not (stale render), so err toward bumping.
     version: u64,
+}
+
+/// Wall time the durable review row itself records, for a card built from
+/// history. Live cards get the same number from progress ticks; history has no
+/// ticks, so the start/end timestamps are the only real elapsed source and a
+/// missing or malformed timestamp reads as unknown (`0`), never as a guess.
+fn review_elapsed_ms(summary: &leveler_client_protocol::UiReviewSummary) -> u64 {
+    let created = chrono::DateTime::parse_from_rfc3339(&summary.created_at).ok();
+    let finished = summary
+        .finished_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+    match (created, finished) {
+        (Some(created), Some(finished)) => (finished - created)
+            .num_milliseconds()
+            .max(0)
+            .try_into()
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 impl TranscriptState {
@@ -1002,7 +1042,8 @@ impl TranscriptState {
 
     /// Insert or update one review card. Identity is the durable review id:
     /// a live `ReviewStarted`, a reconnect's history list and a repeated
-    /// terminal all converge on the same block.
+    /// terminal all converge on the same block. A report already attached is
+    /// never dropped by a newer transient summary.
     pub fn upsert_review(&mut self, summary: leveler_client_protocol::UiReviewSummary) {
         self.bump();
         if let Some(block) = self.items.iter_mut().find_map(|item| match item {
@@ -1020,7 +1061,73 @@ impl TranscriptState {
             summary,
             live_tool: None,
             investigations,
+            report: None,
+            expanded: true,
+            elapsed_ms: 0,
+            native_child: false,
         }));
+    }
+
+    /// A native sub-agent row for this review exists in the conversation. The
+    /// card stops being the running projection from that point on.
+    pub fn mark_review_native_child(&mut self, id: &str) {
+        let mut changed = false;
+        for item in &mut self.items {
+            if let TranscriptItem::Review(block) = item
+                && block.summary.id == id
+                && !block.native_child
+            {
+                block.native_child = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
+    }
+
+    /// Attach the durable formal report to its review card. A repeated
+    /// terminal is idempotent: the same id replaces its report in place.
+    pub fn attach_review_report(
+        &mut self,
+        summary: leveler_client_protocol::UiReviewSummary,
+        report: Option<leveler_client_protocol::UiReviewReport>,
+    ) {
+        let review_id = summary.id.clone();
+        self.upsert_review(summary);
+        let Some(block) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == review_id => Some(block),
+            _ => None,
+        }) else {
+            return;
+        };
+        // A terminal event without a fetched report must not erase one this
+        // block already shows: duplicate or stale settlements are common on
+        // resume, and the durable row is the same row.
+        if let Some(report) = report {
+            block.report = Some(Box::new(report));
+        }
+        if block.elapsed_ms == 0 {
+            block.elapsed_ms = review_elapsed_ms(&block.summary);
+        }
+        block.live_tool = None;
+        self.bump();
+    }
+
+    /// Fold or unfold the inline report attached to one review block.
+    pub fn toggle_review_report(&mut self, review_id: &str) -> bool {
+        let Some(block) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == review_id => Some(block),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if block.report.is_none() {
+            return false;
+        }
+        block.expanded = !block.expanded;
+        self.bump();
+        true
     }
 
     /// Update a running review's transient tool label without touching its
@@ -1031,6 +1138,7 @@ impl TranscriptState {
         tool: Option<String>,
         status: Option<leveler_client_protocol::UiReviewStatus>,
         investigations: Vec<leveler_client_protocol::UiReviewInvestigation>,
+        elapsed_ms: u64,
     ) {
         let Some(block) = self.items.iter_mut().find_map(|item| match item {
             TranscriptItem::Review(block) if block.summary.id == review_id => Some(block),
@@ -1045,19 +1153,25 @@ impl TranscriptState {
             block.summary.status = status;
         }
         block.investigations = investigations;
+        block.elapsed_ms = elapsed_ms;
         self.bump();
     }
 
-    /// Append a page of stored review cards. The runtime lists newest first;
-    /// history is conversation order, so this walks backwards. Existing ids
-    /// are updated in place, never duplicated.
+    /// Append a page of stored review cards and the newest reports. The
+    /// runtime lists newest first; history is conversation order, so this
+    /// walks backwards. Existing ids are updated in place, never duplicated.
     pub fn push_review_history(
         &mut self,
         mut summaries: Vec<leveler_client_protocol::UiReviewSummary>,
+        reports: Vec<leveler_client_protocol::UiReviewReport>,
     ) {
         summaries.reverse();
         for summary in summaries {
-            self.upsert_review(summary);
+            let report = reports
+                .iter()
+                .find(|report| report.summary.id == summary.id)
+                .cloned();
+            self.attach_review_report(summary, report);
         }
     }
 
@@ -1417,8 +1531,25 @@ impl TranscriptState {
     /// or an unfinished assistant message stays "live" forever — never committing
     /// to scrollback, showing a stuck spinner/cursor. A cleanly-completed turn has
     /// nothing in-flight, so this is a no-op there.
+    /// Reviews in this transcript that have not settled. Their execution is a
+    /// session-level child: a turn ending says nothing about it.
+    pub fn live_review_ids(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Review(block) if !block.summary.status.settled() => {
+                    Some(block.summary.id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn finalize_in_flight(&mut self) {
         self.bump();
+        // A session-level review is not this turn's child. Its row stays live
+        // while the review runs; only the review's own terminal may settle it.
+        let live_reviews = self.live_review_ids();
         for item in &mut self.items {
             match item {
                 TranscriptItem::Assistant(b) if !b.done => {
@@ -1458,7 +1589,9 @@ impl TranscriptState {
                 // The turn ended and no terminal reached us. Failed or
                 // interrupted would both be facts the UI invented; say only
                 // that no terminal arrived.
-                TranscriptItem::SubAgent(b) if b.status == ToolStatus::Running => {
+                TranscriptItem::SubAgent(b)
+                    if b.status == ToolStatus::Running && !live_reviews.contains(&b.id) =>
+                {
                     b.status = ToolStatus::Failed;
                     b.unreported = true;
                 }
@@ -2303,6 +2436,9 @@ impl TranscriptState {
             TranscriptItem::SubAgent(block) => Some(two_state(block.expanded)),
             TranscriptItem::UserShell(shell) => Some(two_state(shell.view.follow)),
             TranscriptItem::GoalRecap(block) => Some(two_state(block.expanded)),
+            TranscriptItem::Review(block) if block.report.is_some() => {
+                Some(two_state(block.expanded))
+            }
             TranscriptItem::Failure(block) => Some(block.display),
             _ => None,
         }
@@ -2347,6 +2483,10 @@ impl TranscriptState {
             // has no collapsed/expanded pair to write.
             Some(TranscriptItem::UserShell(_)) => return false,
             Some(TranscriptItem::GoalRecap(block)) => {
+                block.expanded = mode.is_expanded();
+                true
+            }
+            Some(TranscriptItem::Review(block)) if block.report.is_some() => {
                 block.expanded = mode.is_expanded();
                 true
             }

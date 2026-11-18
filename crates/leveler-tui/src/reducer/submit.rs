@@ -9,8 +9,7 @@ use crate::transcript::InputDelivery;
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
-    open_model_picker, open_recovery_confirm, open_review_scope_picker, open_theme_picker,
-    open_unsupported_media,
+    open_model_picker, open_recovery_confirm, open_theme_picker, open_unsupported_media,
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
@@ -61,6 +60,10 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     if raw.is_empty() && state.pending_attachments.is_empty() {
         return Vec::new();
     }
+    // The person is acting again: the previous command's rejection notice is
+    // no longer the last word about this input. Its durable transcript record
+    // stays.
+    super::clear_command_notice(state);
     // A FIRST LINE starting with a KNOWN `/command` is a local slash command,
     // parsed locally and never sent to the model — its argument may span
     // multiple lines (a small pasted goal below the chip threshold must not
@@ -235,6 +238,7 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     // submit→first-event window where a second submit would send instead of
     // queue, double-driving the runtime.
     start_turn(state);
+    super::clear_command_notice(state);
     // Mirror session collaboration on the busy chrome (footer/plan shell).
     // Runtime maps collaboration=goal SubmitMessage → goal turn profile.
     state.goal_mode_active =
@@ -1518,11 +1522,12 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         .unwrap_or(command)
         .trim_start()
         .to_string();
-    if rest.is_empty() {
-        open_review_scope_picker(state);
-        return Vec::new();
-    }
     let tokens: Vec<&str> = rest.split_whitespace().collect();
+    // A bare `/review`, and a `/review <focus>` with no directive, both mean
+    // "review what I am working on". The runtime resolves that against real
+    // Git state and asks back (`ReviewScopeRequired`) when nothing is
+    // unambiguously reviewable — the client never guesses a boundary.
+    let mut scope = UiReviewScope::Auto;
     // Keyboard entry to a durable report. The mouse path (clicking the review
     // card) is unchanged; this names the same report by id, or the newest
     // settled review when no id is given.
@@ -1585,7 +1590,6 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         })];
     }
     let mut index = 0;
-    let mut scope = UiReviewScope::CurrentTask;
     let mut model: Option<ModelRef> = None;
     while index < tokens.len() {
         let token = tokens[index];
@@ -1679,7 +1683,14 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             }
         }
     }
-    let focus = tokens[index..].join(" ");
+    let mut focus = tokens[index..].join(" ");
+    // A focus typed before a scope picker opened survives the round trip: the
+    // person chose an OBJECT, not a different request.
+    if focus.trim().is_empty()
+        && let Some(pending) = state.review_scope_focus.take()
+    {
+        focus = pending;
+    }
     vec![Effect::Send(ClientCommand::RunReview {
         session_id: state.session_id.clone(),
         focus,

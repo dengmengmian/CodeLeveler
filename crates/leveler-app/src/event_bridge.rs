@@ -616,7 +616,9 @@ pub(crate) fn project_child_limit(
 /// Deliberately total: every field crosses. Dropping one here is invisible at
 /// the call site and unrecoverable downstream — which is exactly how
 /// `contribution` was lost before.
-fn project_contribution(c: &leveler_lifecycle::ChildResultProjection) -> ChildContribution {
+pub(crate) fn project_contribution(
+    c: &leveler_lifecycle::ChildResultProjection,
+) -> ChildContribution {
     ChildContribution {
         role: c.role.clone(),
         profile_id: c.profile_id.clone(),

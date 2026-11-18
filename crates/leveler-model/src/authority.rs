@@ -154,6 +154,13 @@ pub enum RuntimeNoticeKind {
     /// this session's user intent, and its completion claims are not verified
     /// facts.
     ForeignSessionImport,
+    /// A manual review admitted in this conversation. The row states the
+    /// durable review id and object; it is a runtime fact, not a user message.
+    ReviewStarted,
+    /// A manual review reached its terminal. The body carries the structured
+    /// result the parent agent may cite; the reviewer's own report remains the
+    /// durable review row, not this notice.
+    ReviewSettled,
 }
 
 /// Why a transcript row exists.
@@ -379,6 +386,11 @@ fn classify_runtime_notice(notice: RuntimeNoticeKind) -> OriginClass {
         // user asked another agent to do; it is not this session's user intent
         // and its claims are unverified.
         RuntimeNoticeKind::ForeignSessionImport => (PromptAuthority::AdvisoryContext, false),
+        // An admitted review is a runtime fact. Its terminal notice carries
+        // reviewer output, so it is advisory evidence: the parent may cite it,
+        // but it never becomes user intent or a completion claim.
+        RuntimeNoticeKind::ReviewStarted => (PromptAuthority::RuntimeFact, false),
+        RuntimeNoticeKind::ReviewSettled => (PromptAuthority::AdvisoryContext, false),
         RuntimeNoticeKind::ChildResumed
         | RuntimeNoticeKind::ChildLost
         | RuntimeNoticeKind::ChildRecovery
@@ -490,6 +502,24 @@ mod tests {
         assert!(!item.authority_mismatch);
         assert_eq!(item.lifecycle, SegmentLifecycle::Transcript);
         assert!(projection.control_text().is_empty());
+    }
+
+    #[test]
+    fn review_notices_are_context_not_user_intent() {
+        let started = classify_transcript_origin(Some(&TranscriptOrigin::RuntimeNotice {
+            notice: RuntimeNoticeKind::ReviewStarted,
+        }));
+        assert_eq!(started.authority, PromptAuthority::RuntimeFact);
+        assert!(!started.authority.is_instruction());
+        assert!(!started.authority_mismatch);
+
+        let settled = classify_transcript_origin(Some(&TranscriptOrigin::RuntimeNotice {
+            notice: RuntimeNoticeKind::ReviewSettled,
+        }));
+        assert_eq!(settled.authority, PromptAuthority::AdvisoryContext);
+        assert!(!settled.authority.is_instruction());
+        assert_ne!(settled.authority, PromptAuthority::UserIntent);
+        assert!(!settled.authority_mismatch);
     }
 
     #[test]

@@ -532,6 +532,31 @@ async fn run_collaboration_turn(
 }
 
 impl Application {
+    /// Give an ordinary turn the read-only `review_status` tool.
+    ///
+    /// A manual review is not a turn, so nothing in the turn table answers
+    /// "what is the review doing". The tool is bound to this session and reads
+    /// the live registry plus the durable rows; it can never name another
+    /// session or change a review.
+    fn with_review_status_tool(
+        &self,
+        engine: leveler_agent::coding::CodingRuntime,
+        db: &leveler_storage::Database,
+        session_id: &leveler_core::SessionId,
+    ) -> leveler_agent::coding::CodingRuntime {
+        let mut registry = (*engine.factory.registry).clone();
+        registry.register(std::sync::Arc::new(
+            crate::review_live::ReviewStatusTool::new(
+                self.review_live.clone(),
+                db.clone(),
+                session_id.clone(),
+            ),
+        ));
+        let mut engine = engine;
+        engine.factory.registry = std::sync::Arc::new(registry);
+        engine
+    }
+
     /// Create and persist a new session record, returning its id. The caller can
     /// then run it, and — crucially — knows the id even if the run is cancelled.
     ///
@@ -965,6 +990,10 @@ impl Application {
             .await?
             .with_steering(steering)
             .with_task_cancel(task_cancel);
+        // A review is not a turn, so an ordinary agent cannot learn its state
+        // from the turn it is in. This read-only tool answers from the live
+        // review registry plus the durable rows, bound to THIS session.
+        let engine = self.with_review_status_tool(engine, &db, session_id);
         // Candidate extraction moved to the caller that owns a client
         // connection (`InteractiveRuntime`), because a pending candidate nobody
         // is told about is the same as none. Doing it here could only log.
@@ -1044,6 +1073,10 @@ impl Application {
             .await?
             .with_steering(steering)
             .with_task_cancel(task_cancel);
+        // A review is not a turn, so an ordinary agent cannot learn its state
+        // from the turn it is in. This read-only tool answers from the live
+        // review registry plus the durable rows, bound to THIS session.
+        let engine = self.with_review_status_tool(engine, &db, session_id);
         let goal = goal_from_content(&content);
         // See the note in `run_in_session_with_policy`: the notice belongs to
         // the layer with a client to notify.

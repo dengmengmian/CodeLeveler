@@ -851,7 +851,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
-            state.team.mark_unreported_at_turn_end(state.elapsed_secs);
+            let live_reviews = state.transcript.live_review_ids();
+            state
+                .team
+                .mark_unreported_at_turn_end(state.elapsed_secs, &live_reviews);
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
             state.turn_cancel_requested = false;
@@ -934,7 +937,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             clear_activity(state);
             state.goal_mode_active = false;
             state.transcript.finalize_in_flight();
-            state.team.mark_unreported_at_turn_end(state.elapsed_secs);
+            let live_reviews = state.transcript.live_review_ids();
+            state
+                .team
+                .mark_unreported_at_turn_end(state.elapsed_secs, &live_reviews);
             state.cancel_armed = false;
             state.cancel_repeat_armed = false;
             state.turn_cancel_requested = false;
@@ -996,6 +1002,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let started = state.elapsed_secs;
             let agent_name = agent.as_ref().map(|a| a.name.clone());
             let display_title = title.clone();
+            // A review's reviewer is a real child under the review's own id.
+            // Once its row exists, the running review card stops drawing
+            // itself: one execution, one projection.
+            state.transcript.mark_review_native_child(&id);
             state.team.apply_update(crate::multi_agent::ChildUpdate {
                 id: id.clone(),
                 nickname: nickname.clone(),
@@ -1306,21 +1316,39 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             });
         }
         RuntimeEvent::ReviewStarted { review } => {
+            // The review the person asked for is now running: an earlier
+            // "cannot determine the scope" rejection no longer describes
+            // anything true about this input row.
+            super::clear_command_notice(state);
+            if !review.status.settled() {
+                state.live_review = true;
+            }
             state.transcript.upsert_review(review);
         }
         RuntimeEvent::ReviewProgress {
             review_id,
             tool,
             investigations,
+            elapsed_ms,
             ..
         } => {
-            // The card's status stays `running`; the live tool is transient.
+            // The card's status stays `running`; the live tool and elapsed
+            // time are runtime facts, not a fabricated percentage.
+            state.transcript.note_review_progress(
+                &review_id,
+                tool,
+                None,
+                investigations,
+                elapsed_ms,
+            );
+        }
+        RuntimeEvent::ReviewFinished { review, report } => {
+            // The formal report arrives with the terminal and renders inline.
+            // Finishing never navigates away from the conversation.
+            state.live_review = false;
             state
                 .transcript
-                .note_review_progress(&review_id, tool, None, investigations);
-        }
-        RuntimeEvent::ReviewFinished { review } => {
-            state.transcript.upsert_review(review);
+                .attach_review_report(review, report.map(|report| *report));
         }
         RuntimeEvent::ReviewReportLoaded { query_id, report } => {
             let ours = query_id.is_some() && query_id == state.review_query;
@@ -1332,13 +1360,27 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.active_screen = crate::screen::Screen::Review;
             state.screen_scroll = 0;
         }
-        RuntimeEvent::ReviewHistoryLoaded { query_id, reviews } => {
+        RuntimeEvent::ReviewHistoryLoaded {
+            query_id,
+            reviews,
+            reports,
+        } => {
             let ours = query_id.is_some() && query_id == state.review_history_query;
             if !ours {
                 return;
             }
             state.review_history_query = None;
-            state.transcript.push_review_history(reviews);
+            state.transcript.push_review_history(reviews, reports);
+        }
+        // Nothing was started: the runtime states that this workspace has no
+        // unambiguous object, and the person chooses one. This is a question,
+        // not a failed command, so it never becomes a sticky error.
+        RuntimeEvent::ReviewScopeRequired { session_id, focus } => {
+            if session_id != state.session_id {
+                return;
+            }
+            state.review_scope_focus = (!focus.trim().is_empty()).then_some(focus);
+            super::overlay_keys::open_review_scope_picker(state);
         }
         RuntimeEvent::Notification { level, message } => {
             // Errors stick until Esc / next turn; also land in the transcript so
@@ -1800,7 +1842,10 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
-    state.team.mark_unreported_at_turn_end(state.elapsed_secs);
+    let live_reviews = state.transcript.live_review_ids();
+    state
+        .team
+        .mark_unreported_at_turn_end(state.elapsed_secs, &live_reviews);
     crate::suggestion::allow_generated(state);
     // §12: a clean outcome still needs an answer behind it. Only the two
     // outcomes that render as done are rewritten — an Incomplete or Failed turn

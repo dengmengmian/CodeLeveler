@@ -1957,6 +1957,7 @@ pub struct UsageText {
 #[derive(Debug)]
 pub struct ReviewText {
     pub scope_picker_title: &'static str,
+    pub scope_auto: &'static str,
     pub scope_current_task: &'static str,
     pub scope_current_task_desc: &'static str,
     pub scope_workspace: &'static str,
@@ -2015,6 +2016,9 @@ pub struct ReviewText {
     pub id: &'static str,
     pub time: &'static str,
     pub findings_section: &'static str,
+    /// Durable ids above the reviewer's prose are the only finding
+    /// identities; id tokens inside the prose are narrative, not identities.
+    pub findings_identity_note: &'static str,
     pub report_section: &'static str,
     pub evidence: &'static str,
     pub impact: &'static str,
@@ -3621,6 +3625,7 @@ static ZH: UiText = UiText {
     untrusted_config_chip: "⚠ 仓库配置未信任",
     review: ReviewText {
         scope_picker_title: "选择审查范围",
+        scope_auto: "自动选择",
         scope_current_task: "当前任务",
         scope_current_task_desc: "审查当前任务的交付、需求与修改文件",
         scope_workspace: "当前工作区变更",
@@ -3666,6 +3671,7 @@ static ZH: UiText = UiText {
         id: "审查 ID",
         time: "时间",
         findings_section: "问题",
+        findings_identity_note: "ID 来自本次审查的持久化 Finding 记录；正文中的编号只是叙述，不是正式身份。",
         report_section: "审查者报告",
         evidence: "证据",
         impact: "影响",
@@ -5308,6 +5314,7 @@ static EN: UiText = UiText {
     untrusted_config_chip: "⚠ repo config untrusted",
     review: ReviewText {
         scope_picker_title: "Select review scope",
+        scope_auto: "Automatic",
         scope_current_task: "Current task",
         scope_current_task_desc: "Review this task's delivery, request and changed files",
         scope_workspace: "Working-tree changes",
@@ -5353,6 +5360,7 @@ static EN: UiText = UiText {
         id: "Review ID",
         time: "Time",
         findings_section: "Findings",
+        findings_identity_note: "IDs come from this review's durable finding records; ids in the prose below are narrative, not identities.",
         report_section: "Reviewer report",
         evidence: "Evidence",
         impact: "Impact",

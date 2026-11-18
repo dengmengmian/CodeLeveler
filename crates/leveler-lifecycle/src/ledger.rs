@@ -367,6 +367,98 @@ impl EvidenceLedger {
         self.findings.iter().find(|f| f.id == id)
     }
 
+    /// The ids of the review's formal findings, in allocation order. A formal
+    /// finding is the Lead's own record or an explicitly adopted candidate;
+    /// candidates, rejections and duplicates keep their ids as evidence but
+    /// are not part of the formal set. Ids are never renumbered: a gap left by
+    /// a duplicate or rejection stays a gap.
+    pub fn formal_finding_ids(&self) -> Vec<&str> {
+        self.findings
+            .iter()
+            .filter(|finding| finding.is_formal())
+            .map(|finding| finding.id.as_str())
+            .collect()
+    }
+
+    /// Validate one `report_review` submission against this ledger's durable
+    /// finding identities.
+    ///
+    /// `declared` is the structured formal set the report claims to present;
+    /// `report` is the Markdown body. Identity belongs to the ledger: every id
+    /// in either place must name a formal record of THIS review. Candidate,
+    /// rejected and duplicate records keep their ids for traceability, but a
+    /// report may not present them as formal findings.
+    pub fn validate_review_report(&self, declared: &[String], report: &str) -> Result<(), String> {
+        let formal = self.formal_finding_ids();
+        let formal_text = || formal_ids_text(&formal);
+
+        // The declared set is a conformance check, not a second identity
+        // source: it must be exactly the formal set this ledger owns.
+        let mut seen: Vec<&str> = Vec::with_capacity(declared.len());
+        for id in declared {
+            if seen.contains(&id.as_str()) {
+                return Err(format!(
+                    "report_review `formal_findings` lists `{id}` more than once. {}",
+                    formal_text()
+                ));
+            }
+            match self.finding(id) {
+                None => {
+                    return Err(format!(
+                        "report_review `formal_findings` names `{id}`, which is not a \
+                         finding in this review. {}",
+                        formal_text()
+                    ));
+                }
+                Some(record) if !record.is_formal() => {
+                    return Err(format!(
+                        "report_review `formal_findings` names `{id}`, which is {}, not a \
+                         formal finding. {}",
+                        disposition_text(record),
+                        formal_text()
+                    ));
+                }
+                Some(_) => {}
+            }
+            seen.push(id);
+        }
+        for id in &formal {
+            if !seen.contains(id) {
+                return Err(format!(
+                    "report_review `formal_findings` omits `{id}`, a formal finding of \
+                     this review. {}",
+                    formal_text()
+                ));
+            }
+        }
+
+        // The body may cite formal ids only. Referential integrity is checked
+        // against the ledger, outside quoted code; this never rewrites the
+        // reviewer's prose.
+        for reference in report_id_references(report) {
+            match self.finding(reference) {
+                None => {
+                    return Err(format!(
+                        "the report body cites `{reference}`, which is not a finding in \
+                         this review. {}",
+                        formal_text()
+                    ));
+                }
+                Some(record) if !record.is_formal() => {
+                    return Err(format!(
+                        "the report body cites `{reference}`, which is {}, not a formal \
+                         finding. Candidate, rejected and duplicate records are rendered \
+                         from structured data; do not cite their ids as formal findings. {}",
+                        disposition_text(record),
+                        formal_text()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Store the reviewer's structured declaration. A later call replaces the
     /// earlier one: the ledger holds the reviewer's current statement, not a
     /// history of drafts.
@@ -389,6 +481,121 @@ impl EvidenceLedger {
         self.next_seq = self.next_seq.saturating_add(1);
         self.investigation = Some(record);
     }
+}
+
+/// How a non-formal record is named in a report-identity error.
+fn disposition_text(record: &FindingRecord) -> String {
+    use crate::findings::FindingDisposition;
+    match record.details.disposition {
+        Some(FindingDisposition::Candidate) => "an unresolved candidate".to_string(),
+        Some(FindingDisposition::Rejected) => "a rejected candidate".to_string(),
+        Some(FindingDisposition::Duplicate) => match record.details.duplicate_of.as_deref() {
+            Some(target) => format!("a duplicate of `{target}`"),
+            None => "a duplicate".to_string(),
+        },
+        // An adopted record is formal; an absent disposition is the seat's own
+        // record, also formal. Neither can reach this branch.
+        _ => "not a formal finding".to_string(),
+    }
+}
+
+/// The formal ids an error message can offer as the correct targets.
+fn formal_ids_text(formal: &[&str]) -> String {
+    const MAX_LISTED: usize = 32;
+    if formal.is_empty() {
+        return "This review has no formal findings.".to_string();
+    }
+    let mut ids = formal
+        .iter()
+        .take(MAX_LISTED)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if formal.len() > MAX_LISTED {
+        ids.push_str(&format!(" (+{} more)", formal.len() - MAX_LISTED));
+    }
+    format!("Formal finding ids in this review: {ids}.")
+}
+
+/// The `f-<digits>` identifiers a reader could take as finding references.
+///
+/// Fenced code blocks and inline code spans are quoted material, not report
+/// references; ids inside them are ignored. The grammar is the ledger's own id
+/// shape, so this is a referential-integrity check, not prose interpretation.
+fn report_id_references(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if let Some((marker, length)) = fence {
+            if closes_fence(trimmed, marker, length) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = opens_fence(trimmed) {
+            fence = Some(open);
+            continue;
+        }
+        scan_line_outside_code(line, &mut out);
+    }
+    out
+}
+
+fn opens_fence(line: &str) -> Option<(char, usize)> {
+    for marker in ['`', '~'] {
+        let length = line.chars().take_while(|ch| *ch == marker).count();
+        if length >= 3 {
+            return Some((marker, length));
+        }
+    }
+    None
+}
+
+fn closes_fence(line: &str, marker: char, opened_with: usize) -> bool {
+    let length = line.chars().take_while(|ch| *ch == marker).count();
+    length >= opened_with && line[length..].trim().is_empty()
+}
+
+fn scan_line_outside_code<'a>(line: &'a str, out: &mut Vec<&'a str>) {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut inline_code: Option<usize> = None;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let run = bytes[index..].iter().take_while(|b| **b == b'`').count();
+            inline_code = match inline_code {
+                None => Some(run),
+                Some(opened_with) if run == opened_with => None,
+                Some(opened_with) => Some(opened_with),
+            };
+            index += run;
+            continue;
+        }
+        if inline_code.is_none()
+            && bytes[index] == b'f'
+            && bytes.get(index + 1) == Some(&b'-')
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_digit)
+        {
+            let start = index;
+            let start_ok = start == 0 || !is_id_byte(bytes[start - 1]);
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let end_ok = end == bytes.len() || !is_id_byte(bytes[end]);
+            if start_ok && end_ok {
+                out.push(&line[start..end]);
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn is_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
 }
 
 #[cfg(test)]
@@ -780,5 +987,198 @@ mod finding_tests {
         )
         .unwrap();
         assert_eq!(led.evidence_revision, before);
+    }
+
+    fn adopt(led: &mut EvidenceLedger, id: &str) {
+        led.adjudicate_finding(
+            id,
+            crate::findings::FindingAdjudication {
+                disposition: crate::findings::FindingDisposition::Adopted,
+                reason: Some("verified".into()),
+                ..crate::findings::FindingAdjudication::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn merge_into(led: &mut EvidenceLedger, id: &str, target: &str) {
+        led.adjudicate_finding(
+            id,
+            crate::findings::FindingAdjudication {
+                disposition: crate::findings::FindingDisposition::Duplicate,
+                duplicate_of: Some(target.into()),
+                ..crate::findings::FindingAdjudication::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Four candidates, one merged duplicate: the formal set is f-1, f-2, f-4.
+    /// The allocated ids never move to close the gap.
+    fn gapped_formal_ledger() -> (EvidenceLedger, Vec<String>) {
+        let mut led = EvidenceLedger::default();
+        let ids: Vec<String> = (0..4)
+            .map(|_| led.adopt_candidate("agent-1", "investigator", &child_finding()))
+            .collect();
+        adopt(&mut led, &ids[0]);
+        adopt(&mut led, &ids[1]);
+        merge_into(&mut led, &ids[2], &ids[0]);
+        adopt(&mut led, &ids[3]);
+        (led, ids)
+    }
+
+    /// A gap is part of the identity: adjudication changes the disposition,
+    /// never the id or the allocation sequence.
+    #[test]
+    fn formal_ids_stay_stable_and_gapped_after_adjudication() {
+        let (led, ids) = gapped_formal_ledger();
+        assert_eq!(ids, vec!["f-1", "f-2", "f-3", "f-4"]);
+        assert_eq!(led.formal_finding_ids(), vec!["f-1", "f-2", "f-4"]);
+        assert_eq!(
+            led.finding("f-4").map(|finding| finding.id.as_str()),
+            Some("f-4"),
+            "the surviving finding keeps its allocated id"
+        );
+        assert_eq!(led.next_finding_seq, 4);
+        let unique: std::collections::HashSet<&str> = led
+            .findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect();
+        assert_eq!(
+            unique.len(),
+            led.findings.len(),
+            "one review never holds two records with the same formal id"
+        );
+    }
+
+    /// The structured declaration must equal the durable formal set exactly.
+    #[test]
+    fn report_validation_requires_the_exact_formal_set() {
+        let (led, _) = gapped_formal_ledger();
+        let report = "## f-1\n\n## f-2\n\n## f-4\n";
+
+        assert!(
+            led.validate_review_report(&["f-1".into(), "f-2".into(), "f-4".into()], report)
+                .is_ok()
+        );
+
+        let missing = led
+            .validate_review_report(&["f-1".into(), "f-2".into()], report)
+            .unwrap_err();
+        assert!(missing.contains("f-4"), "{missing}");
+        assert!(missing.contains("formal"), "{missing}");
+
+        let repeated = led
+            .validate_review_report(
+                &["f-1".into(), "f-2".into(), "f-2".into(), "f-4".into()],
+                report,
+            )
+            .unwrap_err();
+        assert!(repeated.contains("f-2"), "{repeated}");
+        assert!(repeated.contains("more than once"), "{repeated}");
+
+        let unknown = led
+            .validate_review_report(
+                &["f-1".into(), "f-2".into(), "f-4".into(), "f-9".into()],
+                report,
+            )
+            .unwrap_err();
+        assert!(unknown.contains("f-9"), "{unknown}");
+        assert!(unknown.contains("not a finding"), "{unknown}");
+    }
+
+    /// A duplicate, rejection or unresolved candidate is evidence, never a
+    /// formal finding: it cannot be declared and cannot be cited as one.
+    #[test]
+    fn report_validation_rejects_non_formal_ids_in_the_set_and_the_body() {
+        let (mut led, ids) = gapped_formal_ledger();
+        let id = ids[1].clone();
+        led.adjudicate_finding(
+            &id,
+            crate::findings::FindingAdjudication {
+                disposition: crate::findings::FindingDisposition::Rejected,
+                reason: Some("caller checks the owner".into()),
+                ..crate::findings::FindingAdjudication::default()
+            },
+        )
+        .unwrap();
+        // Formal set is now f-1, f-4; f-2 rejected, f-3 duplicate.
+        let formal = vec!["f-1".to_string(), "f-4".to_string()];
+
+        let declared = led
+            .validate_review_report(&["f-1".into(), "f-2".into(), "f-4".into()], "body")
+            .unwrap_err();
+        assert!(declared.contains("f-2"), "{declared}");
+        assert!(declared.contains("not a formal finding"), "{declared}");
+
+        let duplicate = led
+            .validate_review_report(&formal, "## f-1\n\nf-3 与 f-1 同根因。\n")
+            .unwrap_err();
+        assert!(duplicate.contains("f-3"), "{duplicate}");
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
+
+        let rejected = led
+            .validate_review_report(&formal, "f-2 需要修复。")
+            .unwrap_err();
+        assert!(rejected.contains("f-2"), "{rejected}");
+        assert!(rejected.contains("rejected"), "{rejected}");
+
+        let unknown = led
+            .validate_review_report(&formal, "f-9 需要修复。")
+            .unwrap_err();
+        assert!(unknown.contains("f-9"), "{unknown}");
+        assert!(unknown.contains("not a finding"), "{unknown}");
+
+        // The valid body and set still pass.
+        assert!(
+            led.validate_review_report(&formal, "## f-1\n\n## f-4\n")
+                .is_ok()
+        );
+    }
+
+    /// Quoted code is material, not a reference: an id-shaped string inside a
+    /// fence or an inline code span does not become a formal identity.
+    #[test]
+    fn report_validation_ignores_identifiers_inside_code() {
+        let (led, _) = gapped_formal_ledger();
+        let formal = vec!["f-1".to_string(), "f-2".to_string(), "f-4".to_string()];
+        let body = "## f-1\n\n```rust\nlet id = \"f-9\"; // f-3 is evidence\n```\n\n\
+                    Inline `f-8` and `f-3` stay quoted.\n\n## f-2\n\n## f-4\n";
+        assert!(led.validate_review_report(&formal, body).is_ok(), "{body}");
+
+        // A bare id is still a reference.
+        assert!(led.validate_review_report(&formal, "see f-3").is_err());
+        // Identifiers embedded in a larger token are not references.
+        assert!(led.validate_review_report(&formal, "xf-9 f-9a").is_ok());
+    }
+
+    /// A Lead-authored finding is formal without an adjudication, and can be
+    /// reported.
+    #[test]
+    fn a_lead_authored_finding_is_part_of_the_formal_set() {
+        let mut led = EvidenceLedger::default();
+        let id = led.record_finding(FindingKind::Correctness, "missing check", None, None);
+        assert_eq!(led.formal_finding_ids(), vec![id.as_str()]);
+        assert!(
+            led.validate_review_report(std::slice::from_ref(&id), &format!("## {id}\n"))
+                .is_ok()
+        );
+    }
+
+    /// A review with no formal findings may submit an empty declaration and a
+    /// body that cites none.
+    #[test]
+    fn a_review_without_formal_findings_accepts_an_empty_set() {
+        let mut led = EvidenceLedger::default();
+        led.adopt_candidate("agent-1", "investigator", &child_finding());
+        assert!(
+            led.validate_review_report(&[], "没有正式 Finding。")
+                .is_ok()
+        );
+        assert!(
+            led.validate_review_report(&[], "候选 f-1 未采纳。")
+                .is_err()
+        );
     }
 }
