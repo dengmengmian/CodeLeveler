@@ -1236,6 +1236,77 @@ async fn a_commit_review_reads_that_tree_and_refuses_live_worktree_tools() {
     );
 }
 
+/// A branch review's object is `merge-base(base, HEAD)..HEAD`. On Windows the
+/// scope and the evidence both come from the local object database: no Git
+/// process is started, and the reviewed branch content is still exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_branch_review_reads_the_merge_base_range() {
+    let responses = vec![
+        sse(&[
+            tool_call_frame(
+                "call_branch_history",
+                "git_history",
+                serde_json::json!({
+                    "action": "file",
+                    "rev": "HEAD",
+                    "path": "src/billing.rs"
+                }),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        final_response("审查完成。"),
+    ];
+    let (tmp, server, _app, client, session) = harness(responses).await;
+    let base = {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    for args in [
+        vec!["checkout", "-q", "-b", "feature"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "feature: receipt"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session,
+            focus: "检查该分支的账单读取实现".into(),
+            scope: UiReviewScope::Branch { base },
+            model: None,
+        })
+        .await
+        .unwrap();
+    let finished = next_review_finished(&mut rx, &server).await;
+    assert_eq!(finished.status, UiReviewStatus::Completed);
+
+    let bodies = server.request_bodies().await;
+    assert!(!bodies.is_empty());
+    let first = &bodies[0];
+    assert!(
+        first.contains("pub fn receipt"),
+        "the branch range must reach the reviewer: {first}"
+    );
+    assert!(
+        first.contains("本次分支审查由本地只读对象库解析"),
+        "the review must state that its object access started no process: {first}"
+    );
+}
+
 /// A fixed commit review may read that commit and its ancestors, never a
 /// later commit on the same branch. Without this, a reviewer could read the
 /// fix from a future commit and call it evidence about the reviewed object.
@@ -1289,19 +1360,12 @@ async fn a_commit_review_cannot_read_a_later_commit_as_evidence() {
 
     let bodies = server.request_bodies().await;
     let second = &bodies[1];
-    // Windows has no per-command network-denial backend, so `git_history`
-    // refuses every query before revision-scope validation. The reviewed
-    // commit still cannot become evidence; the fixed-commit review surface is
-    // a documented Windows limitation rather than a scope bypass.
-    #[cfg(not(windows))]
+    // Windows reads the same object database through the local reader, so
+    // the scope rule is identical on every host: the later commit is refused
+    // by ancestry, not by an unavailable network-deny backend.
     assert!(
         second.contains("outside the reviewed object's ancestry"),
         "a later commit must be refused: {second}"
-    );
-    #[cfg(windows)]
-    assert!(
-        second.contains("Windows network deny is not available"),
-        "the fixed-commit history query must fail closed on Windows: {second}"
     );
     assert!(
         !second.contains("pub fn receipt"),

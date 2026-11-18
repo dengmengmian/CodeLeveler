@@ -1,4 +1,5 @@
 //! `git_history` — structural, read-only queries over a repository's object
+//! `git_history` — structural, read-only queries over a repository's object
 //! database: a commit list, one commit's change, a file at a revision, a
 //! revision-scoped search/listing, and blame.
 //!
@@ -18,7 +19,10 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
+#[cfg(not(windows))]
 use leveler_vcs::GitWorkflow;
+#[cfg(windows)]
+use leveler_vcs::RepositoryHistory;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -90,6 +94,167 @@ impl GitHistoryTool {
             scope_tip: Some(tip.into()),
         }
     }
+    /// Read the object database directly on hosts without per-command network
+    /// denial. Every operation is a bounded file read; nothing is spawned.
+    #[cfg(windows)]
+    async fn execute_local(
+        &self,
+        input: Input,
+        context: &ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let root = context.require_workspace()?.root().to_path_buf();
+        let history = tokio::task::spawn_blocking(move || RepositoryHistory::open(&root))
+            .await
+            .map_err(|error| ToolError::Io(format!("join history open: {error}")))?
+            .map_err(|error| ToolError::Io(error.to_string()))?;
+        let history = std::sync::Arc::new(history);
+        let invalid_argument = |message: String| ToolError::InvalidArguments {
+            tool: self.name().to_string(),
+            message,
+        };
+        let default_rev = self.scope_tip.as_deref().unwrap_or("HEAD");
+        let rev =
+            valid_rev(input.rev.as_deref().unwrap_or(default_rev)).map_err(invalid_argument)?;
+        let path = match input.path.as_deref() {
+            Some(raw) => Some(
+                valid_path(raw).map_err(|message| ToolError::InvalidArguments {
+                    tool: self.name().to_string(),
+                    message,
+                })?,
+            ),
+            None => None,
+        };
+        if let Some(path) = &path {
+            context.execution_workspace()?.resolve_for_read(path)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Io("git_history cancelled".into()));
+        }
+
+        let resolve_rev = rev.clone();
+        let resolved = {
+            let history = std::sync::Arc::clone(&history);
+            tokio::task::spawn_blocking(move || history.resolve_commit_id(&resolve_rev))
+                .await
+                .map_err(|error| ToolError::Io(format!("join history resolve: {error}")))?
+        };
+        let sha = match resolved {
+            Ok(sha) => sha,
+            Err(error)
+                if matches!(
+                    error,
+                    leveler_vcs::HistoryError::InvalidRevision(_)
+                        | leveler_vcs::HistoryError::ObjectMissing(_)
+                ) =>
+            {
+                return Ok(invalid(format!(
+                    "cannot resolve revision `{rev}` to a commit: {error}"
+                )));
+            }
+            Err(error) => return Err(ToolError::Io(error.to_string())),
+        };
+
+        if let Some(tip) = &self.scope_tip {
+            let tip = tip.clone();
+            let sha_for_scope = sha.clone();
+            let (tip_sha, ancestry) = {
+                let history = std::sync::Arc::clone(&history);
+                tokio::task::spawn_blocking(move || {
+                    let tip_sha = history.resolve_commit_id(&tip)?;
+                    let ancestry = history.is_ancestor(&sha_for_scope, &tip_sha)?;
+                    Ok::<_, leveler_vcs::HistoryError>((tip_sha, ancestry))
+                })
+                .await
+                .map_err(|error| ToolError::Io(format!("join history scope: {error}")))?
+            }
+            .map_err(|error| ToolError::Io(error.to_string()))?;
+            let _ = tip_sha;
+            if !ancestry {
+                return Ok(invalid(format!(
+                    "revision `{rev}` is outside the reviewed object's ancestry (`{}`); \
+                     a review cannot use a later or sibling commit as evidence for it",
+                    self.scope_tip.as_deref().unwrap_or("HEAD")
+                )));
+            }
+        }
+
+        let query = {
+            let history = std::sync::Arc::clone(&history);
+            let action = input.action;
+            let sha = sha.clone();
+            let path = path.clone();
+            let pattern = input.pattern.clone();
+            let line_start = input.line_start;
+            let line_end = input.line_end;
+            let count = input
+                .max_count
+                .unwrap_or(DEFAULT_LOG_COUNT)
+                .clamp(1, MAX_LOG_COUNT);
+            tokio::task::spawn_blocking(move || match action {
+                Action::Log => history.log(&sha, count, path.as_deref()),
+                Action::Show => history.show(&sha, path.as_deref()),
+                Action::File => match &path {
+                    Some(path) => history.file(&sha, path),
+                    None => Err(leveler_vcs::HistoryError::InvalidPath(
+                        "action `file` requires `path`".into(),
+                    )),
+                },
+                Action::Search => match pattern.as_deref().map(str::trim) {
+                    Some(pattern) if !pattern.is_empty() => {
+                        if pattern.len() > MAX_PATTERN_BYTES || pattern.contains('\0') {
+                            return Err(leveler_vcs::HistoryError::InvalidRevision(
+                                "`pattern` is too long or contains a NUL byte".into(),
+                            ));
+                        }
+                        history.search(&sha, pattern, path.as_deref())
+                    }
+                    _ => Err(leveler_vcs::HistoryError::InvalidPath(
+                        "action `search` requires `pattern`".into(),
+                    )),
+                },
+                Action::List => history.list(&sha, path.as_deref()),
+                Action::Blame => match &path {
+                    Some(path) => {
+                        if line_start.is_some() != line_end.is_some() {
+                            return Err(leveler_vcs::HistoryError::InvalidRevision(
+                                "blame line ranges require both `line_start` and `line_end`".into(),
+                            ));
+                        }
+                        if let (Some(start), Some(end)) = (line_start, line_end)
+                            && (start == 0 || end < start)
+                        {
+                            return Err(leveler_vcs::HistoryError::InvalidRevision(
+                                "`line_start` must be >= 1 and `line_end` must be >= `line_start`"
+                                    .into(),
+                            ));
+                        }
+                        history.blame(&sha, path, line_start, line_end)
+                    }
+                    None => Err(leveler_vcs::HistoryError::InvalidPath(
+                        "action `blame` requires `path`".into(),
+                    )),
+                },
+            })
+            .await
+            .map_err(|error| ToolError::Io(format!("join history query: {error}")))?
+        };
+
+        match query {
+            Ok(text) => {
+                let body = if text.trim().is_empty() {
+                    "(no output)\n".to_string()
+                } else if text.ends_with('\n') {
+                    text
+                } else {
+                    format!("{text}\n")
+                };
+                Ok(ToolOutput::ok(body))
+            }
+            Err(error @ leveler_vcs::HistoryError::Io(_)) => Err(ToolError::Io(error.to_string())),
+            Err(error) => Ok(ToolOutput::error(format!("{error}\n"))),
+        }
+    }
 }
 
 impl Default for GitHistoryTool {
@@ -98,6 +263,7 @@ impl Default for GitHistoryTool {
     }
 }
 
+#[cfg(not(windows))]
 fn vcs(context: &ToolContext) -> Result<GitWorkflow, ToolError> {
     Ok(GitWorkflow::with_runner(
         context.require_workspace()?.root(),
@@ -148,6 +314,7 @@ fn invalid(message: impl Into<String>) -> ToolOutput {
     ToolOutput::error(format!("{}\n", message.into()))
 }
 
+#[cfg(not(windows))]
 fn render(output: leveler_execution::ProcessOutput) -> ToolOutput {
     if !output.success() {
         return ToolOutput::error(format!(
@@ -170,6 +337,7 @@ fn render(output: leveler_execution::ProcessOutput) -> ToolOutput {
     ToolOutput::ok(body)
 }
 
+#[cfg(not(windows))]
 fn render_part(output: &leveler_execution::ProcessOutput) -> Result<String, ToolOutput> {
     if !output.success() {
         return Err(ToolOutput::error(format!(
@@ -186,6 +354,7 @@ fn render_part(output: &leveler_execution::ProcessOutput) -> Result<String, Tool
 /// same first-parent diff the review brief uses, and say which parent was
 /// chosen. A merge is still readable by `file`/`search`/`list`; only the
 /// `show` rendering needs this special case.
+#[cfg(not(windows))]
 async fn show_merge(
     workflow: &GitWorkflow,
     sha: &str,
@@ -269,232 +438,244 @@ impl Tool for GitHistoryTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let workflow = vcs(&context)?;
-        let invalid_argument = |message: String| ToolError::InvalidArguments {
-            tool: self.name().to_string(),
-            message,
-        };
-        let default_rev = self.scope_tip.as_deref().unwrap_or("HEAD");
-        let rev =
-            valid_rev(input.rev.as_deref().unwrap_or(default_rev)).map_err(invalid_argument)?;
-        let path = match input.path.as_deref() {
-            Some(raw) => Some(
-                valid_path(raw).map_err(|message| ToolError::InvalidArguments {
-                    tool: self.name().to_string(),
-                    message,
-                })?,
-            ),
-            None => None,
-        };
-        // A path that names a credential/trust-gated file is refused by the
-        // same workspace authority file reads use. The object may not exist in
-        // the worktree (it can be deleted at this revision), so the check is
-        // applied to the lexical path, not to an existing file.
-        if let Some(path) = &path {
-            context.execution_workspace()?.resolve_for_read(path)?;
+        // Windows has no per-command network-denial backend, so the git
+        // subprocess path cannot run a fixed-object review. Read the object
+        // database directly instead: no process, no network, no hooks.
+        #[cfg(windows)]
+        {
+            return self.execute_local(input, &context, cancellation).await;
         }
+        #[cfg(not(windows))]
+        {
+            let workflow = vcs(&context)?;
+            let invalid_argument = |message: String| ToolError::InvalidArguments {
+                tool: self.name().to_string(),
+                message,
+            };
+            let default_rev = self.scope_tip.as_deref().unwrap_or("HEAD");
+            let rev =
+                valid_rev(input.rev.as_deref().unwrap_or(default_rev)).map_err(invalid_argument)?;
+            let path = match input.path.as_deref() {
+                Some(raw) => {
+                    Some(
+                        valid_path(raw).map_err(|message| ToolError::InvalidArguments {
+                            tool: self.name().to_string(),
+                            message,
+                        })?,
+                    )
+                }
+                None => None,
+            };
+            // A path that names a credential/trust-gated file is refused by the
+            // same workspace authority file reads use. The object may not exist in
+            // the worktree (it can be deleted at this revision), so the check is
+            // applied to the lexical path, not to an existing file.
+            if let Some(path) = &path {
+                context.execution_workspace()?.resolve_for_read(path)?;
+            }
 
-        // Resolve ONCE, then use the SHA. `--end-of-options` keeps a
-        // revision-shaped option from being read as one, and `^{commit}`
-        // refuses a tree/blob instead of silently accepting it.
-        let verify = workflow
-            .inspect_history(
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--end-of-options",
-                    &format!("{rev}^{{commit}}"),
-                ],
-                cancellation.clone(),
-            )
-            .await
-            .map_err(|error| ToolError::Io(error.to_string()))?;
-        if !verify.success() {
-            return Ok(invalid(format!(
-                "cannot resolve revision `{rev}` to a commit: {}",
-                format!("{}{}", verify.stdout, verify.stderr).trim()
-            )));
-        }
-        let sha = verify.stdout.trim().to_string();
-        if sha.is_empty() {
-            return Ok(invalid(format!("revision `{rev}` resolved to nothing")));
-        }
-        // A fixed-object review may read the reviewed tip and its history.
-        // A sibling/later ref (for example the branch that fixed this defect)
-        // is outside the object and must not become evidence.
-        if let Some(tip) = &self.scope_tip {
-            let tip_verify = workflow
+            // Resolve ONCE, then use the SHA. `--end-of-options` keeps a
+            // revision-shaped option from being read as one, and `^{commit}`
+            // refuses a tree/blob instead of silently accepting it.
+            let verify = workflow
                 .inspect_history(
                     &[
                         "rev-parse",
                         "--verify",
                         "--end-of-options",
-                        &format!("{tip}^{{commit}}"),
+                        &format!("{rev}^{{commit}}"),
                     ],
                     cancellation.clone(),
                 )
                 .await
                 .map_err(|error| ToolError::Io(error.to_string()))?;
-            if !tip_verify.success() {
+            if !verify.success() {
                 return Ok(invalid(format!(
-                    "the review's object revision `{tip}` cannot be resolved"
+                    "cannot resolve revision `{rev}` to a commit: {}",
+                    format!("{}{}", verify.stdout, verify.stderr).trim()
                 )));
             }
-            let tip_sha = tip_verify.stdout.trim().to_string();
-            let ancestry = workflow
-                .inspect_history(
-                    &["merge-base", "--is-ancestor", &sha, &tip_sha],
-                    cancellation.clone(),
-                )
-                .await
-                .map_err(|error| ToolError::Io(error.to_string()))?;
-            match ancestry.exit_code {
-                Some(0) => {}
-                Some(1) => {
-                    return Ok(invalid(format!(
-                        "revision `{rev}` is outside the reviewed object's ancestry (`{tip}`); \
-                         a review cannot use a later or sibling commit as evidence for it"
-                    )));
-                }
-                _ => {
-                    return Err(ToolError::Io(format!(
-                        "could not check whether `{rev}` belongs to the reviewed object: {}",
-                        format!("{}{}", ancestry.stdout, ancestry.stderr).trim()
-                    )));
-                }
+            let sha = verify.stdout.trim().to_string();
+            if sha.is_empty() {
+                return Ok(invalid(format!("revision `{rev}` resolved to nothing")));
             }
-        }
-
-        let args: Vec<String> = match input.action {
-            Action::Log => {
-                let count = input
-                    .max_count
-                    .unwrap_or(DEFAULT_LOG_COUNT)
-                    .clamp(1, MAX_LOG_COUNT);
-                let mut args = vec![
-                    "--no-pager".into(),
-                    "log".into(),
-                    "--no-show-signature".into(),
-                    "--format=%H%x09%aI%x09%an%x09%s".into(),
-                    "-n".into(),
-                    count.to_string(),
-                    sha.clone(),
-                ];
-                if let Some(path) = &path {
-                    args.push("--".into());
-                    args.push(path.clone());
-                }
-                args
-            }
-            Action::Show => {
-                let parents = workflow
+            // A fixed-object review may read the reviewed tip and its history.
+            // A sibling/later ref (for example the branch that fixed this defect)
+            // is outside the object and must not become evidence.
+            if let Some(tip) = &self.scope_tip {
+                let tip_verify = workflow
                     .inspect_history(
-                        &["rev-list", "--parents", "-n", "1", &sha],
+                        &[
+                            "rev-parse",
+                            "--verify",
+                            "--end-of-options",
+                            &format!("{tip}^{{commit}}"),
+                        ],
                         cancellation.clone(),
                     )
                     .await
                     .map_err(|error| ToolError::Io(error.to_string()))?;
-                if parents.success() && parents.stdout.split_whitespace().count() > 2 {
-                    return show_merge(&workflow, &sha, path.as_deref(), cancellation).await;
+                if !tip_verify.success() {
+                    return Ok(invalid(format!(
+                        "the review's object revision `{tip}` cannot be resolved"
+                    )));
                 }
-                let mut args = vec![
-                    "--no-pager".into(),
-                    "show".into(),
-                    "--no-ext-diff".into(),
-                    "--no-textconv".into(),
-                    "--format=fuller".into(),
-                    "--stat".into(),
-                    "--patch".into(),
-                    sha.clone(),
-                ];
-                if let Some(path) = &path {
-                    args.push("--".into());
-                    args.push(path.clone());
+                let tip_sha = tip_verify.stdout.trim().to_string();
+                let ancestry = workflow
+                    .inspect_history(
+                        &["merge-base", "--is-ancestor", &sha, &tip_sha],
+                        cancellation.clone(),
+                    )
+                    .await
+                    .map_err(|error| ToolError::Io(error.to_string()))?;
+                match ancestry.exit_code {
+                    Some(0) => {}
+                    Some(1) => {
+                        return Ok(invalid(format!(
+                            "revision `{rev}` is outside the reviewed object's ancestry (`{tip}`); \
+                         a review cannot use a later or sibling commit as evidence for it"
+                        )));
+                    }
+                    _ => {
+                        return Err(ToolError::Io(format!(
+                            "could not check whether `{rev}` belongs to the reviewed object: {}",
+                            format!("{}{}", ancestry.stdout, ancestry.stderr).trim()
+                        )));
+                    }
                 }
-                args
             }
-            Action::File => {
-                let Some(path) = &path else {
-                    return Ok(invalid("action `file` requires `path`"));
-                };
-                vec!["--no-pager".into(), "show".into(), format!("{sha}:{path}")]
-            }
-            Action::Search => {
-                let Some(pattern) = input
-                    .pattern
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|pattern| !pattern.is_empty())
-                else {
-                    return Ok(invalid("action `search` requires `pattern`"));
-                };
-                if pattern.len() > MAX_PATTERN_BYTES || pattern.contains('\0') {
-                    return Ok(invalid("`pattern` is too long or contains a NUL byte"));
+
+            let args: Vec<String> = match input.action {
+                Action::Log => {
+                    let count = input
+                        .max_count
+                        .unwrap_or(DEFAULT_LOG_COUNT)
+                        .clamp(1, MAX_LOG_COUNT);
+                    let mut args = vec![
+                        "--no-pager".into(),
+                        "log".into(),
+                        "--no-show-signature".into(),
+                        "--format=%H%x09%aI%x09%an%x09%s".into(),
+                        "-n".into(),
+                        count.to_string(),
+                        sha.clone(),
+                    ];
+                    if let Some(path) = &path {
+                        args.push("--".into());
+                        args.push(path.clone());
+                    }
+                    args
                 }
-                let mut args = vec![
-                    "--no-pager".into(),
-                    "grep".into(),
-                    "-n".into(),
-                    "-I".into(),
-                    "-e".into(),
-                    pattern.to_string(),
-                    sha.clone(),
-                ];
-                if let Some(path) = &path {
-                    args.push("--".into());
-                    args.push(path.clone());
+                Action::Show => {
+                    let parents = workflow
+                        .inspect_history(
+                            &["rev-list", "--parents", "-n", "1", &sha],
+                            cancellation.clone(),
+                        )
+                        .await
+                        .map_err(|error| ToolError::Io(error.to_string()))?;
+                    if parents.success() && parents.stdout.split_whitespace().count() > 2 {
+                        return show_merge(&workflow, &sha, path.as_deref(), cancellation).await;
+                    }
+                    let mut args = vec![
+                        "--no-pager".into(),
+                        "show".into(),
+                        "--no-ext-diff".into(),
+                        "--no-textconv".into(),
+                        "--format=fuller".into(),
+                        "--stat".into(),
+                        "--patch".into(),
+                        sha.clone(),
+                    ];
+                    if let Some(path) = &path {
+                        args.push("--".into());
+                        args.push(path.clone());
+                    }
+                    args
                 }
-                args
-            }
-            Action::List => {
-                let mut args = vec![
-                    "--no-pager".into(),
-                    "ls-tree".into(),
-                    "-r".into(),
-                    "--name-only".into(),
-                    sha.clone(),
-                ];
-                if let Some(path) = &path {
-                    args.push("--".into());
-                    args.push(path.clone());
+                Action::File => {
+                    let Some(path) = &path else {
+                        return Ok(invalid("action `file` requires `path`"));
+                    };
+                    vec!["--no-pager".into(), "show".into(), format!("{sha}:{path}")]
                 }
-                args
-            }
-            Action::Blame => {
-                let Some(path) = &path else {
-                    return Ok(invalid("action `blame` requires `path`"));
-                };
-                let mut args = vec!["--no-pager".into(), "blame".into(), "--abbrev=12".into()];
-                match (input.line_start, input.line_end) {
-                    (Some(start), Some(end)) => {
-                        if start == 0 || end < start {
+                Action::Search => {
+                    let Some(pattern) = input
+                        .pattern
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|pattern| !pattern.is_empty())
+                    else {
+                        return Ok(invalid("action `search` requires `pattern`"));
+                    };
+                    if pattern.len() > MAX_PATTERN_BYTES || pattern.contains('\0') {
+                        return Ok(invalid("`pattern` is too long or contains a NUL byte"));
+                    }
+                    let mut args = vec![
+                        "--no-pager".into(),
+                        "grep".into(),
+                        "-n".into(),
+                        "-I".into(),
+                        "-e".into(),
+                        pattern.to_string(),
+                        sha.clone(),
+                    ];
+                    if let Some(path) = &path {
+                        args.push("--".into());
+                        args.push(path.clone());
+                    }
+                    args
+                }
+                Action::List => {
+                    let mut args = vec![
+                        "--no-pager".into(),
+                        "ls-tree".into(),
+                        "-r".into(),
+                        "--name-only".into(),
+                        sha.clone(),
+                    ];
+                    if let Some(path) = &path {
+                        args.push("--".into());
+                        args.push(path.clone());
+                    }
+                    args
+                }
+                Action::Blame => {
+                    let Some(path) = &path else {
+                        return Ok(invalid("action `blame` requires `path`"));
+                    };
+                    let mut args = vec!["--no-pager".into(), "blame".into(), "--abbrev=12".into()];
+                    match (input.line_start, input.line_end) {
+                        (Some(start), Some(end)) => {
+                            if start == 0 || end < start {
+                                return Ok(invalid(
+                                    "`line_start` must be >= 1 and `line_end` must be >= `line_start`",
+                                ));
+                            }
+                            args.push("-L".into());
+                            args.push(format!("{start},{end}"));
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
                             return Ok(invalid(
-                                "`line_start` must be >= 1 and `line_end` must be >= `line_start`",
+                                "blame line ranges require both `line_start` and `line_end`",
                             ));
                         }
-                        args.push("-L".into());
-                        args.push(format!("{start},{end}"));
+                        (None, None) => {}
                     }
-                    (Some(_), None) | (None, Some(_)) => {
-                        return Ok(invalid(
-                            "blame line ranges require both `line_start` and `line_end`",
-                        ));
-                    }
-                    (None, None) => {}
+                    args.push(sha.clone());
+                    args.push("--".into());
+                    args.push(path.clone());
+                    args
                 }
-                args.push(sha.clone());
-                args.push("--".into());
-                args.push(path.clone());
-                args
-            }
-        };
+            };
 
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = workflow
-            .inspect_history(&argv, cancellation)
-            .await
-            .map_err(|error| ToolError::Io(error.to_string()))?;
-        Ok(render(output))
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let output = workflow
+                .inspect_history(&argv, cancellation)
+                .await
+                .map_err(|error| ToolError::Io(error.to_string()))?;
+            Ok(render(output))
+        }
     }
 }
 
@@ -765,6 +946,120 @@ mod tests {
         )
         .await;
         assert!(out.content.contains("bug_marker"), "{}", out.content);
+        std::fs::remove_dir_all(&f.dir).ok();
+    }
+
+    /// The Windows path must not depend on a `git` executable at all. Give
+    /// the execution environment a PATH that contains nothing and exercise
+    /// every action; a spawn would fail, a direct object read cannot.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reads_fixed_commits_without_a_git_executable_on_path() {
+        let f = fixture();
+        let empty = tempfile::tempdir().unwrap();
+        let values: Vec<_> = std::env::vars_os()
+            .filter(|(key, _)| !key.eq_ignore_ascii_case("GIT_DIR"))
+            .filter(|(key, _)| !key.eq_ignore_ascii_case("GIT_WORK_TREE"))
+            .map(|(key, value)| {
+                if key.eq_ignore_ascii_case("PATH") {
+                    (key, empty.path().as_os_str().to_os_string())
+                } else {
+                    (key, value)
+                }
+            })
+            .collect();
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            values,
+            f.dir.clone(),
+            std::env::temp_dir(),
+        ));
+        let ctx = ToolContext::with_environment(
+            leveler_execution::Workspace::new(&f.dir).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+            environment,
+        );
+        for input in [
+            serde_json::json!({"action": "file", "rev": f.first, "path": "src/a.rs"}),
+            serde_json::json!({"action": "log", "rev": f.second, "max_count": 2}),
+            serde_json::json!({"action": "show", "rev": f.first}),
+            serde_json::json!({"action": "search", "rev": f.first, "pattern": "bug_marker"}),
+            serde_json::json!({"action": "list", "rev": f.first}),
+            serde_json::json!({
+                "action": "blame", "rev": f.first, "path": "src/a.rs",
+                "line_start": 1, "line_end": 1
+            }),
+        ] {
+            let out = run(&ctx, input.clone()).await;
+            assert!(!out.is_error, "{input}: {}", out.content);
+        }
+        std::fs::remove_dir_all(&f.dir).ok();
+    }
+
+    /// A fixed-object review pins a SHA. A branch or HEAD that moves after
+    /// the tool was constructed cannot change the default revision, and a
+    /// later commit remains outside the reviewed ancestry.
+    #[tokio::test]
+    async fn a_moved_head_cannot_change_a_pinned_review_object() {
+        let f = fixture();
+        let ctx = ctx(&f.dir);
+        let tool = GitHistoryTool::scoped_to(f.first.clone());
+        std::fs::write(f.dir.join("src/later.rs"), "pub fn later_marker() {}\n").unwrap();
+        git(&f.dir, &["add", "."]);
+        git(&f.dir, &["commit", "-q", "-m", "C: later"]);
+        let later = rev(&f.dir, "HEAD");
+
+        let default_read = tool
+            .execute(
+                serde_json::json!({"action": "file", "path": "src/a.rs"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!default_read.is_error, "{}", default_read.content);
+        assert!(default_read.content.contains("bug_marker"));
+        assert!(!default_read.content.contains("fixed_marker"));
+
+        let outside = tool
+            .execute(
+                serde_json::json!({"action": "file", "rev": later, "path": "src/later.rs"}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(outside.is_error, "{}", outside.content);
+        assert!(
+            outside
+                .content
+                .contains("outside the reviewed object's ancestry"),
+            "{}",
+            outside.content
+        );
+        std::fs::remove_dir_all(&f.dir).ok();
+    }
+
+    /// A packed object database (the normal shape after `git gc`) reads the
+    /// same evidence as loose objects.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn packed_history_is_readable_through_the_tool() {
+        let f = fixture();
+        git(&f.dir, &["gc", "--aggressive", "--prune=now"]);
+        let ctx = ctx(&f.dir);
+        let file = run(
+            &ctx,
+            serde_json::json!({"action": "file", "rev": f.first, "path": "src/a.rs"}),
+        )
+        .await;
+        assert!(file.content.contains("bug_marker"), "{}", file.content);
+        let show = run(&ctx, serde_json::json!({"action": "show", "rev": f.first})).await;
+        assert!(!show.is_error, "{}", show.content);
+        assert!(
+            show.content.contains("+pub fn bug_marker"),
+            "{}",
+            show.content
+        );
         std::fs::remove_dir_all(&f.dir).ok();
     }
 }

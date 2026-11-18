@@ -12,12 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor;
-use crossterm::event::{
-    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size};
-use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{broadcast::error::RecvError, mpsc};
@@ -28,6 +25,7 @@ use leveler_client_protocol::{
 };
 
 use crate::action::{Action, CleanHost, Effect, EffectCompletion, UrlOpener};
+use crate::input_guard::TerminalInput;
 use crate::reducer::reduce;
 use crate::render::render;
 use crate::screen::Screen;
@@ -147,8 +145,11 @@ pub async fn run(
     let theme_id = crate::theme_config::load_theme_id().unwrap_or(crate::theme::ThemeId::DEFAULT);
     let mut state = AppState::new(Theme::resolve(theme_id, Theme::env_no_color()), boot);
     state.runtime_outlives_client = exit_scope == crate::exit::ClientExitScope::DetachesFromRuntime;
+    let mut startup_input = crate::input_guard::StartupInput::default();
     if !state.theme.monochrome {
-        match crate::splash::NativeMascot::detect() {
+        let (image, startup) = crate::splash::NativeMascot::detect();
+        startup_input = startup;
+        match image {
             Ok(image) => state.welcome_image = image,
             Err(error) => {
                 tracing::warn!(%error, "welcome PNG could not be decoded; hiding the image")
@@ -310,7 +311,7 @@ pub async fn run(
         );
     }
 
-    let mut term_events = EventStream::new();
+    let mut term_events = TerminalInput::with_startup(startup_input);
     let mut tick = tokio::time::interval(BUSY_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Origin of the UI's motion clock. Live animations sweep on elapsed time
@@ -367,26 +368,27 @@ pub async fn run(
         } else if !state.terminal_lost
             && let Some(action) = pending_terminal_actions.pop_front()
         {
+            if let Action::Resize(cols, rows) = &action {
+                state.size = (*cols, *rows);
+            }
             effects = reduce(&mut state, action);
             paint_now = true;
         } else {
             tokio::select! {
                 maybe = term_events.next(), if !state.terminal_lost => {
                 match maybe {
-                    Some(Ok(ev)) => {
-                        if let CtEvent::Resize(c, r) = ev {
-                            state.size = (c, r);
+                    Some(Ok(action)) => {
+                        if let Action::Resize(cols, rows) = &action {
+                            state.size = (*cols, *rows);
                         }
-                        if let Some(action) = map_terminal_event(ev) {
-                            let action = maybe_coalesce_text_input(
-                                action,
-                                &state,
-                                &mut term_events,
-                                &mut pending_terminal_actions,
-                            )
-                            .await?;
-                            effects = reduce(&mut state, action);
-                        }
+                        let action = maybe_coalesce_text_input(
+                            action,
+                            &state,
+                            &mut term_events,
+                            &mut pending_terminal_actions,
+                        )
+                        .await?;
+                        effects = reduce(&mut state, action);
                         paint_now = true;
                         requests_since_frame += 1;
                     }
@@ -1618,16 +1620,6 @@ fn flush_welcome_cleanup(stdout: &mut Stdout, state: &mut AppState) -> io::Resul
     stdout.flush()
 }
 
-fn map_terminal_event(event: CtEvent) -> Option<Action> {
-    match event {
-        CtEvent::Key(key) => Some(Action::Key(key)),
-        CtEvent::Mouse(mouse) => Some(Action::Mouse(mouse)),
-        CtEvent::Paste(text) => Some(Action::Paste(text)),
-        CtEvent::Resize(cols, rows) => Some(Action::Resize(cols, rows)),
-        _ => None,
-    }
-}
-
 /// Forward handled termination signals into the event loop.
 ///
 /// A default SIGTERM/SIGHUP kills the process without restoring the terminal or
@@ -1685,7 +1677,7 @@ fn spawn_termination_forwarder(tx: mpsc::UnboundedSender<()>) {
 async fn maybe_coalesce_text_input(
     first: Action,
     state: &AppState,
-    term_events: &mut EventStream,
+    term_events: &mut TerminalInput,
     pending: &mut VecDeque<Action>,
 ) -> io::Result<Action> {
     let Action::Key(key) = first else {
@@ -1715,9 +1707,9 @@ async fn maybe_coalesce_text_input(
     text.push(first_char);
     loop {
         let next = tokio::time::timeout(INPUT_BURST_WINDOW, term_events.next()).await;
-        let event = match next {
+        let action = match next {
             Err(_) => break,
-            Ok(Some(Ok(event))) => event,
+            Ok(Some(Ok(action))) => action,
             Ok(Some(Err(error))) => return Err(error),
             Ok(None) => {
                 return Err(io::Error::new(
@@ -1725,9 +1717,6 @@ async fn maybe_coalesce_text_input(
                     "terminal input closed",
                 ));
             }
-        };
-        let Some(action) = map_terminal_event(event) else {
-            continue;
         };
         match action {
             Action::Key(key) => {

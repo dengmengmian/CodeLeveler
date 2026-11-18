@@ -33,6 +33,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use leveler_win_confine::IntegrityLabel;
+// The audited Win32 boundary also owns the stable filesystem object identity
+// used by resource grants. Callers reach it through this module so no other
+// crate needs windows-sys.
+#[cfg(windows)]
+pub use leveler_win_confine::file_object_identity_of_raw_handle;
+pub use leveler_win_confine::{FileObjectIdentity, file_identity_supported, file_object_identity};
 
 /// The name of the launcher binary, next to the running executable.
 const LAUNCHER_NAME: &str = "leveler-confine.exe";

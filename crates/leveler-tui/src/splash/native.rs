@@ -4,6 +4,8 @@ use image::{DynamicImage, ImageFormat};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::{StatefulProtocol, StatefulProtocolType};
 
+use crate::input_guard::{DeviceReplyFilter, StartupInput};
+
 const PNG: &[u8] = include_bytes!("../../../../assets/brand/codeleveler-mascot.png");
 
 pub(crate) struct NativeMascot {
@@ -26,7 +28,7 @@ impl std::fmt::Debug for NativeMascot {
 }
 
 impl NativeMascot {
-    pub(crate) fn detect() -> Result<Option<Self>, image::ImageError> {
+    pub(crate) fn detect() -> (Result<Option<Self>, image::ImageError>, StartupInput) {
         let env = leveler_core::environment();
         let multiplexer = env.var_os("TMUX").is_some() || env.var_os("STY").is_some();
         let wt_session = env.var_os("WT_SESSION").is_some();
@@ -34,7 +36,11 @@ impl NativeMascot {
         // advertises Sixel with attribute 4, so ask the terminal rather than
         // guessing from the OS name. The probe is bounded and runs before the
         // first frame; a failed probe simply keeps the image hidden.
-        let sixel = wt_session && !multiplexer && probe_sixel();
+        let (sixel, startup) = if wt_session && !multiplexer {
+            probe_sixel()
+        } else {
+            (false, StartupInput::default())
+        };
         let protocol = protocol_for(
             env.var("TERM_PROGRAM").as_deref(),
             env.var("TERM").as_deref(),
@@ -44,7 +50,7 @@ impl NativeMascot {
             sixel,
         );
         let Some(protocol) = protocol else {
-            return Ok(None);
+            return (Ok(None), startup);
         };
         let font = crossterm::terminal::window_size()
             .ok()
@@ -54,7 +60,7 @@ impl NativeMascot {
                 (w > 0 && h > 0).then_some((w, h))
             })
             .unwrap_or((10, 20));
-        Self::new(protocol, font).map(Some)
+        (Self::new(protocol, font).map(Some), startup)
     }
 
     pub(crate) fn new(protocol: ProtocolType, font: (u16, u16)) -> Result<Self, image::ImageError> {
@@ -211,36 +217,41 @@ fn protocol_for(
 ///
 /// Only Windows Terminal needs this path: it sets neither TERM nor
 /// TERM_PROGRAM, and its DA1 reply (`ESC[?61;4;...c`) advertises Sixel with
-/// attribute 4. The probe is bounded to 150 ms and runs after raw mode is
-/// enabled but before the first frame. A key already waiting means the user is
-/// typing, so the probe backs off instead of consuming it.
+/// attribute 4. The probe is bounded to 150 ms (extended once a reply starts)
+/// and runs after raw mode is enabled but before the first frame.
+///
+/// The reply parser is the same [`DeviceReplyFilter`] the event loop uses.
+/// Anything the probe reads that is not part of a reply is returned as
+/// startup input, so a key a user pressed during startup is delivered rather
+/// than consumed. A reply prefix that did not finish is handed back too, so
+/// the event loop can recognize its continuation whenever it arrives.
 #[cfg(windows)]
-fn probe_sixel() -> bool {
+fn probe_sixel() -> (bool, StartupInput) {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
-    use crossterm::event::{Event, KeyCode, poll, read};
+    use crossterm::event::{Event, poll, read};
 
+    use crate::action::Action;
+
+    let mut startup = StartupInput::default();
     // A just-created terminal window often has a Resize or mouse event queued.
     // Those are terminal bookkeeping, not user input; discard them after a
-    // short settle so the DA1 reply can be read. A pending key does back off.
+    // short settle so the DA1 reply can be read. A pending key is the user
+    // already typing: back off and hand it to the event loop.
     std::thread::sleep(Duration::from_millis(30));
-    let mut key_pending = false;
     for _ in 0..64 {
         match poll(Duration::ZERO) {
             Ok(true) => match read() {
-                Ok(Event::Key(_)) => {
-                    key_pending = true;
-                    break;
+                Ok(Event::Key(key)) => {
+                    startup.push_user(Action::Key(key));
+                    return (false, startup);
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => return (false, startup),
             },
             _ => break,
         }
-    }
-    if key_pending {
-        return false;
     }
     let mut stdout = std::io::stdout();
     if stdout
@@ -248,71 +259,49 @@ fn probe_sixel() -> bool {
         .and_then(|_| stdout.flush())
         .is_err()
     {
-        return false;
+        return (false, startup);
     }
-    // The terminal may answer slower than the initial budget when the host is
-    // busy. Starting a reply earns it its own window: a half-read sequence
-    // would otherwise stay in the input queue and reach the composer as if
-    // the user had typed it.
-    let started_at = Instant::now();
-    let mut deadline = started_at + Duration::from_millis(150);
-    let mut started = false;
-    let mut response = String::new();
+    let mut filter = DeviceReplyFilter::new();
+    let mut deadline = Instant::now() + Duration::from_millis(150);
+    let mut extended = false;
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
         match poll(left) {
             Ok(true) => match read() {
                 Ok(Event::Key(key)) => {
-                    if !started && is_da1_start(&key) {
-                        started = true;
+                    for action in filter.push(Action::Key(key)) {
+                        startup.push_user(action);
+                    }
+                    if let Some(reply) = filter.take_completed_reply() {
+                        return (da1_advertises_sixel(&reply), startup);
+                    }
+                    if filter.is_buffering() && !extended {
+                        // A reply started; give it room to finish.
+                        extended = true;
                         deadline = Instant::now() + Duration::from_millis(1_000);
                     }
-                    match key.code {
-                        KeyCode::Esc => response.push('\x1b'),
-                        KeyCode::Char(c) => response.push(c),
-                        _ => {}
-                    }
-                    if response.ends_with('c') {
-                        break;
+                    if filter.deadline().is_none() {
+                        // A complete non-reply burst: the user is typing.
+                        return (false, startup);
                     }
                 }
                 Ok(_) => {}
-                Err(_) => return false,
+                Err(_) => return (false, startup),
             },
             _ => break,
         }
     }
-    if started && !response.ends_with('c') {
-        // The reply started but did not finish. Consume what is already
-        // queued: it is the solicited terminal response, and delivering its
-        // tail to the composer would read as the user's own typing. The
-        // probe still reports no capability, so the image stays hidden.
-        for _ in 0..256 {
-            match poll(Duration::ZERO) {
-                Ok(true) => {
-                    let _ = read();
-                }
-                _ => break,
-            }
-        }
+    // A prefix that did not finish belongs to the runtime filter: its
+    // continuation is still a device reply, not user text.
+    for action in filter.flush() {
+        startup.push_reply(action);
     }
-    da1_advertises_sixel(&response)
-}
-
-/// The first token of a DA1 reply. Crossterm may consume the leading ESC while
-/// parsing the sequence, so a bare `[` (or `?`) opens it too.
-#[cfg(any(windows, test))]
-fn is_da1_start(key: &crossterm::event::KeyEvent) -> bool {
-    use crossterm::event::KeyCode;
-    matches!(
-        key.code,
-        KeyCode::Esc | KeyCode::Char('[') | KeyCode::Char('?')
-    )
+    (false, startup)
 }
 
 #[cfg(not(windows))]
-fn probe_sixel() -> bool {
-    false
+fn probe_sixel() -> (bool, StartupInput) {
+    (false, StartupInput::default())
 }
 
 #[cfg(any(windows, test))]
@@ -451,19 +440,38 @@ mod tests {
         assert!(!da1_advertises_sixel(""));
     }
 
-    /// A DA1 reply can be split across reads. Only its own opening tokens may
-    /// claim the extended window and the drain of an unfinished reply; an
-    /// ordinary user key during startup must not.
+    /// The probe and the runtime share one parser: a reply split across reads
+    /// stays buffered until its final `c`, and no other key claims it. The
+    /// filter's own tests cover the replay of a non-matching prefix.
     #[test]
-    fn only_a_da1_reply_opener_extended_the_probe() {
+    fn the_probe_and_the_runtime_share_the_da1_grammar() {
+        use crate::action::Action;
+        use crate::input_guard::DeviceReplyFilter;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        assert!(is_da1_start(&key(KeyCode::Esc)));
-        assert!(is_da1_start(&key(KeyCode::Char('['))));
-        assert!(is_da1_start(&key(KeyCode::Char('?'))));
-        assert!(!is_da1_start(&key(KeyCode::Char('a'))));
-        assert!(!is_da1_start(&key(KeyCode::Enter)));
-        assert!(!is_da1_start(&key(KeyCode::Backspace)));
+        let key = |code| Action::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let mut filter = DeviceReplyFilter::new();
+        for code in [KeyCode::Esc, KeyCode::Char('['), KeyCode::Char('?')] {
+            assert!(filter.push(key(code)).is_empty());
+            assert!(filter.is_buffering());
+        }
+        for code in [
+            KeyCode::Char('6'),
+            KeyCode::Char('1'),
+            KeyCode::Char(';'),
+            KeyCode::Char('4'),
+        ] {
+            assert!(filter.push(key(code)).is_empty());
+        }
+        assert!(filter.push(key(KeyCode::Char('c'))).is_empty());
+        assert_eq!(filter.take_completed_reply().as_deref(), Some("[?61;4c"));
+
+        let mut filter = DeviceReplyFilter::new();
+        let mut replay = Vec::new();
+        for code in [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Backspace] {
+            replay.extend(filter.push(key(code)));
+        }
+        assert_eq!(replay.len(), 3);
+        assert!(!filter.is_buffering());
     }
 
     #[test]

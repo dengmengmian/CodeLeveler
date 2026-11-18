@@ -1026,6 +1026,33 @@ mod tests {
 
     /// PB_B_ORCH_1: a child with zero claimed paths reached apply_patch and
     /// created files. The tool itself must refuse, not only the drive loop.
+    /// An external update must expose a reusable binding on Windows; this is
+    /// the request the approval surface offers as Session/Project consent.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_external_update_patch_produces_reusable_bindings() {
+        use leveler_execution::PermissionProfile;
+        let (context, _workspace) = super::super::test_ctx(PermissionProfile::Assisted, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("approved.txt");
+        std::fs::write(&path, "original\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-original\n+first\n*** End Patch",
+            path.display()
+        );
+        let bindings = ApplyPatchTool
+            .grant_bindings(&serde_json::json!({ "patch": patch }), &context)
+            .await
+            .unwrap();
+        let bindings = bindings.unwrap_or_else(|| panic!("a reusable binding is required"));
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.capability == leveler_core::Capability::FilesystemWrite),
+            "{bindings:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn resource_patch_failure_restores_own_commit_but_preserves_third_party_replacement() {

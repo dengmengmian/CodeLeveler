@@ -1854,6 +1854,192 @@ fn resolve_project(repo: &Path) -> Result<ResolvedScope, ClientError> {
     })
 }
 
+/// Resolve a fixed commit without starting a Git process.
+///
+/// Windows has no per-command network denial, so every object this review
+/// presents has to come from the local object database. The reader verifies
+/// each object's hash; a missing object is an error, never a worktree
+/// fallback. The worktree's dirty state is estimated by comparing HEAD's tree
+/// with the files on disk (tracked files only).
+#[cfg(windows)]
+fn resolve_commit(repo: &Path, rev: &str) -> Result<ResolvedScope, ClientError> {
+    let history = leveler_vcs::RepositoryHistory::open(repo)
+        .map_err(|error| ClientError::Runtime(format!("无法打开本地 Git 对象库：{error}")))?;
+    let sha = history
+        .resolve_commit_id(rev)
+        .map_err(|_| ClientError::Runtime(format!("无法解析 Commit `{rev}`")))?;
+    let commit = history
+        .commit(&sha)
+        .map_err(|error| ClientError::Runtime(format!("无法读取 Commit `{rev}`：{error}")))?;
+    let is_merge = commit.parents.len() > 1;
+    let parent = commit.parents.first().cloned();
+    let diff = history
+        .show(&sha, None)
+        .map_err(|error| ClientError::Runtime(format!("无法读取 Commit `{rev}`：{error}")))?;
+    let files = match &parent {
+        Some(parent) => history.changed_files(parent, &sha).map_err(|error| {
+            ClientError::Runtime(format!("无法读取 Commit `{rev}` 的变更文件：{error}"))
+        })?,
+        None => history
+            .list(&sha, None)
+            .map_err(|error| {
+                ClientError::Runtime(format!("无法读取 Commit `{rev}` 的树：{error}"))
+            })?
+            .lines()
+            .map(str::to_string)
+            .collect(),
+    };
+    let head = history
+        .head()
+        .map_err(|error| ClientError::Runtime(format!("无法读取当前 HEAD：{error}")))?;
+    let dirty = history
+        .worktree_dirty()
+        .map_err(|error| ClientError::Runtime(format!("无法比较工作区与 HEAD：{error}")))?;
+
+    let mut notes: Vec<String> = vec![
+        "本次固定 Commit 审查由本地只读对象库解析，未启动外部 Git 进程，因此不会触网、不会执行仓库代码。"
+            .to_string(),
+        "工作区 dirty 状态由 HEAD 树与工作区文件内容比较估算；未跟踪文件不参与该判断。".to_string(),
+    ];
+    if is_merge {
+        notes.push(
+            "这是合并提交；diff 取第一父提交，不是合并提交相对所有父提交的组合 diff。".to_string(),
+        );
+    } else if files.is_empty() {
+        notes.push(format!(
+            "Commit `{rev}` 没有可展示的 diff（可能是空提交）。"
+        ));
+    }
+    if head.as_deref() != Some(sha.as_str()) {
+        notes.push(format!(
+            "审查对象是 Commit `{sha}`，但文件工具读取的是当前工作区{}。\
+             源码读取结果可能与该 Commit 的树不同；以 diff 为准，不要声称读取了该版本的完整源码。",
+            head.as_deref()
+                .map(|head| format!("（HEAD {head}）"))
+                .unwrap_or_default()
+        ));
+    } else if dirty {
+        notes.push(
+            "工作区有未提交变更，它们不在该 Commit 的 diff 中；\
+             文件工具读取的源码可能比审查对象新。"
+                .to_string(),
+        );
+    }
+    let limitation = Some(notes.join("\n\n"));
+    let object = UiReviewObject {
+        workspace: Some(repo.display().to_string()),
+        head: head.clone(),
+        dirty,
+        files: cap_files(&files),
+        untracked: Vec::new(),
+        revision: Some(sha.clone()),
+        fingerprint: fingerprint_parts(&[
+            "commit-local-objects",
+            &sha,
+            head.as_deref().unwrap_or(""),
+            if dirty { "dirty" } else { "clean" },
+            &diff,
+        ]),
+        captured_at: leveler_core::now().to_rfc3339(),
+    };
+    let diff_truncated = diff.len() > DIFF_MAX_BYTES;
+    Ok(ResolvedScope {
+        object,
+        files: cap_files(&files),
+        diff: Some(cap(&diff, DIFF_MAX_BYTES)),
+        diff_truncated,
+        fingerprint_truncated: false,
+        fingerprint_unreadable: false,
+        limitation,
+    })
+}
+
+/// Resolve a branch range without starting a Git process.
+///
+/// `base...HEAD` is the merge-base range, so the reader computes the best
+/// common ancestor first. Untracked files are not enumerated by the object
+/// reader; the limitation says so rather than presenting an incomplete list
+/// as complete.
+#[cfg(windows)]
+fn resolve_branch(repo: &Path, base: &str) -> Result<ResolvedScope, ClientError> {
+    let base = validate_rev(base)?;
+    let history = leveler_vcs::RepositoryHistory::open(repo)
+        .map_err(|error| ClientError::Runtime(format!("无法打开本地 Git 对象库：{error}")))?;
+    let base_sha = history
+        .resolve_commit_id(&base)
+        .map_err(|_| ClientError::Runtime(format!("无法解析分支基线 `{base}`")))?;
+    let head = history
+        .head()
+        .map_err(|error| ClientError::Runtime(format!("无法读取当前 HEAD：{error}")))?
+        .ok_or_else(|| ClientError::Runtime("无法读取当前 HEAD".to_string()))?;
+    let common = history
+        .merge_base(&base_sha, &head)
+        .map_err(|error| {
+            ClientError::Runtime(format!("无法计算 `{base}...HEAD` 的 merge base：{error}"))
+        })?
+        .ok_or_else(|| {
+            ClientError::Runtime(format!(
+                "分支 `{base}` 与 HEAD 没有共同祖先，无法形成审查范围"
+            ))
+        })?;
+    let diff = history
+        .diff(&common, &head, None)
+        .map_err(|error| ClientError::Runtime(format!("无法比较分支 `{base}` 与 HEAD：{error}")))?;
+    let files = history
+        .changed_files(&common, &head)
+        .map_err(|error| ClientError::Runtime(format!("无法读取分支范围的变更文件：{error}")))?;
+    let dirty = history
+        .worktree_dirty()
+        .map_err(|error| ClientError::Runtime(format!("无法比较工作区与 HEAD：{error}")))?;
+    let untracked = history
+        .untracked_files(OBJECT_FILES_MAX)
+        .map_err(|error| ClientError::Runtime(format!("无法枚举未跟踪文件：{error}")))?;
+    let sample = hash_untracked_sample(repo, &untracked);
+    let mut notes = vec![
+        format!("本次分支审查由本地只读对象库解析（{base_sha}...HEAD），未启动外部 Git 进程。"),
+        "未跟踪文件由本地工作区扫描枚举，它们不属于已提交的分支范围。".to_string(),
+    ];
+    if diff.trim().is_empty() {
+        notes.push(format!("当前分支相对 `{base}` 没有差异。"));
+    } else if dirty {
+        notes.push(
+            "工作区有未提交变更，它们不在 base...HEAD 的 diff 中；\
+             文件工具读取的源码可能比这次分支 diff 新。"
+                .to_string(),
+        );
+    }
+    let limitation = Some(notes.join("\n\n"));
+    let object = UiReviewObject {
+        workspace: Some(repo.display().to_string()),
+        head: Some(head.clone()),
+        dirty,
+        files: cap_files(&files),
+        untracked: cap_files(&untracked),
+        revision: Some(format!("{base_sha}...{head}")),
+        fingerprint: fingerprint_parts(&[
+            "branch-local-objects",
+            &base_sha,
+            &common,
+            &head,
+            if dirty { "dirty" } else { "clean" },
+            &diff,
+            &sample.digest,
+        ]),
+        captured_at: leveler_core::now().to_rfc3339(),
+    };
+    let diff_truncated = diff.len() > DIFF_MAX_BYTES;
+    Ok(ResolvedScope {
+        object,
+        files: cap_files(&files),
+        diff: Some(cap(&diff, DIFF_MAX_BYTES)),
+        diff_truncated,
+        fingerprint_truncated: sample.truncated,
+        fingerprint_unreadable: sample.unreadable,
+        limitation,
+    })
+}
+
+#[cfg(not(windows))]
 fn resolve_commit(repo: &Path, rev: &str) -> Result<ResolvedScope, ClientError> {
     let rev = validate_rev(rev)?;
     let sha = git_trim(
@@ -1966,6 +2152,7 @@ fn resolve_commit(repo: &Path, rev: &str) -> Result<ResolvedScope, ClientError> 
     })
 }
 
+#[cfg(not(windows))]
 fn resolve_branch(repo: &Path, base: &str) -> Result<ResolvedScope, ClientError> {
     let base = validate_rev(base)?;
     let base_sha = git_trim(
