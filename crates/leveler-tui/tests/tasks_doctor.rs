@@ -521,6 +521,60 @@ fn doctor_opens_while_busy_with_local_facts_and_a_shared_query() {
         .find(|finding| finding.id == finding_id::RUNTIME_RECOVERY)
         .expect("recovery finding");
     assert_eq!(recovered.status, DiagnosticStatus::Warn);
+    assert!(
+        recovered
+            .evidence
+            .iter()
+            .any(|line| line.contains("个中断的工具调用等待确认")),
+        "client-owned evidence follows the Chinese UI: {:?}",
+        recovered.evidence
+    );
+    assert!(
+        recovered
+            .evidence
+            .iter()
+            .all(|line| !line.contains("interrupted tool call")),
+        "no English recovery evidence in the Chinese UI: {:?}",
+        recovered.evidence
+    );
+
+    // The same client-owned finding under the English UI.
+    let mut english = self::state();
+    english.locale = leveler_tui::Locale::En;
+    english.snapshot_version = Some(1);
+    english.interrupted_tool_calls = vec![leveler_client_protocol::UiInterruptedToolCall {
+        call_id: "c1".into(),
+        tool: "run_command".into(),
+        pending_approval: false,
+        state: leveler_client_protocol::UiInterruptedCallState::Unknown,
+    }];
+    let english_recovery = leveler_tui::doctor::local_findings(&english)
+        .into_iter()
+        .find(|finding| finding.id == finding_id::RUNTIME_RECOVERY)
+        .expect("recovery finding");
+    assert!(
+        english_recovery
+            .evidence
+            .iter()
+            .any(|line| line.contains("interrupted tool call(s) await acknowledgement")),
+        "{:?}",
+        english_recovery.evidence
+    );
+    assert!(
+        english_recovery
+            .evidence
+            .iter()
+            .all(|line| !line.contains("中断的工具调用")),
+        "{:?}",
+        english_recovery.evidence
+    );
+
+    // UX-06: the selected finding's own evidence is visible and localized.
+    let detail_frame = text(&mut state, 100, 50);
+    assert!(
+        detail_frame.contains("个中断的工具调用等待确认"),
+        "the client-owned recovery evidence is missing:\n{detail_frame}"
+    );
     key(&mut state, KeyCode::Enter); // collapse the fact panel
     let frame = text(&mut state, 100, 50);
     assert!(frame.contains("运行时连接"), "{frame}");
@@ -528,6 +582,19 @@ fn doctor_opens_while_busy_with_local_facts_and_a_shared_query() {
     assert!(frame.contains("崩溃恢复窗口"), "{frame}");
     assert!(frame.contains("警告"), "{frame}");
     assert!(frame.contains("终端能力"), "{frame}");
+}
+
+#[test]
+fn doctor_detail_renders_the_selected_findings_evidence() {
+    let mut state = state();
+    state.snapshot_version = Some(1);
+    submit(&mut state, "/doctor");
+    state.doctor.selected = Some("runtime.build".into());
+    let frame = text(&mut state, 100, 50);
+    assert!(
+        frame.contains("运行时尚未报告已知的构建标识"),
+        "the selected finding's evidence is not painted:\n{frame}"
+    );
 }
 
 #[test]

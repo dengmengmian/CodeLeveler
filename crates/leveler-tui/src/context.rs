@@ -202,14 +202,16 @@ pub fn render_stats_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
             // No assembled request yet. The runtime's own query is the only
             // source of an accounting; until one exists this is the empty
             // state, and a query still in flight is a different thing.
-            let msg = if state.context.track.in_flight() {
-                t.context_loading
+            let (msg, color) = if let Some(error) = &state.stats_error {
+                (error.as_str(), theme.status.error)
+            } else if state.context.track.in_flight() {
+                (t.context_loading, theme.text.secondary)
             } else {
-                t.context_empty
+                (t.context_empty, theme.text.secondary)
             };
             lines.push(Line::from(Span::styled(
-                msg,
-                Style::default().fg(theme.text.secondary),
+                msg.to_string(),
+                Style::default().fg(color),
             )));
         }
     }

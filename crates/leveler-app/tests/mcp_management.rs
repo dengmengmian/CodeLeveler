@@ -59,6 +59,12 @@ fn python() -> Option<String> {
     .map(str::to_string)
 }
 
+fn toml_path(path: &Path) -> String {
+    // TOML basic strings treat `\` as an escape; a Windows path is written
+    // with forward slashes so the fixture parses on every host.
+    path.display().to_string().replace('\\', "/")
+}
+
 fn isolate_home(home: &Path) {
     unsafe {
         std::env::set_var("LEVELER_HOME", home);
@@ -94,8 +100,9 @@ impl Fixture {
         std::fs::write(
             &config,
             format!(
-                "[[mcp_servers]]\nname = \"echo\"\ncommand = \"{python}\"\nargs = [\"-u\", \"{}\"]\nenv = {{ SERVICE_API_KEY = \"SERVICE_API_KEY\" }}\n",
-                script.display()
+                "[[mcp_servers]]\nname = \"echo\"\ncommand = \"{}\"\nargs = [\"-u\", \"{}\"]\nenv = {{ SERVICE_API_KEY = \"SERVICE_API_KEY\" }}\n",
+                toml_path(Path::new(&python)),
+                toml_path(&script)
             ),
         )
         .unwrap();
@@ -149,6 +156,7 @@ impl Fixture {
             .send(ClientCommand::QueryDiagnostics {
                 requester_session_id: self.session.clone(),
                 query_id: query_id.clone(),
+                locale: None,
             })
             .await
             .expect("send QueryDiagnostics");
@@ -323,7 +331,7 @@ async fn mcp_management_reads_and_changes_the_runtime_authority() {
                 name: "second".into(),
                 transport: McpTransport::Stdio,
                 command: python(),
-                args: vec!["-u".into(), fixture.script.display().to_string()],
+                args: vec!["-u".into(), toml_path(&fixture.script)],
                 env: Vec::new(),
                 url: None,
                 headers: Vec::new(),

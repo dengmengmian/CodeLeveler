@@ -31,9 +31,13 @@ pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
     lines.push(Line::from(""));
 
     let Some(loaded) = state.trace.loaded.as_ref() else {
+        let (message, color) = match &state.trace.error {
+            Some(error) => (error.as_str(), theme.status.error),
+            None => (t.trace_loading, theme.text.secondary),
+        };
         lines.push(Line::from(Span::styled(
-            t.trace_loading,
-            Style::default().fg(theme.text.secondary),
+            message.to_string(),
+            Style::default().fg(color),
         )));
         render_scrolled(frame, area, state, lines);
         return;

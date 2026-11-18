@@ -2878,7 +2878,12 @@ mod authorize_tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
-        let mut exec = executor_at(dir.path(), PermissionProfile::FullAccess, approver.clone());
+        // This test asserts the contract a host that CAN enforce the network
+        // denial must honour. Say so explicitly: a Windows host reports
+        // `network_deny=false`, and inheriting that probe would test a
+        // different contract than the one asserted here.
+        let mut exec = executor_at(dir.path(), PermissionProfile::FullAccess, approver.clone())
+            .with_network_enforceable(true);
         exec.tool_context = exec.tool_context.clone().with_sandbox(true);
         exec.tool_context.policy.read_only = true;
         exec.tool_context.policy.command_write_allowlist = Some(Arc::new(Vec::new()));

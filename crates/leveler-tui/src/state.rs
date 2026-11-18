@@ -512,9 +512,10 @@ pub struct AppState {
     /// from "there are no changes" — the Diff screen must never claim the
     /// workspace is clean while it is still computing the diff.
     pub diff_pending: bool,
-    /// Why the last `RequestDiff` failed, if it did. Separate from an empty
-    /// `diff`: an unreadable workspace must not be shown as "no changes".
+    /// Why the last diff read did not produce a diff.
     pub diff_error: Option<String>,
+    /// Why the Context & Usage page could not read its two sources.
+    pub stats_error: Option<String>,
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
@@ -545,6 +546,11 @@ pub struct AppState {
     pub all_sessions: Vec<UiSessionSummary>,
     pub sessions_filter: SessionFilter,
     pub sessions_selected: usize,
+    /// A `/sessions` read is outstanding. Distinguishes "loading" from the
+    /// runtime's real empty inventory.
+    pub sessions_loading: bool,
+    /// Why the last `/sessions` read did not produce an inventory.
+    pub sessions_error: Option<String>,
     /// `/resume-claude` / `/resume-codex`: the source picker's projection.
     pub foreign_sessions: crate::foreign_session::ForeignSessionsView,
     /// Where this session came from when it was created by importing another
@@ -917,6 +923,7 @@ impl AppState {
             diff: None,
             diff_pending: false,
             diff_error: None,
+            stats_error: None,
             diff_selected: 0,
             goal_mode_active: false,
             execution_task_active: false,
@@ -928,6 +935,8 @@ impl AppState {
             all_sessions: Vec::new(),
             sessions_filter: SessionFilter::default(),
             sessions_selected: 0,
+            sessions_loading: false,
+            sessions_error: None,
             foreign_sessions: crate::foreign_session::ForeignSessionsView::default(),
             foreign_origin: None,
             context_tokens: 0,

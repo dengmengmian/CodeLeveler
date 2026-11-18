@@ -313,6 +313,23 @@ fn session_list_distinguishes_answers_declarations_and_legacy_endings() {
         let row = text.lines().find(|line| line.contains(goal)).unwrap();
         assert!(row.contains(label), "{row}");
     }
+
+    // The same rows in the English UI: the status words follow the locale
+    // instead of falling back to the Chinese literals.
+    state.locale = leveler_tui::Locale::En;
+    let english = frame(&mut state, 100, 24).join("\n");
+    for (goal, label) in [
+        ("answer", "answered"),
+        ("declaration", "declared complete"),
+        ("legacy", "ended"),
+    ] {
+        let row = english.lines().find(|line| line.contains(goal)).unwrap();
+        assert!(row.contains(label), "{row}");
+    }
+    assert!(
+        !english.contains("已回答") && !english.contains("声明完成") && !english.contains("已结束"),
+        "English session status still shows Chinese:\n{english}"
+    );
 }
 
 fn wheel(kind: MouseEventKind, column: u16, row: u16) -> Action {

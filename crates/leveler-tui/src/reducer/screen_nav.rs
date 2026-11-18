@@ -615,10 +615,19 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         // form → detail → list → conversation, the same rule Esc follows.
         Screen::Schedules => crate::schedules::back(state),
         // Both pages drop their in-flight query on the way out, so a late
-        // answer is not attributed to a later visit.
-        Screen::Tasks => crate::tasks::close(state),
+        // answer is not attributed to a later visit. Their inner levels are the
+        // same ones Esc leaves: detail/form first, then the page.
+        Screen::Tasks => {
+            if !crate::tasks::back(state) {
+                crate::tasks::close(state);
+            }
+        }
         Screen::Doctor => crate::doctor::close(state),
-        Screen::Mcp => crate::mcp::close(state),
+        Screen::Mcp => {
+            if !crate::mcp::back(state) {
+                crate::mcp::close(state);
+            }
+        }
         Screen::Settings => crate::settings::close(state),
         Screen::Help => {
             if state.help.detail.is_some() {
@@ -631,15 +640,30 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         Screen::Memory => crate::memory::back(state),
         // The child list clears its own selection on the way out.
         Screen::Team => close_team(state),
-        _ => match state.detail_return.take() {
-            Some(parent) => {
-                state.active_screen = parent;
-                state.screen_scroll = 0;
+        // The trace page's inspect panel is its inner level, exactly as Esc
+        // treats it.
+        Screen::Trace => {
+            if state.trace.inspect {
+                state.trace.inspect = false;
+            } else {
+                close_to_opener(state);
             }
-            None => close_screen(state),
-        },
+        }
+        _ => close_to_opener(state),
     }
     Vec::new()
+}
+
+/// Leave a secondary page for the screen that opened it, or the conversation
+/// when it was opened from there.
+fn close_to_opener(state: &mut AppState) {
+    match state.detail_return.take() {
+        Some(parent) => {
+            state.active_screen = parent;
+            state.screen_scroll = 0;
+        }
+        None => close_screen(state),
+    }
 }
 
 /// Keyboard and mouse share the same live-state check and runtime command.
@@ -796,6 +820,12 @@ pub(super) fn open_diff_screen(state: &mut AppState) -> Vec<Effect> {
     }
     state.active_screen = Screen::Diff;
     state.diff_selected = 0;
+    if !state.runtime_connected {
+        state.diff = None;
+        state.diff_pending = false;
+        state.diff_error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     // The previous diff may belong to another moment; do not show it as the
     // answer while the fresh one is computed.
     state.diff = None;
@@ -828,6 +858,11 @@ pub(super) fn open_trace(
     state.screen_scroll = 0;
     state.trace.inspect = false;
     state.trace.selected = 0;
+    state.trace.error = None;
+    if !state.runtime_connected {
+        state.trace.error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     vec![Effect::Send(crate::observability::issue_query(
         &mut state.trace,
         session_id,
@@ -859,6 +894,11 @@ pub(crate) fn open_stats(
     state.stats_reveal = Some(section);
     state.screen_scroll = 0;
     state.context.selected = 0;
+    state.stats_error = None;
+    if !state.runtime_connected {
+        state.stats_error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
     // One page, two sections: BOTH are asked for, whichever section the entry
     // point reveals. Opening `/context` must not leave the Usage section
     // pretending to wait for an answer nobody requested.
@@ -908,6 +948,13 @@ pub(super) fn open_sessions_screen(state: &mut AppState) -> Vec<Effect> {
     }
     state.active_screen = Screen::Sessions;
     state.sessions_selected = 0;
+    if !state.runtime_connected {
+        state.sessions_loading = false;
+        state.sessions_error = Some(state.t().connection_lost.to_string());
+        return Vec::new();
+    }
+    state.sessions_loading = true;
+    state.sessions_error = None;
     vec![Effect::Send(ClientCommand::RequestSessionListFor {
         requester_session_id: state.session_id.clone(),
     })]

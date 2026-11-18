@@ -485,7 +485,17 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
             .replacen("{}", state.sessions_filter.label(t), 1),
         Style::default().fg(theme.text.secondary),
     )));
-    if state.sessions.is_empty() {
+    if let Some(error) = &state.sessions_error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(theme.status.error),
+        )));
+    } else if state.sessions_loading {
+        lines.push(Line::from(Span::styled(
+            t.sessions_loading,
+            Style::default().fg(theme.text.secondary),
+        )));
+    } else if state.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             t.sessions_empty,
             Style::default().fg(theme.text.secondary),
@@ -502,12 +512,20 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
             "  "
         };
         let (dot, color) = session_status_dot(&s.status, theme);
+        // The wire status stays typed data; only the rendering is localized.
+        // An unknown status is shown verbatim rather than guessed.
         let status = if s.status == "completed" {
             match s.declaration {
-                Some(leveler_client_protocol::UiTaskDeclaration::Answered) => "已回答",
-                Some(leveler_client_protocol::UiTaskDeclaration::Completed) => "声明完成",
-                None => "已结束",
+                Some(leveler_client_protocol::UiTaskDeclaration::Answered) => {
+                    t.sessions_status_answered
+                }
+                Some(leveler_client_protocol::UiTaskDeclaration::Completed) => {
+                    t.sessions_status_declared
+                }
+                None => t.sessions_status_ended,
             }
+        } else if s.status == "active" {
+            t.sessions_status_active
         } else {
             &s.status
         };

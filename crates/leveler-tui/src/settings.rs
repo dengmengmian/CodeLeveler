@@ -16,7 +16,9 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use leveler_client_protocol::settings::{
     UiProviderSetting, UiSettingEffect, UiSettingScope, UiSettingSource, UiSettingsSnapshot,
 };
-use leveler_client_protocol::{ClientCommand, CommandId, RuntimeEvent, SessionId};
+use leveler_client_protocol::{
+    ClientCommand, CommandId, PermissionProfile, RuntimeEvent, SessionId,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -139,7 +141,13 @@ pub fn close(state: &mut AppState) {
 /// Read the runtime's effective settings projection.
 pub fn reload(state: &mut AppState) -> Vec<Effect> {
     if state.settings.query.is_some() {
-        return Vec::new();
+        if state.settings.checking() {
+            return Vec::new();
+        }
+        // The answer is overdue; the page already says so. Release the stale
+        // latch so `r` can actually re-ask.
+        state.settings.query = None;
+        state.settings.query_started = None;
     }
     if !state.runtime_connected {
         state.settings.error = Some(state.t().settings_page.disconnected.to_string());
@@ -211,9 +219,51 @@ pub fn observe_config_reloaded(state: &mut AppState, outcome: &str, error: Optio
     }
 }
 
+/// A setting this page can issue. Only these rejections belong on the page;
+/// another surface's failure keeps the conversation's notice row.
+pub fn is_edit_command(command: &ClientCommand) -> bool {
+    matches!(
+        command,
+        ClientCommand::SelectModel { .. }
+            | ClientCommand::SetDefaultModel { .. }
+            | ClientCommand::SetPermissionProfile { .. }
+            | ClientCommand::SetThinkingLevel { .. }
+    )
+}
+
+/// The runtime refused this edit. The page is a full-viewport surface, so the
+/// conversation's notice row is not painted: the failure must land in the
+/// page's own status line or the row would look silently unchanged.
+pub fn observe_rejection(state: &mut AppState, message: &str) {
+    let t = state.t();
+    state.settings.notice = None;
+    state.settings.error = Some(if message.contains("version conflict") {
+        t.settings_page.error_conflict.to_string()
+    } else {
+        message.to_string()
+    });
+}
+
+/// No answer arrived. The value on screen may be the runtime's or the user's
+/// stale view; say so instead of leaving a spinner or an assumed success.
+pub fn observe_uncertain(state: &mut AppState) {
+    state.settings.notice = None;
+    state.settings.error = Some(state.t().settings_page.error_uncertain.to_string());
+}
+
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
+
+fn permission_label(state: &AppState) -> String {
+    let t = state.t();
+    match state.mode {
+        PermissionProfile::RequestApproval => t.perm_readonly,
+        PermissionProfile::Assisted => t.perm_workspace,
+        PermissionProfile::FullAccess => t.perm_full,
+    }
+    .to_string()
+}
 
 pub fn rows(state: &AppState) -> Vec<SettingsRow> {
     let mut rows = Vec::new();
@@ -293,7 +343,7 @@ pub fn rows(state: &AppState) -> Vec<SettingsRow> {
         id: ROW_PERMISSION.into(),
         group: SettingsGroup::Session,
         label: state.t().settings_page.row_permission.to_string(),
-        value: state.mode_label.clone(),
+        value: permission_label(state),
         source: UiSettingSource::Session,
         scope: UiSettingScope::Session,
         editable: true,
@@ -956,6 +1006,82 @@ mod tests {
         state
     }
 
+    #[test]
+    fn a_permission_row_speaks_the_interface_language() {
+        let mut state = state();
+        state.mode = PermissionProfile::Assisted;
+        let row = rows(&state)
+            .into_iter()
+            .find(|row| row.id == ROW_PERMISSION)
+            .unwrap();
+        assert_eq!(row.value, "替我审批");
+        state.locale = crate::i18n::Locale::En;
+        let row = rows(&state)
+            .into_iter()
+            .find(|row| row.id == ROW_PERMISSION)
+            .unwrap();
+        assert_eq!(row.value, "assisted");
+    }
+
+    #[test]
+    fn a_rejected_edit_is_shown_on_the_settings_page_not_a_hidden_notice_row() {
+        let mut state = state();
+        state.active_screen = crate::screen::Screen::Settings;
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::EffectCompleted(
+                crate::action::EffectCompletion::CommandRejected {
+                    command: ClientCommand::SetPermissionProfile {
+                        session_id: SessionId::new("s1"),
+                        mode: PermissionProfile::Assisted,
+                    },
+                    message: "version conflict: resync required".into(),
+                    snapshot: None,
+                },
+            ),
+        );
+        assert!(
+            state
+                .settings
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("另一个客户端")),
+            "{:?}",
+            state.settings.error
+        );
+        assert!(
+            state.notification.is_none(),
+            "the conversation's notice row is not painted on this page"
+        );
+    }
+
+    #[test]
+    fn an_uncertain_edit_says_the_outcome_is_unconfirmed() {
+        let mut state = state();
+        state.active_screen = crate::screen::Screen::Settings;
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::EffectCompleted(
+                crate::action::EffectCompletion::CommandUncertain {
+                    command: ClientCommand::SetThinkingLevel {
+                        session_id: SessionId::new("s1"),
+                        level: None,
+                    },
+                    snapshot: None,
+                },
+            ),
+        );
+        assert!(
+            state
+                .settings
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("未确认")),
+            "{:?}",
+            state.settings.error
+        );
+    }
+
     fn snapshot() -> UiSettingsSnapshot {
         UiSettingsSnapshot {
             generated_at: "2026-11-17T00:00:00Z".into(),
@@ -1026,6 +1152,24 @@ mod tests {
         assert!(state.settings.snapshot.is_none());
         apply_loaded(&mut state, &requester, &query, snapshot());
         assert!(state.settings.snapshot.is_some());
+    }
+
+    #[test]
+    fn a_timed_out_settings_query_can_be_retried() {
+        let mut state = state();
+        state.settings.query = Some(CommandId::generate());
+        state.settings.query_started =
+            Some(Instant::now() - QUERY_TIMEOUT - Duration::from_secs(1));
+        let effects = reload(&mut state);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [crate::action::Effect::Send(
+                    ClientCommand::QuerySettings { .. }
+                )]
+            ),
+            "a timed-out query must be replaceable: {effects:?}"
+        );
     }
 
     #[test]

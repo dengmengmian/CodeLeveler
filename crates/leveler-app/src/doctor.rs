@@ -173,6 +173,18 @@ pub fn run_with_mcp(
     config: &LoadedConfig,
     mcp: Option<&[leveler_client_protocol::mcp::McpServerView]>,
 ) -> Vec<DiagnosticFinding> {
+    run_with_mcp_locale(config, mcp, false)
+}
+
+/// The same checks with the runtime's own user-readable evidence rendered for
+/// a client that asked for Chinese. Finding ids, statuses, subjects, paths,
+/// versions and raw provider errors are unchanged; only the runtime's own
+/// sentences are translated (see [`crate::doctor_text`]).
+pub fn run_with_mcp_locale(
+    config: &LoadedConfig,
+    mcp: Option<&[leveler_client_protocol::mcp::McpServerView]>,
+    chinese: bool,
+) -> Vec<DiagnosticFinding> {
     let mut results = Vec::new();
 
     // Required tooling.
@@ -277,6 +289,9 @@ pub fn run_with_mcp(
         ],
     ));
 
+    if chinese {
+        crate::doctor_text::localize_findings(&mut results);
+    }
     results
 }
 
@@ -1069,6 +1084,46 @@ mod tests {
                 "{warning:?}"
             );
         }
+    }
+
+    #[test]
+    fn chinese_evidence_is_localized_without_changing_findings_or_facts() {
+        let config = LoadedConfig::default();
+        let english = run_with_mcp_locale(&config, None, false);
+        let chinese = run_with_mcp_locale(&config, None, true);
+        let shape = |findings: &[DiagnosticFinding]| {
+            findings
+                .iter()
+                .map(|finding| (finding.id.clone(), finding.subject.clone(), finding.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shape(&english),
+            shape(&chinese),
+            "the report structure and statuses do not depend on the display language"
+        );
+        assert!(
+            english
+                .iter()
+                .flat_map(|finding| &finding.evidence)
+                .any(|line| line.starts_with("none loaded")),
+            "{english:?}"
+        );
+        assert!(
+            chinese
+                .iter()
+                .flat_map(|finding| &finding.evidence)
+                .any(|line| line.starts_with("未加载")),
+            "{chinese:?}"
+        );
+        // Machine facts stay in their original form.
+        assert!(
+            chinese
+                .iter()
+                .flat_map(|finding| &finding.evidence)
+                .any(|line| line.contains("write=")),
+            "the sandbox capability line is a technical fact: {chinese:?}"
+        );
     }
 
     #[test]

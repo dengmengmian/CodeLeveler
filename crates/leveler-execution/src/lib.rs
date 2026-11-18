@@ -26,6 +26,8 @@ pub mod git_effects;
 pub mod git_isolation;
 pub mod hooks;
 pub mod host_settlement;
+#[cfg(target_os = "linux")]
+mod linux_fence;
 pub mod network;
 pub mod permission_rules;
 pub mod policy;

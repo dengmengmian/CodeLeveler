@@ -178,6 +178,17 @@ def main() -> int:
         time.sleep(0.3)
         pty.key("\r")
         ok = wait(pty, "REAL_MCP_OK", 180)
+        if not ok:
+            # `external_tools` is an on-demand capability pack. A model that
+            # enables it in this turn has the tool on the NEXT request (the
+            # pack's documented semantics), so give it the new turn it asks
+            # for instead of treating its honest explanation as a call.
+            pty.write(
+                "请在新一轮请求里调用工具 mcp__real_echo__echo（参数为空对象），然后原样回复它返回的文本。"
+            )
+            time.sleep(0.3)
+            pty.key("\r")
+            ok = wait(pty, "REAL_MCP_OK", 180)
         check(report, "real", "the real model calls the MCP tool and its result reaches the conversation", ok, pty.screen.text()[:1200])
         report.dump("real-turn", pty)
 

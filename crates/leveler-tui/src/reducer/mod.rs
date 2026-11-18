@@ -706,6 +706,12 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
             message,
             snapshot,
         } => {
+            let settings_page_error = state.active_screen == Screen::Settings
+                && crate::settings::is_edit_command(&command);
+            let mcp_page_error = state.active_screen == Screen::Mcp
+                && matches!(command, ClientCommand::ManageMcp { .. });
+            let schedules_page_error = state.active_screen == Screen::Schedules
+                && matches!(command, ClientCommand::ManageSchedule { .. });
             if let Some(snapshot) = snapshot {
                 runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
@@ -716,10 +722,20 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                     .transcript
                     .set_tool_stop(call_id, crate::transcript::StopRequest::None);
             }
-            state.notification = Some(Notification {
-                level: NotificationLevel::Error,
-                message,
-            });
+            if settings_page_error {
+                // A full-viewport page does not paint the conversation's notice
+                // row; the rejection belongs in the page's own status line.
+                crate::settings::observe_rejection(state, &message);
+            } else if mcp_page_error {
+                crate::mcp::observe_command_failure(state, Some(&message));
+            } else if schedules_page_error {
+                crate::schedules::observe_command_failure(state, Some(&message));
+            } else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Error,
+                    message,
+                });
+            }
         }
         EffectCompletion::CommandUncertain { command, snapshot } => {
             let resynced = snapshot.is_some();
@@ -747,16 +763,30 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 (false, true) => state.t().command_outcome_unknown_synced,
                 (false, false) => state.t().command_outcome_unknown_unreachable,
             };
+            let settings_page_error = state.active_screen == Screen::Settings
+                && crate::settings::is_edit_command(&command);
+            let mcp_page_error = state.active_screen == Screen::Mcp
+                && matches!(command, ClientCommand::ManageMcp { .. });
+            let schedules_page_error = state.active_screen == Screen::Schedules
+                && matches!(command, ClientCommand::ManageSchedule { .. });
             if !resynced {
                 // Delivery is uncertain: the runtime may already be executing.
                 // Fail closed until reconnect/snapshot establishes authority;
                 // never expose Idle and permit a duplicate turn.
                 state.runtime_connected = false;
             }
-            state.notification = Some(Notification {
-                level: NotificationLevel::Error,
-                message: message.to_string(),
-            });
+            if settings_page_error {
+                crate::settings::observe_uncertain(state);
+            } else if mcp_page_error {
+                crate::mcp::observe_command_failure(state, None);
+            } else if schedules_page_error {
+                crate::schedules::observe_command_failure(state, None);
+            } else {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Error,
+                    message: message.to_string(),
+                });
+            }
         }
         EffectCompletion::SubmissionUnconfirmed { command_id } => {
             let mut posted_steer_id = None;
@@ -1780,34 +1810,43 @@ fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
         ),
         _ => return None,
     };
+    use crate::output_view::OutputCompleteness;
     let root = state.shell_output_root();
-    let source = match full_output.as_deref() {
+    let (source, completeness) = match full_output.as_deref() {
         Some(directory) => {
             match crate::output_view::Capture::open(
                 std::path::Path::new(directory),
                 root.as_deref(),
             ) {
-                Ok(capture) => capture.source(),
-                Err(error) => {
+                Ok(capture) => (capture.source(), OutputCompleteness::Complete),
+                Err(_) => {
                     if truncated {
+                        // The advertised complete capture is gone and the
+                        // retained text lost bytes: never present the tail as
+                        // the whole result.
                         state.notification = Some(Notification {
                             level: NotificationLevel::Warning,
-                            message: error,
+                            message: state.t().output_capture_unavailable.to_string(),
                         });
                         return None;
                     }
-                    // The capture is gone but the retained text is complete:
-                    // page it from memory rather than claiming the whole
-                    // result is unavailable.
-                    crate::output_view::OutputSource::Memory(retained.clone().into())
+                    // The capture is gone but the retained text is complete.
+                    // Page it from memory and say the capture was unavailable.
+                    (
+                        crate::output_view::OutputSource::Memory(retained.clone().into()),
+                        OutputCompleteness::CaptureUnavailable,
+                    )
                 }
             }
         }
-        None if !truncated => crate::output_view::OutputSource::Memory(retained.clone().into()),
+        None if !truncated => (
+            crate::output_view::OutputSource::Memory(retained.clone().into()),
+            OutputCompleteness::Complete,
+        ),
         None => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: state.t().copy_output_unavailable.to_string(),
+                message: state.t().output_capture_unavailable.to_string(),
             });
             return None;
         }
@@ -1819,6 +1858,7 @@ fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
     let title = command.replace('\n', " ");
     let effect_source = source.clone();
     let mut view = crate::output_view::OutputView::new(source, title, width);
+    view.completeness = completeness;
     view.generation = 1;
     state.output_view = Some(view);
     state.active_screen = Screen::Output;

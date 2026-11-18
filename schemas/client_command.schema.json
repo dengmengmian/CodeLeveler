@@ -39,6 +39,13 @@
         "type"
       ],
       "properties": {
+        "locale": {
+          "description": "UI language for user-readable evidence (`zh` or `en`). Absent means English, which keeps the CLI's JSON machine contract stable. The report structure, finding ids, statuses and raw facts never change with this hint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "query_id": {
           "$ref": "#/definitions/CommandId"
         },

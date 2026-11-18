@@ -88,6 +88,23 @@ impl McpState {
     }
 }
 
+/// The runtime refused a management command (or never answered it). Release
+/// the page's in-flight latch: leaving it armed makes Enter look ignored and
+/// Esc dead, and the reason must be visible on the form that issued it.
+pub fn observe_command_failure(state: &mut AppState, message: Option<&str>) {
+    let message = message
+        .map(str::to_string)
+        .unwrap_or_else(|| state.t().mcp_page.query_failed.to_string());
+    state.mcp.query = None;
+    state.mcp.query_started = None;
+    state.mcp.pending = None;
+    state.mcp.error = Some(message.clone());
+    if let Some(form) = state.mcp.form.as_mut() {
+        form.submitting = false;
+        form.error = Some(message);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Opening and requests
 // ---------------------------------------------------------------------------
@@ -105,6 +122,37 @@ pub fn open(state: &mut AppState) -> Vec<Effect> {
     state.mcp.tool_scroll = 0;
     ensure_selection(state);
     reload(state)
+}
+
+/// One level of back, with the same precedence the Esc key uses: form →
+/// remove confirmation → server/tool detail → filter → the page itself.
+/// Returns `true` when it consumed the level; `false` means the caller should
+/// close the page. A submitting form is inert, exactly like Esc.
+pub fn back(state: &mut AppState) -> bool {
+    if let Some(form) = state.mcp.form.as_ref() {
+        if !form.submitting {
+            state.mcp.form = None;
+        }
+        return true;
+    }
+    if state.mcp.confirm_remove.is_some() {
+        state.mcp.confirm_remove = None;
+        return true;
+    }
+    if state.mcp.detail_open {
+        state.mcp.detail_open = false;
+        state.mcp.tool_scroll = 0;
+        return true;
+    }
+    if state.mcp.filter_focus {
+        state.mcp.filter_focus = false;
+        if !state.mcp.filter.is_empty() {
+            state.mcp.filter.clear();
+            ensure_selection(state);
+        }
+        return true;
+    }
+    false
 }
 
 pub fn close(state: &mut AppState) {
@@ -125,6 +173,7 @@ pub fn reload(state: &mut AppState) -> Vec<Effect> {
 }
 
 fn send(state: &mut AppState, request: McpRequest, intent: McpIntent) -> Vec<Effect> {
+    expire_failed_query(state);
     if state.mcp.query.is_some() {
         return Vec::new();
     }
@@ -144,8 +193,20 @@ fn send(state: &mut AppState, request: McpRequest, intent: McpIntent) -> Vec<Eff
     })]
 }
 
+/// A timed-out answer no longer owns the page. Clearing it lets `r` and a
+/// mutation retry instead of being silently refused for the rest of the visit.
+fn expire_failed_query(state: &mut AppState) {
+    if state.mcp.query.is_some() && !state.mcp.checking() {
+        state.mcp.query = None;
+        state.mcp.query_started = None;
+        state.mcp.pending = None;
+        state.mcp.error = Some(state.t().mcp_page.query_failed.to_string());
+    }
+}
+
 /// A mutation is refused while a turn runs or another request is in flight.
 fn mutate(state: &mut AppState, request: McpRequest, intent: McpIntent) -> Vec<Effect> {
+    expire_failed_query(state);
     if state.is_busy() {
         state.mcp.notice = None;
         state.mcp.error = Some(state.t().mcp_page.busy_notice.to_string());
@@ -868,6 +929,26 @@ fn submit_form(state: &mut AppState) -> Vec<Effect> {
         bearer_token_env: bearer,
         enabled: form.enabled,
     };
+    // The mutation gate runs before the form is latched. Otherwise a refused
+    // submit (busy turn, in-flight query, disconnected runtime) leaves the
+    // form on "submitting": Enter appears ignored, Esc is blocked, and the
+    // reason is hidden behind the form.
+    if state.is_busy() {
+        let message = state.t().mcp_page.busy_notice.to_string();
+        set_form_error(state, &message);
+        return Vec::new();
+    }
+    expire_failed_query(state);
+    if state.mcp.query.is_some() {
+        let message = state.t().mcp_page.pending.to_string();
+        set_form_error(state, &message);
+        return Vec::new();
+    }
+    if !state.runtime_connected {
+        let message = state.t().mcp_page.disconnected.to_string();
+        set_form_error(state, &message);
+        return Vec::new();
+    }
     if let Some(form) = state.mcp.form.as_mut() {
         form.submitting = true;
         form.error = None;
@@ -1578,6 +1659,7 @@ fn stamp(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::state::Boot;
+    use crossterm::event::KeyModifiers;
 
     fn state() -> AppState {
         let mut state = AppState::new(
@@ -1632,6 +1714,44 @@ mod tests {
             generation: 0,
             retry_in_seconds: None,
         }
+    }
+
+    #[test]
+    fn a_busy_form_submit_stays_visible_and_leaves_on_esc() {
+        let mut state = state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let mut form = McpForm::new();
+        form.name = "fixture".into();
+        form.command = "echo".into();
+        state.mcp.form = Some(form);
+
+        let effects = submit_form(&mut state);
+        assert!(effects.is_empty(), "a busy mutation must not be sent");
+        let form = state.mcp.form.as_ref().expect("the form stays open");
+        assert!(!form.submitting, "a refused submit must not latch");
+        assert!(
+            form.error.as_deref().is_some_and(|error| !error.is_empty()),
+            "the refusal must be visible on the form"
+        );
+        assert!(state.mcp.query.is_none());
+
+        handle_form_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.mcp.form.is_none(), "Esc must still close the form");
+    }
+
+    #[test]
+    fn a_timed_out_query_no_longer_blocks_a_retry() {
+        let mut state = state();
+        state.mcp.query = Some(CommandId::generate());
+        state.mcp.query_started = Some(Instant::now() - QUERY_TIMEOUT - Duration::from_secs(1));
+        let effects = reload(&mut state);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Send(ClientCommand::ManageMcp { .. })]
+            ),
+            "a timed-out query must be replaceable: {effects:?}"
+        );
     }
 
     #[test]

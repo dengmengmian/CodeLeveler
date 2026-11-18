@@ -90,12 +90,18 @@ permissions files, so the agent cannot grant itself hooks or standing
 permissions. Reads stay allowed. `.leveler/config.yaml` stays editable as
 ordinary project configuration, but any edit invalidates its trust record, so
 it cannot inherit a mode approval given to different bytes. Confined shell
-commands also cannot write `.leveler/agents` or `.leveler/skills` on macOS
-(the kernel denies the path even when the directory does not exist yet) and on
-Linux when those directories exist: a definition authored that way would be
-loaded by a later session without the confirmation the `save_agent` /
-`save_skill` tools require. Windows has no per-path deny in the current write
-backend, so that shell path remains unenforced there.
+commands also cannot write `.leveler/agents` or `.leveler/skills`: a definition
+authored that way would be loaded by a later session without the confirmation
+the `save_agent` / `save_skill` tools require. macOS denies the path with a
+Seatbelt rule even when it does not exist yet. Linux uses the same read-only
+binds for existing paths, and a `seccomp` supervisor (started only when a
+protected path is missing) refuses creation syscalls that would give a
+protected name a new inode — including `AGENTS.md` at any depth below a
+writable root. The supervisor performs allowed operations itself and injects
+their descriptors into the sandbox, so a symlink swapped in after the check
+cannot redirect the write. Windows labels existing protected paths Medium
+after lowering the write root; a protected path created after admission is not
+covered there (see the trade-offs below).
 
 ## Approval, rules and resource boundaries
 
@@ -148,21 +154,27 @@ oversights. Reports that only restate them will be closed as known.
   directory is swept to a 512 MiB quota (oldest first). A swept artifact is
   reported as unavailable rather than silently replaced. A local process that
   can read the state directory can read retained non-secret output.
-- **Policy files created after admission are not covered on every backend.**
-  `AGENTS.md`, `.git`, `.leveler/agents` and `.leveler/skills` stay write-denied
-  for a confined shell while the workspace is writable. On macOS the profile
-  denies any `AGENTS.md` at any depth (case-insensitively) through a path
-  regex, so creating one after admission is denied too. Linux re-binds existing
-  paths read-only; a missing protected path is left absent because bwrap can
-  only mount an existing destination, so a root `AGENTS.md`, `.git`, or
-  definition directory created after admission is not covered. Materializing
-  those destinations was tried and reverted: it changed the workspace for the
-  duration of every confined command and broke tools that detect VCS metadata
-  from the presence of `.git`. Windows labels existing protected paths
-  Medium after lowering the write root (unverified on a real Windows host); a
-  protected path created after admission is not covered. The file tools still
-  refuse definition edits and require consent through the definition-writing
-  tools.
+- **Policy files created after admission are covered on macOS and Linux, not
+  on Windows.** `AGENTS.md`, `.git`, `.leveler/agents` and `.leveler/skills`
+  stay write-denied for a confined shell while the workspace is writable. On
+  macOS the profile denies any `AGENTS.md` at any depth (case-insensitively)
+  through a path regex. On Linux `bwrap` can only bind an existing destination,
+  so a missing protected path is fenced by `leveler-linux-confine`: a
+  `seccomp` user-notification supervisor resolves every creation syscall
+  (`openat`, `mkdirat`, `mknodat`, `symlinkat`, `linkat`, `renameat*`) and
+  denies a protected destination; allowed operations are performed by the
+  supervisor with the destination's parent pinned and the final component
+  opened with `O_NOFOLLOW`, and the resulting descriptor is injected with
+  `SECCOMP_IOCTL_NOTIF_ADDFD`. This keeps the workspace untouched (no
+  placeholder files) and preserves ordinary writes. If the kernel or process
+  inspectors cannot support the fence, the confined command is refused rather
+  than run unfenced. `io_uring` submission is disabled inside the fence because
+  it would bypass syscall filtering. Windows labels existing protected paths
+  Medium after lowering the write root; a protected path created after
+  admission is not covered by an OS boundary there, so the definition-writing
+  tools and their consent remain the authority on that path. The file tools
+  still refuse definition edits and require consent through the
+  definition-writing tools.
 
 ## Resource grants
 

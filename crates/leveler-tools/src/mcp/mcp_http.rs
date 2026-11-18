@@ -21,7 +21,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient, ServiceError};
 use tokio::sync::Mutex;
 
-use super::{McpServerConfig, McpToolInfo};
+use super::{McpServerConfig, McpToolInfo, Redactor};
 
 const AUTO_CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 const LEGACY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -42,7 +42,7 @@ pub(super) struct HttpSession {
     url: String,
     headers: Vec<(String, String)>,
     bearer_token: Option<String>,
-    secrets: Vec<String>,
+    redactor: Redactor,
     tools_changed: Arc<AtomicBool>,
     service: Mutex<Option<Arc<rmcp::service::RunningService<RoleClient, LevelerHandler>>>>,
     protocol: Mutex<String>,
@@ -74,13 +74,13 @@ impl HttpSession {
             .clone()
             .ok_or_else(|| "Streamable HTTP MCP 缺少 url".to_string())?;
         validate_mcp_url(&url)?;
-        let secrets = secret_values(cfg);
+        let redactor = Redactor::for_config(cfg);
         let tools_changed = Arc::new(AtomicBool::new(false));
         let opened = open_service(
             &url,
             &cfg.headers,
             cfg.bearer_token.as_deref(),
-            &secrets,
+            &redactor,
             Arc::clone(&tools_changed),
         )
         .await?;
@@ -89,7 +89,7 @@ impl HttpSession {
             url,
             headers: cfg.headers.clone(),
             bearer_token: cfg.bearer_token.clone(),
-            secrets,
+            redactor,
             tools_changed,
             service: Mutex::new(Some(Arc::new(opened.service))),
             protocol: Mutex::new(protocol),
@@ -123,7 +123,7 @@ impl HttpSession {
             .map_err(|_| "tools/list 超时".to_string())?
             .map_err(|error| self.fail(error))?;
             for tool in page.tools {
-                if let Some(info) = tool_info(tool) {
+                if let Some(mut info) = tool_info(tool) {
                     if tools
                         .iter()
                         .any(|existing: &McpToolInfo| existing.name == info.name)
@@ -131,6 +131,8 @@ impl HttpSession {
                         tracing::warn!(tool = %info.name, "MCP server returned a duplicate tool name; keeping the first");
                         continue;
                     }
+                    info.description = self.redactor.redact_known(&info.description);
+                    self.redactor.redact_json(&mut info.input_schema);
                     tools.push(info);
                 }
             }
@@ -164,11 +166,14 @@ impl HttpSession {
         // A server that asks for either gets one clear failure.
         match tokio::time::timeout(CALL_TIMEOUT, service.call_tool_once(params)).await {
             Ok(Ok(rmcp::model::CallToolResponse::Complete(result))) => {
-                let text = self.redact(&truncate_text(&format_call(&result)));
+                let complete = truncate_text(&format_call(&result));
                 if result.is_error == Some(true) {
-                    CallOutcome::Failed(text)
+                    CallOutcome::Failed(self.redact(&complete))
                 } else {
-                    CallOutcome::Done(text)
+                    // A successful result is the content the caller requested.
+                    // Hide only the configured credentials, not every string
+                    // that happens to look like a token.
+                    CallOutcome::Done(self.redactor.redact_known(&complete))
                 }
             }
             Ok(Ok(_)) => CallOutcome::Failed(
@@ -213,7 +218,7 @@ impl HttpSession {
             &self.url,
             &self.headers,
             self.bearer_token.as_deref(),
-            &self.secrets,
+            &self.redactor,
             Arc::clone(&self.tools_changed),
         )
         .await?;
@@ -237,7 +242,7 @@ impl HttpSession {
     }
 
     fn redact(&self, text: &str) -> String {
-        redact(text, &self.secrets)
+        self.redactor.redact(text)
     }
 }
 
@@ -250,7 +255,7 @@ async fn open_service(
     url: &str,
     headers: &[(String, String)],
     bearer_token: Option<&str>,
-    secrets: &[String],
+    redactor: &Redactor,
     tools_changed: Arc<AtomicBool>,
 ) -> Result<OpenedSession, String> {
     validate_mcp_url(url)?;
@@ -268,7 +273,7 @@ async fn open_service(
     let opened = match first {
         Ok(opened) => opened,
         Err(error) => {
-            let message = redact(&error, secrets);
+            let message = redactor.redact(&error);
             if !is_protocol_mismatch(&message) {
                 return Err(message);
             }
@@ -287,7 +292,7 @@ async fn open_service(
                 {
                     Ok(opened) => return Ok(opened),
                     Err(error) => {
-                        last = redact(&error, secrets);
+                        last = redactor.redact(&error);
                         if !is_protocol_mismatch(&last) {
                             return Err(last);
                         }
@@ -529,31 +534,6 @@ fn is_protocol_mismatch(message: &str) -> bool {
     lower.contains("protocol version")
         || lower.contains("no compatible protocol")
         || lower.contains("unsupported protocol")
-}
-
-fn secret_values(cfg: &McpServerConfig) -> Vec<String> {
-    let mut secrets = Vec::new();
-    for (_, value) in &cfg.headers {
-        if value.len() >= 4 {
-            secrets.push(value.clone());
-        }
-    }
-    if let Some(token) = &cfg.bearer_token
-        && token.len() >= 4
-    {
-        secrets.push(token.clone());
-    }
-    secrets
-}
-
-fn redact(text: &str, secrets: &[String]) -> String {
-    let mut out = text.to_string();
-    for secret in secrets {
-        if secret.len() >= 4 {
-            out = out.replace(secret, "[redacted]");
-        }
-    }
-    out
 }
 
 /// Accept only an http(s) URL the user configured. Credentials in the URL are

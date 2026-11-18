@@ -175,31 +175,12 @@ pub(crate) fn descriptor_for(server: &str, tool: &Arc<dyn Tool>) -> McpToolDescr
     }
 }
 
-/// Redact the one thing a connection reason could carry from a URL: the
-/// `userinfo@` part and any query/fragment. Environment and header values are
-/// never interpolated into these reasons by the producer; this is a second
-/// boundary for messages that include a provider's own text.
+/// Redact a connection reason at the wire boundary. The transport already
+/// strips the values this server was given; this second boundary also handles
+/// generic credential shapes in text produced before a client existed, and
+/// keeps the page from carrying an unbounded server string.
 fn redact_reason(reason: &str) -> String {
-    let mut out = reason.to_string();
-    // `scheme://user:password@host` -> `scheme://host`.
-    if let Some(scheme_at) = out.find("://") {
-        let authority_start = scheme_at + 3;
-        let authority_end = out[authority_start..]
-            .find(['/', ' ', ')', ']', ',', ';'])
-            .map(|index| authority_start + index)
-            .unwrap_or(out.len());
-        let authority = &out[authority_start..authority_end];
-        if let Some((_, host)) = authority.rsplit_once('@') {
-            let mut redacted = String::with_capacity(out.len());
-            redacted.push_str(&out[..authority_start]);
-            redacted.push_str(host);
-            redacted.push_str(&out[authority_end..]);
-            out = redacted;
-        }
-    }
-    if let Some(query) = out.find('?') {
-        out.truncate(query);
-    }
+    let mut out = leveler_tools::mcp::redact_sensitive_text(reason, &[]);
     // A server-provided failure text is untrusted output, not an instruction
     // and not a place to carry a megabyte into the page.
     const MAX_REASON_CHARS: usize = 2048;

@@ -14,6 +14,7 @@ mod collaboration;
 pub mod config_manager;
 pub mod contribution_query;
 pub mod doctor;
+mod doctor_text;
 /// Engine events -> client events. Public so a recorded session can be replayed
 /// through the same projection a live client received, instead of a second
 /// hand-written dialect that drifts from it.

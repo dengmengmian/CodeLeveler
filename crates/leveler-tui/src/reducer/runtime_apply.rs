@@ -617,6 +617,8 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
         }
         RuntimeEvent::SessionList { sessions } => {
+            state.sessions_loading = false;
+            state.sessions_error = None;
             // The list is the runtime's authoritative inventory, including
             // archived rows (marked, not hidden — archive never deletes).
             state.all_sessions = sessions;
@@ -1476,6 +1478,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 return;
             }
             state.trace.loaded = Some(observation);
+            state.trace.error = None;
             state.trace.clamp();
         }
         RuntimeEvent::BackgroundTaskUnknown {

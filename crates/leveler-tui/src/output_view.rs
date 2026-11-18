@@ -70,6 +70,37 @@ impl OutputSource {
     }
 }
 
+/// How much of the result the windowed page actually holds.
+///
+/// The value comes from structured state — the shell record's terminal status
+/// and truncation flags, or the validated capture metadata — never from words
+/// in the output text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputCompleteness {
+    /// The whole result is present: a validated capture, or a retained result
+    /// the runtime never truncated.
+    Complete,
+    /// The command is still running; the page holds a live tail.
+    Running,
+    /// The retained result dropped bytes and no complete capture is available.
+    Truncated,
+    /// The runtime advertised a complete capture that is now gone or
+    /// unreadable; the page shows the retained text instead.
+    CaptureUnavailable,
+}
+
+impl OutputCompleteness {
+    /// Localized status phrase for the page header.
+    pub fn label(self, text: &crate::i18n::UiText) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::Running => Some(text.output_status_partial_running),
+            Self::Truncated => Some(text.output_status_truncated),
+            Self::CaptureUnavailable => Some(text.output_status_capture_unavailable),
+        }
+    }
+}
+
 /// A validated complete capture directory.
 #[derive(Debug, Clone)]
 pub struct Capture {
@@ -747,6 +778,9 @@ fn wrap_rows(resolved: &str, expanded: &[ExpandedChar], width: usize) -> Vec<Row
 pub struct OutputView {
     pub source: OutputSource,
     pub title: String,
+    /// Structured completeness of `source`; `Complete` only when the whole
+    /// result is present.
+    pub completeness: OutputCompleteness,
     pub index: Option<Arc<OutputIndex>>,
     /// Identity of the outstanding index request. A completion for an older
     /// generation is discarded.
@@ -785,6 +819,7 @@ impl OutputView {
         Self {
             source,
             title,
+            completeness: OutputCompleteness::Complete,
             index: None,
             generation: 0,
             loading: true,

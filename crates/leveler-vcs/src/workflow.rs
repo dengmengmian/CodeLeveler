@@ -149,18 +149,31 @@ impl GitWorkflow {
     }
 
     /// Run a historical/read-only git query with the workspace mounted
-    /// read-only and the network denied.
+    /// read-only and the network denied where the host can enforce it.
     ///
     /// History queries never need to mutate the repository. Running them under
     /// `WriteScope::None` makes that structural: a git invocation cannot
     /// refresh the index, run a hook that writes, or turn an inspection into a
     /// repository mutation. `GIT_OPTIONAL_LOCKS=0` keeps git from trying to
     /// take an optional index lock the sandbox would deny anyway.
+    ///
+    /// The network denial is requested only when the host reports that a
+    /// backend can enforce it. A Windows backend without AppContainer cannot,
+    /// and asks every spawn to be refused rather than run open, which would
+    /// otherwise fail every read-only history call at spawn time.
     pub async fn inspect_history(
         &self,
         args: &[&str],
         cancellation: CancellationToken,
     ) -> Result<ProcessOutput, VcsError> {
+        self.runner
+            .run(self.history_request(args), cancellation)
+            .await
+            .map_err(|e| VcsError::Spawn(e.to_string()))
+    }
+
+    /// Build the request [`Self::inspect_history`] runs.
+    fn history_request(&self, args: &[&str]) -> ProcessRequest {
         let mut request = ProcessRequest::new(
             "git",
             args.iter().map(|s| s.to_string()).collect(),
@@ -168,15 +181,14 @@ impl GitWorkflow {
         );
         request.timeout = INSPECT_TIMEOUT;
         request.write_scope = leveler_execution::WriteScope::None;
-        request.deny_network = true;
+        // Ask for a network deny only where the host can actually enforce one;
+        // a request for an unenforceable denial is refused at spawn.
+        request.deny_network = leveler_execution::probe_sandbox_capabilities().network_deny;
         request.authority_env = vec![
             ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ];
-        self.runner
-            .run(request, cancellation)
-            .await
-            .map_err(|e| VcsError::Spawn(e.to_string()))
+        request
     }
 
     /// The repository root this workflow operates in.
@@ -441,6 +453,32 @@ mod tests {
             "add-cancel-order-to-orderservice"
         );
         assert_eq!(slugify("   "), "task");
+    }
+
+    #[test]
+    fn history_request_denies_the_network_only_where_it_is_enforceable() {
+        let dir = tmp("history-request");
+        let wf = GitWorkflow::new(&dir);
+        let request = wf.history_request(&["log", "-1"]);
+
+        assert_eq!(
+            request.deny_network,
+            leveler_execution::probe_sandbox_capabilities().network_deny,
+            "the request must follow the host capability instead of assuming a denial"
+        );
+        assert_eq!(request.write_scope, leveler_execution::WriteScope::None);
+        assert_eq!(request.timeout, INSPECT_TIMEOUT);
+        assert!(
+            request
+                .authority_env
+                .contains(&("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()))
+        );
+        assert!(
+            request
+                .authority_env
+                .contains(&("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

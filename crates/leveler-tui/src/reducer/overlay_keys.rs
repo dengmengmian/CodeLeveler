@@ -219,9 +219,16 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 state.overlay = Some(Overlay::ConfirmCheckpointRestore(sel));
                 Vec::new()
             }
-            SelectionOutcome::Cancel => Vec::new(),
+            // Cancelling the confirmation returns to the checkpoint list: the
+            // first Esc leaves the confirmation, the second leaves the picker.
+            // Nothing was restored.
+            SelectionOutcome::Cancel => {
+                open_checkpoint_picker(state);
+                Vec::new()
+            }
             SelectionOutcome::Confirm(key) => {
                 if key == CHECKPOINT_RESTORE_CANCEL {
+                    open_checkpoint_picker(state);
                     Vec::new()
                 } else {
                     vec![Effect::Send(ClientCommand::RestoreCheckpoint {

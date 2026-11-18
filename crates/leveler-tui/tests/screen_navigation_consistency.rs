@@ -206,6 +206,65 @@ fn every_page_that_paints_a_back_glyph_publishes_its_hit() {
     }
 }
 
+/// The header `←` leaves the same inner level Esc leaves. Clicking it with a
+/// detail (Mcp/Tasks) or the trace inspect panel open stays on the page; the
+/// next click leaves the page. Esc produces the same sequence.
+#[test]
+fn a_header_back_leaves_one_inner_level_like_esc() {
+    for screen in [Screen::Mcp, Screen::Tasks, Screen::Trace] {
+        let mut clicked = opened();
+        seed(&mut clicked, screen);
+        clicked.active_screen = screen;
+        match screen {
+            Screen::Mcp => clicked.mcp.detail_open = true,
+            Screen::Tasks => clicked.tasks.detail_open = true,
+            Screen::Trace => clicked.trace.inspect = true,
+            _ => unreachable!(),
+        }
+        let _ = Page::of(&mut clicked, 120, 30);
+        let hit = clicked.back_hit.expect("header back hit");
+        reduce(&mut clicked, click(hit.1, hit.0));
+        assert_eq!(
+            clicked.active_screen, screen,
+            "{screen:?}: the first back leaves the inner level, not the page"
+        );
+        let inner_open = match screen {
+            Screen::Mcp => clicked.mcp.detail_open,
+            Screen::Tasks => clicked.tasks.detail_open,
+            Screen::Trace => clicked.trace.inspect,
+            _ => unreachable!(),
+        };
+        assert!(!inner_open, "{screen:?}: the inner level must be closed");
+        let _ = Page::of(&mut clicked, 120, 30);
+        let hit = clicked.back_hit.expect("header back hit");
+        reduce(&mut clicked, click(hit.1, hit.0));
+        assert_eq!(
+            clicked.active_screen,
+            Screen::Conversation,
+            "{screen:?}: the second back leaves the page"
+        );
+
+        // Esc follows the same precedence.
+        let mut escaped = opened();
+        seed(&mut escaped, screen);
+        escaped.active_screen = screen;
+        match screen {
+            Screen::Mcp => escaped.mcp.detail_open = true,
+            Screen::Tasks => escaped.tasks.detail_open = true,
+            Screen::Trace => escaped.trace.inspect = true,
+            _ => unreachable!(),
+        }
+        reduce(&mut escaped, key(KeyCode::Esc));
+        assert_eq!(escaped.active_screen, screen, "{screen:?}: Esc stays");
+        reduce(&mut escaped, key(KeyCode::Esc));
+        assert_eq!(
+            escaped.active_screen,
+            Screen::Conversation,
+            "{screen:?}: Esc leaves on the second press"
+        );
+    }
+}
+
 /// The published hit is the painted glyph + title, never the whole header row:
 /// the right half belongs to the status, so a click there must not navigate.
 #[test]

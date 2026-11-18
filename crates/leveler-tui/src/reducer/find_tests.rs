@@ -529,5 +529,31 @@ fn a_user_shell_capture_result_opens_its_complete_output() {
         s.output_view.as_ref().expect("output page").target_line,
         Some(2)
     );
+    assert!(
+        s.output_view
+            .as_ref()
+            .expect("output page")
+            .title
+            .contains(crate::i18n::Locale::Zh.text().find.source_output),
+        "the artifact title follows the Chinese UI: {:?}",
+        s.output_view.as_ref().map(|view| &view.title)
+    );
+
+    // The same artifact under the English UI: the title suffix is the locale's
+    // word, not the Chinese literal.
+    s.locale = crate::i18n::Locale::En;
+    let effects = handle_slash(&mut s, "find SHELL_CAPTURE_TOKEN");
+    finish_search(&mut s, effects.clone());
+    finish_artifacts(&mut s, effects);
+    reduce(&mut s, Action::Key(key(KeyCode::Enter)));
+    let title = s.output_view.as_ref().expect("output page").title.clone();
+    assert!(
+        title.contains(crate::i18n::Locale::En.text().find.source_output),
+        "the artifact title follows the English UI: {title}"
+    );
+    assert!(
+        !title.contains(crate::i18n::Locale::Zh.text().find.source_output),
+        "the English artifact title still shows the Chinese suffix: {title}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
