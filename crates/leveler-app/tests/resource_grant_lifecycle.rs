@@ -236,9 +236,15 @@ async fn a_session_grant_is_persisted_then_revocation_makes_the_next_call_ask_ag
         std::path::Path::new(canonical_path),
         target.canonicalize().unwrap()
     );
+    #[cfg(windows)]
     assert!(
         object_identity.starts_with("windows:"),
         "the identity must come from the Windows object, not a path: {object_identity}"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        object_identity.starts_with("unix:"),
+        "the identity must come from the Unix object, not a path: {object_identity}"
     );
     client
         .send(ClientCommand::ApprovalDecision {
