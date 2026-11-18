@@ -324,8 +324,11 @@ pub struct GoalRecapBlock {
 }
 
 /// One manual review in the conversation. The card is the reviewer's live
-/// row; once settled, `report` carries the durable formal report and the same
-/// block renders it inline.
+/// row and, once settled, the execution record: status, counts and the
+/// investigations it launched stay where the review was requested. The formal
+/// report itself is delivered as its own [`ReviewResultBlock`] at the moment
+/// the review finished, so a review that settles several turns later produces
+/// a new conversation entry instead of updating a card above the reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewBlock {
     pub summary: leveler_client_protocol::UiReviewSummary,
@@ -333,12 +336,12 @@ pub struct ReviewBlock {
     pub live_tool: Option<String>,
     /// Independent investigations this review launched, as runtime facts.
     pub investigations: Vec<leveler_client_protocol::UiReviewInvestigation>,
-    /// The formal report, projected from the durable review row. `None` while
-    /// running and when the terminal could not be persisted. Boxed so one
-    /// transcript item stays small even when the report holds many findings.
+    /// A legacy inline report, attached only for rows written before the
+    /// result-message delivery existed (or fetched by an explicit report
+    /// query). New settlements deliver [`ReviewResultBlock`] instead.
     pub report: Option<Box<leveler_client_protocol::UiReviewReport>>,
-    /// Whether the inline report is expanded. Defaults to expanded; clicking
-    /// the card folds a long report.
+    /// Whether the legacy inline report is expanded. Defaults to expanded;
+    /// clicking the card folds a long report.
     pub expanded: bool,
     /// Reviewer wall time as reported by the runtime. Real elapsed time, never
     /// a fabricated percentage.
@@ -349,6 +352,30 @@ pub struct ReviewBlock {
     /// child lives in the runtime, not the transcript), so its card is the
     /// only thing that can state the review is still going.
     pub native_child: bool,
+    /// This review's result was delivered as its own conversation entry. The
+    /// card then keeps its execution record and offers no report disclosure:
+    /// the report is already below, in full.
+    pub report_delivered: bool,
+}
+
+/// The formal report of one settled review as a conversation entry.
+///
+/// It is the reviewer's durable result, not a model-authored answer: the body
+/// is composed from the review row's submitted report, findings, verdict and
+/// coverage, and rendered through the ordinary assistant Markdown path. One
+/// review has at most one of these entries, keyed by the review id; a repeated
+/// terminal updates it in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewResultBlock {
+    pub summary: leveler_client_protocol::UiReviewSummary,
+    /// The durable report, when the row carries one. Boxed for the same reason
+    /// as the legacy card field.
+    pub report: Option<Box<leveler_client_protocol::UiReviewReport>>,
+    /// Reviewer wall time as reported by the durable row.
+    pub elapsed_ms: u64,
+    /// The composed Markdown body and its parsed form. `done` + `Final` keep
+    /// the ordinary assistant renderer's final-answer tone.
+    pub body: AssistantBlock,
 }
 
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
@@ -605,9 +632,12 @@ pub enum TranscriptItem {
     Recap(RecapBlock),
     /// Durable goal checkpoint presentation (`✽ 阶段回顾`), click-expandable.
     GoalRecap(GoalRecapBlock),
-    /// A manual review's conversation card (`/review`). The card carries a
-    /// summary; the full report opens as a page from its ↗.
+    /// A manual review's conversation card (`/review`). The card carries the
+    /// execution record; a settled review's formal report is delivered as its
+    /// own [`ReviewResultBlock`] entry at the moment it finished.
     Review(ReviewBlock),
+    /// The full formal report of a settled review, as a conversation entry.
+    ReviewResult(ReviewResultBlock),
 }
 
 /// Whether this item is a reasoning block still streaming. The ONE definition
@@ -661,6 +691,13 @@ fn is_foldable_item(item: &TranscriptItem) -> bool {
 pub struct TranscriptState {
     items: Vec<TranscriptItem>,
     journal_inputs: Vec<UserInputBlock>,
+    /// Settled review results waiting for a safe conversation boundary.
+    ///
+    /// A review settles independently of the turn in flight. Inserting its
+    /// report while an assistant message is still streaming would put the
+    /// report in the middle of the person's answer. The result is complete and
+    /// durable at that point; only its PLACE waits for the answer to close.
+    pending_review_results: Vec<ReviewResultBlock>,
     /// Next concurrent-burst id. Monotonic for the session so two bursts are
     /// never confused after a group closes and reopens.
     next_batch: u32,
@@ -675,7 +712,7 @@ pub struct TranscriptState {
 /// history. Live cards get the same number from progress ticks; history has no
 /// ticks, so the start/end timestamps are the only real elapsed source and a
 /// missing or malformed timestamp reads as unknown (`0`), never as a guess.
-fn review_elapsed_ms(summary: &leveler_client_protocol::UiReviewSummary) -> u64 {
+pub(crate) fn review_elapsed_ms(summary: &leveler_client_protocol::UiReviewSummary) -> u64 {
     let created = chrono::DateTime::parse_from_rfc3339(&summary.created_at).ok();
     let finished = summary
         .finished_at
@@ -688,6 +725,29 @@ fn review_elapsed_ms(summary: &leveler_client_protocol::UiReviewSummary) -> u64 
             .try_into()
             .unwrap_or(0),
         _ => 0,
+    }
+}
+
+/// One settled review's result entry. The body is composed Markdown from the
+/// durable report, rendered by the same path a final assistant answer uses.
+fn review_result_block(
+    summary: leveler_client_protocol::UiReviewSummary,
+    report: Option<leveler_client_protocol::UiReviewReport>,
+    elapsed_ms: u64,
+    body: String,
+) -> ReviewResultBlock {
+    let id = MessageId::new(format!("review-result:{}", summary.id));
+    ReviewResultBlock {
+        body: AssistantBlock {
+            id,
+            rendered: Some(MdDoc::parse(&body)),
+            text: body,
+            done: true,
+            kind: AssistantKind::Final,
+        },
+        summary,
+        report: report.map(Box::new),
+        elapsed_ms,
     }
 }
 
@@ -716,6 +776,7 @@ impl TranscriptState {
         self.version = self.version.max(other.version).wrapping_add(1);
         self.items = other.items;
         self.journal_inputs = other.journal_inputs;
+        self.pending_review_results = other.pending_review_results;
         self.next_batch = self.next_batch.max(other.next_batch);
     }
 
@@ -1065,6 +1126,7 @@ impl TranscriptState {
             expanded: true,
             elapsed_ms: 0,
             native_child: false,
+            report_delivered: false,
         }));
     }
 
@@ -1157,9 +1219,150 @@ impl TranscriptState {
         self.bump();
     }
 
+    /// Apply a review terminal to its execution card, keeping the card where
+    /// the request was made.
+    ///
+    /// The formal report is not attached here. It is delivered as its own
+    /// conversation entry at the moment the review finished, which is what a
+    /// person who kept chatting while the review ran actually sees.
+    pub fn apply_review_terminal(&mut self, summary: leveler_client_protocol::UiReviewSummary) {
+        self.bump();
+        let Some(block) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == summary.id => Some(block),
+            _ => None,
+        }) else {
+            return;
+        };
+        block.investigations = summary.investigations.clone();
+        block.summary = summary;
+        block.live_tool = None;
+        if block.elapsed_ms == 0 {
+            block.elapsed_ms = review_elapsed_ms(&block.summary);
+        }
+    }
+
+    /// Append the delivered formal report of one review.
+    ///
+    /// Identity is the durable review id: a repeated terminal, a history
+    /// replay racing a live event, or a re-fetch must converge on the same
+    /// entry instead of printing the report twice. A different report revision
+    /// updates the entry in place; it never creates a second copy.
+    pub fn push_review_result(
+        &mut self,
+        summary: leveler_client_protocol::UiReviewSummary,
+        report: Option<leveler_client_protocol::UiReviewReport>,
+        elapsed_ms: u64,
+        body: String,
+    ) -> bool {
+        let block = review_result_block(summary, report, elapsed_ms, body);
+        self.insert_review_result(block)
+    }
+
+    /// Hold a settled review's result until the conversation reaches a safe
+    /// boundary (no assistant message still streaming).
+    pub fn defer_review_result(
+        &mut self,
+        summary: leveler_client_protocol::UiReviewSummary,
+        report: Option<leveler_client_protocol::UiReviewReport>,
+        elapsed_ms: u64,
+        body: String,
+    ) -> bool {
+        if self.has_review_result(&summary.id) {
+            // A duplicate/revision of an entry already in the timeline is
+            // updated where it stands; it is not a new placement problem.
+            return self.push_review_result(summary, report, elapsed_ms, body);
+        }
+        let block = review_result_block(summary, report, elapsed_ms, body);
+        let id = block.summary.id.clone();
+        if let Some(existing) = self
+            .pending_review_results
+            .iter_mut()
+            .find(|pending| pending.summary.id == id)
+        {
+            *existing = block;
+        } else {
+            self.pending_review_results.push(block);
+        }
+        self.bump();
+        true
+    }
+
+    /// Deliver any held review results now that no assistant message is open.
+    ///
+    /// Called at every boundary that ends streaming: an assistant message
+    /// completing and a turn finalizing (cancelled and failed turns included).
+    /// A result is never dropped because its turn was cancelled.
+    pub fn flush_pending_review_results(&mut self) -> bool {
+        if self.has_open_assistant() || self.pending_review_results.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.pending_review_results);
+        let mut changed = false;
+        for block in pending {
+            changed |= self.insert_review_result(block);
+        }
+        changed
+    }
+
+    /// Whether an assistant message is still being written. The one test that
+    /// decides whether a review result may enter the timeline right now.
+    pub fn has_open_assistant(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Assistant(block) if !block.done))
+    }
+
+    /// Whether this review's formal report already has its conversation entry.
+    pub fn has_review_result(&self, id: &str) -> bool {
+        self.items.iter().any(
+            |item| matches!(item, TranscriptItem::ReviewResult(block) if block.summary.id == id),
+        ) || self
+            .pending_review_results
+            .iter()
+            .any(|block| block.summary.id == id)
+    }
+
+    fn insert_review_result(&mut self, block: ReviewResultBlock) -> bool {
+        self.bump();
+        let review_id = block.summary.id.clone();
+        if let Some(existing) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::ReviewResult(existing) if existing.summary.id == review_id => {
+                Some(existing)
+            }
+            _ => None,
+        }) {
+            if *existing == block {
+                return false;
+            }
+            *existing = block;
+        } else {
+            self.close_tool_group();
+            self.items.push(TranscriptItem::ReviewResult(block));
+        }
+        // The card is the execution record; it says the report was delivered
+        // so it never offers a second, folded copy of the same report.
+        if let Some(card) = self.items.iter_mut().find_map(|item| match item {
+            TranscriptItem::Review(block) if block.summary.id == review_id => Some(block),
+            _ => None,
+        }) {
+            card.report_delivered = true;
+            // One report, one place. A history attach that raced this delivery
+            // left a copy on the card; the conversation entry is now the
+            // authority, so the card keeps only its execution record.
+            card.report = None;
+            card.expanded = false;
+        }
+        true
+    }
+
     /// Append a page of stored review cards and the newest reports. The
     /// runtime lists newest first; history is conversation order, so this
     /// walks backwards. Existing ids are updated in place, never duplicated.
+    ///
+    /// A review whose formal report was already delivered as its own
+    /// conversation entry keeps that entry: the report is not attached to the
+    /// card a second time. Rows written before result messages existed have no
+    /// entry, so their inline report remains the readable form.
     pub fn push_review_history(
         &mut self,
         mut summaries: Vec<leveler_client_protocol::UiReviewSummary>,
@@ -1171,6 +1374,13 @@ impl TranscriptState {
                 .iter()
                 .find(|report| report.summary.id == summary.id)
                 .cloned();
+            if self.has_review_result(&summary.id) {
+                // The report is already a conversation entry. This answer may
+                // add a card the replay window omitted, but it must not place
+                // a second card below the report that already landed.
+                self.apply_review_terminal(summary);
+                continue;
+            }
             self.attach_review_report(summary, report);
         }
     }
@@ -1435,6 +1645,9 @@ impl TranscriptState {
             block.done = true;
             block.rendered = Some(MdDoc::parse(&block.text));
         }
+        // The answer closed: a review that settled while it streamed can take
+        // its place after it now.
+        self.flush_pending_review_results();
     }
 
     /// Open a live reasoning block. A second start for the same segment is a
@@ -1531,18 +1744,54 @@ impl TranscriptState {
     /// or an unfinished assistant message stays "live" forever — never committing
     /// to scrollback, showing a stuck spinner/cursor. A cleanly-completed turn has
     /// nothing in-flight, so this is a no-op there.
-    /// Reviews in this transcript that have not settled. Their execution is a
-    /// session-level child: a turn ending says nothing about it.
+    /// Reviews in this transcript that have not settled, plus the independent
+    /// investigations they still own. Their execution is a session-level
+    /// child: a turn ending says nothing about it.
+    ///
+    /// The investigations are part of the same execution. The reviewer's
+    /// `SubAgentUpdated` rows carry their own ids, so without this a turn
+    /// boundary marked a running investigation as a child that lost its
+    /// terminal — red `未收到结束状态` over an agent still spending model
+    /// calls.
     pub fn live_review_ids(&self) -> Vec<String> {
-        self.items
-            .iter()
-            .filter_map(|item| match item {
-                TranscriptItem::Review(block) if !block.summary.status.settled() => {
-                    Some(block.summary.id.clone())
-                }
-                _ => None,
-            })
-            .collect()
+        let mut ids = Vec::new();
+        for item in &self.items {
+            let TranscriptItem::Review(block) = item else {
+                continue;
+            };
+            if block.summary.status.settled() {
+                continue;
+            }
+            ids.push(block.summary.id.clone());
+            ids.extend(
+                block
+                    .investigations
+                    .iter()
+                    .filter(|investigation| {
+                        investigation.state
+                            == leveler_client_protocol::UiReviewInvestigationState::Running
+                    })
+                    .map(|investigation| investigation.id.clone()),
+            );
+        }
+        ids
+    }
+
+    /// Whether `id` is a child of a review that has not settled. Cheap
+    /// membership test for the render path: a review's children are runtime
+    /// activity, not this turn's Main work.
+    pub fn is_live_review_child(&self, id: &str) -> bool {
+        self.items.iter().any(|item| match item {
+            TranscriptItem::Review(block) if !block.summary.status.settled() => {
+                block.summary.id == id
+                    || block.investigations.iter().any(|investigation| {
+                        investigation.id == id
+                            && investigation.state
+                                == leveler_client_protocol::UiReviewInvestigationState::Running
+                    })
+            }
+            _ => false,
+        })
     }
 
     pub fn finalize_in_flight(&mut self) {
@@ -1598,6 +1847,9 @@ impl TranscriptState {
                 _ => {}
             }
         }
+        // A review result that was waiting on the answer must not be lost when
+        // the turn ends without one (cancel, failure, history cutoff).
+        self.flush_pending_review_results();
     }
 
     /// Stamp `call` with the batch it was observed in.
@@ -2854,6 +3106,13 @@ impl TranscriptState {
                 output_tokens,
                 cached_input_tokens,
             };
+            // A live progress report disproves "no terminal arrived": the
+            // runtime just reported this child working. Reopen it; a settled
+            // block is a real terminal and stays closed.
+            if block.unreported {
+                block.unreported = false;
+                block.status = ToolStatus::Running;
+            }
         }
     }
 

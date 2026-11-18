@@ -929,9 +929,17 @@ async fn run_prepared_sub_agent(
         // accounting need; the ordinary capture closure otherwise drops
         // nested child events. Usage records must travel too: the review's
         // durable spend is the sum of every request it caused.
+        //
+        // Activity and cumulative progress travel with them. Both already
+        // carry the child's own id, so the projection attributes them to the
+        // grandchild instead of the executor that forwarded them. Without
+        // this, a running investigation showed no tool and zero tokens while
+        // it was really reading files and spending model calls.
         AgentEvent::SubAgentStarted { .. }
         | AgentEvent::SubAgentFinished { .. }
-        | AgentEvent::SubAgentModelRequest { .. } => {
+        | AgentEvent::SubAgentModelRequest { .. }
+        | AgentEvent::SubAgentProgress { .. }
+        | AgentEvent::SubAgentActivity { .. } => {
             let _ = activity_tx.send(event.clone());
         }
         _ => {}

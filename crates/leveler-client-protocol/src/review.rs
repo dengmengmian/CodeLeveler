@@ -606,6 +606,44 @@ pub struct UiReviewVerdict {
     pub limitations: Vec<UiReviewLimitation>,
 }
 
+/// The Git facts a bare `/review` scope picker offers before anything runs.
+///
+/// Read-only and unfetched: `upstream` is the remote-tracking ref Git already
+/// records for the branch, never an assumed `origin/main`. `recommended` is
+/// the scope those facts make the honest default, and `None` is a fact too —
+/// a clean tree with no upstream has no defensible default, so the picker
+/// asks instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiReviewScopeFacts {
+    /// The session has a workspace this runtime can review.
+    #[serde(default)]
+    pub workspace: bool,
+    /// The workspace is a Git work tree. `false` means branch/commit facts are
+    /// unknown, not empty; paths and the project remain selectable.
+    #[serde(default)]
+    pub git: bool,
+    /// Staged, unstaged or untracked changes exist.
+    #[serde(default)]
+    pub dirty: bool,
+    /// The current branch name, when HEAD is on one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The upstream this branch's own Git configuration records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Commits `upstream..HEAD` at read time. Zero when unknown or equal.
+    #[serde(default)]
+    pub ahead: u32,
+    /// The scope these facts recommend. Absent when nothing is unambiguously
+    /// reviewable; the client then asks without a preselection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<UiReviewScope>,
+    /// Why facts are missing or nothing is recommended. Presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// The full report behind a summary card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

@@ -8143,6 +8143,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 query_id,
             } => review::list(self, session_id, query_id).await,
+            ClientCommand::QueryReviewScopes {
+                session_id,
+                query_id,
+            } => review::scopes(self, session_id, query_id).await,
             ClientCommand::CancelCurrentTurn { session_id } => {
                 // Accepted input that never reached a model is settled with
                 // the task it belonged to; it must not resurrect in a later

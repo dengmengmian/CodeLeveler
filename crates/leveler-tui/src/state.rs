@@ -487,6 +487,17 @@ pub struct AppState {
     /// to review. It is restored onto the next `/review` so choosing a scope
     /// does not discard what the person wrote.
     pub review_scope_focus: Option<String>,
+    /// Correlation id of the scope-facts query a bare `/review` opened. Its
+    /// answer refreshes the picker with the workspace's real Git state; a
+    /// stale answer is ignored.
+    pub review_scope_query: Option<CommandId>,
+    /// The Git facts the open scope picker was built from. The branch row
+    /// carries the upstream it recommends, so confirming it starts exactly
+    /// that comparison.
+    pub review_scope_facts: Option<leveler_client_protocol::UiReviewScopeFacts>,
+    /// A `/review @model <ref>` override that must survive the scope picker.
+    /// The model is part of the request; choosing the object must not drop it.
+    pub review_scope_model: Option<leveler_client_protocol::ModelRef>,
     /// A manual review is running in this session (no turn owns it).
     pub live_review: bool,
     /// The message of the notice a REJECTED COMMAND produced, when that notice
@@ -975,6 +986,9 @@ impl AppState {
             reconnected_until: None,
             notification: None,
             review_scope_focus: None,
+            review_scope_query: None,
+            review_scope_facts: None,
+            review_scope_model: None,
             command_notice: None,
             live_review: false,
             update: None,

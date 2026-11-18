@@ -230,9 +230,25 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let anchor = fold_boundary
                 .then(|| interaction::reading_anchor(state))
                 .flatten();
+            // A runtime scope question and the TUI's "what is in this
+            // workspace" question are the same question. Ask for the facts so
+            // the picker can recommend a real object instead of a guess.
+            let scope_query = matches!(
+                &event,
+                RuntimeEvent::ReviewScopeRequired { session_id, .. }
+                    if session_id == &state.session_id
+            )
+            .then(CommandId::generate);
             apply_runtime(state, event);
             interaction::restore_reading_anchor(state, anchor);
             let mut effects = Vec::new();
+            if let Some(query_id) = scope_query {
+                state.review_scope_query = Some(query_id.clone());
+                effects.push(Effect::Send(ClientCommand::QueryReviewScopes {
+                    session_id: state.session_id.clone(),
+                    query_id: Some(query_id),
+                }));
+            }
             if opened && state.active_screen == Screen::Tasks {
                 crate::tasks::session_changed(state);
                 effects.extend(crate::tasks::refresh(state));
@@ -750,10 +766,19 @@ fn apply_effect_completion(state: &mut AppState, completion: EffectCompletion) {
                 && matches!(command, ClientCommand::ManageMcp { .. });
             let schedules_page_error = state.active_screen == Screen::Schedules
                 && matches!(command, ClientCommand::ManageSchedule { .. });
+            // The scope picker's facts query is not a command the person
+            // issued: a failure leaves the picker usable and says why, rather
+            // than writing a command-rejection row into the conversation.
+            let scope_facts_error = matches!(command, ClientCommand::QueryReviewScopes { .. });
             if let Some(snapshot) = snapshot {
                 runtime_apply::apply_session_confirmation(state, *snapshot, false);
             }
             crate::pending_steer::completed(state, &command, false);
+            if scope_facts_error {
+                state.review_scope_query = None;
+                overlay_keys::review_scope_failed(state, &message);
+                return;
+            }
             // Nothing is being stopped: the row goes back to offering a stop.
             if let ClientCommand::CancelToolCall { call_id, .. } = &command {
                 state

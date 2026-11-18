@@ -484,11 +484,22 @@ impl TaskTeamView {
 
     /// Live execution state. `active` separates "spending model calls" from
     /// "launched and queued", which is what makes waiting explicable.
+    ///
+    /// `Unreported` and `Interrupted` are not terminals: they record that this
+    /// view holds no current outcome. A fresh progress report is runtime
+    /// evidence that the child runs, so it reopens them. A settled child
+    /// (`Completed`/`Failed`) stays settled.
     pub fn apply_progress(&mut self, id: &str, active: bool, input: u32, output: u32) {
         if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
             c.input_tokens = input;
             c.output_tokens = output;
-            if matches!(c.status, ChildStatus::Waiting | ChildStatus::Running) {
+            if matches!(
+                c.status,
+                ChildStatus::Waiting
+                    | ChildStatus::Running
+                    | ChildStatus::Interrupted
+                    | ChildStatus::Unreported
+            ) {
                 c.status = if active {
                     ChildStatus::Running
                 } else {
@@ -822,7 +833,10 @@ mod tests {
             started_elapsed_secs: 0,
         });
         let rows = roster_rows(&team, 10, t);
-        assert_eq!(rows[0].activity, "摸清 GitCode 事件入口");
+        assert_eq!(
+            rows[0].activity,
+            format!("{} · 摸清 GitCode 事件入口", t.sub_agent_waiting)
+        );
         assert!(!rows[0].activity.contains("你是只读探查"));
     }
 
@@ -1526,6 +1540,111 @@ mod tests {
         assert!(rows[0].activity.contains("7"), "{:?}", rows[0]);
     }
 
+    /// While a child is active the row says what it is doing right now: the
+    /// tool in flight by name, otherwise the model round it is waiting on.
+    /// A live panel that only repeats the spawn title cannot tell a working
+    /// agent from a stalled one.
+    #[test]
+    fn an_active_child_shows_its_live_phase_and_its_task() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "w1", "worker", "implement the change");
+        started(&mut team, "a1", "explorer", "look");
+        for (id, title) in [("w1", "wire the client"), ("a1", "read the call chain")] {
+            team.apply_update(crate::multi_agent::ChildUpdate {
+                id: id.into(),
+                nickname: "Newton".into(),
+                role: "worker".into(),
+                done: false,
+                ok: false,
+                detail: "task".into(),
+                title: Some(title.into()),
+                profile_id: None,
+                agent_name: None,
+                read_only: true,
+                contribution: None,
+                started_elapsed_secs: 0,
+                stop: None,
+                limit: None,
+            });
+        }
+        // The worker is in a model round; the explorer has a tool in flight.
+        team.apply_progress("w1", true, 1_200, 80);
+        team.apply_activity("a1", "tool_started", "grep", "{}", false);
+        let rows = roster_rows(&team, 10, t);
+        assert!(
+            rows[0].activity.contains(t.waiting_model),
+            "a running child with no tool in flight is waiting on the model: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].activity.contains("wire the client"),
+            "the row keeps the task it was given: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].activity.contains("grep"),
+            "the tool in flight is the live state: {:?}",
+            rows[1]
+        );
+        assert!(
+            !rows[1].activity.contains(t.waiting_model),
+            "a tool call is not a model wait: {:?}",
+            rows[1]
+        );
+    }
+
+    /// `Unreported` means "no terminal reached this view", not "it died". A
+    /// live progress report is fresh runtime evidence that the child is
+    /// running, so the honest projection reopens it instead of leaving a red
+    /// marker over a working agent.
+    #[test]
+    fn a_live_progress_report_reopens_an_unreported_child() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "c1", "explorer", "look");
+        team.mark_unreported_at_turn_end(10, &[]);
+        assert_eq!(team.children[0].status, ChildStatus::Unreported);
+
+        team.apply_progress("c1", true, 1_200, 80);
+        assert_eq!(
+            team.children[0].status,
+            ChildStatus::Running,
+            "a running child must not stay painted as unreported"
+        );
+        let rows = roster_rows(&team, 20, t);
+        assert!(
+            !rows[0].activity.contains(t.sub_agent_unreported),
+            "{:?}",
+            rows[0]
+        );
+    }
+
+    /// A child whose terminal never arrived is not a success. The settled
+    /// team line and its glyph are the only summary left once the rows are
+    /// gone, so neither may read as a clean finish over an unknown outcome.
+    #[test]
+    fn a_team_that_lost_a_terminal_never_reads_as_done() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "a1", "explorer", "look");
+        started(&mut team, "w1", "worker", "implement");
+        finished(&mut team, "a1", true, Some(contribution(0)));
+        team.mark_unreported_at_turn_end(10, &[]);
+        assert_eq!(team.children[1].status, ChildStatus::Unreported);
+
+        let line = collaboration_compact_line(&team, t);
+        assert_eq!(
+            line,
+            t.collaboration_ended_incomplete
+                .replace("{n}", "2")
+                .replace("{bad}", "1"),
+            "{line}"
+        );
+        assert_eq!(collaboration_glyph(&team, true), "⚠");
+        assert_eq!(team_panel_title(&team, t), t.team_panel_incomplete);
+    }
+
     #[test]
     fn a_clean_reviewer_reads_as_a_result_in_the_panel() {
         let t = crate::i18n::Locale::En.text();
@@ -1798,6 +1917,10 @@ pub enum RosterTone {
     Done,
     /// A child that ended without completing. Never rendered as success.
     Failed,
+    /// The view holds no outcome for this child: it is not running and no
+    /// terminal arrived. Warning, never error — an unknown end is not a
+    /// failure the runtime reported.
+    Unconfirmed,
 }
 
 /// One row of the active agent runtime roster: who, doing what, for how
@@ -1862,21 +1985,52 @@ fn child_meta(view: &ChildAgentView, now_elapsed: u64) -> Option<String> {
     Some(elapsed)
 }
 
-/// The child's assigned task. The short spawn title is the caption. Without
-/// one, the row says the state. `purpose` is the child's prompt and is not a
-/// caption.
+/// What a child is doing right now, from the events the runtime sent.
+///
+/// A `SubAgentActivity` call that has not finished is a tool in flight; a
+/// running child with no call open is in a model round. Both are observable
+/// facts, never inferences from prose, and they use the same words the main
+/// status line uses for the same two states.
+fn child_phase(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<String> {
+    if !matches!(view.status, ChildStatus::Running | ChildStatus::Waiting) {
+        return None;
+    }
+    if let Some(call) = view
+        .activity
+        .iter()
+        .rev()
+        .find(|call| call.status == crate::transcript::ToolStatus::Running)
+    {
+        return Some(call.tool.clone());
+    }
+    Some(if view.status == ChildStatus::Running {
+        t.waiting_model.to_string()
+    } else {
+        t.sub_agent_waiting.to_string()
+    })
+}
+
+/// The child's live phase, then the task it was given.
+///
+/// The phase leads because it is the fact that changes: a row that only
+/// repeats the spawn title cannot tell a working agent from a stalled one.
+/// It stays in this cell rather than the meta column so the right-hand
+/// ` · 4m 09s ↗` column keeps its narrow, guaranteed place.
 fn child_activity(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
-    if let Some(title) = view
+    let phase = child_phase(view, t);
+    let title = view
         .title
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return title.to_string();
-    }
-    match view.status {
-        ChildStatus::Running => t.sub_agent_running.to_string(),
-        _ => t.sub_agent_waiting.to_string(),
+        .filter(|s| !s.is_empty());
+    match (phase, title) {
+        (Some(phase), Some(title)) => format!("{phase} · {title}"),
+        (Some(phase), None) => phase,
+        (None, Some(title)) => title.to_string(),
+        (None, None) => match view.status {
+            ChildStatus::Running => t.sub_agent_running.to_string(),
+            _ => t.sub_agent_waiting.to_string(),
+        },
     }
 }
 
@@ -1904,8 +2058,12 @@ pub fn roster_rows(
                     .map(str::to_string)
                     .unwrap_or_else(|| t.sub_agent_ended_incomplete.to_string()),
             ),
-            ChildStatus::Interrupted => (RosterTone::Failed, t.sub_agent_interrupted.to_string()),
-            ChildStatus::Unreported => (RosterTone::Failed, t.sub_agent_unreported.to_string()),
+            ChildStatus::Interrupted => {
+                (RosterTone::Unconfirmed, t.sub_agent_interrupted.to_string())
+            }
+            ChildStatus::Unreported => {
+                (RosterTone::Unconfirmed, t.sub_agent_unreported.to_string())
+            }
         };
         rows.push(AgentRosterRow {
             label: {
@@ -1941,9 +2099,14 @@ pub fn collaboration_runtime_line(
     if active == 0 {
         return collaboration_compact_line(team, t);
     }
-    let tokens = team.children.iter().fold(0u32, |sum, child| {
-        sum.saturating_add(child.input_tokens.saturating_add(child.output_tokens))
-    });
+    let input = team
+        .children
+        .iter()
+        .fold(0u32, |sum, child| sum.saturating_add(child.input_tokens));
+    let output = team
+        .children
+        .iter()
+        .fold(0u32, |sum, child| sum.saturating_add(child.output_tokens));
     let started = team
         .active()
         .map(|child| child.started_elapsed_secs)
@@ -1952,8 +2115,15 @@ pub fn collaboration_runtime_line(
     let mut line = t
         .agents_running_header
         .replacen("{}", &active.to_string(), 1);
-    if tokens > 0 {
-        line.push_str(&format!(" · {} tokens", fmt_tokens_compact(tokens)));
+    // Prompt and completion tokens are different measurements. Summing them
+    // into one unlabeled number hid which one moved and could not be checked
+    // against the durable rows.
+    if input > 0 || output > 0 {
+        line.push_str(&format!(
+            " · ↑{} ↓{}",
+            fmt_tokens_compact(input),
+            fmt_tokens_compact(output)
+        ));
     }
     line.push_str(&format!(
         " · {}",
@@ -1976,11 +2146,7 @@ pub fn team_panel_should_show(team: &TaskTeamView) -> bool {
 /// lost a child never says "completed".
 pub fn collaboration_compact_line(team: &TaskTeamView, t: &crate::i18n::UiText) -> String {
     let n = team.children.len();
-    let bad = team
-        .children
-        .iter()
-        .filter(|c| c.status == ChildStatus::Failed)
-        .count();
+    let bad = team.children.iter().filter(|c| unfinished(c)).count();
     if team.active().next().is_none() {
         return if bad > 0 {
             t.collaboration_ended_incomplete
@@ -2012,14 +2178,21 @@ pub fn collaboration_compact_line(team: &TaskTeamView, t: &crate::i18n::UiText) 
 ///
 /// `terminal` is the caller's own settled test, so WHEN the glyph appears does
 /// not change — only what it says when the team lost someone.
+/// A child whose outcome this view does not hold. `Unreported` and
+/// `Interrupted` are not failures, but they are also not finishes: a settled
+/// team must not read as clean over either of them.
+fn unfinished(child: &ChildAgentView) -> bool {
+    matches!(
+        child.status,
+        ChildStatus::Failed | ChildStatus::Unreported | ChildStatus::Interrupted
+    )
+}
+
 pub fn collaboration_glyph(team: &TaskTeamView, terminal: bool) -> &'static str {
     if !terminal {
         return "\u{25c9}";
     }
-    let lost_one = team
-        .children
-        .iter()
-        .any(|c| c.status == ChildStatus::Failed);
+    let lost_one = team.children.iter().any(unfinished);
     if lost_one { "\u{26a0}" } else { "\u{2713}" }
 }
 
@@ -2032,11 +2205,7 @@ pub fn team_panel_title(team: &TaskTeamView, t: &crate::i18n::UiText) -> String 
     }
     // A team with a failed child has not finished. Saying "done" over a ✗ is
     // the panel contradicting the line directly beneath it.
-    if team
-        .children
-        .iter()
-        .any(|c| c.status == ChildStatus::Failed)
-    {
+    if team.children.iter().any(unfinished) {
         return t.team_panel_incomplete.to_string();
     }
     t.team_panel_done.to_string()

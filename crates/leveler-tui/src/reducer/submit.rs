@@ -1302,6 +1302,14 @@ fn build_export_markdown(state: &AppState) -> String {
                 out.push_str(block.text.trim());
                 out.push_str("\n\n");
             }
+            // A delivered review report is part of the conversation, so an
+            // export keeps its body where the answer would be. The durable
+            // review row remains the authority, not this copy.
+            TranscriptItem::ReviewResult(block) => {
+                out.push_str(&format!("{}\n\n", state.t().export_assistant));
+                out.push_str(block.body.text.trim());
+                out.push_str("\n\n");
+            }
             TranscriptItem::TurnEnd(_) => out.push_str("---\n\n"),
             _ => {}
         }
@@ -1516,6 +1524,11 @@ fn set_collab_cmd(state: &mut AppState, command: &str) -> Vec<Effect> {
 /// The client parses only the COMMAND it was given (`/review @commit <rev>`);
 /// the remaining words are the user's review focus and go to the reviewer
 /// model verbatim. The runtime never classifies an ordinary message.
+///
+/// A directive-free `/review` always opens the native scope picker before
+/// anything runs. The runtime's real Git state supplies the recommendation,
+/// so a clean branch with commits over its upstream is preselected there —
+/// never assumed, never fetched, and never started without confirmation.
 fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command
         .strip_prefix("review")
@@ -1523,11 +1536,8 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         .trim_start()
         .to_string();
     let tokens: Vec<&str> = rest.split_whitespace().collect();
-    // A bare `/review`, and a `/review <focus>` with no directive, both mean
-    // "review what I am working on". The runtime resolves that against real
-    // Git state and asks back (`ReviewScopeRequired`) when nothing is
-    // unambiguously reviewable — the client never guesses a boundary.
     let mut scope = UiReviewScope::Auto;
+    let mut explicit = false;
     // Keyboard entry to a durable report. The mouse path (clicking the review
     // card) is unchanged; this names the same report by id, or the newest
     // settled review when no id is given.
@@ -1620,6 +1630,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 scope = UiReviewScope::Commit {
                     rev: (*rev).to_string(),
                 };
+                explicit = true;
                 index += 2;
                 break;
             }
@@ -1630,6 +1641,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 scope = UiReviewScope::Branch {
                     base: (*base).to_string(),
                 };
+                explicit = true;
                 index += 2;
                 break;
             }
@@ -1647,6 +1659,7 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                     return review_usage(state);
                 }
                 scope = UiReviewScope::Paths { paths };
+                explicit = true;
                 index += 2;
                 break;
             }
@@ -1661,16 +1674,19 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
                 scope = UiReviewScope::Session {
                     session_id: target.map(|id| leveler_core::SessionId::new(*id)),
                 };
+                explicit = true;
                 index += if target.is_some() { 2 } else { 1 };
                 break;
             }
             "@project" => {
                 scope = UiReviewScope::Project;
+                explicit = true;
                 index += 1;
                 break;
             }
             "@workspace" => {
                 scope = UiReviewScope::Workspace;
+                explicit = true;
                 index += 1;
                 break;
             }
@@ -1691,6 +1707,26 @@ fn review_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     {
         focus = pending;
     }
+    if !explicit {
+        // The object is not named, so this command only asks which object.
+        // Nothing is started and no reviewer is spent until the person
+        // confirms a row; the runtime answers with the real Git state the
+        // picker recommends from.
+        state.review_scope_focus = (!focus.trim().is_empty()).then_some(focus);
+        state.review_scope_model = model;
+        let query_id = CommandId::generate();
+        state.review_scope_query = Some(query_id.clone());
+        super::overlay_keys::open_review_scope_picker(state);
+        return vec![Effect::Send(ClientCommand::QueryReviewScopes {
+            session_id: state.session_id.clone(),
+            query_id: Some(query_id),
+        })];
+    }
+    // A `@model` chosen before the picker belongs to the same request. When
+    // the picker confirmed a row that needs a target, the pre-filled command
+    // carries no model text, so the stored override is the one to use.
+    let stored_model = state.review_scope_model.take();
+    let model = model.or(stored_model);
     vec![Effect::Send(ClientCommand::RunReview {
         session_id: state.session_id.clone(),
         focus,
@@ -2218,6 +2254,41 @@ mod export_tests {
             !zh.contains(crate::i18n::Locale::En.text().export_tools),
             "the Chinese export must not use the English Tools heading: {zh}"
         );
+    }
+
+    /// A review's formal report is a conversation message. An export that
+    /// skipped it would silently drop the longest answer the person got.
+    #[test]
+    fn export_keeps_a_delivered_review_report() {
+        let mut s = state_with_dialogue();
+        let summary = leveler_client_protocol::UiReviewSummary {
+            id: "review-1".into(),
+            session_id: SessionId::new("s-export"),
+            focus: "检查".into(),
+            scope: leveler_client_protocol::UiReviewScope::Workspace,
+            model: "m/x".into(),
+            status: leveler_client_protocol::UiReviewStatus::Completed,
+            created_at: "2026-11-18T00:00:00Z".into(),
+            finished_at: Some("2026-11-18T00:01:00Z".into()),
+            counts: Default::default(),
+            conclusion: None,
+            object_changed: false,
+            modified_source: false,
+            failure: None,
+            stop_detail: None,
+            usage: Default::default(),
+            investigations: Vec::new(),
+            report_source: leveler_client_protocol::UiReviewReportSource::Submitted,
+            report_evidence_revision: 1,
+            evidence_revision: 1,
+            report_revision: 1,
+            report_stale: false,
+        };
+        s.transcript
+            .push_review_result(summary, None, 60_000, "# 审查报告\n\n正文-AUDIT".into());
+        let md = build_export_markdown(&s);
+        assert!(md.contains("# 审查报告"), "{md}");
+        assert!(md.contains("正文-AUDIT"), "{md}");
     }
 
     /// E5: tool evidence names the call and its result facts, and points at

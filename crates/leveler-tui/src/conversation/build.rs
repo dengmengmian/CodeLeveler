@@ -1202,6 +1202,13 @@ fn render_cacheable_unit(
             ));
             crate::selection::apply_copy_rows(&mut copy[base..], &group_copy);
         }
+        TranscriptItem::ReviewResult(block) => {
+            let (lines, rows) = crate::render::transcript_lines::review_result_lines_with_copy(
+                block, theme, width, t,
+            );
+            out.extend(lines);
+            copy = rows;
+        }
         TranscriptItem::Plan(plan) => {
             let waiting_for_user = crate::workbench::plan_waiting_for_user_projection(state);
             crate::render::transcript_lines::historical_plan_lines_with_context(
@@ -3170,6 +3177,46 @@ mod semantic_copy_tests {
         assert!(all.contains("Narration: reading the files."), "{all:?}");
         assert!(all.contains("Final: the answer."), "{all:?}");
         assert!(!all.contains('●'), "the painted bullet never copies");
+    }
+
+    /// The delivered report is the longest answer a person gets. Its body is
+    /// ordinary copyable prose; only the status head is paint.
+    #[test]
+    fn a_delivered_review_report_copies_its_body_without_the_head() {
+        let mut s = dark_state();
+        s.transcript.push_user("question".into());
+        let summary = leveler_client_protocol::UiReviewSummary {
+            id: "review-1".into(),
+            session_id: SessionId::new("s1"),
+            focus: "检查".into(),
+            scope: leveler_client_protocol::UiReviewScope::Workspace,
+            model: "m/x".into(),
+            status: leveler_client_protocol::UiReviewStatus::Completed,
+            created_at: "2026-11-18T00:00:00Z".into(),
+            finished_at: Some("2026-11-18T00:01:00Z".into()),
+            counts: Default::default(),
+            conclusion: None,
+            object_changed: false,
+            modified_source: false,
+            failure: None,
+            stop_detail: None,
+            usage: Default::default(),
+            investigations: Vec::new(),
+            report_source: leveler_client_protocol::UiReviewReportSource::Submitted,
+            report_evidence_revision: 1,
+            evidence_revision: 1,
+            report_revision: 1,
+            report_stale: false,
+        };
+        s.transcript
+            .push_review_result(summary, None, 60_000, "# 审查报告\n\n正文-COPY".into());
+        let all = copy_rows(&s, 80, 0, s.conversation_plain(80).0.len());
+        assert!(all.contains("审查报告"), "{all:?}");
+        assert!(all.contains("正文-COPY"), "{all:?}");
+        assert!(
+            !all.contains("审查完成"),
+            "the painted status head is not the report body: {all:?}"
+        );
     }
 
     /// A runtime note is a host fact, not a user prompt: it copies its text

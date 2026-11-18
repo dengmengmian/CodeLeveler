@@ -31,6 +31,7 @@ pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
                 | TranscriptItem::Recap(_)
                 | TranscriptItem::GoalRecap(_)
                 | TranscriptItem::Review(_)
+                | TranscriptItem::ReviewResult(_)
                 // A Thought is conversation content: a replay that carried
                 // reasoning is not an empty session.
                 | TranscriptItem::Thought(_)

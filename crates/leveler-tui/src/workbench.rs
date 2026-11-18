@@ -1275,6 +1275,7 @@ fn render_team_panel(
             crate::multi_agent::RosterTone::Active => theme.accent.primary,
             crate::multi_agent::RosterTone::Done => theme.status.success,
             crate::multi_agent::RosterTone::Failed => theme.status.error,
+            crate::multi_agent::RosterTone::Unconfirmed => theme.status.warning,
         };
         let mut spans = vec![
             Span::styled(head, Style::default().fg(color)),
@@ -2066,9 +2067,16 @@ mod tests {
             .collect();
         let body_row = row_of(&lines, "git push");
         assert!(row_of(&lines, "plan 1/3") < body_row);
-        assert!(!lines.iter().any(|row| row.contains("waiting for model")));
         let footer_row = row_of(&lines, "29%/200k");
         let roster_row = row_of(&lines, "agents running");
+        // The live roster names the child's model round; the approval unit
+        // above it must not carry a second, displacing status line.
+        assert!(
+            !lines[..roster_row]
+                .iter()
+                .any(|row| row.contains("waiting for model")),
+            "{lines:#?}"
+        );
         assert!(
             body_row < footer_row,
             "approval body renders above the footer"
@@ -2198,7 +2206,7 @@ mod tests {
             "elapsed and detail affordance stay: {row:?}"
         );
         assert!(
-            reported.iter().any(|line| line.contains("362k tokens")),
+            reported.iter().any(|line| line.contains("↑181k")),
             "aggregate usage moves to the summary: {reported:#?}"
         );
     }
@@ -2241,7 +2249,9 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
             false,
         );
-        let row = roster_row(&lines, "explorer task");
+        // At this width the live phase keeps its place and the task caption is
+        // the part that truncates; the meta and the affordance never are.
+        let row = roster_row(&lines, "55s");
         assert!(
             row.contains("55s ↗"),
             "narrow width preserves the detail affordance: {row:?}"
@@ -2260,7 +2270,7 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
             false,
         );
-        let row = roster_row(&wide, "explorer task");
+        let row = roster_row(&wide, "waiting for model");
         assert!(
             row.contains("55s"),
             "given room, the meta is shown: {row:?}"
@@ -2342,15 +2352,15 @@ mod tests {
         let rows = panel_rows(&state, 3);
         let text = rows.join("\n");
         assert!(
-            squash(&rows[0]).contains("2个agents正在运行·29.9ktokens·1m46s"),
+            squash(&rows[0]).contains("2个agents正在运行·↑29.9k↓0·1m46s"),
             "summary: {text}"
         );
         assert!(
-            squash(&rows[1]).contains("Euclid·摸清前台手工发单全链路·1m46s↗"),
+            squash(&rows[1]).contains("Euclid·等待模型·摸清前台手工"),
             "first child stays on one line: {text}"
         );
         assert!(
-            squash(&rows[2]).contains("Newton·摸清后台目录规格编辑链路·1m46s↗"),
+            squash(&rows[2]).contains("Newton·等待模型·摸清后台目录"),
             "second child stays on one line: {text}"
         );
         assert!(
@@ -3542,9 +3552,12 @@ mod tests {
         let squashed = rows.replace(' ', "");
         assert!(rows.contains('●'), "{rows}");
         assert!(squashed.contains("1个agents正在运行"), "{rows}");
-        assert!(squashed.contains("审计生命周期与身份"), "{rows}");
+        // The live phase leads the cell, so at 70 columns a ten-glyph CJK
+        // title keeps its head and loses its tail. The task identity is what
+        // survives; the phase is the fact that moves.
+        assert!(squashed.contains("等待模型·审计生命周期"), "{rows}");
         assert!(squashed.contains("4m09s"), "elapsed: {rows}");
-        assert!(rows.contains("168k tokens"), "aggregate usage: {rows}");
+        assert!(rows.contains("↑120k ↓48k"), "aggregate usage: {rows}");
     }
 
     /// Matrix L: no usage reported yet → elapsed only, never a fake 0.

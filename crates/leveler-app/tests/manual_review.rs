@@ -1644,6 +1644,135 @@ async fn cancelling_a_review_cancels_its_active_investigation() {
     assert_eq!(stored.status, "cancelled");
 }
 
+/// An investigation is a real child on the session stream. Its tool activity
+/// and its model spend must reach the client under its own id, and the review's
+/// live usage must be the sum of everything the review caused. The reviewer
+/// child's capture used to drop both: two running investigators showed no
+/// activity and zero tokens while the review was really spending them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_investigation_reports_activity_and_usage_under_its_own_id() {
+    // Usage frames make the mock provider report what it spent, so the live
+    // and settled totals are a measurement rather than a zero.
+    let responses = vec![
+        sse(&[
+            tool_call_frame(
+                "call_spawn",
+                "spawn_agent",
+                serde_json::json!({
+                    "title": "账单读取权限调查",
+                    "task": "独立调查账单读取路径的 owner/tenant 边界。",
+                    "run_in_background": false
+                }),
+            ),
+            usage_frame(300, 30, 150),
+            finish_frame("tool_calls"),
+        ]),
+        sse(&[
+            tool_call_frame(
+                "call_investigation",
+                "report_investigation",
+                serde_json::json!({
+                    "objective": "核对账单读取的 owner/tenant 边界",
+                    "observed_facts": [{"statement": "load() 只按 document id 查询。"}],
+                    "examined_scope": ["src/billing.rs"]
+                }),
+            ),
+            usage_frame(100, 10, 40),
+            finish_frame("tool_calls"),
+        ]),
+        sse(&[
+            text_frame("调查完成。"),
+            usage_frame(50, 5, 20),
+            finish_frame("stop"),
+        ]),
+        sse(&[
+            tool_call_frame(
+                "call_verdict",
+                "report_review",
+                serde_json::json!({
+                    "conclusion": "inconclusive",
+                    "coverage": [{"dimension": "security", "status": "partial"}]
+                }),
+            ),
+            usage_frame(200, 20, 100),
+            finish_frame("tool_calls"),
+        ]),
+        sse(&[
+            text_frame("审查完成。"),
+            usage_frame(60, 6, 30),
+            finish_frame("stop"),
+        ]),
+    ];
+    let (_tmp, _server, _app, client, session) = harness(responses).await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: "检查账单读取的授权边界".into(),
+            scope: UiReviewScope::Workspace,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let mut investigator: Option<String> = None;
+    let mut saw_activity = false;
+    let mut investigator_input: u32 = 0;
+    let mut last_live_input = 0u32;
+    let mut settled = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while settled.is_none() {
+        let event = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("the review must settle")
+            .expect("event stream");
+        match event {
+            RuntimeEvent::SubAgentUpdated {
+                id,
+                role,
+                done: false,
+                ..
+            } if role == "investigator" => investigator = Some(id),
+            RuntimeEvent::SubAgentActivity { id, .. }
+                if investigator.as_ref().is_some_and(|own| own == &id) =>
+            {
+                saw_activity = true;
+            }
+            RuntimeEvent::SubAgentProgress {
+                id, input_tokens, ..
+            } if investigator.as_ref().is_some_and(|own| own == &id) => {
+                // The spawn announces itself with zero; the running totals
+                // that follow carry what it actually spent.
+                investigator_input = investigator_input.max(input_tokens);
+            }
+            RuntimeEvent::ReviewProgress { input_tokens, .. } => {
+                last_live_input = input_tokens;
+            }
+            RuntimeEvent::ReviewFinished { review, .. } => settled = Some(review),
+            _ => {}
+        }
+    }
+    let investigator = investigator.expect("the review launched an investigation");
+    assert!(
+        saw_activity,
+        "the investigation's tools are observable under {investigator}"
+    );
+    assert!(
+        investigator_input > 0,
+        "the investigation's own spend must reach the client, not only the durable row"
+    );
+    let settled = settled.expect("settled");
+    assert_eq!(
+        settled.usage.input_tokens, 710,
+        "the durable usage sums every request the review caused"
+    );
+    assert_eq!(
+        last_live_input, 710,
+        "the live review total and the settled total are one measurement: \
+         reviewer and investigations together"
+    );
+}
+
 /// A review seat cannot widen its authority by supplying a capability field
 /// the restricted schema does not advertise. Host admission refuses it and no
 /// child is started.
@@ -3234,4 +3363,96 @@ async fn a_review_is_cancellable_through_the_native_child_command() {
     let finished = next_review_finished(&mut rx, &server).await;
     assert_eq!(finished.id, review_id);
     assert_eq!(finished.status, UiReviewStatus::Cancelled);
+}
+
+/// A bare `/review` asks which object without starting anything. The runtime
+/// answers with the workspace's real Git facts: uncommitted changes first,
+/// otherwise the commits the branch has over the upstream its own Git config
+/// records. Nothing is fetched and no remote is assumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_scope_facts_recommend_from_the_real_git_state() {
+    let (tmp, _server, _app, client, session) = harness(Vec::new()).await;
+    let mut rx = client.subscribe();
+
+    client
+        .send(ClientCommand::QueryReviewScopes {
+            session_id: session.clone(),
+            query_id: Some(CommandId::new("q-dirty")),
+        })
+        .await
+        .unwrap();
+    let dirty = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the scope query must answer")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewScopesLoaded { facts, .. } = event {
+            break facts;
+        }
+    };
+    assert!(dirty.git, "the fixture is a Git work tree");
+    assert!(dirty.dirty, "the fixture has an uncommitted change");
+    assert_eq!(
+        dirty.recommended,
+        Some(UiReviewScope::Workspace),
+        "uncommitted changes are the object a bare /review should offer"
+    );
+    assert_eq!(dirty.upstream, None, "no upstream was configured yet");
+
+    // Commit the change, give the branch a real upstream, then move ahead of
+    // it. The recommendation must follow the branch facts now.
+    git(tmp.path(), &["add", "."]);
+    git(tmp.path(), &["commit", "-qm", "clean"]);
+    let bare = tempfile::tempdir().unwrap();
+    git(bare.path(), &["init", "--bare", "-q"]);
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            bare.path().to_str().expect("utf-8 path"),
+        ],
+    );
+    git(
+        tmp.path(),
+        &["push", "-q", "-u", "origin", "HEAD:refs/heads/main"],
+    );
+    std::fs::write(
+        tmp.path().join("src/billing.rs"),
+        "pub fn load(document_id: &str) { let _ = document_id; }\n// ahead\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["commit", "-qam", "ahead"]);
+
+    client
+        .send(ClientCommand::QueryReviewScopes {
+            session_id: session.clone(),
+            query_id: Some(CommandId::new("q-clean")),
+        })
+        .await
+        .unwrap();
+    let clean = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the second scope query must answer")
+            .expect("event stream");
+        if let RuntimeEvent::ReviewScopesLoaded {
+            query_id, facts, ..
+        } = event
+            && query_id.as_ref().is_some_and(|id| id.as_str() == "q-clean")
+        {
+            break facts;
+        }
+    };
+    assert!(!clean.dirty, "the tree was committed");
+    assert_eq!(clean.upstream.as_deref(), Some("origin/main"));
+    assert_eq!(clean.ahead, 1);
+    assert_eq!(
+        clean.recommended,
+        Some(UiReviewScope::Branch {
+            base: "origin/main".into()
+        }),
+        "a clean branch ahead of its recorded upstream is the honest default"
+    );
 }

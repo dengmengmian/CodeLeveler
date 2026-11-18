@@ -160,6 +160,15 @@ impl SelectionModel {
             .collect()
     }
 
+    /// The key of the row the cursor is on, when the cursor is on one. Lets a
+    /// caller rebuild the same kind of picker (a scope list refreshed with
+    /// live facts) without stealing the person's current row.
+    pub fn focused_key(&self) -> Option<&str> {
+        let vis = self.visible();
+        vis.get(self.cursor)
+            .map(|&abs| self.options[abs].key.as_str())
+    }
+
     /// Absolute option indices currently visible under the query filter.
     fn visible(&self) -> Vec<usize> {
         let query = self.query.text();

@@ -2147,7 +2147,7 @@ fn push_report_line(
     }
 }
 
-fn severity_label(severity: leveler_client_protocol::UiReviewSeverity) -> String {
+pub(crate) fn severity_label(severity: leveler_client_protocol::UiReviewSeverity) -> String {
     use leveler_client_protocol::UiReviewSeverity;
     match severity {
         UiReviewSeverity::P0 => "P0",
@@ -2158,7 +2158,7 @@ fn severity_label(severity: leveler_client_protocol::UiReviewSeverity) -> String
     .to_string()
 }
 
-fn confidence_label(confidence: leveler_client_protocol::UiReviewConfidence) -> String {
+pub(crate) fn confidence_label(confidence: leveler_client_protocol::UiReviewConfidence) -> String {
     use leveler_client_protocol::UiReviewConfidence;
     match confidence {
         UiReviewConfidence::High => "high",
@@ -2168,7 +2168,7 @@ fn confidence_label(confidence: leveler_client_protocol::UiReviewConfidence) -> 
     .to_string()
 }
 
-fn dimension_label(
+pub(crate) fn dimension_label(
     dimension: leveler_client_protocol::UiReviewDimension,
     t: &crate::i18n::UiText,
 ) -> &'static str {
@@ -3949,9 +3949,9 @@ mod tests {
         }
 
         let active = render_text(&mut state, 100, 28);
-        assert!(active.contains("3.8k tokens"), "{active}");
+        assert!(active.contains("↑3.6k ↓240"), "{active}");
         assert_eq!(
-            active.matches("3.8k tokens").count(),
+            active.matches("↑3.6k ↓240").count(),
             2,
             "durable conversation summary plus live bottom summary: {active}"
         );

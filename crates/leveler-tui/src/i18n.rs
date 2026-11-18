@@ -1970,8 +1970,22 @@ pub struct ReviewText {
     pub scope_commit_desc: &'static str,
     pub scope_branch: &'static str,
     pub scope_branch_desc: &'static str,
+    /// The picker row for the branch's own commits over its recorded
+    /// upstream. Distinct from `scope_branch`, which names an explicit base.
+    pub scope_branch_current: &'static str,
     pub scope_paths: &'static str,
     pub scope_paths_desc: &'static str,
+    /// The picker is open but the runtime has not answered yet. The Git state
+    /// decides the recommendation, so the rows that depend on it say they are
+    /// still being read instead of guessing.
+    pub scope_loading: &'static str,
+    pub scope_workspace_dirty: &'static str,
+    pub scope_workspace_clean: &'static str,
+    /// `{}` upstream, `{}` commit count.
+    pub scope_branch_ahead: &'static str,
+    pub scope_branch_no_upstream: &'static str,
+    pub scope_branch_none_ahead: &'static str,
+    pub scope_not_git: &'static str,
     /// Shown after choosing a scope that needs a target.
     pub target_prompt: &'static str,
     pub running: &'static str,
@@ -1996,6 +2010,8 @@ pub struct ReviewText {
     pub findings: &'static str,
     /// `{}` is the number of formal findings recorded as observations.
     pub observations: &'static str,
+    /// One formal finding's own observation marker.
+    pub observation: &'static str,
     /// `{}` is the number of CANDIDATES an investigation reported. Never the
     /// formal finding count.
     pub investigation_findings: &'static str,
@@ -3638,8 +3654,16 @@ static ZH: UiText = UiText {
         scope_commit_desc: "从指定 Commit 的 diff 审查（输入 rev）",
         scope_branch: "指定分支基线",
         scope_branch_desc: "审查当前分支相对 base 的提交（输入 base）",
+        scope_branch_current: "当前分支新增提交",
         scope_paths: "指定文件或目录",
         scope_paths_desc: "只审查列出的路径（逗号分隔）",
+        scope_loading: "正在读取 Git 状态…",
+        scope_workspace_dirty: "有未提交改动（含已暂存、未暂存与未跟踪文件）",
+        scope_workspace_clean: "工作区没有未提交变更",
+        scope_branch_ahead: "{}..HEAD · {} 个提交",
+        scope_branch_no_upstream: "当前分支没有记录的上游",
+        scope_branch_none_ahead: "当前分支没有领先上游的提交",
+        scope_not_git: "当前目录不是 Git 工作树",
         target_prompt: "输入目标后回车",
         running: "审查中",
         completed: "审查完成",
@@ -3656,6 +3680,7 @@ static ZH: UiText = UiText {
         finding_source: "来源：{}",
         findings: "正式 Finding {}",
         observations: "观察 {}",
+        observation: "观察",
         investigation_findings: "候选 {}",
         none_found: "没有正式 Finding（不代表已证明正确）",
         readonly: "未修改源码",
@@ -5327,8 +5352,16 @@ static EN: UiText = UiText {
         scope_commit_desc: "Review one commit's diff (enter a rev)",
         scope_branch: "A branch base",
         scope_branch_desc: "Review this branch against a base (enter a base)",
+        scope_branch_current: "Commits on this branch",
         scope_paths: "Files or directories",
         scope_paths_desc: "Review only the listed paths (comma separated)",
+        scope_loading: "reading Git state…",
+        scope_workspace_dirty: "uncommitted changes (staged, unstaged, untracked)",
+        scope_workspace_clean: "no uncommitted changes",
+        scope_branch_ahead: "{}..HEAD · {} commit(s)",
+        scope_branch_no_upstream: "this branch records no upstream",
+        scope_branch_none_ahead: "no commits ahead of the recorded upstream",
+        scope_not_git: "this directory is not a Git work tree",
         target_prompt: "enter a target and press Enter",
         running: "Reviewing",
         completed: "Review completed",
@@ -5345,6 +5378,7 @@ static EN: UiText = UiText {
         finding_source: "source: {}",
         findings: "{} formal finding(s)",
         observations: "observations {}",
+        observation: "observation",
         investigation_findings: "candidates {}",
         none_found: "No formal findings (not proof of correctness)",
         readonly: "source unchanged",

@@ -529,7 +529,15 @@ fn busy_status_line(state: &AppState, width: usize, stats: bool) -> Line<'static
     let theme = &state.theme;
     let t = state.t();
     let wait = crate::wait_status::project(state);
+    // The roster owns the live status when the active children belong to this
+    // turn's Main. A session-level review's children are not Main's work: they
+    // run in the background, so letting them blank this line would hide what
+    // Main itself is waiting on while the review runs.
     if state.team.active().next().is_some()
+        && !state
+            .team
+            .active()
+            .all(|child| state.transcript.is_live_review_child(&child.id))
         && wait.as_ref().is_none_or(|view| {
             matches!(
                 view.kind,
@@ -1897,6 +1905,79 @@ mod tests {
         assert!(
             text.trim().is_empty(),
             "team panel is the only live owner: {text}"
+        );
+    }
+
+    /// A review's children are not Main's work. While Main is answering with a
+    /// review running in the background, the roster reports the review and the
+    /// strip still reports what Main itself is waiting on — otherwise the
+    /// review silently takes over the only place Main's state was visible.
+    #[test]
+    fn a_background_review_does_not_take_over_mains_status_line() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        let summary = leveler_client_protocol::UiReviewSummary {
+            id: "review-1".into(),
+            session_id: leveler_client_protocol::SessionId::new("s1"),
+            focus: "检查支付模块".into(),
+            scope: leveler_client_protocol::UiReviewScope::Workspace,
+            model: "mock/m".into(),
+            status: leveler_client_protocol::UiReviewStatus::Running,
+            created_at: "2026-11-18T00:00:00Z".into(),
+            finished_at: None,
+            counts: leveler_client_protocol::UiReviewCounts::default(),
+            conclusion: None,
+            object_changed: false,
+            modified_source: false,
+            failure: None,
+            stop_detail: None,
+            usage: leveler_client_protocol::UiReviewUsage::default(),
+            investigations: Vec::new(),
+            report_source: leveler_client_protocol::UiReviewReportSource::Submitted,
+            report_evidence_revision: 0,
+            evidence_revision: 0,
+            report_revision: 1,
+            report_stale: false,
+        };
+        state.transcript.upsert_review(summary);
+        for (id, role) in [("review-1", "reviewer"), ("inv-1", "investigator")] {
+            state.team.apply_update(crate::multi_agent::ChildUpdate {
+                id: id.into(),
+                nickname: "Reviewer".into(),
+                role: role.into(),
+                done: false,
+                ok: false,
+                detail: "检查".into(),
+                title: Some("当前工作区变更".into()),
+                profile_id: None,
+                agent_name: None,
+                read_only: true,
+                contribution: None,
+                stop: None,
+                limit: None,
+                started_elapsed_secs: 0,
+            });
+        }
+        state.transcript.note_review_progress(
+            "review-1",
+            Some("git_history".into()),
+            None,
+            vec![leveler_client_protocol::UiReviewInvestigation {
+                id: "inv-1".into(),
+                title: "租户隔离".into(),
+                role: "investigator".into(),
+                state: leveler_client_protocol::UiReviewInvestigationState::Running,
+                objective: None,
+                findings: 0,
+                elapsed_ms: 0,
+            }],
+            74_000,
+        );
+
+        let text = status_text(&state);
+        assert!(
+            text.contains(state.t().waiting_model),
+            "Main's own model wait stays on the strip: {text}"
         );
     }
 

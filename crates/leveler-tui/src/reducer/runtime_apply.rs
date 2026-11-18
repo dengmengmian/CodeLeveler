@@ -1343,12 +1343,35 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             );
         }
         RuntimeEvent::ReviewFinished { review, report } => {
-            // The formal report arrives with the terminal and renders inline.
-            // Finishing never navigates away from the conversation.
+            // The review's execution record updates where it was requested;
+            // the durable formal report is delivered as its own conversation
+            // entry at the moment it finished. Finishing never navigates away
+            // from the conversation.
             state.live_review = false;
-            state
-                .transcript
-                .attach_review_report(review, report.map(|report| *report));
+            let elapsed_ms = crate::transcript::review_elapsed_ms(&review);
+            let summary = review.clone();
+            state.transcript.apply_review_terminal(review);
+            let Some(report) = report else {
+                // No durable report exists (no formal submission, or the
+                // terminal could not be persisted). The card states the
+                // terminal truth; there is no report body to deliver, and a
+                // later terminal without one must never erase a report this
+                // review already delivered.
+                return;
+            };
+            let body = crate::review_result::compose(&summary, Some(report.as_ref()), state.t());
+            if state.transcript.has_open_assistant() {
+                // A result must not land inside an answer that is still
+                // streaming. It is complete and durable now; only its place
+                // waits for the answer to close.
+                state
+                    .transcript
+                    .defer_review_result(summary, Some(*report), elapsed_ms, body);
+            } else {
+                state
+                    .transcript
+                    .push_review_result(summary, Some(*report), elapsed_ms, body);
+            }
         }
         RuntimeEvent::ReviewReportLoaded { query_id, report } => {
             let ours = query_id.is_some() && query_id == state.review_query;
@@ -1374,13 +1397,29 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         // Nothing was started: the runtime states that this workspace has no
         // unambiguous object, and the person chooses one. This is a question,
-        // not a failed command, so it never becomes a sticky error.
+        // not a failed command, so it never becomes a sticky error. The same
+        // facts query a bare `/review` uses fills in the recommendation.
         RuntimeEvent::ReviewScopeRequired { session_id, focus } => {
             if session_id != state.session_id {
                 return;
             }
             state.review_scope_focus = (!focus.trim().is_empty()).then_some(focus);
             super::overlay_keys::open_review_scope_picker(state);
+        }
+        RuntimeEvent::ReviewScopesLoaded {
+            query_id,
+            session_id,
+            facts,
+        } => {
+            if session_id != state.session_id {
+                return;
+            }
+            let ours = query_id.is_some() && query_id == state.review_scope_query;
+            if !ours {
+                return;
+            }
+            state.review_scope_query = None;
+            super::overlay_keys::apply_review_scope_facts(state, &facts);
         }
         RuntimeEvent::Notification { level, message } => {
             // Errors stick until Esc / next turn; also land in the transcript so

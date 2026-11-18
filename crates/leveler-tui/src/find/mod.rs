@@ -858,6 +858,17 @@ pub fn build_corpus(state: &AppState) -> FindCorpus {
                 &block.summary.focus,
                 None,
             ),
+            TranscriptItem::ReviewResult(block) => push_doc(
+                &mut docs,
+                index,
+                None,
+                None,
+                None,
+                FindSource::Review,
+                turn,
+                &block.body.text,
+                None,
+            ),
             TranscriptItem::Completion(_) | TranscriptItem::TurnEnd(_) => {}
         }
     }
@@ -1541,7 +1552,7 @@ fn resolve_target(state: &AppState, hit: &FindHit) -> Option<(usize, Option<usiz
             fingerprint(&sub_agent_text(block)) == hit.text_fingerprint
         }
         (FindSource::Plan, TranscriptItem::Plan(_)) => true,
-        (FindSource::Review, TranscriptItem::Review(_)) => true,
+        (FindSource::Review, TranscriptItem::Review(_) | TranscriptItem::ReviewResult(_)) => true,
         _ => false,
     };
     matches.then_some((hit.item, None))

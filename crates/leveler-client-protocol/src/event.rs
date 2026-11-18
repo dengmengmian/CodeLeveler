@@ -935,6 +935,15 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reports: Vec<crate::UiReviewReport>,
     },
+    /// Result of [`crate::ClientCommand::QueryReviewScopes`]. Facts only: no
+    /// review was started, and the client still confirms the object with the
+    /// person before spending a reviewer.
+    ReviewScopesLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        session_id: leveler_core::SessionId,
+        facts: crate::UiReviewScopeFacts,
+    },
     /// A bare `/review` reached the runtime, but nothing in this workspace is
     /// unambiguously reviewable: no uncommitted change and no upstream this
     /// branch is ahead of. Nothing was started. The client asks the person to

@@ -490,6 +490,16 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// Read the Git facts a bare `/review` needs to offer its scope picker:
+    /// whether the working tree has uncommitted changes, and whether the
+    /// branch is ahead of the upstream Git records for it. Read-only: nothing
+    /// is fetched, no review is started, and no repository state changes.
+    /// Answers with [`crate::RuntimeEvent::ReviewScopesLoaded`].
+    QueryReviewScopes {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Read-only observatory query. Does not mutate runtime, tools, or
     /// verification. Results arrive as [`crate::RuntimeEvent::ObservabilityLoaded`].
     QueryObservability {
@@ -807,6 +817,7 @@ impl ClientCommand {
             | ClientCommand::CancelReview { session_id, .. }
             | ClientCommand::QueryReviewReport { session_id, .. }
             | ClientCommand::ListReviews { session_id, .. }
+            | ClientCommand::QueryReviewScopes { session_id, .. }
             | ClientCommand::Recap { session_id }
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }

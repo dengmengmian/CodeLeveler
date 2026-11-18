@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::{
     ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile, UiReviewScope,
-    UiThinkingAccess,
+    UiReviewScopeFacts, UiThinkingAccess,
 };
 use leveler_model::ThinkingLevel;
 
@@ -156,8 +156,11 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
             }
             SelectionOutcome::Cancel => {
                 // The question is gone, so the words it carried are no longer
-                // pending anything.
+                // pending anything. A later facts answer for it is stale.
                 state.review_scope_focus = None;
+                state.review_scope_query = None;
+                state.review_scope_facts = None;
+                state.review_scope_model = None;
                 Vec::new()
             }
             SelectionOutcome::Confirm(key) => apply_review_scope_choice(state, &key),
@@ -681,29 +684,164 @@ pub(super) fn open_collab_picker(state: &mut AppState) {
     state.overlay = Some(Overlay::CollabPicker(Box::new(model)));
 }
 
-/// `/review` with no argument: choose what to review. The default is the
-/// current task, which is the narrowest honest object (the latest accepted
-/// delivery's own files, never every file another session touched).
+/// A bare `/review` opens this picker before anything runs. `facts` carries
+/// the runtime's real Git state once it answers; the baseline call (no facts)
+/// says the state is being read instead of guessing a recommendation.
 pub(super) fn open_review_scope_picker(state: &mut AppState) {
+    install_review_scope_picker(state, None);
+}
+
+/// Refresh an open picker with the runtime's Git facts. A picker the person
+/// already confirmed or cancelled is left alone: the answer arrives for a
+/// question that no longer exists.
+pub(super) fn apply_review_scope_facts(state: &mut AppState, facts: &UiReviewScopeFacts) {
+    if !matches!(state.overlay, Some(Overlay::ReviewScopePicker(_))) {
+        return;
+    }
+    install_review_scope_picker(state, Some(facts));
+}
+
+/// The facts could not be read. The picker stays usable with its baseline
+/// rows; the reason is stated, never hidden.
+pub(super) fn review_scope_failed(state: &mut AppState, reason: &str) {
+    if !matches!(state.overlay, Some(Overlay::ReviewScopePicker(_))) {
+        return;
+    }
+    install_review_scope_picker(state, None);
+    state.notification = Some(Notification {
+        level: NotificationLevel::Warning,
+        message: reason.to_string(),
+    });
+}
+
+/// Build the scope rows from the facts the runtime reported.
+///
+/// Only a scope the Git state actually supports is recommended: uncommitted
+/// changes make the working tree the object, otherwise the branch's commits
+/// over the upstream Git records for it. A clean tree with no recorded
+/// upstream has no defensible default, so nothing is marked recommended and
+/// the rows that need a target stay enabled.
+fn install_review_scope_picker(state: &mut AppState, facts: Option<&UiReviewScopeFacts>) {
     let t = state.t();
     let review = &t.review;
-    let options = vec![
-        SelectionOption::new("current_task", review.scope_current_task)
-            .description(review.scope_current_task_desc)
-            .recommended(true)
-            .current(true),
-        SelectionOption::new("workspace", review.scope_workspace)
-            .description(review.scope_workspace_desc),
-        SelectionOption::new("project", review.scope_project)
-            .description(review.scope_project_desc),
-        SelectionOption::new("session", review.scope_session)
-            .description(review.scope_session_desc),
-        SelectionOption::new("commit", review.scope_commit).description(review.scope_commit_desc),
-        SelectionOption::new("branch", review.scope_branch).description(review.scope_branch_desc),
-        SelectionOption::new("paths", review.scope_paths).description(review.scope_paths_desc),
-    ];
-    let model =
-        SelectionModel::new(review.scope_picker_title, options, false).focus_key("current_task");
+    // The baseline cursor sits on the first enabled row; a person who already
+    // moved to another row keeps it when the facts land.
+    let previous = match &state.overlay {
+        Some(Overlay::ReviewScopePicker(model)) => model.focused_key().map(str::to_string),
+        _ => None,
+    };
+    let recommended = facts.and_then(|facts| facts.recommended.clone());
+    let workspace_recommended = matches!(recommended, Some(UiReviewScope::Workspace));
+    let branch_recommended = matches!(&recommended, Some(UiReviewScope::Branch { .. }));
+
+    let workspace = {
+        let mut option = SelectionOption::new("workspace", review.scope_workspace)
+            .recommended(workspace_recommended);
+        match facts {
+            None => {
+                option = option.disabled(review.scope_loading);
+            }
+            Some(facts) if !facts.workspace => {
+                let reason = facts
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| review.scope_not_git.to_string());
+                option = option.disabled(reason);
+            }
+            Some(facts) if !facts.git => {
+                option = option.disabled(review.scope_not_git);
+            }
+            Some(facts) if facts.dirty => {
+                option = option.description(review.scope_workspace_dirty);
+            }
+            Some(_) => {
+                option = option.disabled(review.scope_workspace_clean);
+            }
+        }
+        option
+    };
+
+    let branch = {
+        let mut option = SelectionOption::new("branch", review.scope_branch_current)
+            .recommended(branch_recommended);
+        match facts {
+            None => {
+                option = option.disabled(review.scope_loading);
+            }
+            Some(facts) if facts.git => match facts.upstream.as_deref() {
+                Some(upstream) if facts.ahead > 0 => {
+                    option = option.description(
+                        review
+                            .scope_branch_ahead
+                            .replacen("{}", upstream, 1)
+                            .replacen("{}", &facts.ahead.to_string(), 1),
+                    );
+                }
+                Some(_) => {
+                    option = option.disabled(review.scope_branch_none_ahead);
+                }
+                None => {
+                    option = option.disabled(review.scope_branch_no_upstream);
+                }
+            },
+            Some(_) => {
+                option = option.disabled(review.scope_not_git);
+            }
+        }
+        option
+    };
+
+    // A scope that needs a target only PRE-FILLS the composer: launching a
+    // review with an empty rev would be a lie about what was reviewed.
+    let mut paths =
+        SelectionOption::new("paths", review.scope_paths).description(review.scope_paths_desc);
+    let mut commit =
+        SelectionOption::new("commit", review.scope_commit).description(review.scope_commit_desc);
+    // A range the Git state cannot recommend — `base...HEAD` for any base the
+    // person types. The runtime validates the rev when it is submitted.
+    let mut range =
+        SelectionOption::new("range", review.scope_branch).description(review.scope_branch_desc);
+    let mut project = SelectionOption::new("project", review.scope_project)
+        .description(review.scope_project_desc);
+    if let Some(facts) = facts {
+        if !facts.workspace {
+            let reason = facts
+                .detail
+                .clone()
+                .unwrap_or_else(|| review.scope_not_git.to_string());
+            paths = paths.disabled(reason.clone());
+            commit = commit.disabled(reason.clone());
+            range = range.disabled(reason.clone());
+            project = project.disabled(reason);
+        } else if !facts.git {
+            // Outside a Git work tree only the explicit paths scope has a
+            // reviewable object the runtime can enumerate.
+            commit = commit.disabled(review.scope_not_git);
+            range = range.disabled(review.scope_not_git);
+            project = project.disabled(review.scope_not_git);
+        }
+    }
+
+    let options = vec![workspace, branch, paths, commit, range, project];
+    let model = SelectionModel::new(review.scope_picker_title, options, false);
+    let model = match facts {
+        // The facts are what the recommendation is made from: put the cursor
+        // there. A row the person explicitly moved to before the answer is
+        // reached again by the same key.
+        Some(_) => match &recommended {
+            Some(UiReviewScope::Workspace) => model.focus_key("workspace"),
+            Some(UiReviewScope::Branch { .. }) => model.focus_key("branch"),
+            _ => {
+                let mut model = model;
+                if let Some(key) = previous.as_deref() {
+                    model = model.focus_key(key);
+                }
+                model
+            }
+        },
+        None => model,
+    };
+    state.review_scope_facts = facts.cloned();
     state.overlay = Some(Overlay::ReviewScopePicker(Box::new(model)));
 }
 
@@ -712,15 +850,31 @@ pub(super) fn open_review_scope_picker(state: &mut AppState) {
 /// what was reviewed.
 fn apply_review_scope_choice(state: &mut AppState, key: &str) -> Vec<Effect> {
     let prefix = match key {
-        "current_task" => return start_review(state, UiReviewScope::CurrentTask),
+        // The current task and the whole session remain reachable through the
+        // scopes the runtime resolves; the picker offers the objects a bare
+        // `/review` can actually see.
         "workspace" => return start_review(state, UiReviewScope::Workspace),
         "project" => return start_review(state, UiReviewScope::Project),
         "session" => return start_review(state, UiReviewScope::Session { session_id: None }),
         "commit" => "/review @commit ",
-        "branch" => "/review @branch ",
+        // The confirmed branch row IS the runtime's recorded upstream: start
+        // that comparison instead of asking the person to type the same ref.
+        "branch" => {
+            if let Some(upstream) = state
+                .review_scope_facts
+                .as_ref()
+                .and_then(|facts| facts.upstream.clone())
+            {
+                return start_review(state, UiReviewScope::Branch { base: upstream });
+            }
+            "/review @branch "
+        }
         "paths" => "/review @path ",
+        "range" => "/review @branch ",
         _ => return Vec::new(),
     };
+    state.review_scope_facts = None;
+    state.review_scope_query = None;
     let message = state.t().review.target_prompt.to_string();
     state.composer.replace(prefix);
     state.notification = Some(Notification {
@@ -730,15 +884,21 @@ fn apply_review_scope_choice(state: &mut AppState, key: &str) -> Vec<Effect> {
     Vec::new()
 }
 
+/// Start the review the picker's row names. The branch row is already tied to
+/// the upstream the runtime reported, so confirming it starts that exact
+/// comparison without retyping the base.
 fn start_review(state: &mut AppState, scope: UiReviewScope) -> Vec<Effect> {
     // A focus typed before the runtime asked for a scope is part of the same
     // request: choosing the OBJECT must not drop it.
     let focus = state.review_scope_focus.take().unwrap_or_default();
+    let model = state.review_scope_model.take();
+    state.review_scope_facts = None;
+    state.review_scope_query = None;
     vec![Effect::Send(ClientCommand::RunReview {
         session_id: state.session_id.clone(),
         focus,
         scope,
-        model: None,
+        model,
     })]
 }
 

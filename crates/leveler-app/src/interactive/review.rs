@@ -27,8 +27,8 @@ use leveler_client_protocol::{
     UiReviewCounts, UiReviewCoverage, UiReviewCoverageStatus, UiReviewDimension, UiReviewFinding,
     UiReviewFindingDisposition, UiReviewInvestigation, UiReviewInvestigationState,
     UiReviewLimitation, UiReviewLimitationKind, UiReviewLimitationSource, UiReviewObject,
-    UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewSeverity, UiReviewStatus,
-    UiReviewSummary, UiReviewUsage, UiReviewVerdict, UiRole,
+    UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewScopeFacts, UiReviewSeverity,
+    UiReviewStatus, UiReviewSummary, UiReviewUsage, UiReviewVerdict, UiRole,
 };
 use leveler_core::{RequestId, SessionId};
 use leveler_execution::PermissionProfile;
@@ -883,7 +883,7 @@ fn review_target_text(scope: &UiReviewScope) -> String {
     }
 }
 
-fn review_dimension_name(dimension: UiReviewDimension) -> &'static str {
+pub(crate) fn review_dimension_name(dimension: UiReviewDimension) -> &'static str {
     match dimension {
         UiReviewDimension::Code => "code",
         UiReviewDimension::Business => "business",
@@ -1017,6 +1017,140 @@ pub(super) async fn list(
 
 const REVIEW_HISTORY_REPORTS_MAX: usize = 20;
 const REVIEW_HISTORY_REPORT_BYTES_MAX: usize = 2 * 1024 * 1024;
+
+/// Read the Git facts a bare `/review` needs to offer its scope picker.
+///
+/// Facts only: no review is admitted, no row is written and nothing on disk is
+/// touched. The client still asks the person to confirm the object before a
+/// reviewer is spent. Like every review path, an unknown Git state is stated
+/// rather than turned into "clean".
+pub(super) async fn scopes(
+    client: &InProcessRuntimeClient,
+    session_id: SessionId,
+    query_id: Option<leveler_core::CommandId>,
+) -> Result<(), ClientError> {
+    let db = client
+        .app
+        .open_database()
+        .await
+        .map_err(|error| ClientError::Runtime(error.to_string()))?;
+    let record = SessionRepository::new(&db)
+        .get(&session_id)
+        .await
+        .map_err(|error| ClientError::Runtime(error.to_string()))?
+        .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+    let repo = record.repository.map(PathBuf::from);
+    let primary = client.app.layout.primary_workspace().map(Path::to_path_buf);
+    let facts =
+        tokio::task::spawn_blocking(move || scope_facts(repo.as_deref(), primary.as_deref()))
+            .await
+            .map_err(|error| ClientError::Runtime(format!("读取审查范围失败: {error}")))?;
+    emit(
+        client,
+        &session_id,
+        RuntimeEvent::ReviewScopesLoaded {
+            query_id,
+            session_id: session_id.clone(),
+            facts,
+        },
+    );
+    Ok(())
+}
+
+/// The picker's Git facts, read synchronously off the async workers.
+///
+/// `@{upstream}` is the same ref `resolve_auto` uses: the branch's own recorded
+/// remote-tracking ref. Nothing is fetched and no default remote is assumed.
+fn scope_facts(repo: Option<&Path>, primary: Option<&Path>) -> UiReviewScopeFacts {
+    let Some(repo) = repo else {
+        return UiReviewScopeFacts {
+            workspace: false,
+            git: false,
+            dirty: false,
+            branch: None,
+            upstream: None,
+            ahead: 0,
+            recommended: None,
+            detail: Some("当前会话没有工作区；无法确定审查对象。".to_string()),
+        };
+    };
+    if let Some(primary) = primary
+        && !same_path(repo, primary)
+    {
+        return UiReviewScopeFacts {
+            workspace: false,
+            git: false,
+            dirty: false,
+            branch: None,
+            upstream: None,
+            ahead: 0,
+            recommended: None,
+            detail: Some(format!(
+                "该 Session 的工作区是 {}，不是当前运行时工作区 {}；本次审查无法读取它",
+                repo.display(),
+                primary.display()
+            )),
+        };
+    }
+    let Some(status) = git(repo, &["status", "--porcelain"]) else {
+        return UiReviewScopeFacts {
+            workspace: true,
+            git: false,
+            dirty: false,
+            branch: None,
+            upstream: None,
+            ahead: 0,
+            recommended: None,
+            detail: Some(
+                "无法读取 Git 状态：目录不是 Git 仓库或 git 不可用。可指定路径审查。".to_string(),
+            ),
+        };
+    };
+    let dirty = !status.trim().is_empty();
+    let branch =
+        git_trim(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|name| name != "HEAD");
+    let upstream = git_trim(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+    let ahead = upstream
+        .as_deref()
+        .and_then(|upstream| git_trim(repo, &["rev-list", "--count", &format!("{upstream}..HEAD")]))
+        .and_then(|count| count.parse::<u32>().ok())
+        .unwrap_or(0);
+    let recommended = if dirty {
+        Some(UiReviewScope::Workspace)
+    } else {
+        upstream
+            .clone()
+            .filter(|_| ahead > 0)
+            .map(|base| UiReviewScope::Branch { base })
+    };
+    let detail = match (&recommended, &upstream) {
+        (Some(UiReviewScope::Workspace), _) => Some("工作区有未提交变更。".to_string()),
+        (Some(UiReviewScope::Branch { .. }), Some(upstream)) => Some(format!(
+            "工作区没有未提交变更；当前分支相对 {upstream} 领先 {ahead} 个提交。\
+             上游是本地远程跟踪引用（上次 fetch 的状态），本次没有联网校验远端。"
+        )),
+        (_, None) => Some("工作区干净，且当前分支没有记录的上游；请选择审查对象。".to_string()),
+        _ => Some("工作区干净，且当前分支没有领先上游的提交；请选择审查对象。".to_string()),
+    };
+    UiReviewScopeFacts {
+        workspace: true,
+        git: true,
+        dirty,
+        branch,
+        upstream,
+        ahead,
+        recommended,
+        detail,
+    }
+}
 
 /// One review, verified to belong to the requesting session, with a stale
 /// `running` row settled as incomplete instead of being shown as live.
@@ -1543,9 +1677,6 @@ async fn run_review(
                     output_tokens: *output_tokens,
                     cached_input_tokens: *cached_input_tokens,
                 });
-                last_input = *input_tokens;
-                last_output = *output_tokens;
-                last_cached = *cached_input_tokens;
             }
             AgentEvent::SubAgentActivity {
                 id,
@@ -1596,6 +1727,13 @@ async fn run_review(
             }
             _ => return,
         }
+        // The live total is the same measurement the durable row records: every
+        // model request the review caused, reviewer and investigations
+        // together. Using the last child progress event instead made the live
+        // number shrink to one child's spend and disagree with the settlement.
+        last_input = u32::try_from(usage.input_tokens).unwrap_or(u32::MAX);
+        last_output = u32::try_from(usage.output_tokens).unwrap_or(u32::MAX);
+        last_cached = u32::try_from(usage.cached_input_tokens).unwrap_or(u32::MAX);
         let investigations_now = investigations_obs
             .lock()
             .map(|guard| guard.clone())
@@ -3042,6 +3180,12 @@ fn resolve_branch(repo: &Path, base: &str) -> Result<ResolvedScope, ClientError>
 
 fn resolve_paths(repo: &Path, paths: &[String]) -> Result<ResolvedScope, ClientError> {
     let paths = validate_paths(paths)?;
+    // A workspace does not have to be a Git work tree to be reviewable by
+    // explicit paths: the reviewer reads the named files directly. In that
+    // case there is no diff, no HEAD and no history, and the report says so.
+    if git(repo, &["status", "--porcelain"]).is_none() {
+        return resolve_paths_without_git(repo, &paths);
+    }
     let mut scope = resolve_live(repo, Some(&paths), "paths")?;
     scope.object.files = cap_files(&paths);
     scope.files = cap_files(&paths);
@@ -3061,6 +3205,104 @@ fn resolve_paths(repo: &Path, paths: &[String]) -> Result<ResolvedScope, ClientE
         );
     }
     Ok(scope)
+}
+
+/// Explicit paths in a directory that is not a Git work tree.
+///
+/// The named files are enumerated directly (ordinary files only; a symlink or
+/// special file is skipped, never followed). There is no diff and the object
+/// records no HEAD, which the limitation states instead of implying a Git
+/// delta exists.
+fn resolve_paths_without_git(repo: &Path, paths: &[String]) -> Result<ResolvedScope, ClientError> {
+    let mut files = Vec::new();
+    for path in paths {
+        let absolute = repo.join(path);
+        let metadata = std::fs::symlink_metadata(&absolute)
+            .map_err(|error| ClientError::Runtime(format!("无法读取审查路径 `{path}`: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_regular_files(repo, &absolute, &mut files)?;
+        } else if metadata.is_file() {
+            files.push(path.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err(ClientError::Runtime(
+            "指定路径中没有可审查的普通文件".to_string(),
+        ));
+    }
+    let all_files = cap_files(&files);
+    let sample = hash_untracked_sample(repo, &all_files);
+    let fingerprint = fingerprint_parts(&[
+        "paths",
+        "",
+        &all_files.join("\n"),
+        &all_files.join("\n"),
+        &sample.digest,
+        "",
+    ]);
+    Ok(ResolvedScope {
+        object: UiReviewObject {
+            workspace: Some(repo.display().to_string()),
+            head: None,
+            dirty: false,
+            files: all_files.clone(),
+            untracked: all_files.clone(),
+            revision: None,
+            fingerprint,
+            captured_at: leveler_core::now().to_rfc3339(),
+        },
+        files: all_files,
+        diff: None,
+        diff_truncated: false,
+        fingerprint_truncated: sample.truncated,
+        fingerprint_unreadable: sample.unreadable,
+        limitation: Some(
+            "当前工作区不是 Git 仓库：审查只覆盖指定路径的普通文件，没有 diff 或提交历史。"
+                .to_string(),
+        ),
+    })
+}
+
+/// Collect ordinary files under `dir`, repository-relative and bounded.
+fn collect_regular_files(
+    repo: &Path,
+    dir: &Path,
+    files: &mut Vec<String>,
+) -> Result<(), ClientError> {
+    if files.len() >= OBJECT_FILES_MAX * 4 {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|error| {
+        ClientError::Runtime(format!("无法读取审查目录 `{}`: {error}", dir.display()))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ClientError::Runtime(format!("无法读取审查目录 `{}`: {error}", dir.display()))
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            ClientError::Runtime(format!("无法读取审查路径 `{}`: {error}", path.display()))
+        })?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            collect_regular_files(repo, &path, files)?;
+        } else if metadata.is_file()
+            && let Ok(relative) = path.strip_prefix(repo)
+        {
+            files.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
 }
 
 fn diff_for_paths(repo: &Path, paths: &[String]) -> Option<String> {
@@ -3959,7 +4201,7 @@ fn verdict_from_record(record: &ReviewRecord) -> Result<Option<UiReviewVerdict>,
         .transpose()
 }
 
-fn report_from_record(record: &ReviewRecord) -> Result<UiReviewReport, ClientError> {
+pub(crate) fn report_from_record(record: &ReviewRecord) -> Result<UiReviewReport, ClientError> {
     let summary = summary_from_record(record)?;
     let object = record
         .object_json
@@ -4234,6 +4476,42 @@ mod tests {
         git(dir, &["remote", "add", name, url]);
         git(dir, &["push", "-q", "-u", name, "main"]);
         bare
+    }
+
+    /// A directory that is not a Git work tree can still be reviewed by
+    /// explicit paths: the named ordinary files are enumerated directly, and
+    /// the report states that there is no diff or history.
+    #[test]
+    fn explicit_paths_review_works_outside_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/deep/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "readme\n").unwrap();
+        let resolved = resolve_for_test(
+            &task_context(dir.path(), &[]),
+            &UiReviewScope::Paths {
+                paths: vec!["src".to_string()],
+            },
+        )
+        .expect("a non-Git workspace reviews explicit paths");
+        assert_eq!(
+            resolved.files,
+            vec!["src/a.rs".to_string(), "src/deep/b.rs".to_string()]
+        );
+        assert!(resolved.diff.is_none(), "there is no Git diff to show");
+        assert!(
+            resolved
+                .limitation
+                .as_deref()
+                .is_some_and(|text| text.contains("不是 Git")),
+            "{:?}",
+            resolved.limitation
+        );
+        assert!(
+            !resolved.files.iter().any(|file| file == "README.md"),
+            "only the named paths are reviewed"
+        );
     }
 
     /// A bare `/review` reviews what the person is working on. Uncommitted

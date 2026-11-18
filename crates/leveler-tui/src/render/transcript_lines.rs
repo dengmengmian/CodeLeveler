@@ -506,8 +506,88 @@ pub fn item_render(
         }
         TranscriptItem::GoalRecap(block) => goal_recap_lines(block, theme, wrap_width, &mut out, t),
         TranscriptItem::Review(block) => review_lines(block, theme, wrap_width, &mut out, t),
+        TranscriptItem::ReviewResult(block) => {
+            review_result_lines(block, theme, wrap_width, &mut out, t)
+        }
     }
     out
+}
+
+/// One settled review's formal report as a conversation message.
+///
+/// The head is the same child grammar the execution card uses; the body is the
+/// composed report rendered by the ordinary assistant Markdown path. It is
+/// never folded and never truncated: a long report scrolls exactly as a long
+/// answer does.
+fn review_result_lines(
+    block: &crate::transcript::ReviewResultBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    out: &mut Vec<Line<'static>>,
+    t: &UiText,
+) {
+    out.extend(review_result_lines_with_copy(block, theme, wrap_width, t).0);
+}
+
+/// [`review_result_lines`] plus the copy policy produced by the same layout
+/// pass: the head row is chrome, every report row is the reviewer's text.
+pub(crate) fn review_result_lines_with_copy(
+    block: &crate::transcript::ReviewResultBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &UiText,
+) -> (Vec<Line<'static>>, Vec<crate::selection::PlainRow>) {
+    let mut copy = vec![crate::selection::PlainRow {
+        skip: true,
+        ..Default::default()
+    }];
+    let mut out = vec![review_result_head(block, theme, t)];
+    let (lines, rows) = assistant_render_with_copy(&block.body, theme, wrap_width);
+    out.extend(lines);
+    copy.extend(rows);
+    (out, copy)
+}
+
+fn review_result_head(
+    block: &crate::transcript::ReviewResultBlock,
+    theme: &Theme,
+    t: &UiText,
+) -> Line<'static> {
+    let summary = &block.summary;
+    let accent = Style::default()
+        .fg(theme.accent.primary)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.text.secondary);
+    let (glyph, glyph_color) = match summary.status {
+        leveler_client_protocol::UiReviewStatus::Queued
+        | leveler_client_protocol::UiReviewStatus::Running => ("\u{25cc}", theme.accent.primary),
+        leveler_client_protocol::UiReviewStatus::Completed => ("\u{2713}", theme.status.success),
+        leveler_client_protocol::UiReviewStatus::Incomplete
+        | leveler_client_protocol::UiReviewStatus::Cancelled => ("?", theme.status.warning),
+        leveler_client_protocol::UiReviewStatus::Failed => ("\u{2717}", theme.status.error),
+    };
+    let mut head = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+        Span::styled(t.sub_agent_reviewer.to_string(), accent),
+        Span::styled(
+            format!(
+                " · {} · {}",
+                review_status_label(summary.status, t),
+                review_scope_label(&summary.scope, t)
+            ),
+            muted,
+        ),
+    ];
+    if block.elapsed_ms > 0 {
+        head.push(Span::styled(
+            format!(
+                " · {}",
+                crate::status_line::fmt_elapsed(block.elapsed_ms / 1000)
+            ),
+            muted,
+        ));
+    }
+    Line::from(head)
 }
 
 /// One review in the conversation, drawn with the same grammar as a delegated
@@ -569,10 +649,10 @@ fn review_lines(
     if let Some(tool) = block.live_tool.as_deref().filter(|tool| !tool.is_empty()) {
         head.push(Span::styled(format!(" · {tool}"), accent));
     }
-    if summary.status.settled() && block.report.is_none() {
-        // The report page is still a fallback for rows without a fetched
-        // report. The entry sits on the card's right edge; it wraps only when
-        // the row truly has no room.
+    if summary.status.settled() && block.report.is_none() && !block.report_delivered {
+        // The report page is still a fallback for rows without a delivered
+        // report entry and without a fetched report. A review whose report is
+        // already in the conversation offers no second, folded copy.
         let label = t.review.view_report;
         let used: usize = head
             .iter()
@@ -587,7 +667,9 @@ fn review_lines(
         head.push(Span::styled(label, accent));
     }
     out.push(Line::from(head));
-    if let Some(report) = block.report.as_ref() {
+    if !block.report_delivered
+        && let Some(report) = block.report.as_ref()
+    {
         // The durable row is the only source of this report: it was projected
         // from `report_review` and delivered with the terminal event. The
         // conversation renders it in place; there is no second, agent-written
@@ -769,9 +851,9 @@ pub(crate) fn review_scope_label(
         leveler_client_protocol::UiReviewScope::Commit { rev } => {
             format!("{} {rev}", t.review.scope_commit)
         }
-        leveler_client_protocol::UiReviewScope::Branch { base } => {
-            format!("{} {base}", t.review.scope_branch)
-        }
+        // The reviewed object IS the range: naming the base alone leaves the
+        // reader unsure whether the whole branch or one commit was read.
+        leveler_client_protocol::UiReviewScope::Branch { base } => format!("{base}..HEAD"),
         leveler_client_protocol::UiReviewScope::Paths { paths } => {
             format!("{} {}", t.review.scope_paths, paths.join(", "))
         }
@@ -1588,10 +1670,17 @@ fn sub_agent_tree_group_lines(
     now_elapsed_secs: u64,
 ) {
     let n = blocks.len();
-    let any_running = blocks.iter().any(|b| b.status == ToolStatus::Running);
+    let running = blocks
+        .iter()
+        .filter(|b| b.status == ToolStatus::Running)
+        .count();
+    let any_running = running > 0;
     let all_ok = blocks.iter().all(|b| b.status == ToolStatus::Ok);
 
-    let count = n.to_string();
+    // Only the blocks still running are "正在运行". Counting every block in
+    // the group made a mixed batch read as three live agents while the live
+    // roster, which counts active children, said one at the same moment.
+    let count = if any_running { running } else { n }.to_string();
     let (glyph, color, header) = if any_running {
         (
             "◌",
@@ -1622,14 +1711,19 @@ fn sub_agent_tree_group_lines(
         .fold(0u64, |acc, b| acc + u64::from(b.progress.output_tokens));
     let mut stats = String::new();
     if sum_in > 0 || sum_out > 0 {
-        let total = sum_in.saturating_add(sum_out);
+        // Prompt and completion tokens are different measurements; one
+        // unlabeled sum could not be checked against the durable rows.
         stats.push_str(&format!(
-            " · {} tokens",
-            crate::multi_agent::fmt_tokens_compact(u32::try_from(total).unwrap_or(u32::MAX))
+            " · ↑{} ↓{}",
+            crate::multi_agent::fmt_tokens_compact(u32::try_from(sum_in).unwrap_or(u32::MAX)),
+            crate::multi_agent::fmt_tokens_compact(u32::try_from(sum_out).unwrap_or(u32::MAX))
         ));
     }
+    // While the batch is live, its clock is the oldest still-running block.
+    // A block that settled earlier is history, not part of this window.
     let started = blocks
         .iter()
+        .filter(|block| !any_running || block.status == ToolStatus::Running)
         .map(|block| block.started_elapsed_secs)
         .min()
         .unwrap_or(now_elapsed_secs);
@@ -3798,7 +3892,7 @@ mod tests {
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("◌ 2 个 agents 正在运行"), "{text}");
-        assert!(text.contains("3.8k tokens"), "{text}");
+        assert!(text.contains("↑3.6k ↓240"), "{text}");
         assert!(text.contains("摸清事件入口"), "{text}");
         assert!(!text.contains("你是只读探查"), "{text}");
         assert!(
@@ -3825,6 +3919,23 @@ mod tests {
         );
     }
 
+    /// A group header sums the run, but only the blocks still running are
+    /// "正在运行". Counting every block in the group made a mixed batch read
+    /// as three live agents when one of them had already settled — and the
+    /// roster, which counts active children, said two at the same moment.
+    #[test]
+    fn a_mixed_group_counts_only_the_agents_still_running() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
+        let b = sub_agent("agent-2", "Newton", ToolStatus::Ok);
+        let c = sub_agent("agent-3", "Curie", ToolStatus::Ok);
+        let lines = sub_agent_tree_lines(&[&a, &b, &c], &theme, 100, t, 10);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("1 个 agents 正在运行"), "{text}");
+        assert!(!text.contains("3 个 agents 正在运行"), "{text}");
+    }
+
     #[test]
     fn sub_agent_tree_all_done_shows_stats_not_status_words() {
         let theme = Theme::default();
@@ -3835,7 +3946,7 @@ mod tests {
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("✓ 2 个 agents 完成"), "{text}");
-        assert!(text.contains("87.8k tokens"), "{text}");
+        assert!(text.contains("↑87.8k ↓0"), "{text}");
         assert!(!text.contains("├─ Euclid"), "{text}");
     }
 

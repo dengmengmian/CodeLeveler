@@ -14140,6 +14140,32 @@ fn a_live_entry_with_an_ambiguous_durable_id_is_a_conflict() {
 
 // ── Manual review (/review) ──────────────────────────────────────────────────
 
+fn scope_facts(
+    dirty: bool,
+    upstream: Option<&str>,
+    ahead: u32,
+) -> leveler_client_protocol::UiReviewScopeFacts {
+    let recommended = if dirty {
+        Some(leveler_client_protocol::UiReviewScope::Workspace)
+    } else {
+        upstream
+            .filter(|_| ahead > 0)
+            .map(|base| leveler_client_protocol::UiReviewScope::Branch {
+                base: base.to_string(),
+            })
+    };
+    leveler_client_protocol::UiReviewScopeFacts {
+        workspace: true,
+        git: true,
+        dirty,
+        branch: Some("feature".into()),
+        upstream: upstream.map(str::to_string),
+        ahead,
+        recommended,
+        detail: None,
+    }
+}
+
 fn review_summary(
     id: &str,
     status: leveler_client_protocol::UiReviewStatus,
@@ -14206,31 +14232,72 @@ fn review_report(
     }
 }
 
+/// A bare `/review` never starts a review on its own. The picker opens at
+/// once and the runtime is asked for the workspace's real Git facts, which is
+/// what makes the preselection a fact rather than a guess.
 #[test]
-fn a_bare_review_asks_the_runtime_for_the_default_object() {
+fn a_bare_review_opens_the_scope_picker_before_anything_runs() {
     let mut s = state();
     s.composer.replace("/review");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
-        panic!("expected one RunReview, got {effects:?}");
+    let [
+        Effect::Send(ClientCommand::QueryReviewScopes {
+            session_id,
+            query_id,
+        }),
+    ] = &effects[..]
+    else {
+        panic!("expected one QueryReviewScopes, got {effects:?}");
     };
-    assert!(focus.is_empty(), "{focus:?}");
-    // The runtime decides from real Git state; the client never guesses a
-    // boundary and never asks the person to run a Goal first.
-    assert_eq!(*scope, leveler_client_protocol::UiReviewScope::Auto);
-    assert!(!matches!(s.overlay, Some(Overlay::ReviewScopePicker(_))));
+    assert_eq!(session_id, &s.session_id);
+    assert_eq!(query_id, &s.review_scope_query);
+    assert!(
+        matches!(s.overlay, Some(Overlay::ReviewScopePicker(_))),
+        "a bare /review always asks which object"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(ClientCommand::RunReview { .. }))),
+        "nothing may start before the person confirms a scope"
+    );
 }
 
+/// The words after `/review` are the review focus, not a scope. They survive
+/// the picker round trip and reach the reviewer verbatim.
 #[test]
-fn review_focus_is_carried_verbatim_with_the_default_scope() {
+fn review_focus_is_carried_verbatim_through_the_scope_picker() {
     let mut s = state();
     s.composer.replace("/review 检查刚才的业务实现是否正确");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::QueryReviewScopes { .. })]
+        ),
+        "{effects:?}"
+    );
+    assert_eq!(
+        s.review_scope_focus.as_deref(),
+        Some("检查刚才的业务实现是否正确")
+    );
+
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    let session_id = s.session_id.clone();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(true, None, 0),
+        }),
+    );
     let effects = reduce(&mut s, key(KeyCode::Enter));
     let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
         panic!("expected one RunReview, got {effects:?}");
     };
     assert_eq!(focus, "检查刚才的业务实现是否正确");
-    assert_eq!(*scope, leveler_client_protocol::UiReviewScope::Auto);
+    assert_eq!(*scope, leveler_client_protocol::UiReviewScope::Workspace);
 }
 
 /// A bare `/review` with nothing reviewable is a question, not an error: the
@@ -14240,19 +14307,36 @@ fn review_focus_is_carried_verbatim_with_the_default_scope() {
 fn a_scope_question_opens_the_picker_and_keeps_the_focus() {
     let mut s = state();
     let session_id = s.session_id.clone();
-    reduce(
+    let effects = reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ReviewScopeRequired {
-            session_id,
+            session_id: session_id.clone(),
             focus: "只看并发".into(),
         }),
     );
     assert!(matches!(s.overlay, Some(Overlay::ReviewScopePicker(_))));
     assert_eq!(s.notification, None, "a question is not an error");
     assert_eq!(s.review_scope_focus.as_deref(), Some("只看并发"));
+    // The runtime's question and the picker's facts are one question: ask the
+    // Git state so the recommendation is real.
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::QueryReviewScopes { session_id: asked, .. })]
+                if asked == &session_id
+        ),
+        "{effects:?}"
+    );
 
-    // The focused option is "current task"; move to "working-tree changes".
-    reduce(&mut s, key(KeyCode::Down));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(true, None, 0),
+        }),
+    );
     let effects = reduce(&mut s, key(KeyCode::Enter));
     let [Effect::Send(ClientCommand::RunReview { focus, scope, .. })] = &effects[..] else {
         panic!("expected one RunReview, got {effects:?}");
@@ -14328,6 +14412,12 @@ fn a_targetless_commit_review_is_refused_before_it_can_lie() {
 #[test]
 fn slash_review_report_opens_the_latest_settled_report() {
     let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ReviewFinished {
@@ -14464,6 +14554,12 @@ fn a_review_card_renders_the_investigations_the_runtime_reported() {
     }];
     reduce(
         &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    reduce(
+        &mut s,
         Action::Runtime(RuntimeEvent::ReviewFinished {
             review: summary,
             report: None,
@@ -14490,6 +14586,12 @@ fn a_review_card_renders_the_investigations_the_runtime_reported() {
 #[test]
 fn a_review_card_labels_investigation_counts_as_candidates() {
     let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ReviewFinished {
@@ -14597,6 +14699,12 @@ fn a_settled_review_card_renders_counts_and_the_report_entry() {
     summary.report_stale = true;
     reduce(
         &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    reduce(
+        &mut s,
         Action::Runtime(RuntimeEvent::ReviewFinished {
             review: summary,
             report: None,
@@ -14621,12 +14729,21 @@ fn a_settled_review_card_renders_counts_and_the_report_entry() {
     );
 }
 
+/// The settlement is a new conversation entry at the bottom, rendered by the
+/// ordinary assistant Markdown path. The execution card above stays an
+/// execution record: no second folded copy, no page to open.
 #[test]
 fn a_finished_review_renders_its_durable_report_in_the_conversation() {
     let mut s = state();
     let summary = review_summary(
         "review-1",
         leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
     );
     reduce(
         &mut s,
@@ -14640,6 +14757,16 @@ fn a_finished_review_renders_its_durable_report_in_the_conversation() {
         Screen::Conversation,
         "a settled review must not take the reader off the conversation"
     );
+    assert!(
+        s.transcript.has_review_result("review-1"),
+        "the report is a conversation entry, not a card update"
+    );
+    assert!(
+        s.transcript
+            .review("review-1")
+            .is_some_and(|card| card.report_delivered),
+        "the execution card knows its result is already below"
+    );
     let screen = rendered(&mut s, 110, 60);
     assert!(screen.contains("审查 Agent"), "{screen}");
     assert!(
@@ -14650,15 +14777,18 @@ fn a_finished_review_renders_its_durable_report_in_the_conversation() {
         screen.contains("审查完成：发现一个越权读取问题。"),
         "the reviewer's prose is rendered verbatim: {screen}"
     );
-    assert!(screen.contains("点击折叠"), "{screen}");
+    assert!(
+        !screen.contains("点击折叠") && !screen.contains("点击展开"),
+        "a delivered report is never folded: {screen}"
+    );
     assert!(
         !screen.contains("查看报告"),
-        "an inline report does not also advertise the separate page: {screen}"
+        "a delivered report does not also advertise the separate page: {screen}"
     );
 }
 
 #[test]
-fn a_repeated_terminal_without_a_report_does_not_erase_the_inline_report() {
+fn a_repeated_terminal_without_a_report_does_not_erase_the_delivered_report() {
     let mut s = state();
     let summary = review_summary(
         "review-1",
@@ -14678,6 +14808,16 @@ fn a_repeated_terminal_without_a_report_does_not_erase_the_inline_report() {
             report: None,
         }),
     );
+    let results = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+        .count();
+    assert_eq!(
+        results, 1,
+        "a duplicate terminal must not add a second entry"
+    );
     let screen = rendered(&mut s, 110, 60);
     assert!(
         screen.contains("缺少 owner 过滤"),
@@ -14687,7 +14827,7 @@ fn a_repeated_terminal_without_a_report_does_not_erase_the_inline_report() {
 
 /// A review terminal is a conversation fact, not a turn boundary. It must
 /// not truncate, demote, or replace an answer that is still streaming. The
-/// person asked a question while the reviewer worked; the answer is theirs.
+/// report waits for the answer to close, then lands after it.
 #[test]
 fn a_settling_review_does_not_interrupt_a_streaming_answer() {
     let mut s = state();
@@ -14716,6 +14856,13 @@ fn a_settling_review_does_not_interrupt_a_streaming_answer() {
             report: Some(Box::new(review_report(summary))),
         }),
     );
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ReviewResult(_))),
+        "the report must not enter the timeline while the answer is open"
+    );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AssistantTextDelta {
@@ -14727,20 +14874,24 @@ fn a_settling_review_does_not_interrupt_a_streaming_answer() {
         &mut s,
         Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
     );
-    let answer = s
-        .transcript
-        .items()
+    let items = s.transcript.items();
+    let answer_index = items
         .iter()
-        .find_map(|item| match item {
-            TranscriptItem::Assistant(block) => Some(block),
-            _ => None,
-        })
+        .position(|item| matches!(item, TranscriptItem::Assistant(_)))
         .expect("the streaming answer is still the conversation's answer");
+    let result_index = items
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+        .expect("the settled report is delivered at the boundary");
+    let answer = match &items[answer_index] {
+        TranscriptItem::Assistant(block) => block,
+        _ => unreachable!(),
+    };
     assert_eq!(answer.text, "前半段。后半段。");
     assert!(answer.done);
     assert!(
-        s.transcript.review("review-1").is_some(),
-        "the review lands beside the answer, not inside it"
+        result_index > answer_index,
+        "the report lands after the answer, never inside it"
     );
 }
 
@@ -14797,8 +14948,11 @@ fn review_history_restores_the_durable_elapsed_time() {
     );
 }
 
+/// The delivered result has no fold at all: a long report scrolls like a long
+/// answer. The legacy inline card (a row written before result messages) keeps
+/// its two-state fold so an old conversation stays readable.
 #[test]
-fn a_review_report_folds_and_unfolds_in_place() {
+fn a_delivered_report_is_never_folded_but_a_legacy_card_still_folds() {
     let mut s = state();
     let mut summary = review_summary(
         "review-1",
@@ -14812,16 +14966,49 @@ fn a_review_report_folds_and_unfolds_in_place() {
         &mut s,
         Action::Runtime(RuntimeEvent::ReviewFinished {
             review: summary.clone(),
-            report: Some(Box::new(review_report(summary))),
+            report: Some(Box::new(review_report(summary.clone()))),
         }),
     );
-    assert!(s.transcript.toggle_review_report("review-1"));
-    let folded = rendered(&mut s, 110, 60);
+    assert!(
+        !s.transcript.toggle_review_report("review-1"),
+        "the result entry has no fold"
+    );
+    let screen = rendered(&mut s, 110, 60);
+    assert!(screen.contains("缺少 owner 过滤"), "{screen}");
+    assert!(
+        !screen.contains("点击展开") && !screen.contains("点击折叠"),
+        "{screen}"
+    );
+
+    // A row that predates result delivery has no result entry, so the report
+    // stays on its card and the card keeps its fold.
+    let mut legacy = state();
+    let query = leveler_client_protocol::CommandId::new("q1");
+    legacy.review_history_query = Some(query.clone());
+    let mut summary = review_summary(
+        "review-legacy",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    summary.counts = leveler_client_protocol::UiReviewCounts {
+        p1: 1,
+        ..Default::default()
+    };
+    let report = review_report(summary.clone());
+    reduce(
+        &mut legacy,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![summary],
+            reports: vec![report],
+        }),
+    );
+    assert!(legacy.transcript.toggle_review_report("review-legacy"));
+    let folded = rendered(&mut legacy, 110, 60);
     assert!(!folded.contains("缺少 owner 过滤"), "{folded}");
     assert!(folded.contains("点击展开"), "{folded}");
     assert!(folded.contains("P1 1"), "{folded}");
-    assert!(s.transcript.toggle_review_report("review-1"));
-    let open = rendered(&mut s, 110, 60);
+    assert!(legacy.transcript.toggle_review_report("review-legacy"));
+    let open = rendered(&mut legacy, 110, 60);
     assert!(open.contains("缺少 owner 过滤"), "{open}");
 }
 
@@ -15306,4 +15493,702 @@ fn a_turn_end_does_not_settle_a_session_level_review_child() {
         "the roster keeps it live: {:?}",
         s.team.children
     );
+}
+
+/// A reviewer's independent investigations belong to the review, not to the
+/// turn that happened to be open while they ran. The UI only knows that
+/// through the review's own investigation list, so a turn ending must consult
+/// it: two running investigators were painted `未收到结束状态` while they were
+/// still spending model calls.
+#[test]
+fn a_turn_end_keeps_a_live_reviews_investigators_running() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    for (id, nickname, role) in [
+        ("review-1", "Reviewer", "reviewer"),
+        ("inv-1", "Euclid", "investigator"),
+        ("inv-2", "Newton", "investigator"),
+    ] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::SubAgentUpdated {
+                id: id.into(),
+                nickname: nickname.into(),
+                role: role.into(),
+                title: Some(format!("{nickname} 的调查")),
+                done: false,
+                ok: false,
+                detail: "核对读取路径".into(),
+                profile_id: None,
+                profile_role: None,
+                read_only: true,
+                agent: None,
+                contribution: None,
+                outcome: None,
+                stop: None,
+                limit: None,
+                background: Some(true),
+                scope: Vec::new(),
+            }),
+        );
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewProgress {
+            review_id: "review-1".into(),
+            active: true,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            tool: Some("git_history".into()),
+            elapsed_ms: 74_000,
+            investigations: vec![
+                leveler_client_protocol::UiReviewInvestigation {
+                    id: "inv-1".into(),
+                    title: "Euclid 的调查".into(),
+                    role: "investigator".into(),
+                    state: leveler_client_protocol::UiReviewInvestigationState::Running,
+                    objective: None,
+                    findings: 0,
+                    elapsed_ms: 40_000,
+                },
+                leveler_client_protocol::UiReviewInvestigation {
+                    id: "inv-2".into(),
+                    title: "Newton 的调查".into(),
+                    role: "investigator".into(),
+                    state: leveler_client_protocol::UiReviewInvestigationState::Running,
+                    objective: None,
+                    findings: 0,
+                    elapsed_ms: 40_000,
+                },
+            ],
+        }),
+    );
+
+    // A normal question ends while the review and both investigations run.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnIncomplete {
+            reason: "用户问题已结束".into(),
+        }),
+    );
+
+    for id in ["review-1", "inv-1", "inv-2"] {
+        let block = s
+            .transcript
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                leveler_tui::transcript::TranscriptItem::SubAgent(block) if block.id == id => {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{id} row exists"));
+        assert_eq!(
+            block.status,
+            leveler_tui::transcript::ToolStatus::Running,
+            "{id} is still running and must not be settled by the turn"
+        );
+        assert!(!block.unreported, "{id} did not lose a terminal");
+    }
+    assert_eq!(
+        s.team.active().count(),
+        3,
+        "the roster counts the reviewer and both investigations: {:?}",
+        s.team.children
+    );
+}
+
+/// An `unreported` row is an absent terminal, never a verdict. When the
+/// runtime reports live progress for that child afterwards, the projection
+/// must reopen it: a working agent painted as a lost one is the failure this
+/// whole surface exists to avoid.
+#[test]
+fn a_late_progress_report_reopens_an_unreported_child() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentUpdated {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            title: Some("检查调用链".into()),
+            done: false,
+            ok: false,
+            detail: "检查调用链".into(),
+            profile_id: None,
+            profile_role: None,
+            read_only: true,
+            agent: None,
+            contribution: None,
+            outcome: None,
+            stop: None,
+            limit: None,
+            background: None,
+            scope: Vec::new(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnIncomplete {
+            reason: "用户问题已结束".into(),
+        }),
+    );
+    let block = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            leveler_tui::transcript::TranscriptItem::SubAgent(block) if block.id == "c1" => {
+                Some(block)
+            }
+            _ => None,
+        })
+        .expect("the child row exists");
+    assert!(block.unreported, "no terminal reached the view");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SubAgentProgress {
+            id: "c1".into(),
+            active: true,
+            input_tokens: 900,
+            output_tokens: 40,
+            cached_input_tokens: 300,
+        }),
+    );
+    let block = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            leveler_tui::transcript::TranscriptItem::SubAgent(block) if block.id == "c1" => {
+                Some(block)
+            }
+            _ => None,
+        })
+        .expect("the child row exists");
+    assert!(!block.unreported, "live progress disproves 'lost'");
+    assert_eq!(block.status, leveler_tui::transcript::ToolStatus::Running);
+    assert_eq!(
+        s.team.children[0].status,
+        leveler_tui::multi_agent::ChildStatus::Running
+    );
+}
+
+/// A review is asked for at one point and answers at another. The execution
+/// card stays where the request was made; the formal report is a NEW entry at
+/// the position where the review finished. A review that settled after three
+/// more turns must produce a row the reader can see, not only update a card
+/// hundreds of lines above them.
+#[test]
+fn a_settled_review_delivers_a_new_result_where_it_finished() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    let card_index = s.transcript.items().len() - 1;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "这段时间先看下项目结构".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    let mut settled = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    settled.finished_at = Some("2026-11-18T07:44:33Z".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: settled.clone(),
+            report: Some(Box::new(review_report(settled))),
+        }),
+    );
+
+    let items = s.transcript.items();
+    assert!(
+        matches!(&items[card_index], TranscriptItem::Review(block) if block.summary.id == "review-1"),
+        "the execution card keeps its request position: {items:#?}"
+    );
+    let last = items.last().expect("the conversation has items");
+    assert!(
+        matches!(last, TranscriptItem::ReviewResult(block) if block.summary.id == "review-1"),
+        "the formal report is the newest conversation entry, got {last:?}"
+    );
+    assert_eq!(
+        s.transcript
+            .reviews()
+            .filter(|block| block.summary.id == "review-1")
+            .count(),
+        1,
+        "one review has one execution card"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+            .count(),
+        1,
+        "one review has one delivered report"
+    );
+}
+
+/// The scope picker's rows, at the moment the person sees them.
+fn review_scope_rows(s: &AppState) -> Vec<(String, bool, bool, Option<String>, Option<String>)> {
+    match &s.overlay {
+        Some(Overlay::ReviewScopePicker(model)) => model
+            .visible_rows()
+            .into_iter()
+            .map(|(_, option, focused)| {
+                (
+                    option.key.clone(),
+                    option.recommended,
+                    focused,
+                    option.description.clone(),
+                    option.disabled_reason.clone(),
+                )
+            })
+            .collect(),
+        other => panic!("expected the scope picker, got {other:?}"),
+    }
+}
+
+fn focused_scope(s: &AppState) -> String {
+    review_scope_rows(s)
+        .into_iter()
+        .find(|(_, _, focused, _, _)| *focused)
+        .map(|(key, ..)| key)
+        .expect("a focused scope row")
+}
+
+/// A clean branch with commits over its recorded upstream is the honest
+/// default, and the row names that exact comparison. The client never assumes
+/// `origin/main`; the runtime read it from the branch's own Git config.
+#[test]
+fn a_clean_branch_ahead_of_its_upstream_preselects_the_branch() {
+    let mut s = state();
+    s.composer.replace("/review");
+    let _ = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    let session_id = s.session_id.clone();
+    // The baseline picker says it is still reading; no row pretends to know.
+    let rows = review_scope_rows(&s);
+    let branch = rows.iter().find(|(key, ..)| key == "branch").unwrap();
+    assert!(branch.4.is_some(), "the branch row is not confirmable yet");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(false, Some("origin/main"), 4),
+        }),
+    );
+    let rows = review_scope_rows(&s);
+    let branch = rows.iter().find(|(key, ..)| key == "branch").unwrap();
+    assert!(branch.1, "the branch row is recommended: {rows:?}");
+    assert!(
+        branch
+            .3
+            .as_deref()
+            .is_some_and(|text| text.contains("origin/main..HEAD · 4 个提交")),
+        "{branch:?}"
+    );
+    assert_eq!(
+        focused_scope(&s),
+        "branch",
+        "the recommendation is preselected"
+    );
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let [Effect::Send(ClientCommand::RunReview { scope, .. })] = &effects[..] else {
+        panic!("expected one RunReview, got {effects:?}");
+    };
+    assert_eq!(
+        *scope,
+        leveler_client_protocol::UiReviewScope::Branch {
+            base: "origin/main".into()
+        }
+    );
+}
+
+/// Uncommitted changes — staged, unstaged or untracked — are the working
+/// tree, and that row is preselected over the branch.
+#[test]
+fn a_dirty_workspace_preselects_the_working_tree() {
+    let mut s = state();
+    s.composer.replace("/review");
+    let _ = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    let session_id = s.session_id.clone();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(true, Some("origin/main"), 4),
+        }),
+    );
+    let rows = review_scope_rows(&s);
+    let workspace = rows.iter().find(|(key, ..)| key == "workspace").unwrap();
+    assert!(workspace.1, "the working tree is recommended: {rows:?}");
+    assert!(workspace.2, "and the cursor is already on it: {rows:?}");
+}
+
+/// A clean tree with no recorded upstream has no defensible default: nothing
+/// is recommended, and the rows that need a target stay available.
+#[test]
+fn a_clean_tree_without_an_upstream_recommends_nothing() {
+    let mut s = state();
+    s.composer.replace("/review");
+    let _ = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    let session_id = s.session_id.clone();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(false, None, 0),
+        }),
+    );
+    let rows = review_scope_rows(&s);
+    assert!(
+        rows.iter().all(|(_, recommended, ..)| !*recommended),
+        "no row may be recommended without a real object: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, _, _, _, disabled)| key == "paths" && disabled.is_none()),
+        "an explicit target is still available: {rows:?}"
+    );
+    assert_eq!(focused_scope(&s), "paths");
+}
+
+/// Another session's scope answer is not this picker's answer.
+#[test]
+fn scope_facts_for_another_session_are_ignored() {
+    let mut s = state();
+    s.composer.replace("/review");
+    let _ = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id: SessionId::new("other"),
+            facts: scope_facts(true, None, 0),
+        }),
+    );
+    assert!(
+        review_scope_rows(&s)
+            .iter()
+            .any(|(_, recommended, ..)| !*recommended),
+        "the foreign answer did not recommend anything here"
+    );
+    assert!(s.review_scope_query.is_some(), "the query is still awaited");
+}
+
+/// Cancelling the picker ends the question: the typed focus, the in-flight
+/// facts query and the last facts are all gone, and no review starts.
+#[test]
+fn cancelling_the_scope_picker_clears_its_pending_state() {
+    let mut s = state();
+    s.composer.replace("/review 只看并发");
+    let _ = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    let session_id = s.session_id.clone();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(true, None, 0),
+        }),
+    );
+    s.review_scope_model = Some(leveler_client_protocol::ModelRef::parse("deepseek/v3").unwrap());
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.overlay.is_none(), "the picker is gone");
+    assert_eq!(s.review_scope_focus, None);
+    assert_eq!(s.review_scope_query, None);
+    assert!(s.review_scope_facts.is_none());
+    assert!(s.review_scope_model.is_none());
+    assert!(s.composer.is_empty(), "no hidden /review was left behind");
+}
+
+/// A stale "cannot determine the change boundary" rejection does not survive
+/// the review it was about: the successful start is the later fact, and the
+/// durable error row stays in the conversation as its record.
+#[test]
+fn a_started_review_clears_the_stale_scope_error() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::EffectCompleted(EffectCompletion::CommandRejected {
+            command: ClientCommand::RunReview {
+                session_id: SessionId::new("s1"),
+                focus: String::new(),
+                scope: leveler_client_protocol::UiReviewScope::Auto,
+                model: None,
+            },
+            message: "无法确定当前任务的修改边界；请选择".into(),
+            snapshot: None,
+        }),
+    );
+    assert!(s.command_notice.is_some());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    assert_eq!(s.command_notice, None, "the stale rejection is retired");
+    assert!(s.notification.is_none(), "{:?}", s.notification);
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Error(text) if text.contains("修改边界"))),
+        "the durable record of the failure remains"
+    );
+}
+
+/// The result arrives on its own. It must not move a reader who is looking at
+/// history, take the composer's draft, or force the viewport to the bottom.
+#[test]
+fn a_delivered_review_result_does_not_steal_scroll_or_the_draft() {
+    let mut s = state();
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 42;
+    s.composer.replace("半句话");
+    let summary = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: summary.clone(),
+            report: Some(Box::new(review_report(summary))),
+        }),
+    );
+    assert!(s.transcript.has_review_result("review-1"));
+    assert!(!s.conv.auto_scroll, "the reader's parked position is kept");
+    assert_eq!(s.conv.scroll, 42);
+    assert_eq!(s.composer.text(), "半句话");
+}
+
+/// A review's result is keyed by durable id. A second terminal — a retry, a
+/// reconnect, a report revision — updates that entry instead of printing the
+/// report again.
+#[test]
+fn a_second_terminal_updates_the_same_result_instead_of_duplicating_it() {
+    let mut s = state();
+    let mut first = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    first.report_revision = 1;
+    let mut first_report = review_report(first.clone());
+    first_report.report = "第一版报告正文".into();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: first,
+            report: Some(Box::new(first_report)),
+        }),
+    );
+    let mut second = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    second.report_revision = 2;
+    let mut second_report = review_report(second.clone());
+    second_report.report = "第二版报告正文".into();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: second,
+            report: Some(Box::new(second_report)),
+        }),
+    );
+    let results: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::ReviewResult(block) => Some(block),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "one review, one delivered result");
+    assert!(
+        results[0].body.text.contains("第二版报告正文"),
+        "the newer report revision replaces the older body"
+    );
+    assert!(!results[0].body.text.contains("第一版报告正文"));
+}
+
+/// Two reviews that settle while the person is elsewhere each get their own
+/// entry, in the order they finished, after the conversation that ran while
+/// they were open.
+#[test]
+fn two_reviews_deliver_their_results_in_settlement_order() {
+    let mut s = state();
+    for id in ["review-a", "review-b"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReviewStarted {
+                review: review_summary(id, leveler_client_protocol::UiReviewStatus::Running),
+            }),
+        );
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UserMessageAdded {
+            message: UiMessage {
+                id: MessageId::new("u1"),
+                role: UiRole::User,
+                text: "这段时间先看下项目结构".into(),
+                ordinal: None,
+                kind: None,
+                images: 0,
+            },
+        }),
+    );
+    for id in ["review-b", "review-a"] {
+        let summary = review_summary(id, leveler_client_protocol::UiReviewStatus::Completed);
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReviewFinished {
+                review: summary.clone(),
+                report: Some(Box::new(review_report(summary))),
+            }),
+        );
+    }
+    let delivered: Vec<String> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::ReviewResult(block) => Some(block.summary.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, vec!["review-b", "review-a"]);
+}
+
+/// A history refresh can attach the report to the card just before the live
+/// terminal arrives. The delivered conversation entry is the one report: the
+/// card's copy is dropped, never shown twice.
+#[test]
+fn a_live_delivery_supersedes_the_cards_history_copy_of_the_same_report() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewStarted {
+            review: review_summary("review-1", leveler_client_protocol::UiReviewStatus::Running),
+        }),
+    );
+    let settled = review_summary(
+        "review-1",
+        leveler_client_protocol::UiReviewStatus::Completed,
+    );
+    let query = leveler_client_protocol::CommandId::new("q1");
+    s.review_history_query = Some(query.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewHistoryLoaded {
+            query_id: Some(query),
+            reviews: vec![settled.clone()],
+            reports: vec![review_report(settled.clone())],
+        }),
+    );
+    assert!(
+        s.transcript
+            .review("review-1")
+            .is_some_and(|card| card.report.is_some()),
+        "the history answer attached the durable report"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewFinished {
+            review: settled.clone(),
+            report: Some(Box::new(review_report(settled))),
+        }),
+    );
+    let card = s.transcript.review("review-1").expect("the card");
+    assert!(card.report_delivered);
+    assert!(
+        card.report.is_none(),
+        "the same report is not rendered on the card and in the result"
+    );
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::ReviewResult(_)))
+            .count(),
+        1
+    );
+    let screen = rendered(&mut s, 110, 60);
+    assert_eq!(
+        screen.matches("缺少 owner 过滤").count(),
+        1,
+        "one report body, one copy: {screen}"
+    );
+}
+
+/// The picker also has to cover a range the Git state cannot recommend: the
+/// person names the base through the existing, validated directive. The
+/// picker only prefills it — launching with an empty base would be a lie
+/// about what was reviewed.
+#[test]
+fn the_custom_range_row_prefills_the_existing_directive() {
+    let mut s = state();
+    s.composer.replace("/review");
+    let _ = reduce(&mut s, key(KeyCode::Enter));
+    let query_id = s.review_scope_query.clone().expect("the facts query");
+    let session_id = s.session_id.clone();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReviewScopesLoaded {
+            query_id: Some(query_id),
+            session_id,
+            facts: scope_facts(false, None, 0),
+        }),
+    );
+    let rows = review_scope_rows(&s);
+    assert!(
+        rows.iter()
+            .any(|(key, _, _, _, disabled)| key == "range" && disabled.is_none()),
+        "a custom range stays available when no upstream is recorded: {rows:?}"
+    );
+    // Baseline focus is `paths`; the rows after it are commit, range, project.
+    reduce(&mut s, key(KeyCode::Down));
+    reduce(&mut s, key(KeyCode::Down));
+    assert_eq!(focused_scope(&s), "range");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.text(), "/review @branch ");
+    assert!(s.overlay.is_none());
 }

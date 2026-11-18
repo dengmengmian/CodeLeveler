@@ -132,8 +132,8 @@ pub use review::{
     UiReviewCoverage, UiReviewCoverageStatus, UiReviewDimension, UiReviewFinding,
     UiReviewFindingDisposition, UiReviewInvestigation, UiReviewInvestigationState,
     UiReviewLimitation, UiReviewLimitationKind, UiReviewLimitationSource, UiReviewObject,
-    UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewSeverity, UiReviewStatus,
-    UiReviewSummary, UiReviewUsage, UiReviewVerdict,
+    UiReviewReport, UiReviewReportSource, UiReviewScope, UiReviewScopeFacts, UiReviewSeverity,
+    UiReviewStatus, UiReviewSummary, UiReviewUsage, UiReviewVerdict,
 };
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
