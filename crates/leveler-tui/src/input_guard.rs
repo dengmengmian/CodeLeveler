@@ -56,6 +56,7 @@ pub(crate) struct DeviceReplyFilter {
     state: State,
     buffer: Vec<Action>,
     parameters: String,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     last_reply: Option<String>,
 }
 
@@ -188,6 +189,7 @@ impl DeviceReplyFilter {
 
     /// The most recent complete device reply, e.g. `[?61;4c`. Used by the
     /// startup capability probe; unrelated to user input.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub(crate) fn take_completed_reply(&mut self) -> Option<String> {
         self.last_reply.take()
     }
@@ -201,6 +203,7 @@ impl DeviceReplyFilter {
         }
     }
 
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub(crate) fn is_buffering(&self) -> bool {
         self.state != State::Idle
     }
@@ -216,6 +219,9 @@ pub(crate) struct StartupInput {
     entries: Vec<StartupEntry>,
 }
 
+/// One startup input, tagged with whether the capability probe classified it
+/// as a reply prefix. Constructed by the Windows probe and its tests.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[derive(Debug)]
 enum StartupEntry {
     User(Action),
@@ -223,10 +229,12 @@ enum StartupEntry {
 }
 
 impl StartupInput {
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub(crate) fn push_user(&mut self, action: Action) {
         self.entries.push(StartupEntry::User(action));
     }
 
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub(crate) fn push_reply(&mut self, action: Action) {
         self.entries.push(StartupEntry::Reply(action));
     }

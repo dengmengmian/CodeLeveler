@@ -1301,6 +1301,9 @@ async fn a_branch_review_reads_the_merge_base_range() {
         first.contains("pub fn receipt"),
         "the branch range must reach the reviewer: {first}"
     );
+    // Windows resolves the range from the local object database and says so;
+    // the unix path keeps the existing git-backed scope text.
+    #[cfg(windows)]
     assert!(
         first.contains("本次分支审查由本地只读对象库解析"),
         "the review must state that its object access started no process: {first}"
