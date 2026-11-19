@@ -320,6 +320,78 @@ enum ManageAction {
     Remove,
 }
 
+/// `request_approval`, `assisted` (default) or `full_access`.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ModeInput {
+    RequestApproval,
+    Assisted,
+    FullAccess,
+}
+
+impl ModeInput {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::RequestApproval => "request_approval",
+            Self::Assisted => "assisted",
+            Self::FullAccess => "full_access",
+        }
+    }
+}
+
+/// `continue` (default) or `fresh`.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SessionPolicyInput {
+    Continue,
+    Fresh,
+}
+
+impl SessionPolicyInput {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Fresh => "fresh",
+        }
+    }
+}
+
+/// `skip-if-running` (default), `queue-one` or `allow-concurrent`.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+enum OverlapInput {
+    SkipIfRunning,
+    QueueOne,
+    AllowConcurrent,
+}
+
+impl OverlapInput {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::SkipIfRunning => "skip-if-running",
+            Self::QueueOne => "queue-one",
+            Self::AllowConcurrent => "allow-concurrent",
+        }
+    }
+}
+
+/// `skip` (default) or `run-once`.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+enum MisfireInput {
+    Skip,
+    RunOnce,
+}
+
+impl MisfireInput {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::RunOnce => "run-once",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ManageInput {
@@ -342,13 +414,13 @@ struct ManageInput {
     trigger: Option<TriggerInput>,
     /// `continue` (default) or `fresh`.
     #[serde(default)]
-    session_policy: Option<String>,
+    session_policy: Option<SessionPolicyInput>,
     /// `skip-if-running` (default), `queue-one` or `allow-concurrent`.
     #[serde(default)]
-    overlap: Option<String>,
+    overlap: Option<OverlapInput>,
     /// `request_approval`, `assisted` (default) or `full_access`.
     #[serde(default)]
-    mode: Option<String>,
+    mode: Option<ModeInput>,
     /// `provider/model`; required for an agent action to name its model.
     /// `update` with an empty string clears it.
     #[serde(default)]
@@ -357,7 +429,7 @@ struct ManageInput {
     timeout_secs: Option<u64>,
     /// `skip` (default) or `run-once`.
     #[serde(default)]
-    misfire: Option<String>,
+    misfire: Option<MisfireInput>,
     #[serde(default)]
     misfire_grace_secs: Option<u64>,
     /// `update`: the `revision` this client last observed. Required; a stale
@@ -418,7 +490,7 @@ impl Tool for ScheduleManageTool {
                     .map(describe_trigger)
                     .unwrap_or_else(|| "(未指定时间)".into());
                 let workspace = input.workspace.as_deref().unwrap_or("(未指定工作区)");
-                let mode = input.mode.as_deref().unwrap_or("assisted");
+                let mode = input.mode.map(ModeInput::as_wire).unwrap_or("assisted");
                 Some(format!(
                     "创建计划「{name}」:{trigger};工作区 {workspace};权限 {mode};未授权无人值守,\
                      创建后需要用户在界面或命令行明确授权。OS 后台唤醒不会自动启用。"
@@ -501,12 +573,12 @@ fn request_from_input(
                         workspace,
                         action: work.into(),
                         trigger: trigger.into(),
-                        session_policy: input.session_policy,
-                        overlap: input.overlap,
-                        mode: input.mode,
+                        session_policy: input.session_policy.map(|value| value.as_wire().to_string()),
+                        overlap: input.overlap.map(|value| value.as_wire().to_string()),
+                        mode: input.mode.map(|value| value.as_wire().to_string()),
                         model: input.model,
                         timeout_secs: input.timeout_secs,
-                        misfire: input.misfire,
+                        misfire: input.misfire.map(|value| value.as_wire().to_string()),
                         misfire_grace_secs: input.misfire_grace_secs,
                         // Authorization and OS wakeup are user gestures, not model
                         // tool parameters. A schedule created here always starts
@@ -536,12 +608,12 @@ fn request_from_input(
                 workspace: input.workspace,
                 action: input.work.map(Into::into),
                 trigger: input.trigger.map(Into::into),
-                session_policy: input.session_policy,
-                overlap: input.overlap,
-                mode: input.mode,
+                session_policy: input.session_policy.map(|value| value.as_wire().to_string()),
+                overlap: input.overlap.map(|value| value.as_wire().to_string()),
+                mode: input.mode.map(|value| value.as_wire().to_string()),
                 model: input.model,
                 timeout_secs: input.timeout_secs,
-                misfire: input.misfire,
+                misfire: input.misfire.map(|value| value.as_wire().to_string()),
                 misfire_grace_secs: input.misfire_grace_secs,
             };
             if patch == SchedulePatch::default() {
@@ -956,6 +1028,66 @@ mod tests {
             .unwrap_or_else(|| panic!("{field} missing from {view}"))
             .parse()
             .expect("an RFC3339 instant")
+    }
+
+    /// The tool schema is the contract the model reads before it calls. A
+    /// free-form string for a field the manager only accepts as a fixed set
+    /// makes the first call a guess; the enum belongs in the schema.
+    #[test]
+    fn the_schema_states_the_policy_enums_the_runtime_accepts() {
+        let schema = leveler_tools::tools::schema_of::<ManageInput>();
+        // An optional enum is published as `anyOf: [enum, null]`; the values
+        // are what the model reads when filling the field.
+        let values = |field: &str| {
+            let property = &schema["properties"][field];
+            property
+                .get("enum")
+                .and_then(Value::as_array)
+                .or_else(|| {
+                    property
+                        .get("anyOf")?
+                        .as_array()?
+                        .iter()
+                        .find_map(|branch| branch.get("enum")?.as_array())
+                })
+                .unwrap_or_else(|| panic!("{field} publishes no enum: {property}"))
+                .clone()
+        };
+        assert_eq!(
+            values("mode"),
+            json!(["request_approval", "assisted", "full_access"]).as_array().unwrap().clone()
+        );
+        assert_eq!(
+            values("session_policy"),
+            json!(["continue", "fresh"]).as_array().unwrap().clone()
+        );
+        assert_eq!(
+            values("overlap"),
+            json!(["skip-if-running", "queue-one", "allow-concurrent"])
+                .as_array()
+                .unwrap()
+                .clone()
+        );
+        assert_eq!(
+            values("misfire"),
+            json!(["skip", "run-once"]).as_array().unwrap().clone()
+        );
+    }
+
+    /// The schema is the first guard; the runtime must still refuse a value
+    /// the manager does not accept, and the refusal must name the allowed set.
+    #[tokio::test]
+    async fn an_invalid_policy_value_is_refused_with_the_allowed_values() {
+        let fixture = fixture().await;
+        let (dispatch, _calls) = noop_dispatch();
+        let tool = ScheduleManageTool::new(fixture.manager.clone(), dispatch);
+        let mut args = create_args(&fixture.workspace);
+        args["mode"] = json!("full");
+        let error = run(&tool, args).await.expect_err("invalid mode is refused");
+        let message = error.to_string();
+        assert!(message.contains("request_approval"), "{message}");
+        assert!(message.contains("assisted"), "{message}");
+        assert!(message.contains("full_access"), "{message}");
     }
 
     #[tokio::test]
