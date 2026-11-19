@@ -176,7 +176,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. For yield: what this window accomplished and what remains. Do not restate the user question or list files you read."
+                    "description": "Required. Non-empty terminal account shown to the user. Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. For yield: what this window accomplished and what remains. Do not restate the user question or list files you read."
                 },
                 "deliver_answer": {
                     "type": "boolean",
@@ -1825,6 +1825,11 @@ mod plan_sync_contract_tests {
             .expect("status description");
         assert!(status.contains("Required"), "{status}");
         assert!(status.contains("complete"), "{status}");
+        let summary = goal.input_schema["properties"]["summary"]["description"]
+            .as_str()
+            .expect("summary description");
+        assert!(summary.contains("Required"), "{summary}");
+        assert!(summary.contains("Non-empty"), "{summary}");
         for schema in [
             super::declare_scope_tool_definition().input_schema,
             super::declare_intent_tool_definition().input_schema,

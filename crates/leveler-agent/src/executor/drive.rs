@@ -6124,6 +6124,56 @@ impl AgentHarness for Drive<'_> {
                         continue;
                     }
                 };
+                // `summary` is the terminal account of the resolution: for
+                // `complete` it is the recap shown with the delivery, for
+                // `blocked` why the work stopped, and for `yield` what this
+                // window accomplished and what remains. The schema requires
+                // it. Accepting an omission used to produce an empty terminal
+                // and an empty goal checkpoint, so the runtime enforces the
+                // same contract as the schema instead of substituting "".
+                let summary = match call.arguments.get("summary") {
+                    Some(serde_json::Value::String(text)) if !text.trim().is_empty() => {
+                        text.trim().to_string()
+                    }
+                    other => {
+                        let observed = other.map(compact_json).unwrap_or_else(|| "no summary".to_string());
+                        let message = format!(
+                            "update_goal requires a non-empty `summary` string for complete, \
+                             blocked, and yield: it is the terminal account shown to the user \
+                             (for yield, what this window accomplished and what remains). Got \
+                             {observed}. Call update_goal again with `summary`."
+                        );
+                        denied_calls_this_round += 1;
+                        (self.observer)(AgentEvent::GoalIntercepted {
+                            kind: "missing_summary".to_string(),
+                            detail: observed,
+                        });
+                        self.note_refused_completion(
+                            &round_prose,
+                            declares_answer,
+                            revises_answer,
+                            round_has_work,
+                        );
+                        (self.observer)(AgentEvent::ToolResult {
+                            exit_code: None,
+                            stop: None,
+                            execution_status: None,
+                            id: call.id.as_str().to_string(),
+                            name: UPDATE_GOAL_TOOL.to_string(),
+                            is_error: true,
+                            preview: goal_refusal_preview("missing_summary", &message),
+                            applied_diff: None,
+                        });
+                        results[index] = Some(ContentPart::ToolResult {
+                            result: ToolResultContent {
+                                call_id: call.id,
+                                content: message,
+                                is_error: true,
+                            },
+                        });
+                        continue;
+                    }
+                };
                 // A completion judges the tree as it is now. A still-running
                 // write-capable task has no settlement yet, so observe what it
                 // has already changed before accepting an older pass as
@@ -6730,13 +6780,8 @@ impl AgentHarness for Drive<'_> {
                     preview: receipt.to_string(),
                     applied_diff: None,
                 });
-                let summary = call
-                    .arguments
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                // Validated above; the schema-required field is guaranteed
+                // non-empty on every accepted resolution.
                 goal_resolution = Some((reason, summary));
                 goal_delivery_declared = declares_answer;
                 goal_answer_revised = revises_answer;

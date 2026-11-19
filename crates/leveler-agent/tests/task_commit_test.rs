@@ -2007,7 +2007,10 @@ async fn a_chat_turn_that_joins_a_goal_can_cite_an_earlier_turns_execution() {
             ),
             Scripted::run_tests(),
             // The window ends; the goal still owes work.
-            Scripted::Tool("update_goal", serde_json::json!({"status": "yield"})),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({"status": "yield", "summary": "测试已通过，构建脚本仍需修改"}),
+            ),
         ],
         false,
     )
@@ -7802,4 +7805,75 @@ async fn a_recommit_cannot_drop_a_recorded_requirement() {
         leveler_agent::StopReason::Completed,
         "a completion that ignores the recorded requirement is refused"
     );
+}
+
+/// `summary` is the terminal account of a resolution: for `yield` it is what
+/// the window accomplished and what remains, and it is the text the user
+/// receives when the model wrote no separate final answer. The schema already
+/// requires it, but the runtime used to accept an omission and substitute an
+/// empty string. A silent empty terminal is worse than one precise refusal.
+#[tokio::test]
+async fn a_resolution_without_a_summary_is_refused_then_the_summary_is_delivered() {
+    const REQUEST: &str = "先写报告大纲，再继续完成报告";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["报告大纲存在"],
+                    "task_relation": "continue"
+                }),
+            ),
+            // The schema requires `summary`; the runtime must enforce the
+            // same contract instead of accepting an empty terminal.
+            Scripted::Tool("update_goal", serde_json::json!({"status": "yield"})),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "yield",
+                    "summary": "this window wrote the outline; the report body remains"
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refusals: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "missing_summary" =>
+            {
+                Some(detail)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the omission is refused once, with the field named: {events:?}"
+    );
+    assert!(
+        refusals[0].contains("summary"),
+        "the refusal names the missing field: {refusals:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Yielded);
+    assert_eq!(report.final_text, "this window wrote the outline; the report body remains");
 }
