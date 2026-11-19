@@ -90,13 +90,13 @@ permissions files, so the agent cannot grant itself hooks or standing
 permissions. Reads stay allowed. `.leveler/config.yaml` stays editable through
 the file tools as ordinary project configuration, but any edit invalidates its
 trust record, so it cannot inherit a mode approval given to different bytes. A
-confined shell command cannot author any part of `.leveler` — the agent and
-skill definitions, the rules, or the config: a definition authored that way
-would be loaded by a later session without the confirmation the `save_agent` /
-`save_skill` tools require. The same boundary covers every existing
-`AGENTS.md` at any depth and every existing `.leveler/instructions.md` and
-`.leveler/rules/*.md`, because those are the documents a later turn loads as
-authority. macOS denies the paths with Seatbelt rules even when they do not
+confined shell command cannot write inside an existing `.leveler` tree — the
+agent and skill definitions, the rules, or the config: a definition authored
+that way would be loaded by a later session without the confirmation the
+`save_agent` / `save_skill` tools require. The same boundary covers every
+existing `AGENTS.md` at any depth and every existing `.leveler/instructions.md`
+and `.leveler/rules/*.md`, because those are the documents a later turn loads
+as authority. macOS denies the paths with Seatbelt rules even when they do not
 exist yet. Linux uses the same read-only binds for existing paths, and a
 `seccomp` supervisor (started only when a protected path is missing) refuses
 creation syscalls that would give a protected name a new inode — including
