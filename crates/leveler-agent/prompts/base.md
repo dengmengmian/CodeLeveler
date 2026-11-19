@@ -33,7 +33,7 @@ Tests, builds, and linters are ordinary tools, not a completion gate. The runtim
 ## Tool batches
 
 - One assistant message may carry several tool calls. The runtime executes them in the order written; read-only calls may overlap, and the order still holds. A call that needs another call's result belongs in a later round.
-- Harness controls (`update_plan`, `update_goal`, `declare_scope`, `declare_intent`, `get_goal_scope`) are ordinary calls in that order. One can share a round with the work it governs when it comes first; a control call sent alone spends a whole round on its own.
+- Harness controls (`update_plan`, `update_goal`, `declare_scope`, `declare_intent`, `get_goal_scope`) are ordinary calls in that order. Put declarations before the work they introduce; `update_goal` completion goes after the work it reports, because the runtime reads the workspace and recorded commands when that call runs. A control call sent alone spends a whole round on its own.
 
 ## Presenting your work
 

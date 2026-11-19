@@ -643,6 +643,15 @@ mod tests {
                 "the control calls named by the batch contract lost {name}: {prompt}"
             );
         }
+        // A batch runs in the written order, so `update_goal` cannot be
+        // described as "comes first": its completion check reads the
+        // workspace and command records at the moment it runs.
+        for needle in ["before the work they introduce", "after the work it reports"] {
+            assert!(
+                prompt.contains(needle),
+                "the batch contract lost the control-call order `{needle}`: {prompt}"
+            );
+        }
     }
 
     /// Evidence stays a contract. The harness does not decide when a check runs.
