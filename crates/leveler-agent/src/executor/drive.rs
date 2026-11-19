@@ -467,51 +467,6 @@ fn is_goal_bookkeeping(name: &str) -> bool {
     name == UPDATE_GOAL_TOOL || name == "update_plan"
 }
 
-/// What the numbers in `execution_state` mean, as facts owned by the runtime.
-///
-/// The model decides when its task is done; the runtime only ensures a
-/// cumulative counter is not read as a spending allowance, a missing cap is
-/// not read as an invented quota, and a mechanical breaker is not read as a
-/// task budget. Nothing here asks the model to hurry, stop, or continue.
-fn execution_budget_facts(limits: &ModelStepLimits) -> String {
-    let mut facts = String::from(
-        "model_tokens.spent and model_tokens.estimated are cumulative usage for the whole task, \
-         not a budget or an allowance. ",
-    );
-    match limits.max_model_tokens {
-        Some(cap) => facts.push_str(&format!(
-            "A model-token cap of {cap} tokens is configured (model_tokens.limit). "
-        )),
-        None => facts.push_str(
-            "No model-token cap is configured; model_tokens.limit is null, which means unlimited. ",
-        ),
-    }
-    match limits.max_cost_usd_micros {
-        Some(cap) => facts.push_str(&format!(
-            "A model-cost cap of {cap} micro-USD is configured (cost_usd_micros.limit). "
-        )),
-        None => facts.push_str(
-            "No model-cost cap is configured; cost_usd_micros.limit is null, which means \
-             unlimited. ",
-        ),
-    }
-    match limits.max_duration {
-        Some(limit) => facts.push_str(&format!(
-            "A wall-clock limit of {} ms is configured (duration_limit_ms). ",
-            limit.as_millis().min(u64::MAX as u128)
-        )),
-        None => facts.push_str(
-            "No wall-clock limit is configured; duration_limit_ms is null, which means unlimited. ",
-        ),
-    }
-    facts.push_str(
-        "model_step_ceiling is the harness loop's mechanical safety breaker. \
-         model_step_window_limit, when set, is the hard edge of a bounded unit of work the host \
-         owns. Neither is a task budget, and neither measures how much of the task is left.",
-    );
-    facts
-}
-
 fn background_task_result_message(
     task_id: String,
     session: &str,
@@ -4040,7 +3995,6 @@ impl AgentHarness for Drive<'_> {
                 "last_request_input_tokens": self.last_actual_input_tokens,
                 "last_request_projected_input_tokens": self.last_projected_input_tokens,
             },
-            "budget_facts": execution_budget_facts(limits),
             "commands_executed": self.commands_run,
             "command_limit": self.executor.step_limits.max_commands,
             "modified_paths_observed": projected_epoch_file_count(&self.progress, &self.modified_files),
