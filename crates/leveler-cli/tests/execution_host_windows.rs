@@ -70,6 +70,25 @@ impl Fixture {
     }
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // The Host is designed to outlive its client, so a test that forgets an
+        // explicit stop would leave a process holding the debug binary and make
+        // the next build fail with a sharing violation. Stop the fixture's own
+        // host before the temporary home is removed.
+        let Some(pid) = std::fs::read(self.home.join("execution-host/ready.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|ready| ready["pid"].as_u64())
+        else {
+            return;
+        };
+        let _ = std::process::Command::new(r"C:\Windows\System32\taskkill.exe")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
 fn host_pid(config: &ExecutionHostConfig) -> u32 {
     let ready: serde_json::Value = serde_json::from_slice(
         &std::fs::read(config.state_dir.join("ready.json")).expect("ready file"),

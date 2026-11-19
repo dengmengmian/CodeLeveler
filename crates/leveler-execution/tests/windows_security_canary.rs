@@ -182,7 +182,8 @@ async fn the_confined_shell_write_boundary_on_a_real_windows_workspace() {
     canary
         .run(
             "sec01-root-write",
-            "echo PWNED>> AGENTS.md & echo PWNED> AGENTS.MD & move /Y src\\business.rs AGENTS.md & \
+            "echo PWNED>> AGENTS.md & echo PWNED> AGENTS.MD & copy /Y src\\business.rs AGENTS.md & \
+             move /Y src\\business.rs AGENTS.md & \
              del AGENTS.md & ren AGENTS.md root-moved.md & \
              del .leveler\\config.yaml & ren .leveler leveler-moved & \
              rd /s /q .git & ren .git git-moved",
@@ -219,6 +220,84 @@ async fn the_confined_shell_write_boundary_on_a_real_windows_workspace() {
             "delete/rename/replace of guarded files refused; .leveler intact={leveler_intact}; .git intact={git_intact}"
         ),
     );
+
+    // SEC-07B: a pre-existing hardlink alias shares the file object, so it
+    // shares the Medium label and the runtime's delete-sharing fence. Writing
+    // or deleting through the alias must not change the protected original.
+    std::fs::hard_link(
+        canary.root.join("AGENTS.md"),
+        canary.root.join("hard-AGENTS.md"),
+    )
+    .expect("create hardlink alias");
+    canary
+        .run(
+            "sec07b-hardlink",
+            "echo PWNED>> hard-AGENTS.md & del hard-AGENTS.md",
+        )
+        .await;
+    let hardlink_rules = canary.read("hard-AGENTS.md");
+    let root_after_hardlink = canary.read("AGENTS.md").unwrap_or_default();
+    canary.record(
+        "SEC-07B",
+        if root_after_hardlink == "ROOT-RULES\n"
+            && hardlink_rules
+                .as_deref()
+                .is_none_or(|text| text == "ROOT-RULES\n")
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        format!(
+            "hardlink alias = {hardlink_rules:?}; protected original = {root_after_hardlink:?}"
+        ),
+    );
+    let _ = std::fs::remove_file(canary.root.join("hard-AGENTS.md"));
+
+    // SEC-08B: a file symlink is another alias onto the same file object. If
+    // this unprivileged account cannot create one (Developer Mode / SeCreateSymbolicLink),
+    // record the OS limitation rather than pretending the case passed.
+    let symlink = canary.root.join("sym-AGENTS.md");
+    match std::os::windows::fs::symlink_file("AGENTS.md", &symlink) {
+        Ok(()) => {
+            canary
+                .run(
+                    "sec08b-symlink",
+                    "echo PWNED>> sym-AGENTS.md & del sym-AGENTS.md",
+                )
+                .await;
+            let symlink_rules = canary.read("sym-AGENTS.md");
+            let root_after_symlink = canary.read("AGENTS.md").unwrap_or_default();
+            canary.record(
+                "SEC-08B",
+                if root_after_symlink == "ROOT-RULES\n"
+                    && symlink_rules
+                        .as_deref()
+                        .is_none_or(|text| text == "ROOT-RULES\n")
+                {
+                    "PASS"
+                } else {
+                    "FAIL"
+                },
+                format!(
+                    "symlink alias = {symlink_rules:?}; protected original = {root_after_symlink:?}"
+                ),
+            );
+            let _ = std::fs::remove_file(&symlink);
+        }
+        Err(error) => {
+            std::fs::write(
+                canary.evidence.join("sec08b-symlink-unavailable.txt"),
+                format!("symlink creation by this account failed: {error}\n"),
+            )
+            .unwrap();
+            canary.record(
+                "SEC-08B",
+                "NOT_APPLICABLE",
+                format!("this unprivileged account cannot create a file symlink: {error}"),
+            );
+        }
+    }
 
     // SEC-03: existing nested AGENTS.md.
     canary
