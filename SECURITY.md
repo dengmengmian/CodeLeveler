@@ -121,11 +121,13 @@ when a human approved the exact bytes on disk:
   its lock, its snapshot directory, and the executable-config store), even when
   an external-path resource grant is presented: a forged record is not a human
   decision.
-- A missing, corrupt, future-schema, or inside-project store fails the whole
+- A corrupt, future-schema, or inside-project store fails the whole
   `leveler trust` approval or revocation transaction before the separate
-  executable-config store is touched. A store path that is inside the checkout
-  is refused even when the store file does not exist yet (a missing path is
-  compared with the same canonical identity, not treated as "outside").
+  executable-config store is touched. A missing store is the normal first-run
+  state: it trusts nothing and the command may create it. A store path that is
+  inside the checkout is refused even when the store file does not exist yet (a
+  missing path is compared with the same canonical identity, not treated as
+  "outside").
 - A confined command that runs `leveler trust` can only write its per-command
   sandbox home; the runtime reads the host home, so such a command cannot create
   an effective approval. If the command explicitly points the CLI at the host
