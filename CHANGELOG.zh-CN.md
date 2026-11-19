@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- 可信定义控制面新增两处 fail-closed：除 FullAccess 外，`write_file`/`apply_patch` 即使持有外部路径资源授权，也拒绝写入定义 Trust Store、其锁与快照目录、以及可执行配置 Trust Store；批准仍只能由 `leveler trust` 作出。损坏、未来版本或位于仓库内的 Store 现在会在触碰配置 Store 之前整体拒绝批准或撤销事务；位于 checkout 内的 Store 路径在文件尚不存在时也会被拒绝。受限命令运行 `leveler trust` 只能写入其每次命令的沙箱私有 home，Runtime 从不读取该 home；若显式指向宿主 home，OS 写边界会拒绝。
+- 全量测试中的两个负载敏感测试不再依赖墙钟阈值或外部 shell 程序：后台启动测试用测试二进制自身作为长生命周期进程，并发时长测试用两个子流之间的 rendezvous。
+- Windows 安全 canary 新增证明：真实 Low Integrity Shell 无法向 Runtime Store 自我批准、无法打开 Runtime 的 Medium 命名管道、无法通过 Task Scheduler 或 WMI 创建进程。FullAccess 仍是明确记录的用户权限边界。
 - 项目定义现在必须由人工批准确切内容后才生效。覆盖任意深度的 `AGENTS.md`、`.leveler/instructions.md`、`.leveler/rules/*.md`、`.leveler/agents` 下的声明式 Agent，以及 `.leveler/skills` 与兼容的项目/用户技能根。`leveler trust` 列出并批准显示的 SHA-256，`leveler trust show` 报告新增/变更/已信任，`leveler trust diff <path>` 对比已批准版本，`leveler trust revoke-definition <path>` 撤销单条记录。任何编辑、`git pull`、提交、Runtime 重启或 Session Resume 都不会继承旧批准。Trust Store 位于工作区之外，缺失或损坏时失败关闭。这不会关闭 Windows OS 仍允许受限 Shell 创建原本缺失定义路径的缺口；此类文件可以被创建，但未经批准绝不会被采纳。
 - Windows 资源授权改为绑定文件对象的稳定卷号/文件 ID 与创建时间，并从已打开的句柄读取。授权可列出、撤销并通过执行层持久复用；对象被替换后不再匹配。无法提供持久文件 ID 的文件系统明确 fail-closed，不回退到路径字符串比较。
 - Windows 上的固定 Commit 与分支审查不再启动 `git` 进程。`git_history` 与审查的固定对象范围直接读取 loose object 与 packfile，逐个校验对象哈希，缺失对象明确失败，并保留被审查对象的祖先边界；该路径不触网、不执行 hooks/filters/helpers。

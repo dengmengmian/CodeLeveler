@@ -120,7 +120,36 @@ pub fn trust_store_path(global_home: &Path) -> PathBuf {
 pub fn store_is_outside_repo(global_home: &Path, repo_root: &Path) -> bool {
     let home = resolve_for_compare(global_home);
     let repo = resolve_for_compare(repo_root);
-    !home.starts_with(&repo)
+    #[cfg(windows)]
+    {
+        // A home that does not exist yet is not canonicalized, while the
+        // repository is. `starts_with` alone would then call a store inside
+        // the repository "outside" and let the repository ship its own
+        // approvals. Compare the Windows spellings with the verbatim marker
+        // removed.
+        let home = compare_absolute(&home);
+        let repo = compare_absolute(&repo);
+        !(home == repo
+            || home
+                .strip_prefix(&repo)
+                .is_some_and(|rest| rest.starts_with('/')))
+    }
+    #[cfg(not(windows))]
+    {
+        !home.starts_with(&repo)
+    }
+}
+
+#[cfg(windows)]
+fn compare_absolute(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.trim_end_matches('/');
+    let text = if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else {
+        text.strip_prefix("//?/").unwrap_or(text).to_string()
+    };
+    text.to_lowercase()
 }
 
 /// Resolve a possibly relative path against the process cwd before comparing.
@@ -385,5 +414,12 @@ mod tests {
         assert!(store.revoke(repo.path()));
         assert!(!store.is_trusted(repo.path(), ".leveler/hooks.yaml", b"a"));
         assert!(!store.revoke(repo.path()));
+    }
+
+    #[test]
+    fn a_missing_home_inside_the_repo_is_not_outside_it() {
+        let repo = tempdir().unwrap();
+        let home = repo.path().join("missing-home");
+        assert!(!store_is_outside_repo(&home, repo.path()));
     }
 }

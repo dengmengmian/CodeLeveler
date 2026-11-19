@@ -116,7 +116,20 @@ when a human approved the exact bytes on disk:
   show` lists the state; `leveler trust diff <path>` shows the approved version
   against the current bytes; `leveler trust revoke-definition <path>` removes
   one approval. The agent has no tool that writes a trust record, and neither a
-  permission mode nor model text creates one.
+  permission mode nor model text creates one. In every mode except FullAccess,
+  the file tools refuse to write the trust-store files themselves (the store,
+  its lock, its snapshot directory, and the executable-config store), even when
+  an external-path resource grant is presented: a forged record is not a human
+  decision.
+- A missing, corrupt, future-schema, or inside-project store fails the whole
+  `leveler trust` approval or revocation transaction before the separate
+  executable-config store is touched. A store path that is inside the checkout
+  is refused even when the store file does not exist yet (a missing path is
+  compared with the same canonical identity, not treated as "outside").
+- A confined command that runs `leveler trust` can only write its per-command
+  sandbox home; the runtime reads the host home, so such a command cannot create
+  an effective approval. If the command explicitly points the CLI at the host
+  home, the OS write boundary denies the store write.
 - Status is re-evaluated from the store on every turn, and a turn's decisions
   are frozen into that turn's execution context. A definition created or edited
   by a command during a turn cannot become trusted authority inside a request

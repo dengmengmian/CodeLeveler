@@ -105,6 +105,37 @@ pub struct ExecutionResources {
     pub memory_index: Option<Arc<str>>,
 }
 
+/// Compare two filesystem names after resolving an existing file or its
+/// parent. The trust-store check must not be defeated by a junction alias.
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    fn resolve(path: &std::path::Path) -> std::path::PathBuf {
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(canonical_parent) = parent.canonicalize()
+        {
+            return canonical_parent.join(name);
+        }
+        path.to_path_buf()
+    }
+    let left = resolve(left);
+    let right = resolve(right);
+    if cfg!(windows) {
+        fn simplify(path: std::path::PathBuf) -> String {
+            let text = path.to_string_lossy().into_owned();
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{rest}")
+            } else {
+                text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+            }
+        }
+        simplify(left).eq_ignore_ascii_case(&simplify(right))
+    } else {
+        left == right
+    }
+}
+
 /// Gates and budgets — the scope-varying part of the context. Per-engine
 /// (`mode`, `read_only`), per-turn (`tool_output_budget`, network grant), and
 /// per-invocation (write constraints, fs grant) knobs live together because
@@ -520,12 +551,50 @@ impl ToolContext {
         path: &str,
         capability: leveler_core::Capability,
     ) -> Option<String> {
+        // The trust stores are not ordinary external files. An exact-call
+        // resource grant may admit an external path, but it must never let a
+        // tool author a fake approval record or snapshot. The human approval
+        // surface is `leveler trust`; a file write is not that decision.
+        if let Some(denied) = self.security_control_write_denied(path) {
+            return Some(denied);
+        }
         if self.execution_workspace().is_ok_and(|workspace| {
             workspace.allows_resource_path(capability, std::path::Path::new(path))
         }) {
             return None;
         }
         self.policy.write_path_denied(path)
+    }
+
+    /// Whether `path` names one of the trust controls themselves. Reads stay
+    /// allowed; admission depends on the bytes, not on who may read them.
+    pub(crate) fn security_control_write_denied(&self, path: &str) -> Option<String> {
+        if self.policy.unrestricted_execution() {
+            return None;
+        }
+        let home = leveler_core::LevelerHome::resolve(&self.execution.environment)
+            .root()
+            .to_path_buf();
+        let workspace = self.execution_workspace().ok()?;
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.root().join(raw)
+        };
+        if leveler_definition_trust::is_trust_store_path(&home, &absolute) {
+            return Some(format!(
+                "`{path}` is the definition trust store, a security control. Approve \
+                 definitions with `leveler trust`; file tools cannot write this path."
+            ));
+        }
+        if same_path(&absolute, &leveler_execution::trust_store_path(&home)) {
+            return Some(format!(
+                "`{path}` is the in-repo configuration trust store, a security control. \
+                 Use `leveler trust`; file tools cannot write this path."
+            ));
+        }
+        None
     }
 
     /// Point this context at a permission profile the SESSION owns, instead

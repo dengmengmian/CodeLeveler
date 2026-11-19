@@ -64,6 +64,11 @@ struct SleepyRuntime {
     /// Invoked with the 0-based stream index at the start of each `stream`
     /// call, so tests can time cancellation deterministically.
     on_stream: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    /// When set, the two child streams (indices 1 and 2) must both be in
+    /// flight before either may answer. A serialized executor times out here,
+    /// so concurrency is proven by a rendezvous rather than a wall-clock
+    /// threshold that a loaded host can exceed.
+    child_barrier: Option<Arc<tokio::sync::Barrier>>,
     stream_count: std::sync::atomic::AtomicUsize,
     /// The message list of every request, in stream order, so tests can assert
     /// what the model was actually shown on each round.
@@ -79,6 +84,7 @@ impl SleepyRuntime {
             delays: Mutex::new(VecDeque::new()),
             default_delay: delay,
             on_stream: None,
+            child_barrier: None,
             stream_count: std::sync::atomic::AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
             controls: Mutex::new(Vec::new()),
@@ -94,6 +100,12 @@ impl SleepyRuntime {
     /// Hook invoked at the start of each `stream` call with its 0-based index.
     fn with_stream_hook(mut self, hook: impl Fn(usize) + Send + Sync + 'static) -> Self {
         self.on_stream = Some(Arc::new(hook));
+        self
+    }
+
+    /// Require the two child streams to overlap before either answers.
+    fn with_child_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        self.child_barrier = Some(barrier);
         self
     }
 }
@@ -126,6 +138,22 @@ impl ModelRuntime for SleepyRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(hook) = &self.on_stream {
             hook(index);
+        }
+        if let Some(barrier) = &self.child_barrier
+            && matches!(index, 1 | 2)
+        {
+            // A serialized executor would leave the first child parked here
+            // until the timeout. The test then fails on the product property
+            // (children did not run concurrently), not on host scheduling.
+            if tokio::time::timeout(Duration::from_secs(5), barrier.wait())
+                .await
+                .is_err()
+            {
+                return Err(ModelError::new(
+                    leveler_model::ModelErrorKind::Other,
+                    "child streams did not overlap: the executor serialized them",
+                ));
+            }
         }
         let delay = self
             .delays
@@ -1826,22 +1854,28 @@ async fn child_duration_does_not_inflate_parent_wall_clock() {
     let tool_context =
         ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
-    // Two concurrent children each delayed 80ms → concurrent wall ~80ms, serial ~160ms.
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![
-                    spawn_call("s1", serde_json::json!({"task": "A", "role": "explorer"})),
-                    spawn_call("s2", serde_json::json!({"task": "B", "role": "explorer"})),
-                ],
-                FinishReason::ToolCalls,
-            ),
-            assistant_text("A"),
-            assistant_text("B"),
-            assistant_text("parent done"),
-        ],
-        Duration::from_millis(80),
-    ));
+    // The two child streams must overlap before either may answer. This is the
+    // setup fact the old wall-clock threshold tried to infer; a rendezvous
+    // cannot be exceeded by host load.
+    let children = Arc::new(tokio::sync::Barrier::new(2));
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![
+                        spawn_call("s1", serde_json::json!({"task": "A", "role": "explorer"})),
+                        spawn_call("s2", serde_json::json!({"task": "B", "role": "explorer"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                assistant_text("A"),
+                assistant_text("B"),
+                assistant_text("parent done"),
+            ],
+            Duration::from_millis(80),
+        )
+        .with_child_barrier(children),
+    );
 
     let started = Instant::now();
     let outcome = Executor::new(
@@ -1867,11 +1901,6 @@ async fn child_duration_does_not_inflate_parent_wall_clock() {
     assert!(
         ledger_ms <= wall.as_millis() as u64 + 50,
         "ledger duration must track parent wall, not sum of children; ledger_ms={ledger_ms} wall={wall:?}"
-    );
-    // Sanity: we actually ran concurrent-ish (under serial 4×80=320ms).
-    assert!(
-        wall < Duration::from_millis(350),
-        "test setup expected concurrency; wall={wall:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

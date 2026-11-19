@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 use leveler_definition_trust::{
     ApprovalSurface, DefinitionCandidate, DefinitionTrust, DefinitionTrustView, DiscoveryRoots,
-    approve, discover, read_snapshot, revoke_all, revoke_definition, store_is_outside_project,
+    StoreStatus, approve, discover, read_snapshot, revoke_all, revoke_definition,
+    store_is_outside_project,
 };
 use leveler_execution::{
     TRUSTABLE_PROJECT_FILES, TrustStore, TrustedRead, content_digest, read_trusted_project_file,
@@ -131,12 +132,43 @@ pub(crate) fn cmd_trust(
 
     match cmd {
         Some(TrustCommand::Revoke) => {
+            // A revocation writes the same control files as an approval, so a
+            // store the repository can rewrite is not a store it may revoke
+            // through. Fail closed instead of writing a meaningless change.
+            if !store_boundary_ok(&home, &repo) {
+                return Ok(std::process::ExitCode::FAILURE);
+            }
+            // Refuse before touching the config store: a corrupt definition
+            // store means the revocation cannot be completed, and a partial
+            // "revoked" report would be false.
+            let trust_status = DefinitionTrustView::load(&home, Some(&repo)).status();
+            if matches!(
+                trust_status,
+                StoreStatus::Corrupt { .. }
+                    | StoreStatus::UnsupportedVersion { .. }
+                    | StoreStatus::InsideProject
+            ) {
+                println!(
+                    "{}",
+                    Line::fail(&format!(
+                        "the definition trust store is unusable ({}); nothing was revoked.",
+                        trust_status.as_str()
+                    ))
+                );
+                return Ok(std::process::ExitCode::FAILURE);
+            }
             let mut store = TrustStore::load(&home);
             let config_revoked = store.revoke(&repo);
             if config_revoked {
                 store.save()?;
             }
-            let definitions_revoked = revoke_all(&home, &repo).unwrap_or(false);
+            let definitions_revoked = match revoke_all(&home, &repo) {
+                Ok(revoked) => revoked,
+                Err(error) => {
+                    println!("{}", Line::fail(&error.to_string()));
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
+            };
             if config_revoked || definitions_revoked {
                 println!(
                     "{}",
@@ -170,7 +202,10 @@ pub(crate) fn cmd_trust(
                     "{}",
                     Line::warn(&format!("`{}` had no approval", row.display))
                 ),
-                Err(error) => println!("{}", Line::fail(&error.to_string())),
+                Err(error) => {
+                    println!("{}", Line::fail(&error.to_string()));
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
@@ -181,17 +216,7 @@ pub(crate) fn cmd_trust(
             // Trust granted from a store the repository itself contains means
             // nothing, and the gate ignores it. Say so instead of reporting a
             // write that will never take effect.
-            if !leveler_execution::store_is_outside_repo(&home, &repo)
-                || !store_is_outside_project(&home, &repo)
-            {
-                println!(
-                    "{}",
-                    Line::fail(&format!(
-                        "the trust store ({}) is inside this repository, so trusting it would grant nothing",
-                        trust_store_display(&home)
-                    ))
-                );
-                println!("  set HOME (or LEVELER_HOME) to a directory outside the repository.");
+            if !store_boundary_ok(&home, &repo) {
                 return Ok(std::process::ExitCode::FAILURE);
             }
 
@@ -209,6 +234,29 @@ pub(crate) fn cmd_trust(
                 .iter()
                 .filter(|row| matches!(row.state, DefinitionState::Unreadable { .. }))
                 .collect();
+
+            // A corrupt or future-version definition store cannot be written
+            // safely. Refuse the whole transaction BEFORE the config store is
+            // saved: otherwise a pending hooks file would be approved while
+            // every definition silently failed to record.
+            let trust_status = DefinitionTrustView::load(&home, Some(&repo)).status();
+            if matches!(
+                trust_status,
+                StoreStatus::Corrupt { .. }
+                    | StoreStatus::UnsupportedVersion { .. }
+                    | StoreStatus::InsideProject
+            ) {
+                print_unreadable(&unreadable);
+                println!(
+                    "{}",
+                    Line::fail(&format!(
+                        "the definition trust store is unusable ({}); nothing was approved. \
+                         Repair or remove it first.",
+                        trust_status.as_str()
+                    ))
+                );
+                return Ok(std::process::ExitCode::FAILURE);
+            }
 
             if pending.is_empty() && pending_definitions.is_empty() {
                 if !unreadable.is_empty() {
@@ -300,6 +348,11 @@ pub(crate) fn cmd_trust(
                     repo.display()
                 ))
             );
+            println!(
+                "  definition store: {}",
+                leveler_definition_trust::store_path(&home).display()
+            );
+            println!("  config store: {}", trust_store_display(&home));
             if !changed.is_empty() {
                 println!(
                     "{}",
@@ -677,6 +730,25 @@ fn trust_store_display(home: &Path) -> String {
     leveler_execution::trust_store_path(home)
         .display()
         .to_string()
+}
+
+/// Refuse a write to a trust store the project can rewrite. Both the
+/// executable-config store and the definition store have this rule; a
+/// revocation must be as fail-closed as an approval.
+fn store_boundary_ok(home: &Path, repo: &Path) -> bool {
+    if leveler_execution::store_is_outside_repo(home, repo) && store_is_outside_project(home, repo)
+    {
+        return true;
+    }
+    println!(
+        "{}",
+        Line::fail(&format!(
+            "the trust store ({}) is inside this repository, so a record written there would grant nothing",
+            trust_store_display(home)
+        ))
+    );
+    println!("  set HOME (or LEVELER_HOME) to a directory outside the repository.");
+    false
 }
 
 fn leveler_home() -> PathBuf {

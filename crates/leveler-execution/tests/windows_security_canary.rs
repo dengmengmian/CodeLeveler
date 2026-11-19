@@ -105,7 +105,27 @@ impl Canary {
     }
 
     fn read(&self, relative: &str) -> Option<String> {
-        std::fs::read_to_string(self.root.join(relative)).ok()
+        // Windows console tools write the OEM/ANSI code page. Evidence is
+        // text to a human, so decode lossily rather than dropping a real
+        // denial because the exception message is not UTF-8.
+        std::fs::read(self.root.join(relative))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A child may exit before the filesystem write it delegated to a
+    /// grandchild is visible. Poll a bounded number of times; the condition is
+    /// the file's content, never a fixed sleep as a correctness signal.
+    async fn read_eventually(&self, relative: &str) -> String {
+        for _ in 0..30 {
+            if let Some(text) = self.read(relative)
+                && !text.is_empty()
+            {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        self.read(relative).unwrap_or_default()
     }
 
     fn record(&mut self, id: &str, verdict: &'static str, detail: impl Into<String>) {
@@ -824,4 +844,145 @@ MORE
         .collect();
     assert!(failed.is_empty(), "admission cases failed: {failed:?}");
     let _ = std::fs::remove_dir_all(&trust_home);
+}
+
+/// TD-13: the runtime's local IPC is a same-user boundary in the DACL, so the
+/// test that matters is the mandatory label. A confined shell must not be able
+/// to open a pipe object the Medium-integrity runtime creates. The canary opens
+/// a real named-pipe server in this (Medium) process and runs a Low client
+/// against it; connection is judged by the OS result, not by a CLI message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows OS security canary; needs leveler-confine.exe and a scratch workspace"]
+async fn the_runtime_ipc_pipe_is_unreachable_for_a_confined_shell() {
+    if leveler_execution::windows_confine::launcher_path().is_none() {
+        panic!("leveler-confine.exe is not built beside the test binary");
+    }
+    let mut canary = Canary::new();
+    let pipe = format!(r"\\.\pipe\LevelerCanaryPipe-{}", std::process::id());
+    let server = tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe)
+        .expect("the canary pipe server must start");
+    let accept = tokio::spawn(async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server.connect()).await;
+    });
+    let script = format!(
+        "$ErrorActionPreference='Stop'\n\
+         $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'LevelerCanaryPipe-{pid}', [System.IO.Pipes.PipeDirection]::InOut)\n\
+         try {{ $c.Connect(3000); Set-Content -LiteralPath 'pipe-result.txt' -Value 'CONNECTED'; $c.Dispose() }}\n\
+         catch {{ Set-Content -LiteralPath 'pipe-result.txt' -Value ('DENIED: ' + $_.Exception.Message) }}\n",
+        pid = std::process::id()
+    );
+    std::fs::write(canary.root.join("pipe-client.ps1"), script).unwrap();
+    std::fs::write(
+        canary.root.join("pipe-client.cmd"),
+        "@echo off\r\ncd /d \"%~dp0\"\r\npowershell -NoProfile -ExecutionPolicy Bypass -File pipe-client.ps1\r\n",
+    )
+    .unwrap();
+    let pipe_script = canary.root.join("pipe-client.cmd").display().to_string();
+    canary.run("runtime-pipe-client", &pipe_script).await;
+    accept.abort();
+    let result = canary.read_eventually("pipe-result.txt").await;
+    std::fs::write(canary.evidence.join("runtime-pipe-result.txt"), &result).unwrap();
+    canary.record(
+        "TD-13",
+        if result.starts_with("DENIED") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        format!("Low client against a Medium pipe: {result}"),
+    );
+    let report = format!("TD-13 {result}\n");
+    std::fs::write(canary.evidence.join("RUNTIME_PIPE_CANARY.txt"), &report).unwrap();
+    println!(
+        "RUNTIME_PIPE_CANARY workspace={}\n{report}",
+        canary.root.display()
+    );
+    assert!(
+        result.starts_with("DENIED"),
+        "a confined shell must not open the runtime IPC pipe: {result:?}"
+    );
+}
+
+/// TD-12/13: process-start escapes that would run outside the Low token. Task
+/// Scheduler creation and WMI process creation are the two generic Windows
+/// routes; both must be denied by the OS for a confined shell. The test also
+/// checks from the Medium side that no task was left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows OS security canary; needs leveler-confine.exe and a scratch workspace"]
+async fn a_confined_shell_cannot_escape_through_scheduler_or_wmi() {
+    if leveler_execution::windows_confine::launcher_path().is_none() {
+        panic!("leveler-confine.exe is not built beside the test binary");
+    }
+    let mut canary = Canary::new();
+    let task = format!("LevelerCanary_{}", std::process::id());
+    let proof = canary.root.join("cim-proof.txt");
+    let proof_text = proof.display().to_string().replace('\'', "''");
+    let cim = format!(
+        "$ErrorActionPreference='Stop'\n\
+         try {{\n\
+           Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='C:\\Windows\\System32\\cmd.exe /c echo CIM_RAN > \"{proof_text}\"'}} | Out-Null\n\
+           'CIM_OK'\n\
+         }} catch {{ 'CIM_DENIED: ' + $_.Exception.Message }}\n"
+    );
+    std::fs::write(canary.root.join("cim-probe.ps1"), cim).unwrap();
+    let script = format!(
+        "@echo off\r\n\
+         cd /d \"%~dp0\"\r\n\
+         whoami /groups > groups.txt 2>&1\r\n\
+         C:\\Windows\\System32\\schtasks.exe /Query /FO LIST > schtasks-query.txt 2>&1\r\n\
+         echo QUERY_EXIT=%ERRORLEVEL% >> schtasks-query.txt\r\n\
+         C:\\Windows\\System32\\schtasks.exe /Create /TN {task} /TR \"C:\\Windows\\System32\\cmd.exe /c echo TASK_RAN\" /SC ONCE /ST 23:59 /F > schtasks-create.txt 2>&1\r\n\
+         echo CREATE_EXIT=%ERRORLEVEL% >> schtasks-create.txt\r\n\
+         C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File cim-probe.ps1 > cim.txt 2>&1\r\n\
+         echo CIM_EXIT=%ERRORLEVEL% >> cim.txt\r\n"
+    );
+    std::fs::write(canary.root.join("escape-probe.cmd"), script).unwrap();
+    let escape_script = canary.root.join("escape-probe.cmd").display().to_string();
+    canary.run("scheduler-wmi-probe", &escape_script).await;
+
+    let query = canary.read_eventually("schtasks-query.txt").await;
+    let create = canary.read_eventually("schtasks-create.txt").await;
+    let cim_out = canary.read_eventually("cim.txt").await;
+    let task_exists = std::process::Command::new("C:\\Windows\\System32\\schtasks.exe")
+        .args(["/Query", "/TN", &task])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if task_exists {
+        let _ = std::process::Command::new("C:\\Windows\\System32\\schtasks.exe")
+            .args(["/Delete", "/TN", &task, "/F"])
+            .output();
+    }
+    let evidence = format!(
+        "task: {task}\ntask_exists_after: {task_exists}\n\
+         schtasks query:\n{query}\nschtasks create:\n{create}\ncim:\n{cim_out}\n\
+         cim_proof_exists: {}\n",
+        canary.root.join("cim-proof.txt").exists()
+    );
+    std::fs::write(canary.evidence.join("SCHEDULER_WMI_CANARY.txt"), &evidence).unwrap();
+    println!(
+        "SCHEDULER_WMI_CANARY workspace={}\n{evidence}",
+        canary.root.display()
+    );
+
+    assert!(!task_exists, "a confined shell created a scheduled task");
+    assert!(
+        create.contains("CREATE_EXIT=") && !create.contains("CREATE_EXIT=0"),
+        "task creation must fail: {create}"
+    );
+    assert!(
+        !cim_out.contains("CIM_OK"),
+        "WMI process creation must be denied: {cim_out}"
+    );
+    assert!(
+        !canary.root.join("cim-proof.txt").exists(),
+        "a WMI-created process wrote its proof file"
+    );
+    canary.record(
+        "TD-12",
+        "PASS",
+        format!("task_exists={task_exists}; {}", create.trim()),
+    );
+    canary.record("TD-13", "PASS", format!("wmi: {}", cim_out.trim()));
 }

@@ -221,11 +221,17 @@ pub fn store_path(store_root: &Path) -> PathBuf {
     store_root.join(STORE_FILE_NAME)
 }
 
-fn snapshot_dir(store_root: &Path) -> PathBuf {
-    store_root.join("definition-trust").join("snapshots")
+/// The directory that holds approved-content snapshots. The whole directory is
+/// a security-control namespace: no file under it may be authored by a tool.
+pub fn snapshot_root(store_root: &Path) -> PathBuf {
+    store_root.join("definition-trust")
 }
 
-fn lock_path(store_root: &Path) -> PathBuf {
+fn snapshot_dir(store_root: &Path) -> PathBuf {
+    snapshot_root(store_root).join("snapshots")
+}
+
+pub fn lock_path(store_root: &Path) -> PathBuf {
     store_root.join("definition-trust.lock")
 }
 
@@ -604,12 +610,14 @@ struct StoreLock {
 impl StoreLock {
     fn acquire(store_root: &Path) -> Result<Self, TrustStoreError> {
         std::fs::create_dir_all(store_root)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path(store_root))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path(store_root))?;
         file.lock_exclusive()
             .map_err(|error| TrustStoreError::Lock(error.to_string()))?;
         Ok(Self { file })

@@ -307,3 +307,97 @@ fn a_corrupt_definition_store_is_reported_and_nothing_is_approved() {
         "a corrupt store is not a reason to report nothing: {out}"
     );
 }
+
+/// An approval is scoped to the store root the runtime reads. A CLI run that
+/// points at another root can record a real-looking store, but this project's
+/// gate must not see it.
+#[test]
+fn a_different_store_root_cannot_approve_this_projects_definitions() {
+    use leveler_definition_trust::{
+        DefinitionIdentity, DefinitionKind, DefinitionTrust, DefinitionTrustView,
+    };
+
+    let real_home = tempfile::tempdir().unwrap();
+    let other_home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join("AGENTS.md"), "RULE\n");
+
+    let (ok, out) = run(other_home.path(), repo.path(), &["trust", "allow", "--yes"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("store:"),
+        "the store it wrote must be named: {out}"
+    );
+
+    let identity = DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap();
+    let digest = DefinitionIdentity::single_digest(b"RULE\n");
+    assert_eq!(
+        DefinitionTrustView::load(real_home.path(), Some(repo.path())).check(&identity, &digest),
+        DefinitionTrust::Unapproved,
+        "a store in another root is not this project's approval"
+    );
+    assert!(
+        DefinitionTrustView::load(other_home.path(), Some(repo.path()))
+            .check(&identity, &digest)
+            .is_trusted(),
+        "the approval exists only in the store that recorded it"
+    );
+}
+
+/// Revocation writes the same control files as approval, so it must fail
+/// closed when the store would live inside the repository.
+#[test]
+fn revoke_refuses_when_the_trust_store_would_live_inside_the_repo() {
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join(".leveler/hooks.yaml"), HOOKS);
+    let home = repo.path().join(".leveler");
+
+    let (ok, out) = run(&home, repo.path(), &["trust", "revoke"]);
+    assert!(!ok, "must not claim success: {out}");
+    assert!(out.contains("inside this repository"), "{out}");
+    assert!(!home.join("trusted.yaml").exists());
+    assert!(!home.join("definition-trust.yaml").exists());
+}
+
+/// A corrupt definition store blocks the whole transaction, including the
+/// separate executable-config store. Otherwise the command would report a
+/// successful hooks approval while every definition was unreadable.
+#[test]
+fn a_corrupt_definition_store_blocks_config_approval_too() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join(".leveler/hooks.yaml"), HOOKS);
+    write(
+        &home.path().join("definition-trust.yaml"),
+        "!! not yaml !!\n",
+    );
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "allow", "--yes"]);
+    assert!(!ok, "must not claim success: {out}");
+    assert!(out.contains("unusable"), "{out}");
+    assert!(
+        !home.path().join("trusted.yaml").exists(),
+        "no config approval may be written beside a corrupt definition store"
+    );
+}
+
+#[test]
+fn revoke_refuses_a_corrupt_definition_store_without_partial_state() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join(".leveler/hooks.yaml"), HOOKS);
+    write(
+        &home.path().join("definition-trust.yaml"),
+        "!! not yaml !!\n",
+    );
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "revoke"]);
+    assert!(!ok, "must not claim a revoke: {out}");
+    assert!(out.contains("unusable"), "{out}");
+    assert!(!home.path().join("trusted.yaml").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("definition-trust.yaml")).unwrap(),
+        "!! not yaml !!\n",
+        "the corrupt store must not be rewritten"
+    );
+}

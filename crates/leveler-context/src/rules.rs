@@ -1456,6 +1456,37 @@ mod tests {
     }
 
     #[test]
+    fn an_untrusted_config_cannot_select_an_unapproved_rule() {
+        let root = temp_dir("untrusted-config-policy");
+        std::fs::create_dir_all(root.join(".leveler")).unwrap();
+        std::fs::write(
+            root.join(".leveler/config.yaml"),
+            "rules:\n  always_delivered: [Release marker]\n  budget_bytes: 16000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Project rules\n\n## Release marker\nEVIL-CONFIG-SELECTED\n",
+        )
+        .unwrap();
+        let config = leveler_project::config::ProjectConfig::load(&root).unwrap();
+        let policy = RuleDeliveryPolicy {
+            always: config.rules.always_delivered,
+            budget_bytes: config.rules.budget_bytes,
+        };
+        let plan = plan_rule_delivery(&root, &policy, &untrusted());
+        assert!(
+            plan.documents.is_empty(),
+            "the config policy may select only admitted definitions: {plan:?}"
+        );
+        assert_eq!(plan.untrusted.len(), 1, "{plan:?}");
+        let loaded = load_rules(&root, &untrusted());
+        assert!(loaded.documents.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn configured_rules_deliver_tdd_and_minimum_verification() {
         let root = temp_dir("configured-rules");
         std::fs::create_dir_all(root.join(".leveler")).unwrap();

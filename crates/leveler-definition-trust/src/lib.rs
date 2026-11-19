@@ -302,6 +302,29 @@ fn normalize_absolute(path: &std::path::Path) -> String {
     }
 }
 
+/// Compare spelling for the trust-store namespace. `std::fs::canonicalize`
+/// returns a Windows verbatim `\\?\` path while an agent-supplied spelling
+/// does not; stripping the marker here keeps the store identity stable without
+/// changing the persisted project-domain keys.
+fn compare_absolute(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.trim_end_matches('/');
+    let text = if cfg!(windows) {
+        if let Some(rest) = text.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else {
+            text.strip_prefix("//?/").unwrap_or(text).to_string()
+        }
+    } else {
+        text.to_string()
+    };
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
+}
+
 /// Whether `store_root` (the Leveler home) is outside `project_root`. A store
 /// inside the project could be authored by the same sandboxed shell the gate
 /// defends against, so such an arrangement grants nothing.
@@ -314,12 +337,83 @@ pub fn store_is_outside_project(
     if !cfg!(windows) {
         return !store.starts_with(&project);
     }
-    let store = normalize_absolute(&store);
-    let project = normalize_absolute(&project);
+    let store = compare_absolute(&store);
+    let project = compare_absolute(&project);
     !(store == project
         || store
             .strip_prefix(&project)
             .is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// Whether `candidate` names the definition trust store, its lock file, or a
+/// file under its snapshot directory.
+///
+/// Tool-facing writes must never author these files: a forged approval record
+/// is equivalent to a human approval. The comparison resolves an existing
+/// candidate and the candidate's parent, so a junction/symlink alias inside a
+/// writable workspace cannot spell the store as an innocent relative path.
+pub fn is_trust_store_path(store_root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    let store = resolve_for_compare(store_root);
+    let candidate = resolve_candidate_for_compare(candidate);
+    if paths_equal(&candidate, &store.join(STORE_FILE_NAME))
+        || paths_equal(&candidate, &crate::store::lock_path(&store))
+    {
+        return true;
+    }
+    if path_is_under(&crate::store::snapshot_root(&store), &candidate) {
+        return true;
+    }
+    // Atomic writes leave a `.definition-trust.yaml.tmp-*` beside the store.
+    // No tool may author one: a later rename would make it the store.
+    candidate
+        .parent()
+        .is_some_and(|parent| paths_equal(parent, &store))
+        && candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!(".{STORE_FILE_NAME}.tmp-")))
+}
+
+fn resolve_candidate_for_compare(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    if let Ok(canonical) = absolute.canonicalize() {
+        return canonical;
+    }
+    // A store file that does not exist yet still has a parent that may be a
+    // junction or symlink. Resolve that part before comparing the final name.
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        return canonical_parent.join(name);
+    }
+    absolute
+}
+
+fn paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if cfg!(windows) {
+        compare_absolute(left) == compare_absolute(right)
+    } else {
+        left == right
+    }
+}
+
+fn path_is_under(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    if cfg!(windows) {
+        let root = compare_absolute(root);
+        let candidate = compare_absolute(candidate);
+        candidate == root
+            || candidate
+                .strip_prefix(&root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    } else {
+        candidate.starts_with(root)
+    }
 }
 
 #[cfg(test)]
@@ -384,5 +478,41 @@ mod path_boundary_tests {
         std::fs::create_dir_all(&sibling).unwrap();
         assert!(store_is_outside_project(&sibling, &project));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_store_inside_the_project_is_still_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let store = project.path().join("not-created-yet");
+        assert!(!store_is_outside_project(&store, project.path()));
+        let view = DefinitionTrustView::load(&store, Some(project.path()));
+        assert_eq!(view.status(), crate::store::StoreStatus::InsideProject);
+    }
+
+    #[test]
+    fn the_definition_store_namespace_is_recognized() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join(STORE_FILE_NAME);
+        assert!(is_trust_store_path(home.path(), &store));
+        assert!(is_trust_store_path(
+            home.path(),
+            &home.path().join("definition-trust.lock")
+        ));
+        assert!(is_trust_store_path(
+            home.path(),
+            &home.path().join("definition-trust/snapshots/abc")
+        ));
+        assert!(is_trust_store_path(
+            home.path(),
+            &home.path().join(format!(".{STORE_FILE_NAME}.tmp-1-2"))
+        ));
+        assert!(!is_trust_store_path(
+            home.path(),
+            &home.path().join("config.toml")
+        ));
+        assert!(!is_trust_store_path(
+            home.path(),
+            &home.path().join("other/definition-trust.yaml")
+        ));
     }
 }

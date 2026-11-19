@@ -309,6 +309,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_file_tool_cannot_author_the_trust_controls() {
+        let (_, dir) = super::super::test_ctx(leveler_execution::PermissionProfile::Assisted, &[]);
+        let home = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        vars.retain(|(key, _)| key != "LEVELER_HOME");
+        vars.push((
+            std::ffi::OsString::from("LEVELER_HOME"),
+            home.path().as_os_str().to_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            vars,
+            dir.clone(),
+            std::env::temp_dir(),
+        ));
+        let ctx = ToolContext::with_environment(
+            leveler_execution::Workspace::new(&dir).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+            environment,
+        );
+        let definition_store = home.path().join("definition-trust.yaml");
+        let snapshot = home.path().join("definition-trust/snapshots/deadbeef");
+        let config_store = leveler_execution::trust_store_path(home.path());
+        for path in [&definition_store, &snapshot, &config_store] {
+            let out = run(
+                ctx.clone(),
+                serde_json::json!({"path": path, "content": "forged: true\n"}),
+            )
+            .await;
+            assert!(
+                out.is_error && out.content.contains("security control"),
+                "{}: {out:?}",
+                path.display()
+            );
+            assert!(!path.exists(), "no file may be written: {}", path.display());
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn full_access_keeps_its_documented_file_authority() {
+        let (_, dir) =
+            super::super::test_ctx(leveler_execution::PermissionProfile::FullAccess, &[]);
+        let home = tempfile::tempdir().unwrap();
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        vars.retain(|(key, _)| key != "LEVELER_HOME");
+        vars.push((
+            std::ffi::OsString::from("LEVELER_HOME"),
+            home.path().as_os_str().to_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            vars,
+            dir.clone(),
+            std::env::temp_dir(),
+        ));
+        let ctx = ToolContext::with_environment(
+            leveler_execution::Workspace::new(&dir).unwrap(),
+            leveler_execution::PermissionProfile::FullAccess,
+            environment,
+        );
+        let store = home.path().join("definition-trust.yaml");
+        let out = run(
+            ctx,
+            serde_json::json!({"path": store, "content": "forged: true\n"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(store.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn full_reads_creates_updates_and_patches_external_credentials() {
         let (ctx, dir) =
             super::super::test_ctx(leveler_execution::PermissionProfile::FullAccess, &[]);
