@@ -7875,5 +7875,8 @@ async fn a_resolution_without_a_summary_is_refused_then_the_summary_is_delivered
         "the refusal names the missing field: {refusals:?}"
     );
     assert_eq!(report.stop_reason, leveler_agent::StopReason::Yielded);
-    assert_eq!(report.final_text, "this window wrote the outline; the report body remains");
+    assert_eq!(
+        report.final_text,
+        "this window wrote the outline; the report body remains"
+    );
 }

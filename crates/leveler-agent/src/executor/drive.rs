@@ -6136,7 +6136,9 @@ impl AgentHarness for Drive<'_> {
                         text.trim().to_string()
                     }
                     other => {
-                        let observed = other.map(compact_json).unwrap_or_else(|| "no summary".to_string());
+                        let observed = other
+                            .map(compact_json)
+                            .unwrap_or_else(|| "no summary".to_string());
                         let message = format!(
                             "update_goal requires a non-empty `summary` string for complete, \
                              blocked, and yield: it is the terminal account shown to the user \

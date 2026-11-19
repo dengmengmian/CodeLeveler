@@ -2494,7 +2494,9 @@ mod file_observation_tests {
     fn content(prior: Vec<Message>) -> TurnInput {
         TurnInput::Content {
             prior,
-            content: vec![ContentPart::Text { text: "next".into() }],
+            content: vec![ContentPart::Text {
+                text: "next".into(),
+            }],
             origin: TranscriptOrigin::UserInput,
         }
     }

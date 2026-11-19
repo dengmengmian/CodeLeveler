@@ -1194,7 +1194,11 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        for candidate in [path.clone(), path.with_extension("db-wal"), path.with_extension("db-shm")] {
+        for candidate in [
+            path.clone(),
+            path.with_extension("db-wal"),
+            path.with_extension("db-shm"),
+        ] {
             if !candidate.exists() {
                 continue;
             }

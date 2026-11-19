@@ -573,7 +573,9 @@ fn request_from_input(
                         workspace,
                         action: work.into(),
                         trigger: trigger.into(),
-                        session_policy: input.session_policy.map(|value| value.as_wire().to_string()),
+                        session_policy: input
+                            .session_policy
+                            .map(|value| value.as_wire().to_string()),
                         overlap: input.overlap.map(|value| value.as_wire().to_string()),
                         mode: input.mode.map(|value| value.as_wire().to_string()),
                         model: input.model,
@@ -608,7 +610,9 @@ fn request_from_input(
                 workspace: input.workspace,
                 action: input.work.map(Into::into),
                 trigger: input.trigger.map(Into::into),
-                session_policy: input.session_policy.map(|value| value.as_wire().to_string()),
+                session_policy: input
+                    .session_policy
+                    .map(|value| value.as_wire().to_string()),
                 overlap: input.overlap.map(|value| value.as_wire().to_string()),
                 mode: input.mode.map(|value| value.as_wire().to_string()),
                 model: input.model,
@@ -1055,7 +1059,10 @@ mod tests {
         };
         assert_eq!(
             values("mode"),
-            json!(["request_approval", "assisted", "full_access"]).as_array().unwrap().clone()
+            json!(["request_approval", "assisted", "full_access"])
+                .as_array()
+                .unwrap()
+                .clone()
         );
         assert_eq!(
             values("session_policy"),
