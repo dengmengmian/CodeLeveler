@@ -693,7 +693,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
             "properties": {
                 "objective": {
                     "type": "string",
-                    "description": "The user's requested end state, as stated. Do not add, narrow or rewrite requirements."
+                    "description": "The user's requested end state. Used only when this turn carries no user text; otherwise the user's message is the objective and this value is ignored. Do not add, narrow or rewrite requirements."
                 },
                 "acceptance": {
                     "type": "array",
@@ -761,7 +761,7 @@ pub(crate) fn commit_task_tool_definition() -> ToolDefinition {
                     "description": "When a goal is already running and the objective differs, use continue to extend it or new for independent work."
                 }
             },
-            "required": ["objective", "acceptance"],
+            "required": ["acceptance"],
             "additionalProperties": false
         }),
     }
@@ -1830,6 +1830,13 @@ mod plan_sync_contract_tests {
             .expect("summary description");
         assert!(summary.contains("Required"), "{summary}");
         assert!(summary.contains("Non-empty"), "{summary}");
+        // The runtime uses the turn's user text as the objective and ignores
+        // the model's copy; only a turn with no user text needs it. The schema
+        // must not require a field the runtime discards.
+        assert_eq!(
+            super::commit_task_tool_definition().input_schema["required"],
+            serde_json::json!(["acceptance"])
+        );
         for schema in [
             super::declare_scope_tool_definition().input_schema,
             super::declare_intent_tool_definition().input_schema,
