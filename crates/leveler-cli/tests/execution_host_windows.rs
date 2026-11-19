@@ -478,10 +478,24 @@ async fn a_running_task_can_be_stopped_and_its_tree_is_gone() {
         .expect("spawn");
     let pid = view.pid.expect("pid");
     let stopped = client.kill_owned(id, "owner-c").await.expect("stop");
+    // The stop reply is the host's decision, not the child's exit: a real
+    // process may still be terminating. The terminal state is the host's own
+    // durable fact, so wait for it rather than accepting a command that was
+    // merely signalled.
     assert!(
-        stopped.status.is_terminal(),
-        "stop must settle the task: {:?}",
+        matches!(
+            stopped.status,
+            BackgroundTaskStatus::Killing | BackgroundTaskStatus::Killed
+        ),
+        "stop must signal the task: {:?}",
         stopped.status
+    );
+    let settled = wait_for_terminal(&client, id, "owner-c").await;
+    assert_eq!(
+        settled.status,
+        BackgroundTaskStatus::Killed,
+        "stop must settle the task: {:?}",
+        settled.status
     );
     wait_until("the workload after stop", Duration::from_secs(10), || {
         process_gone(pid)
