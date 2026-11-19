@@ -375,6 +375,7 @@ async fn fixture_with_clarifier(
             scratch,
         )),
     )
+    .trust_all_definitions_for_tests()
     .with_read_only(read_only);
     let mut registry = leveler_tools::default_registry();
     leveler_agent::register_harness_controls(&mut registry);

@@ -67,4 +67,9 @@ Name an agent in your request, such as “Have security-reviewer review these ch
 
 Edits affect agents started afterward. Deleting a definition does not stop work already running.
 
-Project agents come from the repository. Inspect their definitions before using an untrusted project. Instructions cannot expand tool or write permissions.
+Project agents come from the repository. A definition is inert until a human
+approves its exact `agent.yaml` and `instructions.md` with `leveler trust`; the
+approval is a digest over both files, so editing either one requires a new
+approval. Skills are gated the same way. An unapproved definition is not listed
+as available and cannot be spawned. Inspect a definition before approving it.
+Instructions cannot expand tool or write permissions.

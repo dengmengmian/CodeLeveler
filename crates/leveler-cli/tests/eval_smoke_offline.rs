@@ -164,7 +164,7 @@ expect:
     let outcome = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     )

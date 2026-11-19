@@ -189,7 +189,8 @@ impl Env {
             std::env::temp_dir(),
         ));
         let context =
-            ToolContext::with_environment(Workspace::new(&self.repo).unwrap(), profile, env);
+            ToolContext::with_environment(Workspace::new(&self.repo).unwrap(), profile, env)
+                .trust_all_definitions_for_tests();
         let runtime = Arc::new(Script {
             replies: Mutex::new(replies.into()),
             tools_seen: Mutex::new(Vec::new()),

@@ -87,6 +87,11 @@ pub struct ExecutionResources {
     /// result looks authoritative while being meaningless. `ToolContext` is
     /// cloned into every child, so the `Arc` makes one gate for the whole run.
     pub command_gate: Arc<tokio::sync::Mutex<()>>,
+    /// This execution's frozen view of the definition trust store. The host
+    /// builds it from its own environment; every rule read, agent registry,
+    /// skill registry and tool in this execution reads the same snapshot. A
+    /// mid-turn file creation or edit cannot enter it.
+    pub definition_trust: Arc<leveler_definition_trust::DefinitionTrustView>,
     /// Host-owned memory access policy, when the user enabled the memory
     /// pipeline. Ordinary file tools route paths inside the configured memory
     /// roots through this policy so memory files keep their own containment,
@@ -425,9 +430,14 @@ impl ToolContext {
         mode: PermissionProfile,
         environment: Arc<leveler_core::EnvSnapshot>,
     ) -> Self {
+        let definition_trust = Arc::new(leveler_definition_trust::DefinitionTrustView::load(
+            leveler_core::LevelerHome::resolve(&environment).root(),
+            workspace.as_ref().map(Workspace::root),
+        ));
         Self {
             execution: ExecutionResources {
                 workspace: workspace.map(Arc::new),
+                definition_trust,
                 runner: Arc::new(CommandRunner::with_environment(environment.clone())),
                 environment,
                 checkpoint: Arc::new(Checkpoint::new()),
@@ -466,6 +476,16 @@ impl ToolContext {
     }
 
     /// A structural execution prerequisite, independent of mutable grants.
+    /// Admit every definition for a test context. Compiled only for test
+    /// builds; production constructs the view from the real store and never
+    /// calls this.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trust_all_definitions_for_tests(mut self) -> Self {
+        self.execution.definition_trust =
+            Arc::new(leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests());
+        self
+    }
+
     pub fn require_workspace(&self) -> Result<&Workspace, ToolError> {
         self.execution
             .workspace

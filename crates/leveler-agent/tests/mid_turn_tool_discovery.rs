@@ -208,7 +208,8 @@ async fn a_tool_discovered_mid_turn_is_advertised_and_runs_in_the_same_turn() {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let mut registry = leveler_tools::default_registry();
     leveler_agent::register_harness_controls(&mut registry);
 
@@ -306,7 +307,8 @@ async fn an_unexposed_discovered_pack_is_announced_then_usable_after_enable() {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let mut registry = leveler_tools::default_registry();
     leveler_agent::register_harness_controls(&mut registry);
 
@@ -459,7 +461,8 @@ async fn an_available_unexposed_pack_states_what_it_would_add() {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let mut registry = leveler_tools::default_registry();
     leveler_agent::register_harness_controls(&mut registry);
     // The real path: an external server that is already up when the turn

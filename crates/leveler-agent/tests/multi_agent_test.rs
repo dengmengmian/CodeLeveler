@@ -271,7 +271,8 @@ fn tmp(tag: &str, salt: u64) -> std::path::PathBuf {
 async fn multiple_spawns_in_one_round_run_concurrently() {
     let dir = tmp("concurrent", 1);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Parent emits TWO spawn calls in one assistant round, then finishes.
@@ -353,7 +354,8 @@ async fn multiple_spawns_in_one_round_run_concurrently() {
 async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
     let dir = tmp("progress", 71);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let mut first_child_round = read_call("progress-read");
     first_child_round.usage = TokenUsage {
@@ -427,7 +429,8 @@ async fn explorer_role_cannot_modify_files() {
     let dir = tmp("explorer", 2);
     std::fs::write(dir.join("lib.rs"), "pub fn old() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The explorer sub-agent tries to apply_patch, which is not in its toolset.
@@ -493,7 +496,8 @@ async fn worker_ownership_rejects_out_of_scope_edit() {
     std::fs::write(dir.join("a.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(dir.join("b.rs"), "pub fn b() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Worker owns only a.rs but tries to patch b.rs.
@@ -562,7 +566,8 @@ async fn a_worker_that_only_repeats_refused_calls_stops_on_the_no_progress_bound
     std::fs::write(dir.join("a.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(dir.join("b.rs"), "pub fn b() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The worker owns only a.rs and every round re-issues the same b.rs edit,
@@ -663,7 +668,8 @@ async fn a_worker_cannot_keep_a_shell_write_outside_its_scope() {
     std::fs::write(dir.join("other.rs"), "other\n").unwrap();
     init_git(&dir);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -748,7 +754,8 @@ fn init_git(dir: &std::path::Path) {
 async fn explorer_can_finish_after_more_than_six_rounds() {
     let dir = tmp("explorer-budget", 31);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let mut responses = vec![assistant_with(
@@ -803,7 +810,8 @@ async fn worker_can_finish_after_more_than_twelve_rounds() {
     let dir = tmp("worker-budget", 37);
     std::fs::write(dir.join("owned.rs"), "pub fn owned() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let mut responses = vec![assistant_with(
@@ -862,7 +870,8 @@ async fn worker_can_finish_after_more_than_twelve_rounds() {
 async fn sub_agent_events_carry_nickname_and_task() {
     let dir = tmp("events", 4);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -938,7 +947,8 @@ async fn sub_agent_events_carry_nickname_and_task() {
 async fn sub_agent_started_carries_the_spawn_task_title() {
     let dir = tmp("title", 4);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -998,7 +1008,8 @@ async fn sub_agent_started_carries_the_spawn_task_title() {
 async fn total_agent_cap_rejects_excess_spawns() {
     let dir = tmp("cap", 5);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Three spawns in one round, but the cap is 2.
@@ -1075,7 +1086,8 @@ fn read_call(id: &str) -> ModelResponse {
 async fn until_terminal_run_is_not_cut_off_by_a_round_budget() {
     let dir = tmp("until-terminal", 5);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // `0` is the compatibility spelling for the new unbounded top-level
@@ -1122,7 +1134,8 @@ async fn until_terminal_run_is_not_cut_off_by_a_round_budget() {
 async fn bounded_run_stops_at_the_round_budget() {
     let dir = tmp("nopersist", 6);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // A delegated/measured unit remains bounded even though top-level turns are
@@ -1197,7 +1210,8 @@ impl leveler_tools::Tool for GaugedTool {
 async fn run_gauged_round(max_parallel_tools: usize) -> usize {
     let dir = tmp("gauge", max_parallel_tools as u64);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1259,7 +1273,8 @@ async fn worker_sub_agent_serializes_parallel_safe_tools() {
     let dir = tmp("worker-serial", 91);
     std::fs::write(dir.join("owned.rs"), "pub fn owned() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1324,7 +1339,8 @@ async fn worker_sub_agent_serializes_parallel_safe_tools() {
 async fn exhausted_parent_command_budget_hard_blocks_child() {
     let dir = tmp("exhausted-child", 201);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
@@ -1401,7 +1417,8 @@ async fn exhausted_parent_command_budget_hard_blocks_child() {
 async fn parallel_children_do_not_oversell_command_budget() {
     let dir = tmp("parallel-budget", 202);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
@@ -1491,7 +1508,8 @@ async fn parallel_children_do_not_oversell_command_budget() {
 async fn cancel_after_child_spend_still_flushes_ledger() {
     let dir = tmp("cancel-spend", 203);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let token = CancellationToken::new();
     let cancel = token.clone();
@@ -1570,7 +1588,8 @@ async fn cancel_after_child_spend_still_flushes_ledger() {
 async fn mixed_parent_command_and_child_both_count_in_same_batch() {
     let dir = tmp("mixed-batch", 205);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
@@ -1635,7 +1654,8 @@ async fn mixed_parent_command_and_child_both_count_in_same_batch() {
 async fn queued_child_refreshes_duration_after_semaphore_wait() {
     let dir = tmp("queue-duration", 206);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(
         SleepyRuntime::new(
@@ -1726,7 +1746,8 @@ async fn queued_child_refreshes_duration_after_semaphore_wait() {
 async fn child_cancelled_mid_run_rolls_up_partial_command_spend() {
     let dir = tmp("child-cancel-partial", 207);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
@@ -1802,7 +1823,8 @@ async fn child_cancelled_mid_run_rolls_up_partial_command_spend() {
 async fn child_duration_does_not_inflate_parent_wall_clock() {
     let dir = tmp("duration-rollup", 204);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     // Two concurrent children each delayed 80ms → concurrent wall ~80ms, serial ~160ms.
     let runtime = Arc::new(SleepyRuntime::new(
@@ -1861,7 +1883,8 @@ async fn child_duration_does_not_inflate_parent_wall_clock() {
 async fn a_child_stopped_by_its_duration_cap_says_the_duration_ran_out() {
     let dir = tmp("child-duration-stop", 208);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(
         SleepyRuntime::new(
@@ -1969,7 +1992,8 @@ fn child_terminal_event(
 async fn a_child_that_finishes_early_is_never_asked_to_finalize() {
     let dir = tmp("child-finalize-a", 230);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
             assistant_with(
@@ -2028,7 +2052,8 @@ async fn a_child_that_finishes_early_is_never_asked_to_finalize() {
 async fn a_child_near_its_cap_is_asked_to_finalize_and_can_still_finish() {
     let dir = tmp("child-finalize-b", 231);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(
         SleepyRuntime::new(
             vec![
@@ -2105,7 +2130,8 @@ async fn a_child_near_its_cap_is_asked_to_finalize_and_can_still_finish() {
 async fn a_child_that_ignores_the_finalization_request_is_cut_at_the_hard_cap() {
     let dir = tmp("child-finalize-c", 232);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(
         SleepyRuntime::new(
             vec![
@@ -2193,7 +2219,8 @@ async fn a_child_that_ignores_the_finalization_request_is_cut_at_the_hard_cap() 
 async fn an_external_cancel_before_the_soft_deadline_stays_a_cancellation() {
     let dir = tmp("child-finalize-e", 233);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(
         SleepyRuntime::new(
             vec![
@@ -2263,7 +2290,8 @@ async fn concurrent_spawns_emit_attributed_tool_activity() {
     std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir.join("b.txt"), "beta\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     /// Parent first, then per-task child scripts: tool then text.
@@ -2474,7 +2502,8 @@ async fn concurrent_spawns_emit_attributed_tool_activity() {
 async fn delegation_off_hides_spawn_agent_from_tool_list() {
     let dir = tmp("nodeleg", 22);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let tool_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2659,7 +2688,8 @@ mod named_agents {
         args: serde_json::Value,
     ) -> (Vec<AgentEvent>, Vec<ModelRequest>, Vec<Vec<String>>) {
         let workspace = Workspace::new(dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
         let runtime = Arc::new(CapturingRuntime::new(args));
         let executor = Executor::new(
             Arc::clone(&runtime) as Arc<dyn ModelRuntime>,
@@ -2854,7 +2884,8 @@ mod full_access_is_silent {
     async fn requesting_permissions_under_full_access_asks_nobody() {
         let dir = tmp("fullaccess-silent", 41);
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+            .trust_all_definitions_for_tests();
         let asked = Arc::new(Mutex::new(0usize));
 
         let runtime = Arc::new(SleepyRuntime::new(
@@ -2908,7 +2939,8 @@ mod full_access_is_silent {
     async fn full_access_does_not_advertise_the_permission_tool() {
         let dir = tmp("fullaccess-tools", 42);
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+            .trust_all_definitions_for_tests();
         let names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CaptureTools {
@@ -3003,7 +3035,8 @@ mod steering {
     async fn steering_text_reaches_the_transcript_mid_turn() {
         let dir = tmp("steering", 81);
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
         let source = Arc::new(QueuedOnce {
             pending: Mutex::new(vec!["STEER_MARKER 改用另一个模块".to_string()]),
             takes: Mutex::new(0),
@@ -3052,7 +3085,8 @@ mod steering {
     async fn an_empty_steering_source_changes_nothing() {
         let dir = tmp("steering-empty", 82);
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
         let source = Arc::new(QueuedOnce {
             pending: Mutex::new(vec![String::new(), "   ".to_string()]),
             takes: Mutex::new(0),
@@ -3154,7 +3188,8 @@ mod child_side_effects_are_recoverable {
         let executor = Executor::new(
             runtime,
             Arc::new(default_registry()),
-            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ToolContext::new(workspace, PermissionProfile::Assisted)
+                .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             10,
         )
@@ -3237,7 +3272,8 @@ mod child_side_effects_are_recoverable {
         Executor::new(
             runtime,
             Arc::new(default_registry()),
-            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ToolContext::new(workspace, PermissionProfile::Assisted)
+                .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             10,
         )
@@ -3311,7 +3347,8 @@ mod child_side_effects_are_recoverable {
         Executor::new(
             runtime,
             Arc::new(default_registry()),
-            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ToolContext::new(workspace, PermissionProfile::Assisted)
+                .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             10,
         )
@@ -3423,7 +3460,8 @@ fn child_result_harness(
 ) -> (std::path::PathBuf, Arc<SleepyRuntime>, ToolContext) {
     let dir = tmp(tag, salt);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     (
         dir,
         Arc::new(SleepyRuntime::new(responses, delay)),
@@ -3562,7 +3600,8 @@ async fn child_completed_without_findings_is_distinguishable_from_failure() {
 async fn budget_limited_child_preserves_its_partial_findings() {
     let dir = tmp("child-result-c", 303);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let token = CancellationToken::new();
     let cancel = token.clone();
     let runtime = Arc::new(
@@ -3711,7 +3750,8 @@ async fn failed_child_reports_no_result_rather_than_no_findings() {
 async fn a_worker_spawn_without_a_file_scope_is_refused() {
     let dir = tmp("worker-noscope", 91);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -3776,7 +3816,8 @@ async fn a_worker_spawn_without_a_file_scope_is_refused() {
 async fn an_explorer_spawn_with_a_write_scope_is_refused() {
     let dir = tmp("explorer-scope", 92);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -3846,7 +3887,8 @@ async fn an_explorer_spawn_with_a_write_scope_is_refused() {
 async fn overlapping_worker_scopes_refuse_the_second_spawn() {
     let dir = tmp("worker-overlap", 93);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -3959,7 +4001,8 @@ fn last_ledger(events: &[AgentEvent]) -> leveler_lifecycle::EvidenceLedger {
 async fn an_explorer_finding_is_adopted_by_the_parent() {
     let dir = tmp("finding-adopt", 94);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -4036,7 +4079,8 @@ async fn an_explorer_finding_is_adopted_by_the_parent() {
 async fn a_stopped_child_still_delivers_its_partial_findings() {
     let dir = tmp("finding-partial", 96);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The child reports one finding, then the runtime dies (no more scripted
@@ -4104,7 +4148,8 @@ async fn an_unjudged_finding_does_not_refuse_completion() {
     let dir = tmp("finding-no-gate", 97);
     std::fs::write(dir.join("a.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // A seeded ledger carrying an unjudged correctness finding, exactly as a
@@ -4179,7 +4224,8 @@ async fn an_incomplete_worker_is_reported_without_a_ledger_gate() {
     let dir = tmp("worker-incomplete-block", 99);
     std::fs::write(dir.join("owned.rs"), "pub fn owned() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Only the parent's spawn is scripted: the child's first model call
@@ -4250,7 +4296,8 @@ async fn an_incomplete_worker_is_reported_without_a_ledger_gate() {
 async fn structured_findings_without_prose_are_still_a_result() {
     let dir = tmp("structured-is-result", 103);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
@@ -4318,7 +4365,8 @@ async fn structured_findings_without_prose_are_still_a_result() {
 async fn adopted_findings_survive_a_seeded_replay_without_duplication() {
     let dir = tmp("finding-replay", 101);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -4406,7 +4454,8 @@ async fn adopted_findings_survive_a_seeded_replay_without_duplication() {
 async fn child_observability_reconstructs_from_authoritative_events() {
     let dir = tmp("obs-rebuild", 102);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(SleepyRuntime::new(
@@ -4630,7 +4679,8 @@ async fn a_default_spawn_runs_in_background_and_settles_into_a_later_round() {
     std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(RoutedRuntime::new(
@@ -4745,7 +4795,8 @@ async fn a_running_workers_scope_fences_the_parent_and_new_workers() {
     std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(RoutedRuntime::new(
@@ -4847,7 +4898,8 @@ async fn goal_completion_is_refused_while_children_are_outstanding() {
     let dir = tmp("bg-goalgate", 63);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(RoutedRuntime::new(
@@ -4972,7 +5024,8 @@ async fn a_resumed_run_reports_children_lost_at_restart() {
     let dir = tmp("bg-lost", 64);
     std::fs::write(dir.join("a.txt"), "x\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(SleepyRuntime::new(
         vec![assistant_text("nothing else to do")],
@@ -5036,7 +5089,8 @@ async fn cancellation_drains_background_children_without_orphans() {
     let dir = tmp("bg-cancel", 65);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let cancel = CancellationToken::new();
 
@@ -5118,7 +5172,8 @@ async fn the_round_limit_exit_drains_running_children_instead_of_aborting() {
     std::fs::write(dir.join("a.txt"), "x\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5209,7 +5264,8 @@ async fn the_completion_gate_drain_keeps_same_batch_parent_spend() {
     let dir = tmp("bg-pinspend", 67);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5309,7 +5365,8 @@ async fn settlement_notices_are_appended_to_the_transcript_sink() {
     std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5409,7 +5466,8 @@ async fn a_settlement_at_the_exit_drain_still_lands() {
     std::fs::write(dir.join("a.txt"), "x\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5484,7 +5542,8 @@ async fn a_default_spawned_child_starts_without_write_authority() {
     let dir = tmp("lbo-noauth", 80);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5543,7 +5602,8 @@ async fn a_child_claim_enables_scoped_write() {
     let dir = tmp("lbo-claim", 81);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5613,7 +5673,8 @@ async fn a_child_write_outside_its_claim_is_denied() {
     std::fs::write(dir.join("a.txt"), "keep\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5674,7 +5735,8 @@ async fn settlement_releases_the_claimed_scope_for_the_next_child() {
     let dir = tmp("lbo-release", 83);
     std::fs::write(dir.join("b.txt"), "one\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5840,7 +5902,8 @@ async fn a_granted_claim_is_reconstructable_from_durable_events() {
     let dir = tmp("lbo-claimprov", 89);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -5950,7 +6013,8 @@ async fn a_granted_claim_is_reconstructable_from_durable_events() {
 async fn an_unclaimed_child_cannot_update_a_file_the_parent_created() {
     let dir = tmp("lbo-m7shape", 88);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -6033,7 +6097,8 @@ async fn an_unclaimed_child_cannot_mutate_through_a_shell_command() {
     let dir = tmp("lbo-shellwrite", 87);
     std::fs::create_dir_all(dir.join("victim")).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -6091,7 +6156,8 @@ async fn an_unclaimed_child_cannot_mutate_through_a_shell_command() {
 async fn an_unclaimed_child_cannot_create_new_files_either() {
     let dir = tmp("lbo-addfile", 86);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -6164,7 +6230,8 @@ async fn an_unclaimed_child_cannot_update_an_existing_file_either() {
     .unwrap();
     let original = std::fs::read_to_string(dir.join("docs/src/reference-verbs.md.in")).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -6229,7 +6296,8 @@ async fn a_late_bound_child_claim_fences_the_parent() {
     let dir = tmp("lbo-parentfence", 85);
     std::fs::write(dir.join("b.txt"), "child-owns\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(DualChildRuntime {
         parent: Mutex::new(VecDeque::from(vec![
@@ -6321,7 +6389,8 @@ async fn a_denied_claim_does_not_kill_the_child() {
     let dir = tmp("lbo-denied", 84);
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(DualChildRuntime {
         parent: Mutex::new(VecDeque::from(vec![
@@ -6412,7 +6481,8 @@ async fn a_settlement_the_parent_acts_on_is_consumed() {
     std::fs::write(dir.join("a.txt"), "parent\n").unwrap();
     std::fs::write(dir.join("b.txt"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(RoutedRuntime::new(
         vec![
@@ -6565,7 +6635,8 @@ mod mcp_ownership_boundary {
         Executor::new(
             runtime,
             registry_with_fake_mcp(touched.clone()),
-            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ToolContext::new(workspace, PermissionProfile::Assisted)
+                .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             10,
         )
@@ -6634,7 +6705,8 @@ mod mcp_ownership_boundary {
         Executor::new(
             runtime,
             registry_with_fake_mcp(touched.clone()),
-            ToolContext::new(workspace, PermissionProfile::Assisted),
+            ToolContext::new(workspace, PermissionProfile::Assisted)
+                .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             10,
         )
@@ -6680,7 +6752,8 @@ mod mcp_ownership_boundary {
         Executor::new(
             runtime,
             registry_with_fake_mcp(touched.clone()),
-            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ToolContext::new(workspace, PermissionProfile::FullAccess)
+                .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             10,
         )
@@ -6733,7 +6806,8 @@ impl leveler_agent::TranscriptSink for SpendSink {
 async fn a_delegated_child_is_charged_to_the_parent_once() {
     let dir = tmp("child-spend-once", 91);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let mut child_round = read_call("child-spend-read");
     child_round.usage = TokenUsage {
@@ -6888,7 +6962,8 @@ impl ModelRuntime for FailingParentRuntime {
 async fn a_run_ending_in_error_stops_and_settles_its_background_children() {
     let dir = tmp("error-exit-drains", 88);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let mut events = Vec::new();
     let result = Executor::new(
         Arc::new(FailingParentRuntime {
@@ -7032,7 +7107,8 @@ async fn a_child_on_a_pinned_model_is_billed_at_that_models_price() {
         "Look around.\n",
     );
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(PricedRuntime {
         child_marker: "PRICED_CHILD_TASK",
         parent_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -7159,7 +7235,8 @@ impl ModelRuntime for SlowChildRuntime {
 async fn a_host_can_cancel_one_child_without_cancelling_its_parent() {
     let dir = tmp("cancel-one-child", 90);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let handles = Arc::new(ChildHandles::default());
     let watcher = handles.clone();
     tokio::spawn(async move {
@@ -7216,7 +7293,8 @@ async fn a_host_can_cancel_one_child_without_cancelling_its_parent() {
 async fn a_child_is_cancellable_by_the_time_its_start_is_observed() {
     let dir = tmp("cancellable-at-start", 90);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let handles = Arc::new(ChildHandles::default());
     let seen = handles.clone();
     let registered_at_start = Arc::new(Mutex::new(Vec::new()));
@@ -7346,7 +7424,8 @@ async fn spawn_under_cost_cap(tag: &str, agent: &'static str, model: &str) -> (S
         "Look.\n",
     );
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let mut events = Vec::new();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
@@ -7441,7 +7520,8 @@ impl leveler_agent::TranscriptSink for ChildRecordFailingSink {
 async fn a_foreground_batch_that_errors_still_ends_its_children_for_the_host() {
     let dir = tmp("fg-error-ends-child", 92);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let handles = Arc::new(ChildHandles::default());
     let result = Executor::new(
         Arc::new(SleepyRuntime::new(
@@ -7606,7 +7686,8 @@ async fn task_tools_on_child(
 ) -> (Vec<(String, bool)>, Vec<AgentEvent>) {
     let dir = tmp(tag, 93);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
@@ -7715,7 +7796,8 @@ async fn single_spawn(
         write_agent_dir(&dir, name, yaml_body, "Look.\n");
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let transcript = Arc::new(Mutex::new(Vec::new()));
     let mut sink = RecordingSink {
         messages: transcript.clone(),
@@ -7951,6 +8033,7 @@ async fn an_older_background_writer_cannot_spend_after_a_later_sibling_exhausts_
         Workspace::new(dir.path()).unwrap(),
         PermissionProfile::Assisted,
     )
+    .trust_all_definitions_for_tests()
     .with_session_scope(session.as_str());
     let executor = |writer: &str| {
         Executor::new(
@@ -8056,7 +8139,8 @@ async fn an_older_background_writer_cannot_spend_after_a_later_sibling_exhausts_
 async fn a_spawn_call_is_recorded_before_its_child_exists() {
     let dir = tmp("spawn_events", 91);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(SleepyRuntime::new(
         vec![

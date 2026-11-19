@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent_core::BudgetExhaustion;
+use leveler_definition_trust::DefinitionTrustView;
 use leveler_engine::{
     ChildToolEvent, EventBarrier, ExecutionFence, ModelRequestRecord, PortError, TranscriptSink,
 };
@@ -2769,6 +2770,13 @@ impl Executor {
         self.system_segments_with(request, Some(&rules))
     }
 
+    /// The trust snapshot for this executor's workspace. One store read; the
+    /// constructor is cheap enough to call at each boundary that needs a
+    /// frozen decision (turn start, drive start).
+    pub(crate) fn definition_trust(&self) -> DefinitionTrustView {
+        (*self.tool_context.execution.definition_trust).clone()
+    }
+
     /// Read and select this turn's project rules. Called ONCE per turn when the
     /// control context is built; capability refreshes reuse the existing
     /// blocks instead of re-reading, so a mid-turn edit cannot change the
@@ -2787,6 +2795,11 @@ impl Executor {
                 audit: leveler_context::RuleDeliveryAudit::default(),
             };
         };
+        // One snapshot per turn. The bounded shell can create a file, but this
+        // view admits only content a human approved; a file that appeared or
+        // changed after approval stays out of the control context until the
+        // next turn re-reads the store and finds a matching record.
+        let trust = self.definition_trust();
         // The delivery policy is project data read from the same
         // `.leveler/config.yaml` the rest of the runtime reads. Composing it
         // here keeps the selection next to the rules it selects, and keeps a
@@ -2820,7 +2833,7 @@ impl Executor {
                  no section is treated as mandatory this turn."
             ));
         }
-        let plan = leveler_context::plan_rule_delivery(root, &policy);
+        let plan = leveler_context::plan_rule_delivery(root, &policy, &trust);
         let report = &plan.report;
         tracing::info!(
             event = "rule_delivery",
@@ -2854,6 +2867,40 @@ impl Executor {
                 error.source,
                 error.kind.as_key(),
                 error.detail
+            ));
+        }
+        for entry in &plan.untrusted {
+            // No body, no untrusted instructions: only the identity and the
+            // typed state. The model must know a rule exists but was refused,
+            // or an edit under it would proceed as if the path had no rules.
+            tracing::warn!(
+                event = "definition_untrusted",
+                id = %entry.id,
+                display = %entry.display,
+                kind = %entry.kind,
+                state = %entry.state,
+                store_status = entry.store_status.as_deref().unwrap_or(""),
+                approved_digest = entry.approved_digest.as_deref().unwrap_or("")
+            );
+            diagnostics.push(format!(
+                "The project definition `{}` ({}) is present but NOT trusted ({}), so its                  instructions are NOT in your context. Do not treat this as an empty rule set.                  The user can review and approve it with `leveler trust`.",
+                entry.display, entry.kind, entry.state
+            ));
+        }
+        if matches!(
+            trust.status(),
+            leveler_definition_trust::StoreStatus::Corrupt { .. }
+                | leveler_definition_trust::StoreStatus::UnsupportedVersion { .. }
+                | leveler_definition_trust::StoreStatus::InsideProject
+        ) {
+            let status = trust.status();
+            tracing::warn!(
+                event = "definition_trust_store_unavailable",
+                status = status.as_str()
+            );
+            diagnostics.push(format!(
+                "The trusted-definition store is unavailable ({}), so NO project definition                  was loaded this turn. This fails closed; fix the store before relying on                  project rules.",
+                status.as_str()
             ));
         }
         let audit = leveler_context::RuleDeliveryAudit {
@@ -3457,6 +3504,7 @@ impl Executor {
         let environment = &self.tool_context.execution.environment;
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+            &self.definition_trust(),
         );
         let index = leveler_skills::render_capped_index(
             &registry.summaries(),
@@ -3489,6 +3537,7 @@ impl Executor {
         let environment = &self.tool_context.execution.environment;
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+            &self.definition_trust(),
         );
         let resolution = registry.resolve_mentions(request);
         let text = leveler_skills::render_turn_injection(&resolution)?;
@@ -4941,7 +4990,8 @@ mod authority_classification {
             ToolContext::new(
                 leveler_execution::Workspace::new(root).unwrap(),
                 leveler_execution::PermissionProfile::Assisted,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             leveler_model::ModelRef::new("mock", "m"),
             2,
         )
@@ -4991,6 +5041,102 @@ mod authority_classification {
         assert!(
             segments.iter().any(|segment| segment.name == "base"
                 && segment.authority == PromptAuthority::CoreContract)
+        );
+    }
+
+    fn approved_view(
+        root: &std::path::Path,
+    ) -> (
+        tempfile::TempDir,
+        leveler_definition_trust::DefinitionTrustView,
+    ) {
+        use leveler_definition_trust::{ApprovalSurface, approve, discover_project};
+        let store = tempfile::tempdir().unwrap();
+        let requests: Vec<_> = discover_project(root)
+            .iter()
+            .filter_map(|candidate| candidate.approval_request().ok())
+            .collect();
+        approve(store.path(), root, &requests, ApprovalSurface::Cli).unwrap();
+        let view = leveler_definition_trust::DefinitionTrustView::load(store.path(), Some(root));
+        (store, view)
+    }
+
+    fn parent_with(
+        root: &std::path::Path,
+        trust: leveler_definition_trust::DefinitionTrustView,
+    ) -> Executor {
+        let mut context = ToolContext::new(
+            leveler_execution::Workspace::new(root).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+        );
+        context.execution.definition_trust = Arc::new(trust);
+        Executor::new(
+            Arc::new(NullRuntime),
+            Arc::new(leveler_tools::default_registry()),
+            context,
+            leveler_model::ModelRef::new("mock", "m"),
+            2,
+        )
+    }
+
+    #[test]
+    fn a_child_inherits_the_parents_trust_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "CHILD-TRUSTED-RULE").unwrap();
+        let (_store, view) = approved_view(dir.path());
+        let parent = parent_with(dir.path(), view);
+        let child = parent.child_for_role_on(AgentRole::Explorer, Vec::new(), None);
+        let segments = child.system_segments("inspect");
+        let rules = segments
+            .iter()
+            .find(|segment| segment.name == "project_rules")
+            .expect("the child gets the parent's snapshot");
+        assert!(rules.text.contains("CHILD-TRUSTED-RULE"));
+    }
+
+    #[test]
+    fn a_child_cannot_reload_an_unapproved_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "CHILD-EVIL-RULE").unwrap();
+        let loaded = leveler_context::load_rules(
+            dir.path(),
+            &leveler_definition_trust::DefinitionTrustView::deny_all(),
+        );
+        assert_eq!(
+            loaded.untrusted.len(),
+            1,
+            "loader sees the definition: {loaded:?}"
+        );
+        let parent = parent_with(
+            dir.path(),
+            leveler_definition_trust::DefinitionTrustView::deny_all(),
+        );
+        let parent_segments = parent.system_segments("inspect");
+        let parent_names: Vec<&str> = parent_segments.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            parent_names.contains(&"project_rule_delivery"),
+            "parent diagnostics: {parent_names:?}"
+        );
+        let child = parent.child_for_role_on(AgentRole::Explorer, Vec::new(), None);
+        let segments = child.system_segments("inspect");
+        assert!(
+            !segments
+                .iter()
+                .any(|segment| segment.name == "project_rules"),
+            "an unapproved rule must not reach the child: {segments:?}"
+        );
+        let names: Vec<&str> = segments
+            .iter()
+            .map(|segment| segment.name.as_str())
+            .collect();
+        let diagnostic = segments
+            .iter()
+            .find(|segment| segment.name == "project_rule_delivery")
+            .unwrap_or_else(|| panic!("the child is told why: {names:?}"));
+        assert!(
+            diagnostic.text.contains("NOT trusted"),
+            "{:?}",
+            diagnostic.text
         );
     }
 }

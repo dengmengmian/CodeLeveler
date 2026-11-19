@@ -262,7 +262,8 @@ fn coding_runtime(db: &Database, root: &Path, script: Vec<ModelResponse>) -> Cod
             tool_context: ToolContext::new(
                 Workspace::new(root).unwrap(),
                 PermissionProfile::Assisted,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,

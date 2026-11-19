@@ -355,6 +355,7 @@ async fn harness_with(responses: Vec<ModelResponse>, wait_for_background: bool) 
     ));
     let tool_context =
         ToolContext::with_environment(workspace, PermissionProfile::Assisted, environment.clone())
+            .trust_all_definitions_for_tests()
             .with_session_scope(SESSION_SCOPE);
     // ONE registry: the tools that start and manage background tasks, and the
     // engine that reaps them at terminal settlement, must be looking at the

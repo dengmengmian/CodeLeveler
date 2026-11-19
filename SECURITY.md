@@ -85,6 +85,58 @@ open is not trusted. `leveler trust show` reports the current state and
 The global `~/.leveler/hooks.yaml` and `~/.leveler/permissions.yaml` are your
 own files, outside any repository, and are not gated.
 
+## Project definitions are inert until trusted
+
+Authority-bearing definitions are gated independently of the executable config
+above. This covers `<repo>/AGENTS.md`, every nested `AGENTS.md`,
+`.leveler/instructions.md`, `.leveler/rules/*.md`, declarative agents under
+`.leveler/agents`, skills under `.leveler/skills` and the compatible project
+roots (`.codex/skills`, `.agents/skills`, `.claude/skills`), plus the user-wide
+agent and skill roots (including `~/.leveler/agents` and `~/.leveler/skills`).
+
+The gate is content-addressed, not path-addressed. A definition is admitted only
+when a human approved the exact bytes on disk:
+
+- The approval is bound to the definition identity (project root, type, canonical
+  relative path) and to the SHA-256 of its content. For an agent, both
+  `agent.yaml` and `instructions.md` contribute to one composite digest, so a
+  trusted manifest with an edited instructions file is not trusted.
+- A file that exists but was never approved, or whose bytes changed after
+  approval, is **not** put into the model's control context. It is not treated
+  as an absent rule: the next turn receives a runtime-fact diagnostic naming the
+  path and the typed state (`unapproved` or `changed`).
+- A missing, corrupt, or future-schema trust store fails closed. A store that
+  lives inside the repository is refused entirely, because that repository's
+  own sandboxed execution could rewrite it.
+- Git-tracked or Git-committed status is not approval. A clone, a commit, a
+  rename, a copy, a runtime restart or a resumed session does not inherit a
+  trust record for different bytes.
+- The approval surface is the human CLI. `leveler trust` lists pending
+  definitions and approves the exact digests it displayed; `leveler trust
+  show` lists the state; `leveler trust diff <path>` shows the approved version
+  against the current bytes; `leveler trust revoke-definition <path>` removes
+  one approval. The agent has no tool that writes a trust record, and neither a
+  permission mode nor model text creates one.
+- Status is re-evaluated from the store on every turn, and a turn's decisions
+  are frozen into that turn's execution context. A definition created or edited
+  by a command during a turn cannot become trusted authority inside a request
+  that was already composed. Child agents and reviewers inherit the same frozen
+  execution context; they do not re-discover definitions through a second path.
+
+The gate controls what the harness loads as **authority**. It does not stop the
+model from reading an unapproved file through an ordinary tool and being
+influenced by its text; that is the general prompt-injection boundary of tool
+output, not an admission of the file as a trusted definition. It also does not
+change the OS write boundary: on Windows a confined shell can still create a
+previously missing `AGENTS.md` or a missing `.leveler` tree. Such a file is
+created but not admitted; the two facts are reported separately.
+
+**FullAccess is a grant of the user's own authority, not a definition
+approval.** A FullAccess agent can write any user file, including the trust
+store, by design. Do not run an untrusted workspace with FullAccess and expect
+the trust gate to constrain the agent. The gate's threat model is bounded
+execution and non-user surfaces.
+
 The workspace layer additionally refuses **writes** to the hooks and
 permissions files, so the agent cannot grant itself hooks or standing
 permissions. Reads stay allowed. `.leveler/config.yaml` stays editable through
@@ -108,7 +160,8 @@ delete-sharing fence on every existing protected file: Mandatory Integrity
 Control denies content writes, and the fence denies the `DELETE` access that
 delete, rename and replace require, so a Low child in a Low workspace can no
 longer delete or replace them. A protected path created after admission is
-still not covered there (see the trade-offs below).
+still not covered there (see the trade-offs below); if it is a definition, the
+trust gate above still refuses to load it as authority.
 
 ## Approval, rules and resource boundaries
 

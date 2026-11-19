@@ -164,7 +164,8 @@ fn understand_met_required_ac() -> ModelResponse {
 
 fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> CodingRuntime {
     let workspace = Workspace::new(dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     CodingRuntime {
         engine: TaskEngine {
             stores: leveler_storage::EngineStores::from_database(db),

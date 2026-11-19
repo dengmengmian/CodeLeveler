@@ -136,7 +136,8 @@ fn tmp(tag: &str, salt: u64) -> std::path::PathBuf {
 
 async fn run_spawn(dir: &std::path::Path, script: Vec<ModelResponse>) -> Vec<AgentEvent> {
     let workspace = Workspace::new(dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let mut events = Vec::new();
     Executor::new(
         std::sync::Arc::new(ScriptedRuntime::new(script)),

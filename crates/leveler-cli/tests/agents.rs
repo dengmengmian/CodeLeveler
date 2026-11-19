@@ -66,7 +66,13 @@ fn fixture() -> Fx {
         "capability: read_only\n",
         "User explorer.",
     );
-    Fx { home, repo }
+    // Definitions are inert until a human approves their exact bytes. These
+    // tests exercise the listing surface, so approve the fixture through the
+    // real CLI entry point first.
+    let fx = Fx { home, repo };
+    let (ok, out) = run(fx.home.path(), fx.repo.path(), &["trust", "allow", "--yes"]);
+    assert!(ok, "fixture trust failed: {out}");
+    fx
 }
 
 #[test]

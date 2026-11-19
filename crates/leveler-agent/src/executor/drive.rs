@@ -203,6 +203,10 @@ pub(crate) struct Drive<'a> {
     /// count of the agent's request cadence, never a task-progress measure.
     model_steps: u32,
     scoped_paths: Vec<String>,
+    /// This drive's frozen view of the definition trust store. Loaded once at
+    /// drive start; a file created or changed mid-turn cannot become trusted
+    /// authority inside a request already composed.
+    definition_trust: leveler_definition_trust::DefinitionTrustView,
     /// Scoped rule sources injected during the CURRENT round. Another call in
     /// the same round cannot have read them (the request already left), so a
     /// mutating call that needs one is refused as well — but the source is
@@ -1143,6 +1147,7 @@ impl Executor {
             modified_files: Vec::new(),
             model_steps: 0,
             scoped_paths,
+            definition_trust: self.definition_trust(),
             staged_scoped_rules: std::collections::HashSet::new(),
             progress_caps: ProgressCaps::default(),
             last_progress_emitted: progress_emitted.then(|| progress.clone()),
@@ -3452,8 +3457,8 @@ impl Drive<'_> {
         let Some(root) = self.scoped_rule_root() else {
             return Vec::new();
         };
-        let candidates = scoped_rule_sources(&root, &self.scoped_paths);
-        self.set_scoped_rule_errors(&candidates.errors);
+        let candidates = scoped_rule_sources(&root, &self.scoped_paths, &self.definition_trust);
+        self.set_scoped_rule_errors(&candidates.errors, &candidates.untrusted);
         let documents = candidates.documents;
         let mut dropped = false;
         let mut retained: Vec<leveler_model::PromptSegment> =
@@ -3489,45 +3494,68 @@ impl Drive<'_> {
         let Some(root) = self.scoped_rule_root() else {
             return leveler_context::ScopedRules::default();
         };
-        scoped_rule_sources(&root, paths)
+        scoped_rule_sources(&root, paths, &self.definition_trust)
     }
 
     /// Keep one runtime-fact block naming nested rules that exist but could
-    /// not be read. The block is replaced or removed on the next reconcile, so
-    /// a fixed file stops producing a stale warning.
-    fn set_scoped_rule_errors(&mut self, errors: &[leveler_context::RuleReadError]) {
+    /// not be read or were not admitted by the trust gate. The block is
+    /// replaced or removed on the next reconcile, so a fixed file stops
+    /// producing a stale warning.
+    fn set_scoped_rule_errors(
+        &mut self,
+        errors: &[leveler_context::RuleReadError],
+        untrusted: &[leveler_definition_trust::TrustAuditEntry],
+    ) {
         self.control_context
             .blocks
             .retain(|block| block.name != "scoped_rule_errors");
-        if errors.is_empty() {
+        if errors.is_empty() && untrusted.is_empty() {
             return;
         }
-        let mut text = String::from("\n\nNested project rules could not be read:\n");
-        for error in errors {
-            tracing::warn!(
-                event = "scoped_rule_unreadable",
-                source = %error.source,
-                kind = error.kind.as_key(),
-                detail = %error.detail
-            );
-            text.push_str(&format!(
-                "- `{}` ({}): {}\n",
-                error.source,
-                error.kind.as_key(),
-                error.detail
-            ));
+        let mut text = String::new();
+        if !errors.is_empty() {
+            text.push_str("\n\nNested project rules could not be read:\n");
+            for error in errors {
+                tracing::warn!(
+                    event = "scoped_rule_unreadable",
+                    source = %error.source,
+                    kind = error.kind.as_key(),
+                    detail = %error.detail
+                );
+                text.push_str(&format!(
+                    "- `{}` ({}): {}\n",
+                    error.source,
+                    error.kind.as_key(),
+                    error.detail
+                ));
+            }
+        }
+        if !untrusted.is_empty() {
+            text.push_str("\n\nNested project rules are present but NOT trusted:\n");
+            for entry in untrusted {
+                tracing::warn!(
+                    event = "scoped_definition_untrusted",
+                    id = %entry.id,
+                    display = %entry.display,
+                    state = %entry.state
+                );
+                text.push_str(&format!(
+                    "- `{}` ({}). The user can approve it with `leveler trust`.\n",
+                    entry.display, entry.state
+                ));
+            }
         }
         text.push_str(
             "Their content is NOT in your context; do not treat this as an absence of rules \n\
              for that path.",
         );
+        let mut paths: Vec<String> = errors.iter().map(|error| error.source.clone()).collect();
+        paths.extend(untrusted.iter().map(|entry| entry.display.clone()));
         self.control_context
             .blocks
             .push(leveler_model::PromptSegment::control(
                 "scoped_rule_errors",
-                crate::executor::PromptSource::ProjectRules {
-                    paths: errors.iter().map(|error| error.source.clone()).collect(),
-                },
+                crate::executor::PromptSource::ProjectRules { paths },
                 crate::executor::PromptAuthority::RuntimeFact,
                 crate::executor::SegmentLifecycle::Turn,
                 false,
@@ -7159,7 +7187,8 @@ impl AgentHarness for Drive<'_> {
                 collect_scoped_paths_from_call(&call, &mut call_paths);
                 let applicable = self.applicable_scoped_rules(&call_paths);
                 let scoped_errors = applicable.errors;
-                if !scoped_errors.is_empty() {
+                let scoped_untrusted = applicable.untrusted;
+                if !scoped_errors.is_empty() || !scoped_untrusted.is_empty() {
                     // Keep the path so the next reconcile re-checks it and the
                     // runtime-fact block can appear/clear with the file.
                     for path in &call_paths {
@@ -7173,29 +7202,43 @@ impl AgentHarness for Drive<'_> {
                             detail = %error.detail
                         );
                     }
-                    // A nested rule that exists but cannot be read is not an
-                    // absent rule: the edit would otherwise run without the
-                    // rule that governs its path. Refuse this call and say
-                    // why; the model can repair the document and retry.
-                    let reasons = scoped_errors
+                    for entry in &scoped_untrusted {
+                        tracing::warn!(
+                            event = "scoped_definition_untrusted",
+                            id = %entry.id,
+                            display = %entry.display,
+                            state = %entry.state
+                        );
+                    }
+                    // A nested rule that exists but cannot be read, or whose
+                    // exact bytes are not approved, is not an absent rule: the
+                    // edit would otherwise run without the rule that governs
+                    // its path. Refuse this call and say why.
+                    let mut reasons = scoped_errors
                         .iter()
                         .map(|error| {
                             format!(
-                                "{} ({}: {})",
+                                "{} could not be read ({}: {})",
                                 error.source,
                                 error.kind.as_key(),
                                 error.detail
                             )
                         })
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                        .collect::<Vec<_>>();
+                    reasons.extend(scoped_untrusted.iter().map(|entry| {
+                        format!(
+                            "{} is not trusted ({}; approve with `leveler trust`)",
+                            entry.display, entry.state
+                        )
+                    }));
+                    let reasons = reasons.join(", ");
                     denied_calls_this_round += 1;
                     results[index] = Some(deny_call(
                         &mut *self.observer,
                         call,
                         format!(
                             "Edit paused before execution: project rules that apply to this \
-                             path could not be read: {reasons}. Fix the rule document, then retry."
+                             path are not available: {reasons}. Resolve the rule source, then retry."
                         ),
                         model_steps,
                     ));

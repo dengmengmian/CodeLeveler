@@ -4,6 +4,7 @@
 
 ## [Unreleased]
 
+- 项目定义现在必须由人工批准确切内容后才生效。覆盖任意深度的 `AGENTS.md`、`.leveler/instructions.md`、`.leveler/rules/*.md`、`.leveler/agents` 下的声明式 Agent，以及 `.leveler/skills` 与兼容的项目/用户技能根。`leveler trust` 列出并批准显示的 SHA-256，`leveler trust show` 报告新增/变更/已信任，`leveler trust diff <path>` 对比已批准版本，`leveler trust revoke-definition <path>` 撤销单条记录。任何编辑、`git pull`、提交、Runtime 重启或 Session Resume 都不会继承旧批准。Trust Store 位于工作区之外，缺失或损坏时失败关闭。这不会关闭 Windows OS 仍允许受限 Shell 创建原本缺失定义路径的缺口；此类文件可以被创建，但未经批准绝不会被采纳。
 - Windows 资源授权改为绑定文件对象的稳定卷号/文件 ID 与创建时间，并从已打开的句柄读取。授权可列出、撤销并通过执行层持久复用；对象被替换后不再匹配。无法提供持久文件 ID 的文件系统明确 fail-closed，不回退到路径字符串比较。
 - Windows 上的固定 Commit 与分支审查不再启动 `git` 进程。`git_history` 与审查的固定对象范围直接读取 loose object 与 packfile，逐个校验对象哈希，缺失对象明确失败，并保留被审查对象的祖先边界；该路径不触网、不执行 hooks/filters/helpers。
 - 终端设备回复（DA1/Sixel 能力应答）在 TUI 输入边界与用户输入隔离。迟到、重复或分片的回复不再进入输入框，包括在一条命令的两次输入之间到达的回复；粘贴文本与正常 Unicode/IME 输入不受影响。

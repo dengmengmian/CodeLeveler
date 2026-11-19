@@ -124,7 +124,8 @@ fn executor(root: &std::path::Path, script: Arc<Script>) -> Executor {
     Executor::new(
         script,
         Arc::new(leveler_tools::default_registry()),
-        ToolContext::new(Workspace::new(root).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(root).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     )
@@ -253,7 +254,8 @@ async fn full_access_still_injects_a_named_skill_before_its_pack_is_enabled() {
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::FullAccess,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     )
@@ -308,7 +310,8 @@ async fn a_named_skill_cannot_widen_authority_outside_full_access() {
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     )

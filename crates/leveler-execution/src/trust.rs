@@ -118,13 +118,23 @@ pub fn trust_store_path(global_home: &Path) -> PathBuf {
 /// when leveler runs from the repo root. A store the repository can ship would
 /// let a clone approve its own hooks, so that arrangement grants nothing.
 pub fn store_is_outside_repo(global_home: &Path, repo_root: &Path) -> bool {
-    let home = global_home
-        .canonicalize()
-        .unwrap_or_else(|_| global_home.to_path_buf());
-    let repo = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let home = resolve_for_compare(global_home);
+    let repo = resolve_for_compare(repo_root);
     !home.starts_with(&repo)
+}
+
+/// Resolve a possibly relative path against the process cwd before comparing.
+/// A relative `LEVELER_HOME` otherwise compares as "outside" every absolute
+/// repository even when it lands inside the current checkout.
+fn resolve_for_compare(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    absolute.canonicalize().unwrap_or(absolute)
 }
 
 impl TrustStore {

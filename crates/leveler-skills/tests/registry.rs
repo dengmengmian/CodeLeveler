@@ -6,10 +6,19 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use leveler_definition_trust::{
+    ApprovalRequest, ApprovalSurface, DefinitionIdentity, DefinitionTrustView, approve,
+};
 use leveler_skills::{
     SkillDraft, SkillFile, SkillLookupError, SkillRegistry, SkillRoot, SkillRoots, SkillScope,
     SkillSource, SkillState, SkillStore,
 };
+
+/// These tests exercise discovery, precedence and loading; the trust gate has
+/// its own tests, including real-store tests. Admit every definition here.
+fn load(roots: &SkillRoots) -> SkillRegistry {
+    SkillRegistry::load(roots, &DefinitionTrustView::trust_everything_for_tests())
+}
 
 fn write_skill(root: &Path, relative: &str, name: &str, description: &str, body: &str) {
     let dir = root.join(relative);
@@ -71,7 +80,7 @@ impl Fx {
     }
 
     fn registry(&self) -> SkillRegistry {
-        SkillRegistry::load(&self.roots())
+        load(&self.roots())
     }
 }
 
@@ -325,7 +334,7 @@ fn external_roots_are_discovered_from_the_injected_environment() {
         }
     };
     let roots = SkillRoots::for_project_in(tmp.path(), &var);
-    let registry = SkillRegistry::load(&roots);
+    let registry = load(&roots);
     for (name, source) in [
         ("agents-skill", SkillSource::AgentSkills),
         ("codex-skill", SkillSource::Codex),
@@ -366,7 +375,7 @@ fn user_native_wins_a_same_scope_collision_deterministically() {
         "Agents.",
         "A.",
     );
-    let registry = SkillRegistry::load(&SkillRoots::for_project_in(
+    let registry = load(&SkillRoots::for_project_in(
         &tmp.path().join("repo"),
         &|key: &str| match key {
             "HOME" | "USERPROFILE" => Some(home.clone().into_os_string()),
@@ -444,7 +453,7 @@ fn a_project_root_that_escapes_the_project_loads_nothing() {
         dir: outside.clone(),
         containing_root: Some(repo),
     });
-    let registry = SkillRegistry::load(&roots);
+    let registry = load(&roots);
     assert!(registry.get("escape").is_none());
     assert!(
         registry
@@ -473,7 +482,7 @@ fn external_skills_are_read_but_the_store_never_touches_them() {
         "HOME" | "USERPROFILE" => Some(home.clone().into_os_string()),
         _ => None,
     });
-    let registry = SkillRegistry::load(&roots);
+    let registry = load(&roots);
     assert!(registry.load_skill("external").is_ok());
 
     // The store only manages the native store: deleting the external name fails
@@ -520,7 +529,7 @@ fn store_create_update_delete_round_trips() {
         ..draft.clone()
     };
     store.update(SkillScope::Project, &updated).unwrap();
-    let registry = SkillRegistry::load(&{
+    let registry = load(&{
         let mut roots = SkillRoots::empty();
         roots.push(root(
             SkillScope::Project,
@@ -641,4 +650,139 @@ fn store_user_scope_writes_under_the_user_directory() {
         )
         .unwrap();
     assert!(user.join("personal/SKILL.md").is_file());
+}
+
+// ── Trust gate ──────────────────────────────────────────────────────────────
+
+#[test]
+fn an_unapproved_project_skill_is_not_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "evil",
+        "evil",
+        "Evil.",
+        "EVIL-BODY",
+    );
+    let roots = SkillRoots::for_project(&project);
+    let registry = SkillRegistry::load(&roots, &DefinitionTrustView::deny_all());
+    assert!(registry.get("evil").is_none(), "{:?}", registry.entries());
+    assert_eq!(registry.untrusted().len(), 1, "{:?}", registry.untrusted());
+    assert_eq!(registry.untrusted()[0].state, "unapproved");
+    assert!(registry.load_skill("evil").is_err());
+}
+
+#[test]
+fn a_changed_skill_body_is_refused_even_by_an_existing_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "helper",
+        "helper",
+        "Helper.",
+        "ORIGINAL",
+    );
+    let skill_md = project.join(".leveler/skills/helper/SKILL.md");
+    let body = std::fs::read(&skill_md).unwrap();
+    let store = tmp.path().join("store");
+    let identity = DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::Skill,
+        ".leveler/skills/helper",
+    )
+    .unwrap();
+    approve(
+        &store,
+        &project,
+        &[ApprovalRequest::single(identity, &body)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    let view = DefinitionTrustView::load(&store, Some(&project));
+    let roots = SkillRoots::for_project(&project);
+    let registry = SkillRegistry::load(&roots, &view);
+    assert!(registry.load_skill("helper").is_ok());
+
+    std::fs::write(
+        &skill_md,
+        "---
+name: helper
+description: Helper.
+---
+
+TAMPERED
+",
+    )
+    .unwrap();
+    match registry.load_skill("helper") {
+        Err(SkillLookupError::Untrusted { state, .. }) => assert_eq!(state, "changed"),
+        other => panic!("changed bytes must be refused: {other:?}"),
+    }
+    let fresh = SkillRegistry::load(&roots, &view);
+    assert!(fresh.get("helper").is_none());
+    assert_eq!(fresh.untrusted()[0].state, "changed");
+}
+
+#[test]
+fn an_untrusted_skill_does_not_shadow_a_trusted_lower_precedence_skill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    let user = tmp.path().join("home/.leveler/skills");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "dup",
+        "dup",
+        "Project.",
+        "PROJECT",
+    );
+    write_skill(&user, "dup", "dup", "User.", "USER");
+    let user_body = std::fs::read(user.join("dup/SKILL.md")).unwrap();
+    let store = tmp.path().join("store");
+    let identity = DefinitionIdentity::user_skill("leveler", "dup").unwrap();
+    approve(
+        &store,
+        &project,
+        &[ApprovalRequest::single(identity, &user_body)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    let view = DefinitionTrustView::load(&store, Some(&project));
+    let mut roots = SkillRoots::empty();
+    roots.push(root(
+        SkillScope::Project,
+        SkillSource::Native,
+        project.join(".leveler/skills"),
+    ));
+    roots.push(root(SkillScope::User, SkillSource::Native, user));
+    let registry = SkillRegistry::load(&roots, &view);
+    let entry = registry.get("dup").expect("the user skill must be visible");
+    assert_eq!(entry.source, SkillSource::Native);
+    assert_eq!(entry.scope, SkillScope::User);
+    assert_eq!(registry.untrusted().len(), 1);
+    assert_eq!(registry.untrusted()[0].display, ".leveler/skills/dup");
+}
+
+#[test]
+fn an_unapproved_user_skill_is_not_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let user = tmp.path().join("home/.leveler/skills");
+    write_skill(
+        &user,
+        "global-evil",
+        "global-evil",
+        "Global.",
+        "GLOBAL_BODY",
+    );
+    let mut roots = SkillRoots::empty();
+    roots.push(root(SkillScope::User, SkillSource::Native, user));
+    let registry = SkillRegistry::load(&roots, &DefinitionTrustView::deny_all());
+    assert!(
+        registry.get("global-evil").is_none(),
+        "{:?}",
+        registry.entries()
+    );
+    assert_eq!(registry.untrusted().len(), 1);
+    assert_eq!(registry.untrusted()[0].state, "unapproved");
+    assert!(registry.load_skill("global-evil").is_err());
 }

@@ -152,7 +152,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
     let responses = runtime.responses.clone();

@@ -41,6 +41,10 @@ const PREVIEW_INSTRUCTIONS_CHARS: usize = 1200;
 
 /// The roots the authoring tools act on: this workspace, and the user agents
 /// directory of the home in the tool's own environment.
+fn trust_for(context: &ToolContext) -> leveler_definition_trust::DefinitionTrustView {
+    (*context.execution.definition_trust).clone()
+}
+
 fn roots_for(context: &ToolContext) -> AgentRoots {
     AgentRoots {
         project_root: context
@@ -68,7 +72,7 @@ fn skill_registry_for(context: &ToolContext) -> leveler_skills::SkillRegistry {
             })
         })
         .unwrap_or_else(leveler_skills::SkillRoots::empty);
-    leveler_skills::SkillRegistry::load(&roots)
+    leveler_skills::SkillRegistry::load(&roots, &trust_for(context))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -177,7 +181,7 @@ pub(crate) fn preflight(
     context: &ToolContext,
 ) -> Result<String, String> {
     let roots = roots_for(context);
-    let registry = AgentRegistry::load(&roots);
+    let registry = AgentRegistry::load(&roots, &trust_for(context));
     let skills = skill_registry_for(context);
     match tool {
         SAVE_AGENT_TOOL => {
@@ -378,7 +382,7 @@ impl Tool for ListAgentsTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: ListArgs = parse_input(self.name(), input)?;
-        let registry = AgentRegistry::load(&roots_for(&context));
+        let registry = AgentRegistry::load(&roots_for(&context), &trust_for(&context));
         let Some(name) = args
             .name
             .as_deref()
@@ -527,7 +531,7 @@ impl Tool for SaveAgentTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: SaveArgs = parse_input(self.name(), input)?;
         let roots = roots_for(&context);
-        let registry = AgentRegistry::load(&roots);
+        let registry = AgentRegistry::load(&roots, &trust_for(&context));
         let skills = skill_registry_for(&context);
         let manifest = match check_save(&args, &roots, &registry, &skills) {
             Ok((manifest, _)) => manifest,

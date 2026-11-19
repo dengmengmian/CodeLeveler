@@ -11,6 +11,7 @@ use leveler_client_protocol::{
     ClientCommand, CommandId, InteractiveRuntimeClient, RuntimeEvent, SessionId, UiAgentCapability,
     UiAgentDraft, UiAgentScope, UiAgentSource, UiAgentStatus,
 };
+use leveler_definition_trust::{ApprovalSurface, DiscoveryRoots, approve, discover};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
@@ -112,7 +113,26 @@ fn draft(name: &str, capability: UiAgentCapability) -> UiAgentDraft {
     }
 }
 
+/// Approve every definition currently on disk. These tests exercise the
+/// registry protocol; the trust decision itself has dedicated tests.
+fn approve_all(repo: &Path) {
+    let home = home();
+    let roots = DiscoveryRoots {
+        project_root: Some(repo.to_path_buf()),
+        leveler_home: home.to_path_buf(),
+        user_home: None,
+    };
+    let requests: Vec<_> = discover(&roots)
+        .iter()
+        .filter_map(|candidate| candidate.approval_request().ok())
+        .collect();
+    if !requests.is_empty() {
+        approve(home, repo, &requests, ApprovalSurface::Cli).expect("approve fixture");
+    }
+}
+
 async fn list(fx: &Fixture) -> Vec<leveler_client_protocol::UiAgentEntry> {
+    approve_all(&fx.repo);
     let q = CommandId::generate();
     let want = q.clone();
     fx.ask(
@@ -131,6 +151,7 @@ async fn list(fx: &Fixture) -> Vec<leveler_client_protocol::UiAgentEntry> {
 }
 
 async fn mutate(fx: &Fixture, command: ClientCommand) -> (bool, Option<String>) {
+    approve_all(&fx.repo);
     fx.ask(command, |e| match e {
         RuntimeEvent::AgentMutated { ok, error, .. } => Some((ok, error)),
         _ => None,
@@ -203,6 +224,7 @@ async fn get_returns_the_instructions_or_says_why_not() {
         "capability: read_only\n",
         "Only exploitable issues.",
     );
+    approve_all(&fx.repo);
     let detail = fx
         .ask(
             ClientCommand::GetAgent {

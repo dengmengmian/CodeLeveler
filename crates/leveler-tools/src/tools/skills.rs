@@ -176,10 +176,10 @@ fn store_for(context: &ToolContext) -> Result<SkillStore, ToolError> {
 
 fn registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
     let root = context.require_workspace()?.root();
-    Ok(SkillRegistry::load(&SkillRoots::for_project_in(
-        root,
-        &|key| context.execution.environment.var_os(key),
-    )))
+    Ok(SkillRegistry::load(
+        &SkillRoots::for_project_in(root, &|key| context.execution.environment.var_os(key)),
+        context.execution.definition_trust.as_ref(),
+    ))
 }
 
 /// Validate a `save_skill` / `delete_skill` call before anyone is asked, and
@@ -456,6 +456,7 @@ mod tests {
     fn context(root: &std::path::Path) -> ToolContext {
         let ws = leveler_execution::Workspace::new(root).unwrap();
         ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests()
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -614,5 +615,40 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("does not exist"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unapproved_skill_body_is_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join(".leveler/skills/evil");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: evil\ndescription: Evil.\n---\n\nEVIL_SKILL_BODY\n",
+        )
+        .unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx.execution.definition_trust =
+            std::sync::Arc::new(leveler_definition_trust::DefinitionTrustView::deny_all());
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            !out.content.contains("EVIL_SKILL_BODY"),
+            "unapproved skill body leaked: {}",
+            out.content
+        );
     }
 }

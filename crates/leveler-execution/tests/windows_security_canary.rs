@@ -558,3 +558,270 @@ async fn the_confined_shell_write_boundary_on_a_real_windows_workspace() {
         "unclosed OS-boundary cases on this host: {failed:?}"
     );
 }
+
+/// TD-10: the definition trust store lives outside the workspace and must be
+/// unreachable for a confined shell. This is not an "is_trusted()" unit test:
+/// it runs the production launcher under a real Low token and inspects the
+/// resulting filesystem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows OS security canary; needs leveler-confine.exe and a scratch workspace"]
+async fn the_definition_trust_store_is_unreachable_for_a_confined_shell() {
+    if leveler_execution::windows_confine::launcher_path().is_none() {
+        panic!("leveler-confine.exe is not built beside the test binary");
+    }
+    let mut canary = Canary::new();
+    canary.seed();
+    let trust_home = canary
+        .root
+        .parent()
+        .expect("workspace parent")
+        .join("trust-home");
+    let _ = std::fs::remove_dir_all(&trust_home);
+    std::fs::create_dir_all(trust_home.join("definition-trust").join("snapshots")).unwrap();
+    let store = trust_home.join("definition-trust.yaml");
+    let original = "version: 1\ndomains: {}\n";
+    std::fs::write(&store, original).unwrap();
+    std::fs::write(
+        trust_home
+            .join("definition-trust")
+            .join("snapshots")
+            .join("deadbeef"),
+        "approved snapshot",
+    )
+    .unwrap();
+
+    let t = trust_home.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$t = '{t}'; $r = @(); \
+         try {{ Set-Content -LiteralPath \"$t\\definition-trust.yaml\" -Value 'PWNED' -ErrorAction Stop; $r += 'WRITE_OK' }} catch {{ $r += 'WRITE_DENIED' }}; \
+         try {{ Add-Content -LiteralPath \"$t\\definition-trust.yaml\" -Value 'PWNED' -ErrorAction Stop; $r += 'APPEND_OK' }} catch {{ $r += 'APPEND_DENIED' }}; \
+         try {{ Remove-Item -LiteralPath \"$t\\definition-trust.yaml\" -Force -ErrorAction Stop; $r += 'DELETE_OK' }} catch {{ $r += 'DELETE_DENIED' }}; \
+         try {{ Rename-Item -LiteralPath \"$t\\definition-trust.yaml\" -NewName 'moved.yaml' -ErrorAction Stop; $r += 'RENAME_OK' }} catch {{ $r += 'RENAME_DENIED' }}; \
+         try {{ Set-Content -LiteralPath \"$t\\forged.yaml\" -Value 'PWNED' -ErrorAction Stop; $r += 'CREATE_OK' }} catch {{ $r += 'CREATE_DENIED' }}; \
+         try {{ New-Item -ItemType Directory -Path \"$t\\forged-dir\" -ErrorAction Stop | Out-Null; $r += 'MKDIR_OK' }} catch {{ $r += 'MKDIR_DENIED' }}; \
+         try {{ Set-Content -LiteralPath \"$t\\definition-trust\\snapshots\\deadbeef\" -Value 'PWNED' -ErrorAction Stop; $r += 'SNAPSHOT_OK' }} catch {{ $r += 'SNAPSHOT_DENIED' }}; \
+         $r -join ','"
+    );
+    let mut request = ProcessRequest::new(
+        "powershell",
+        vec![
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            script,
+        ],
+        canary.root.clone(),
+    );
+    request.write_scope = WriteScope::Workspace {
+        root: canary.root.clone(),
+    };
+    let output = canary
+        .runner
+        .run(request, CancellationToken::new())
+        .await
+        .expect("confined powershell must run");
+    std::fs::write(
+        canary.evidence.join("td10-trust-store.txt"),
+        format!(
+            "exit: {:?}\nstdout:\n{}\nstderr:\n{}\n",
+            output.exit_code, output.stdout, output.stderr
+        ),
+    )
+    .unwrap();
+
+    let store_after = std::fs::read_to_string(&store).unwrap_or_default();
+    let snapshot_after = std::fs::read_to_string(
+        trust_home
+            .join("definition-trust")
+            .join("snapshots")
+            .join("deadbeef"),
+    )
+    .unwrap_or_default();
+    let forged = trust_home.join("forged.yaml").exists();
+    let moved = trust_home.join("moved.yaml").exists();
+    let forged_dir = trust_home.join("forged-dir").exists();
+    let all_denied = output.stdout.matches("_DENIED").count() == 7;
+    canary.record(
+        "TD-10",
+        if store_after == original
+            && snapshot_after == "approved snapshot"
+            && !forged
+            && !moved
+            && !forged_dir
+            && all_denied
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        format!(
+            "store intact={}; snapshot intact={}; forged={forged}; moved={moved}; dir={forged_dir}; stdout={:?}",
+            store_after == original,
+            snapshot_after == "approved snapshot",
+            output.stdout.trim()
+        ),
+    );
+
+    let mut report = String::from("id,verdict,detail\n");
+    for (id, verdict, detail) in &canary.results {
+        report.push_str(&format!(
+            "{id},{verdict},\"{}\"\n",
+            detail.replace('"', "'").replace('\n', " ")
+        ));
+    }
+    std::fs::write(canary.evidence.join("TEST_MATRIX.csv"), &report).unwrap();
+    println!(
+        "TRUST_STORE_CANARY trust_home={} evidence={}\n{report}",
+        trust_home.display(),
+        canary.evidence.display()
+    );
+    let failed: Vec<&str> = canary
+        .results
+        .iter()
+        .filter(|(_, verdict, _)| *verdict == "FAIL")
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    assert!(failed.is_empty(), "trust store boundary failed: {failed:?}");
+    let _ = std::fs::remove_dir_all(&trust_home);
+}
+
+/// TD-02 / TD-03: a confined shell can create the file (the OS gap) but the
+/// trust gate refuses its bytes until a human approves them; approval admits
+/// exactly those bytes, and a later confined edit invalidates it. This is the
+/// Property A / Property B split observed on a real NTFS tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows OS security canary; needs leveler-confine.exe and a scratch workspace"]
+async fn a_shell_created_agents_md_is_created_but_not_admitted() {
+    use leveler_definition_trust::{
+        ApprovalSurface, DefinitionTrustView, approve, discover_project,
+    };
+    if leveler_execution::windows_confine::launcher_path().is_none() {
+        panic!("leveler-confine.exe is not built beside the test binary");
+    }
+    let mut canary = Canary::new();
+    canary.seed();
+    let trust_home = canary
+        .root
+        .parent()
+        .expect("workspace parent")
+        .join("trust-home-rules");
+    let _ = std::fs::remove_dir_all(&trust_home);
+    std::fs::create_dir_all(&trust_home).unwrap();
+
+    // Root AGENTS.md: OS creation succeeds, admission does not.
+    std::fs::remove_file(canary.root.join("AGENTS.md")).unwrap();
+    canary.run("td02-create", "echo FORGED> AGENTS.md").await;
+    let created = canary.read("AGENTS.md");
+    assert!(created.is_some(), "the OS gap is real; this is Property A");
+    let view = DefinitionTrustView::load(&trust_home, Some(&canary.root));
+    let probe_identity = leveler_definition_trust::DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::RootAgents,
+        "AGENTS.md",
+    )
+    .unwrap();
+    let probe_bytes = std::fs::read(canary.root.join("AGENTS.md")).unwrap();
+    let decision = view.check(
+        &probe_identity,
+        &leveler_definition_trust::DefinitionIdentity::single_digest(&probe_bytes),
+    );
+    assert!(
+        !decision.admits(),
+        "fresh store must not admit: {decision:?} status={:?}",
+        view.status()
+    );
+    let unapproved = leveler_context::load_rules(&canary.root, &view);
+    assert!(unapproved.documents.is_empty(), "{unapproved:?}");
+    assert_eq!(unapproved.untrusted.len(), 1, "{unapproved:?}");
+    assert_eq!(unapproved.untrusted[0].state, "unapproved");
+
+    // Exact-byte approval admits the current content.
+    let requests: Vec<_> = discover_project(&canary.root)
+        .iter()
+        .filter_map(|candidate| candidate.approval_request().ok())
+        .collect();
+    approve(&trust_home, &canary.root, &requests, ApprovalSurface::Cli).unwrap();
+    let approved_view = DefinitionTrustView::load(&trust_home, Some(&canary.root));
+    let approved = leveler_context::load_rules(&canary.root, &approved_view);
+    assert_eq!(approved.documents.len(), 1, "{approved:?}");
+    assert!(approved.documents[0].content.contains("FORGED"));
+
+    // A later edit changes the bytes; the old approval no longer covers them.
+    // The confined append is denied by the OS boundary (the file now exists and
+    // is Medium), so the edit is made by the trusted host, which is exactly the
+    // case the content digest must catch.
+    canary
+        .run("td02-append-denied", "echo MORE>> AGENTS.md")
+        .await;
+    std::fs::write(
+        canary.root.join("AGENTS.md"),
+        "FORGED
+MORE
+",
+    )
+    .unwrap();
+    let changed = leveler_context::load_rules(&canary.root, &approved_view);
+    assert!(changed.documents.is_empty(), "{changed:?}");
+    assert_eq!(changed.untrusted[0].state, "changed");
+
+    // A nested AGENTS.md in a directory that did not exist at approval time:
+    // same two properties at depth, with no prior record to be "changed".
+    canary
+        .run(
+            "td03-nested-create",
+            "mkdir src\\new & echo NESTED-FORGED> src\\new\\AGENTS.md",
+        )
+        .await;
+    let nested_created = canary.read("src/new/AGENTS.md");
+    assert!(nested_created.is_some());
+    let nested = leveler_context::scoped_rule_sources(
+        &canary.root,
+        &["src/new/lib.rs".to_string()],
+        &approved_view,
+    );
+    assert!(nested.documents.is_empty(), "{nested:?}");
+    assert_eq!(nested.untrusted[0].state, "unapproved");
+
+    canary.record(
+        "TD-02",
+        if created.is_some()
+            && unapproved.documents.is_empty()
+            && approved.documents.len() == 1
+            && changed.documents.is_empty()
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        "root AGENTS.md: created by Low shell; not admitted; admitted after exact-byte approval; changed bytes not admitted",
+    );
+    canary.record(
+        "TD-03",
+        if nested_created.is_some() && nested.documents.is_empty() {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        "nested AGENTS.md: created by Low shell; not admitted by the scoped loader",
+    );
+    let mut report = String::from("id,verdict,detail\n");
+    for (id, verdict, detail) in &canary.results {
+        report.push_str(&format!(
+            "{id},{verdict},\"{}\"\n",
+            detail.replace('"', "'").replace('\n', " ")
+        ));
+    }
+    std::fs::write(canary.evidence.join("TEST_MATRIX.csv"), &report).unwrap();
+    println!(
+        "DEFINITION_ADMISSION_CANARY workspace={} evidence={}\n{report}",
+        canary.root.display(),
+        canary.evidence.display()
+    );
+    let failed: Vec<&str> = canary
+        .results
+        .iter()
+        .filter(|(_, verdict, _)| *verdict == "FAIL")
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    assert!(failed.is_empty(), "admission cases failed: {failed:?}");
+    let _ = std::fs::remove_dir_all(&trust_home);
+}

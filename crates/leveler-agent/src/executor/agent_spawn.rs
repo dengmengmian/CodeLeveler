@@ -39,7 +39,7 @@ impl Executor {
     }
 
     pub(crate) fn load_agent_registry(&self) -> AgentRegistry {
-        AgentRegistry::load(&self.agent_roots())
+        AgentRegistry::load(&self.agent_roots(), &self.definition_trust())
     }
 
     /// Admit one `spawn_agent` call. `registry` is loaded by the caller once per
@@ -179,6 +179,7 @@ impl Executor {
         let environment = &self.tool_context.execution.environment;
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+            &self.definition_trust(),
         );
         let mut skills = Vec::new();
         let mut unavailable = Vec::new();

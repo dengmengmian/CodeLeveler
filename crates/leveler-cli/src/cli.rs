@@ -440,8 +440,18 @@ pub enum TrustCommand {
     },
     /// Show what is trusted, untrusted, or absent for this repository.
     Show,
+    /// Show the approved version against the current bytes for one definition.
+    Diff {
+        /// The path exactly as `leveler trust show` displays it.
+        path: String,
+    },
     /// Drop every trust record for this repository.
     Revoke,
+    /// Drop one definition approval (project or user scope).
+    RevokeDefinition {
+        /// The path exactly as `leveler trust show` displays it.
+        path: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

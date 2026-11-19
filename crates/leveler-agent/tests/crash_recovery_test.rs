@@ -190,7 +190,8 @@ async fn harness_captured(
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     std::fs::write(dir.path().join("README.md"), "# Project\n").unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let db = Database::connect_in_memory().await.unwrap();
     let engine = CodingRuntime {
         engine: TaskEngine {

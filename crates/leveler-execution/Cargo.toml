@@ -61,6 +61,8 @@ libc = { workspace = true }
 leveler-linux-confine = { workspace = true }
 
 [dev-dependencies]
+leveler-context = { workspace = true }
+leveler-definition-trust = { workspace = true }
 leveler-test-support = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

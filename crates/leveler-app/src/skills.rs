@@ -24,7 +24,10 @@ impl Application {
             .primary_workspace()
             .map(|root| SkillRoots::for_project_in(root, &|key| self.environment.var_os(key)))
             .unwrap_or_else(SkillRoots::empty);
-        SkillRegistry::load(&roots)
+        SkillRegistry::load(
+            &roots,
+            &self.definition_trust_for(self.layout.primary_workspace()),
+        )
     }
 
     /// Every entry with its status here, plus the directory entries that are not

@@ -158,7 +158,13 @@ mod tests {
             dir: user,
             containing_root: None,
         });
-        (tmp, SkillRegistry::load(&roots))
+        (
+            tmp,
+            SkillRegistry::load(
+                &roots,
+                &leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests(),
+            ),
+        )
     }
 
     #[test]

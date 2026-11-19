@@ -240,3 +240,44 @@ fn a_repo_with_no_gated_files_has_nothing_to_trust() {
     assert!(ok, "{out}");
     assert!(out.contains("(no file)"), "{out}");
 }
+
+#[test]
+fn project_definitions_are_inert_until_exact_bytes_are_approved() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join("AGENTS.md"), "RULE-ONE\n");
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("AGENTS.md"), "{out}");
+    assert!(out.contains("new (ignored)"), "{out}");
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "allow", "--yes"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("1 definition(s)"), "{out}");
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("trusted"), "{out}");
+
+    // A changed file is no longer admitted, and the diff is against the exact
+    // bytes the human approved, not against HEAD or the current file.
+    write(&repo.path().join("AGENTS.md"), "RULE-TWO\n");
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("changed since approval"), "{out}");
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "diff", "AGENTS.md"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("- RULE-ONE"), "{out}");
+    assert!(out.contains("+ RULE-TWO"), "{out}");
+
+    let (ok, out) = run(
+        home.path(),
+        repo.path(),
+        &["trust", "revoke-definition", "AGENTS.md"],
+    );
+    assert!(ok, "{out}");
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("new (ignored)"), "{out}");
+}

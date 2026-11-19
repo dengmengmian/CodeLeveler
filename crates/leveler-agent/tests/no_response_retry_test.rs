@@ -562,7 +562,8 @@ async fn executor_with_responses(
     let dir = tempfile::tempdir().unwrap();
     let workspace = leveler_execution::Workspace::new(dir.path()).unwrap();
     let context =
-        leveler_tools::ToolContext::new(workspace, leveler_execution::PermissionProfile::Assisted);
+        leveler_tools::ToolContext::new(workspace, leveler_execution::PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
     let executor = leveler_agent::Executor::new(
         std::sync::Arc::new(registry(&server)),
         std::sync::Arc::new(leveler_tools::ToolRegistry::new()),

@@ -210,7 +210,8 @@ impl Lifecycle {
 async fn run_fan_out(n: usize, salt: u64) -> Lifecycle {
     let dir = tmp(&format!("fanout-{n}"), salt);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let mut script = vec![assistant_with(
         (0..n)
@@ -326,7 +327,8 @@ async fn fan_out_scales_to_the_cap_and_refuses_past_it() {
 async fn a_child_that_fails_still_reports_a_terminal() {
     let dir = tmp("child-failure", 7);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let script = vec![
         assistant_with(
@@ -443,7 +445,8 @@ async fn a_wide_fan_out_loses_no_lifecycle_event() {
 async fn cancelling_the_parent_settles_every_child_in_flight() {
     let dir = tmp("cancel-fanout", 41);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let mut script = vec![assistant_with(
         (0..3)
@@ -534,7 +537,8 @@ async fn cancelling_the_parent_settles_every_child_in_flight() {
 async fn a_settled_child_reports_a_contribution_projection() {
     let dir = tmp("contribution", 77);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let script = vec![
         assistant_with(
@@ -643,7 +647,8 @@ impl leveler_agent::EventBarrier for ArmedFailingBarrier {
 async fn no_child_executes_before_its_start_event_is_flushed() {
     let dir = tmp("durable-before-execute", 71);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let script = vec![
         assistant_with(
@@ -719,7 +724,8 @@ async fn no_child_executes_before_its_start_event_is_flushed() {
 async fn a_start_that_cannot_become_durable_stops_the_children() {
     let dir = tmp("flush-fail-closed", 72);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let script = vec![
         assistant_with(
@@ -824,7 +830,8 @@ async fn the_total_child_cap_survives_a_window_boundary() {
     Executor::new(
         Arc::new(ScriptedRuntime::new(script)),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     )
@@ -873,7 +880,8 @@ async fn the_total_child_cap_survives_a_window_boundary() {
     Executor::new(
         Arc::new(ScriptedRuntime::new(script)),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     )
@@ -936,7 +944,8 @@ async fn settlement_order(background: bool) -> Vec<String> {
         73,
     );
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let mut call = spawn_call("s0", "explore slice 0");
     if let ContentPart::ToolCall { call } = &mut call {
         call.arguments["run_in_background"] = serde_json::Value::Bool(background);

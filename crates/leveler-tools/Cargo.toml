@@ -8,7 +8,11 @@ authors.workspace = true
 repository.workspace = true
 description = "Tool trait, registry, JSON-schema validation, and the built-in tools."
 
+[features]
+test-support = ["leveler-definition-trust/test-support"]
+
 [dependencies]
+leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }
 leveler-execution = { workspace = true }
@@ -55,6 +59,7 @@ cap-std = { workspace = true }
 cap-tempfile = { workspace = true }
 
 [dev-dependencies]
+leveler-definition-trust = { workspace = true, features = ["test-support"] }
 leveler-test-support = { workspace = true }
 image = { workspace = true }
 tempfile = "3"

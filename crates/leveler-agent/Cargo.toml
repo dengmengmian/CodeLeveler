@@ -15,6 +15,7 @@ default = []
 test-crash-barrier = []
 
 [dependencies]
+leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-model = { workspace = true }
@@ -40,6 +41,8 @@ sha2 = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+leveler-tools = { workspace = true, features = ["test-support"] }
+leveler-definition-trust = { workspace = true, features = ["test-support"] }
 leveler-test-support = { workspace = true }
 # Test-only: the tests that measure against a real provider need the same
 # runtime the product uses.
