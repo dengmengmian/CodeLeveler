@@ -236,7 +236,7 @@ impl WorkspaceSearch {
             .build()
             .map_err(|e| SearchError::InvalidRegex {
                 pattern: query.pattern.clone(),
-                message: first_line(&e.to_string()),
+                message: regex_error_message(&e),
             })?;
         let include = query.include.as_deref().map(compile_glob).transpose()?;
 
@@ -366,6 +366,23 @@ fn display_path(path: &Path, relative_to: &Path) -> String {
 
 fn first_line(message: &str) -> String {
     message.lines().next().unwrap_or(message).trim().to_string()
+}
+
+/// The regex crate's syntax error puts the actionable reason on the line
+/// beginning `error:`. Keeping only the first line left a real session with
+/// `regex parse error:` and no diagnosis, so the model could not repair the
+/// pattern. Keep the reason; non-syntax errors (for example a size limit) have
+/// no such line and keep their one-line display.
+fn regex_error_message(error: &regex::Error) -> String {
+    let text = error.to_string();
+    let reason = text
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("error: "));
+    match reason {
+        Some(reason) => format!("regex parse error: {reason}"),
+        None => first_line(&text),
+    }
 }
 
 /// The one traversal. `.gitignore` and `.ignore` files are honoured whether or
@@ -656,6 +673,30 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, SearchError::InvalidRegex { .. }), "{err:?}");
+    }
+
+    /// Regression: a real session's look-ahead regex produced
+    /// `regex parse error:` with the reason stripped. The model cannot fix a
+    /// pattern it cannot diagnose; the parser's own reason must survive.
+    #[tokio::test]
+    async fn grep_reports_why_a_regex_is_invalid() {
+        let dir = fixture();
+        let err = WorkspaceSearch::grep(
+            dir.path(),
+            dir.path(),
+            &query("a(?=b)"),
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let SearchError::InvalidRegex { message, .. } = err else {
+            panic!("expected InvalidRegex, got {err:?}");
+        };
+        assert!(
+            message.contains("look-around"),
+            "the parser's reason must survive: {message}"
+        );
     }
 
     #[tokio::test]

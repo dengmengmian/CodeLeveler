@@ -774,7 +774,7 @@ fn unmatched_citation(
         Some(partial) if partial.full_record_prefix => format!(
             "`{cited}` command does not match `{label}` (step {step}): the citation contains \
              extra text after the full recorded command, and that text is not a result note \
-             (`→`, `->`, `=>`, or a parenthetical).",
+             (`→`, `->`, `=>`, `—`, or a parenthetical).",
             label = partial.run.label,
             step = partial.run.model_step
         ),
@@ -805,8 +805,8 @@ fn unmatched_citation(
         format!(
             "{why} Recorded commands that can be cited in full: {citable}. Reuse a relevant \
              command without rerunning it by citing `call_id:<id>` when one is shown, or by \
-             copying the command exactly as shown. A trailing result note (`→ ...` or a \
-             parenthetical) is not part of the command. If these records do not prove the \
+             copying the command exactly as shown. A trailing result note (`→ ...`, `— ...`, or a parenthetical) is not part \
+             of the command. If these records do not prove the \
              claim, run the required check as its own command."
         )
     }
@@ -1119,13 +1119,14 @@ pub(crate) fn run_matches_command(label: &str, command: &str) -> bool {
 }
 
 fn result_note_marker(token: &str) -> bool {
-    matches!(token, "→" | "->" | "=>" | "⇒")
+    matches!(token, "→" | "->" | "=>" | "⇒" | "—" | "–")
 }
 
 /// A full recorded command plus a trailing result note.
 ///
-/// The note starts at an unquoted `→`, `->`, `=>`, or `⇒`. An arrow inside a
-/// quoted argument stays part of that argument, so it cannot open a note.
+/// The note starts at an unquoted `→`, `->`, `=>`, `⇒`, `—`, or `–`. A marker
+/// inside a quoted argument stays part of that argument, so it cannot open a
+/// note.
 fn cites_recorded_command_with_result_note(label: &str, cited: &str) -> bool {
     let cited_tokens = command_tokens(strip_trailing_note(cited));
     let label_tokens = command_tokens(label);
@@ -1545,6 +1546,8 @@ mod tests {
         for cited in [
             format!("{command} → 0|0|15|1"),
             format!("{command} -> 0|0|15|1"),
+            format!("{command} — exit 0"),
+            format!("{command} – exit 0"),
             format!("{command} (0|0|15|1)"),
             "call_id:probe".to_string(),
         ] {

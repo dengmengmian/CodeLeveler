@@ -1337,6 +1337,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A patch document under `input` must come back as guidance that names
+    /// both fields, through the same registry path the model's call takes.
+    #[tokio::test]
+    async fn apply_patch_misnamed_document_gets_targeted_guidance_through_the_registry() {
+        let reg = default_registry();
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-patchinput-{}",
+            crate::tools::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = reg
+            .execute(
+                "apply_patch",
+                serde_json::json!({
+                    "input": "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"
+                }),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a friendly tool error, not a schema rejection");
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("`patch`"), "{}", out.content);
+        assert!(out.content.contains("`input`"), "{}", out.content);
+        assert!(!dir.join("a.txt").exists(), "guidance must not write");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn run_command_missing_program_steers_to_shell_command() {
         let reg = default_registry();

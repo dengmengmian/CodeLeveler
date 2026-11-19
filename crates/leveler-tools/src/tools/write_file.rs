@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use leveler_context::Staleness;
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -150,17 +151,30 @@ impl Tool for WriteFileTool {
             Some(existing) => {
                 // The decision to replace the whole file was made against what
                 // the model read. If the file moved on since, refuse — exactly
-                // as `apply_patch` does.
-                if context
+                // as `apply_patch` does. A resumed window has no observation at
+                // all; that is an unknown version, not a confirmed edit.
+                match context
                     .execution
                     .file_state
-                    .is_stale(&resolved, existing.as_bytes())
+                    .staleness(&resolved, existing.as_bytes())
                 {
-                    return Ok(ToolOutput::error(format!(
-                        "{} changed since you read it — re-read it and decide again \
-                         whether to replace the whole file.",
-                        input.path
-                    )));
+                    Staleness::Unchanged => {}
+                    Staleness::Changed => {
+                        return Ok(ToolOutput::error(format!(
+                            "{} changed since you read it — re-read it and decide again \
+                             whether to replace the whole file.",
+                            input.path
+                        )));
+                    }
+                    Staleness::Unobserved => {
+                        return Ok(ToolOutput::error(format!(
+                            "{} has not been read in this session window — the task was \
+                             resumed, so its current contents are unknown. Nothing was \
+                             written. Read {}, then decide again whether to replace the \
+                             whole file.",
+                            input.path, input.path
+                        )));
+                    }
                 }
                 WorkspaceEditor::replace(
                     &context,
@@ -502,6 +516,26 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Full mode is frozen execution authority: an external path is writable
+    /// and no approval or workspace fence applies. Two 2026-09 full-access
+    /// sessions were refused with the workspace-invariant message, so this is
+    /// the regression lock for the product contract.
+    #[tokio::test]
+    async fn full_access_writes_a_path_outside_the_workspace() {
+        let (ctx, dir) =
+            super::super::test_ctx(leveler_execution::PermissionProfile::FullAccess, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.txt");
+        let out = run(
+            ctx,
+            serde_json::json!({"path": target.to_string_lossy(), "content": "written\n"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "written\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]
@@ -566,8 +600,15 @@ mod resume_observation_tests {
             .unwrap();
         assert!(refused.is_error, "{}", refused.content);
         assert!(
-            refused.content.contains("changed since you read it"),
-            "{}",
+            refused
+                .content
+                .contains("has not been read in this session window"),
+            "a resumed, unobserved file was not edited behind the model's back: {}",
+            refused.content
+        );
+        assert!(
+            !refused.content.contains("changed since you read it"),
+            "no change happened, so the refusal must not claim one: {}",
             refused.content
         );
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");

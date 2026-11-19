@@ -844,7 +844,10 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
             `task` is the child's whole instruction. `title` is the short display \
             name and stays fixed for that child's lifetime.\n\n\
             Calls in one assistant message run concurrently. Calls in a later \
-            message run after those return. `run_in_background` defaults to true: \
+            message run after those return. The runtime caps the number of child \
+            agents one task may start; when the cap is reached, a further call is \
+            refused and the remaining work must be done directly. \
+            `run_in_background` defaults to true: \
             the call returns the child's id immediately, and the runtime reports \
             the child's result, including partial work, when the child settles. \
             false waits for that result before this call returns.\n\n\

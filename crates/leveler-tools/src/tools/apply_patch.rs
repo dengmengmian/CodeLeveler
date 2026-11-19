@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use leveler_context::Staleness;
 use leveler_execution::RiskLevel;
 
 use super::applied_diff::{self, AppliedHunk};
@@ -82,6 +83,26 @@ struct Input {
     /// [REDACTED] in a new line or new file. Defaults to false.
     #[serde(default)]
     allow_redacted_literal: bool,
+}
+
+/// Whether a string is the documented patch grammar rather than an ordinary
+/// argument. Used only to name a misplaced document in a refusal.
+fn looks_like_patch_document(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("*** Begin Patch") || text.starts_with("--- ")
+}
+
+/// Field names come from the caller. Keep the refusal one line and bounded.
+fn display_key(key: &str) -> String {
+    let mut shown: String = key
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(40)
+        .collect();
+    if key.chars().count() > 40 {
+        shown.push('…');
+    }
+    shown
 }
 
 /// A resolved filesystem operation, computed before anything is written.
@@ -366,6 +387,36 @@ impl Tool for ApplyPatchTool {
 
     fn input_schema(&self) -> serde_json::Value {
         super::schema_of::<Input>()
+    }
+
+    /// A real session sent the patch document under `input` twice. The bare
+    /// schema error named the missing property but not the document sitting
+    /// under the wrong key. Name both; never move the document and execute it.
+    fn invalid_input_guidance(&self, input: &serde_json::Value) -> Option<String> {
+        if input.get("patch").is_some() {
+            // Present (string or not): the executor or the schema's type error
+            // owns the next decision.
+            return None;
+        }
+        let misnamed = input.as_object().and_then(|object| {
+            object.iter().find_map(|(key, value)| {
+                let text = value.as_str()?;
+                looks_like_patch_document(text).then_some(key.as_str())
+            })
+        });
+        Some(match misnamed {
+            Some(key) => format!(
+                "apply_patch requires the patch document in `patch`; this call put a patch \
+                 document in `{}`. Nothing was executed. Re-issue the call with the same \
+                 document as the value of `patch`: {{\"patch\": \"*** Begin Patch\\n...\"}}. \
+                 The document is never read from any other field.",
+                display_key(key)
+            ),
+            None => "apply_patch requires `patch`: the full patch document starting with \
+                     `*** Begin Patch` and ending with `*** End Patch`. This call did not \
+                     contain one, so nothing was executed."
+                .to_string(),
+        })
     }
 
     fn risk(&self) -> RiskLevel {
@@ -714,17 +765,30 @@ impl Tool for ApplyPatchTool {
                     // The patch was written against contents the model read. If
                     // the file moved on since, applying it would discard whatever
                     // the other writer did — refuse and make the model re-read.
-                    if context
+                    // A resumed window has no observation at all; that is an
+                    // unknown version, not evidence that someone edited it.
+                    match context
                         .execution
                         .file_state
-                        .is_stale(&resolved, existing.as_bytes())
+                        .staleness(&resolved, existing.as_bytes())
                     {
-                        return Ok(ToolOutput::error(format!(
-                            "{path} changed since you read it — another process, command, or \
-                             the user edited it. Your patch was written against stale contents \
-                             and applying it would discard their change. Re-read {path} and \
-                             rebuild the patch against what is there now."
-                        )));
+                        Staleness::Unchanged => {}
+                        Staleness::Changed => {
+                            return Ok(ToolOutput::error(format!(
+                                "{path} changed since you read it — another process, command, or \
+                                 the user edited it. Your patch was written against stale contents \
+                                 and applying it would discard their change. Re-read {path} and \
+                                 rebuild the patch against what is there now."
+                            )));
+                        }
+                        Staleness::Unobserved => {
+                            return Ok(ToolOutput::error(format!(
+                                "{path} has not been read in this session window — the task was \
+                                 resumed, so its current contents are unknown. Nothing was \
+                                 written. Read {path}, then rebuild the patch against what is \
+                                 there now."
+                            )));
+                        }
                     }
 
                     let (updated, hunks) = match apply_update_located(&existing, &chunks) {
@@ -1022,6 +1086,52 @@ mod tests {
                 "tool descriptions state capability, not strategy ({coaching:?})"
             );
         }
+    }
+
+    /// A real session put the patch document under `input` instead of `patch`
+    /// twice. The bare schema error named neither the field the caller sent nor
+    /// the correct shape, so the model had to infer both. Guidance may name the
+    /// mistake; it must never move the document into `patch` and execute it.
+    #[test]
+    fn a_patch_document_under_another_key_is_named_not_repaired() {
+        let document = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch";
+        let guidance = ApplyPatchTool
+            .invalid_input_guidance(&serde_json::json!({ "input": document }))
+            .expect("a misnamed patch document gets guidance");
+        assert!(guidance.contains("`patch`"), "{guidance}");
+        assert!(guidance.contains("`input`"), "{guidance}");
+        assert!(guidance.contains("Nothing was executed"), "{guidance}");
+        assert!(
+            guide_is_not_a_write(&guidance),
+            "guidance must not claim the patch ran: {guidance}"
+        );
+    }
+
+    /// No recognizable document: name the required field and the document
+    /// shape. A present but non-string `patch` keeps the raw type error.
+    #[test]
+    fn a_missing_patch_names_what_the_tool_needs() {
+        let guidance = ApplyPatchTool
+            .invalid_input_guidance(&serde_json::json!({}))
+            .expect("a missing patch gets guidance");
+        assert!(guidance.contains("`patch`"), "{guidance}");
+        assert!(guidance.contains("*** Begin Patch"), "{guidance}");
+        assert!(
+            ApplyPatchTool
+                .invalid_input_guidance(&serde_json::json!({ "patch": 7 }))
+                .is_none(),
+            "a wrong-typed patch keeps the schema's type error"
+        );
+        assert!(
+            ApplyPatchTool
+                .invalid_input_guidance(&serde_json::json!({ "patch": "*** Begin Patch" }))
+                .is_none(),
+            "a present string patch is the executor's decision, not the gate's"
+        );
+    }
+
+    fn guide_is_not_a_write(guidance: &str) -> bool {
+        !guidance.contains("Applied patch") && !guidance.contains("was written")
     }
 
     /// PB_B_ORCH_1: a child with zero claimed paths reached apply_patch and
@@ -2581,6 +2691,18 @@ mod resume_observation_tests {
             .await
             .unwrap();
         assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            refused
+                .content
+                .contains("has not been read in this session window"),
+            "a resumed, unobserved file was not edited behind the model's back: {}",
+            refused.content
+        );
+        assert!(
+            !refused.content.contains("changed since you read it"),
+            "no change happened, so the refusal must not claim one: {}",
+            refused.content
+        );
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
 
         crate::tools::read_file::ReadFileTool

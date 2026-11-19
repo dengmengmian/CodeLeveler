@@ -19,7 +19,7 @@ pub use compaction::{
     objective_pin_message, retention_tail_budget, round_boundary, shrink_externalized_results,
     summary_request,
 };
-pub use guard::{ContentFingerprint, FileStateTracker};
+pub use guard::{ContentFingerprint, FileStateTracker, Staleness};
 pub use repo_map::RepositoryMap;
 pub use rules::{
     LoadedRuleSet, MAX_RULE_BYTES, ProjectInstruction, READ_PROJECT_RULES_TOOL, RuleDeliveryAudit,

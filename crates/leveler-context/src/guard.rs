@@ -60,6 +60,19 @@ pub struct FileStateTracker {
     require_observation: AtomicBool,
 }
 
+/// What the tracker knows about a path's current contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staleness {
+    /// The contents equal the last observation, or no observation was ever
+    /// required.
+    Unchanged,
+    /// An observation exists and the on-disk bytes differ from it.
+    Changed,
+    /// No observation exists and this window requires one (after resume).
+    /// This is not evidence that someone else edited the file.
+    Unobserved,
+}
+
 impl FileStateTracker {
     /// Fingerprint an in-memory byte slice using the same incremental algorithm
     /// as [`ContentFingerprint`].
@@ -102,35 +115,43 @@ impl FileStateTracker {
         self.seen.lock().unwrap().remove(path);
     }
 
-    /// Whether `path` changed since it was last recorded. An untracked path is
-    /// never stale — the agent never claimed to know its contents.
-    pub fn is_stale(&self, path: &Path, current: &[u8]) -> bool {
+    /// Classify `path` against what this window observed. The distinction
+    /// between [`Staleness::Changed`] and [`Staleness::Unobserved`] is the
+    /// difference between "someone edited this" and "this window never read
+    /// it"; the writer's refusal must not claim the former for the latter.
+    pub fn staleness(&self, path: &Path, current: &[u8]) -> Staleness {
         match self.seen.lock().unwrap().get(path) {
-            Some(&known) => known != Self::fingerprint(current),
+            Some(&known) if known == Self::fingerprint(current) => Staleness::Unchanged,
+            Some(_) => Staleness::Changed,
             // Untracked is normally "the agent never claimed to know it".
             // After a restart the observation was lost, not absent: fail
             // closed and require a fresh read before an overwrite.
-            None => self.require_observation(),
+            None if self.require_observation() => Staleness::Unobserved,
+            None => Staleness::Unchanged,
         }
     }
 }
 
 #[cfg(test)]
+
 mod tests {
     use super::*;
 
     #[test]
     fn untracked_file_is_never_stale() {
         let t = FileStateTracker::default();
-        assert!(!t.is_stale(Path::new("never/read.rs"), b"anything"));
+        assert_eq!(
+            t.staleness(Path::new("never/read.rs"), b"anything"),
+            Staleness::Unchanged
+        );
     }
 
     #[test]
     fn recorded_file_is_stale_only_when_content_differs() {
         let t = FileStateTracker::default();
         t.record(Path::new("a.rs"), b"one");
-        assert!(!t.is_stale(Path::new("a.rs"), b"one"));
-        assert!(t.is_stale(Path::new("a.rs"), b"two"));
+        assert_eq!(t.staleness(Path::new("a.rs"), b"one"), Staleness::Unchanged);
+        assert_eq!(t.staleness(Path::new("a.rs"), b"two"), Staleness::Changed);
     }
 
     #[test]
@@ -138,7 +159,7 @@ mod tests {
         let t = FileStateTracker::default();
         t.record(Path::new("a.rs"), b"one");
         t.record(Path::new("a.rs"), b"two");
-        assert!(!t.is_stale(Path::new("a.rs"), b"two"));
+        assert_eq!(t.staleness(Path::new("a.rs"), b"two"), Staleness::Unchanged);
     }
 
     #[test]
@@ -147,19 +168,30 @@ mod tests {
         let fingerprint = FileStateTracker::fingerprint(bytes);
         let tracker = FileStateTracker::default();
         tracker.record_fingerprint(Path::new("a.rs"), fingerprint);
-        assert!(!tracker.is_stale(Path::new("a.rs"), bytes));
+        assert_eq!(
+            tracker.staleness(Path::new("a.rs"), bytes),
+            Staleness::Unchanged
+        );
     }
 
     #[test]
-    fn a_resumed_tracker_requires_an_observation_before_an_overwrite() {
+    fn a_resumed_tracker_reports_an_unobserved_file_not_a_changed_one() {
         let t = FileStateTracker::default();
         t.set_require_observation(true);
-        assert!(
-            t.is_stale(Path::new("a.rs"), b"old bytes"),
+        assert_eq!(
+            t.staleness(Path::new("a.rs"), b"old bytes"),
+            Staleness::Unobserved,
             "an unobserved existing file is an unknown version after resume"
         );
         t.record(Path::new("a.rs"), b"old bytes");
-        assert!(!t.is_stale(Path::new("a.rs"), b"old bytes"));
+        assert_eq!(
+            t.staleness(Path::new("a.rs"), b"old bytes"),
+            Staleness::Unchanged
+        );
+        assert_eq!(
+            t.staleness(Path::new("a.rs"), b"new bytes"),
+            Staleness::Changed
+        );
     }
 
     #[test]
@@ -167,6 +199,9 @@ mod tests {
         let t = FileStateTracker::default();
         t.record(Path::new("a.rs"), b"one");
         t.forget(Path::new("a.rs"));
-        assert!(!t.is_stale(Path::new("a.rs"), b"totally different"));
+        assert_eq!(
+            t.staleness(Path::new("a.rs"), b"totally different"),
+            Staleness::Unchanged
+        );
     }
 }
