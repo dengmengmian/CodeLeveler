@@ -120,6 +120,10 @@ impl Tool for RunCommandTool {
          {\"program\": \"ls\", \"args\": [\".\"]}. Each argument is an operand or flag \
          for the program. To list workspace entries directly, use list_files with {\"path\": \".\"}. \
          There is no `cmd` field. Use `shell_command` for shell syntax such as pipes. \
+         `program` is the executable itself, not a shell: `{\"program\": \"sh\", \"args\": \
+         [\"tool --version\"]}` tries to run a file literally named `tool --version` and fails. \
+         To run a command line through a shell, use `shell_command` with \
+         {\"cmd\": \"tool --version\"}. \
          Returns `exit: N`, stdout, \
          and stderr. `exit: 0` means the program succeeded. Distinguish executable lookup or launch \
          failures (check the executable in the same cwd and PATH) from a client that ran but \
@@ -2010,6 +2014,19 @@ mod contract_tests {
     async fn a_shell_string_is_still_steered_to_shell_command() {
         let out = run(serde_json::json!({"program": "  "})).await;
         assert!(out.contains("shell_command"), "{out}");
+    }
+
+    /// A real session passed `sh` as `program` with a command line in `args`
+    /// twice and never recovered. The schema cannot tell an interpreter from
+    /// any other executable without guessing, so the description must name
+    /// the mistake before the call.
+    #[test]
+    fn the_description_names_the_shell_interpreter_mistake() {
+        let tool = super::RunCommandTool::new(crate::tools::test_commands());
+        let description = <super::RunCommandTool as crate::tool::Tool>::description(&tool);
+        assert!(description.contains("\"sh\""), "{description}");
+        assert!(description.contains("command line"), "{description}");
+        assert!(description.contains("shell_command"), "{description}");
     }
 
     async fn run(input: serde_json::Value) -> String {
