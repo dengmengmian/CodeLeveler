@@ -211,6 +211,10 @@ pub(crate) fn cmd_trust(
                 .collect();
 
             if pending.is_empty() && pending_definitions.is_empty() {
+                if !unreadable.is_empty() {
+                    print_unreadable(&unreadable);
+                    return Ok(std::process::ExitCode::FAILURE);
+                }
                 print_status(&home, &repo);
                 println!();
                 println!("{}", Line::ok("nothing to trust"));
@@ -240,16 +244,7 @@ pub(crate) fn cmd_trust(
                 }
                 println!();
             }
-            if !unreadable.is_empty() {
-                println!("{}", Line::warn("Definitions that could not be read:"));
-                for row in unreadable {
-                    let DefinitionState::Unreadable { error } = &row.state else {
-                        continue;
-                    };
-                    println!("  {}  [{}] {}", row.display, row.kind, error);
-                }
-                println!();
-            }
+            print_unreadable(&unreadable);
 
             // A trust decision is the user's, so a non-interactive run must not
             // make it silently — `--yes` is the explicit non-interactive path.
@@ -318,6 +313,23 @@ pub(crate) fn cmd_trust(
             Ok(std::process::ExitCode::SUCCESS)
         }
     }
+}
+
+fn print_unreadable(rows: &[&DefinitionRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        Line::warn("Definitions that could not be read or admitted:")
+    );
+    for row in rows {
+        let DefinitionState::Unreadable { error } = &row.state else {
+            continue;
+        };
+        println!("  {}  [{}] {}", row.display, row.kind, error);
+    }
+    println!();
 }
 
 fn find_row<'a>(rows: &'a [DefinitionRow], path: &str) -> Option<&'a DefinitionRow> {

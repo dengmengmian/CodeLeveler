@@ -281,3 +281,29 @@ fn project_definitions_are_inert_until_exact_bytes_are_approved() {
     assert!(ok, "{out}");
     assert!(out.contains("new (ignored)"), "{out}");
 }
+
+#[test]
+fn a_corrupt_definition_store_is_reported_and_nothing_is_approved() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join("AGENTS.md"), "RULE\n");
+    write(
+        &home.path().join("definition-trust.yaml"),
+        "!! not yaml !!\n",
+    );
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust"]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("could not be read or admitted"),
+        "the unreadable store must be named: {out}"
+    );
+    assert!(
+        out.contains("trust store unavailable"),
+        "the typed store failure must be reported: {out}"
+    );
+    assert!(
+        !out.contains("nothing to trust"),
+        "a corrupt store is not a reason to report nothing: {out}"
+    );
+}
