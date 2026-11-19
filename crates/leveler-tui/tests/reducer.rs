@@ -6461,6 +6461,27 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
         }),
     );
 
+    // A delivered completion has the answer behind it; a bare TurnCompleted
+    // is rewritten to NoFinalAnswer and is not a completion terminal.
+    let answer = MessageId::new("goal-answer");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: answer.clone(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: answer.clone(),
+            delta: "实现和测试都已完成。".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: answer }),
+    );
+
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
 
     assert!(matches!(

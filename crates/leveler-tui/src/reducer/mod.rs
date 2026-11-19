@@ -344,24 +344,29 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 }));
             }
             let successful_turn = turn_ended
-                && state.transcript.last_turn_end().is_some_and(|turn| {
-                    matches!(
-                        turn.status,
-                        crate::transcript::TurnEndStatus::Completed
-                            | crate::transcript::TurnEndStatus::CompletedPartiallyUnverified
-                            | crate::transcript::TurnEndStatus::CompletedWithWarnings
-                            | crate::transcript::TurnEndStatus::Answered
-                            | crate::transcript::TurnEndStatus::AnsweredUnregistered
-                    )
-                });
+                && state
+                    .transcript
+                    .last_turn_end()
+                    .is_some_and(|turn| terminal_allows_generated_recap(turn.status));
             if successful_turn && state.composer.is_empty() && state.prompt_suggestion.is_none() {
                 effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
                     session_id: state.session_id.clone(),
                 }));
             }
             // The recap is a transcript row, not composer text, so a draft does
-            // not suppress it. A structured goal recap already occupies the row.
-            if (successful_turn || restored_history)
+            // not suppress it. A turn that already has one is skipped by the
+            // identity-based check inside `request`.
+            //
+            // A restored history may only fill in a review the live turn could
+            // also have requested. A yield, failure, cancellation or incomplete
+            // turn never had one, so reopening must not invent it.
+            let recap_eligible = successful_turn
+                || (restored_history
+                    && state
+                        .transcript
+                        .last_turn_end()
+                        .is_some_and(|turn| terminal_allows_generated_recap(turn.status)));
+            if recap_eligible
                 && state.status == RuntimeStatus::Idle
                 && !state.transcript.is_empty()
                 && let Some(effect) = crate::away_summary::request(state)
@@ -4654,6 +4659,23 @@ mod final_nav_tests {
             Some(s.t().final_nav_empty)
         );
     }
+}
+
+/// Whether a terminal is one where the live client asks the runtime for a
+/// generated one-line review.
+///
+/// This is the same set the turn-end trigger uses. A reopened session must use
+/// it too: otherwise a yield/failure/cancellation would gain a review on the
+/// next open that the live turn never showed.
+fn terminal_allows_generated_recap(status: crate::transcript::TurnEndStatus) -> bool {
+    matches!(
+        status,
+        crate::transcript::TurnEndStatus::Completed
+            | crate::transcript::TurnEndStatus::CompletedPartiallyUnverified
+            | crate::transcript::TurnEndStatus::CompletedWithWarnings
+            | crate::transcript::TurnEndStatus::Answered
+            | crate::transcript::TurnEndStatus::AnsweredUnregistered
+    )
 }
 
 #[cfg(test)]

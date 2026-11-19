@@ -179,23 +179,51 @@ fn history_response(s: &AppState, empty: bool) -> RuntimeEvent {
         entries: if empty {
             Vec::new()
         } else {
-            vec![leveler_client_protocol::UiHistoryEntry {
-                turn_elapsed_ms: 0,
-                turn_start: false,
-                event: RuntimeEvent::TurnAnswered,
-            }]
+            // A settled answer has the prose behind it; a bare TurnAnswered is
+            // rewritten to NoFinalAnswer by the client's own rule.
+            vec![
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 100,
+                    turn_start: false,
+                    event: RuntimeEvent::AssistantMessageStarted {
+                        message_id: MessageId::new("history-answer"),
+                    },
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 200,
+                    turn_start: false,
+                    event: RuntimeEvent::AssistantTextDelta {
+                        message_id: MessageId::new("history-answer"),
+                        delta: "已完成。".into(),
+                    },
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 300,
+                    turn_start: false,
+                    event: RuntimeEvent::AssistantMessageCompleted {
+                        message_id: MessageId::new("history-answer"),
+                    },
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 400,
+                    turn_start: false,
+                    event: RuntimeEvent::TurnAnswered,
+                },
+            ]
         },
     }
 }
 
 #[test]
-fn restored_history_requests_one_prediction_even_when_entries_are_empty() {
+fn restored_history_requests_a_prediction_and_recaps_only_a_settled_turn() {
     for empty in [false, true] {
         let mut s = reopened_with_history();
         let response = history_response(&s, empty);
         let effects = reduce(&mut s, Action::Runtime(response.clone()));
         assert_eq!(prediction_requests(&effects), 1, "empty={empty}");
-        assert_eq!(recap_requests(&effects), 1, "empty={empty}");
+        // No durable turn means no turn to attach or replay a review to.
+        let expected_recaps = usize::from(!empty);
+        assert_eq!(recap_requests(&effects), expected_recaps, "empty={empty}");
         assert!(s.composer.is_empty());
         let again = reduce(&mut s, Action::Runtime(response));
         assert_eq!(prediction_requests(&again), 0);
@@ -326,8 +354,11 @@ fn restored_history_does_not_request_a_prediction_after_input_or_while_busy() {
         }
         let effects = reduce(&mut s, Action::Runtime(response));
         assert_eq!(prediction_requests(&effects), 0, "{guard}");
-        let recap = matches!(guard, "draft" | "erased" | "attachment" | "suggestion");
-        assert_eq!(recap_requests(&effects), usize::from(recap), "{guard}");
+        assert_eq!(
+            recap_requests(&effects),
+            0,
+            "{guard}: an empty history has no settled turn to attach a review to"
+        );
     }
 }
 
@@ -441,6 +472,35 @@ fn goal_turn(s: &mut AppState, status: &str, next_step: Option<&str>) {
 }
 
 fn goal_turn_with_args(s: &mut AppState, args: serde_json::Value, ok: bool) {
+    let status = args
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // A delivered goal completion has the answer behind it. Without one the
+    // TUI's own rule rewrites the terminal to NoFinalAnswer, which is a
+    // different (and non-completing) state.
+    if ok && status == "complete" {
+        // Unique per turn: a repeated id would attach the second turn's text
+        // to the first turn's already-finished block.
+        let answer = MessageId::new(format!("goal-answer-{}", s.transcript.items().len()));
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: answer.clone(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: answer.clone(),
+                delta: "任务已完成。".into(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: answer }),
+        );
+    }
     let id = ToolCallId::new("goal");
     reduce(
         s,
@@ -465,7 +525,19 @@ fn goal_turn_with_args(s: &mut AppState, args: serde_json::Value, ok: bool) {
             applied_diff: None,
         }),
     );
-    reduce(s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    let reason = args
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("目标已终止")
+        .to_string();
+    match (ok, status) {
+        (true, "complete") => reduce(s, Action::Runtime(RuntimeEvent::TurnCompleted)),
+        (true, "blocked") => reduce(s, Action::Runtime(RuntimeEvent::TurnBlocked { reason })),
+        (true, "yield") => reduce(s, Action::Runtime(RuntimeEvent::TurnYielded { reason })),
+        // A refused or non-terminal call leaves the turn as an ordinary
+        // completed turn; it carries no structured recap either way.
+        _ => reduce(s, Action::Runtime(RuntimeEvent::TurnCompleted)),
+    };
 }
 
 /// A turn that ends on plain prose — no structured next step anywhere.
@@ -538,6 +610,24 @@ fn a_finished_answer_requests_a_recap_and_a_suggestion_together() {
 fn a_structured_goal_recap_is_not_followed_by_another_recap_request() {
     let mut s = opened();
     let effects = {
+        let answer = MessageId::new("structured-recap-answer");
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: answer.clone(),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: answer.clone(),
+                delta: "阶段一已经完成。".into(),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: answer }),
+        );
         let args = serde_json::json!({
             "status": "complete",
             "summary": "阶段一已经完成。",
@@ -725,18 +815,32 @@ fn summary_only_recap_is_visible_without_a_next_step_or_ghost() {
             }
             goal_turn_with_args(&mut s, args, true);
 
-            assert!(
-                matches!(
-                    s.transcript.items().last(),
-                    Some(TranscriptItem::Recap(block))
-                        if block.summary.as_deref() == Some("阶段一已经完成。")
-                ),
-                "summary must produce a recap for {status} with {next_step:?}"
-            );
-            assert_eq!(s.prompt_suggestion, None);
+            if status == "blocked" {
+                // The blocked terminal is the account; a separate recap would
+                // repeat it.
+                assert!(
+                    !has_recap(&s),
+                    "blocked must not repeat its summary in a recap: {next_step:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        s.transcript.items().last(),
+                        Some(TranscriptItem::Recap(block))
+                            if block.summary.as_deref() == Some("阶段一已经完成。")
+                    ),
+                    "summary must produce a recap for {status} with {next_step:?}"
+                );
+            }
+            let expected = if status == "blocked" {
+                Some("继续")
+            } else {
+                None
+            };
+            assert_eq!(s.prompt_suggestion.as_deref(), expected);
             assert!(s.composer.is_empty());
             let text = frame(&mut s, 100, 24);
-            assert!(text.contains("回顾: 阶段一已经完成。"), "{text}");
+            assert!(text.contains("阶段一已经完成。"), "{text}");
             assert!(!text.contains("下一步"), "{text}");
         }
     }
@@ -803,11 +907,13 @@ fn a1_complete_goal_with_next_step_offers_a_ghost_and_leaves_the_buffer_empty() 
 }
 
 #[test]
-fn a2_blocked_goal_with_next_step_also_offers_a_ghost() {
+fn a2_blocked_goal_offers_the_runtime_continuation_not_the_models_advice() {
     let mut s = opened();
     goal_turn(&mut s, "blocked", Some("补上缺失的凭据再继续"));
 
-    assert_eq!(s.prompt_suggestion.as_deref(), Some("补上缺失的凭据再继续"));
+    // The model's next step belongs to the recap; the offered input is the
+    // runtime's continuation.
+    assert_eq!(s.prompt_suggestion.as_deref(), Some("继续"));
     assert!(s.composer.is_empty());
 }
 
@@ -1816,7 +1922,6 @@ fn e4_a_new_turn_result_replaces_the_old_suggestion() {
     let mut s = with_suggestion();
     reduce(&mut s, Action::Runtime(busy()));
     goal_turn(&mut s, "complete", Some("发布 v0.3.0"));
-
     assert_eq!(s.prompt_suggestion.as_deref(), Some("发布 v0.3.0"));
 }
 
@@ -1952,4 +2057,450 @@ fn evidence_two_frames() {
         s.composer.canonical_text()
     );
     println!("Enter sends: {:?}", reduce(&mut s, key(KeyCode::Enter)));
+}
+
+// ---------------------------------------------------------------------------
+// Recap terminal consistency (F1)
+// ---------------------------------------------------------------------------
+
+fn has_recap(state: &AppState) -> bool {
+    state
+        .transcript
+        .items()
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::Recap(_)))
+}
+
+/// A model declared completion and the runtime accepted the call, but the turn
+/// did not end on a completed terminal. The tool result stays Ok; the terminal
+/// is the authority, so no successful recap may be shown.
+#[test]
+fn an_accepted_completion_is_not_a_recap_when_the_turn_did_not_complete() {
+    for terminal in [
+        RuntimeEvent::TurnIncomplete {
+            reason: "预算用尽".into(),
+        },
+        RuntimeEvent::TurnTruncated {
+            error: "stream ended".into(),
+        },
+        RuntimeEvent::TurnYielded {
+            reason: "本窗口结束".into(),
+        },
+        RuntimeEvent::TurnCancelled,
+        RuntimeEvent::TurnFailed {
+            error: "provider failed".into(),
+            failure: None,
+            recovery: None,
+        },
+    ] {
+        let mut s = opened();
+        let id = ToolCallId::new("goal-withdrawn");
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: id.clone(),
+                name: "update_goal".into(),
+                arguments: serde_json::json!({
+                    "status": "complete",
+                    "summary": "全部测试通过，任务完成。",
+                    "next_step": "提交改动",
+                })
+                .to_string(),
+                parallel: false,
+                model_step: None,
+                answer_effect: Some(AnswerEffect::Bookkeeping),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
+                id,
+                ok: true,
+                preview: "Goal completed".into(),
+                duration_ms: 5,
+                applied_diff: None,
+            }),
+        );
+        let label = format!("{terminal:?}");
+        reduce(&mut s, Action::Runtime(terminal));
+        assert!(
+            !has_recap(&s),
+            "{label}: an accepted but unsettled completion must not be a recap"
+        );
+        assert_ne!(
+            s.prompt_suggestion.as_deref(),
+            Some("提交改动"),
+            "{label}: the stale next step must not become the offered input"
+        );
+    }
+}
+
+/// The positive side of the same rule: a completed terminal keeps its recap,
+/// and a blocked terminal keeps the blocked account.
+#[test]
+fn a_completed_or_blocked_terminal_keeps_its_structured_recap() {
+    for (status, terminal) in [
+        (
+            "complete",
+            RuntimeEvent::TurnCompletedPartiallyUnverified {
+                requirements: vec!["R1 未验证".into()],
+            },
+        ),
+        (
+            "blocked",
+            RuntimeEvent::TurnBlocked {
+                reason: "缺少凭据".into(),
+            },
+        ),
+    ] {
+        let mut s = opened();
+        if status == "complete" {
+            let answer = MessageId::new("goal-positive-answer");
+            reduce(
+                &mut s,
+                Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                    message_id: answer.clone(),
+                }),
+            );
+            reduce(
+                &mut s,
+                Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                    message_id: answer.clone(),
+                    delta: "阶段结论已交付。".into(),
+                }),
+            );
+            reduce(
+                &mut s,
+                Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: answer }),
+            );
+        }
+        let id = ToolCallId::new("goal-ok");
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: id.clone(),
+                name: "update_goal".into(),
+                arguments: serde_json::json!({
+                    "status": status,
+                    "summary": "阶段结论。",
+                    "next_step": "继续处理",
+                })
+                .to_string(),
+                parallel: false,
+                model_step: None,
+                answer_effect: Some(AnswerEffect::Bookkeeping),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
+                id,
+                ok: true,
+                preview: "Goal resolved".into(),
+                duration_ms: 5,
+                applied_diff: None,
+            }),
+        );
+        reduce(&mut s, Action::Runtime(terminal));
+        assert!(has_recap(&s), "{status}: the terminal carries a recap");
+    }
+}
+
+/// A durable recap is that turn's review. Rows that belong to the same turn
+/// (a review card, a shell execution, a compaction note) can follow it, so
+/// "the last item is a recap" is not the question — "this turn already has a
+/// recap" is.
+#[test]
+fn a_turn_that_already_has_a_recap_is_not_regenerated_after_trailing_rows() {
+    let mut s = reopened_with_history();
+    let answer = MessageId::new("durable-answer");
+    let event = RuntimeEvent::SessionHistoryLoaded {
+        query_id: s.history_query.clone(),
+        session_id: s.session_id.clone(),
+        omitted_turns: 0,
+        entries: vec![
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 0,
+                turn_start: true,
+                event: RuntimeEvent::UserMessageAdded {
+                    message: leveler_client_protocol::UiMessage {
+                        id: MessageId::new("durable-user"),
+                        role: leveler_client_protocol::UiRole::User,
+                        text: "梳理配置".into(),
+                        ordinal: None,
+                        kind: None,
+                        images: 0,
+                    },
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 100,
+                turn_start: false,
+                event: RuntimeEvent::AssistantMessageStarted {
+                    message_id: answer.clone(),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 200,
+                turn_start: false,
+                event: RuntimeEvent::AssistantTextDelta {
+                    message_id: answer.clone(),
+                    delta: "配置已梳理完毕。".into(),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 300,
+                turn_start: false,
+                event: RuntimeEvent::AssistantMessageCompleted { message_id: answer },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 400,
+                turn_start: false,
+                event: RuntimeEvent::TurnAnswered,
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 500,
+                turn_start: false,
+                event: RuntimeEvent::AwaySummary {
+                    text: "DURABLE-RECAP 配置已梳理完毕".into(),
+                },
+            },
+            // A row of the same turn that is not a turn boundary.
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 600,
+                turn_start: false,
+                event: RuntimeEvent::ContextCompacted { from: 100, to: 40 },
+            },
+        ],
+    };
+    let effects = reduce(&mut s, Action::Runtime(event));
+    assert_eq!(
+        recap_requests(&effects),
+        0,
+        "a turn that already has a durable recap must not ask the model again: {effects:?}"
+    );
+    let recaps: Vec<&str> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::AwaySummary(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recaps, vec!["DURABLE-RECAP 配置已梳理完毕"]);
+}
+
+/// Live and reopened sessions agree: a turn that did not end successfully has
+/// no generated review. Reopening must not be the event that creates one.
+#[test]
+fn reopening_a_non_successful_last_turn_does_not_generate_a_recap() {
+    for terminal in [
+        RuntimeEvent::TurnYielded {
+            reason: "本窗口结束".into(),
+        },
+        RuntimeEvent::TurnIncomplete {
+            reason: "预算用尽".into(),
+        },
+        RuntimeEvent::TurnCancelled,
+        RuntimeEvent::TurnFailed {
+            error: "provider failed".into(),
+            failure: None,
+            recovery: None,
+        },
+    ] {
+        let mut s = reopened_with_history();
+        let label = format!("{terminal:?}");
+        let event = RuntimeEvent::SessionHistoryLoaded {
+            query_id: s.history_query.clone(),
+            session_id: s.session_id.clone(),
+            omitted_turns: 0,
+            entries: vec![
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 0,
+                    turn_start: true,
+                    event: RuntimeEvent::UserMessageAdded {
+                        message: leveler_client_protocol::UiMessage {
+                            id: MessageId::new("terminal-user"),
+                            role: leveler_client_protocol::UiRole::User,
+                            text: "做一件事".into(),
+                            ordinal: None,
+                            kind: None,
+                            images: 0,
+                        },
+                    },
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 100,
+                    turn_start: false,
+                    event: terminal,
+                },
+            ],
+        };
+        let effects = reduce(&mut s, Action::Runtime(event));
+        assert_eq!(
+            recap_requests(&effects),
+            0,
+            "{label}: reopening must not invent a review for a non-successful terminal"
+        );
+    }
+}
+
+/// The blocked terminal already states the model's reason. Repeating the same
+/// summary in the recap duplicates it; only the next action is new.
+#[test]
+fn a_blocked_summary_is_not_repeated_as_a_recap() {
+    let mut s = opened();
+    goal_turn(&mut s, "blocked", Some("补上缺失的凭据再继续"));
+
+    let text = frame(&mut s, 120, 40);
+    assert_eq!(
+        text.matches("阶段一已经完成。").count(),
+        1,
+        "the blocked summary belongs to the terminal, not twice: {text}"
+    );
+    assert!(
+        text.contains("补上缺失的凭据再继续"),
+        "the next action must stay visible: {text}"
+    );
+}
+
+/// Without a next action there is nothing new to add: the terminal's reason is
+/// the whole blocked account.
+#[test]
+fn a_blocked_goal_without_a_next_step_has_no_recap_row() {
+    let mut s = opened();
+    goal_turn_with_args(
+        &mut s,
+        serde_json::json!({ "status": "blocked", "summary": "缺少凭据" }),
+        true,
+    );
+
+    assert!(!has_recap(&s), "no separate recap is owed");
+    let text = frame(&mut s, 120, 40);
+    assert!(
+        text.contains("缺少凭据"),
+        "the reason stays visible: {text}"
+    );
+}
+
+/// A goal terminal that had a structured recap live rebuilds the same recap
+/// from the durable event log; reopening does not add a generated one.
+#[test]
+fn replaying_a_goal_terminal_rebuilds_the_same_recap_once() {
+    for (status, terminal) in [
+        (
+            "complete",
+            RuntimeEvent::TurnCompleted,
+        ),
+        (
+            "blocked",
+            RuntimeEvent::TurnBlocked {
+                reason: "缺少凭据".into(),
+            },
+        ),
+    ] {
+        let mut s = reopened_with_history();
+        let answer = MessageId::new("replay-answer");
+        let tool = ToolCallId::new("replay-goal");
+        let entries = vec![
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 0,
+                turn_start: true,
+                event: RuntimeEvent::UserMessageAdded {
+                    message: leveler_client_protocol::UiMessage {
+                        id: MessageId::new("replay-user"),
+                        role: leveler_client_protocol::UiRole::User,
+                        text: "做一件事".into(),
+                        ordinal: None,
+                        kind: None,
+                        images: 0,
+                    },
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 100,
+                turn_start: false,
+                event: RuntimeEvent::AssistantMessageStarted {
+                    message_id: answer.clone(),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 200,
+                turn_start: false,
+                event: RuntimeEvent::AssistantTextDelta {
+                    message_id: answer.clone(),
+                    delta: "结论。".into(),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 300,
+                turn_start: false,
+                event: RuntimeEvent::AssistantMessageCompleted { message_id: answer },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 400,
+                turn_start: false,
+                event: RuntimeEvent::ToolCallStarted {
+                    id: tool.clone(),
+                    name: "update_goal".into(),
+                    arguments: serde_json::json!({
+                        "status": status,
+                        "summary": "阶段结论。",
+                        "next_step": "继续处理",
+                    })
+                    .to_string(),
+                    parallel: false,
+                    model_step: None,
+                    answer_effect: Some(AnswerEffect::Bookkeeping),
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 500,
+                turn_start: false,
+                event: RuntimeEvent::ToolCallCompleted {
+                    exit_code: None,
+                    stop: None,
+                    id: tool,
+                    ok: true,
+                    preview: "Goal resolved".into(),
+                    duration_ms: 5,
+                    applied_diff: None,
+                },
+            },
+            leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 600,
+                turn_start: false,
+                event: terminal,
+            },
+        ];
+        let event = RuntimeEvent::SessionHistoryLoaded {
+            query_id: s.history_query.clone(),
+            session_id: s.session_id.clone(),
+            omitted_turns: 0,
+            entries,
+        };
+        let effects = reduce(&mut s, Action::Runtime(event));
+        assert_eq!(recap_requests(&effects), 0, "{status}");
+        let recaps: Vec<&leveler_tui::transcript::RecapBlock> = s
+            .transcript
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Recap(block) => Some(block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recaps.len(), 1, "{status}: one recap");
+        if status == "blocked" {
+            assert_eq!(recaps[0].summary, None, "the terminal carries the reason");
+            assert_eq!(recaps[0].next_step.as_deref(), Some("继续处理"));
+        } else {
+            assert_eq!(recaps[0].summary.as_deref(), Some("阶段结论。"));
+        }
+    }
 }

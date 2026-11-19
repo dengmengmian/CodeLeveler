@@ -680,8 +680,13 @@ pub enum RuntimeEvent {
     /// it is never persisted as user input and never participates in task
     /// completion. Clients may discard it when the user has started typing.
     PromptSuggestion { text: String },
-    /// Best-effort, transient post-turn recap requested after an idle window.
-    /// It is display-only and never becomes model-visible conversation.
+    /// The durable one-line review of a settled turn (`※ 回顾`).
+    ///
+    /// The runtime persists it under `(session_id, turn_id)` before publishing
+    /// it, so a reconnect replays the same text instead of generating another
+    /// review. It is display-only and never becomes model-visible
+    /// conversation, and a draft in the composer does not discard it — only a
+    /// new turn ends its window.
     AwaySummary { text: String },
     /// The current turn finished successfully.
     TurnCompleted,

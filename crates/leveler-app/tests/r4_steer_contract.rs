@@ -184,6 +184,123 @@ async fn an_away_summary_is_delivered_to_the_client_that_requested_it() {
     }
 }
 
+/// F2: a repeated request for the same turn publishes the durable review, not
+/// a second generated version, and spends no second model call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_recap_request_publishes_the_durable_text_without_a_model_call() {
+    let (_tmp, server, client, session) = client_with(vec![
+        text("the answer"),
+        MockResponse::json_ok(
+            r#"{"id":"assist","choices":[{"message":{"role":"assistant","content":"DURABLE-FIRST"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+        ),
+        MockResponse::json_ok(
+            r#"{"id":"assist","choices":[{"message":{"role":"assistant","content":"SECOND-VERSION"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+        ),
+    ])
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "hello".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(await_turn_terminal(&mut rx).await, "the turn settles");
+
+    for expected in ["DURABLE-FIRST", "DURABLE-FIRST"] {
+        client
+            .send(ClientCommand::RequestAwaySummary {
+                session_id: session.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(await_away_summary(&mut rx).await, expected);
+    }
+
+    let recap_calls = server
+        .request_bodies()
+        .await
+        .iter()
+        .filter(|body| body.contains("Write one concise"))
+        .count();
+    assert_eq!(
+        recap_calls, 1,
+        "the durable review must be reused instead of regenerated"
+    );
+}
+
+async fn await_away_summary(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::AwaySummary { text })) => return text,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            other => panic!("no away summary: {other:?}"),
+        }
+    }
+}
+
+/// F3: the recap request carries the runtime's structured outcome and the
+/// failed tool calls of the turn it describes. The model still writes the
+/// sentence; it is no longer asked to infer success from its own prose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recap_request_carries_the_turns_structured_tool_failure_facts() {
+    let (_tmp, server, client, session) = client_with(vec![
+        tool_call(
+            "run_command",
+            serde_json::json!({"program": "sh", "args": ["-c", "exit 3"]}),
+        ),
+        text("the command failed; I am reporting it."),
+        MockResponse::json_ok(
+            r#"{"id":"assist","choices":[{"message":{"role":"assistant","content":"命令失败，任务未完成。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+        ),
+    ])
+    .await;
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "run it".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(await_turn_terminal(&mut rx).await, "the turn settles");
+
+    client
+        .send(ClientCommand::RequestAwaySummary {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    let _ = await_away_summary(&mut rx).await;
+
+    let bodies = server.request_bodies().await;
+    let recap = bodies
+        .iter()
+        .find(|body| body.contains("Write one concise"))
+        .expect("the recap request exists");
+    assert!(
+        recap.contains("outcome: completed"),
+        "the settled outcome is stated: {recap}"
+    );
+    assert!(
+        recap.contains("failed tool calls: run_command"),
+        "the failed call is stated by name: {recap}"
+    );
+    let first_round = bodies
+        .iter()
+        .find(|body| body.contains("run it"))
+        .expect("the turn request exists");
+    assert!(
+        !first_round.contains("Runtime facts for the settled turn"),
+        "the facts belong to the recap, not to every request"
+    );
+}
+
 /// S2/S5 (durable side): three appends sent while a tool call runs arrive in
 /// the next model request in submission order, each exactly once, and the tool
 /// itself is neither interrupted nor repeated.
@@ -506,7 +623,10 @@ async fn a_review_is_durable_and_replays_after_its_turn() {
         .iter()
         .filter(|body| body.contains("Write one concise"))
         .count();
-    assert_eq!(recap_calls, 2, "each request made one assist call");
+    assert_eq!(
+        recap_calls, 1,
+        "a turn that already has a durable review must not spend a second model call"
+    );
 }
 
 /// R11: two settled turns keep two reviews, each bound to its own turn.

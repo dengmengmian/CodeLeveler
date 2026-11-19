@@ -52,6 +52,16 @@ pub(crate) async fn generate(
     } else {
         transcript_context(&raw.messages)?
     };
+    // The recap is model text, but it must not describe a failed execution as
+    // success. Give it the runtime's own terminal and failed-call facts for the
+    // turn it is recapping; the assistant prose alone cannot know them.
+    let context = match kind {
+        AssistKind::AwaySummary => match recap_runtime_facts(&db, session_id).await {
+            Some(facts) => format!("{facts}\n\nConversation:\n{context}"),
+            None => context,
+        },
+        AssistKind::PromptSuggestion => context,
+    };
 
     let style = app
         .registry()
@@ -165,6 +175,69 @@ fn repository_context(repo: &std::path::Path) -> Option<String> {
         bounded(&commits, 2_000),
         bounded(&status, 2_000)
     ))
+}
+
+/// The runtime's own facts about the turn an away summary is describing:
+/// its settled outcome and the tool calls that failed (by name, bounded).
+///
+/// The conversation tail is model prose; on its own it cannot tell a failed
+/// command from a successful one. These facts are small, structured, and read
+/// from the durable turn/event records — no extra model request.
+async fn recap_runtime_facts(
+    db: &leveler_storage::Database,
+    session_id: &SessionId,
+) -> Option<String> {
+    let turn = leveler_storage::TurnRepository::new(db)
+        .latest_settled(session_id)
+        .await
+        .ok()
+        .flatten()?;
+    let events = leveler_storage::EventRepository::new(db)
+        .load_by_types_in_turn(
+            session_id,
+            &leveler_core::TurnId::new(turn.id.clone()),
+            &["tool_call_finished"],
+        )
+        .await
+        .ok()?;
+    let mut failures: Vec<(String, usize)> = Vec::new();
+    for record in events {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.payload) else {
+            continue;
+        };
+        let payload = value.get("payload").unwrap_or(&value);
+        if payload.get("is_error").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        let name = payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("tool");
+        match failures.iter_mut().find(|(existing, _)| existing == name) {
+            Some((_, count)) => *count += 1,
+            None => failures.push((name.to_string(), 1)),
+        }
+    }
+    let mut facts = format!(
+        "Runtime facts for the settled turn being recapped (authoritative; do not contradict them):\n\
+         - outcome: {}\n",
+        turn.status
+    );
+    if failures.is_empty() {
+        facts.push_str("- failed tool calls: none\n");
+    } else {
+        let listed = failures
+            .iter()
+            .take(8)
+            .map(|(name, count)| format!("{name} ×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        facts.push_str(&format!("- failed tool calls: {listed}\n"));
+    }
+    facts.push_str(
+        "Do not describe a failed call as success; state the outcome and the current blocker.",
+    );
+    Some(facts)
 }
 
 fn transcript_context(messages: &[Message]) -> Option<String> {

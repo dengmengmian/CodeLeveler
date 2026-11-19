@@ -313,6 +313,47 @@ pub struct RecapBlock {
     pub next_step: Option<String>,
 }
 
+/// What the model declared when it produced a [`RecapBlock`].
+///
+/// The declaration is not the turn's outcome: the runtime can accept a
+/// completion and still withdraw it, and a turn can end on a different
+/// terminal. [`TurnHandoff::accepts_terminal`] is the only place that decides
+/// whether the declaration may be shown as this turn's recap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnHandoffKind {
+    Complete,
+    Blocked,
+}
+
+/// One handoff candidate, with the declaration it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnHandoff {
+    pub kind: TurnHandoffKind,
+    pub recap: RecapBlock,
+}
+
+impl TurnHandoff {
+    /// Whether this declaration is the account of a turn that ended on
+    /// `status`.
+    ///
+    /// A completion is only a completion account when the runtime's own
+    /// terminal says the work finished; a block is only a block account when
+    /// the runtime recorded `Blocked`. Everything else — incomplete, failed,
+    /// truncated, yielded, cancelled, no final answer — must not present a
+    /// withdrawn or unrelated declaration as success.
+    pub fn accepts_terminal(&self, status: TurnEndStatus) -> bool {
+        match self.kind {
+            TurnHandoffKind::Complete => matches!(
+                status,
+                TurnEndStatus::Completed
+                    | TurnEndStatus::CompletedPartiallyUnverified
+                    | TurnEndStatus::CompletedWithWarnings
+            ),
+            TurnHandoffKind::Blocked => status == TurnEndStatus::Blocked,
+        }
+    }
+}
+
 /// A durable goal recap (long-goal P3): the HISTORY presentation of one
 /// persisted GoalCheckpoint. `recap.checkpoint_id` is its identity — the
 /// expanded view presents the same persisted fields, never a client-side
@@ -625,8 +666,11 @@ pub enum TranscriptItem {
     Failure(FailureBlock),
     /// Multi-line host note. Transcript-visible, not a 1-row status notification.
     Note(String),
-    /// Transient, model-generated recap shown after a post-turn idle window.
-    /// Display-only: never persisted or replayed into model context.
+    /// Durable model-generated recap of a settled turn (`※ 回顾`).
+    ///
+    /// It is persisted with the turn and replayed on reconnect; it is never
+    /// part of the model-visible conversation. A goal terminal's structured
+    /// recap is the separate [`TranscriptItem::Recap`].
     AwaySummary(String),
     TurnEnd(TurnEndBlock),
     Recap(RecapBlock),
@@ -1436,9 +1480,14 @@ impl TranscriptState {
         })
     }
 
-    /// Return a recap when a successful terminal `update_goal` supplied a
-    /// summary or concrete next step. Freeform assistant prose is never used.
-    pub fn latest_turn_handoff(&self) -> Option<RecapBlock> {
+    /// Return the latest structured handoff candidate of this turn, with the
+    /// declaration it came from. Freeform assistant prose is never used.
+    ///
+    /// The caller must gate it on the turn's terminal through
+    /// [`TurnHandoff::accepts_terminal`]: an `Ok` tool result means the runtime
+    /// accepted the declaration when it was made, not that the turn ended on
+    /// that outcome (a completion can be withdrawn before the terminal).
+    pub fn latest_turn_handoff(&self) -> Option<TurnHandoff> {
         for item in self.items.iter().rev() {
             match item {
                 TranscriptItem::TurnEnd(_) => break,
@@ -1449,12 +1498,11 @@ impl TranscriptState {
                         }
                         let value =
                             serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
-                        if !matches!(
-                            value.get("status").and_then(serde_json::Value::as_str),
-                            Some("complete" | "blocked")
-                        ) {
-                            continue;
-                        }
+                        let kind = match value.get("status").and_then(serde_json::Value::as_str) {
+                            Some("complete") => TurnHandoffKind::Complete,
+                            Some("blocked") => TurnHandoffKind::Blocked,
+                            _ => continue,
+                        };
                         let next_step = value
                             .get("next_step")
                             .and_then(serde_json::Value::as_str)
@@ -1468,7 +1516,10 @@ impl TranscriptState {
                         if summary.is_none() && next_step.is_none() {
                             continue;
                         }
-                        return Some(RecapBlock { summary, next_step });
+                        return Some(TurnHandoff {
+                            kind,
+                            recap: RecapBlock { summary, next_step },
+                        });
                     }
                 }
                 _ => {}
@@ -2861,6 +2912,29 @@ impl TranscriptState {
         self.items.iter().rev().find_map(|item| match item {
             TranscriptItem::TurnEnd(block) => Some(block),
             _ => None,
+        })
+    }
+
+    /// Whether the turn that ends the transcript already carries a recap.
+    ///
+    /// The `※` row is per turn, and a turn can keep producing rows after its
+    /// recap (a review card, a shell execution, a compaction note). Identity
+    /// is therefore the last turn boundary, never the last item: a new turn
+    /// pushes its own `TurnEnd` and starts a fresh segment.
+    pub fn current_turn_has_recap(&self) -> bool {
+        let start = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::TurnEnd(_)));
+        let segment = match start {
+            Some(index) => &self.items[index..],
+            None => &self.items[..],
+        };
+        segment.iter().any(|item| {
+            matches!(
+                item,
+                TranscriptItem::Recap(_) | TranscriptItem::AwaySummary(_)
+            )
         })
     }
 

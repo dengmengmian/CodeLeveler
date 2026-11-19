@@ -1135,6 +1135,26 @@ fn recap_does_not_render_raw_markdown_markers() {
             applied_diff: None,
         }),
     );
+    // A delivered completion has the answer behind it; a bare TurnCompleted
+    // is rewritten to NoFinalAnswer and is not a completion terminal.
+    let answer = leveler_client_protocol::MessageId::new("recap-answer");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: answer.clone(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: answer.clone(),
+            delta: "构建和测试已经完成。".into(),
+        }),
+    );
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: answer }),
+    );
     reduce(&mut state, Action::Runtime(RuntimeEvent::TurnCompleted));
 
     let text = render_at(100, 24, &mut state);

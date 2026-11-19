@@ -36,28 +36,53 @@ impl<'a> SessionRecapRepository<'a> {
         Self { db }
     }
 
-    /// Persist one review. Returns `true` when this call created the row and
-    /// `false` when the turn already had one, so a repeated assist call is
-    /// idempotent by the turn identity rather than by the text.
+    /// Persist one review and return the row's authoritative text.
+    ///
+    /// `(session_id, turn_id)` is the identity. A retried or racing assist
+    /// call therefore keeps the FIRST persisted review: the upsert's conflict
+    /// branch preserves `text` and `RETURNING` hands that text back, so the
+    /// caller publishes exactly what replay will show instead of a second,
+    /// never-durable version.
     pub async fn record(
         &self,
         session_id: &SessionId,
         turn_id: &str,
         text: &str,
         now: Timestamp,
-    ) -> Result<bool, StorageError> {
-        let result = sqlx::query(
+    ) -> Result<String, StorageError> {
+        let stored = sqlx::query_scalar(
             "INSERT INTO session_recaps (session_id, turn_id, text, created_at) \
              VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(session_id, turn_id) DO NOTHING",
+             ON CONFLICT(session_id, turn_id) DO UPDATE SET text = session_recaps.text \
+             RETURNING text",
         )
         .bind(session_id.as_str())
         .bind(turn_id)
         .bind(text)
         .bind(now.to_rfc3339())
-        .execute(self.db.pool())
+        .fetch_one(self.db.pool())
         .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(stored)
+    }
+
+    /// The review already persisted for one turn, if any.
+    ///
+    /// A request for a turn that already has its one review must not spend a
+    /// model call; this read is the app-side backstop to the client's
+    /// identity-based dedup.
+    pub async fn text_for_turn(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let text = sqlx::query_scalar(
+            "SELECT text FROM session_recaps WHERE session_id = ?1 AND turn_id = ?2",
+        )
+        .bind(session_id.as_str())
+        .bind(turn_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(text)
     }
 
     /// Every review of a session, oldest first.
@@ -108,17 +133,18 @@ mod tests {
     async fn a_turn_has_at_most_one_review() {
         let (db, session, turn) = db_with_turn().await;
         let repo = SessionRecapRepository::new(&db);
-        assert!(
+        assert_eq!(
             repo.record(&session, &turn, "first", leveler_core::now())
                 .await
-                .unwrap()
+                .unwrap(),
+            "first"
         );
-        assert!(
-            !repo
-                .record(&session, &turn, "second", leveler_core::now())
+        assert_eq!(
+            repo.record(&session, &turn, "second", leveler_core::now())
                 .await
                 .unwrap(),
-            "the same turn cannot collect a second review"
+            "first",
+            "a retried generation must publish the durable review, not its own text"
         );
         let rows = repo.load_for_session(&session).await.unwrap();
         assert_eq!(rows.len(), 1);

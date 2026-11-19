@@ -1997,7 +1997,13 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     // Read BEFORE `push_turn_end`: a TurnEnd marker is the scan boundary, so
     // the handoff has to be taken while this turn is still the latest one.
     // The handoff is captured before the terminal so it owns only this turn.
-    let handoff = state.transcript.latest_turn_handoff();
+    // The runtime's terminal is the authority: an accepted `update_goal` can
+    // still be withdrawn before this point, so a declaration that does not
+    // match the final status is not this turn's account.
+    let handoff = state
+        .transcript
+        .latest_turn_handoff()
+        .filter(|handoff| handoff.accepts_terminal(status));
     // A blocked goal's next action is the runtime's continuation. The model's
     // own `next_step` is advice recorded in the recap; it is not the confirmed
     // resume action, so it must not become the offered input.
@@ -2005,7 +2011,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         TurnEndStatus::Blocked => Some(state.t().suggestion_continue.to_string()),
         _ => handoff
             .as_ref()
-            .and_then(|handoff| handoff.next_step.clone())
+            .and_then(|handoff| handoff.recap.next_step.clone())
             .or_else(|| {
                 (status == TurnEndStatus::Incomplete)
                     .then(|| state.t().suggestion_continue.to_string())
@@ -2015,10 +2021,20 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     archive_active_plan(state);
     state.turn_diff_files = None;
     push_turn_receipt(state, status, summary, detail);
-    if status != TurnEndStatus::Cancelled
-        && let Some(handoff) = handoff
-    {
-        state.transcript.push_recap(handoff);
+    if let Some(handoff) = handoff {
+        // The blocked terminal already shows the model's own reason. Repeating
+        // that summary in the recap would say the same thing twice; the recap
+        // adds only the next action, which the terminal does not carry.
+        let recap = match handoff.kind {
+            crate::transcript::TurnHandoffKind::Blocked => crate::transcript::RecapBlock {
+                summary: None,
+                next_step: handoff.recap.next_step,
+            },
+            crate::transcript::TurnHandoffKind::Complete => handoff.recap,
+        };
+        if recap.summary.is_some() || recap.next_step.is_some() {
+            state.transcript.push_recap(recap);
+        }
     }
     // Ghost text, not input: the composer buffer stays exactly as the user
     // left it, and Tab is what moves the suggestion into it.

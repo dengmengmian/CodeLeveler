@@ -9,7 +9,6 @@ use leveler_client_protocol::ClientCommand;
 
 use crate::action::Effect;
 use crate::state::AppState;
-use crate::transcript::TranscriptItem;
 
 /// Ask for a recap of the conversation now on screen.
 ///
@@ -20,14 +19,12 @@ pub fn request(state: &mut AppState) -> Option<Effect> {
     if state.away_summary_pending || state.is_busy() {
         return None;
     }
-    // A turn that already has a durable review — the structured goal recap
-    // the turn terminal pushed, or a recap replayed from history — must not
-    // ask a second time: a reconnect would otherwise drop the row by
-    // rebuilding the transcript and then regenerate it with a new model call.
-    if matches!(
-        state.transcript.items().last(),
-        Some(TranscriptItem::Recap(_)) | Some(TranscriptItem::AwaySummary(_))
-    ) {
+    // A turn that already has a recap — the structured goal recap the turn
+    // terminal pushed, or a review replayed from history — must not ask a
+    // second time. Rows that belong to the same turn (a review card, a shell
+    // execution, a note) can follow the recap, so identity is the current
+    // turn segment, not the last item.
+    if state.transcript.current_turn_has_recap() {
         return None;
     }
     state.away_summary_pending = true;

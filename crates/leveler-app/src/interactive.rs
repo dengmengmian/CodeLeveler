@@ -304,6 +304,21 @@ fn spawn_auxiliary_assist(
         } else {
             None
         };
+        // One review per turn. If this turn already has its durable review,
+        // publish exactly that text without a model call: the request exists
+        // because the client's transcript lacks the row, not because the turn
+        // needs a second, differently worded review.
+        if let Some(turn_id) = recap_turn.as_deref()
+            && let Some(text) = existing_session_recap(&app, &session_id, turn_id).await
+        {
+            let publish = assists.is_current(&session_id, kind, generation)
+                && !active.is_running(&session_id);
+            assists.finish(&session_id, kind, generation);
+            if publish {
+                let _ = events.send(RuntimeEvent::AwaySummary { text });
+            }
+            return;
+        }
         let Some(generated) =
             prompt_assist::generate(&app, &session_id, model, kind, cancellation).await
         else {
@@ -326,15 +341,21 @@ fn spawn_auxiliary_assist(
             AssistKind::AwaySummary => {
                 // Durable BEFORE the client sees it: a reconnect must replay
                 // this exact review instead of regenerating one, and a crash
-                // after delivery must not lose it. A storage failure leaves
-                // the review visible for this session but not replayable; it
-                // is reported rather than silently turning into an empty row.
-                if let Some(turn_id) = recap_turn {
-                    record_session_recap(&app, &session_id, &turn_id, &generated.text).await;
-                }
-                RuntimeEvent::AwaySummary {
-                    text: generated.text,
-                }
+                // after delivery must not lose it. The store returns the row's
+                // authoritative text, so a retried generation publishes the
+                // review replay will show — never a second version that only
+                // this client saw. A storage failure leaves the generated text
+                // visible for this session but not replayable; it is reported
+                // rather than silently turning into an empty row.
+                let text = match recap_turn {
+                    Some(turn_id) => {
+                        record_session_recap(&app, &session_id, &turn_id, &generated.text)
+                            .await
+                            .unwrap_or(generated.text)
+                    }
+                    None => generated.text,
+                };
+                RuntimeEvent::AwaySummary { text }
             }
         };
         let _ = events.send(event);
@@ -353,13 +374,30 @@ async fn settled_turn_id(app: &Arc<Application>, session_id: &SessionId) -> Opti
         .map(|turn| turn.id)
 }
 
+/// The review already persisted for a turn, if any.
+async fn existing_session_recap(
+    app: &Arc<Application>,
+    session_id: &SessionId,
+    turn_id: &str,
+) -> Option<String> {
+    let db = app.open_database().await.ok()?;
+    SessionRecapRepository::new(&db)
+        .text_for_turn(session_id, turn_id)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Persist the review a client is about to see. Idempotent by turn identity.
+///
+/// Returns the row's authoritative text (`None` when it could not be read or
+/// written; the caller then keeps the generated text visible for this session).
 async fn record_session_recap(
     app: &Arc<Application>,
     session_id: &SessionId,
     turn_id: &str,
     text: &str,
-) {
+) -> Option<String> {
     let db = match app.open_database().await {
         Ok(db) => db,
         Err(error) => {
@@ -368,18 +406,22 @@ async fn record_session_recap(
                 error = %error,
                 "the review could not be persisted for replay"
             );
-            return;
+            return None;
         }
     };
-    if let Err(error) = SessionRecapRepository::new(&db)
+    match SessionRecapRepository::new(&db)
         .record(session_id, turn_id, text, leveler_core::now())
         .await
     {
-        tracing::warn!(
-            session = session_id.as_str(),
-            error = %error,
-            "the review could not be persisted for replay"
-        );
+        Ok(stored) => Some(stored),
+        Err(error) => {
+            tracing::warn!(
+                session = session_id.as_str(),
+                error = %error,
+                "the review could not be persisted for replay"
+            );
+            None
+        }
     }
 }
 
