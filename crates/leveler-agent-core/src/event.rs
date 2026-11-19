@@ -27,8 +27,11 @@ pub enum AgentEvent {
     /// Transient: presentation freezes its mutable block into history on this.
     /// A segment that never reaches this event was interrupted, not completed.
     ReasoningCompleted { elapsed_ms: u64 },
-    /// Token usage the model reported for a request (may arrive mid-stream or
-    /// at the end).
+    /// Token usage the model reported for one physical request. Emitted
+    /// exactly once per attempt, after the attempt's durable record is
+    /// accepted, carrying the provider's final value (incremental reports
+    /// are folded, never emitted separately). A request that reported no
+    /// usage emits nothing: unreported is not a measured zero.
     Usage(TokenUsage),
     /// The context accounting of the request the loop is ABOUT to send: what
     /// the exact next model-visible payload is made of, category by category.

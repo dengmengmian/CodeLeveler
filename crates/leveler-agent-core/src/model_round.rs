@@ -355,6 +355,17 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
                 projected_input_tokens,
             })
             .await?;
+        // One live usage signal per physical attempt, after the attempt's
+        // durable record is accepted. The provider may have reported usage
+        // incrementally or only once; this is the single final measurement
+        // that consumers see. An interrupted attempt still spent its tokens,
+        // so it emits its own signal exactly once. A request with no
+        // reported usage emits nothing: unreported is not a measured zero.
+        if let Some(usage) = observed_usage
+            && usage.total() > 0
+        {
+            observer.on_event(AgentEvent::Usage(usage));
+        }
         let error = match outcome {
             Ok(mut value) => {
                 value.retry_count = retries;
@@ -785,7 +796,9 @@ async fn stream_round(
             Ok(ModelEvent::UsageUpdated {
                 usage: latest_usage,
             }) => {
-                on_event(AgentEvent::Usage(latest_usage));
+                // Fold only. The consumer-facing signal is emitted once per
+                // physical attempt after the attempt is settled (see the
+                // retry loop), so incremental reports cannot double-count.
                 // A zero report is the ABSENCE of a measurement, not a
                 // measurement of zero. A gateway that emits an empty `usage`
                 // object after the real one must not erase it, or the round
@@ -857,11 +870,9 @@ async fn stream_round(
         "model round finished"
     );
 
-    // Guarantee one final usage signal even when the provider only reported
-    // tokens once mid-stream (or only after completion).
-    if usage.total() > 0 {
-        on_event(AgentEvent::Usage(usage));
-    }
+    // Usage is settled by the retry loop: it emits exactly one live signal
+    // per physical attempt after `on_attempt` records the measurement. This
+    // function only assembles the round.
 
     // Same part order as the non-streaming path
     // (`leveler_model::stream_from_response`): reasoning, then text, then the
@@ -3162,6 +3173,204 @@ mod attempt_contract_tests {
         assert_eq!(round.usage.output_tokens, 3);
         assert!(
             matches!(observer.attempts[0].error.as_ref().unwrap().delivery_state, DeliveryState::StreamInterrupted { progress } if progress.reasoning && !progress.text && !progress.tool_args)
+        );
+    }
+}
+
+/// The live usage signal is one measurement per physical model request.
+///
+/// The provider may report usage incrementally and again at the end; the
+/// round folds every report into the attempt ledger, but consumer-facing
+/// telemetry must see the final value exactly once. Otherwise any stream
+/// consumer that sums usage events (dashboards, cost reports, the audit log)
+/// doubles the request's tokens.
+#[cfg(test)]
+mod usage_emission_tests {
+    use super::*;
+    use leveler_model::{ModelEventStream, ModelProfile, ModelRef, ModelResponse};
+    use std::sync::Mutex;
+
+    struct Scripted {
+        scripts: Mutex<Vec<Vec<Result<ModelEvent, ModelError>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelRuntime for Scripted {
+        async fn stream(
+            &self,
+            _: ModelRequest,
+            _: CancellationToken,
+        ) -> Result<ModelEventStream, ModelError> {
+            let script = self.scripts.lock().unwrap().remove(0);
+            Ok(Box::pin(futures::stream::iter(script)))
+        }
+        async fn generate(
+            &self,
+            _: ModelRequest,
+            _: CancellationToken,
+        ) -> Result<ModelResponse, ModelError> {
+            unreachable!()
+        }
+        async fn profile(&self, _: &ModelRef) -> Result<ModelProfile, ModelError> {
+            unreachable!()
+        }
+    }
+
+    fn usage_event(input: u64, output: u64) -> Result<ModelEvent, ModelError> {
+        Ok(ModelEvent::UsageUpdated {
+            usage: TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn completed() -> Result<ModelEvent, ModelError> {
+        Ok(ModelEvent::MessageCompleted {
+            finish_reason: FinishReason::Stop,
+        })
+    }
+
+    fn no_output_cut() -> ModelError {
+        ModelError::new(ModelErrorKind::StreamInterrupted, "cut").with_delivery_state(
+            DeliveryState::StreamInterrupted {
+                progress: StreamProgress::default(),
+            },
+        )
+    }
+
+    fn request() -> ModelRequest {
+        ModelRequest::new(
+            ModelRef::new("mock", "m"),
+            vec![Message::text(Role::User, "hi")],
+        )
+    }
+
+    fn policy(max_retries: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_retries,
+            delay_scale: 0.0,
+            recovery_window: None,
+        }
+    }
+
+    fn usage_signals(events: &[AgentEvent]) -> Vec<TokenUsage> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_request_emits_only_its_final_usage() {
+        let runtime = Scripted {
+            scripts: Mutex::new(vec![vec![
+                usage_event(100, 10),
+                usage_event(100, 20),
+                completed(),
+            ]]),
+        };
+        let mut events = Vec::new();
+        run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+            policy(0),
+        )
+        .await
+        .expect("the request completes");
+
+        let seen = usage_signals(&events);
+        assert_eq!(
+            seen.len(),
+            1,
+            "one physical request must emit one usage signal, got {seen:?}"
+        );
+        assert_eq!(seen[0].output_tokens, 20, "the final report wins");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_attempt_emits_its_usage_once_and_the_retry_emits_its_own() {
+        let runtime = Scripted {
+            scripts: Mutex::new(vec![
+                vec![usage_event(100, 5), Err(no_output_cut())],
+                vec![usage_event(120, 7), completed()],
+            ]),
+        };
+        let mut events = Vec::new();
+        run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+            policy(1),
+        )
+        .await
+        .expect("the retry lands");
+
+        let seen = usage_signals(&events);
+        assert_eq!(
+            seen.len(),
+            2,
+            "each physical request emits one signal, failed or not: {seen:?}"
+        );
+        assert_eq!(seen[0].output_tokens, 5, "the interrupted attempt's spend");
+        assert_eq!(seen[1].output_tokens, 7, "the retry's own spend");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_attempt_still_emits_its_observed_usage_once() {
+        let runtime = Scripted {
+            scripts: Mutex::new(vec![vec![
+                usage_event(100, 4),
+                Err(ModelError::cancelled()),
+            ]]),
+        };
+        let mut events = Vec::new();
+        let result = run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+            policy(0),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AgentCoreError::Cancelled)),
+            "{result:?}"
+        );
+        let seen = usage_signals(&events);
+        assert_eq!(
+            seen.len(),
+            1,
+            "a cancelled request still spent its observed tokens: {seen:?}"
+        );
+        assert_eq!(seen[0].output_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn an_unreported_usage_emits_no_zero_measurement() {
+        let runtime = Scripted {
+            scripts: Mutex::new(vec![vec![usage_event(0, 0), completed()]]),
+        };
+        let mut events = Vec::new();
+        run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+            policy(0),
+        )
+        .await
+        .expect("the request completes");
+        assert!(
+            usage_signals(&events).is_empty(),
+            "unreported is not a measured zero"
         );
     }
 }
