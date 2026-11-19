@@ -14,6 +14,7 @@ pub mod home;
 pub mod ids;
 pub mod ownership;
 pub mod path;
+pub mod private_fs;
 pub mod resource_grant;
 pub mod secret;
 pub mod test_crash;

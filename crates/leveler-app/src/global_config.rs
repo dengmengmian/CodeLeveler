@@ -719,6 +719,10 @@ impl GlobalConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
+            // The home root holds config, state, logs and skills. Keep the
+            // whole tree owner-only rather than relying on each child's mode.
+            leveler_core::private_fs::restrict_dir(parent)
+                .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
         }
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -736,6 +740,11 @@ impl GlobalConfig {
         // any other reader) must never observe a half-written configuration.
         let staged = path.with_extension("toml.tmp");
         std::fs::write(&staged, doc.to_string())
+            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
+        // The file may carry provider keys and MCP environment values. Set the
+        // owner-only mode on the staged file so the rename publishes both the
+        // content and its permissions atomically.
+        leveler_core::private_fs::restrict_file(&staged)
             .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
         std::fs::rename(&staged, path).map_err(|e| {
             let _ = std::fs::remove_file(&staged);
@@ -3068,6 +3077,22 @@ provider = "deepseek"
                 .default_model
                 .as_deref(),
             Some("p/m")
+        );
+    }
+
+    /// The file can carry provider API keys and MCP environment blocks, so a
+    /// config this process writes must not be readable by other local users.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        GlobalConfig::save_default_model_at(&path, &leveler_model::ModelRef::new("p", "m"))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

@@ -172,12 +172,16 @@ fn tui_log_file() -> Option<std::fs::File> {
         .join("leveler.log");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
+        leveler_core::private_fs::restrict_dir(parent).ok()?;
     }
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-        .ok()
+        .open(&path)
+        .ok()?;
+    // Diagnostics can quote command lines and paths; keep the log owner-only.
+    leveler_core::private_fs::restrict_file(&path).ok()?;
+    Some(file)
 }
 
 fn resolve_layout(repo: Option<PathBuf>, config_dir: Option<PathBuf>) -> anyhow::Result<Layout> {

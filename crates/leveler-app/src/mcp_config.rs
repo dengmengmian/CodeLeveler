@@ -378,7 +378,10 @@ fn write_document(path: &std::path::Path, doc: &DocumentMut) -> Result<(), McpCo
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| McpConfigError::Io(e.to_string()))?;
     }
-    std::fs::write(path, doc.to_string()).map_err(|e| McpConfigError::Io(e.to_string()))
+    std::fs::write(path, doc.to_string()).map_err(|e| McpConfigError::Io(e.to_string()))?;
+    // MCP environment blocks can carry credentials; the resident config is
+    // owner-only like the rest of the private home.
+    leveler_core::private_fs::restrict_file(path).map_err(|e| McpConfigError::Io(e.to_string()))
 }
 
 /// A server name a runtime and a client can both address unambiguously.

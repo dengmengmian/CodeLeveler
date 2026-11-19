@@ -227,6 +227,9 @@ impl ScheduleStore {
             pool.close().await;
             return Err(error.into());
         }
+        // Schedule definitions can carry command lines and agent goals; keep
+        // the store and its sidecars owner-only like session history.
+        leveler_core::private_fs::restrict_sqlite(options.get_filename())?;
         Ok(Self { pool })
     }
 

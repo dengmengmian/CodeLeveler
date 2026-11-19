@@ -79,6 +79,9 @@ pub enum StorageError {
     /// so retrying will not help.
     #[error("invalid persisted data: {0}")]
     InvalidData(String),
+    /// A durable file could not be secured or opened.
+    #[error("storage I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// A handle to the SQLite database (WAL mode, foreign keys on).
@@ -120,6 +123,11 @@ impl Database {
         .await;
         migration_pool.close().await;
         result?;
+        // Session history contains the user's conversation and tool
+        // arguments/results. SQLite's default mode follows the umask, so an
+        // existing or freshly created database and its sidecars are made
+        // owner-only before any pool is exposed to callers.
+        leveler_core::private_fs::restrict_sqlite(path)?;
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -1167,5 +1175,31 @@ mod tests {
         assert_eq!(peek_repository(&junk).await, None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Session history carries tool arguments and results, which can include
+    /// credentials the user or a command printed. The file must be readable
+    /// only by its owner, including the WAL sidecar a write creates.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_session_database_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let db = Database::connect(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, repository, goal, status, model, state, \
+             created_at, updated_at) VALUES ('s','/r','g','created','m','understand','t','t')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for candidate in [path.clone(), path.with_extension("db-wal"), path.with_extension("db-shm")] {
+            if !candidate.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(&candidate).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be owner-only", candidate.display());
+        }
     }
 }

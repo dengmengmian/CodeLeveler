@@ -1419,6 +1419,15 @@ impl Application {
             path: self.layout.state_dir.display().to_string(),
             source,
         })?;
+        // The state directory holds the session database and permission
+        // rules. Keep it owner-only; the database file itself is restricted
+        // at the storage boundary as well.
+        leveler_core::private_fs::restrict_dir(&self.layout.state_dir).map_err(|source| {
+            AppError::Io {
+                path: self.layout.state_dir.display().to_string(),
+                source,
+            }
+        })?;
         let connect_started = std::time::Instant::now();
         let db = Database::connect(&self.layout.database_path()).await?;
         tracing::info!(
