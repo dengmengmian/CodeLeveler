@@ -107,6 +107,22 @@ pub(crate) fn content_objective_text(content: &[ContentPart]) -> String {
     }
 }
 
+/// Whether this turn starts without the file observations an earlier turn
+/// made. Every turn after the session's first one either continues a prior
+/// transcript (Content), continues a goal that already ran windows, or is an
+/// explicit Resume. Within one process the observations are shared, so the
+/// flag is harmless there; after a restart it is the only thing that keeps an
+/// overwrite of an unread file from succeeding.
+fn requires_file_observation(input: &TurnInput) -> bool {
+    match input {
+        TurnInput::Resume { .. } => true,
+        TurnInput::Goal {
+            prior, continuing, ..
+        } => *continuing || !prior.is_empty(),
+        TurnInput::Content { prior, .. } => !prior.is_empty(),
+    }
+}
+
 /// Build the turn's executor, run it, and report the facts the engine records.
 ///
 /// Every durable side of the turn arrives through `ports`: the executor never
@@ -249,10 +265,13 @@ pub async fn drive_turn(
         executor = executor.with_goal_verification_source(source);
     }
 
-    // A resumed execution has no in-process file observations. Existing files
-    // it wants to overwrite are unknown versions: require a fresh read first.
-    // New files remain creatable; a fresh turn keeps the old behavior.
-    if resumes_task_epoch {
+    // A turn that continues earlier work has no file observations of its own
+    // after a restart. Existing files it wants to overwrite are unknown
+    // versions: require a fresh read first. This covers an explicit Resume, a
+    // continued goal window, and an ordinary `--session` reopen (a Content
+    // turn carrying prior messages). New files remain creatable; the first
+    // turn of a fresh session keeps the old behavior.
+    if requires_file_observation(&input) {
         executor.set_require_file_observation(true);
     }
 
@@ -2464,5 +2483,75 @@ mod clarification_answer_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod file_observation_tests {
+    use super::*;
+    use leveler_model::{Message, Role, TranscriptOrigin};
+
+    fn content(prior: Vec<Message>) -> TurnInput {
+        TurnInput::Content {
+            prior,
+            content: vec![ContentPart::Text { text: "next".into() }],
+            origin: TranscriptOrigin::UserInput,
+        }
+    }
+
+    fn goal(prior: Vec<Message>, continuing: bool) -> TurnInput {
+        TurnInput::Goal {
+            goal: "finish it".into(),
+            content: vec![ContentPart::Text {
+                text: "finish it".into(),
+            }],
+            origin: TranscriptOrigin::UserInput,
+            prior,
+            goal_id: leveler_core::GoalId::new("g1"),
+            verification: VerificationFacts::default(),
+            continuing,
+        }
+    }
+
+    /// The first turn of a fresh session may create or replace a file without
+    /// a prior read; that is the established behavior and not what changed.
+    #[test]
+    fn the_first_turn_of_a_fresh_session_needs_no_prior_read() {
+        assert!(!requires_file_observation(&content(Vec::new())));
+        assert!(!requires_file_observation(&goal(Vec::new(), false)));
+    }
+
+    /// A `--session` reopen is an ordinary Content turn. It carries the prior
+    /// transcript but no in-process observations, so an overwrite of an
+    /// existing file must be preceded by a read.
+    #[test]
+    fn an_ordinary_session_reopen_requires_a_prior_read() {
+        let prior = vec![Message::text(Role::User, "earlier request")];
+        assert!(requires_file_observation(&content(prior.clone())));
+        assert!(requires_file_observation(&goal(prior, false)));
+    }
+
+    /// A goal window continues earlier work even when its own prior list is
+    /// bounded away; the continuation flag is still a restart boundary.
+    #[test]
+    fn a_continued_goal_window_requires_a_prior_read() {
+        assert!(requires_file_observation(&goal(Vec::new(), true)));
+    }
+
+    #[test]
+    fn an_explicit_resume_requires_a_prior_read() {
+        let resume = TurnInput::Resume {
+            prior: Vec::new(),
+            instruction: None,
+            objective: leveler_lifecycle::ObjectiveAnchor::new(
+                "resume",
+                leveler_lifecycle::ObjectiveSource::ContinueActive,
+            ),
+            lineage_turn_ids: Vec::new(),
+            root_turn_id: leveler_core::TurnId::new("t1"),
+            goal_id: None,
+            verification: VerificationFacts::default(),
+        };
+        assert!(requires_file_observation(&resume));
     }
 }

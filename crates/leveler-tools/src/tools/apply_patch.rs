@@ -785,10 +785,9 @@ impl Tool for ApplyPatchTool {
                         }
                         Staleness::Unobserved => {
                             return Ok(ToolOutput::error(format!(
-                                "{path} has not been read in this session window — the task was \
-                                 resumed, so its current contents are unknown. Nothing was \
-                                 written. Read {path}, then rebuild the patch against what is \
-                                 there now."
+                                "{path} has not been read in this session window — its current \
+                                 contents are unknown. Nothing was written. Read {path}, then \
+                                 rebuild the patch against what is there now."
                             )));
                         }
                     }

@@ -168,10 +168,9 @@ impl Tool for WriteFileTool {
                     }
                     Staleness::Unobserved => {
                         return Ok(ToolOutput::error(format!(
-                            "{} has not been read in this session window — the task was \
-                             resumed, so its current contents are unknown. Nothing was \
-                             written. Read {}, then decide again whether to replace the \
-                             whole file.",
+                            "{} has not been read in this session window — its current contents \
+                             are unknown. Nothing was written. Read {}, then decide again \
+                             whether to replace the whole file.",
                             input.path, input.path
                         )));
                     }
