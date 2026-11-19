@@ -108,18 +108,28 @@ pub(crate) fn content_objective_text(content: &[ContentPart]) -> String {
 }
 
 /// Whether this turn starts without the file observations an earlier turn
-/// made. Every turn after the session's first one either continues a prior
-/// transcript (Content), continues a goal that already ran windows, or is an
-/// explicit Resume. Within one process the observations are shared, so the
-/// flag is harmless there; after a restart it is the only thing that keeps an
-/// overwrite of an unread file from succeeding.
+/// made. A later turn either continues prior assistant work (Content), continues
+/// a goal that already ran windows, or is an explicit Resume. Within one
+/// process the observations are shared, so the flag is harmless there; after a
+/// restart it is the only thing that keeps an overwrite of an unread file from
+/// succeeding.
+///
+/// A Content turn's `prior` also carries this turn's user message (and may
+/// carry a system notice), so a non-empty list is not evidence of earlier
+/// work. An assistant message is: it is what any earlier turn that could have
+/// read a file produced.
 fn requires_file_observation(input: &TurnInput) -> bool {
+    fn prior_work(prior: &[Message]) -> bool {
+        prior
+            .iter()
+            .any(|message| message.role == leveler_model::Role::Assistant)
+    }
     match input {
         TurnInput::Resume { .. } => true,
         TurnInput::Goal {
             prior, continuing, ..
-        } => *continuing || !prior.is_empty(),
-        TurnInput::Content { prior, .. } => !prior.is_empty(),
+        } => *continuing || prior_work(prior),
+        TurnInput::Content { prior, .. } => prior_work(prior),
     }
 }
 
@@ -2517,18 +2527,25 @@ mod file_observation_tests {
 
     /// The first turn of a fresh session may create or replace a file without
     /// a prior read; that is the established behavior and not what changed.
+    /// The turn's own user message is in `prior`, so a non-empty list alone
+    /// must not switch the guard on.
     #[test]
     fn the_first_turn_of_a_fresh_session_needs_no_prior_read() {
+        let own_message = vec![Message::text(Role::User, "this turn")];
         assert!(!requires_file_observation(&content(Vec::new())));
-        assert!(!requires_file_observation(&goal(Vec::new(), false)));
+        assert!(!requires_file_observation(&content(own_message.clone())));
+        assert!(!requires_file_observation(&goal(own_message, false)));
     }
 
-    /// A `--session` reopen is an ordinary Content turn. It carries the prior
-    /// transcript but no in-process observations, so an overwrite of an
+    /// A `--session` reopen is an ordinary Content turn. It carries prior
+    /// assistant work but no in-process observations, so an overwrite of an
     /// existing file must be preceded by a read.
     #[test]
     fn an_ordinary_session_reopen_requires_a_prior_read() {
-        let prior = vec![Message::text(Role::User, "earlier request")];
+        let prior = vec![
+            Message::text(Role::User, "earlier request"),
+            Message::text(Role::Assistant, "earlier answer"),
+        ];
         assert!(requires_file_observation(&content(prior.clone())));
         assert!(requires_file_observation(&goal(prior, false)));
     }
