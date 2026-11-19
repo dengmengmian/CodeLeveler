@@ -8603,15 +8603,12 @@ async fn execution_state_separates_cumulative_usage_caps_and_mechanical_breakers
     // Real configured limits are labeled as such, and absent ones as absent.
     assert_eq!(state["duration_limit_set"], false);
     assert_eq!(state["cost_usd_micros"]["limit_set"], false);
-    let facts = state["budget_facts"]
-        .as_str()
-        .expect("the projection states the budget facts");
-    assert!(facts.contains("cumulative"), "{facts}");
-    assert!(facts.contains("unlimited"), "{facts}");
-    assert!(facts.contains("mechanical safety breaker"), "{facts}");
+    // What the numbers mean is stated once by the system contract. Repeating
+    // it inside the uncached trailing observation would pay that prose on
+    // every request.
     assert!(
-        !facts.contains("remaining"),
-        "the projection never invents a remaining budget: {facts}"
+        state.get("budget_facts").is_none(),
+        "the observation carries numbers, not a second copy of their meaning: {state:?}"
     );
     assert!(
         state.get("model_steps_remaining").is_none(),

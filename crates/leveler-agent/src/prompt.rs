@@ -602,6 +602,49 @@ mod tests {
         assert!(BASE_PROMPT.contains("You are CodeLeveler"));
     }
 
+    /// The execution state is numbers. What those numbers *mean* is a contract
+    /// fact, stated once in the cached system prompt instead of repeated as
+    /// prose inside the uncached observation on every request.
+    #[test]
+    fn the_base_prompt_explains_the_execution_state_numbers() {
+        let prompt = PromptBuilder::new().build();
+        for needle in [
+            "cumulative usage",
+            "not an allowance",
+            "mechanical safety breaker",
+            "host-owned work unit",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "the execution-state semantics lost `{needle}`: {prompt}"
+            );
+        }
+    }
+
+    /// One round can carry several tool calls. The runtime has always executed
+    /// them in the order written — serial calls in place, read-only calls
+    /// deferred within the same order — but the contract never said so. Models
+    /// then spent an entire model round on a lone `declare_scope` or
+    /// `update_plan` call whose action followed in the next one. The fact
+    /// belongs in the prompt: how one message's calls are treated, without
+    /// telling the model which calls to make.
+    #[test]
+    fn the_base_prompt_states_how_one_rounds_tool_calls_run() {
+        let prompt = PromptBuilder::new().build();
+        for needle in ["several tool calls", "in the order written", "later round"] {
+            assert!(
+                prompt.contains(needle),
+                "the batch contract lost `{needle}`: {prompt}"
+            );
+        }
+        for name in ["`declare_scope`", "`update_plan`", "`update_goal`"] {
+            assert!(
+                prompt.contains(name),
+                "the control calls named by the batch contract lost {name}: {prompt}"
+            );
+        }
+    }
+
     /// Evidence stays a contract. The harness does not decide when a check runs.
     #[test]
     fn the_base_prompt_keeps_evidence_and_truthfulness() {

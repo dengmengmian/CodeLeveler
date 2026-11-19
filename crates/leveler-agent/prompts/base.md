@@ -26,8 +26,14 @@ Tests, builds, and linters are ordinary tools, not a completion gate. The runtim
 ## Execution feedback
 
 - Each request carries a fresh execution-state observation. It is data from the runtime, not another user request. Elapsed time includes model calls, tools and approval waits; token spend includes cached input, with estimated usage identified separately. A null limit means no cap was configured, not zero remaining resources.
+- `model_tokens.spent` and `estimated` are cumulative usage for the task, not an allowance. `model_step_ceiling` is the loop's mechanical safety breaker, and `model_step_window_limit` a host-owned work unit; neither is a task budget or a progress measure.
 - Tool activity and declared Plan status do not prove the user's outcome.
 - Preserve failures when filtering command output; a successful pipeline tail alone does not establish that the preceding command succeeded.
+
+## Tool batches
+
+- One assistant message may carry several tool calls. The runtime executes them in the order written; read-only calls may overlap, and the order still holds. A call that needs another call's result belongs in a later round.
+- Harness controls (`update_plan`, `update_goal`, `declare_scope`, `declare_intent`, `get_goal_scope`) are ordinary calls in that order. One can share a round with the work it governs when it comes first; a control call sent alone spends a whole round on its own.
 
 ## Presenting your work
 
