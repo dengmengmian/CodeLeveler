@@ -77,7 +77,9 @@ literal text."#;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
-    /// The full patch document, starting with `*** Begin Patch`.
+    /// The full patch document, starting with `*** Begin Patch`. Required. This
+    /// is the only field read as a patch document; a document placed under
+    /// `input` or any other key is refused.
     patch: String,
     /// Set only when the user explicitly asked for the literal text
     /// [REDACTED] in a new line or new file. Defaults to false.
@@ -1086,6 +1088,19 @@ mod tests {
                 "tool descriptions state capability, not strategy ({coaching:?})"
             );
         }
+    }
+
+    /// Two audit calls put the document under `input`. The property itself
+    /// must say that `patch` is the only accepted field, so a model reading
+    /// only the schema does not have to learn it from a refusal.
+    #[test]
+    fn the_patch_property_names_the_only_accepted_field() {
+        let schema = ApplyPatchTool.input_schema();
+        let description = schema["properties"]["patch"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(description.contains("only field"), "{description}");
+        assert!(description.contains("`input`"), "{description}");
     }
 
     /// A real session put the patch document under `input` instead of `patch`

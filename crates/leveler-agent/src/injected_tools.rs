@@ -167,7 +167,7 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
                 "status": {
                     "type": "string",
                     "enum": ["complete", "blocked", "yield"],
-                    "description": "Meaning is defined by the tool description above."
+                    "description": "Required. `complete`, `blocked`, or `yield`; the meaning of each is defined by the tool description above."
                 },
                 "blocked_kind": {
                     "type": "string",
@@ -487,6 +487,7 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 8,
+                    "description": "At most 8 operations per call. Split a larger declaration into multiple calls.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -614,6 +615,7 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 8,
+                    "description": "At most 8 operations per call. Split a larger declaration into multiple calls.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -656,7 +658,7 @@ pub(crate) fn declare_intent_tool_definition() -> ToolDefinition {
                         "required": ["kind"],
                         "additionalProperties": false
                     },
-                    "description": "Ordered operations. Applied in this order."
+                    "description": "Ordered operations. Applied in this order. At most 8 operations per call; split a larger declaration into multiple calls."
                 }
             },
             "required": ["operations", "source_quote"],
@@ -1809,6 +1811,28 @@ mod plan_sync_contract_tests {
                 def.description.contains(needle),
                 "completion semantics lost `{needle}`"
             );
+        }
+    }
+
+    /// Two audit calls omitted `status` even though the schema required it;
+    /// two more exceeded the 8-operation cap. Keep the field-level contract
+    /// explicit, not only in the long tool description or `maxItems`.
+    #[test]
+    fn the_required_fields_state_their_contract_in_the_property() {
+        let goal = super::update_goal_tool_definition();
+        let status = goal.input_schema["properties"]["status"]["description"]
+            .as_str()
+            .expect("status description");
+        assert!(status.contains("Required"), "{status}");
+        assert!(status.contains("complete"), "{status}");
+        for schema in [
+            super::declare_scope_tool_definition().input_schema,
+            super::declare_intent_tool_definition().input_schema,
+        ] {
+            let operations = schema["properties"]["operations"]["description"]
+                .as_str()
+                .expect("operations description");
+            assert!(operations.contains("At most 8 operations"), "{operations}");
         }
     }
 
