@@ -2160,6 +2160,7 @@ dependencies = [
  "leveler-tools",
  "leveler-tui",
  "leveler-update",
+ "leveler-win-confine",
  "ratatui",
  "reqwest 0.12.28",
  "serde",

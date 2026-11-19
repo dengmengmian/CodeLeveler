@@ -12,11 +12,18 @@
 //! already carry a Low label for reasons of their own. "Authorized roots are
 //! writable, ordinary files are not" is the guarantee; "nowhere else" is not.
 //!
+//! MIC also does not govern deletion: NTFS checks the parent directory's label
+//! for delete, so a Low workspace would let the child delete or replace a
+//! Medium-labelled `AGENTS.md`. Every existing protected file therefore also
+//! carries a delete-sharing fence held by the trusted runtime (`PathGuard`):
+//! delete, rename and replace fail with a sharing violation for the command's
+//! lifetime, while ordinary business files stay freely writable.
+//!
 //! Three pieces live here:
 //! - [`launcher_path`] finds `leveler-confine.exe`, the argv wrapper that
 //!   lowers the token — the Windows counterpart of `sandbox-exec` / `bwrap`.
-//! - [`lease_write_roots`] labels the write roots and puts their labels back
-//!   when the command ends.
+//! - [`lease_write_roots`] labels the write roots, fences protected files, and
+//!   puts their labels back when the command ends.
 //! - [`recover_stale_write_roots`] puts them back after a run that never got
 //!   to. A lowered label outlives the process that lowered it, so the record
 //!   that describes it has to be durable and has to be acted on without
@@ -141,6 +148,12 @@ struct LeasedRoot {
 #[derive(Debug)]
 pub struct WriteRootLease {
     roots: Vec<LeasedRoot>,
+    /// Delete-sharing fences on every existing protected file (and the files
+    /// inside a protected directory). MIC denies write-up but does not govern
+    /// deletion, so without these a Low child could delete or replace a
+    /// Medium-labelled `AGENTS.md`. Dropped with the command.
+    #[cfg(windows)]
+    _guards: Vec<leveler_win_confine::PathGuard>,
 }
 
 impl Drop for WriteRootLease {
@@ -184,7 +197,11 @@ pub fn lease_write_roots(
     ensure_recovered(&records)?;
 
     let home = leveler_core::LevelerHome::resolve(environment);
-    let mut lease = WriteRootLease { roots: Vec::new() };
+    let mut lease = WriteRootLease {
+        roots: Vec::new(),
+        #[cfg(windows)]
+        _guards: Vec::new(),
+    };
     for root in roots {
         // A root CodeLeveler owns is never restored, so it needs no record —
         // and a record for it would tell recovery to undo a label that is
@@ -202,6 +219,8 @@ pub fn lease_write_roots(
         if !path.exists() {
             continue;
         }
+        #[cfg(windows)]
+        guard_protected_tree(path, &mut lease._guards)?;
         let restorable = !is_leveler_owned(path, home.root());
         let record = acquire(path, &records, restorable, DesiredLabel::Medium)?;
         if let Some(record) = record {
@@ -212,6 +231,104 @@ pub fn lease_write_roots(
         }
     }
     Ok(lease)
+}
+
+/// Fence every existing file a protected path covers against delete, rename
+/// and replace. A directory handle alone does not stop NTFS from renaming the
+/// directory; a fenced file inside does, so the walk fences files (and the
+/// directory handle for completeness).
+///
+/// `.git` is walked one level only: its internals number in the thousands and
+/// its top-level files (`HEAD`, refs, index) are what make a rename/deletion
+/// visible as a repository-integrity violation. Definition directories are
+/// small and are walked fully.
+#[cfg(windows)]
+fn guard_protected_tree(
+    path: &Path,
+    guards: &mut Vec<leveler_win_confine::PathGuard>,
+) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        // The link itself is not policy content; the object it reaches is
+        // fenced at its own path when that path is protected.
+        return Ok(());
+    }
+    if metadata.is_file() {
+        guards.push(leveler_win_confine::guard_path(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot fence protected file {} against delete/rename: {error}",
+                    path.display()
+                ),
+            )
+        })?);
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        // The directory handle does not itself block a rename, but it pins the
+        // object while the walk runs and makes the intent explicit.
+        guards.push(leveler_win_confine::guard_path(path)?);
+        let depth_limit = if path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+        {
+            1
+        } else {
+            usize::MAX
+        };
+        guard_directory_files(path, 0, depth_limit, guards)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn guard_directory_files(
+    directory: &Path,
+    depth: usize,
+    depth_limit: usize,
+    guards: &mut Vec<leveler_win_confine::PathGuard>,
+) -> io::Result<()> {
+    if depth >= depth_limit {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        // A protected path that exists but cannot be listed is not silently
+        // left unfenced: the caller must see the failure.
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot enumerate protected directory {}: {error}",
+                    directory.display()
+                ),
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            guard_directory_files(&entry.path(), depth + 1, depth_limit, guards)?;
+        } else if file_type.is_file() {
+            guards.push(
+                leveler_win_confine::guard_path(&entry.path()).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot fence protected file {} against delete/rename: {error}",
+                            entry.path().display()
+                        ),
+                    )
+                })?,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether `root` is one of CodeLeveler's own directories rather than the
@@ -1116,6 +1233,61 @@ mod windows_canaries {
         );
     }
 
+    /// The whole `.leveler` namespace is Medium while the workspace is Low, so
+    /// a *missing* `agents`/`skills` directory cannot be forged by creating it
+    /// inside the protected parent. An existing nested `AGENTS.md` is policy
+    /// text at any depth and is protected like the root one. Ordinary source
+    /// writes remain possible.
+    #[tokio::test]
+    async fn a_confined_command_cannot_forge_definitions_or_rewrite_nested_rules() {
+        if !cfg!(windows) || !launcher_or_skip() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("src").join("deep")).expect("nested");
+        std::fs::create_dir_all(workspace.path().join(".leveler")).expect("leveler dir");
+        let nested = workspace.path().join("src").join("deep").join("AGENTS.md");
+        std::fs::write(&nested, "NESTED-RULES").unwrap();
+        std::fs::write(
+            workspace.path().join(".leveler").join("config.yaml"),
+            "default_mode: assisted\n",
+        )
+        .unwrap();
+
+        let output = host_runner()
+            .run(
+                confined(
+                    "echo PWNED>> src\\deep\\AGENTS.md & \
+                     mkdir .leveler\\agents & \
+                     echo PWNED> .leveler\\agents\\evil.yaml & \
+                     echo PWNED> .leveler\\config.yaml & \
+                     echo fine> src\\ordinary.txt",
+                    workspace.path(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("confined command must run");
+        assert_eq!(
+            std::fs::read_to_string(&nested).unwrap(),
+            "NESTED-RULES",
+            "an existing nested rule document must stay write-denied: {output:?}"
+        );
+        assert!(
+            !workspace.path().join(".leveler").join("agents").exists(),
+            "a missing definition directory must not be creatable under `.leveler`: {output:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".leveler").join("config.yaml")).unwrap(),
+            "default_mode: assisted\n",
+            "shell commands cannot author `.leveler` content: {output:?}"
+        );
+        assert!(
+            workspace.path().join("src").join("ordinary.txt").is_file(),
+            "ordinary source writes must stay allowed: {output:?}"
+        );
+    }
+
     /// The whole point of the backend: a coding agent on Windows must still be
     /// able to run the toolchain that lives outside its workspace.
     #[tokio::test]
@@ -1220,6 +1392,30 @@ mod windows_canaries {
             "a confined command wrote outside its workspace: {}",
             target.display()
         );
+    }
+
+    /// The delete fence is a real OS sharing boundary: while the guard is
+    /// alive the guarded file cannot be opened for DELETE by any process
+    /// (including this one), so delete/rename/replace fail. Releasing the
+    /// guard must re-allow it, or ordinary toolchain work would stay blocked.
+    #[tokio::test]
+    async fn a_delete_guard_blocks_delete_until_it_is_released() {
+        if !cfg!(windows) {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let agents = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents, "RULES").unwrap();
+        let guard = leveler_win_confine::guard_path(&agents).expect("guard");
+        let denied = std::fs::remove_file(&agents);
+        assert!(
+            denied.is_err(),
+            "a guarded file must not be deletable: {denied:?}"
+        );
+        std::fs::rename(&agents, workspace.path().join("moved.md"))
+            .expect_err("a guarded file must not be renameable");
+        drop(guard);
+        std::fs::remove_file(&agents).expect("after release the fence is gone");
     }
 
     /// The label is a change to the user's repository, so it has to come back.

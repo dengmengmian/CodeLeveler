@@ -437,3 +437,634 @@ pub(crate) fn restore(path: &Path, previous: &IntegrityLabel) -> io::Result<()> 
         } => write_label(path, Some((sid, *ace_flags, *mask))),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Owner-only state directories and object validation.
+//
+// The persistent Execution Host keeps its durable records (spawn intents, task
+// archive, ready endpoint) in a state directory. Unix requires a 0700
+// directory owned by the effective user and refuses symlinks. Windows has no
+// mode bits, so the equivalent invariant is an owner-only DACL: the directory
+// and the files in it are accessible only to the current user, SYSTEM and the
+// Administrators group, with inheritance protected (no inherited Everyone /
+// Users / Authenticated Users ACEs), and no reparse point stands where the
+// directory should be.
+// ---------------------------------------------------------------------------
+
+/// `FILE_ALL_ACCESS` — every file right, used for the owner-only DACL.
+const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+
+/// The current process token's user SID, copied into an owned allocation.
+struct CurrentUserSid(PSID);
+
+impl Drop for CurrentUserSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the SID was allocated with GetTokenInformation into a
+            // Vec, then copied here with CopySid; LocalAlloc owns it.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+fn current_user_sid() -> io::Result<CurrentUserSid> {
+    use windows_sys::Win32::Security::{
+        CopySid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = INVALID_HANDLE_VALUE;
+    // SAFETY: the pseudo-handle is valid; `token` is a live out-parameter.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = OwnedHandle(token);
+
+    let mut needed = 0u32;
+    // SAFETY: a zero-length query only reports the required size and fails
+    // with ERROR_INSUFFICIENT_BUFFER, which is the documented probe.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    // SAFETY: `buffer` is `needed` bytes, the exact size the API asked for.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful TokenUser query wrote a TOKEN_USER at the start of
+    // the buffer; its Sid points into the same buffer, which outlives the copy.
+    let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    // SAFETY: `user.User.Sid` is a valid SID inside `buffer`.
+    let sid_len = unsafe { GetLengthSid(user.User.Sid) } as usize;
+    // SAFETY: LocalAlloc for the copy; freed by CurrentUserSid.
+    let owned: PSID = unsafe {
+        windows_sys::Win32::System::Memory::LocalAlloc(
+            windows_sys::Win32::System::Memory::LMEM_FIXED,
+            sid_len,
+        )
+    } as PSID;
+    if owned.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both SIDs are valid; `owned` has exactly `sid_len` bytes.
+    if unsafe { CopySid(sid_len as u32, owned, user.User.Sid) } == 0 {
+        // SAFETY: `owned` came from LocalAlloc above.
+        unsafe { LocalFree(owned) };
+        return Err(io::Error::last_os_error());
+    }
+    Ok(CurrentUserSid(owned))
+}
+
+fn sid_equals(a: PSID, b: PSID) -> bool {
+    // SAFETY: both pointers reference valid SIDs for the caller's lifetime.
+    !a.is_null() && !b.is_null() && unsafe { windows_sys::Win32::Security::EqualSid(a, b) } != 0
+}
+
+/// Whether `attributes` name a reparse point (symlink, junction, mount point).
+fn is_reparse_point(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn file_attributes(path: &Path) -> io::Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::GetFileAttributesW;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    let wide = wide(path);
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(attributes)
+}
+
+/// Build and install an owner-only, inheritance-protected DACL on `path`.
+fn apply_private_dacl(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, InitializeAcl,
+        OBJECT_INHERIT_ACE,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let user = current_user_sid()?;
+    let system = OwnedSid::parse("S-1-5-18")?;
+    let administrators = OwnedSid::parse("S-1-5-32-544")?;
+    let sids = [user.0, system.0, administrators.0];
+    let acl_size: usize = std::mem::size_of::<ACL>()
+        + sids
+            .iter()
+            .map(|sid| {
+                8 + std::mem::size_of::<u32>() * 2
+                    // SAFETY: every `sid` is a live SID.
+                    + unsafe { GetLengthSid(*sid) } as usize
+            })
+            .sum::<usize>()
+        + 32;
+    let mut storage = vec![0u8; acl_size];
+    let acl = storage.as_mut_ptr() as *mut ACL;
+    // SAFETY: `storage` is `acl_size` writable bytes.
+    if unsafe { InitializeAcl(acl, acl_size as u32, ACL_REVISION) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for sid in sids {
+        // SAFETY: the ACL has room for every ACE (sized above); `sid` is live.
+        if unsafe {
+            AddAccessAllowedAceEx(
+                acl,
+                ACL_REVISION,
+                CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                FILE_ALL_ACCESS,
+                sid,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut path_w = wide(path);
+    // SAFETY: `path_w` is NUL-terminated; `acl` outlives the call.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error(
+            &format!("set owner-only DACL on {}", path.display()),
+            status,
+        ));
+    }
+    Ok(())
+}
+
+/// `ACCESS_ALLOWED_ACE_TYPE`. windows-sys exports ACE structs, but not this
+/// discriminator constant on every feature set.
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+
+/// Refuse any security descriptor that is not owner-only.
+fn validate_private_security(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorOwner,
+        OWNER_SECURITY_INFORMATION,
+    };
+
+    let user = current_user_sid()?;
+    let mut dacl_ptr: *mut ACL = null_mut();
+    let mut owner_ptr: PSID = null_mut();
+    let mut descriptor: *mut std::ffi::c_void = null_mut();
+    let mut path_w = wide(path);
+    // SAFETY: `path_w` is NUL-terminated; the out-parameters are owned below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner_ptr,
+            null_mut(),
+            &mut dacl_ptr,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error(
+            &format!("read security descriptor of {}", path.display()),
+            status,
+        ));
+    }
+    let _descriptor = OwnedSecurityDescriptor(descriptor);
+    let mut defaulted = 0i32;
+    // SAFETY: the descriptor is live for the duration of this function.
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner_ptr, &mut defaulted) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if !sid_equals(owner_ptr, user.0) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "state directory {} is not owned by the current user",
+                path.display()
+            ),
+        ));
+    }
+    if dacl_ptr.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "state directory {} has a null DACL (every principal has access)",
+                path.display()
+            ),
+        ));
+    }
+    let system = OwnedSid::parse("S-1-5-18")?;
+    let administrators = OwnedSid::parse("S-1-5-32-544")?;
+    let creator_owner = OwnedSid::parse("S-1-3-0")?;
+    let owner_rights = OwnedSid::parse("S-1-3-4")?;
+    // SAFETY: `dacl_ptr` points into the live descriptor.
+    let count = unsafe { (*dacl_ptr).AceCount } as u32;
+    let mut saw_user = false;
+    for index in 0..count {
+        let mut ace: *mut std::ffi::c_void = null_mut();
+        // SAFETY: `index` is below AceCount for this live ACL.
+        if unsafe { GetAce(dacl_ptr, index, &mut ace) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unreadable DACL entry on {}", path.display()),
+            ));
+        }
+        // SAFETY: GetAce returned a live ACE inside the descriptor.
+        let header = unsafe { *(ace as *const ACE_HEADER) };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "state directory {} has a non-allow ACE (type {})",
+                    path.display(),
+                    header.AceType
+                ),
+            ));
+        }
+        let allowed = ace as *const ACCESS_ALLOWED_ACE;
+        // SAFETY: the ACE is an ACCESS_ALLOWED_ACE; its SID starts at `SidStart`.
+        let sid = unsafe { std::ptr::addr_of!((*allowed).SidStart) } as PSID;
+        let permitted = sid_equals(sid, user.0)
+            || sid_equals(sid, system.0)
+            || sid_equals(sid, administrators.0)
+            || sid_equals(sid, creator_owner.0)
+            || sid_equals(sid, owner_rights.0);
+        if !permitted {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "state directory {} grants access to a principal other than \
+                     its owner, SYSTEM or Administrators ({})",
+                    path.display(),
+                    sid_to_string(sid).unwrap_or_else(|_| "unknown SID".into())
+                ),
+            ));
+        }
+        if sid_equals(sid, user.0) {
+            saw_user = true;
+        }
+    }
+    if !saw_user {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "state directory {} does not grant its owner access",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Create (if needed) and validate an owner-only state directory.
+///
+/// The directory is created with a protected owner-only DACL when it is
+/// missing. An existing directory is validated, never silently rewritten: an
+/// insecure pre-existing directory is refused, exactly like the Unix 0700
+/// check.
+pub(crate) fn secure_private_state_dir(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            // Rust reports a junction as a reparse-point symlink; either way,
+            // an object that redirects the path is never the state directory.
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("state directory {} is a reparse point", path.display()),
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("state directory {} is not a directory", path.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            let attributes = file_attributes(path)?;
+            if is_reparse_point(attributes) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("state directory {} is a reparse point", path.display()),
+                ));
+            }
+            apply_private_dacl(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let attributes = file_attributes(path)?;
+    if is_reparse_point(attributes) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("state directory {} is a reparse point", path.display()),
+        ));
+    }
+    validate_private_security(path)
+}
+
+/// Validate one file inside a state directory: not a reparse point, owned by
+/// the current user, and reachable only through an owner-only DACL.
+pub(crate) fn verify_private_state_file(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let attributes = file_attributes(path)?;
+    if is_reparse_point(attributes) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    validate_private_security(path)
+}
+
+/// Open `pid` and read its creation time. `ERROR_INVALID_PARAMETER` means no
+/// process with that id exists; any other failure is not proof of absence.
+pub(crate) fn process_creation_time(pid: u32) -> io::Result<u64> {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: `OpenProcess` only takes a pid and a right mask.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = OwnedHandle(handle);
+    let mut creation: windows_sys::Win32::Foundation::FILETIME =
+        // SAFETY: a zeroed FILETIME is a valid "unset" value.
+        unsafe { std::mem::zeroed() };
+    let mut exit: windows_sys::Win32::Foundation::FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: windows_sys::Win32::Foundation::FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: windows_sys::Win32::Foundation::FILETIME = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is live; every out-parameter is local storage.
+    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
+/// Whether `pid` currently names a live (not terminated) process.
+///
+/// A terminated process object can stay queryable while a handle keeps it
+/// alive; its exit code is what distinguishes "still running" from "exited,
+/// not yet reaped". `ERROR_INVALID_PARAMETER` means the id names nothing.
+pub(crate) fn process_is_running(pid: u32) -> io::Result<bool> {
+    /// `STILL_ACTIVE` — the exit code a running process reports.
+    const STILL_ACTIVE: u32 = 259;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: `OpenProcess` only takes a pid and a right mask.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = OwnedHandle(handle);
+    let mut code = 0u32;
+    // SAFETY: the handle is live; `code` is local storage.
+    if unsafe { GetExitCodeProcess(handle.0, &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(code == STILL_ACTIVE)
+}
+
+// ---------------------------------------------------------------------------
+// Process-tree boundary.
+//
+// A persistent owner (the Execution Host) must not leave children behind when
+// it dies abruptly. Per-task Job Objects with kill-on-drop only run their drop
+// code on a graceful exit; `TerminateProcess` (taskkill, a crash, a supervisor
+// hard stop) runs no destructors at all. The kernel guarantee that survives an
+// abrupt death is `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the job itself kills
+// every member when its last handle closes, and the process's handle table is
+// destroyed by the kernel when the process dies.
+//
+// The owner therefore puts *itself* into such a job at startup. Windows assigns
+// every descendant of a job member to the same job automatically, so the whole
+// tree is covered without a per-spawn race. The handle is held by the owner for
+// its lifetime; the runtime that launched the owner never holds it, which is
+// exactly why the owner can outlive that runtime.
+// ---------------------------------------------------------------------------
+
+/// A live kill-on-close Job Object binding the current process and its tree.
+///
+/// The write scope is process-lifetime by construction: dropping the value
+/// closes the job handle and terminates every member, including this process.
+/// Owners keep it in scope for as long as they should exist.
+pub struct ProcessTreeJob {
+    job: OwnedHandle,
+}
+
+impl ProcessTreeJob {
+    /// Create the job, opt into kill-on-close, and join this process to it.
+    ///
+    /// Failing here is a real inability to guarantee tree cleanup; callers
+    /// that own persistent children must refuse to start instead of running
+    /// with a weaker boundary.
+    pub fn adopt_current_process() -> io::Result<Self> {
+        Self::adopt_process(std::process::id())
+    }
+    /// Join `pid` to a fresh kill-on-close job instead of this process.
+    pub fn adopt_process(pid: u32) -> io::Result<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+            PROCESS_TERMINATE,
+        };
+
+        // SAFETY: both arguments may be null; the call allocates a fresh job.
+        let job = unsafe { CreateJobObjectW(null(), null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = OwnedHandle(job);
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            // SAFETY: all-zero is the documented "no limits" start state.
+            unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is exactly the size the class expects.
+        if unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let process = if pid == std::process::id() {
+            // SAFETY: the pseudo-handle names this process.
+            unsafe { GetCurrentProcess() }
+        } else {
+            // SAFETY: `OpenProcess` only takes a pid and a right mask.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                    0,
+                    pid,
+                )
+            };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            handle
+        };
+        let process_owned = pid != std::process::id();
+        let attached = unsafe { AssignProcessToJobObject(job.0, process) };
+        let error = io::Error::last_os_error();
+        if process_owned {
+            // SAFETY: the handle was opened above and is owned here.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(process) };
+        }
+        if attached == 0 {
+            return Err(error);
+        }
+        Ok(Self { job })
+    }
+
+    /// The raw job handle, for callers that need to query or terminate it.
+    pub fn raw(&self) -> HANDLE {
+        self.job.0
+    }
+}
+
+impl Drop for ProcessTreeJob {
+    fn drop(&mut self) {
+        // `OwnedHandle` closes the last handle here, which is what triggers
+        // KILL_ON_JOB_CLOSE. When the process dies abruptly the kernel
+        // performs the same close itself, so no destructor has to run for the
+        // tree to be terminated.
+        let _ = &self.job;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delete/rename fence.
+//
+// Mandatory Integrity Control denies *write-up* content changes but does not
+// govern deletion: NTFS checks the parent directory's label for delete, so a
+// Low-labelled workspace lets a Low child delete or replace a Medium-labelled
+// file. The one unprivileged OS mechanism that prevents this is a sharing
+// fence: a trusted process holds an open handle on the protected object
+// without FILE_SHARE_DELETE. Any later open that asks for DELETE access — the
+// first step of delete, rename, and replace — fails with a sharing violation,
+// while reads and writes through other handles remain possible (the fence
+// shares read and write on purpose: it must not mask the integrity label's
+// content denial or block the trusted runtime's own writes).
+//
+// Renaming a *directory* is not blocked by a handle on the directory itself;
+// NTFS refuses it while a file inside is open with the same fence, so the
+// caller fences the protected files inside, not just the directory.
+// ---------------------------------------------------------------------------
+
+/// An open handle that denies delete sharing on one filesystem object.
+///
+/// Hold it for the lifetime of the confined command. Dropping it re-allows
+/// delete/rename; the handle is process-local and cannot be closed by the
+/// confined child.
+pub struct PathGuard {
+    /// Held for its Drop; never read after construction.
+    _handle: OwnedHandle,
+}
+
+// SAFETY: a file handle is a process-wide kernel object. It may be closed from
+// any thread of the owning process; no thread-affine state is stored.
+unsafe impl Send for PathGuard {}
+
+// SAFETY: sharing `&PathGuard` exposes no handle value and performs no I/O;
+// the handle is closed only by the owning value's drop.
+unsafe impl Sync for PathGuard {}
+
+impl std::fmt::Debug for PathGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathGuard").finish_non_exhaustive()
+    }
+}
+
+fn open_guard(path: &Path) -> io::Result<PathGuard> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let path_w = wide(path);
+    // The fence must request real data-read access. A handle opened only for
+    // FILE_READ_ATTRIBUTES (with or without SYNCHRONIZE) is not consulted by
+    // the delete-sharing check on Windows 11 — measured: `del` and `ren`
+    // succeed with such a handle open. GENERIC_READ makes every DELETE open
+    // fail with a sharing violation while still allowing writes through other
+    // handles (the integrity label is the content boundary).
+    const GENERIC_READ: u32 = 0x8000_0000;
+    let _ = (FILE_READ_ATTRIBUTES, SYNCHRONIZE);
+    let access = GENERIC_READ;
+    // SAFETY: `path_w` is NUL-terminated; the returned handle is owned by
+    // `PathGuard` and closed on drop. No security attributes are requested.
+    let handle = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("open delete fence on {}: {error}", path.display()),
+        ));
+    }
+    Ok(PathGuard {
+        _handle: OwnedHandle(handle),
+    })
+}
+
+/// Open a delete-sharing fence on one file or directory.
+pub(crate) fn guard_path(path: &Path) -> io::Result<PathGuard> {
+    open_guard(path)
+}

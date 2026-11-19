@@ -51,7 +51,17 @@ pub fn process_start_identity(pid: u32) -> Option<String> {
         let fields: Vec<&str> = rest.split_whitespace().collect();
         fields.get(19).map(|s| s.to_string())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        // The creation time is the stable half of a Windows process identity;
+        // the pid alone is a reusable slot. `None` here means the query failed
+        // for an unknown reason (the caller falls back to the conservative
+        // presence probe), never that the process is gone.
+        leveler_win_confine::process_creation_time(pid)
+            .ok()
+            .map(|created| format!("windows:{created}"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = pid;
         None
@@ -60,6 +70,27 @@ pub fn process_start_identity(pid: u32) -> Option<String> {
 
 /// Compare a historical `(pid, start_token)` with the current OS.
 pub fn verify_process_identity(pid: u32, expected_start: &str) -> ProcessIdentity {
+    #[cfg(windows)]
+    {
+        match leveler_win_confine::process_creation_time(pid) {
+            Ok(created) => {
+                let current = format!("windows:{created}");
+                if current == expected_start {
+                    ProcessIdentity::Matches
+                } else {
+                    ProcessIdentity::Mismatch { current }
+                }
+            }
+            Err(error)
+                if error.raw_os_error()
+                    == Some(leveler_win_confine::ERROR_INVALID_PARAMETER_CODE) =>
+            {
+                ProcessIdentity::Exited
+            }
+            Err(_) => ProcessIdentity::Unknown,
+        }
+    }
+    #[cfg(not(windows))]
     match process_start_identity(pid) {
         None => ProcessIdentity::Exited,
         Some(current) if current == expected_start => ProcessIdentity::Matches,

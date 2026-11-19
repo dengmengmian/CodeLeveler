@@ -214,9 +214,9 @@ pub struct BackgroundTaskSnapshot {
     /// Platform start token captured from the OS at spawn.
     ///
     /// A PID is reused; this token is what lets a later runtime tell the same
-    /// process from an unrelated one. It is absent when the platform exposes no
-    /// start token (Windows today) or when the process had already exited when
-    /// it was read. `None` is never a licence to treat the PID as identity.
+    /// process from an unrelated one. Windows uses the process creation time
+    /// (`windows:<FILETIME>`); macOS/Linux use their own kernel start token.
+    /// `None` means the read failed, never that the pid is an identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_identity: Option<String>,
     /// The signal that terminated the process, when the OS reported one.

@@ -801,6 +801,131 @@ pub fn policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     vec![write_root.join("AGENTS.md")]
 }
 
+/// Directories whose recursive walk never contributes rule documents. They are
+/// build output or installed dependencies, not repository policy: walking them
+/// would make every confined command pay for `node_modules`/`target` size.
+const POLICY_WALK_PRUNED: &[&str] = &[
+    ".git",
+    ".leveler",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    "dist",
+    "build",
+];
+
+/// A unit of the walk is a directory; this bounds pathological trees. Hitting
+/// it is reported (the result is never silently presented as complete).
+const POLICY_WALK_LIMIT: usize = 50_000;
+
+/// Every **existing** rule document under `write_root`, plus the `.leveler`
+/// directory that owns the definition namespaces.
+///
+/// The loader reads `AGENTS.md` at any depth, `.leveler/instructions.md` and
+/// `.leveler/rules/*.md`; the shell's write fence must cover the same set, not
+/// only the root document. Existing files can carry the label; a path that
+/// does not exist yet is a platform limitation reported separately (Windows
+/// cannot name-fence a path that does not exist).
+///
+/// `.leveler` itself is included when it exists: that is what makes a missing
+/// `.leveler/agents` or `.leveler/skills` directory unforgeable for the
+/// confined shell — creating the child requires writing the parent, and the
+/// parent is Medium. Without it, a shell command could author a definition
+/// directory that a later session loads without consent.
+///
+/// The walk does not follow reparse points (a link out of the workspace is not
+/// policy this repository owns) and prunes generated/dependency trees listed
+/// in [`POLICY_WALK_PRUNED`].
+pub(crate) fn existing_policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let leveler = write_root.join(".leveler");
+    if leveler.is_dir() {
+        out.push(leveler.clone());
+    } else {
+        let instructions = leveler.join("instructions.md");
+        if instructions.is_file() {
+            out.push(instructions);
+        }
+    }
+    let rules = leveler.join("rules");
+    if !out.contains(&leveler)
+        && rules.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&rules)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut budget = POLICY_WALK_LIMIT;
+    collect_existing_rule_documents(write_root, &mut out, &mut budget);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_rule_document_name(name: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().eq_ignore_ascii_case("AGENTS.md")
+    }
+    #[cfg(not(windows))]
+    {
+        name == "AGENTS.md"
+    }
+}
+
+fn collect_existing_rule_documents(directory: &Path, out: &mut Vec<PathBuf>, budget: &mut usize) {
+    if *budget == 0 {
+        tracing::warn!(
+            root = %directory.display(),
+            "policy-document walk budget exhausted; some existing AGENTS.md files are not write-protected"
+        );
+        return;
+    }
+    *budget -= 1;
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        // Never follow a link: policy is the repository's own files, and a
+        // link that leaves the tree is not this workspace's rule source.
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let text = name.to_string_lossy();
+            if POLICY_WALK_PRUNED
+                .iter()
+                .any(|skip| text.eq_ignore_ascii_case(skip))
+            {
+                continue;
+            }
+            collect_existing_rule_documents(&entry.path(), out, budget);
+        } else if file_type.is_file() && is_rule_document_name(&name) {
+            out.push(entry.path());
+        }
+    }
+}
+
 /// Every path inside a writable scope that stays write-denied. One list feeds
 /// both the Unix profile and the Windows integrity lease, so a path protected
 /// on one backend cannot silently lose its protection on another.
@@ -815,20 +940,38 @@ pub(crate) fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
             protected.extend(git_write_protected_paths(root));
             protected.extend(definition_write_protected_paths(root));
             protected.extend(policy_write_protected_paths(root));
+            protected.extend(existing_policy_write_protected_paths(root));
             protected.extend(excluded.iter().cloned());
         }
         WriteScope::Workspace { root } => {
             protected.extend(git_write_protected_paths(root));
             protected.extend(definition_write_protected_paths(root));
             protected.extend(policy_write_protected_paths(root));
+            protected.extend(existing_policy_write_protected_paths(root));
         }
         WriteScope::WorkspaceWithGit { root } => {
             protected.extend(definition_write_protected_paths(root));
             protected.extend(policy_write_protected_paths(root));
+            protected.extend(existing_policy_write_protected_paths(root));
         }
         _ => {}
     }
-    protected
+    dedupe_protected_paths(protected)
+}
+
+/// Drop a protected path whose ancestor is also protected: the ancestor's
+/// boundary already covers it, and leasing both would label and restore the
+/// same subtree twice.
+fn dedupe_protected_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if out.iter().any(|kept| path.starts_with(kept)) {
+            continue;
+        }
+        out.retain(|kept| !kept.starts_with(&path));
+        out.push(path);
+    }
+    out
 }
 
 /// Directories a confined process may write to.
@@ -3594,6 +3737,54 @@ mod tests {
 
         assert!(protected_write_paths(&WriteScope::Unrestricted).is_empty());
         assert!(protected_write_paths(&WriteScope::None).is_empty());
+    }
+
+    /// A rule document that already exists is policy at any depth, not only at
+    /// the repository root. The whole `.leveler` directory is the definition
+    /// namespace: protecting it is what keeps a *missing* `agents`/`skills`
+    /// child unforgeable (creating the child requires writing the parent).
+    #[test]
+    fn existing_rule_documents_and_the_leveler_directory_stay_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::create_dir_all(root.join(".leveler/rules")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/deep/AGENTS.md"), "nested").unwrap();
+        std::fs::write(root.join("node_modules/pkg/AGENTS.md"), "dependency").unwrap();
+        std::fs::write(root.join(".leveler/instructions.md"), "instructions").unwrap();
+        std::fs::write(root.join(".leveler/rules/a.md"), "rule").unwrap();
+        std::fs::write(root.join("src/notes.txt"), "not policy").unwrap();
+
+        let protected = protected_write_paths(&WriteScope::Workspace {
+            root: root.to_path_buf(),
+        });
+        assert!(
+            protected.iter().any(|path| path == &root.join(".leveler")),
+            "{protected:?}"
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|path| path == &root.join("src/deep/AGENTS.md")),
+            "{protected:?}"
+        );
+        assert!(
+            !protected
+                .iter()
+                .any(|path| path.ends_with("node_modules/pkg/AGENTS.md")),
+            "generated/dependency trees are pruned: {protected:?}"
+        );
+        assert!(
+            !protected.iter().any(|path| path.ends_with("notes.txt")),
+            "ordinary source files are not policy: {protected:?}"
+        );
+        assert!(
+            !protected.iter().any(|path| {
+                path != &root.join(".leveler") && path.starts_with(root.join(".leveler"))
+            }),
+            "the `.leveler` boundary subsumes its children: {protected:?}"
+        );
     }
 
     /// Which confinement backend a platform actually gets. The policy-text

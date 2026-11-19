@@ -68,3 +68,6 @@ futures = { workspace = true }
 tempfile = "3"
 # The clarification dogfood wires a scripted runtime to the real TUI.
 leveler-test-support = { workspace = true }
+# The Windows Execution Host lifecycle test validates the private state
+# directory through the same audited crate the product uses.
+leveler-win-confine = { workspace = true }

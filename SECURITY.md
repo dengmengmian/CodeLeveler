@@ -87,21 +87,28 @@ own files, outside any repository, and are not gated.
 
 The workspace layer additionally refuses **writes** to the hooks and
 permissions files, so the agent cannot grant itself hooks or standing
-permissions. Reads stay allowed. `.leveler/config.yaml` stays editable as
-ordinary project configuration, but any edit invalidates its trust record, so
-it cannot inherit a mode approval given to different bytes. Confined shell
-commands also cannot write `.leveler/agents` or `.leveler/skills`: a definition
-authored that way would be loaded by a later session without the confirmation
-the `save_agent` / `save_skill` tools require. macOS denies the path with a
-Seatbelt rule even when it does not exist yet. Linux uses the same read-only
-binds for existing paths, and a `seccomp` supervisor (started only when a
-protected path is missing) refuses creation syscalls that would give a
-protected name a new inode — including `AGENTS.md` at any depth below a
-writable root. The supervisor performs allowed operations itself and injects
-their descriptors into the sandbox, so a symlink swapped in after the check
-cannot redirect the write. Windows labels existing protected paths Medium
-after lowering the write root; a protected path created after admission is not
-covered there (see the trade-offs below).
+permissions. Reads stay allowed. `.leveler/config.yaml` stays editable through
+the file tools as ordinary project configuration, but any edit invalidates its
+trust record, so it cannot inherit a mode approval given to different bytes. A
+confined shell command cannot author any part of `.leveler` — the agent and
+skill definitions, the rules, or the config: a definition authored that way
+would be loaded by a later session without the confirmation the `save_agent` /
+`save_skill` tools require. The same boundary covers every existing
+`AGENTS.md` at any depth and every existing `.leveler/instructions.md` and
+`.leveler/rules/*.md`, because those are the documents a later turn loads as
+authority. macOS denies the paths with Seatbelt rules even when they do not
+exist yet. Linux uses the same read-only binds for existing paths, and a
+`seccomp` supervisor (started only when a protected path is missing) refuses
+creation syscalls that would give a protected name a new inode — including
+`AGENTS.md` at any depth below a writable root. The supervisor performs allowed
+operations itself and injects their descriptors into the sandbox, so a symlink
+swapped in after the check cannot redirect the write. Windows labels existing
+protected paths Medium after lowering the write root and additionally holds a
+delete-sharing fence on every existing protected file: Mandatory Integrity
+Control denies content writes, and the fence denies the `DELETE` access that
+delete, rename and replace require, so a Low child in a Low workspace can no
+longer delete or replace them. A protected path created after admission is
+still not covered there (see the trade-offs below).
 
 ## Approval, rules and resource boundaries
 
@@ -169,12 +176,15 @@ oversights. Reports that only restate them will be closed as known.
   placeholder files) and preserves ordinary writes. If the kernel or process
   inspectors cannot support the fence, the confined command is refused rather
   than run unfenced. `io_uring` submission is disabled inside the fence because
-  it would bypass syscall filtering. Windows labels existing protected paths
-  Medium after lowering the write root; a protected path created after
-  admission is not covered by an OS boundary there, so the definition-writing
-  tools and their consent remain the authority on that path. The file tools
-  still refuse definition edits and require consent through the
-  definition-writing tools.
+  it would bypass syscall filtering. On Windows every **existing** protected
+  file is labelled Medium (content writes denied), and a delete-sharing fence
+  held by the trusted runtime denies delete, rename and replace. A protected
+  path that does not exist yet has no object for either mechanism: NTFS has no
+  name-based creation filter for an unprivileged token, so a confined shell can
+  still create a new `AGENTS.md`, or a wholly missing `.leveler` tree. The
+  definition-writing tools and their consent remain the authority on such a
+  path, and the gap is tracked as an open platform limitation rather than
+  claimed closed.
 
 ## Resource grants
 
