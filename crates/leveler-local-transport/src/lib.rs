@@ -3580,7 +3580,7 @@ mod tests {
     /// A reviver that performs a REAL ensure: binds a fresh LocalSocketServer
     /// for the same path and serves it. Called only by the client's genuine
     /// failure paths — the test itself never restarts anything.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct TestReviver {
         path: PathBuf,
         runtime: Arc<TestRuntime>,
@@ -3588,7 +3588,21 @@ mod tests {
         shutdown: CancellationToken,
     }
 
-    #[cfg(unix)]
+    /// Whether a socket/pipe endpoint answers right now. The reviver's
+    /// `AlreadyRunning` branch is only success once the endpoint is reachable.
+    #[cfg(any(unix, windows))]
+    async fn endpoint_answers(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            tokio::net::UnixStream::connect(path).await.is_ok()
+        }
+        #[cfg(windows)]
+        {
+            LocalSocketRuntimeClient::connect(path).await.is_ok()
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     #[async_trait]
     impl RuntimeReviver for TestReviver {
         async fn revive(&self) -> Result<(), String> {
@@ -3616,7 +3630,7 @@ mod tests {
                     // socket file is created, so a concurrent binder can hold
                     // the lock while nothing is listening yet.
                     Err(TransportError::AlreadyRunning(_))
-                        if tokio::net::UnixStream::connect(&self.path).await.is_ok() =>
+                        if endpoint_answers(&self.path).await =>
                     {
                         return Ok(());
                     }
@@ -3630,7 +3644,7 @@ mod tests {
     /// The transport's REAL failure path invokes the reviver, the daemon
     /// comes back, and the same client object reaches the same runtime —
     /// requests and the event stream both recover.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn runtime_reviver_restarts_dead_daemon_for_connected_client() {
         let dir = tempfile::tempdir().unwrap();
@@ -3701,7 +3715,7 @@ mod tests {
     /// daemon under a real TUI produced exactly that — nothing on screen for
     /// half a minute, and the turn the runtime had settled as interrupted was
     /// never marked.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn a_reconnected_subscription_says_the_connection_broke() {
         let dir = tempfile::tempdir().unwrap();
@@ -3926,7 +3940,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn await_reconnect(
         rx: &mut broadcast::Receiver<RuntimeEvent>,
         what: &str,
