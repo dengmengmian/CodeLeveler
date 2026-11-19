@@ -318,6 +318,62 @@ async fn a_dead_host_is_settled_as_unknown_without_a_running_ghost() {
 // The environment lock must span the awaits: `LEVELER_HOME` is process-global
 // and every host spawn reads it.
 #[allow(clippy::await_holding_lock)]
+async fn a_foreground_confined_command_shares_the_hosts_workspace_lease() {
+    let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    // SAFETY: see the serial mutex rationale above.
+    unsafe {
+        std::env::set_var("LEVELER_HOME", &fixture.home);
+    }
+    let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+        std::env::vars_os(),
+        fixture.repo.clone(),
+        std::env::temp_dir(),
+    ));
+    let registry = leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone())
+        .with_stable_task_ids()
+        .with_execution_host(fixture.config());
+    let mut hosted = fixture.request("ping -n 30 127.0.0.1 > nul");
+    hosted.write_scope = leveler_execution::WriteScope::Workspace {
+        root: fixture.repo.clone(),
+    };
+    let id = registry
+        .spawn_owned_with_lifetime(
+            hosted,
+            None,
+            Some("session-b"),
+            BackgroundTaskLifetime::Persistent,
+        )
+        .await
+        .expect("a hosted confined task must start");
+    // Let the host establish the workspace label lease.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The runtime that owns the foreground turn is a different process (the
+    // host owns the background task's lease). Ordinary development must keep
+    // working: the foreground command joins the same label state instead of
+    // being refused because another live lease renamed the root.
+    let runner = leveler_execution::CommandRunner::with_environment(environment);
+    let mut foreground = fixture.request("echo FOREGROUND > foreground.txt");
+    foreground.write_scope = leveler_execution::WriteScope::Workspace {
+        root: fixture.repo.clone(),
+    };
+    let output = runner
+        .run(foreground, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("a foreground confined command must run beside a hosted task");
+    assert_eq!(output.exit_code, Some(0), "foreground output: {output:?}");
+    assert!(
+        fixture.repo.join("foreground.txt").is_file(),
+        "the foreground write must persist"
+    );
+    registry.kill(&id).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// The environment lock must span the awaits: `LEVELER_HOME` is process-global
+// and every host spawn reads it.
+#[allow(clippy::await_holding_lock)]
 async fn the_registry_hands_background_work_to_the_host_and_readopts_it() {
     let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();

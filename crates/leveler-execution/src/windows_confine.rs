@@ -94,20 +94,20 @@ enum DesiredLabel {
     Medium,
 }
 
-/// A held claim on one write root: how many commands are writing under it, and
-/// the label to put back when the last one finishes.
+/// A held claim on one write root: how many commands in this process are
+/// writing under it, and the OS lease that keeps the label alive across
+/// processes.
 #[derive(Debug)]
 struct Held {
     count: usize,
-    previous: IntegrityLabel,
     label: DesiredLabel,
-    /// The record this lease owns, so recovery can skip a live root even on a
-    /// host whose file locks would not report the conflict in-process.
+    /// The record this lease owns, so recovery can skip a live root.
     record: Option<PathBuf>,
-    /// Exclusive OS lock on the record's guard file, held until the label is
-    /// back. It is the durable liveness fact recovery needs: a record whose
-    /// guard is locked belongs to a running command, not to a crash.
-    _guard: Option<File>,
+    /// Shared OS lock on the record's lease file, held until this process no
+    /// longer writes under the root. Multiple commands — in this process or in
+    /// another CodeLeveler process such as the Execution Host — share the same
+    /// label and each hold a shared lock. Only the last holder restores.
+    _lease: Option<File>,
 }
 
 fn held() -> &'static Mutex<HashMap<String, Held>> {
@@ -354,45 +354,109 @@ fn record_path(records: &Path, root: &Path) -> PathBuf {
     records.join(format!("{name}.label"))
 }
 
-/// The sidecar a live lease locks. Its hash matches the record's, so recovery
-/// can ask "is anyone still using the label this record describes?" without
-/// reading the record first. The file is intentionally left behind after the
-/// lease: removing it would let a new lease recreate an unlocked file while a
-/// recovery pass was still opening the old one, which is the race it prevents.
-fn guard_path_for_record(record: &Path) -> PathBuf {
+/// The sidecars a live lease locks. Their names match the record's hash, so
+/// recovery can ask "is anyone still using the label this record describes?"
+/// without reading the record first. The files are intentionally left behind
+/// after the lease: removing one would let a new lease recreate an unlocked
+/// file while a recovery pass was still opening the old one.
+///
+/// `.meta` serializes acquisition, release and recovery for this record. It is
+/// taken for a short critical section only — never for the command's lifetime.
+/// `.lease` is held **shared** by every live command, from any process, and is
+/// probed exclusively to prove that none remains.
+fn sidecar_path_for_record(record: &Path, suffix: &str) -> PathBuf {
     let mut name = record
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    name.push(".guard");
+    name.push(suffix);
     record.with_file_name(name)
 }
 
-/// Try to become the only live owner of a record. `None` means another live
-/// lease (in this or another process) holds it; its label must be left alone.
-fn try_lock_guard(path: &Path) -> io::Result<Option<File>> {
-    let file = OpenOptions::new()
+fn meta_path_for_record(record: &Path) -> PathBuf {
+    sidecar_path_for_record(record, ".meta")
+}
+
+fn lease_path_for_record(record: &Path) -> PathBuf {
+    sidecar_path_for_record(record, ".lease")
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(path)?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(file)),
-        // Windows reports a held byte-range lock as ERROR_LOCK_VIOLATION (33)
-        // rather than WouldBlock; fs2 surfaces the raw error there. Both mean
-        // the same thing: another live lease owns this record.
-        Err(error)
-            if error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33) =>
-        {
-            Ok(None)
-        }
+        .open(path)
+}
+
+/// Windows reports a held byte-range lock as ERROR_LOCK_VIOLATION (33) rather
+/// than WouldBlock; fs2 surfaces the raw error there. Both mean the same thing.
+fn lock_is_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33)
+}
+
+/// Whether this handle now holds an exclusive lock; `false` means a live
+/// shared or exclusive holder exists.
+fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    match fs2::FileExt::try_lock_exclusive(file) {
+        Ok(()) => Ok(true),
+        Err(error) if lock_is_busy(&error) => Ok(false),
         Err(error) => Err(error),
     }
 }
 
+/// Whether this handle now holds a shared lock; `false` means an exclusive
+/// holder (an acquisition or restore critical section) is active.
+fn try_lock_shared(file: &File) -> io::Result<bool> {
+    match fs2::FileExt::try_lock_shared(file) {
+        Ok(()) => Ok(true),
+        Err(error) if lock_is_busy(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn unlock(file: &File) -> io::Result<()> {
+    fs2::FileExt::unlock(file)
+}
+
+fn label_matches(label: &IntegrityLabel, desired: DesiredLabel) -> bool {
+    match desired {
+        DesiredLabel::Low => label.is_low(),
+        DesiredLabel::Medium => matches!(
+            label,
+            IntegrityLabel::Explicit { sid, .. }
+                if sid.as_str() == leveler_win_confine::MEDIUM_INTEGRITY_SID
+        ),
+    }
+}
+
+fn apply_desired_label(path: &Path, label: DesiredLabel) -> io::Result<()> {
+    match label {
+        DesiredLabel::Low => leveler_win_confine::apply_low_integrity_label(path).map(|_| ()),
+        DesiredLabel::Medium => leveler_win_confine::apply_medium_integrity_label(path).map(|_| ()),
+    }
+}
+
+fn lease_conflict(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "Windows write-root lease for {} changed while this command was being admitted; \
+             refusing to run over it",
+            path.display()
+        ),
+    )
+}
+
 /// Claim `path`. Returns the record that describes how to put its label back,
 /// or `None` when this path is not one we ever restore.
+///
+/// Commands in different processes share one label state: while any live lease
+/// holds the root, a newcomer joins it (its label must already be the desired
+/// one) instead of relabelling. Only the last participant restores the
+/// recorded label. This is what lets a foreground command keep running while
+/// the Execution Host owns a long-lived background task in the same workspace.
 ///
 /// The record is durable **before** the label moves. The other order would
 /// leave a lowered root with nothing on disk saying what it used to be, which
@@ -404,7 +468,6 @@ fn acquire(
     label: DesiredLabel,
 ) -> io::Result<Option<PathBuf>> {
     let key = root_key(path);
-    let record = restorable.then(|| record_path(records, path));
     let mut map = held().lock().unwrap_or_else(|poison| poison.into_inner());
     if let Some(entry) = map.get_mut(&key) {
         // A path cannot be both a writable root and a protected path in one
@@ -421,51 +484,82 @@ fn acquire(
             ));
         }
         entry.count += 1;
-        return Ok(record);
+        return Ok(entry.record.clone());
     }
-    // Take the guard before reading the old label or writing the new record.
-    // From here until the last lease ends, recovery cannot mistake this path
-    // for a crash leftover.
-    let guard = match record.as_deref() {
-        Some(record) => {
-            let guard = try_lock_guard(&guard_path_for_record(record))?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
+    let Some(record) = (restorable).then(|| record_path(records, path)) else {
+        // CodeLeveler-owned paths are never restored; applying the label is
+        // idempotent across processes and needs no record or lease.
+        apply_desired_label(path, label)?;
+        map.insert(
+            key,
+            Held {
+                count: 1,
+                label,
+                record: None,
+                _lease: None,
+            },
+        );
+        return Ok(None);
+    };
+    // A short critical section decides between "first participant" (snapshot,
+    // record, relabel) and "join a live participant" (verify the label).
+    let meta = open_lock_file(&meta_path_for_record(&record))?;
+    fs2::FileExt::lock_exclusive(&meta)?;
+    let result = (|| {
+        let lease = open_lock_file(&lease_path_for_record(&record))?;
+        if try_lock_exclusive(&lease)? {
+            // No live participant in any process. Any record still here is a
+            // crash leftover: put its label back before lowering the path.
+            recover_one_locked(&record)?;
+            let previous = leveler_win_confine::integrity_label(path)?;
+            write_record(&record, &Record::new(path, previous))?;
+            apply_desired_label(path, label)?;
+            // Keep the lock as a *shared* lease for this command.
+            unlock(&lease)?;
+            if !try_lock_shared(&lease)? {
+                return Err(lease_conflict(path));
+            }
+            Ok((record.clone(), Some(lease)))
+        } else {
+            // A live participant exists. Its label is the one this command
+            // must run under; a different state means the lease and the
+            // filesystem disagree, which is never guessed at.
+            let current = leveler_win_confine::integrity_label(path)?;
+            if !label_matches(&current, label) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
                     format!(
-                        "Windows write root for {} is in use by another live CodeLeveler \
-                         process; refusing to relabel it",
+                        "{} is held by a live write-root lease with label {current:?}, \
+                         not the requested {label:?}; refusing to run over it",
                         path.display()
                     ),
-                )
-            })?;
-            // `ensure_recovered` ran once per process and may have skipped this
-            // path because another process owned it then. Now that the guard
-            // is ours, any record still here is a crash leftover: put its
-            // label back before lowering the path for this command.
-            recover_one_locked(record)?;
-            Some(guard)
+                ));
+            }
+            if !try_lock_shared(&lease)? {
+                return Err(lease_conflict(path));
+            }
+            Ok((record.clone(), Some(lease)))
         }
-        None => None,
+    })();
+    let unlock_result = unlock(&meta);
+    let (record, lease) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = unlock_result;
+            return Err(error);
+        }
     };
-    let previous = leveler_win_confine::integrity_label(path)?;
-    if let Some(record) = record.as_deref() {
-        write_record(record, &Record::new(path, previous.clone()))?;
-    }
-    match label {
-        DesiredLabel::Low => leveler_win_confine::apply_low_integrity_label(path)?,
-        DesiredLabel::Medium => leveler_win_confine::apply_medium_integrity_label(path)?,
-    };
+    unlock_result?;
     map.insert(
         key,
         Held {
             count: 1,
-            previous,
             label,
-            record: record.clone(),
-            _guard: guard,
+            record: Some(record.clone()),
+            _lease: lease,
         },
     );
-    Ok(record)
+    Ok(Some(record))
 }
 
 fn release_root(root: &Path, record: &Path) -> io::Result<()> {
@@ -478,16 +572,32 @@ fn release_root(root: &Path, record: &Path) -> io::Result<()> {
     if entry.count > 0 {
         return Ok(());
     }
-    // Keep the guard (and the map lock) until the label is actually back, so a
-    // new lease cannot relabel the root between this restore and its release.
-    let held = map.remove(&key).expect("the held entry was just checked");
-    let restored = leveler_win_confine::restore_integrity_label(root, &held.previous);
-    // Only drop the record once the label is actually back, so a failure here
-    // still leaves the next run enough to recover from.
-    if restored.is_ok() {
-        let _ = std::fs::remove_file(record);
-    }
-    restored
+    // Keep the map lock until the shared lease is gone, so a new lease in this
+    // process cannot race the release decision.
+    let mut entry = map.remove(&key).expect("the held entry was just checked");
+    let Some(lease) = entry._lease.take() else {
+        return Ok(());
+    };
+    debug_assert!(
+        entry.record.as_deref() == Some(record),
+        "release must name the record the lease was taken for"
+    );
+    let meta = open_lock_file(&meta_path_for_record(record))?;
+    fs2::FileExt::lock_exclusive(&meta)?;
+    // Drop this process's shared claim, then ask the file whether anyone else
+    // still holds one. Only the last leaver restores the recorded label.
+    drop(lease);
+    let restore = (|| {
+        let probe = open_lock_file(&lease_path_for_record(record))?;
+        if !try_lock_exclusive(&probe)? {
+            // Another live command still needs the root's label.
+            return Ok(());
+        }
+        recover_one_locked(record)?;
+        unlock(&probe)
+    })();
+    let unlock_result = unlock(&meta);
+    restore.and(unlock_result)
 }
 
 /// One thing recovery has to do to converge a leftover record.
@@ -704,42 +814,65 @@ fn recover_records(records: &Path) -> io::Result<()> {
     let mut unreadable: Vec<PathBuf> = Vec::new();
     for path in paths {
         // A live lease in this process is never stale, even if the host's
-        // file-lock implementation lets a second handle lock its guard.
+        // file-lock implementation lets a second handle lock its lease.
         if record_is_held(&path) {
             continue;
         }
-        // Take the guard before reading: a record whose writer still holds it
-        // may be half-written, and reading it now would refuse recovery on a
-        // file that is about to disappear. `None` means a live process owns
-        // the root; leave its label exactly where it is.
-        let _guard = match try_lock_guard(&guard_path_for_record(&path)) {
-            Ok(Some(guard)) => guard,
-            Ok(None) => continue,
+        // Acquisition, release and recovery all serialize on `.meta`. Hold it
+        // (and the exclusive lease proof) until the label is restored, so no
+        // participant can join between the proof and the restore.
+        let meta = match open_lock_file(&meta_path_for_record(&path)) {
+            Ok(file) => file,
             Err(error) => {
                 failures.push(format!("{}: {error}", path.display()));
                 continue;
             }
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                unreadable.push(path);
-                continue;
-            }
-        };
-        let Some(step) = plan_record(&path, &text) else {
-            unreadable.push(path);
+        if let Err(error) = fs2::FileExt::lock_exclusive(&meta) {
+            failures.push(format!("{}: {error}", path.display()));
             continue;
-        };
-        let root = match &step {
-            Recovery::Restore { entry, .. } => Some(entry.root.display().to_string()),
-            Recovery::Forget { .. } => None,
-        };
-        if let Err(error) = apply_recovery(step)
-            && let Some(root) = root
+        }
+        let mut probe = None;
+        let mut failure: Option<String> = None;
+        match open_lock_file(&lease_path_for_record(&path))
+            .and_then(|file| try_lock_exclusive(&file).map(|locked| (file, locked)))
         {
-            failures.push(format!("{root}: {error}"));
+            Ok((file, true)) => probe = Some(file),
+            Ok((_file, false)) => {
+                // A live participant keeps the label and record where they are.
+            }
+            Err(error) => failure = Some(format!("{}: {error}", path.display())),
+        }
+        if probe.is_some() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => match plan_record(&path, &text) {
+                    Some(step) => {
+                        let root = match &step {
+                            Recovery::Restore { entry, .. } => {
+                                Some(entry.root.display().to_string())
+                            }
+                            Recovery::Forget { .. } => None,
+                        };
+                        if let Err(error) = apply_recovery(step)
+                            && let Some(root) = root
+                        {
+                            failures.push(format!("{root}: {error}"));
+                        }
+                    }
+                    None => unreadable.push(path.clone()),
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => unreadable.push(path.clone()),
+            }
+        }
+        if let Some(failure) = failure {
+            failures.push(failure);
+        }
+        if let Some(probe) = probe.as_ref() {
+            let _ = unlock(probe);
+        }
+        if let Err(error) = unlock(&meta) {
+            failures.push(format!("{}: {error}", path.display()));
         }
     }
     if !unreadable.is_empty() {
