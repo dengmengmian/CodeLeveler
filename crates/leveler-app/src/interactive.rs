@@ -295,6 +295,13 @@ fn spawn_auxiliary_assist(
     }
     let (generation, cancellation) = assists.begin(&session_id, kind);
     tokio::spawn(async move {
+        // The user's `[assist]` setting is the authority for the affordance.
+        // It also gates the durable-text shortcut below: a switched-off review
+        // must not appear just because its text already exists in the store.
+        if !app.assist_enabled(kind) {
+            assists.finish(&session_id, kind, generation);
+            return;
+        }
         // A review belongs to the turn it describes. Read the settled turn
         // BEFORE the model call so a turn that starts later cannot be credited
         // with this text; the `active.is_running` guard below already refuses
