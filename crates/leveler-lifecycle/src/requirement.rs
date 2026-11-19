@@ -472,6 +472,19 @@ pub enum ScopeError {
         from: &'static str,
         to: &'static str,
     },
+    #[error(
+        "requirement `{id}` cannot change its `target` through `amend`: the target is the \
+         mechanical completion check. `replace` the requirement with a new identity anchored to \
+         the user's newest words, or amend only `text`/`check`."
+    )]
+    TargetChangeRequiresReplace { id: String },
+    #[error(
+        "the `{operation}` of requirement `{id}` reuses the user words that declared it. A \
+         replace or waiver lowers or retires an owed requirement, so it must be anchored to \
+         different user words. If the declaration itself is wrong, amend `text`/`check` in \
+         place; if the user has not changed the requirement, keep it and finish it."
+    )]
+    WeakeningRequiresNewSource { id: String, operation: &'static str },
     #[error("the recorded scope history is corrupt: {0}")]
     CorruptHistory(String),
 }
@@ -717,6 +730,23 @@ fn apply_operation(
                     to: next.label(),
                 });
             }
+            // The target is the mechanical completion check: the exact
+            // command, test command, path or literal file. Rewriting it in
+            // place would keep the same requirement identity while lowering
+            // what the gate verifies (for example `go test ./...` -> `true`).
+            // Only a strictly stronger kind may replace it in place; any
+            // other contract change retires the requirement through
+            // `replace`, which records a new identity and a new user quote.
+            let next_target = normalized(target);
+            let target_changes = next_target.is_some() && next_target != items[index].target;
+            let strengthens = kind.is_some_and(|_| {
+                next_kind.evidence_strength() > items[index].kind.evidence_strength()
+            });
+            if target_changes && !strengthens {
+                return Err(ScopeError::TargetChangeRequiresReplace {
+                    id: requirement_id.clone(),
+                });
+            }
             if items[index].verification.is_some()
                 && verification.is_none()
                 && keeps_registered_check
@@ -779,6 +809,32 @@ fn apply_operation(
                     id: requirement_id.clone(),
                 });
             }
+            // A replace retires an owed requirement and mints a new identity.
+            // The words that declared the current requirement cannot also
+            // authorize a weaker replacement: that would let the model lower
+            // the bar while quoting the very sentence that set it. A
+            // mechanical contract cannot be replaced at equal strength either,
+            // because a different target can be trivially easier
+            // (`go test ./...` -> `true`). A model-judged requirement may be
+            // re-registered with the same words and a new check; the
+            // obligation does not lose evidence strength. `amend` is the
+            // in-place path for a wrong declaration; a real change in what
+            // the user owes must point at different user words.
+            let current_strength = items[index].kind.evidence_strength();
+            let replacement_strength = kind.evidence_strength();
+            let current_mechanical = matches!(
+                items[index].kind.evidence_policy(),
+                Some(EvidencePolicy::Mechanical)
+            );
+            let weakens = replacement_strength < current_strength
+                || (replacement_strength == current_strength && current_mechanical);
+            if items[index].is_owed() && weakens && source_quote.trim() == items[index].source_quote
+            {
+                return Err(ScopeError::WeakeningRequiresNewSource {
+                    id: requirement_id.clone(),
+                    operation: "replace",
+                });
+            }
             if items
                 .iter()
                 .filter(|item| item.state != RequirementState::Superseded)
@@ -822,6 +878,12 @@ fn apply_operation(
             reason,
         } => {
             let index = active_index(items, requirement_id)?;
+            if items[index].is_owed() && source_quote.trim() == items[index].source_quote {
+                return Err(ScopeError::WeakeningRequiresNewSource {
+                    id: requirement_id.clone(),
+                    operation: "waive",
+                });
+            }
             items[index].state = RequirementState::Waived;
             events.push(AppliedRequirementEvent {
                 operation: ScopeOperationKind::Waive,
@@ -1321,6 +1383,207 @@ mod tests {
         .expect("strengthening the contract is allowed");
         assert_eq!(projected.items[0].kind, RequirementKind::Artifact);
         assert_eq!(projected.items[0].target.as_deref(), Some("report.md"));
+    }
+
+    /// The target is the mechanical completion check (`go test ./...`,
+    /// `true`, a file path). Letting `amend` rewrite it while the kind stays
+    /// the same would lower the bar without a new requirement identity or a
+    /// new user statement: the gate would then verify `true` instead of the
+    /// declared suite.
+    #[test]
+    fn an_amend_cannot_retarget_a_mechanical_requirement() {
+        let mut tests = item("R1", RequirementKind::Tests, "the suite must pass");
+        tests.target = Some("go test ./...".to_string());
+        tests.source_quote = "run the suite".to_string();
+        let error = apply_scope_declaration(
+            &[tests],
+            &declaration(vec![ScopeOperation::Amend {
+                requirement_id: "R1".to_string(),
+                kind: None,
+                text: None,
+                target: Some("true".to_string()),
+                source_quote: "run the suite".to_string(),
+                check: None,
+                verification: None,
+                reason: None,
+            }]),
+        )
+        .expect_err("the mechanical target is not amendable in place");
+        assert!(
+            matches!(error, ScopeError::TargetChangeRequiresReplace { ref id } if id == "R1"),
+            "{error:?}"
+        );
+    }
+
+    /// A different request may name a different test command. That is a new
+    /// user statement, so it goes through `replace`; the same words cannot
+    /// re-declare the contract they already declared.
+    #[test]
+    fn a_replace_reusing_the_declaring_quote_cannot_lower_the_contract() {
+        let mut content = item(
+            "R6",
+            RequirementKind::Content,
+            "The worker runs inside the same process and stops cleanly on shutdown.",
+        );
+        content.target = Some("cmd/server/main.go".to_string());
+        content.source_quote =
+            "The worker runs inside the same process and stops cleanly on shutdown.".to_string();
+        let quote = content.source_quote.clone();
+        let error = apply_scope_declaration(
+            &[content],
+            &declaration(vec![ScopeOperation::Replace {
+                requirement_id: "R6".to_string(),
+                kind: RequirementKind::Named,
+                text: "The worker runs inside the same process and stops cleanly on shutdown."
+                    .to_string(),
+                target: None,
+                source_quote: quote,
+                check: None,
+                verification: None,
+                reason: Some("model judgement fits the behavioral property".to_string()),
+            }]),
+        )
+        .expect_err("the user has not said anything new");
+        assert!(
+            matches!(
+                error,
+                ScopeError::WeakeningRequiresNewSource {
+                    ref id,
+                    operation: "replace",
+                } if id == "R6"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_replace_anchored_to_new_user_words_may_change_the_contract() {
+        let mut content = item(
+            "R6",
+            RequirementKind::Content,
+            "the worker stops on shutdown",
+        );
+        content.target = Some("cmd/server/main.go".to_string());
+        content.source_quote = "the worker stops on shutdown".to_string();
+        let projected = apply_scope_declaration(
+            &[content],
+            &declaration(vec![ScopeOperation::Replace {
+                requirement_id: "R6".to_string(),
+                kind: RequirementKind::Named,
+                text: "the worker stops on shutdown".to_string(),
+                target: None,
+                source_quote: "改为按行为验收，不再要求文件包含原句".to_string(),
+                check: None,
+                verification: None,
+                reason: Some("the user changed the acceptance form".to_string()),
+            }]),
+        )
+        .expect("new user words authorize the change");
+        assert_eq!(projected.items[1].kind, RequirementKind::Named);
+        assert_eq!(projected.items[0].state, RequirementState::Superseded);
+    }
+
+    #[test]
+    fn a_replace_cannot_turn_an_owed_deliverable_into_a_non_owed_note() {
+        let named = item("R1", RequirementKind::Named, "the audit report");
+        let error = apply_scope_declaration(
+            &[named],
+            &declaration(vec![ScopeOperation::Replace {
+                requirement_id: "R1".to_string(),
+                kind: RequirementKind::Constraint,
+                text: "the audit report".to_string(),
+                target: None,
+                source_quote: "the audit report".to_string(),
+                check: None,
+                verification: None,
+                reason: None,
+            }]),
+        )
+        .expect_err("an owed deliverable cannot become a non-owed constraint in place");
+        assert!(
+            matches!(
+                error,
+                ScopeError::WeakeningRequiresNewSource {
+                    ref id,
+                    operation: "replace",
+                } if id == "R1"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_waiver_reusing_the_declaring_quote_is_refused() {
+        let named = item("R1", RequirementKind::Named, "docs");
+        let error = apply_scope_declaration(
+            &[named],
+            &declaration(vec![ScopeOperation::Waive {
+                requirement_id: "R1".to_string(),
+                source_quote: "docs".to_string(),
+                reason: None,
+            }]),
+        )
+        .expect_err("the declaring words cannot waive what they declared");
+        assert!(
+            matches!(
+                error,
+                ScopeError::WeakeningRequiresNewSource {
+                    ref id,
+                    operation: "waive",
+                } if id == "R1"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Non-owed kinds carry no completion contract, so a waiver cannot lower
+    /// one. The quote rule guards owed requirements only.
+    #[test]
+    fn a_non_owed_requirement_can_be_waived_with_its_own_words() {
+        let constraint = item("R1", RequirementKind::Constraint, "keep it simple");
+        let projected = apply_scope_declaration(
+            &[constraint],
+            &declaration(vec![ScopeOperation::Waive {
+                requirement_id: "R1".to_string(),
+                source_quote: "keep it simple".to_string(),
+                reason: None,
+            }]),
+        )
+        .expect("a constraint has no completion contract to lower");
+        assert_eq!(projected.items[0].state, RequirementState::Waived);
+    }
+
+    /// The runtime's own `content` diagnostic tells the model to amend `text`
+    /// when the recorded value is a description instead of the literal. That
+    /// correction stays available: the target, which is the mechanical
+    /// anchor, is unchanged.
+    #[test]
+    fn an_amend_may_correct_a_content_literal_in_place() {
+        let mut content = item(
+            "R6",
+            RequirementKind::Content,
+            "The worker runs inside the same process and stops cleanly on shutdown.",
+        );
+        content.target = Some("cmd/server/main.go".to_string());
+        content.source_quote =
+            "The worker runs inside the same process and stops cleanly on shutdown.".to_string();
+        let projected = apply_scope_declaration(
+            &[content],
+            &declaration(vec![ScopeOperation::Amend {
+                requirement_id: "R6".to_string(),
+                kind: None,
+                text: Some("srv.Run(ctx)".to_string()),
+                target: None,
+                source_quote:
+                    "The worker runs inside the same process and stops cleanly on shutdown."
+                        .to_string(),
+                check: None,
+                verification: None,
+                reason: Some("the recorded text was a description, not the file line".to_string()),
+            }]),
+        )
+        .expect("the literal correction keeps the same mechanical contract");
+        assert_eq!(projected.items[0].text, "srv.Run(ctx)");
     }
 
     #[test]

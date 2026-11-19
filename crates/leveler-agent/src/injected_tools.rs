@@ -465,9 +465,12 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
             extracted from the message itself), so never paraphrase or invent one. Use \
             requirement ids from \
             commit_task or get_goal_scope. `add` mints a new id and needs `kind` and `text`; \
-            `amend` changes fields of an active requirement; `replace` retires an active \
-            requirement and mints a new id carrying the replacement; `waive` marks an active \
-            requirement no longer owed without deleting its history; `restore` revives a \
+            `amend` changes fields of an active requirement but cannot change a mechanical \
+            `target`; `replace` retires an active requirement and mints a new id carrying the \
+            replacement, and a replacement that does not strictly strengthen an owed \
+            requirement must quote user words other than the ones that declared it; `waive` \
+            marks an active requirement no longer owed without deleting its history and also \
+            needs different user words than the declaration; `restore` revives a \
             waived requirement. Constraints use the same operations as deliverables. Do not \
             waive or replace an unrelated requirement the user did not mention: every \
             operation must quote the user's own words for that change.",
@@ -509,7 +512,7 @@ pub(crate) fn declare_scope_tool_definition() -> ToolDefinition {
                             "target": {
                                 "type": "string",
                                 "description": format!(
-                                    "The path, file or exact command named by `kind`. For `amend`, set it when changing `kind` to one of these. {target_contract}"
+                                    "The path, file or exact command named by `kind`. For `amend`, set it only when changing `kind` to a strictly stronger mechanical kind; an existing target is fixed in place. {target_contract}"
                                 )
                             },
                             "source_quote": {

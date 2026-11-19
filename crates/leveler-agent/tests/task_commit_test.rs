@@ -2197,6 +2197,136 @@ async fn a_joined_goal_does_not_adopt_an_unrelated_goals_execution() {
 /// A model that records the requirement as prose cannot satisfy it by
 /// rewriting the file; the refusal must name the declaration fix, and an
 /// `amend` to the literal must then complete on the same evidence.
+/// P4 regression: a `content` requirement whose recorded text is a
+/// description (not a file line) refuses completion. The model's shortcut was
+/// to `replace` it with a `named` requirement quoting the same user words that
+/// declared it. That would lower a mechanical contract to model judgement
+/// without the user saying anything new. The runtime refuses the replace and
+/// the documented recovery — amend the literal in place — still completes.
+#[tokio::test]
+async fn a_same_quote_replace_cannot_lower_a_mechanical_requirement() {
+    const REQUEST: &str = "创建 stage-1.txt，内容为一行 stage 1，完成后确认。";
+    fn complete() -> Scripted {
+        Scripted::Tool(
+            "update_goal",
+            serde_json::json!({
+                "status": "complete",
+                "summary": "stage-1.txt 已创建",
+                "verification": {
+                    "status": "not_applicable",
+                    "detail": "the content requirement is checked against the workspace"
+                },
+                "requirements": [
+                    {"id": "R1", "status": "done", "evidence": "created stage-1.txt"}
+                ]
+            }),
+        )
+    }
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["stage-1.txt 内容为一行 stage 1"],
+                    "requirements": [{
+                        "kind": "content",
+                        "text": "stage-1.txt 的内容为一行 stage 1",
+                        "target": "stage-1.txt",
+                        "source_quote": "内容为一行 stage 1"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "write_file",
+                serde_json::json!({"path": "stage-1.txt", "content": "stage 1\n"}),
+            ),
+            complete(),
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [{
+                        "op": "replace",
+                        "requirement_id": "R1",
+                        "kind": "named",
+                        "text": "stage-1.txt 的内容为一行 stage 1",
+                        "source_quote": "内容为一行 stage 1",
+                        "reason": "the requirement is behavioural, not a literal line"
+                    }]
+                }),
+            ),
+            Scripted::Tool(
+                "declare_scope",
+                serde_json::json!({
+                    "operations": [{
+                        "op": "amend",
+                        "requirement_id": "R1",
+                        "text": "stage 1",
+                        "source_quote": "内容为一行 stage 1"
+                    }]
+                }),
+            ),
+            complete(),
+        ],
+        false,
+    )
+    .await;
+
+    let report = chat_with_request(&fx, REQUEST, CancellationToken::new()).await;
+
+    let refusal = {
+        let requests = fx.runtime.requests.lock().unwrap();
+        requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.clone()),
+                _ => None,
+            })
+            .find(|result| {
+                result
+                    .content
+                    .contains("reuses the user words that declared it")
+            })
+            .expect("the refused replace reaches the model")
+    };
+    assert!(
+        refusal.is_error,
+        "the same-quote replace is a refusal: {}",
+        refusal.content
+    );
+    assert!(
+        refusal.content.contains("amend `text`/`check` in place"),
+        "the refusal names the legitimate in-place path: {}",
+        refusal.content
+    );
+
+    let goals = goal_records(&fx).await;
+    let items = leveler_storage::EngineStores::from_database(&fx.db)
+        .goals
+        .requirements(&goals[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the refused replace minted no new requirement: {items:?}"
+    );
+    assert_eq!(items[0].id, "R1");
+    assert_eq!(items[0].kind, leveler_lifecycle::RequirementKind::Content);
+    assert_eq!(items[0].state, leveler_lifecycle::RequirementState::Active);
+    assert_eq!(
+        items[0].text, "stage 1",
+        "the accepted amend corrected the literal in place"
+    );
+    assert_eq!(
+        report.outcome,
+        leveler_lifecycle::TaskOutcome::Completed,
+        "the corrected declaration completes on the evidence that was already there: {report:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_content_requirement_refusal_names_the_declaration_fix() {
     const REQUEST: &str = "创建 stage-1.txt，内容为一行 stage 1，完成后确认。";
