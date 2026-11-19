@@ -479,6 +479,17 @@ pub enum ScopeError {
     )]
     TargetChangeRequiresReplace { id: String },
     #[error(
+        "requirement `{id}` cannot change its kind from `{from}` to `{to}` through `amend`: the \
+         kind selects the mechanical completion check, and two mechanical kinds can verify \
+         different facts. `replace` the requirement with a new identity anchored to the user's \
+         newest words, or amend only `text`/`check`."
+    )]
+    KindChangeRequiresReplace {
+        id: String,
+        from: &'static str,
+        to: &'static str,
+    },
+    #[error(
         "the `{operation}` of requirement `{id}` reuses the user words that declared it. A \
          replace or waiver lowers or retires an owed requirement, so it must be anchored to \
          different user words. If the declaration itself is wrong, amend `text`/`check` in \
@@ -725,6 +736,25 @@ fn apply_operation(
                 // judgement in place. Retiring it through `replace` is an
                 // explicit, separately recorded change with a new identity.
                 return Err(ScopeError::EvidencePolicyDowngrade {
+                    id: requirement_id.clone(),
+                    from: items[index].kind.label(),
+                    to: next.label(),
+                });
+            }
+            // The kind selects the mechanical check itself. Two mechanical
+            // kinds can share an evidence policy and still verify different
+            // facts (`content` compares a literal line, `artifact` only needs
+            // the file to exist), so an equal-strength switch in place would
+            // lower the contract without a new requirement identity. An owed
+            // mechanical requirement changes its kind only through `replace`.
+            if let Some(next) = kind
+                && *next != items[index].kind
+                && matches!(
+                    items[index].kind.evidence_policy(),
+                    Some(EvidencePolicy::Mechanical)
+                )
+            {
+                return Err(ScopeError::KindChangeRequiresReplace {
                     id: requirement_id.clone(),
                     from: items[index].kind.label(),
                     to: next.label(),
@@ -1412,6 +1442,41 @@ mod tests {
         assert!(
             matches!(error, ScopeError::TargetChangeRequiresReplace { ref id } if id == "R1"),
             "{error:?}"
+        );
+    }
+
+    /// `content` and `artifact` have the same evidence policy, so the old
+    /// strength check let `amend` turn "the file contains this literal" into
+    /// "the file exists". The kind is the completion contract, not a label:
+    /// an owed mechanical requirement must be retired through `replace`.
+    #[test]
+    fn an_amend_cannot_switch_a_mechanical_kind_in_place() {
+        let mut content = item("R1", RequirementKind::Content, "srv.Run(ctx)");
+        content.target = Some("cmd/server/main.go".to_string());
+        content.source_quote = "the worker stops on shutdown".to_string();
+        let result = apply_scope_declaration(
+            &[content],
+            &declaration(vec![ScopeOperation::Amend {
+                requirement_id: "R1".to_string(),
+                kind: Some(RequirementKind::Artifact),
+                text: None,
+                target: Some("cmd/server/main.go".to_string()),
+                source_quote: "the worker stops on shutdown".to_string(),
+                check: None,
+                verification: None,
+                reason: None,
+            }]),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ScopeError::KindChangeRequiresReplace {
+                    ref id,
+                    from: "content",
+                    to: "artifact",
+                }) if id == "R1"
+            ),
+            "content -> artifact drops the literal check without a new declaration: {result:?}"
         );
     }
 
