@@ -453,6 +453,7 @@ async fn auto_delivered_background_result_is_citable_without_a_rerun() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "后台检查已退出，退出码 0",
                 "verification": { "status": "passed", "detail": citation },
                 "deliver_answer": true
             }),
@@ -539,6 +540,7 @@ async fn repeated_background_reads_do_not_account_the_same_change_twice() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "引用先前的测试通过结果",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": false
             }),
@@ -572,6 +574,7 @@ async fn repeated_background_reads_do_not_account_the_same_change_twice() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "重新运行测试后完成",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),
@@ -673,6 +676,7 @@ async fn a_failed_background_write_expires_the_verification_it_followed() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "引用先前的测试通过结果",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": false
             }),
@@ -687,6 +691,7 @@ async fn a_failed_background_write_expires_the_verification_it_followed() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "重新运行测试后完成",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),
@@ -795,6 +800,7 @@ async fn a_running_background_write_expires_the_verification_it_followed() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "引用先前的测试通过结果",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": false
             }),
@@ -809,6 +815,7 @@ async fn a_running_background_write_expires_the_verification_it_followed() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "重新运行测试后完成",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),
@@ -915,6 +922,7 @@ async fn a_running_background_read_does_not_expire_current_evidence() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "后台只读任务未改动工作区，测试证据保持有效",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),
@@ -1028,6 +1036,7 @@ async fn a_stopped_background_write_expires_the_verification_it_followed() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "引用先前的测试通过结果",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": false
             }),
@@ -1042,6 +1051,7 @@ async fn a_stopped_background_write_expires_the_verification_it_followed() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "重新运行测试后完成",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),
@@ -1157,6 +1167,7 @@ async fn a_same_batch_terminal_wait_accounts_before_the_completion() {
                 "update_goal",
                 serde_json::json!({
                     "status": "complete",
+                    "summary": "引用先前的测试通过结果",
                     "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                     "deliver_answer": false
                 }),
@@ -1172,6 +1183,7 @@ async fn a_same_batch_terminal_wait_accounts_before_the_completion() {
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "重新运行测试后完成",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),
@@ -1277,6 +1289,7 @@ async fn an_auto_delivered_background_write_expires_the_verification_it_followed
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "引用先前的测试通过结果",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": false
             }),
@@ -1292,6 +1305,7 @@ async fn an_auto_delivered_background_write_expires_the_verification_it_followed
             "update_goal",
             serde_json::json!({
                 "status": "complete",
+                "summary": "重新运行测试后完成",
                 "verification": { "status": "passed", "detail": "sh run-tests.sh" },
                 "deliver_answer": true
             }),

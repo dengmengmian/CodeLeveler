@@ -7881,3 +7881,78 @@ async fn a_resolution_without_a_summary_is_refused_then_the_summary_is_delivered
         "this window wrote the outline; the report body remains"
     );
 }
+
+/// A whitespace-only account is the same omission spelled differently: the
+/// runtime trims before the non-empty check. It is refused exactly once, and
+/// the next valid account is delivered.
+#[tokio::test]
+async fn a_resolution_with_a_blank_summary_is_refused_then_the_summary_is_delivered() {
+    const REQUEST: &str = "先写报告大纲，再继续完成报告";
+    let fx = fixture(
+        vec![
+            Scripted::Tool(
+                "commit_task",
+                serde_json::json!({
+                    "objective": REQUEST,
+                    "acceptance": ["报告大纲存在"],
+                    "task_relation": "continue"
+                }),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({"status": "yield", "summary": "   "}),
+            ),
+            Scripted::Tool(
+                "update_goal",
+                serde_json::json!({
+                    "status": "yield",
+                    "summary": "this window wrote the outline; the report body remains"
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    let mut events = Vec::new();
+    let report = fx
+        .coding
+        .chat(
+            &fx.session,
+            &spec_for(&fx, REQUEST),
+            vec![ContentPart::Text {
+                text: REQUEST.into(),
+            }],
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let refusals: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            leveler_engine::EngineEvent::GoalIntercepted { kind, detail }
+                if kind == "missing_summary" =>
+            {
+                Some(detail)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the blank account is refused once: {events:?}"
+    );
+    assert!(
+        refusals[0]
+            .chars()
+            .all(|character| character == '"' || character.is_whitespace()),
+        "the refusal observes the blank account: {refusals:?}"
+    );
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Yielded);
+    assert_eq!(
+        report.final_text,
+        "this window wrote the outline; the report body remains"
+    );
+}
