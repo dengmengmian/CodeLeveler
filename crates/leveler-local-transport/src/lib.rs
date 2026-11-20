@@ -700,15 +700,7 @@ mod transport {
         let parent = token_path.parent().ok_or_else(|| {
             TransportError::Unavailable("the local socket has no parent directory".into())
         })?;
-        let existed = parent.exists();
         std::fs::create_dir_all(parent)?;
-        if !existed {
-            // Only tighten a directory this bind created. A caller may point
-            // `--socket` at an existing shared directory (a test temp root or
-            // an operator-chosen path); silently chmod-ing that directory
-            // would change unrelated files' access. The token itself is 0600.
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
 
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes).map_err(|error| {
@@ -1342,7 +1334,18 @@ mod transport {
         ) -> Result<Self, TransportError> {
             let path = path.as_ref().to_path_buf();
             if let Some(parent) = path.parent() {
+                // The directory holding the socket and its access token is
+                // private. Only tighten a directory this bind creates: a
+                // caller may point `--socket` at an existing shared directory
+                // (a test temp root or an operator-chosen path), and silently
+                // chmod-ing that would change unrelated files' access. The
+                // socket and token files are 0600 either way.
+                let existed = parent.exists();
                 tokio::fs::create_dir_all(parent).await?;
+                if !existed {
+                    tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                        .await?;
+                }
             }
             // Take the daemon ownership lock BEFORE inspecting the socket
             // path. A live daemon holds it for its whole lifetime, so a
@@ -2930,7 +2933,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.sock");
+        // Bind creates this directory, so it is the one whose mode the
+        // transport owns. The temp root above it belongs to the caller and is
+        // deliberately left as-is.
+        let path = dir.path().join("sockets").join("auth.sock");
         let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
         let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
         let token_path = path.with_extension("token");
