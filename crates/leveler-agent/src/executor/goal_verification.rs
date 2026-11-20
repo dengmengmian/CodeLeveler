@@ -1159,6 +1159,22 @@ fn cites_recorded_command_with_result_note(label: &str, cited: &str) -> bool {
         && result_note_marker(&cited_tokens[label_tokens.len()])
 }
 
+/// Whether a citation names exactly this argv, optionally followed by a
+/// result note.
+///
+/// Quotes group the text they enclose into one token, so an argument the
+/// display label split at its spaces comes back as one argument here. A note
+/// starts at an unquoted result marker, as in
+/// [`cites_recorded_command_with_result_note`]; a parenthetical note was
+/// already removed by [`strip_trailing_note`].
+fn cites_argv(argv: &[String], cited: &str) -> bool {
+    let tokens = command_tokens(strip_trailing_note(cited));
+    if tokens.get(..argv.len()) != Some(argv) {
+        return false;
+    }
+    tokens.len() == argv.len() || result_note_marker(&tokens[argv.len()])
+}
+
 /// Whether a recorded execution is the execution a citation names.
 ///
 /// The citation is text the model wrote; the argv is the identity the process
@@ -1169,7 +1185,7 @@ fn cites_recorded_command_with_result_note(label: &str, cited: &str) -> bool {
 /// in the comparison because it is the prose form the runtime offers back as
 /// citable, and a compound line may be cited by one of its segments.
 fn cites_execution(label: &str, argv: Option<&[String]>, cited: &str) -> bool {
-    run_matches_command(label, argv, cited)
+    argv.is_some_and(|argv| cites_argv(argv, cited))
         || cites(label, cited)
         || cites_recorded_command_with_result_note(label, cited)
 }
@@ -2430,6 +2446,41 @@ mod tests {
             decide(
                 &VerificationClaim::Passed(vec![
                     "python3 -c \"from pricing import quote_web, quote_store, quote_partner\""
+                        .to_string()
+                ]),
+                &[recorded],
+                &[],
+                2,
+                true
+            ),
+            VerificationDecision::Accept {
+                status: Some(VerificationStatus::Verified),
+                warnings: Vec::new(),
+            }
+        );
+    }
+
+    /// A citation may carry the observation the model drew from the run:
+    /// `cmd — it printed …`. The note is presentation, and the command before
+    /// it is still the recorded argv even when one argument was quoted.
+    #[test]
+    fn a_cited_run_command_with_a_quoted_argument_and_a_result_note_resolves() {
+        let mut recorded = run(
+            "python3 -c from pricing import quote_web, quote_store, quote_partner",
+            true,
+            9,
+            2,
+        );
+        recorded.argv = Some(vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            "from pricing import quote_web, quote_store, quote_partner".to_string(),
+        ]);
+        assert_eq!(
+            decide(
+                &VerificationClaim::Passed(vec![
+                    "python3 -c \"from pricing import quote_web, quote_store, quote_partner\" \
+                     — it printed the half-up quote"
                         .to_string()
                 ]),
                 &[recorded],
