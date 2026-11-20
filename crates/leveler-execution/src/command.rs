@@ -4002,6 +4002,7 @@ mod tests {
             &WriteScope::Unrestricted,
             None,
             &[],
+            &[],
         );
         assert_eq!(program, "/usr/bin/sandbox-exec");
         assert!(
@@ -4028,6 +4029,7 @@ mod tests {
             None,
             &[],
             std::slice::from_ref(&secret),
+            &[],
         );
         assert_eq!(
             program, "cat",
@@ -5521,6 +5523,7 @@ mod tests {
             Some(scratch.path()),
             &[],
             std::slice::from_ref(&secret),
+            &[],
         );
         assert_eq!(program, "/usr/bin/sandbox-exec");
         let policy = &args[1];
@@ -5569,6 +5572,7 @@ mod tests {
             Some(scratch.path()),
             std::slice::from_ref(&cache),
             std::slice::from_ref(&sealed.to_path_buf()),
+            &[],
         );
         let policy = &args[1];
         let deny_at = policy
@@ -5625,6 +5629,7 @@ mod tests {
             Some(scratch.path()),
             &cache_roots,
             std::slice::from_ref(&sealed),
+            &[],
         );
         let output = std::process::Command::new(&program)
             .args(&args)
@@ -5663,6 +5668,7 @@ mod tests {
             Some(scratch.path()),
             &cache_roots,
             std::slice::from_ref(&sealed),
+            &[],
         );
         let output = std::process::Command::new(&program)
             .args(&args)
@@ -5705,6 +5711,7 @@ mod tests {
                 root: (root).to_path_buf(),
             },
             Some(scratch.path()),
+            &[],
             &[],
             &[],
         );
@@ -5783,6 +5790,7 @@ mod tests {
                 Some(scratch.as_path()),
                 &[],
                 &denied,
+                &[],
             );
             std::process::Command::new(program)
                 .args(args)
@@ -5886,6 +5894,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
         );
         assert_eq!(program, "cat", "unsealed full access stays unwrapped");
         assert_eq!(args, vec!["x".to_string()]);
@@ -5899,6 +5908,7 @@ mod tests {
             None,
             &[],
             std::slice::from_ref(&secret),
+            &[],
         );
         assert_eq!(program, "/usr/bin/sandbox-exec");
         assert!(
@@ -5932,6 +5942,7 @@ mod tests {
             },
             Some(scratch.path()),
             &cache_roots,
+            &[],
         );
         assert_eq!(program, "/usr/bin/sandbox-exec");
         let policy = &args[1];

@@ -133,7 +133,6 @@ impl FileStateTracker {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 
