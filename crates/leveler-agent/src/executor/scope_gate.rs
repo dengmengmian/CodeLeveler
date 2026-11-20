@@ -755,16 +755,22 @@ enum RunCheck<'a> {
 /// rerun is the repair. A different line that merely contains the command is
 /// not its record.
 fn successful_run<'a>(facts: &ScopeFacts<'a>, command: &str) -> RunCheck<'a> {
-    let matching =
-        |label: &str| crate::executor::goal_verification::run_matches_command(label, command);
-    if let Some(run) = facts.runs.iter().rev().find(|run| matching(&run.label)) {
+    let matching = |label: &str, argv: Option<&[String]>| {
+        crate::executor::goal_verification::run_matches_command(label, argv, command)
+    };
+    if let Some(run) = facts
+        .runs
+        .iter()
+        .rev()
+        .find(|run| matching(&run.label, run.argv.as_deref()))
+    {
         return classify(run, facts.mutation_ops);
     }
     if let Some(started) = facts
         .pending
         .iter()
         .rev()
-        .find(|started| matching(&started.label))
+        .find(|started| matching(&started.label, started.argv.as_deref()))
     {
         return RunCheck::Pending(started);
     }
@@ -838,6 +844,7 @@ mod tests {
     fn run(label: &str, ok: bool, mutation_ops: u64, call_id: &str) -> VerificationRun {
         VerificationRun {
             label: label.to_string(),
+            argv: None,
             ok,
             exit_code: Some(if ok { 0 } else { 1 }),
             model_step: 1,
@@ -1046,6 +1053,47 @@ mod tests {
         );
     }
 
+    /// A `run_command` call carries a program and an argv, while the
+    /// requirement declares the command line as the user wrote it. A quoted
+    /// argument belongs to one argv element; the recorded label must keep that
+    /// boundary, otherwise the exact execution reads as a different command.
+    #[test]
+    fn a_quoted_run_command_argument_is_the_declared_execution() {
+        let target = "python3 -c \"from pricing import quote_web, quote_store, quote_partner\"";
+        let label = crate::executor::goal_verification::command_label(
+            "run_command",
+            &serde_json::json!({
+                "program": "python3",
+                "args": ["-c", "from pricing import quote_web, quote_store, quote_partner"]
+            }),
+        )
+        .expect("a run_command has a label");
+        let requirements = [item(
+            "R7",
+            RequirementKind::Command,
+            "the import check passes",
+            Some(target),
+        )];
+        let accounts = [account("R7", AccountStatus::Done, "call_id:call-1")];
+        let mut passed = [run(&label, true, 1, "call-1")];
+        passed[0].argv = crate::executor::goal_verification::command_argv(
+            "run_command",
+            &serde_json::json!({
+                "program": "python3",
+                "args": ["-c", "from pricing import quote_web, quote_store, quote_partner"]
+            }),
+        );
+        let decision = accept_with(
+            &requirements,
+            &accounts,
+            &passed,
+            1,
+            &absent,
+            &unknown_literal,
+        );
+        accept_verified(decision);
+    }
+
     /// A command that only started has no result yet. Accounting for it as
     /// done is refused for the real missing fact, and the refusal names the
     /// background task to wait on.
@@ -1060,6 +1108,7 @@ mod tests {
         let accounts = [account("R1", AccountStatus::Done, "sh verify.sh")];
         let pending = [PendingCommand {
             label: "sh verify.sh".to_string(),
+            argv: None,
             task_id: Some("bg-1".to_string()),
             call_id: Some("call-1".to_string()),
             started_mutation_ops: Some(0),

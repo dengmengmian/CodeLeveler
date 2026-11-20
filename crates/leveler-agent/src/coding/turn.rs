@@ -21,7 +21,7 @@ use leveler_storage::EventStore;
 use crate::coding::checkpoint::{CodingCheckpointContext, CodingCompactionCheckpoint};
 use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::executor::goal_verification::{
-    PendingCommand, RegisteredCheckStart, VerificationFacts, VerificationRun, command_label,
+    PendingCommand, RegisteredCheckStart, VerificationFacts, VerificationRun, command_identity,
 };
 use crate::sub_agent::SettledChildNotice;
 use crate::{AgentError, AgentEvent, AgentOutcome, DriveAborted, Executor};
@@ -778,12 +778,13 @@ async fn collect_goal_verification(
                 mutation_ops: started_mutation_ops,
             } => {
                 if let Some((name, arguments, _)) = calls.get(&call_id)
-                    && let Some(label) = command_label(name, arguments)
+                    && let Some(identity) = command_identity(name, arguments)
                 {
                     pending.insert(
                         call_id.clone(),
                         PendingCommand {
-                            label,
+                            label: identity.label,
+                            argv: Some(identity.argv),
                             task_id: None,
                             call_id: Some(call_id),
                             started_mutation_ops: Some(started_mutation_ops),
@@ -830,8 +831,8 @@ async fn collect_goal_verification(
                 let Some((name, arguments, model_step)) = calls.remove(&call_id) else {
                     continue;
                 };
-                let Some(label) =
-                    crate::executor::goal_verification::command_label(&name, &arguments)
+                let Some(identity) =
+                    crate::executor::goal_verification::command_identity(&name, &arguments)
                 else {
                     continue;
                 };
@@ -845,7 +846,8 @@ async fn collect_goal_verification(
                     let window = windows.get(&call_id).copied();
                     let check_start = pending.remove(&call_id).and_then(|start| start.check_start);
                     runs.push(VerificationRun {
-                        label,
+                        label: identity.label,
+                        argv: Some(identity.argv),
                         ok: !is_error,
                         exit_code,
                         model_step,
@@ -869,7 +871,8 @@ async fn collect_goal_verification(
                     pending.insert(
                         call_id.clone(),
                         PendingCommand {
-                            label,
+                            label: identity.label,
+                            argv: Some(identity.argv),
                             task_id: task_by_call.get(&call_id).cloned().or(existing_task),
                             call_id: Some(call_id.clone()),
                             started_mutation_ops: windows
@@ -942,8 +945,10 @@ fn background_result_run(
     mutation_ops: u64,
 ) -> Option<VerificationRun> {
     let (name, arguments, model_step) = started.get(call_id)?;
+    let identity = command_identity(name, arguments)?;
     Some(VerificationRun {
-        label: command_label(name, arguments)?,
+        label: identity.label,
+        argv: Some(identity.argv),
         ok: !is_error,
         exit_code,
         model_step: *model_step,

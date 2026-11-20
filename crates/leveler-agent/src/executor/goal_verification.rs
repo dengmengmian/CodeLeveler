@@ -36,6 +36,9 @@ pub(crate) const MAX_VERIFICATION_RUNS: usize = 64;
 pub struct VerificationRun {
     /// The command as executed (`go test ./...`, `sh verify.sh`).
     pub label: String,
+    /// The argv the process received, when the call carried one. `None` for a
+    /// record rebuilt from data written before this identity existed.
+    pub argv: Option<Vec<String>>,
     /// The tool did not report an error (for a command, exit 0).
     pub ok: bool,
     /// The exit status the tool reported, when it reported one. A killed or
@@ -272,6 +275,8 @@ pub(crate) enum VerificationDecision {
 pub struct PendingCommand {
     /// The same label a citation is matched against.
     pub label: String,
+    /// The argv the launched process received, when the call carried one.
+    pub argv: Option<Vec<String>>,
     /// The background task id, when the start reported one.
     pub task_id: Option<String>,
     /// The tool call that started it, so the result can be cited by that id.
@@ -390,6 +395,8 @@ pub(crate) struct BackgroundResultFact {
     pub start_call_id: Option<String>,
     /// The command's label, when the execution can be cited at all.
     pub label: Option<String>,
+    /// The argv the started process received, when the observation knows it.
+    pub argv: Option<Vec<String>>,
     /// The command reached this result (exit 0 is the only pass).
     pub ok: bool,
     pub exit_code: Option<i32>,
@@ -440,6 +447,10 @@ pub(crate) fn record_background_result(
     else {
         return false;
     };
+    let argv = started
+        .as_ref()
+        .and_then(|start| start.argv.clone())
+        .or(fact.argv);
     let window_start = started
         .as_ref()
         .and_then(|start| start.started_mutation_ops);
@@ -484,6 +495,7 @@ pub(crate) fn record_background_result(
     };
     runs.push(VerificationRun {
         label,
+        argv,
         ok: fact.ok && fact.evidence,
         exit_code: fact.exit_code,
         model_step,
@@ -1111,11 +1123,22 @@ fn cited_run_resolved<'a>(
 ///
 /// A `tests` or `command` requirement declares the exact command line whose
 /// run is its evidence, so a different line that merely contains it is a
-/// different execution (`echo make test` did not run `make test`). Only
-/// presentation is normalized: quoting and a trailing result note.
-pub(crate) fn run_matches_command(label: &str, command: &str) -> bool {
+/// different execution (`echo make test` did not run `make test`). The argv
+/// comparison treats shell quoting as syntax, so
+/// `python3 -c "from pricing import x"` and the argv
+/// `["python3", "-c", "from pricing import x"]` are the same execution, while
+/// `grep 'a b' file` and `grep a b file` are not. A record rebuilt from older
+/// data may carry no argv; it falls back to the display-label comparison that
+/// predates the structured identity.
+pub(crate) fn run_matches_command(label: &str, argv: Option<&[String]>, command: &str) -> bool {
     let cited = command_tokens(strip_trailing_note(command));
-    !cited.is_empty() && command_tokens(label) == cited
+    if cited.is_empty() {
+        return false;
+    }
+    match argv {
+        Some(argv) => argv == cited.as_slice(),
+        None => command_tokens(label) == cited,
+    }
 }
 
 fn result_note_marker(token: &str) -> bool {
@@ -1225,7 +1248,9 @@ fn strip_trailing_note(command: &str) -> &str {
 /// The command a tool call actually asked to run, in one display string.
 ///
 /// Only the two command tools have one. Every other tool is not executable
-/// verification, so a call returns `None`.
+/// verification, so a call returns `None`. The display string is not an
+/// identity: use [`command_argv`] when argument boundaries decide whether two
+/// executions are the same command.
 pub(crate) fn command_label(name: &str, arguments: &serde_json::Value) -> Option<String> {
     match name {
         "run_command" => {
@@ -1256,6 +1281,62 @@ pub(crate) fn command_label(name: &str, arguments: &serde_json::Value) -> Option
     }
 }
 
+/// The two forms a command call has: a display label and the argv the process
+/// received.
+///
+/// The label is prose-friendly and rejects nothing; the argv is the execution
+/// identity a `tests` or `command` requirement needs. Keeping both prevents a
+/// quoted argument (`-c "from pricing import x"`) from reading as several
+/// unquoted arguments just because the display joined them with spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandIdentity {
+    pub label: String,
+    pub argv: Vec<String>,
+}
+
+/// The display label and argv of a command tool call.
+pub(crate) fn command_identity(
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<CommandIdentity> {
+    let label = command_label(name, arguments)?;
+    let argv = command_argv(name, arguments)?;
+    Some(CommandIdentity { label, argv })
+}
+
+/// The execution identity of a command tool call, in argv form.
+///
+/// `run_command` already carries an argv. `shell_command` carries a command
+/// line, so its words are split with shell quoting rules.
+pub(crate) fn command_argv(name: &str, arguments: &serde_json::Value) -> Option<Vec<String>> {
+    match name {
+        "run_command" => {
+            let program = arguments.get("program")?.as_str()?.trim();
+            if program.is_empty() {
+                return None;
+            }
+            let mut argv = vec![program.to_string()];
+            if let Some(args) = arguments.get("args").and_then(|value| value.as_array()) {
+                argv.extend(
+                    args.iter()
+                        .filter_map(|arg| arg.as_str())
+                        .map(str::to_string),
+                );
+            }
+            Some(argv)
+        }
+        "shell_command" => {
+            let command = arguments
+                .get("cmd")
+                .or_else(|| arguments.get("command"))?
+                .as_str()?
+                .trim();
+            (!command.is_empty()).then(|| command_tokens(command))
+        }
+        _ => None,
+    }
+}
+
 /// The command label of a process the runtime actually ran, when the result
 /// arrives from the process itself rather than from the call that started it.
 ///
@@ -1270,6 +1351,18 @@ pub(crate) fn background_command_label(program: &str, args: &[String]) -> Option
     }
     let arguments = serde_json::json!({ "program": program, "args": args });
     command_label("run_command", &arguments)
+}
+
+/// The argv of a process the runtime actually ran. The program and its
+/// arguments are already separate, so no command line is re-parsed.
+pub(crate) fn background_command_argv(program: &str, args: &[String]) -> Option<Vec<String>> {
+    let program = program.trim();
+    if program.is_empty() {
+        return None;
+    }
+    let mut argv = vec![program.to_string()];
+    argv.extend(args.iter().cloned());
+    Some(argv)
 }
 
 #[cfg(test)]
@@ -1306,6 +1399,7 @@ mod tests {
     fn run(label: &str, ok: bool, step: u32, mutation_ops: u64) -> VerificationRun {
         VerificationRun {
             label: label.to_string(),
+            argv: None,
             ok,
             exit_code: Some(if ok { 0 } else { 1 }),
             model_step: step,
@@ -1369,6 +1463,7 @@ mod tests {
 
         let mut pending = PendingCommand {
             label: pass.label.clone(),
+            argv: None,
             task_id: Some("background".into()),
             call_id: Some("pending".into()),
             started_mutation_ops: Some(4),
@@ -1795,6 +1890,7 @@ mod tests {
     fn pending_start(label: &str, task_id: &str, call_id: &str) -> PendingCommand {
         PendingCommand {
             label: label.to_string(),
+            argv: None,
             task_id: Some(task_id.to_string()),
             call_id: Some(call_id.to_string()),
             started_mutation_ops: Some(0),
@@ -1813,6 +1909,7 @@ mod tests {
             task_id: task_id.to_string(),
             start_call_id: Some(call_id.to_string()),
             label: Some(label.to_string()),
+            argv: None,
             ok,
             exit_code: Some(if ok { 0 } else { 1 }),
             evidence,
@@ -2127,6 +2224,7 @@ mod tests {
     fn a_citation_of_a_started_command_names_the_task_to_wait_for() {
         let pending = vec![PendingCommand {
             label: "make up CONFIG=probe.yaml".to_string(),
+            argv: None,
             task_id: Some("bg-1".to_string()),
             call_id: None,
             started_mutation_ops: Some(0),
@@ -2158,6 +2256,7 @@ mod tests {
     fn a_pending_start_cited_with_a_result_note_is_reported_as_unfinished() {
         let pending = vec![PendingCommand {
             label: "go test ./... -count=1".to_string(),
+            argv: None,
             task_id: Some("host-42".to_string()),
             call_id: Some("call-start".to_string()),
             started_mutation_ops: Some(0),
@@ -2860,5 +2959,47 @@ print(f'  text={len(t)}')
             command_label("run_command", &serde_json::json!({"program": "  "})),
             None
         );
+    }
+
+    /// A quoted argument keeps its boundary in the execution identity even
+    /// though the display label joins argv words with spaces.
+    #[test]
+    fn a_quoted_argument_matches_the_argv_the_process_received() {
+        let arguments = serde_json::json!({
+            "program": "python3",
+            "args": ["-c", "from pricing import quote_web, quote_store, quote_partner"]
+        });
+        let argv = command_argv("run_command", &arguments).expect("argv");
+        assert_eq!(
+            argv,
+            [
+                "python3",
+                "-c",
+                "from pricing import quote_web, quote_store, quote_partner"
+            ]
+        );
+        assert!(run_matches_command(
+            &command_label("run_command", &arguments).expect("label"),
+            Some(&argv),
+            "python3 -c \"from pricing import quote_web, quote_store, quote_partner\""
+        ));
+        // The same words without quoting are three arguments, not one.
+        assert!(!run_matches_command(
+            "grep a b file",
+            Some(&["grep".into(), "a".into(), "b".into(), "file".into()]),
+            "grep 'a b' file"
+        ));
+    }
+
+    #[test]
+    fn a_shell_command_identity_uses_shell_quoting() {
+        let arguments = serde_json::json!({"cmd": "python3 -c \"from pricing import x\""});
+        let argv = command_argv("shell_command", &arguments).expect("argv");
+        assert_eq!(argv, ["python3", "-c", "from pricing import x"]);
+        assert!(run_matches_command(
+            "python3 -c 'from pricing import x'",
+            Some(&argv),
+            "python3 -c \"from pricing import x\""
+        ));
     }
 }
