@@ -1122,20 +1122,23 @@ fn cited_run_resolved<'a>(
 ///
 /// A `tests` or `command` requirement declares the exact command line whose
 /// run is its evidence, so a different line that merely contains it is a
-/// different execution (`echo make test` did not run `make test`). The argv
-/// comparison treats shell quoting as syntax, so
-/// `python3 -c "from pricing import x"` and the argv
-/// `["python3", "-c", "from pricing import x"]` are the same execution, while
-/// `grep 'a b' file` and `grep a b file` are not. A record rebuilt from older
-/// data may carry no argv; it falls back to the display-label comparison that
-/// predates the structured identity.
+/// different execution (`echo make test` did not run `make test`).
+///
+/// A run has two authoritative renderings: the argv the process received and
+/// the display label the runtime joins from it. A requirement may name either.
+/// The quoted form (`python3 -c "from pricing import x"`) resolves through the
+/// argv, and the display form (`sh -c exit 0`) resolves through the label. The
+/// label is lossy when an argument contains spaces, so it is compared as the
+/// exact text the runtime displayed for that run; a requirement that quotes
+/// such an argument still distinguishes a different argv. A record rebuilt from
+/// older data may carry no argv; it falls back to the label comparison alone.
 pub(crate) fn run_matches_command(label: &str, argv: Option<&[String]>, command: &str) -> bool {
     let cited = command_tokens(strip_trailing_note(command));
     if cited.is_empty() {
         return false;
     }
     match argv {
-        Some(argv) => argv == cited.as_slice(),
+        Some(argv) => argv == cited.as_slice() || command_tokens(label) == cited,
         None => command_tokens(label) == cited,
     }
 }
@@ -3133,6 +3136,18 @@ print(f'  text={len(t)}')
             "python3 -c 'from pricing import x'",
             Some(&argv),
             "python3 -c \"from pricing import x\""
+        ));
+    }
+
+    /// The display label is the other way the runtime names a run, and it is
+    /// the text a requirement copied from the UI carries. A run whose argv
+    /// joins into that label still satisfies the requirement.
+    #[test]
+    fn a_display_label_names_the_execution_it_renders() {
+        assert!(run_matches_command(
+            "sh -c exit 0",
+            Some(&["sh".into(), "-c".into(), "exit 0".into()]),
+            "sh -c exit 0"
         ));
     }
 }
