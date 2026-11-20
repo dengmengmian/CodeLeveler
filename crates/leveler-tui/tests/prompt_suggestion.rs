@@ -2393,10 +2393,7 @@ fn a_blocked_goal_without_a_next_step_has_no_recap_row() {
 #[test]
 fn replaying_a_goal_terminal_rebuilds_the_same_recap_once() {
     for (status, terminal) in [
-        (
-            "complete",
-            RuntimeEvent::TurnCompleted,
-        ),
+        ("complete", RuntimeEvent::TurnCompleted),
         (
             "blocked",
             RuntimeEvent::TurnBlocked {

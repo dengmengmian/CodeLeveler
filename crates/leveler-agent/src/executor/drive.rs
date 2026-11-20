@@ -1692,6 +1692,7 @@ impl<'a> Drive<'a> {
         start_call_id: Option<&str>,
         goal_id: Option<&leveler_core::GoalId>,
         observed_label: Option<String>,
+        observed_argv: Option<Vec<String>>,
         ok: bool,
         exit_code: Option<i32>,
         evidence: bool,
@@ -1715,6 +1716,10 @@ impl<'a> Drive<'a> {
             .as_ref()
             .map(|pending| pending.label.clone())
             .or(observed_label);
+        let argv = started
+            .as_ref()
+            .and_then(|pending| pending.argv.clone())
+            .or(observed_argv);
         let start_call_id = started
             .as_ref()
             .and_then(|pending| pending.call_id.clone())
@@ -1727,6 +1732,7 @@ impl<'a> Drive<'a> {
                 task_id: task_id.to_string(),
                 start_call_id,
                 label,
+                argv,
                 ok,
                 exit_code,
                 evidence,
@@ -1805,6 +1811,7 @@ impl<'a> Drive<'a> {
                 Some(&call_id),
                 goal_id.as_ref(),
                 super::goal_verification::background_command_label(&program, &args),
+                super::goal_verification::background_command_argv(&program, &args),
                 !is_error,
                 exit_code,
                 // A natural exit is the command's own outcome. A stopped or
@@ -1860,6 +1867,7 @@ impl<'a> Drive<'a> {
                     task.origin_call_id.as_deref(),
                     task.goal_id.as_ref(),
                     super::goal_verification::background_command_label(&task.program, &task.args),
+                    super::goal_verification::background_command_argv(&task.program, &task.args),
                     task.status == leveler_execution::BackgroundTaskStatus::Exited
                         && task.exit_code == Some(0),
                     task.exit_code,
@@ -3684,6 +3692,10 @@ impl Drive<'_> {
                         result.start_call_id.as_deref(),
                         result.goal_id.as_ref(),
                         super::goal_verification::background_command_label(
+                            &result.program,
+                            &result.args,
+                        ),
+                        super::goal_verification::background_command_argv(
                             &result.program,
                             &result.args,
                         ),
@@ -7887,13 +7899,14 @@ impl AgentHarness for Drive<'_> {
             // would block one that later passes. So a start is not a result and
             // is not evidence either way. A flagged failure stays a failed run:
             // the command did not pass, whatever stopped it before it ran.
-            if let Some(label) =
-                super::goal_verification::command_label(&call.name, &call.arguments)
+            if let Some(identity) =
+                super::goal_verification::command_identity(&call.name, &call.arguments)
             {
                 if command_facts.execution_status.is_some() || is_error {
                     self.verification_runs
                         .push(super::goal_verification::VerificationRun {
-                            label: label.clone(),
+                            label: identity.label,
+                            argv: Some(identity.argv),
                             ok: !is_error,
                             exit_code: command_facts.exit_code,
                             model_step: model_steps,
@@ -7918,7 +7931,8 @@ impl AgentHarness for Drive<'_> {
                     // running, and must be able to name the task to wait on.
                     self.pending_commands
                         .push(super::goal_verification::PendingCommand {
-                            label,
+                            label: identity.label,
+                            argv: Some(identity.argv),
                             task_id: command_facts.started_task.clone(),
                             call_id: Some(call.id.as_str().to_string()),
                             started_mutation_ops: execution_versions.map(|(start, _)| start),
@@ -7953,6 +7967,10 @@ impl AgentHarness for Drive<'_> {
                     result.start_call_id.as_deref(),
                     result.goal_id.as_ref(),
                     super::goal_verification::background_command_label(
+                        &result.program,
+                        &result.args,
+                    ),
+                    super::goal_verification::background_command_argv(
                         &result.program,
                         &result.args,
                     ),
