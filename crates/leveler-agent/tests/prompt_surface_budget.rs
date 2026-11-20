@@ -1057,9 +1057,27 @@ async fn progressive_initial_surface_inventory() {
     // and the declarative prose they replaced was trimmed to keep the ceiling.
     // The remaining headroom is small on purpose: a new field-sized surface
     // still needs its own budget decision.
+    //
+    // 8850 (was 8750): the same surface measured 8744 at `d2004fa7` (the
+    // commit that set the 8750 pin) and 8804 at `a7cf1bc2`, a net +60 tokens.
+    // The growth is capability and error prevention, not restated prose:
+    //   * update_goal measures 268 tokens SMALLER: its duplicated prose was
+    //     removed while `summary` and `status` state their contract in the
+    //     field itself;
+    //   * declare_scope +236: the 8-operation cap where the field is read,
+    //     the frozen mechanical target on `amend`, and the different-user-
+    //     words rule for `replace`/`waive` — each stated once, nowhere else;
+    //   * run_command +63: the observed `sh`-as-`program` mistake and the
+    //     `shell_command` alternative (`922051b7`);
+    //   * apply_patch +30: the document is read only from `patch`.
+    // Every addition answers an observed failure or a real contract, and the
+    // new ceiling leaves 46 tokens of headroom — below a field-sized
+    // addition, so its regression value stands.
+    let tools_report = report("progressive_initial", &initial);
+    eprintln!("{tools_report}");
     assert!(
-        schema_tokens <= 8750,
-        "initial schema grew beyond its fixed budget: {schema_tokens}"
+        schema_tokens <= 8850,
+        "initial schema grew beyond its fixed budget: {schema_tokens}\n{tools_report}"
     );
     assert!(initial.tools.len() < full.tools.len());
     eprintln!(
@@ -1072,7 +1090,6 @@ async fn progressive_initial_surface_inventory() {
         estimate_tool_definitions(&full.tools),
         schema_tokens + estimate_text(&initial.control_context.text())
     );
-    eprintln!("{}", report("progressive_initial", &initial));
 }
 
 /// FullAccess is authority, not a broadcast of every schema. It must not ask
