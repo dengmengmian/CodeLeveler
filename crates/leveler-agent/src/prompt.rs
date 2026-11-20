@@ -1358,7 +1358,11 @@ mod prompt_budget {
             always: config.rules.always_delivered,
             budget_bytes: config.rules.budget_bytes,
         };
-        let plan = leveler_context::plan_rule_delivery(&root, &policy);
+        let plan = leveler_context::plan_rule_delivery(
+            &root,
+            &policy,
+            &leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests(),
+        );
         let delivered = plan
             .documents
             .iter()

@@ -206,7 +206,8 @@ fn executor(
     Executor::new(
         runtime,
         Arc::new(registry),
-        ToolContext::new(Workspace::new(root).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(root).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )

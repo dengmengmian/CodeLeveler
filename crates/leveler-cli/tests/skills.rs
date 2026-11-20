@@ -75,11 +75,20 @@ fn fixture() -> Fx {
         "Discover skills.",
         "F.",
     );
-    Fx {
+    let fx = Fx {
         home,
         os_home,
         repo,
-    }
+    };
+    // Definitions are inert until a human approves their exact bytes.
+    let (ok, out) = run(
+        fx.home.path(),
+        fx.os_home.path(),
+        fx.repo.path(),
+        &["trust", "allow", "--yes"],
+    );
+    assert!(ok, "fixture trust failed: {out}");
+    fx
 }
 
 #[test]

@@ -183,7 +183,8 @@ fn workspace(tag: &str) -> (std::path::PathBuf, ToolContext) {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let ctx = ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::FullAccess);
+    let ctx = ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
     (dir, ctx)
 }
 

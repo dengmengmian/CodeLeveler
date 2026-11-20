@@ -231,7 +231,8 @@ fn executor_with_mode(
     leveler_agent::Executor::new(
         script,
         Arc::new(registry(minimal_baseline, env.clone())),
-        ToolContext::with_environment(Workspace::new(root).unwrap(), mode, env),
+        ToolContext::with_environment(Workspace::new(root).unwrap(), mode, env)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     )
@@ -780,7 +781,8 @@ async fn initial_baseline_inventory() {
                 Workspace::new(&root).unwrap(),
                 PermissionProfile::Assisted,
                 env,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             4,
         )
@@ -824,7 +826,8 @@ async fn initial_baseline_inventory() {
                 Workspace::new(&root).unwrap(),
                 PermissionProfile::Assisted,
                 env,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             4,
         )

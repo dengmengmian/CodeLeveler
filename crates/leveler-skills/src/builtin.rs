@@ -79,6 +79,7 @@ pub(crate) fn detail(name: &str) -> Option<SkillDetail> {
         dir: PathBuf::from("(built-in)"),
         scripts: Vec::new(),
         references: Vec::new(),
+        reference_contents: Vec::new(),
         other_files: Vec::new(),
     })
 }

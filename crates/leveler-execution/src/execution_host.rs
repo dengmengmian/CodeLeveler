@@ -455,7 +455,12 @@ fn secure_dir(path: &Path) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        leveler_win_confine::secure_private_state_dir(path)
+            .map_err(|e| format!("Execution Host state directory is not private: {e}"))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Err("persistent Execution Host requires an audited owner-only state directory backend on this platform".into())
@@ -476,6 +481,11 @@ fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     file.flush().map_err(|e| e.to_string())?;
     file.as_file().sync_all().map_err(|e| e.to_string())?;
     file.persist(path).map_err(|e| e.to_string())?;
+    // Windows has no directory fsync: `File::open` on a directory needs
+    // FILE_FLAG_BACKUP_SEMANTICS and sync_all on a directory handle is a
+    // no-op at best. The file itself is already flushed and the rename is the
+    // atomic commit point.
+    #[cfg(unix)]
     std::fs::File::open(parent)
         .and_then(|d| d.sync_all())
         .map_err(|e| e.to_string())?;
@@ -513,6 +523,11 @@ fn ready(config: &ExecutionHostConfig) -> Result<Ready, String> {
         if !m.is_file() || m.uid() != nix::unistd::geteuid().as_raw() || m.mode() & 0o077 != 0 {
             return Err("insecure Execution Host ready file".into());
         }
+    }
+    #[cfg(windows)]
+    {
+        leveler_win_confine::verify_private_state_file(&path)
+            .map_err(|e| format!("insecure Execution Host ready file: {e}"))?;
     }
     let r: Ready = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -691,7 +706,31 @@ fn process_presence(pid: Option<u32>) -> ProcessPresence {
             Err(_) => ProcessPresence::Unobservable,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Every hosted child descends from the host's kill-on-close Job
+        // (`ProcessTreeJob`): Windows assigns descendants of a job member to
+        // the same job. When the host dies the kernel closes that job and
+        // terminates every member, so absence of the recorded root process is
+        // proof the whole workload is gone. A live root is Present. Anything
+        // the token cannot open is not proof of absence.
+        let Some(pid) = pid else {
+            return ProcessPresence::Unobservable;
+        };
+        match leveler_win_confine::process_is_running(pid) {
+            Ok(true) => ProcessPresence::Present,
+            // A terminated-but-unreaped process object is not running work.
+            Ok(false) => ProcessPresence::Gone,
+            Err(error)
+                if error.raw_os_error()
+                    == Some(leveler_win_confine::ERROR_INVALID_PARAMETER_CODE) =>
+            {
+                ProcessPresence::Gone
+            }
+            Err(_) => ProcessPresence::Unobservable,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         ProcessPresence::Unobservable
@@ -2054,6 +2093,18 @@ fn constant_time_equal(a: &str, b: &str) -> bool {
 /// Run in the composition-root daemon process, never within an agent runtime.
 pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
     secure_dir(&config.state_dir)?;
+    // The host is the durable owner of background processes. On Windows a
+    // per-task job's kill-on-drop never runs when the host itself is killed,
+    // so the host additionally joins a kill-on-close Job Object: every
+    // descendant is assigned to it automatically, and the kernel terminates
+    // the whole tree when this process dies. Without that guarantee the host
+    // refuses to start — a durable supervisor that can leave unmanaged
+    // orphans is worse than no supervisor.
+    #[cfg(windows)]
+    let _process_tree =
+        leveler_win_confine::ProcessTreeJob::adopt_current_process().map_err(|error| {
+            format!("Execution Host cannot establish its process-tree boundary: {error}")
+        })?;
     if config.state_dir.starts_with(&config.repo_root) {
         return Err("Execution Host state must be outside repository write authority".into());
     }

@@ -158,22 +158,36 @@ pub fn render_skill_package(detail: &SkillDetail) -> String {
 
     if !detail.scripts.is_empty() {
         s.push_str(
-            "\n## Scripts\nThese paths are the skill's scripts. Resolve them relative to `dir`:\n",
+            "\n## Scripts (bundled, not content-approved)\nThese paths are the skill's \
+             scripts. Resolve them relative to `dir`. Approving the skill binds its \
+             instructions, not execution: running a script still needs the normal tool \
+             permission.\n",
         );
         for p in &detail.scripts {
             let abs = detail.dir.join(p);
             s.push_str(&format!("- `{p}` → `{}`\n", abs.display()));
         }
     }
-    if !detail.references.is_empty() {
-        s.push_str("\n## References\nRead with `read_file` using the absolute path:\n");
-        for p in &detail.references {
-            let abs = detail.dir.join(p);
-            s.push_str(&format!("- `{p}` → `{}`\n", abs.display()));
+    if !detail.reference_contents.is_empty() {
+        s.push_str(
+            "\n## References (content approved with this skill)\n\
+             These files were read and hashed with `SKILL.md`; the text below is the \
+             approved version. Do not substitute a re-read of the package path for this \
+             content.\n",
+        );
+        for reference in &detail.reference_contents {
+            s.push_str(&format!(
+                "\n### `{}`\n\n{}\n",
+                reference.relative,
+                reference.text.trim_end()
+            ));
         }
     }
     if !detail.other_files.is_empty() {
-        s.push_str("\n## Other bundled files\n");
+        s.push_str(
+            "\n## Other bundled files (not content-approved)\nThese are ordinary tool \
+             resources, not skill instructions.\n",
+        );
         for p in &detail.other_files {
             let abs = detail.dir.join(p);
             s.push_str(&format!("- `{p}` → `{}`\n", abs.display()));
@@ -287,6 +301,7 @@ mod tests {
             body: "STEP 1: do the thing".into(),
             scripts: Vec::new(),
             references: Vec::new(),
+            reference_contents: Vec::new(),
             other_files: Vec::new(),
         };
         let rendered = render_skill_package(&detail);

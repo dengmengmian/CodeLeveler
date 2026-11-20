@@ -77,6 +77,12 @@ impl Tool for ListFilesTool {
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
         let workspace = context.execution_workspace()?;
         let base = workspace.resolve_for_read(&rel)?;
+        if let Some(reason) = context.security_control_read_denied(&base.to_string_lossy()) {
+            return Ok(ToolOutput::error(reason));
+        }
+        if let Some(reason) = context.skill_content_read_denied(&base.to_string_lossy()) {
+            return Ok(ToolOutput::error(reason));
+        }
         let confine = workspace.reads_confined().then(|| workspace.clone());
         if let Err(reason) = crate::memory_access::validate_read(&context, &base) {
             return Ok(ToolOutput::error(reason));

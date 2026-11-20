@@ -127,7 +127,7 @@ fn executor(
     Executor::new(
         script,
         Arc::new(leveler_tools::default_registry()),
-        ToolContext::new(Workspace::new(root).unwrap(), mode),
+        ToolContext::new(Workspace::new(root).unwrap(), mode).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         rounds,
     )

@@ -66,6 +66,12 @@ pub(crate) fn path_approval_reason(
     if context.policy.unrestricted_execution() {
         return None;
     }
+    // The trust stores are refused by the tool itself, whatever a grant says.
+    // Do not turn that refusal into an approval prompt the tool will then
+    // reject anyway.
+    if write && context.security_control_write_denied(path).is_some() {
+        return None;
+    }
     // Memory files are governed by their own policy, not by the workspace
     // write scope. Asking for workspace consent here would prompt for a path
     // the execution layer is about to handle itself.

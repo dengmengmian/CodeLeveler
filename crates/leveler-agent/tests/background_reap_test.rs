@@ -355,6 +355,7 @@ async fn harness_with(responses: Vec<ModelResponse>, wait_for_background: bool) 
     ));
     let tool_context =
         ToolContext::with_environment(workspace, PermissionProfile::Assisted, environment.clone())
+            .trust_all_definitions_for_tests()
             .with_session_scope(SESSION_SCOPE);
     // ONE registry: the tools that start and manage background tasks, and the
     // engine that reaps them at terminal settlement, must be looking at the
@@ -2046,23 +2047,22 @@ async fn resume_after_provider_timeout_observes_and_stops_the_original_service()
 /// own answer", and no command name is classified either way.
 #[tokio::test]
 async fn a_background_test_start_is_not_evidence_of_a_pass() {
-    let (script_name, script) = if cfg!(windows) {
-        ("run-tests.cmd", "ping -n 30 127.0.0.1 >NUL\r\n")
-    } else {
-        ("run-tests.sh", "sleep 30\n")
-    };
-    let (suite_program, suite_args) = if cfg!(windows) {
-        ("cmd", vec!["/c", script_name])
-    } else {
-        ("sh", vec![script_name])
-    };
+    // A long-lived process the fixture itself owns. A shell spelling
+    // (`ping`/`sleep`) made this test depend on process startup succeeding
+    // while the host was loaded; the helper is the test binary, so the only
+    // failure left is the product decision under test.
+    let suite_program = std::env::current_exe()
+        .expect("the test binary path")
+        .to_string_lossy()
+        .into_owned();
+    let suite_args = vec![
+        "--exact".to_string(),
+        "background_sleeper_helper".to_string(),
+        "--ignored".to_string(),
+        "--test-threads=1".to_string(),
+    ];
     let suite_label = format!("{suite_program} {}", suite_args.join(" "));
     let h = harness(vec![
-        tool_call(
-            "w1",
-            "write_file",
-            serde_json::json!({"path": script_name, "content": script}),
-        ),
         tool_call(
             "b1",
             "run_command",
@@ -2123,6 +2123,15 @@ async fn a_background_test_start_is_not_evidence_of_a_pass() {
         }),
         "the gate must say the command only STARTED, not accept the start: {refusals:?}"
     );
+}
+
+/// The long-lived process the background-start test starts. It is ignored in
+/// ordinary runs and selected with `--exact` by the test binary itself, so no
+/// external shell, network path or package manager can fail under load.
+#[test]
+#[ignore = "helper process for a_background_test_start_is_not_evidence_of_a_pass"]
+fn background_sleeper_helper() {
+    std::thread::sleep(Duration::from_secs(300));
 }
 
 /// GR-02: a citation of a command that only STARTED is refused for the true

@@ -135,6 +135,7 @@ pub mod finding_id {
     pub const MODEL_THINKING: &str = "model.thinking";
     pub const PROVIDER_API_KEY: &str = "provider.api-key";
     pub const AGENTS_REGISTRY: &str = "agents.registry";
+    pub const DEFINITIONS_TRUST: &str = "definitions.trust";
 
     // MCP: configuration is known; live connection state is not exposed yet.
     pub const MCP_CONFIG: &str = "mcp.config";

@@ -16,6 +16,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use leveler_definition_trust::{
+    DefinitionIdentity, DefinitionKind, DefinitionTrustView, TrustAuditEntry,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::builtin;
@@ -190,6 +193,15 @@ const USER_ROOTS: &[(SkillSource, &str)] = &[
     (SkillSource::Claude, ".claude/skills"),
 ];
 
+/// Longest reference text a single `load_skill` may hand to the model.
+///
+/// References are content-bound, so they are returned as verified text rather
+/// than as paths the model must re-read. The bound leaves room under the
+/// registry's 48 KiB tool-result cap for the skill body and its framing; a
+/// larger package fails closed with an actionable error instead of returning
+/// unverified bytes or a silently truncated procedure.
+const MAX_INLINE_REFERENCE_BYTES: usize = 32 * 1024;
+
 fn user_home<F>(var: &F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -209,6 +221,16 @@ pub struct SkillSummary {
     pub source: SkillSource,
 }
 
+/// One verified reference file's text. The bytes were read and hashed as part of
+/// the package approval in the same pass that produced this value, so the model
+/// never receives text that a later edit could have swapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReferenceContent {
+    /// Package-relative path (`references/guide.md`).
+    pub relative: String,
+    pub text: String,
+}
+
 /// A skill's full content, loaded on demand or turn-injected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillDetail {
@@ -225,6 +247,9 @@ pub struct SkillDetail {
     pub scripts: Vec<String>,
     /// Paths relative to [`Self::dir`] under `references/` (and nested).
     pub references: Vec<String>,
+    /// Verified text of every reference file, in the same order as
+    /// [`Self::references`]. These are the bytes the trust approval bound.
+    pub reference_contents: Vec<SkillReferenceContent>,
     /// Other bundled files (not SKILL.md, not under scripts/ or references/).
     pub other_files: Vec<String>,
 }
@@ -266,6 +291,13 @@ pub enum SkillLookupError {
         name: String,
         error: String,
     },
+    /// The package exists but its exact bytes are not approved.
+    Untrusted {
+        name: String,
+        scope: SkillScope,
+        source: SkillSource,
+        state: String,
+    },
 }
 
 impl std::fmt::Display for SkillLookupError {
@@ -296,6 +328,16 @@ impl std::fmt::Display for SkillLookupError {
                 Ok(())
             }
             Self::Read { name, error } => write!(f, "skill `{name}` could not be read: {error}"),
+            Self::Untrusted {
+                name,
+                scope,
+                source,
+                state,
+            } => write!(
+                f,
+                "skill `{name}` ({source} · {scope}) is present but not trusted ({state}); \
+                 approve it with `leveler trust`"
+            ),
         }
     }
 }
@@ -368,20 +410,55 @@ struct Candidate {
 }
 
 /// Every skill visible from one project, resolved by precedence.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SkillRegistry {
     entries: Vec<SkillEntry>,
     problems: Vec<SkillProblem>,
+    /// Packages present but refused by the trust gate. They are not entries:
+    /// an unapproved package never shadows a trusted one.
+    untrusted: Vec<TrustAuditEntry>,
+    /// The snapshot `load_skill` re-checks before returning a body.
+    trust: DefinitionTrustView,
 }
+
+impl Default for SkillRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            problems: Vec::new(),
+            untrusted: Vec::new(),
+            trust: DefinitionTrustView::deny_all(),
+        }
+    }
+}
+
+impl PartialEq for SkillRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.problems == other.problems
+            && self.untrusted == other.untrusted
+    }
+}
+
+impl Eq for SkillRegistry {}
 
 impl SkillRegistry {
     /// Scan every root once. Never fails as a whole: a broken package becomes an
-    /// invalid entry or a problem, not a failed start.
-    pub fn load(roots: &SkillRoots) -> Self {
+    /// invalid entry or a problem, not a failed start. A package the trust gate
+    /// refuses is reported beside the entries and cannot shadow a trusted one.
+    pub fn load(roots: &SkillRoots, trust: &DefinitionTrustView) -> Self {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut problems: Vec<SkillProblem> = Vec::new();
+        let mut untrusted: Vec<TrustAuditEntry> = Vec::new();
         for (rank, root) in roots.roots.iter().enumerate() {
-            read_root(root, rank, &mut candidates, &mut problems);
+            read_root(
+                root,
+                rank,
+                trust,
+                &mut candidates,
+                &mut problems,
+                &mut untrusted,
+            );
         }
         let builtin_rank = roots.roots.len();
         for skill in builtin::skills() {
@@ -422,7 +499,17 @@ impl SkillRegistry {
                 }),
             }
         }
-        Self { entries, problems }
+        Self {
+            entries,
+            problems,
+            untrusted,
+            trust: trust.clone(),
+        }
+    }
+
+    /// Packages present but not admitted by the trust gate.
+    pub fn untrusted(&self) -> &[TrustAuditEntry] {
+        &self.untrusted
     }
 
     pub fn entries(&self) -> &[SkillEntry] {
@@ -500,17 +587,72 @@ impl SkillRegistry {
                 name: entry.name.clone(),
                 error: "the skill has no directory".to_string(),
             })?;
-        let content = std::fs::read_to_string(dir.join("SKILL.md")).map_err(|error| {
-            SkillLookupError::Read {
+        // Read SKILL.md and every reference once. The digest covers exactly
+        // these bytes, and the text handed to the model comes from the same
+        // values, so a hash/read race cannot show unapproved instructions.
+        let package = leveler_definition_trust::read_skill_package(&dir.join("SKILL.md")).map_err(
+            |error| SkillLookupError::Read {
                 name: entry.name.clone(),
-                error: error.to_string(),
+                error,
+            },
+        )?;
+        // Re-check the bytes actually about to be returned. A registry built
+        // before an edit must not hand out content the approval never covered.
+        if let Some(identity) = identity_for(entry.scope, entry.source, &entry.name) {
+            let digest = DefinitionIdentity::skill_package_digest(&package);
+            let decision = self.trust.check(&identity, &digest);
+            if !decision.admits() {
+                return Err(SkillLookupError::Untrusted {
+                    name: entry.name.clone(),
+                    scope: entry.scope,
+                    source: entry.source,
+                    state: decision.audit_state().to_string(),
+                });
             }
+        }
+        let mut skill_body = None;
+        let mut references = Vec::new();
+        let mut reference_contents = Vec::new();
+        let mut inline_bytes = 0usize;
+        for part in package {
+            if part.relative == "SKILL.md" {
+                skill_body = Some(part.bytes);
+                continue;
+            }
+            inline_bytes = inline_bytes.saturating_add(part.bytes.len());
+            if inline_bytes > MAX_INLINE_REFERENCE_BYTES {
+                return Err(SkillLookupError::Read {
+                    name: entry.name.clone(),
+                    error: format!(
+                        "the skill's references exceed the {MAX_INLINE_REFERENCE_BYTES}-byte \
+                         verified-content budget; split the procedure or move non-instruction \
+                         assets out of `references/`"
+                    ),
+                });
+            }
+            let text = String::from_utf8(part.bytes).map_err(|_| SkillLookupError::Read {
+                name: entry.name.clone(),
+                error: format!("{} is not valid UTF-8", part.relative),
+            })?;
+            references.push(part.relative.clone());
+            reference_contents.push(SkillReferenceContent {
+                relative: part.relative,
+                text,
+            });
+        }
+        let bytes = skill_body.ok_or_else(|| SkillLookupError::Read {
+            name: entry.name.clone(),
+            error: "SKILL.md is missing from the approved package".to_string(),
+        })?;
+        let content = String::from_utf8(bytes).map_err(|_| SkillLookupError::Read {
+            name: entry.name.clone(),
+            error: "SKILL.md is not valid UTF-8".to_string(),
         })?;
         let parsed = frontmatter::parse(&content).map_err(|error| SkillLookupError::Read {
             name: entry.name.clone(),
             error,
         })?;
-        let (scripts, references, other_files) = classify_bundled_files(&dir);
+        let (scripts, _, other_files) = classify_bundled_files(&dir);
         Ok(SkillDetail {
             name: entry.name.clone(),
             description: entry.description.clone().unwrap_or_default(),
@@ -520,6 +662,7 @@ impl SkillRegistry {
             dir,
             scripts,
             references,
+            reference_contents,
             other_files,
         })
     }
@@ -535,6 +678,10 @@ impl SkillRegistry {
                 Err(SkillLookupError::NotFound { name, .. }) => unknown.push(name),
                 Err(SkillLookupError::Invalid { name, error, .. })
                 | Err(SkillLookupError::Read { name, error }) => invalid.push((name, error)),
+                Err(SkillLookupError::Untrusted { name, state, .. }) => invalid.push((
+                    name,
+                    format!("not trusted ({state}); the user can approve it with `leveler trust`"),
+                )),
             }
         }
         SkillMentionResolution {
@@ -545,11 +692,39 @@ impl SkillRegistry {
     }
 }
 
+fn identity_for(scope: SkillScope, source: SkillSource, name: &str) -> Option<DefinitionIdentity> {
+    match scope {
+        SkillScope::Builtin => None,
+        SkillScope::Project => {
+            let root = match source {
+                SkillSource::Native => ".leveler/skills",
+                SkillSource::Codex => ".codex/skills",
+                SkillSource::AgentSkills => ".agents/skills",
+                SkillSource::Claude => ".claude/skills",
+                SkillSource::Builtin => return None,
+            };
+            DefinitionIdentity::project(DefinitionKind::Skill, &format!("{root}/{name}"))
+        }
+        SkillScope::User => {
+            let label = match source {
+                SkillSource::Native => "leveler",
+                SkillSource::Codex => "codex",
+                SkillSource::AgentSkills => "agents",
+                SkillSource::Claude => "claude",
+                SkillSource::Builtin => return None,
+            };
+            DefinitionIdentity::user_skill(label, name)
+        }
+    }
+}
+
 fn read_root(
     root: &SkillRoot,
     rank: usize,
+    trust: &DefinitionTrustView,
     candidates: &mut Vec<Candidate>,
     problems: &mut Vec<SkillProblem>,
+    untrusted: &mut Vec<TrustAuditEntry>,
 ) {
     let Ok(listing) = std::fs::read_dir(&root.dir) else {
         return;
@@ -619,37 +794,68 @@ fn read_root(
             });
             continue;
         }
-        candidates.push(read_candidate(root, rank, &path, &dir_name));
+        match read_candidate(root, rank, &path, &dir_name, trust) {
+            CandidateRead::Candidate(candidate) => candidates.push(candidate),
+            CandidateRead::Untrusted(entry) => {
+                // Do not enter the name: an unapproved package must not shadow
+                // a trusted lower-precedence skill.
+                problems.push(SkillProblem {
+                    scope: root.scope,
+                    source: root.source,
+                    location: path,
+                    error: format!(
+                        "the skill is not trusted ({}); approve it with `leveler trust`",
+                        entry.state
+                    ),
+                });
+                untrusted.push(entry);
+            }
+        }
     }
 }
 
-fn read_candidate(root: &SkillRoot, rank: usize, dir: &Path, name: &str) -> Candidate {
-    let invalid = |error: String| Candidate {
-        rank,
-        name: name.to_string(),
-        scope: root.scope,
-        source: root.source,
-        location: Some(dir.to_path_buf()),
-        description: None,
-        error: Some(error),
+enum CandidateRead {
+    Candidate(Candidate),
+    Untrusted(TrustAuditEntry),
+}
+
+fn read_candidate(
+    root: &SkillRoot,
+    rank: usize,
+    dir: &Path,
+    name: &str,
+    trust: &DefinitionTrustView,
+) -> CandidateRead {
+    let invalid = |error: String| {
+        CandidateRead::Candidate(Candidate {
+            rank,
+            name: name.to_string(),
+            scope: root.scope,
+            source: root.source,
+            location: Some(dir.to_path_buf()),
+            description: None,
+            error: Some(error),
+        })
     };
     let skill_md = dir.join("SKILL.md");
-    let Ok(meta) = std::fs::symlink_metadata(&skill_md) else {
+    let package = match leveler_definition_trust::read_skill_package(&skill_md) {
+        Ok(package) => package,
+        Err(error) => return invalid(error),
+    };
+    let Some(bytes) = package
+        .iter()
+        .find(|part| part.relative == "SKILL.md")
+        .map(|part| part.bytes.clone())
+    else {
         return invalid("missing SKILL.md".to_string());
     };
-    // A symlinked SKILL.md may point at the package's real file, but not out of
-    // the package.
-    if meta.file_type().is_symlink()
-        && let (Ok(target), Ok(base)) = (skill_md.canonicalize(), dir.canonicalize())
-        && !target.starts_with(&base)
-    {
-        return invalid(
-            "SKILL.md is a symlink that points outside the skill directory".to_string(),
-        );
+    if let Some(identity) = identity_for(root.scope, root.source, name) {
+        let digest = DefinitionIdentity::skill_package_digest(&package);
+        let decision = trust.check(&identity, &digest);
+        if !decision.admits() {
+            return CandidateRead::Untrusted(trust.audit(&identity, &digest));
+        }
     }
-    let Ok(bytes) = std::fs::read(&skill_md) else {
-        return invalid("SKILL.md could not be read".to_string());
-    };
     let Ok(content) = String::from_utf8(bytes) else {
         return invalid("SKILL.md is not valid UTF-8".to_string());
     };
@@ -667,7 +873,7 @@ fn read_candidate(root: &SkillRoot, rank: usize, dir: &Path, name: &str) -> Cand
     let Some(description) = parsed.frontmatter.description() else {
         return invalid("SKILL.md needs a non-empty `description`".to_string());
     };
-    Candidate {
+    CandidateRead::Candidate(Candidate {
         rank,
         name: name.to_string(),
         scope: root.scope,
@@ -675,7 +881,7 @@ fn read_candidate(root: &SkillRoot, rank: usize, dir: &Path, name: &str) -> Cand
         location: Some(dir.to_path_buf()),
         description: Some(description),
         error: None,
-    }
+    })
 }
 
 /// Walk a skill package directory and classify relative paths. Symlinked
@@ -766,13 +972,21 @@ fn push_classified(
 
 /// Discover skills from every visible root, resolved by precedence.
 pub fn discover(root: &Path) -> Vec<SkillSummary> {
-    SkillRegistry::load(&SkillRoots::for_project(root)).summaries()
+    describe(root).summaries()
 }
 
 /// The full resolved registry for a project (the read model the CLI and TUI
 /// render, and the one `discover`/`load` are derived from).
 pub fn describe(root: &Path) -> SkillRegistry {
-    SkillRegistry::load(&SkillRoots::for_project(root))
+    // Client-side read model (TUI `/skills`, `$` popup). It reads the live
+    // CodeLeveler home, because the display must make the same admission
+    // decision the runtime makes for this user. A store that cannot be
+    // resolved fails closed.
+    let home = leveler_core::LevelerHome::resolve(leveler_core::environment());
+    SkillRegistry::load(
+        &SkillRoots::for_project(root),
+        &DefinitionTrustView::load(home.root(), Some(root)),
+    )
 }
 
 /// Load a skill's full body and structured bundled files by name.

@@ -111,7 +111,7 @@ async fn a_real_reviewer_reads_a_fixed_commit_through_the_local_object_reader() 
     let summary = tokio::time::timeout(TIMEOUT, async {
         loop {
             match events.recv().await {
-                Ok(RuntimeEvent::ReviewFinished { review }) => return review,
+                Ok(RuntimeEvent::ReviewFinished { review, .. }) => return review,
                 Ok(RuntimeEvent::Notification { message, .. }) => {
                     eprintln!("notification: {message}");
                 }

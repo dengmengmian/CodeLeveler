@@ -16,6 +16,7 @@ members = [
     "crates/leveler-agent-core",
     "crates/leveler-agent",
     "crates/leveler-context",
+    "crates/leveler-definition-trust",
     "crates/leveler-vcs",
     "crates/leveler-lsp",
     "crates/leveler-skills",
@@ -65,6 +66,7 @@ leveler-memory = { version = "1.0.27", path = "crates/leveler-memory" }
 leveler-agent-core = { version = "1.0.27", path = "crates/leveler-agent-core" }
 leveler-agent = { version = "1.0.27", path = "crates/leveler-agent" }
 leveler-context = { version = "1.0.27", path = "crates/leveler-context" }
+leveler-definition-trust = { version = "1.0.27", path = "crates/leveler-definition-trust" }
 leveler-vcs = { version = "1.0.27", path = "crates/leveler-vcs" }
 leveler-lsp = { version = "1.0.27", path = "crates/leveler-lsp" }
 leveler-skills = { version = "1.0.27", path = "crates/leveler-skills" }

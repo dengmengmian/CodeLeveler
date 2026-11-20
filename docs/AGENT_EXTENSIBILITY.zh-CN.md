@@ -48,6 +48,9 @@ capability: read_only
 | `tools` | 可选，限制工具列表；不能为空，也不能授予额外权限 |
 | `workspace.write_roots` | 可选，限制可写目录；使用仓库相对路径，不使用 `..` 或通配符 |
 
+
+项目或用户级 Agent 及 Skill 定义在人工用 `leveler trust` 批准其确切内容前不会生效。Agent 的批准摘要覆盖 `agent.yaml` 与 `instructions.md` 两个文件，任一文件修改后都需要重新批准；未批准的定义不会列为可用，也不能被派生。批准前请先审阅定义内容。指令本身不能扩大工具或写入权限。
+
 例如，限制写入前端目录：
 
 ```yaml

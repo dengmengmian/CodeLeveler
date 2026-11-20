@@ -298,9 +298,12 @@ pub fn run_with_mcp_locale(
 /// Agent definitions this project resolves: counts by source, and every
 /// invalid definition or unloadable directory by name. Structural only — a
 /// model that is not configured is `leveler agents list`'s business.
-pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> DiagnosticFinding {
+pub fn agents_check(
+    roots: &leveler_agent::agent_registry::AgentRoots,
+    trust: &leveler_definition_trust::DefinitionTrustView,
+) -> DiagnosticFinding {
     use leveler_agent::agent_registry::{AgentRegistry, AgentSource};
-    let registry = AgentRegistry::load(roots);
+    let registry = AgentRegistry::load(roots, trust);
     let count = |source: AgentSource| {
         registry
             .entries()
@@ -341,6 +344,89 @@ pub fn agents_check(roots: &leveler_agent::agent_registry::AgentRoots) -> Diagno
         DiagnosticCategory::Configuration,
         evidence,
     )
+}
+
+/// Every authority-bearing definition with its trust state. A definition that
+/// exists but is not approved is a First-Class warning: the user must know why
+/// project rules or an agent did not take effect.
+pub fn definitions_check(
+    roots: &leveler_definition_trust::DiscoveryRoots,
+    trust: &leveler_definition_trust::DefinitionTrustView,
+) -> DiagnosticFinding {
+    use leveler_definition_trust::DefinitionTrust;
+    let candidates = leveler_definition_trust::discover(roots);
+    if candidates.is_empty() {
+        return pass(
+            finding_id::DEFINITIONS_TRUST,
+            None,
+            DiagnosticCategory::Configuration,
+            vec!["no authority-bearing definitions on disk".into()],
+        );
+    }
+    let mut pending = Vec::new();
+    let mut store_unavailable = false;
+    for candidate in &candidates {
+        let Some(digest) = &candidate.digest else {
+            pending.push(format!(
+                "{} [{}] unreadable",
+                candidate.identity.display,
+                candidate.identity.kind.as_str()
+            ));
+            continue;
+        };
+        match trust.check(&candidate.identity, digest) {
+            DefinitionTrust::Trusted { .. } | DefinitionTrust::Builtin => {}
+            DefinitionTrust::Unapproved => pending.push(format!(
+                "{} [{}] new (not trusted)",
+                candidate.identity.display,
+                candidate.identity.kind.as_str()
+            )),
+            DefinitionTrust::Changed { .. } => pending.push(format!(
+                "{} [{}] changed since approval",
+                candidate.identity.display,
+                candidate.identity.kind.as_str()
+            )),
+            DefinitionTrust::StoreUnavailable { status } => {
+                store_unavailable = true;
+                pending.push(format!(
+                    "{} [{}] store unavailable ({})",
+                    candidate.identity.display,
+                    candidate.identity.kind.as_str(),
+                    status.as_str()
+                ));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return pass(
+            finding_id::DEFINITIONS_TRUST,
+            None,
+            DiagnosticCategory::Configuration,
+            vec![format!("{} definition(s), all trusted", candidates.len())],
+        );
+    }
+    let mut evidence = vec![format!(
+        "{} of {} definition(s) are not admitted",
+        pending.len(),
+        candidates.len()
+    )];
+    evidence.extend(pending);
+    evidence.push("review with `leveler trust show`, approve with `leveler trust`".into());
+    if store_unavailable {
+        fail(
+            finding_id::DEFINITIONS_TRUST,
+            None,
+            DiagnosticCategory::Configuration,
+            evidence,
+        )
+    } else {
+        warn(
+            finding_id::DEFINITIONS_TRUST,
+            None,
+            DiagnosticCategory::Configuration,
+            evidence,
+        )
+    }
 }
 
 /// Check that at least one provider and model exist, and every model points at

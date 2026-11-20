@@ -79,13 +79,16 @@ impl Tool for FindFilesTool {
         let base_label = input.path.as_deref().unwrap_or(".");
         let workspace = context.execution_workspace()?;
         let base = workspace.resolve_for_read(base_label)?;
+        if let Some(reason) = context.security_control_read_denied(&base.to_string_lossy()) {
+            return Ok(ToolOutput::error(reason));
+        }
         let confine = workspace.reads_confined().then(|| workspace.clone());
         if let Err(reason) = crate::memory_access::validate_read(&context, &base) {
             return Ok(ToolOutput::error(reason));
         }
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
 
-        let found = match WorkspaceSearch::find(
+        let mut found = match WorkspaceSearch::find(
             &base,
             context.require_workspace()?.root(),
             &input.pattern,
@@ -109,6 +112,12 @@ impl Tool for FindFilesTool {
             Err(SearchError::Cancelled) => return Ok(ToolOutput::error("find_files cancelled")),
             Err(other) => return Err(ToolError::Io(format!("find {base_label}: {other:?}"))),
         };
+
+        // Never surface an approval-bound skill file as if it were an ordinary
+        // search hit; `load_skill` is the verified channel.
+        found
+            .paths
+            .retain(|path| context.skill_content_read_denied(&path.0).is_none());
 
         let mut body = if found.paths.is_empty() {
             "(no matching files)\n".to_string()
@@ -208,5 +217,24 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    /// `find_files` must not name an approval-bound skill file as an ordinary
+    /// hit; the verified package loader is the only channel.
+    #[tokio::test]
+    async fn a_skill_reference_path_is_not_listed() {
+        let dir = tempfile::Builder::new()
+            .prefix("leveler-find-skill-")
+            .tempdir()
+            .unwrap();
+        let reference = dir.path().join(".codex/skills/demo/references/guide.md");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::write(&reference, "guide\n").unwrap();
+        std::fs::write(dir.path().join("ordinary.md"), "ordinary\n").unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = find(&ctx, serde_json::json!({"pattern": "**/*.md"})).await;
+        assert!(out.content.contains("ordinary.md"), "{}", out.content);
+        assert!(!out.content.contains("guide.md"), "{}", out.content);
     }
 }

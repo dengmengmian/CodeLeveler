@@ -1803,6 +1803,7 @@ mod contract_tests {
                     bytes: 21,
                     sha256: Some("a".repeat(64)),
                     status: leveler_context::RuleSourceStatus::Delivered,
+                    trust: None,
                 }],
                 report: leveler_context::RuleDeliveryReport {
                     budget_bytes: 65_536,

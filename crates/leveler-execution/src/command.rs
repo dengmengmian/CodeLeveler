@@ -545,6 +545,7 @@ pub(crate) fn sandbox_command(
     scope: &WriteScope,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
+    runtime_control_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
     let denials = configured_read_denials();
     sandbox_command_with_read_denials(
@@ -555,6 +556,7 @@ pub(crate) fn sandbox_command(
         scratch_root,
         cache_write_roots,
         &denials,
+        runtime_control_roots,
     )
 }
 
@@ -568,6 +570,7 @@ pub(crate) fn sandbox_command_with_read_denials(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
     read_denied_roots: &[PathBuf],
+    runtime_control_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
     // Defense in depth. Without confinement to apply this would normally run
     // the command bare — but once a harness has sealed host roots, "no
@@ -584,6 +587,7 @@ pub(crate) fn sandbox_command_with_read_denials(
             deny_network,
             scope,
             read_denied_roots,
+            runtime_control_roots,
             scratch_root,
             cache_write_roots,
         )
@@ -597,6 +601,7 @@ pub(crate) fn sandbox_command_with_read_denials(
             scope,
             scratch_root,
             cache_write_roots,
+            runtime_control_roots,
         )
     }
     #[cfg(windows)]
@@ -606,12 +611,22 @@ pub(crate) fn sandbox_command_with_read_denials(
         // and `leveler-confine.exe` drops the child to Low integrity. Reads are
         // not confined on any host, so the read denials shape nothing here —
         // the macOS seatbelt profile is the only place that can honor them.
-        let _ = (scratch_root, cache_write_roots, read_denied_roots);
+        let _ = (
+            scratch_root,
+            cache_write_roots,
+            read_denied_roots,
+            runtime_control_roots,
+        );
         windows_sandbox_command(program, args, scope)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
-        let _ = (scope, scratch_root, cache_write_roots);
+        let _ = (
+            scope,
+            scratch_root,
+            cache_write_roots,
+            runtime_control_roots,
+        );
         (program.to_string(), args.to_vec())
     }
 }
@@ -653,6 +668,7 @@ fn macos_sandbox_command(
     deny_network: bool,
     scope: &WriteScope,
     read_denied_roots: &[PathBuf],
+    runtime_control_roots: &[PathBuf],
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
@@ -681,6 +697,12 @@ fn macos_sandbox_command(
     // toolchain caches still are, so a build/test can run while every
     // repository mutation fails in the kernel regardless of which program
     // attempts it.
+    // Runtime control (socket, lock, access token) is unreadable to a confined
+    // child. The token is the trusted-local credential; hiding the whole
+    // directory also hides the socket path's exact spelling. These denials are
+    // emitted AFTER the writable-root re-allow below: a Leveler home under a
+    // writable temp/workspace root must not re-expose the control directory.
+    // FullAccess has already returned above: it keeps its documented authority.
     let write_roots = writable_roots_for_scope(scope, scratch_root, cache_write_roots);
     let protected = protected_write_paths(scope);
     let mut policy = String::from(SEATBELT_BASE);
@@ -717,6 +739,14 @@ fn macos_sandbox_command(
             ));
         }
     }
+    // The trusted-local credential and socket stay invisible even when the
+    // home sits under a writable root. Last-match wins, so this must follow the
+    // re-allow above.
+    for i in 0..runtime_control_roots.len() {
+        policy.push_str(&format!(
+            "(deny file-read* (subpath (param \"CONTROL_ROOT_{i}\")) (literal (param \"CONTROL_ROOT_{i}\")))\n"
+        ));
+    }
     policy.push_str("(allow file-write*");
     for i in 0..write_roots.len() {
         policy.push_str(&format!(" (subpath (param \"WRITABLE_ROOT_{i}\"))"));
@@ -743,6 +773,13 @@ fn macos_sandbox_command(
             "(deny file-write* (literal (param \"CACHE_ROOT_{i}\")))\n"
         ));
     }
+    // The confined child must not author or replace the socket, lock or token,
+    // even if the runtime home is inside a writable root.
+    for i in 0..runtime_control_roots.len() {
+        policy.push_str(&format!(
+            "(deny file-write* (subpath (param \"CONTROL_ROOT_{i}\")) (literal (param \"CONTROL_ROOT_{i}\")))\n"
+        ));
+    }
     if !deny_network {
         policy.push_str("(allow network-outbound)\n(allow network-inbound)\n");
         policy.push_str(SEATBELT_NETWORK);
@@ -760,6 +797,9 @@ fn macos_sandbox_command(
     }
     for (i, r) in read_denied_roots.iter().enumerate() {
         wrapped.push(format!("-DREAD_DENIED_{i}={}", r.display()));
+    }
+    for (i, r) in runtime_control_roots.iter().enumerate() {
+        wrapped.push(format!("-DCONTROL_ROOT_{i}={}", r.display()));
     }
     wrapped.push("--".to_string());
     wrapped.push(program.to_string());
@@ -801,6 +841,131 @@ pub fn policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     vec![write_root.join("AGENTS.md")]
 }
 
+/// Directories whose recursive walk never contributes rule documents. They are
+/// build output or installed dependencies, not repository policy: walking them
+/// would make every confined command pay for `node_modules`/`target` size.
+const POLICY_WALK_PRUNED: &[&str] = &[
+    ".git",
+    ".leveler",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    "dist",
+    "build",
+];
+
+/// A unit of the walk is a directory; this bounds pathological trees. Hitting
+/// it is reported (the result is never silently presented as complete).
+const POLICY_WALK_LIMIT: usize = 50_000;
+
+/// Every **existing** rule document under `write_root`, plus the `.leveler`
+/// directory that owns the definition namespaces.
+///
+/// The loader reads `AGENTS.md` at any depth, `.leveler/instructions.md` and
+/// `.leveler/rules/*.md`; the shell's write fence must cover the same set, not
+/// only the root document. Existing files can carry the label; a path that
+/// does not exist yet is a platform limitation reported separately (Windows
+/// cannot name-fence a path that does not exist).
+///
+/// `.leveler` itself is included when it exists: that is what makes a missing
+/// `.leveler/agents` or `.leveler/skills` directory unforgeable for the
+/// confined shell — creating the child requires writing the parent, and the
+/// parent is Medium. Without it, a shell command could author a definition
+/// directory that a later session loads without consent.
+///
+/// The walk does not follow reparse points (a link out of the workspace is not
+/// policy this repository owns) and prunes generated/dependency trees listed
+/// in [`POLICY_WALK_PRUNED`].
+pub(crate) fn existing_policy_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let leveler = write_root.join(".leveler");
+    if leveler.is_dir() {
+        out.push(leveler.clone());
+    } else {
+        let instructions = leveler.join("instructions.md");
+        if instructions.is_file() {
+            out.push(instructions);
+        }
+    }
+    let rules = leveler.join("rules");
+    if !out.contains(&leveler)
+        && rules.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&rules)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut budget = POLICY_WALK_LIMIT;
+    collect_existing_rule_documents(write_root, &mut out, &mut budget);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_rule_document_name(name: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().eq_ignore_ascii_case("AGENTS.md")
+    }
+    #[cfg(not(windows))]
+    {
+        name == "AGENTS.md"
+    }
+}
+
+fn collect_existing_rule_documents(directory: &Path, out: &mut Vec<PathBuf>, budget: &mut usize) {
+    if *budget == 0 {
+        tracing::warn!(
+            root = %directory.display(),
+            "policy-document walk budget exhausted; some existing AGENTS.md files are not write-protected"
+        );
+        return;
+    }
+    *budget -= 1;
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        // Never follow a link: policy is the repository's own files, and a
+        // link that leaves the tree is not this workspace's rule source.
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let text = name.to_string_lossy();
+            if POLICY_WALK_PRUNED
+                .iter()
+                .any(|skip| text.eq_ignore_ascii_case(skip))
+            {
+                continue;
+            }
+            collect_existing_rule_documents(&entry.path(), out, budget);
+        } else if file_type.is_file() && is_rule_document_name(&name) {
+            out.push(entry.path());
+        }
+    }
+}
+
 /// Every path inside a writable scope that stays write-denied. One list feeds
 /// both the Unix profile and the Windows integrity lease, so a path protected
 /// on one backend cannot silently lose its protection on another.
@@ -815,20 +980,38 @@ pub(crate) fn protected_write_paths(scope: &WriteScope) -> Vec<PathBuf> {
             protected.extend(git_write_protected_paths(root));
             protected.extend(definition_write_protected_paths(root));
             protected.extend(policy_write_protected_paths(root));
+            protected.extend(existing_policy_write_protected_paths(root));
             protected.extend(excluded.iter().cloned());
         }
         WriteScope::Workspace { root } => {
             protected.extend(git_write_protected_paths(root));
             protected.extend(definition_write_protected_paths(root));
             protected.extend(policy_write_protected_paths(root));
+            protected.extend(existing_policy_write_protected_paths(root));
         }
         WriteScope::WorkspaceWithGit { root } => {
             protected.extend(definition_write_protected_paths(root));
             protected.extend(policy_write_protected_paths(root));
+            protected.extend(existing_policy_write_protected_paths(root));
         }
         _ => {}
     }
-    protected
+    dedupe_protected_paths(protected)
+}
+
+/// Drop a protected path whose ancestor is also protected: the ancestor's
+/// boundary already covers it, and leasing both would label and restore the
+/// same subtree twice.
+fn dedupe_protected_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if out.iter().any(|kept| path.starts_with(kept)) {
+            continue;
+        }
+        out.retain(|kept| !kept.starts_with(&path));
+        out.push(path);
+    }
+    out
 }
 
 /// Directories a confined process may write to.
@@ -1017,6 +1200,7 @@ fn linux_sandbox_command(
     scope: &WriteScope,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
+    runtime_control_roots: &[PathBuf],
 ) -> (String, Vec<String>) {
     if !scope.confines() {
         // No write confinement (full-access): only optionally drop the network,
@@ -1041,7 +1225,14 @@ fn linux_sandbox_command(
     let protected = protected_write_paths(scope);
     (
         "bwrap".to_string(),
-        bwrap_args(program, args, deny_network, &roots, &protected),
+        bwrap_args(
+            program,
+            args,
+            deny_network,
+            &roots,
+            &protected,
+            runtime_control_roots,
+        ),
     )
 }
 
@@ -1056,6 +1247,7 @@ fn bwrap_args(
     deny_network: bool,
     roots: &[PathBuf],
     protected: &[PathBuf],
+    runtime_control_roots: &[PathBuf],
 ) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--ro-bind".to_string(),
@@ -1086,6 +1278,19 @@ fn bwrap_args(
         let s = p.display().to_string();
         a.push("--ro-bind".to_string());
         a.push(s.clone());
+        a.push(s);
+    }
+    // Runtime control lives in a directory the bounded command has no business
+    // reading: it holds the trusted-local socket, its ownership lock and the
+    // access token. An empty tmpfs at the same path hides the directory in the
+    // child's mount namespace. This runs after writable binds so a workspace
+    // that happens to contain the home cannot re-expose it.
+    for p in runtime_control_roots {
+        if !p.exists() {
+            continue;
+        }
+        let s = p.display().to_string();
+        a.push("--tmpfs".to_string());
         a.push(s);
     }
     if deny_network {
@@ -1591,6 +1796,15 @@ impl CommandRunner {
                     "label the authorized Windows write roots and protected paths: {source}"
                 ))
             })?;
+        let runtime_control_roots: Vec<PathBuf> = if request.write_scope.confines() {
+            let sockets = leveler_core::LevelerHome::resolve(&self.environment).sockets_dir();
+            // Seatbelt matches the resolved vnode path (`/var` is
+            // `/private/var` on macOS); bwrap mounts the spelling it is given.
+            // Resolve once so both backends name the real directory.
+            vec![std::fs::canonicalize(&sockets).unwrap_or(sockets)]
+        } else {
+            Vec::new()
+        };
         let (program, mut args) = if request.unrestricted_execution {
             (request.program.clone(), request.args.clone())
         } else {
@@ -1601,6 +1815,7 @@ impl CommandRunner {
                 &request.write_scope,
                 sandbox_scratch_root,
                 &sandbox_write_roots,
+                &runtime_control_roots,
             )
         };
 
@@ -3504,7 +3719,7 @@ mod tests {
     #[test]
     fn bwrap_confines_writes_to_roots() {
         let roots = vec![PathBuf::from("/ws"), PathBuf::from("/tmp")];
-        let a = bwrap_args("go", &["build".into()], true, &roots, &[]);
+        let a = bwrap_args("go", &["build".into()], true, &roots, &[], &[]);
         assert!(
             a.windows(3)
                 .any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/"),
@@ -3545,7 +3760,7 @@ mod tests {
             missing_agents.clone(),
             existing.clone(),
         ];
-        let a = bwrap_args("sh", &[], false, &[], &protected);
+        let a = bwrap_args("sh", &[], false, &[], &protected, &[]);
         for missing in [&missing_definition, &missing_agents] {
             let text = missing.display().to_string();
             assert!(
@@ -3596,6 +3811,54 @@ mod tests {
         assert!(protected_write_paths(&WriteScope::None).is_empty());
     }
 
+    /// A rule document that already exists is policy at any depth, not only at
+    /// the repository root. The whole `.leveler` directory is the definition
+    /// namespace: protecting it is what keeps a *missing* `agents`/`skills`
+    /// child unforgeable (creating the child requires writing the parent).
+    #[test]
+    fn existing_rule_documents_and_the_leveler_directory_stay_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::create_dir_all(root.join(".leveler/rules")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/deep/AGENTS.md"), "nested").unwrap();
+        std::fs::write(root.join("node_modules/pkg/AGENTS.md"), "dependency").unwrap();
+        std::fs::write(root.join(".leveler/instructions.md"), "instructions").unwrap();
+        std::fs::write(root.join(".leveler/rules/a.md"), "rule").unwrap();
+        std::fs::write(root.join("src/notes.txt"), "not policy").unwrap();
+
+        let protected = protected_write_paths(&WriteScope::Workspace {
+            root: root.to_path_buf(),
+        });
+        assert!(
+            protected.iter().any(|path| path == &root.join(".leveler")),
+            "{protected:?}"
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|path| path == &root.join("src/deep/AGENTS.md")),
+            "{protected:?}"
+        );
+        assert!(
+            !protected
+                .iter()
+                .any(|path| path.ends_with("node_modules/pkg/AGENTS.md")),
+            "generated/dependency trees are pruned: {protected:?}"
+        );
+        assert!(
+            !protected.iter().any(|path| path.ends_with("notes.txt")),
+            "ordinary source files are not policy: {protected:?}"
+        );
+        assert!(
+            !protected.iter().any(|path| {
+                path != &root.join(".leveler") && path.starts_with(root.join(".leveler"))
+            }),
+            "the `.leveler` boundary subsumes its children: {protected:?}"
+        );
+    }
+
     /// Which confinement backend a platform actually gets. The policy-text
     /// tests below each speak one backend's dialect; this one asserts that the
     /// dialect matches the host, so neither of them can quietly become the
@@ -3612,6 +3875,7 @@ mod tests {
                 root: (root).to_path_buf(),
             },
             Some(scratch.path()),
+            &[],
             &[],
         );
 
@@ -3695,6 +3959,7 @@ mod tests {
             },
             Some(scratch.path()),
             &[],
+            &[],
         );
         assert_eq!(program, "/usr/bin/sandbox-exec");
         let policy = &args[1];
@@ -3771,6 +4036,38 @@ mod tests {
         assert_eq!(args, vec!["x".to_string()]);
     }
 
+    /// The trusted-local socket and token are hidden from a confined command.
+    /// The mount is appended after writable binds, so a home that is itself a
+    /// writable root cannot re-expose the control directory.
+    #[test]
+    fn bwrap_masks_the_runtime_control_directory() {
+        let dir = tempfile::tempdir().expect("home");
+        let sockets = dir.path().join("run/sockets");
+        std::fs::create_dir_all(&sockets).unwrap();
+        let a = bwrap_args(
+            "sh",
+            &[],
+            false,
+            &[dir.path().to_path_buf()],
+            &[],
+            std::slice::from_ref(&sockets),
+        );
+        let bind_at = a
+            .iter()
+            .position(|arg| arg == "--bind")
+            .expect("writable bind present");
+        let mask_at = a
+            .iter()
+            .position(|arg| arg == "--tmpfs")
+            .expect("control directory must be masked");
+        assert!(mask_at > bind_at, "mask after writable binds: {a:?}");
+        assert_eq!(
+            a.get(mask_at + 1).map(String::as_str),
+            Some(sockets.to_string_lossy().as_ref()),
+            "the mask names the runtime control directory: {a:?}"
+        );
+    }
+
     #[test]
     fn bwrap_shares_network_when_allowed() {
         let a = bwrap_args(
@@ -3779,6 +4076,7 @@ mod tests {
             false,
             &[PathBuf::from("/ws")],
             &[PathBuf::from("/ws/.git")],
+            &[],
         );
         assert!(
             a.windows(3)
@@ -3786,7 +4084,14 @@ mod tests {
                 || !PathBuf::from("/ws/.git").exists(),
             "protected .git re-bound ro when present: {a:?}"
         );
-        let a = bwrap_args("curl", &["x".into()], false, &[PathBuf::from("/ws")], &[]);
+        let a = bwrap_args(
+            "curl",
+            &["x".into()],
+            false,
+            &[PathBuf::from("/ws")],
+            &[],
+            &[],
+        );
         assert!(
             !a.iter().any(|s| s == "--unshare-net"),
             "network shared: {a:?}"
@@ -5146,6 +5451,7 @@ mod tests {
             &WriteScope::Unrestricted,
             None,
             &[],
+            &[],
         );
         assert_eq!(p, "cargo");
         assert_eq!(a, vec!["test".to_string()]);
@@ -5159,6 +5465,7 @@ mod tests {
             true,
             &WriteScope::Unrestricted,
             None,
+            &[],
             &[],
         );
         #[cfg(target_os = "macos")]
@@ -5387,6 +5694,7 @@ mod tests {
                 root: (root).to_path_buf(),
             },
             Some(scratch.path()),
+            &[],
             &[],
         );
         let (_, empty_denials) = sandbox_command_with_read_denials(

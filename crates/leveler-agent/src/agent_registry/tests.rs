@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use leveler_definition_trust::{
+    ApprovalSurface, DefinitionTrustView, DiscoveryRoots, approve, discover,
+};
+
 use super::*;
 
 struct Fixture {
@@ -30,7 +34,32 @@ impl Fixture {
     }
 
     fn load(&self) -> AgentRegistry {
-        AgentRegistry::load(&self.roots())
+        AgentRegistry::load(
+            &self.roots(),
+            &DefinitionTrustView::trust_everything_for_tests(),
+        )
+    }
+
+    fn load_with(&self, trust: &DefinitionTrustView) -> AgentRegistry {
+        AgentRegistry::load(&self.roots(), trust)
+    }
+
+    /// A real store that approved every agent currently on disk. The returned
+    /// temp dir owns the store.
+    fn trust_all(&self) -> (tempfile::TempDir, DefinitionTrustView) {
+        let store = tempfile::tempdir().unwrap();
+        let roots = DiscoveryRoots {
+            project_root: Some(self.project.clone()),
+            leveler_home: self.user.parent().unwrap().to_path_buf(),
+            user_home: None,
+        };
+        let requests: Vec<_> = discover(&roots)
+            .iter()
+            .filter_map(|candidate| candidate.approval_request().ok())
+            .collect();
+        approve(store.path(), &self.project, &requests, ApprovalSurface::Cli).unwrap();
+        let view = DefinitionTrustView::load(store.path(), Some(&self.project));
+        (store, view)
     }
 
     fn project_agent(&self, name: &str, yaml: &str, instructions: &str) -> PathBuf {
@@ -65,6 +94,61 @@ fn invalid_reason(reg: &AgentRegistry, name: &str) -> String {
         AgentState::Invalid(e) => e.clone(),
         AgentState::Valid(_) => panic!("{name} should be invalid"),
     }
+}
+
+#[test]
+fn an_unapproved_agent_is_not_an_entry_and_does_not_shadow_a_builtin() {
+    let fx = Fixture::new();
+    fx.project_agent(
+        "code-reviewer",
+        &yaml("code-reviewer", ""),
+        "EVIL-INSTRUCTIONS",
+    );
+    let reg = fx.load_with(&DefinitionTrustView::deny_all());
+    assert_eq!(reg.untrusted().len(), 1, "{:?}", reg.untrusted());
+    assert_eq!(reg.untrusted()[0].state, "unapproved");
+    // The shipped persona is still the one that resolves.
+    let def = reg.resolve("code-reviewer").unwrap();
+    assert_eq!(def.source, AgentSource::Builtin);
+    assert_ne!(def.instructions, "EVIL-INSTRUCTIONS");
+}
+
+#[test]
+fn an_approved_agent_resolves_and_a_changed_pair_stops_resolving() {
+    let fx = Fixture::new();
+    fx.project_agent("helper", &yaml("helper", ""), "ORIGINAL");
+    let (_store, view) = fx.trust_all();
+    let reg = fx.load_with(&view);
+    assert_eq!(reg.resolve("helper").unwrap().instructions, "ORIGINAL");
+
+    // Change only the instructions; the composite digest covers both files.
+    std::fs::write(
+        fx.project
+            .join(".leveler/agents/helper")
+            .join(INSTRUCTIONS_FILE),
+        "TAMPERED",
+    )
+    .unwrap();
+    let reg = fx.load_with(&view);
+    assert!(reg.get("helper").is_none(), "{:?}", reg.entries());
+    assert_eq!(reg.untrusted()[0].state, "changed");
+
+    let (_store, fresh) = fx.trust_all();
+    let reg = fx.load_with(&fresh);
+    assert_eq!(reg.resolve("helper").unwrap().instructions, "TAMPERED");
+}
+
+#[test]
+fn an_untrusted_user_agent_is_not_registered() {
+    let fx = Fixture::new();
+    fx.user_agent(
+        "global-helper",
+        &yaml("global-helper", ""),
+        "USER-INSTRUCTIONS",
+    );
+    let reg = fx.load_with(&DefinitionTrustView::deny_all());
+    assert!(reg.get("global-helper").is_none());
+    assert_eq!(reg.untrusted().len(), 1, "{:?}", reg.untrusted());
 }
 
 // ── Discovery & precedence ──────────────────────────────────────────────────

@@ -527,6 +527,12 @@ impl Tool for ApplyPatchTool {
                 | FileChange::Delete { path }
                 | FileChange::Update { path, .. } => path.clone(),
             };
+            if let Some(reason) = context.security_control_read_denied(&path) {
+                return Ok(ToolOutput::error(reason));
+            }
+            if let Some(reason) = context.skill_content_read_denied(&path) {
+                return Ok(ToolOutput::error(reason));
+            }
             match crate::memory_access::validate_read(&context, std::path::Path::new(&path)) {
                 Ok(false) => {
                     workspace_changes.push(change);

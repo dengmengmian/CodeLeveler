@@ -19,7 +19,7 @@
 //! A snapshot that dropped the round would still show the tool — that is why
 //! the assertion is on the identity, not on the row's existence.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +41,10 @@ use leveler_test_support::{MockResponse, MockServer};
 use tokio_util::sync::CancellationToken;
 
 /// Long enough that it never settles on its own inside the test window.
+#[cfg(unix)]
 const COMMAND: &str = "sleep 60";
+#[cfg(windows)]
+const COMMAND: &str = "powershell -NoProfile -Command \"Start-Sleep -Seconds 60\"";
 
 fn isolate_global_config() {
     use std::sync::OnceLock;

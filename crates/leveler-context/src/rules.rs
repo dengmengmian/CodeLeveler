@@ -20,6 +20,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use leveler_definition_trust::{
+    DefinitionIdentity, DefinitionKind, DefinitionTrustView, TrustAuditEntry,
+};
 use serde::{Deserialize, Serialize};
 
 /// Request-wide rule byte budget (selection, not truncation).
@@ -256,30 +259,40 @@ impl RuleReadError {
 }
 
 /// The result of reading one candidate: loaded text, an existing empty file,
-/// or no such file. Only the first is a rule source; the other two must stay
-/// distinguishable so an empty or missing file is not mistaken for a failure.
+/// no such file, or a definition the trust gate refused. Only the first is a
+/// rule source; the others must stay distinguishable so an unapproved file is
+/// never mistaken for an absent one or for a read failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSourceRead {
     Loaded(ProjectInstruction),
     Empty,
     Absent,
+    /// Present and read, but its exact bytes are not approved. The text is
+    /// deliberately not returned: an unapproved file must not reach a caller
+    /// that might still put it in the prompt.
+    Untrusted {
+        audit: TrustAuditEntry,
+    },
 }
 
 /// Everything discovered under one root: usable documents, empty candidates,
-/// and read failures. Discovery never turns a failure into an empty rule set.
+/// trust refusals, and read failures. Discovery never turns a failure into an
+/// empty rule set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadedRuleSet {
     pub documents: Vec<ProjectInstruction>,
     pub empty: Vec<String>,
+    pub untrusted: Vec<TrustAuditEntry>,
     pub errors: Vec<RuleReadError>,
 }
 
 /// Nested rule sources discovered for the current call paths. Read failures
-/// are returned beside the documents so a caller cannot mistake "unreadable"
-/// for "no rules here".
+/// and trust refusals are returned beside the documents so a caller cannot
+/// mistake "unreadable" or "not approved" for "no rules here".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopedRules {
     pub documents: Vec<ProjectInstruction>,
+    pub untrusted: Vec<TrustAuditEntry>,
     pub errors: Vec<RuleReadError>,
 }
 
@@ -296,6 +309,9 @@ pub enum RuleSourceStatus {
     Empty,
     /// The file could not be read; `RuleDeliveryReport::read_errors` says why.
     Unreadable,
+    /// The file was read, but the trust gate refused its exact bytes. Its text
+    /// is not in the prompt.
+    Untrusted,
 }
 
 /// One rule source in the delivery audit. `sha256` is over the exact loaded
@@ -308,6 +324,11 @@ pub struct RuleSourceAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     pub status: RuleSourceStatus,
+    /// Why a present source was refused, when it was. `Untrusted`/`Changed`
+    /// are stable audit codes; the approved digest lets an operator compare
+    /// versions without reading the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustAuditEntry>,
 }
 
 /// Whether the delivery policy came from the project file or the built-in
@@ -385,6 +406,8 @@ pub struct RuleDeliveryPlan {
     pub report: RuleDeliveryReport,
     /// Every discovered source, in delivery order, with its status.
     pub sources: Vec<RuleSourceAudit>,
+    /// Definitions that exist but were refused by the trust gate.
+    pub untrusted: Vec<TrustAuditEntry>,
 }
 
 /// The byte accounting for one request's rule delivery.
@@ -412,6 +435,10 @@ pub struct RuleDeliveryReport {
     /// Files that existed but could not be read. Empty is not a substitute.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_errors: Vec<RuleReadError>,
+    /// Present sources whose exact bytes are not approved. Their text is not
+    /// in the prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untrusted: Vec<TrustAuditEntry>,
 }
 
 /// What one document contributes, by class.
@@ -426,10 +453,20 @@ struct DocumentSelection {
     total: usize,
 }
 
-/// Plan the delivery of every rule document under `root`.
-pub fn plan_rule_delivery(root: &Path, policy: &RuleDeliveryPolicy) -> RuleDeliveryPlan {
-    let loaded = load_rules(root);
-    plan_instructions_with(loaded.documents, policy, loaded.empty, loaded.errors)
+/// Plan the delivery of every approved rule document under `root`.
+pub fn plan_rule_delivery(
+    root: &Path,
+    policy: &RuleDeliveryPolicy,
+    trust: &DefinitionTrustView,
+) -> RuleDeliveryPlan {
+    let loaded = load_rules(root, trust);
+    plan_instructions_with(
+        loaded.documents,
+        policy,
+        loaded.empty,
+        loaded.untrusted,
+        loaded.errors,
+    )
 }
 
 /// Plan delivery across already-loaded documents.
@@ -442,13 +479,14 @@ pub fn plan_instructions(
     instructions: Vec<ProjectInstruction>,
     policy: &RuleDeliveryPolicy,
 ) -> RuleDeliveryPlan {
-    plan_instructions_with(instructions, policy, Vec::new(), Vec::new())
+    plan_instructions_with(instructions, policy, Vec::new(), Vec::new(), Vec::new())
 }
 
 fn plan_instructions_with(
     instructions: Vec<ProjectInstruction>,
     policy: &RuleDeliveryPolicy,
     empty: Vec<String>,
+    untrusted: Vec<TrustAuditEntry>,
     read_errors: Vec<RuleReadError>,
 ) -> RuleDeliveryPlan {
     let budget = policy.budget();
@@ -567,7 +605,8 @@ fn plan_instructions_with(
     }
     report.index_bytes = index_bytes;
 
-    let mut sources = Vec::with_capacity(instructions.len() + empty.len() + read_errors.len());
+    let mut sources =
+        Vec::with_capacity(instructions.len() + empty.len() + untrusted.len() + read_errors.len());
     for (instruction, selection) in instructions.iter().zip(&selections) {
         let status = if selection.delivered == 0 {
             RuleSourceStatus::Omitted
@@ -581,6 +620,7 @@ fn plan_instructions_with(
             bytes: instruction.content.len(),
             sha256: Some(content_sha256(&instruction.content)),
             status,
+            trust: None,
         });
     }
     for source in &empty {
@@ -589,6 +629,16 @@ fn plan_instructions_with(
             bytes: 0,
             sha256: None,
             status: RuleSourceStatus::Empty,
+            trust: None,
+        });
+    }
+    for entry in &untrusted {
+        sources.push(RuleSourceAudit {
+            source: entry.display.clone(),
+            bytes: 0,
+            sha256: None,
+            status: RuleSourceStatus::Untrusted,
+            trust: Some(entry.clone()),
         });
     }
     for error in &read_errors {
@@ -597,13 +647,16 @@ fn plan_instructions_with(
             bytes: 0,
             sha256: None,
             status: RuleSourceStatus::Unreadable,
+            trust: None,
         });
     }
     report.read_errors = read_errors;
+    report.untrusted = untrusted.clone();
     RuleDeliveryPlan {
         documents,
         report,
         sources,
+        untrusted,
     }
 }
 
@@ -744,13 +797,15 @@ fn workspace_relative_identity(path: &Path) -> String {
     }
 }
 
-/// Every root rule document under `root`, in priority order.
+/// Every root rule document under `root`, in priority order, filtered by the
+/// definition trust gate.
 ///
 /// An absent optional document is normal; a document that exists but cannot be
-/// read is returned in `errors` and never collapsed into "no rules". Root and
+/// read is returned in `errors`, and one whose exact bytes are not approved is
+/// returned in `untrusted` and never collapsed into "no rules". Root and
 /// candidate are resolved to their real paths, so a symlink that leaves the
 /// workspace is refused instead of being read.
-pub fn load_rules(root: &Path) -> LoadedRuleSet {
+pub fn load_rules(root: &Path, trust: &DefinitionTrustView) -> LoadedRuleSet {
     let mut out = LoadedRuleSet::default();
     let canonical_root = match root.canonicalize() {
         Ok(root) => root,
@@ -779,11 +834,15 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
                 return out;
             }
         };
-    for candidate in ["AGENTS.md", ".leveler/instructions.md"] {
-        match read_rule_source_in_dir(&root_dir, &canonical_root, candidate) {
+    for (candidate, kind) in [
+        ("AGENTS.md", DefinitionKind::RootAgents),
+        (".leveler/instructions.md", DefinitionKind::Instructions),
+    ] {
+        match read_rule_source_in_dir(&root_dir, &canonical_root, candidate, kind, trust) {
             Ok(RuleSourceRead::Loaded(rule)) => out.documents.push(rule),
             Ok(RuleSourceRead::Empty) => out.empty.push(candidate.to_string()),
             Ok(RuleSourceRead::Absent) => {}
+            Ok(RuleSourceRead::Untrusted { audit }) => out.untrusted.push(audit),
             Err(error) => out.errors.push(error),
         }
     }
@@ -852,10 +911,17 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
                             continue;
                         };
                         let rel = workspace_relative_identity(Path::new(&rel));
-                        match read_rule_source_in_dir(&root_dir, &canonical_root, &rel) {
+                        match read_rule_source_in_dir(
+                            &root_dir,
+                            &canonical_root,
+                            &rel,
+                            DefinitionKind::RuleFile,
+                            trust,
+                        ) {
                             Ok(RuleSourceRead::Loaded(rule)) => out.documents.push(rule),
                             Ok(RuleSourceRead::Empty) => out.empty.push(rel),
                             Ok(RuleSourceRead::Absent) => {}
+                            Ok(RuleSourceRead::Untrusted { audit }) => out.untrusted.push(audit),
                             Err(error) => out.errors.push(error),
                         }
                     }
@@ -883,7 +949,11 @@ pub fn load_rules(root: &Path) -> LoadedRuleSet {
 /// component-aware containment, so a symlink cannot launder arbitrary file
 /// content into project authority. A missing optional file is `Absent`, not an
 /// error; every other failure is returned, never swallowed.
-pub fn read_rule_source(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleReadError> {
+pub fn read_rule_source(
+    root: &Path,
+    rel: &str,
+    trust: &DefinitionTrustView,
+) -> Result<RuleSourceRead, RuleReadError> {
     let canonical_root = root.canonicalize().map_err(|error| {
         RuleReadError::new(
             rel,
@@ -894,7 +964,48 @@ pub fn read_rule_source(root: &Path, rel: &str) -> Result<RuleSourceRead, RuleRe
     let root_dir =
         cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
             .map_err(|error| RuleReadError::from_io(rel, &error))?;
-    read_rule_source_in_dir(&root_dir, &canonical_root, rel)
+    read_rule_source_in_dir(
+        &root_dir,
+        &canonical_root,
+        rel,
+        definition_kind_for(rel),
+        trust,
+    )
+}
+
+/// The audit kind for a rule document path. Identity is the path; the kind is
+/// what the delivery audit reports.
+pub fn definition_kind_for(rel: &str) -> DefinitionKind {
+    let rel = rel.replace('\\', "/");
+    if rel == "AGENTS.md" {
+        DefinitionKind::RootAgents
+    } else if rel == ".leveler/instructions.md" {
+        DefinitionKind::Instructions
+    } else if rel.starts_with(".leveler/rules/") {
+        DefinitionKind::RuleFile
+    } else {
+        DefinitionKind::NestedAgents
+    }
+}
+
+/// One gate decision over the exact bytes just read. `None` means the bytes may
+/// be decoded and delivered; `Some` carries the audit entry that says why not.
+fn trust_admission(
+    rel: &str,
+    kind: DefinitionKind,
+    bytes: &[u8],
+    trust: &DefinitionTrustView,
+) -> Result<Option<TrustAuditEntry>, RuleReadError> {
+    let Some(identity) = DefinitionIdentity::project(kind, rel) else {
+        return Err(RuleReadError::new(
+            rel,
+            RuleReadErrorKind::NotARuleDocument,
+            "not a project rule document",
+        ));
+    };
+    let decision = trust.check(&identity, &DefinitionIdentity::single_digest(bytes));
+    Ok((!decision.admits())
+        .then(|| trust.audit(&identity, &DefinitionIdentity::single_digest(bytes))))
 }
 
 /// Read one rule document through a directory capability.
@@ -906,6 +1017,8 @@ fn read_rule_source_in_dir(
     root_dir: &cap_std::fs::Dir,
     root: &Path,
     rel: &str,
+    kind: DefinitionKind,
+    trust: &DefinitionTrustView,
 ) -> Result<RuleSourceRead, RuleReadError> {
     if !is_rule_document(rel) {
         return Err(RuleReadError::new(
@@ -1003,6 +1116,9 @@ fn read_rule_source_in_dir(
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|error| RuleReadError::from_io(rel, &error))?;
+    if let Some(audit) = trust_admission(rel, kind, &bytes, trust)? {
+        return Ok(RuleSourceRead::Untrusted { audit });
+    }
     rule_source_from_bytes(rel, bytes)
 }
 
@@ -1014,6 +1130,7 @@ fn read_rule_source_in_dir(
 pub fn read_rule_source_with(
     root: &Path,
     rel: &str,
+    trust: &DefinitionTrustView,
     open: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<RuleSourceRead, RuleReadError> {
     if !is_rule_document(rel) {
@@ -1030,12 +1147,14 @@ pub fn read_rule_source_with(
             format!("workspace root: {error}"),
         )
     })?;
-    read_rule_source_in(&canonical_root, rel, open)
+    read_rule_source_in(&canonical_root, rel, definition_kind_for(rel), trust, open)
 }
 
 fn read_rule_source_in(
     root: &Path,
     rel: &str,
+    kind: DefinitionKind,
+    trust: &DefinitionTrustView,
     open: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
 ) -> Result<RuleSourceRead, RuleReadError> {
     if !is_rule_document(rel) {
@@ -1083,6 +1202,9 @@ fn read_rule_source_in(
         ));
     }
     let bytes = open(&canonical).map_err(|error| RuleReadError::from_io(rel, &error))?;
+    if let Some(audit) = trust_admission(rel, kind, &bytes, trust)? {
+        return Ok(RuleSourceRead::Untrusted { audit });
+    }
     rule_source_from_bytes(rel, bytes)
 }
 
@@ -1172,7 +1294,11 @@ pub fn is_rule_document(rel: &str) -> bool {
 /// dropped. Root `AGENTS.md` is never returned — it belongs to the request
 /// prefix, not to a path. Read failures are returned beside the documents; a
 /// path that is a directory also scopes its own `AGENTS.md`.
-pub fn scoped_rule_sources(root: &Path, paths: &[String]) -> ScopedRules {
+pub fn scoped_rule_sources(
+    root: &Path,
+    paths: &[String],
+    trust: &DefinitionTrustView,
+) -> ScopedRules {
     let mut out = ScopedRules::default();
     let canonical_root = match root.canonicalize() {
         Ok(root) => root,
@@ -1188,12 +1314,22 @@ pub fn scoped_rule_sources(root: &Path, paths: &[String]) -> ScopedRules {
     for path in paths {
         let is_dir = canonical_root.join(path).is_dir();
         for rel in scoped_document_paths(path, is_dir) {
-            if rel == "AGENTS.md" || out.documents.iter().any(|rule| rule.source == rel) {
+            if rel == "AGENTS.md"
+                || out.documents.iter().any(|rule| rule.source == rel)
+                || out.untrusted.iter().any(|entry| entry.display == rel)
+            {
                 continue;
             }
-            match read_rule_source_in(&canonical_root, &rel, &|path| std::fs::read(path)) {
+            match read_rule_source_in(
+                &canonical_root,
+                &rel,
+                DefinitionKind::NestedAgents,
+                trust,
+                &|path| std::fs::read(path),
+            ) {
                 Ok(RuleSourceRead::Loaded(rule)) => out.documents.push(rule),
                 Ok(RuleSourceRead::Empty) | Ok(RuleSourceRead::Absent) => {}
+                Ok(RuleSourceRead::Untrusted { audit }) => out.untrusted.push(audit),
                 Err(error) => {
                     if !out.errors.iter().any(|known| known.source == error.source) {
                         out.errors.push(error);
@@ -1274,6 +1410,34 @@ mod tests {
         dir
     }
 
+    /// A view that has approved every definition currently under `root`.
+    ///
+    /// This is a real approval transaction against a throwaway store, not a
+    /// bypass: a test that changes a file afterwards must call it again (or the
+    /// change will be seen as `changed`, which is the production contract).
+    fn trust_all(root: &Path) -> DefinitionTrustView {
+        use leveler_definition_trust::{
+            ApprovalSurface, DefinitionTrustView, approve, discover_project,
+        };
+        let home = std::env::temp_dir().join(format!(
+            "leveler-rules-trust-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let requests: Vec<_> = discover_project(root)
+            .iter()
+            .filter_map(|candidate| candidate.approval_request().ok())
+            .collect();
+        approve(&home, root, &requests, ApprovalSurface::Cli).expect("test approval store");
+        DefinitionTrustView::load(&home, Some(root))
+    }
+
+    fn untrusted() -> DefinitionTrustView {
+        DefinitionTrustView::deny_all()
+    }
+
     /// A document shaped like the real failure: a short requirement first,
     /// ordinary prose in the middle, one late requirement at the end.
     fn over_budget_document() -> String {
@@ -1289,6 +1453,37 @@ mod tests {
             "# Project rules\n\n## Answer artifact\nWrite `answers/answer.txt`.\n\n{filler}\n\
              ## Release marker\nWrite the token `LEVELER-LATE-7Q4` into `markers/late.txt`.\n"
         )
+    }
+
+    #[test]
+    fn an_untrusted_config_cannot_select_an_unapproved_rule() {
+        let root = temp_dir("untrusted-config-policy");
+        std::fs::create_dir_all(root.join(".leveler")).unwrap();
+        std::fs::write(
+            root.join(".leveler/config.yaml"),
+            "rules:\n  always_delivered: [Release marker]\n  budget_bytes: 16000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Project rules\n\n## Release marker\nEVIL-CONFIG-SELECTED\n",
+        )
+        .unwrap();
+        let config = leveler_project::config::ProjectConfig::load(&root).unwrap();
+        let policy = RuleDeliveryPolicy {
+            always: config.rules.always_delivered,
+            budget_bytes: config.rules.budget_bytes,
+        };
+        let plan = plan_rule_delivery(&root, &policy, &untrusted());
+        assert!(
+            plan.documents.is_empty(),
+            "the config policy may select only admitted definitions: {plan:?}"
+        );
+        assert_eq!(plan.untrusted.len(), 1, "{plan:?}");
+        let loaded = load_rules(&root, &untrusted());
+        assert!(loaded.documents.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1311,7 +1506,7 @@ mod tests {
             always: config.rules.always_delivered,
             budget_bytes: config.rules.budget_bytes,
         };
-        let plan = plan_rule_delivery(&root, &policy);
+        let plan = plan_rule_delivery(&root, &policy, &trust_all(&root));
         let delivered = plan
             .documents
             .iter()
@@ -1540,7 +1735,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".leveler/rules")).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "Use tabs.").unwrap();
         std::fs::write(dir.join(".leveler/rules/style.md"), "No unwrap.").unwrap();
-        let rules = load_rules(&dir);
+        let rules = load_rules(&dir, &trust_all(&dir));
         assert!(rules.errors.is_empty(), "{:?}", rules.errors);
         assert_eq!(rules.documents.len(), 2);
         assert_eq!(rules.documents[0].source, "AGENTS.md");
@@ -1560,7 +1755,7 @@ mod tests {
         std::fs::write(dir.join("AGENTS.md"), "Root rule.").unwrap();
         std::fs::write(dir.join("src/AGENTS.md"), "Src rule v1.").unwrap();
 
-        let rules = scoped_rule_sources(&dir, &["src/lib.rs".to_string()]);
+        let rules = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &trust_all(&dir));
         assert!(rules.errors.is_empty(), "{:?}", rules.errors);
         assert_eq!(rules.documents.len(), 1, "{rules:?}");
         assert_eq!(rules.documents[0].source, "src/AGENTS.md");
@@ -1568,13 +1763,13 @@ mod tests {
 
         // A changed file is a changed source: the same call must see v2.
         std::fs::write(dir.join("src/AGENTS.md"), "Src rule v2.").unwrap();
-        let rules = scoped_rule_sources(&dir, &["src/lib.rs".to_string()]);
+        let rules = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &trust_all(&dir));
         assert!(rules.documents[0].content.contains("Src rule v2"));
 
         // A deleted file is no longer a source at all.
         std::fs::remove_file(dir.join("src/AGENTS.md")).unwrap();
         assert!(
-            scoped_rule_sources(&dir, &["src/lib.rs".to_string()])
+            scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &trust_all(&dir))
                 .documents
                 .is_empty()
         );
@@ -1588,7 +1783,7 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "pub fn x() {}").unwrap();
         std::fs::write(dir.join("src/AGENTS.md"), "Src rule.").unwrap();
         assert_eq!(
-            read_rule_source(&dir, "src/lib.rs"),
+            read_rule_source(&dir, "src/lib.rs", &trust_all(&dir)),
             Err(RuleReadError::new(
                 "src/lib.rs",
                 RuleReadErrorKind::NotARuleDocument,
@@ -1596,25 +1791,25 @@ mod tests {
             ))
         );
         assert!(matches!(
-            read_rule_source(&dir, "../AGENTS.md"),
+            read_rule_source(&dir, "../AGENTS.md", &trust_all(&dir)),
             Err(RuleReadError {
                 kind: RuleReadErrorKind::NotARuleDocument,
                 ..
             })
         ));
         assert!(matches!(
-            read_rule_source(&dir, "/etc/passwd"),
+            read_rule_source(&dir, "/etc/passwd", &trust_all(&dir)),
             Err(RuleReadError {
                 kind: RuleReadErrorKind::NotARuleDocument,
                 ..
             })
         ));
         assert!(matches!(
-            read_rule_source(&dir, "missing/AGENTS.md"),
+            read_rule_source(&dir, "missing/AGENTS.md", &trust_all(&dir)),
             Ok(RuleSourceRead::Absent)
         ));
         let RuleSourceRead::Loaded(rule) =
-            read_rule_source(&dir, "src/AGENTS.md").expect("nested rules")
+            read_rule_source(&dir, "src/AGENTS.md", &trust_all(&dir)).expect("nested rules")
         else {
             panic!("expected a loaded rule");
         };
@@ -1625,10 +1820,10 @@ mod tests {
     #[test]
     fn empty_when_no_rules() {
         let dir = temp_dir("none");
-        assert!(load_rules(&dir).documents.is_empty());
-        assert!(load_rules(&dir).errors.is_empty());
+        assert!(load_rules(&dir, &trust_all(&dir)).documents.is_empty());
+        assert!(load_rules(&dir, &trust_all(&dir)).errors.is_empty());
         assert!(
-            plan_rule_delivery(&dir, &RuleDeliveryPolicy::default())
+            plan_rule_delivery(&dir, &RuleDeliveryPolicy::default(), &trust_all(&dir))
                 .documents
                 .is_empty()
         );
@@ -1688,13 +1883,13 @@ mod tests {
         let dir = temp_dir("invalid-utf8");
         std::fs::write(dir.join("AGENTS.md"), [0xff, 0xfe, 0x00, 0x41]).unwrap();
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty());
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].source, "AGENTS.md");
         assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::InvalidUtf8);
 
-        let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default());
+        let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default(), &trust_all(&dir));
         assert!(plan.documents.is_empty());
         assert_eq!(plan.report.read_errors, loaded.errors);
         assert_eq!(plan.sources.len(), 1);
@@ -1721,7 +1916,7 @@ mod tests {
             return;
         }
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty());
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::InvalidUtf8);
@@ -1743,7 +1938,7 @@ mod tests {
         let dir = temp_dir("rule-directory");
         std::fs::create_dir_all(dir.join("AGENTS.md")).unwrap();
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty());
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::NotAFile);
@@ -1754,11 +1949,11 @@ mod tests {
     fn an_empty_rule_is_distinct_from_a_missing_one() {
         let dir = temp_dir("empty-rule");
         std::fs::write(dir.join("AGENTS.md"), " \n\t\n").unwrap();
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty());
         assert!(loaded.errors.is_empty());
         assert_eq!(loaded.empty, vec!["AGENTS.md".to_string()]);
-        let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default());
+        let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default(), &trust_all(&dir));
         assert_eq!(plan.sources[0].status, RuleSourceStatus::Empty);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1778,7 +1973,7 @@ mod tests {
             return;
         }
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty());
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::PermissionDenied);
@@ -1803,7 +1998,7 @@ mod tests {
             return;
         }
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty());
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].source, ".leveler/rules");
@@ -1822,7 +2017,7 @@ mod tests {
         std::fs::write(outside.join("AGENTS.md"), "OUTSIDE-SECRET").unwrap();
         symlink(outside.join("AGENTS.md"), dir.join("AGENTS.md")).unwrap();
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty(), "{loaded:?}");
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::OutsideWorkspace);
@@ -1830,7 +2025,7 @@ mod tests {
         // A nested rule has the same boundary as the root one.
         std::fs::create_dir_all(dir.join("src")).unwrap();
         symlink(outside.join("AGENTS.md"), dir.join("src/AGENTS.md")).unwrap();
-        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()]);
+        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &trust_all(&dir));
         assert!(scoped.documents.is_empty(), "{scoped:?}");
         assert_eq!(scoped.errors.len(), 1, "{:?}", scoped.errors);
         assert_eq!(scoped.errors[0].source, "src/AGENTS.md");
@@ -1851,7 +2046,7 @@ mod tests {
         std::fs::write(sibling.join("AGENTS.md"), "PREFIX-EVIL").unwrap();
         symlink(sibling.join("AGENTS.md"), dir.join("AGENTS.md")).unwrap();
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.documents.is_empty(), "{loaded:?}");
         assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
         assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::OutsideWorkspace);
@@ -1869,7 +2064,7 @@ mod tests {
         std::fs::write(dir.join("docs/style.md"), "# Style\nINSIDE-RULE\n").unwrap();
         symlink("docs/style.md", dir.join("AGENTS.md")).unwrap();
 
-        let loaded = load_rules(&dir);
+        let loaded = load_rules(&dir, &trust_all(&dir));
         assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
         assert_eq!(loaded.documents.len(), 1);
         assert_eq!(loaded.documents[0].source, "AGENTS.md");
@@ -1931,7 +2126,7 @@ mod tests {
         std::fs::write(dir.join("src/AGENTS.md"), "Src rule.").unwrap();
         std::fs::write(dir.join("src/npc/AGENTS.md"), "Npc rule.").unwrap();
 
-        let scoped = scoped_rule_sources(&dir, &["src/npc".to_string()]);
+        let scoped = scoped_rule_sources(&dir, &["src/npc".to_string()], &trust_all(&dir));
         assert!(scoped.errors.is_empty(), "{:?}", scoped.errors);
         assert_eq!(
             scoped
@@ -1958,5 +2153,95 @@ mod tests {
         assert_eq!(plan.sources[0].status, RuleSourceStatus::PartiallyDelivered);
         assert_eq!(plan.report.delivered_sections, vec!["AGENTS.md#keep"]);
         assert_eq!(plan.report.omitted_sections, vec!["AGENTS.md#drop"]);
+    }
+
+    #[test]
+    fn an_unapproved_root_rule_is_not_delivered() {
+        let dir = temp_dir("unapproved-root");
+        std::fs::write(dir.join("AGENTS.md"), "EVIL-MARKER").unwrap();
+        let loaded = load_rules(&dir, &untrusted());
+        assert!(loaded.documents.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
+        assert_eq!(loaded.untrusted[0].state, "unapproved");
+        let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default(), &untrusted());
+        assert!(plan.documents.is_empty());
+        assert_eq!(plan.report.untrusted.len(), 1);
+        assert_eq!(
+            plan.sources
+                .iter()
+                .find(|source| source.source == "AGENTS.md")
+                .map(|source| source.status),
+            Some(RuleSourceStatus::Untrusted)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_changed_rule_stays_out_until_the_new_bytes_are_approved() {
+        let dir = temp_dir("changed-root");
+        std::fs::write(dir.join("AGENTS.md"), "APPROVED-A").unwrap();
+        let first = trust_all(&dir);
+        assert!(
+            load_rules(&dir, &first).documents[0]
+                .content
+                .contains("APPROVED-A")
+        );
+
+        std::fs::write(dir.join("AGENTS.md"), "APPROVED-B").unwrap();
+        let loaded = load_rules(&dir, &first);
+        assert!(
+            loaded.documents.is_empty(),
+            "changed bytes must not load: {loaded:?}"
+        );
+        assert_eq!(loaded.untrusted[0].state, "changed");
+
+        // Re-approval is the only path to the new bytes.
+        let second = trust_all(&dir);
+        assert!(
+            load_rules(&dir, &second).documents[0]
+                .content
+                .contains("APPROVED-B")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_corrupt_store_fails_closed_for_every_rule() {
+        let dir = temp_dir("corrupt-store");
+        std::fs::write(dir.join("AGENTS.md"), "ROOT").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/AGENTS.md"), "NESTED").unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "leveler-rules-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("definition-trust.yaml"), "!! not yaml !!").unwrap();
+        let view = DefinitionTrustView::load(&home, Some(&dir));
+        let loaded = load_rules(&dir, &view);
+        assert!(loaded.documents.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
+        assert_eq!(loaded.untrusted[0].state, "store_unavailable");
+        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &view);
+        assert!(scoped.documents.is_empty(), "{scoped:?}");
+        assert_eq!(scoped.untrusted.len(), 1, "{scoped:?}");
+        assert_eq!(scoped.untrusted[0].state, "store_unavailable");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn an_unapproved_nested_rule_scopes_nothing() {
+        let dir = temp_dir("unapproved-nested");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/AGENTS.md"), "NESTED-EVIL").unwrap();
+        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &untrusted());
+        assert!(scoped.documents.is_empty(), "{scoped:?}");
+        assert_eq!(scoped.untrusted.len(), 1);
+        assert_eq!(scoped.untrusted[0].display, "src/AGENTS.md");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

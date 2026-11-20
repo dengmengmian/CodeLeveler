@@ -470,7 +470,19 @@ fn emit_project_rules(events: &crate::event_bridge::RuntimeEventSender, repo: Op
     let Some(repo) = repo else {
         return;
     };
-    let loaded = leveler_context::load_rules(repo);
+    let home = leveler_core::LevelerHome::resolve(leveler_core::environment());
+    let trust = leveler_definition_trust::DefinitionTrustView::load(home.root(), Some(repo));
+    let loaded = leveler_context::load_rules(repo, &trust);
+    for entry in &loaded.untrusted {
+        // Present but refused: it is not a loaded source, and the UI must not
+        // count it as one. The boot notice and `leveler trust` own the user
+        // decision.
+        tracing::warn!(
+            event = "project_definition_untrusted",
+            display = %entry.display,
+            state = %entry.state
+        );
+    }
     for error in &loaded.errors {
         // This channel only names loaded sources to the UI; a failed read is
         // evidence, not a source, so it goes to the operator log rather than
@@ -7404,8 +7416,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let mut findings =
                     crate::doctor::run_with_mcp_locale(&config, mcp.as_deref(), chinese);
                 if let Some(root) = self.app.layout.primary_workspace() {
+                    let trust = self.app.definition_trust_for(Some(root));
                     findings.push(crate::doctor::agents_check(
                         &leveler_agent::agent_registry::AgentRoots::for_project(root),
+                        &trust,
+                    ));
+                    findings.push(crate::doctor::definitions_check(
+                        &leveler_definition_trust::DiscoveryRoots::resolve(
+                            self.app.environment_snapshot(),
+                            Some(root.to_path_buf()),
+                        ),
+                        &trust,
                     ));
                 }
                 let report = leveler_client_protocol::DiagnosticReport {

@@ -324,7 +324,8 @@ impl Run {
 
 async fn run(repo: &Repo, rt: Rt) -> Run {
     let workspace = Workspace::new(&repo.root).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let rt = Arc::new(rt);
     let mut events = Vec::new();
     let mut sink = Records::default();

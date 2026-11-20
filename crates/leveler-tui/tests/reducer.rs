@@ -1,6 +1,41 @@
 //! Reducer tests: runtime events fold into state; keys edit/submit/cancel (§69.1).
 
+use std::path::Path;
+use std::sync::OnceLock;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// A process-wide isolated home for client-side registry reads. Each test's
+/// repository has its own trust domain, so approvals do not leak across tests.
+fn test_home() -> &'static Path {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = leveler_core::install_environment(leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                dir.path().as_os_str().to_os_string(),
+            )],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        ));
+        dir
+    })
+    .path()
+}
+
+/// Approve the fixture definitions a client-side listing test relies on.
+fn approve_project(root: &Path) {
+    use leveler_definition_trust::{ApprovalSurface, approve, discover_project};
+    let home = test_home();
+    let requests: Vec<_> = discover_project(root)
+        .iter()
+        .filter_map(|candidate| candidate.approval_request().ok())
+        .collect();
+    if !requests.is_empty() {
+        approve(home, root, &requests, ApprovalSurface::Cli).expect("approve fixture");
+    }
+}
 
 use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
@@ -8785,6 +8820,7 @@ fn write_project_skill(root: &std::path::Path, name: &str, desc: &str) {
         format!("---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n\nDo the thing.\n"),
     )
     .unwrap();
+    approve_project(root);
 }
 
 /// Skills live in the `$` namespace only: `/<skill>` is not a second entry.
@@ -11946,6 +11982,7 @@ fn slash_skills_reads_the_local_registry_without_a_round_trip() {
         "---\nname: deploy\ndescription: Ship safely.\n---\n\nBODY_MARKER\n",
     )
     .unwrap();
+    approve_project(tmp.path());
     let mut s = opened();
     s.repository = Some(tmp.path().display().to_string());
 

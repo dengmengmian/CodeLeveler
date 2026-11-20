@@ -218,6 +218,25 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
     eprintln!("  它可以执行命令、授予免批准权限或提高默认权限模式。确认内容后运行：leveler trust");
 }
 
+/// Tell the user when this repository (or their user-wide skill/agent roots)
+/// contains definitions the trust gate will not inject.
+fn warn_untrusted_definitions(layout: &leveler_project::Layout) {
+    let Some(repo) = layout.primary_workspace() else {
+        return;
+    };
+    let notices = crate::trust_cmds::untrusted_definition_notices(repo);
+    if notices.is_empty() {
+        return;
+    }
+    for notice in &notices {
+        eprintln!(
+            "{} 忽略未信任的项目定义：{notice}",
+            crate::output::Line::warn("!")
+        );
+    }
+    eprintln!("  它们不会进入模型的可信指令。核对内容后运行：leveler trust");
+}
+
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     if matches!(&args.command, Some(Command::DesktopBridge)) {
         return desktop_bridge::run(args.config_dir).await;
@@ -253,6 +272,15 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         return Ok(code);
     }
     warn_untrusted_project_config(&layout);
+    // Definition discovery walks the tree; only a command that can start an
+    // agent turn needs the notice. `doctor`, `agents` and `skills` report the
+    // same state through their own surfaces.
+    if matches!(
+        &args.command,
+        None | Some(Command::Tui { .. }) | Some(Command::Run { .. }) | Some(Command::Serve { .. })
+    ) {
+        warn_untrusted_definitions(&layout);
+    }
 
     // No subcommand (or explicit `tui`) opens the interactive terminal UI.
     let command = match args.command {

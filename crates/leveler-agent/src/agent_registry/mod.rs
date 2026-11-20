@@ -33,6 +33,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use leveler_definition_trust::{
+    DefinitionIdentity, DefinitionKind, DefinitionTrustView, TrustAuditEntry,
+};
 use leveler_model::{ModelRef, ReasoningEffort};
 
 use crate::child_profile::{AgentRole, CHILD_MAX_DURATION_SECS, ChildProfile};
@@ -297,24 +300,38 @@ pub struct AgentRegistry {
     /// Sorted by name.
     entries: Vec<AgentEntry>,
     problems: Vec<AgentProblem>,
+    /// Definitions present on disk but refused by the trust gate. They are
+    /// not entries: an unapproved definition never shadows a trusted one.
+    untrusted: Vec<TrustAuditEntry>,
 }
 
 impl AgentRegistry {
     /// Read the built-ins and both directories. Never fails as a whole.
-    pub fn load(roots: &AgentRoots) -> Self {
+    pub fn load(roots: &AgentRoots, trust: &DefinitionTrustView) -> Self {
         let mut candidates: Vec<(String, AgentSource, Option<PathBuf>, AgentState)> = Vec::new();
         let mut problems = Vec::new();
+        let mut untrusted = Vec::new();
         if let Some(root) = &roots.project_root {
             read_agents_dir(
                 &project_agents_dir(root),
                 AgentSource::Project,
                 Some(root),
+                trust,
                 &mut candidates,
                 &mut problems,
+                &mut untrusted,
             );
         }
         if let Some(dir) = &roots.user_agents_dir {
-            read_agents_dir(dir, AgentSource::User, None, &mut candidates, &mut problems);
+            read_agents_dir(
+                dir,
+                AgentSource::User,
+                None,
+                trust,
+                &mut candidates,
+                &mut problems,
+                &mut untrusted,
+            );
         }
         for def in builtin::definitions() {
             candidates.push((
@@ -341,7 +358,16 @@ impl AgentRegistry {
                 }),
             }
         }
-        Self { entries, problems }
+        Self {
+            entries,
+            problems,
+            untrusted,
+        }
+    }
+
+    /// Definitions present but not admitted by the trust gate.
+    pub fn untrusted(&self) -> &[TrustAuditEntry] {
+        &self.untrusted
     }
 
     pub fn entries(&self) -> &[AgentEntry] {
@@ -395,8 +421,10 @@ fn read_agents_dir(
     dir: &Path,
     source: AgentSource,
     containing_root: Option<&Path>,
+    trust: &DefinitionTrustView,
     candidates: &mut Vec<(String, AgentSource, Option<PathBuf>, AgentState)>,
     problems: &mut Vec<AgentProblem>,
+    untrusted: &mut Vec<TrustAuditEntry>,
 ) {
     let Ok(listing) = std::fs::read_dir(dir) else {
         return;
@@ -478,11 +506,44 @@ fn read_agents_dir(
     }
     names.sort();
     for (name, path) in names {
-        let state = match read_definition(&path, &canonical_dir, &name, source) {
-            Ok(def) => AgentState::Valid(Box::new(def)),
-            Err(error) => AgentState::Invalid(error),
+        let identity = match source {
+            AgentSource::Project => DefinitionIdentity::project(
+                DefinitionKind::Agent,
+                &format!(".leveler/agents/{name}"),
+            ),
+            AgentSource::User => DefinitionIdentity::user_agent(&name),
+            AgentSource::Builtin => None,
         };
-        candidates.push((name, source, Some(path), state));
+        let Some(identity) = identity else {
+            problems.push(AgentProblem {
+                source,
+                location: path,
+                error: "the agent name cannot form a stable definition identity".into(),
+            });
+            continue;
+        };
+        match read_definition(&path, &canonical_dir, &name, source, &identity, trust) {
+            AgentLoad::Valid(def) => {
+                candidates.push((name, source, Some(path), AgentState::Valid(Box::new(def))));
+            }
+            AgentLoad::Invalid(error) => {
+                candidates.push((name, source, Some(path), AgentState::Invalid(error)));
+            }
+            AgentLoad::Untrusted(audit) => {
+                // Do not enter the name: an untrusted definition must not
+                // shadow a trusted lower-precedence one. Reporting it as a
+                // problem is enough for the owner to see why it did nothing.
+                problems.push(AgentProblem {
+                    source,
+                    location: path,
+                    error: format!(
+                        "definition is not trusted ({}); approve it with `leveler trust`",
+                        audit.state
+                    ),
+                });
+                untrusted.push(audit);
+            }
+        }
     }
 }
 
@@ -508,32 +569,73 @@ fn legacy_persona_name(path: &Path, file_name: &str) -> Option<String> {
     (head.starts_with(b"---\n") || head.starts_with(b"---\r\n")).then(|| stem.to_string())
 }
 
+enum AgentLoad {
+    Valid(AgentDefinition),
+    Invalid(String),
+    Untrusted(TrustAuditEntry),
+}
+
 fn read_definition(
     dir: &Path,
     canonical_agents_dir: &Path,
     name: &str,
     source: AgentSource,
-) -> Result<AgentDefinition, String> {
-    let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("cannot read: {e}"))?;
-    if meta.file_type().is_symlink() {
-        return Err("symlinked agent directories are not followed".into());
+    identity: &DefinitionIdentity,
+    trust: &DefinitionTrustView,
+) -> AgentLoad {
+    let read = || -> Result<AgentDefinition, AgentTrustFailure> {
+        let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("cannot read: {e}"))?;
+        if meta.file_type().is_symlink() {
+            return Err(AgentTrustFailure::Invalid(
+                "symlinked agent directories are not followed".into(),
+            ));
+        }
+        let canonical = dir
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve: {e}"))?;
+        if canonical.parent() != Some(canonical_agents_dir) {
+            return Err(AgentTrustFailure::Invalid(
+                "the agent directory resolves outside its agents directory".into(),
+            ));
+        }
+        let manifest_text = read_regular_file(&dir.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)
+            .map_err(AgentTrustFailure::Invalid)?;
+        let instructions = read_regular_file(&dir.join(INSTRUCTIONS_FILE), MAX_INSTRUCTIONS_BYTES)
+            .map_err(AgentTrustFailure::Invalid)?;
+        // Trust is checked over the exact bytes read, before parsing them as
+        // authority. A definition whose pair is not approved is not a
+        // definition the runtime will ever run.
+        let digest =
+            DefinitionIdentity::agent_digest(manifest_text.as_bytes(), instructions.as_bytes());
+        if !trust.check(identity, &digest).admits() {
+            return Err(AgentTrustFailure::Untrusted(trust.audit(identity, &digest)));
+        }
+        let manifest = parse_manifest(&manifest_text).map_err(AgentTrustFailure::Invalid)?;
+        resolve_manifest(
+            &manifest,
+            &instructions,
+            name,
+            source,
+            Some(dir.to_path_buf()),
+        )
+        .map_err(AgentTrustFailure::Invalid)
+    };
+    match read() {
+        Ok(def) => AgentLoad::Valid(def),
+        Err(AgentTrustFailure::Invalid(error)) => AgentLoad::Invalid(error),
+        Err(AgentTrustFailure::Untrusted(audit)) => AgentLoad::Untrusted(audit),
     }
-    let canonical = dir
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve: {e}"))?;
-    if canonical.parent() != Some(canonical_agents_dir) {
-        return Err("the agent directory resolves outside its agents directory".into());
+}
+
+enum AgentTrustFailure {
+    Invalid(String),
+    Untrusted(TrustAuditEntry),
+}
+
+impl From<String> for AgentTrustFailure {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
     }
-    let manifest_text = read_regular_file(&dir.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
-    let instructions = read_regular_file(&dir.join(INSTRUCTIONS_FILE), MAX_INSTRUCTIONS_BYTES)?;
-    let manifest = parse_manifest(&manifest_text)?;
-    resolve_manifest(
-        &manifest,
-        &instructions,
-        name,
-        source,
-        Some(dir.to_path_buf()),
-    )
 }
 
 /// Validate a manifest + instructions pair into a definition. The single

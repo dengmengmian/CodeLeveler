@@ -149,7 +149,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let db = Database::connect_in_memory().await.unwrap();
     let record = SessionRecord::new(
         dir.path().display().to_string(),

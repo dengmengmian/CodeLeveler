@@ -300,7 +300,8 @@ async fn run_goal_for_with(
             ToolContext::new(
                 Workspace::new(dir.path()).unwrap(),
                 PermissionProfile::Assisted,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             ModelRef::new("mock", "m"),
             20,
         )
@@ -520,7 +521,8 @@ async fn the_delivery_request_states_that_the_answer_is_still_owed() {
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         20,
     )
@@ -1013,7 +1015,8 @@ async fn a_provider_failure_on_the_delivery_round_is_not_a_completed_delivery() 
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         20,
     )
