@@ -9,9 +9,11 @@ repository.workspace = true
 description = "Agent Skills: discover, resolve, load, and author SKILL.md procedural-knowledge packs."
 
 [dependencies]
+leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 
 [dev-dependencies]
+leveler-definition-trust = { workspace = true, features = ["test-support"] }
 tempfile = "3"

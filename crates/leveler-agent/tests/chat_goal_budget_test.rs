@@ -253,7 +253,8 @@ async fn fixture(schedule: Vec<Option<&str>>, script: Vec<Scripted>, declare: bo
             dir.path().into(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let mut registry = leveler_tools::default_registry();
     leveler_agent::register_harness_controls(&mut registry);
     let coding = CodingRuntime {

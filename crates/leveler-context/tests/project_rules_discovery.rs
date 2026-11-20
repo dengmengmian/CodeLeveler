@@ -10,6 +10,7 @@ use leveler_context::{
     RuleDeliveryPolicy, RuleReadErrorKind, load_rules, plan_rule_delivery, read_rule_source,
     scoped_rule_sources,
 };
+use leveler_definition_trust::{ApprovalSurface, DefinitionTrustView, approve, discover_project};
 
 fn workspace(tag: &str) -> PathBuf {
     let dir =
@@ -27,8 +28,27 @@ fn write(root: &Path, rel: &str, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
+/// Approve exactly the definitions currently on disk. Tests that change a file
+/// afterwards call this again; that is the same human re-approval the product
+/// requires, not a bypass.
+fn trust(root: &Path) -> DefinitionTrustView {
+    let home = std::env::temp_dir().join(format!(
+        "leveler-rules-gate-a-trust-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let requests: Vec<_> = discover_project(root)
+        .iter()
+        .filter_map(|candidate| candidate.approval_request().ok())
+        .collect();
+    approve(&home, root, &requests, ApprovalSurface::Cli).expect("test approval store");
+    DefinitionTrustView::load(&home, Some(root))
+}
+
 fn sources(root: &Path) -> Vec<String> {
-    load_rules(root)
+    load_rules(root, &trust(root))
         .documents
         .into_iter()
         .map(|rule| rule.source)
@@ -49,7 +69,7 @@ fn every_documented_source_is_discovered_in_priority_order() {
     // A rules-directory file that is not Markdown is not a rule document.
     write(&root, ".leveler/rules/notes.txt", "not a rule\n");
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert_eq!(
         loaded
             .documents
@@ -78,7 +98,7 @@ fn every_documented_source_is_discovered_in_priority_order() {
 #[test]
 fn an_empty_workspace_has_no_rules_and_no_failure() {
     let root = workspace("empty");
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert!(loaded.documents.is_empty());
     assert!(
         loaded.errors.is_empty(),
@@ -86,7 +106,7 @@ fn an_empty_workspace_has_no_rules_and_no_failure() {
         loaded.errors
     );
 
-    let plan = plan_rule_delivery(&root, &RuleDeliveryPolicy::default());
+    let plan = plan_rule_delivery(&root, &RuleDeliveryPolicy::default(), &trust(&root));
     assert!(plan.documents.is_empty());
     assert!(plan.report.read_errors.is_empty());
 }
@@ -96,13 +116,13 @@ fn changed_content_is_read_again_on_the_next_load() {
     let root = workspace("changed");
     write(&root, "AGENTS.md", "# Rule\nfirst version\n");
     assert_eq!(
-        load_rules(&root).documents[0].content,
+        load_rules(&root, &trust(&root)).documents[0].content,
         "# Rule\nfirst version"
     );
 
     write(&root, "AGENTS.md", "# Rule\nsecond version\n");
     assert_eq!(
-        load_rules(&root).documents[0].content,
+        load_rules(&root, &trust(&root)).documents[0].content,
         "# Rule\nsecond version"
     );
 }
@@ -115,7 +135,7 @@ fn nested_rules_scope_to_their_directory_and_never_leak_from_siblings() {
     write(&root, "src/deep/AGENTS.md", "# Deep\ndeep rule\n");
     write(&root, "other/AGENTS.md", "# Other\nother rule\n");
 
-    let scoped = scoped_rule_sources(&root, &["src/deep/lib.rs".to_string()]);
+    let scoped = scoped_rule_sources(&root, &["src/deep/lib.rs".to_string()], &trust(&root));
     assert_eq!(
         scoped
             .documents
@@ -126,7 +146,7 @@ fn nested_rules_scope_to_their_directory_and_never_leak_from_siblings() {
         "root and unrelated directories are not scoped rules"
     );
 
-    let sibling = scoped_rule_sources(&root, &["other/lib.rs".to_string()]);
+    let sibling = scoped_rule_sources(&root, &["other/lib.rs".to_string()], &trust(&root));
     assert_eq!(
         sibling
             .documents
@@ -150,7 +170,7 @@ fn an_illegal_path_is_a_refusal_not_an_absent_file() {
     for path in ["../AGENTS.md", "/etc/AGENTS.md", "src/../AGENTS.md"] {
         assert!(
             matches!(
-                read_rule_source(&root, path),
+                read_rule_source(&root, path, &trust(&root)),
                 Err(error) if error.kind == RuleReadErrorKind::NotARuleDocument
             ),
             "{path} must be reported as refused, not as missing"
@@ -165,14 +185,14 @@ fn an_unreadable_document_is_reported_not_treated_as_absent() {
     // document, not a missing one.
     std::fs::create_dir_all(root.join("AGENTS.md")).unwrap();
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert!(loaded.documents.is_empty(), "nothing was delivered");
     assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
     assert_eq!(loaded.errors[0].source, "AGENTS.md");
     assert_eq!(loaded.errors[0].kind, RuleReadErrorKind::NotAFile);
     assert!(!loaded.errors[0].detail.is_empty());
 
-    let plan = plan_rule_delivery(&root, &RuleDeliveryPolicy::default());
+    let plan = plan_rule_delivery(&root, &RuleDeliveryPolicy::default(), &trust(&root));
     assert_eq!(
         plan.report.read_errors, loaded.errors,
         "the delivery report carries the same failure to the caller"
@@ -184,7 +204,7 @@ fn invalid_utf8_is_reported_not_treated_as_absent() {
     let root = workspace("invalid-utf8");
     std::fs::write(root.join("AGENTS.md"), b"# Broken\n\xff\xfe\n").unwrap();
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert!(loaded.documents.is_empty());
     assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
     assert_eq!(loaded.errors[0].source, "AGENTS.md");
@@ -196,7 +216,7 @@ fn a_rules_path_that_cannot_be_listed_is_reported() {
     let root = workspace("rules-not-a-dir");
     write(&root, ".leveler/rules", "this is a file, not a directory\n");
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert!(loaded.documents.is_empty());
     assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
     assert_eq!(loaded.errors[0].source, ".leveler/rules");
@@ -211,7 +231,7 @@ fn a_symlink_outside_the_workspace_is_refused_and_reported() {
     let root = workspace("symlink-outside-link");
     std::os::unix::fs::symlink(outside.join("AGENTS.md"), root.join("AGENTS.md")).unwrap();
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert!(
         loaded
             .documents
@@ -231,7 +251,7 @@ fn a_symlink_inside_the_workspace_is_followed() {
     write(&root, "real/AGENTS.md", "# Real\ninside rule\n");
     std::os::unix::fs::symlink(root.join("real/AGENTS.md"), root.join("AGENTS.md")).unwrap();
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert_eq!(loaded.documents.len(), 1, "{:?}", loaded.errors);
     assert_eq!(loaded.documents[0].source, "AGENTS.md");
     assert!(loaded.documents[0].content.contains("inside rule"));
@@ -244,13 +264,13 @@ fn a_dangling_symlink_is_reported_not_treated_as_absent() {
     let root = workspace("symlink-dangling");
     std::os::unix::fs::symlink(root.join("missing.md"), root.join("AGENTS.md")).unwrap();
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert!(loaded.documents.is_empty());
     assert_eq!(loaded.errors.len(), 1, "{:?}", loaded.errors);
     assert_eq!(loaded.errors[0].source, "AGENTS.md");
     assert_eq!(loaded.errors[0].detail, "dangling symlink");
     assert!(matches!(
-        read_rule_source(&root, "AGENTS.md"),
+        read_rule_source(&root, "AGENTS.md", &trust(&root)),
         Err(error) if error.detail == "dangling symlink"
     ));
 }
@@ -260,7 +280,7 @@ fn source_identity_is_workspace_relative_and_content_is_trimmed_only_at_the_edge
     let root = workspace("identity");
     write(&root, ".leveler/rules/style.md", "\n\n# Style\n\nbody\n\n");
 
-    let loaded = load_rules(&root);
+    let loaded = load_rules(&root, &trust(&root));
     assert_eq!(loaded.documents.len(), 1);
     assert_eq!(loaded.documents[0].source, ".leveler/rules/style.md");
     assert_eq!(loaded.documents[0].content, "# Style\n\nbody");

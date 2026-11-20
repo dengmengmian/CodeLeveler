@@ -32,7 +32,8 @@ async fn w2_committed_move_diff_survives_bridge_and_wire_without_preview_truncat
             ToolContext::new(
                 Workspace::new(dir.path()).unwrap(),
                 PermissionProfile::FullAccess,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             CancellationToken::new(),
         )
         .await
@@ -254,7 +255,7 @@ async fn w2_failed_patch_has_no_confirmed_diff_and_leaves_files_unchanged() {
     std::fs::write(dir.path().join("file.txt"), "actual\n").unwrap();
     let output = ApplyPatchTool.execute(
         serde_json::json!({"patch": "*** Begin Patch\n*** Update File: file.txt\n@@\n-invented\n+claimed\n*** End Patch"}),
-        ToolContext::new(Workspace::new(dir.path()).unwrap(), PermissionProfile::FullAccess),
+        ToolContext::new(Workspace::new(dir.path()).unwrap(), PermissionProfile::FullAccess).trust_all_definitions_for_tests(),
         CancellationToken::new(),
     ).await.unwrap();
     assert!(output.is_error);
@@ -307,7 +308,8 @@ async fn w2_large_confirmed_edit_is_not_silently_removed_by_a_diff_budget() {
             ToolContext::new(
                 Workspace::new(dir.path()).unwrap(),
                 PermissionProfile::FullAccess,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             CancellationToken::new(),
         )
         .await

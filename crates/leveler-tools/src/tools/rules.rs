@@ -22,6 +22,7 @@ use leveler_context::{
     READ_PROJECT_RULES_TOOL, RuleReadErrorKind, RuleSourceRead, load_rules, read_rule_source,
     read_rule_source_with, split_rule_sections,
 };
+
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -36,6 +37,34 @@ struct ReadRulesInput {
     /// `architecture-gates`. Omit to list the sections of `source`.
     #[serde(default)]
     section: Option<String>,
+}
+
+fn append_untrusted(listing: &mut String, untrusted: &[leveler_definition_trust::TrustAuditEntry]) {
+    if untrusted.is_empty() {
+        return;
+    }
+    listing.push_str(
+        "
+Sources present but not trusted (their text is not loaded):
+",
+    );
+    for entry in untrusted {
+        let approved = entry
+            .approved_digest
+            .as_deref()
+            .map(|digest| {
+                format!(
+                    ", approved sha256:{}",
+                    &digest[7..].chars().take(12).collect::<String>()
+                )
+            })
+            .unwrap_or_default();
+        listing.push_str(&format!(
+            "  {}: {}{approved}. The user can approve it with `leveler trust`.
+",
+            entry.display, entry.state
+        ));
+    }
 }
 
 pub struct ReadProjectRulesTool;
@@ -76,7 +105,12 @@ impl Tool for ReadProjectRulesTool {
         let input: ReadRulesInput = super::parse_input(self.name(), input)?;
         let workspace = context.execution_workspace()?;
         let root: &Path = workspace.root();
-        let rules = load_rules(root);
+        // The same frozen snapshot the turn's prompt gate read. The tool is an
+        // optional lens, never a way around admission: an unapproved
+        // definition's text is not returned here even if the model asks for it
+        // by name.
+        let trust = context.execution.definition_trust.as_ref();
+        let rules = load_rules(root, trust);
 
         let Some(source) = input.source.as_deref() else {
             if input.section.is_some() {
@@ -85,14 +119,15 @@ impl Tool for ReadProjectRulesTool {
                 ));
             }
             if rules.documents.is_empty() {
-                if rules.errors.is_empty() {
+                if rules.errors.is_empty() && rules.untrusted.is_empty() {
                     return Ok(ToolOutput::ok("No project rules are configured."));
                 }
-                // Existing-but-unreadable is not "none configured": saying so
-                // would turn a host failure into a false claim about the
-                // project.
+                // Existing-but-unreadable or unapproved is not "none
+                // configured": saying so would turn a host decision into a
+                // false claim about the project.
                 let mut listing = String::from(
-                    "No project rules could be read. The following sources exist but failed:\n",
+                    "No project rules are in this turn's trusted set. The following sources \
+                     exist but were not admitted:\n",
                 );
                 for error in &rules.errors {
                     listing.push_str(&format!(
@@ -102,6 +137,7 @@ impl Tool for ReadProjectRulesTool {
                         error.detail
                     ));
                 }
+                append_untrusted(&mut listing, &rules.untrusted);
                 return Ok(ToolOutput::error(listing));
             }
             let mut listing = String::from("Project rules available:\n");
@@ -125,6 +161,7 @@ impl Tool for ReadProjectRulesTool {
                     ));
                 }
             }
+            append_untrusted(&mut listing, &rules.untrusted);
             return Ok(ToolOutput::ok(listing));
         };
 
@@ -143,7 +180,7 @@ impl Tool for ReadProjectRulesTool {
                 // workspace capability, so the containment check and the bytes
                 // describe the same opened object.
                 if workspace.reads_confined() {
-                    read_rule_source_with(root, source, &|path| {
+                    read_rule_source_with(root, source, trust, &|path| {
                         workspace
                             .open_confined(path)
                             .map(|file| {
@@ -159,7 +196,7 @@ impl Tool for ReadProjectRulesTool {
                             })
                     })
                 } else {
-                    read_rule_source(root, source)
+                    read_rule_source(root, source, trust)
                 }
             }) {
             Ok(RuleSourceRead::Loaded(instruction)) => instruction,
@@ -173,6 +210,13 @@ impl Tool for ReadProjectRulesTool {
                     "`{source}` does not exist. Rule documents are `AGENTS.md` in any directory, \
                      `.leveler/instructions.md` and `.leveler/rules/*.md`; call with no arguments \
                      to list the root ones."
+                )));
+            }
+            Ok(RuleSourceRead::Untrusted { audit }) => {
+                return Ok(ToolOutput::error(format!(
+                    "`{source}` is not trusted in this project ({}), so its text is not \
+                     available here. The user can review and approve it with `leveler trust`.",
+                    audit.state
                 )));
             }
             Err(error) if error.kind == RuleReadErrorKind::NotARuleDocument => {
@@ -223,7 +267,8 @@ mod tests {
             .tempdir()
             .unwrap();
         let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
-        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
         (dir, ctx)
     }
 
@@ -331,7 +376,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!section.is_error);
-        let loaded = leveler_context::scoped_rule_sources(dir.path(), &["src/lib.rs".to_string()]);
+        let loaded = leveler_context::scoped_rule_sources(
+            dir.path(),
+            &["src/lib.rs".to_string()],
+            &leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests(),
+        );
         assert_eq!(loaded.documents.len(), 1);
         assert!(
             section.content.contains(loaded.documents[0].content.trim()),
@@ -366,5 +415,52 @@ mod tests {
             named.content
         );
         assert!(named.content.contains("invalid_utf8"), "{}", named.content);
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unapproved_rule_is_not_returned_by_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Evil\nEVIL_TOOL_MARKER\n").unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx.execution.definition_trust =
+            std::sync::Arc::new(leveler_definition_trust::DefinitionTrustView::deny_all());
+
+        let listing = ReadProjectRulesTool
+            .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(listing.is_error, "{}", listing.content);
+        assert!(
+            listing.content.contains("not trusted"),
+            "{}",
+            listing.content
+        );
+        assert!(
+            !listing.content.contains("EVIL_TOOL_MARKER"),
+            "{}",
+            listing.content
+        );
+
+        let direct = ReadProjectRulesTool
+            .execute(
+                serde_json::json!({"source": "AGENTS.md"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(direct.is_error, "{}", direct.content);
+        assert!(direct.content.contains("not trusted"), "{}", direct.content);
+        assert!(
+            !direct.content.contains("EVIL_TOOL_MARKER"),
+            "{}",
+            direct.content
+        );
     }
 }

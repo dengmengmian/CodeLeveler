@@ -75,6 +75,11 @@ impl Tool for ReadSymbolTool {
             let mut body = String::new();
             for m in located.definitions.iter().take(3) {
                 {
+                    if context.security_control_read_denied(&m.path).is_some()
+                        || context.skill_content_read_denied(&m.path).is_some()
+                    {
+                        continue;
+                    }
                     let text = read_source(
                         &workspace,
                         std::path::Path::new(&m.path),
@@ -99,6 +104,12 @@ impl Tool for ReadSymbolTool {
         // Fallback: find a defining file by scan, then extract the block there.
         let files = source_files(root.clone(), cancellation.clone()).await?;
         for rel in files {
+            if context
+                .skill_content_read_denied(&root.join(&rel).to_string_lossy())
+                .is_some()
+            {
+                continue;
+            }
             let text = read_source(&workspace, &root.join(&rel), &cancellation, None).await?;
             if !leveler_context::defines(&text, &input.symbol) {
                 continue;

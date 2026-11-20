@@ -9,6 +9,7 @@ repository.workspace = true
 description = "CodeLeveler interactive terminal UI (Ratatui/Crossterm): AppState, reducer, composer, screens."
 
 [dependencies]
+leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-client-protocol = { workspace = true }
@@ -38,9 +39,10 @@ base64 = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+leveler-tools = { workspace = true, features = ["test-support"] }
+leveler-definition-trust = { workspace = true, features = ["test-support"] }
 async-trait = { workspace = true }
 libc = { workspace = true }
 leveler-client-protocol = { workspace = true, features = ["testing"] }
-leveler-tools = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }

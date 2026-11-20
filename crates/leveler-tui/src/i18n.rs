@@ -3636,7 +3636,7 @@ static ZH: UiText = UiText {
     diff_unavailable: "无可用 diff",
     tools_footer_hint_full: "Tab 过滤 · ↑↓ 选择 · PgUp/PgDn 滚动 · Esc 返回",
     tools_footer_hint_compact: "Tab 过滤 · ↑↓ 选择 · Esc 返回",
-    untrusted_config_title: "已忽略仓库内配置（未信任）",
+    untrusted_config_title: "已忽略仓库内配置或定义（未信任）",
     untrusted_config_hint: "核对内容后运行 leveler trust",
     untrusted_config_chip: "⚠ 仓库配置未信任",
     review: ReviewText {
@@ -5334,7 +5334,7 @@ static EN: UiText = UiText {
     diff_unavailable: "no diff available",
     tools_footer_hint_full: "Tab filter · ↑↓ select · PgUp/PgDn scroll · Esc back",
     tools_footer_hint_compact: "Tab filter · ↑↓ select · Esc back",
-    untrusted_config_title: "Ignored in-repo config (untrusted)",
+    untrusted_config_title: "Ignored in-repo config or definitions (untrusted)",
     untrusted_config_hint: "Review it, then run leveler trust",
     untrusted_config_chip: "⚠ repo config untrusted",
     review: ReviewText {

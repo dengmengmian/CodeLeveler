@@ -131,6 +131,7 @@ impl Harness {
             PermissionProfile::Assisted,
             self.environment.clone(),
         )
+        .trust_all_definitions_for_tests()
         .with_session_scope(session)
         .with_read_only(read_only);
         Executor::new(

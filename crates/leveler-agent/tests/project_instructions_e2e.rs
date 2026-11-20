@@ -116,7 +116,8 @@ fn executor(
     Executor::new(
         Arc::new(registry(server, protocol)),
         Arc::new(leveler_tools::default_registry()),
-        leveler_tools::ToolContext::new(Workspace::new(root).unwrap(), mode),
+        leveler_tools::ToolContext::new(Workspace::new(root).unwrap(), mode)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         8,
     )
@@ -611,6 +612,54 @@ async fn resume_rebuilds_rules_and_does_not_promote_legacy_system_text() {
         "no system position may carry the legacy row"
     );
     assert_only_system_carries(&bodies[0], &rule);
+}
+
+#[tokio::test]
+async fn resume_does_not_admit_an_unapproved_rule() {
+    let dir = workspace("openai-resume-untrusted");
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# Rule
+UNAPPROVED_RESUME_RULE
+",
+    );
+    let server = MockServer::start_one(openai_text("done")).await;
+    let mut context = leveler_tools::ToolContext::new(
+        Workspace::new(dir.path()).unwrap(),
+        PermissionProfile::Assisted,
+    );
+    context.execution.definition_trust =
+        Arc::new(leveler_definition_trust::DefinitionTrustView::deny_all());
+    let executor = Executor::new(
+        Arc::new(registry(&server, ProtocolKind::OpenAiChat)),
+        Arc::new(leveler_tools::default_registry()),
+        context,
+        ModelRef::new("mock", "m"),
+        8,
+    )
+    .with_delegation(false);
+    let prior = vec![
+        Message::text(Role::System, "STALE_LEGACY_SYSTEM_TEXT"),
+        Message::text(Role::User, "continue the task"),
+    ];
+    executor
+        .resume(prior, &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .expect("the resumed turn completes");
+
+    let bodies = bodies(&server).await;
+    let system = openai_system(&bodies[0]);
+    assert!(
+        !system.contains("UNAPPROVED_RESUME_RULE"),
+        "a resumed turn must not admit an unapproved rule: {system}"
+    );
+    assert!(
+        system.contains("NOT trusted"),
+        "the model is told the rule was refused: {system}"
+    );
+    assert!(!system.contains("STALE_LEGACY_SYSTEM_TEXT"));
+    assert_only_system_carries(&bodies[0], "NOT trusted");
 }
 
 #[tokio::test]

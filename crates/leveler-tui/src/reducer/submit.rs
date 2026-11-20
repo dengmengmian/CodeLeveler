@@ -1816,7 +1816,10 @@ pub(super) fn refresh_skill_catalog(state: &mut AppState) {
 fn skills_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let registry = match skill_root(state) {
         Some(root) => leveler_skills::describe(&root),
-        None => leveler_skills::SkillRegistry::load(&leveler_skills::SkillRoots::empty()),
+        None => leveler_skills::SkillRegistry::load(
+            &leveler_skills::SkillRoots::empty(),
+            &leveler_definition_trust::DefinitionTrustView::deny_all(),
+        ),
     };
     let name = command.strip_prefix("skills").unwrap_or(command).trim();
     let t = state.t();

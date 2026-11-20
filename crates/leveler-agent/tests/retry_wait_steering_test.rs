@@ -151,7 +151,8 @@ async fn a_steer_during_retry_backoff_is_delivered_to_the_next_round() {
     let dir = std::env::temp_dir().join(format!("leveler-retry-steer-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("note.txt"), "hello").unwrap();
-    let ctx = ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::FullAccess);
+    let ctx = ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
     let runtime = Arc::new(FlakyThenScripted {
@@ -237,7 +238,8 @@ async fn a_retry_after_tool_execution_does_not_repeat_the_side_effect() {
     let dir =
         std::env::temp_dir().join(format!("leveler-retry-side-effect-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let ctx = ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::FullAccess);
+    let ctx = ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
     let runtime = Arc::new(FlakyThenScripted {

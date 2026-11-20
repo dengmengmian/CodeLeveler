@@ -121,6 +121,112 @@ pub fn restore_integrity_label(path: &Path, previous: &IntegrityLabel) -> io::Re
     }
 }
 
+/// Create (when missing) and validate an owner-only state directory.
+///
+/// This is the Windows counterpart of the Unix `0700` directory check the
+/// persistent Execution Host performs: the directory must be owned by the
+/// current user, carry no reparse point, and its DACL may grant access only to
+/// that user, SYSTEM and the Administrators group. A missing directory is
+/// created with exactly that DACL (inheritance protected); an existing
+/// directory that does not already satisfy it is refused rather than silently
+/// rewritten.
+pub fn secure_private_state_dir(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::secure_private_state_dir(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(unsupported())
+    }
+}
+
+/// Validate one regular file inside a private state directory.
+///
+/// The file must not be a reparse point, must be owned by the current user and
+/// must carry the owner-only DACL the state directory establishes.
+pub fn verify_private_state_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::verify_private_state_file(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(unsupported())
+    }
+}
+
+/// Read a process's creation time as its stable start token.
+///
+/// `ERROR_INVALID_PARAMETER` means no process with that id exists;
+/// `ERROR_ACCESS_DENIED` means existence could not be established for this
+/// token. Callers must distinguish those two answers from "the process is
+/// gone" — only the first is proof of absence.
+pub fn process_creation_time(pid: u32) -> io::Result<u64> {
+    #[cfg(windows)]
+    {
+        windows::process_creation_time(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        Err(unsupported())
+    }
+}
+
+/// Whether `pid` names a live (not terminated) process.
+///
+/// A terminated process object may remain queryable while a handle keeps it
+/// alive; looking at the exit code is what separates "running" from "exited,
+/// not yet reaped". `Err` is not evidence either way unless its code is
+/// [`ERROR_INVALID_PARAMETER_CODE`].
+pub fn process_is_running(pid: u32) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        windows::process_is_running(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        Err(unsupported())
+    }
+}
+
+/// The raw `ERROR_INVALID_PARAMETER` code [`process_creation_time`] reports
+/// for a pid that names no process.
+pub const ERROR_INVALID_PARAMETER_CODE: i32 = 87;
+
+/// The raw `ERROR_ACCESS_DENIED` code a process probe reports when the token
+/// may not query that process.
+pub const ERROR_ACCESS_DENIED_CODE: i32 = 5;
+
+/// A kill-on-close Job Object binding the current process and every
+/// descendant. Held by a persistent owner for its whole life; when the owner
+/// dies — gracefully or abruptly — the kernel closes the last handle and
+/// terminates the whole tree. A supervisor that must not leave children
+/// behind refuses to start when this cannot be established.
+#[cfg(windows)]
+pub use windows::ProcessTreeJob;
+
+/// An open handle that denies delete sharing on one filesystem object.
+///
+/// Mandatory Integrity Control does not govern deletion (NTFS checks the
+/// parent directory's label), so a Low child in a Low workspace can delete a
+/// Medium-labelled file. This fence closes that: while the trusted runtime
+/// holds the handle, any open requesting DELETE — the first step of delete,
+/// rename and replace — fails with a sharing violation. Reads and writes stay
+/// possible, so the integrity label remains the content boundary.
+#[cfg(windows)]
+pub use windows::PathGuard;
+
+/// Open a delete-sharing fence on `path`.
+#[cfg(windows)]
+pub fn guard_path(path: &Path) -> io::Result<PathGuard> {
+    windows::guard_path(path)
+}
+
 /// Where `cmd.exe`'s own parsing takes over.
 ///
 /// `cmd /C <tail>` hands everything after the switch to cmd, which parses it
@@ -219,6 +325,104 @@ pub fn file_identity_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_state_directory_is_created_owner_only_and_validates() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state").join("execution-host");
+        secure_private_state_dir(&state).expect("fresh state dir");
+        assert!(state.is_dir());
+        let ready = state.join("ready.json");
+        std::fs::write(&ready, b"{}").unwrap();
+        verify_private_state_file(&ready).expect("ready file inherits the private DACL");
+        // Re-validating an existing private directory is idempotent.
+        secure_private_state_dir(&state).expect("existing state dir");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_state_directory_that_grants_everyone_access_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("broad");
+        std::fs::create_dir_all(&state).unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&state)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls must succeed");
+        let error = secure_private_state_dir(&state).expect_err("broad DACL must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_where_the_state_directory_should_be_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J must succeed");
+        let error = secure_private_state_dir(&link).expect_err("junction must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_reattached_reparse_point_ready_file_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        secure_private_state_dir(&state).unwrap();
+        let target = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = state.join("ready.json");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J must succeed");
+        let error = verify_private_state_file(&link).expect_err("reparse point must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_creation_time_identifies_a_live_process_and_refuses_a_dead_pid() {
+        let mine = process_creation_time(std::process::id()).expect("own process");
+        assert!(mine > 0);
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        // Give the kernel a moment to release the id; absence is reported as
+        // ERROR_INVALID_PARAMETER, never as a generic failure.
+        let mut last = None;
+        for _ in 0..50 {
+            match process_creation_time(pid) {
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER_CODE) => {
+                    return;
+                }
+                other => {
+                    last = other.ok();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        // A recycled id would be a different process; the only acceptable
+        // alternative to ERROR_INVALID_PARAMETER is a different creation time.
+        assert_ne!(last, Some(mine), "a dead pid must not keep its identity");
+    }
 
     #[test]
     fn a_low_label_is_recognised_by_its_sid() {

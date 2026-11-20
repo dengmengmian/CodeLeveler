@@ -13,6 +13,7 @@ default = []
 test-crash-barrier = ["leveler-agent/test-crash-barrier"]
 
 [dependencies]
+leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }
 leveler-provider = { workspace = true }
@@ -53,6 +54,8 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+leveler-tools = { workspace = true, features = ["test-support"] }
+leveler-definition-trust = { workspace = true, features = ["test-support"] }
 leveler-test-support = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

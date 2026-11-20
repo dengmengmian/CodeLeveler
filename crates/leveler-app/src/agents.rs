@@ -64,8 +64,27 @@ impl Application {
             .unwrap_or_default()
     }
 
+    /// The runtime's own environment snapshot. Reads of the home or of a
+    /// project definition must use this, never the confined child's env.
+    pub fn environment_snapshot(&self) -> &leveler_core::EnvSnapshot {
+        &self.environment
+    }
+
+    /// The definition trust snapshot for this application's project. One store
+    /// read; callers that need a frozen decision keep the returned view.
+    pub fn definition_trust_for(
+        &self,
+        root: Option<&std::path::Path>,
+    ) -> leveler_definition_trust::DefinitionTrustView {
+        let home = leveler_core::LevelerHome::resolve(&self.environment);
+        leveler_definition_trust::DefinitionTrustView::load(home.root(), root)
+    }
+
     pub fn agent_registry(&self) -> AgentRegistry {
-        AgentRegistry::load(&self.agent_roots())
+        AgentRegistry::load(
+            &self.agent_roots(),
+            &self.definition_trust_for(self.layout.primary_workspace()),
+        )
     }
 
     async fn agent_environment(
@@ -159,18 +178,49 @@ impl Application {
         } else {
             store.update(scope, &manifest, &draft.instructions)
         };
-        saved.map_err(|e| e.to_string())?;
+        let saved = saved.map_err(|e| e.to_string())?;
+        // Return the definition the store just validated. The registry may
+        // refuse to admit it until a human approves its exact bytes; that is a
+        // trust state, not a failed write. Report it as unavailable with the
+        // reason instead of claiming it is ready to run.
         let registry = self.agent_registry();
         let env = self.agent_environment(&registry, session_model).await;
-        registry
-            .get(&manifest.name)
-            .map(|entry| ui_entry(entry, &env))
-            .ok_or_else(|| {
-                format!(
-                    "agent \"{}\" was written but does not resolve",
-                    manifest.name
-                )
-            })
+        let entry = AgentEntry {
+            name: saved.name.clone(),
+            source: saved.source,
+            location: saved.location.clone(),
+            state: AgentState::Valid(Box::new(saved)),
+            shadowed: Vec::new(),
+        };
+        let mut ui = ui_entry(&entry, &env);
+        if let Some(location) = &entry.location {
+            let identity = match scope {
+                AgentScope::Project => leveler_definition_trust::DefinitionIdentity::project(
+                    leveler_definition_trust::DefinitionKind::Agent,
+                    &format!(".leveler/agents/{}", entry.name),
+                ),
+                AgentScope::User => {
+                    leveler_definition_trust::DefinitionIdentity::user_agent(&entry.name)
+                }
+            };
+            if let Some(identity) = identity {
+                let manifest = std::fs::read(location.join("agent.yaml")).unwrap_or_default();
+                let instructions =
+                    std::fs::read(location.join("instructions.md")).unwrap_or_default();
+                let digest = leveler_definition_trust::DefinitionIdentity::agent_digest(
+                    &manifest,
+                    &instructions,
+                );
+                let trust = self.definition_trust_for(self.layout.primary_workspace());
+                if !trust.check(&identity, &digest).admits() {
+                    ui.status = UiAgentStatus::Unavailable;
+                    ui.reason = Some(
+                        "written, but not trusted yet; approve it with `leveler trust`".into(),
+                    );
+                }
+            }
+        }
+        Ok(ui)
     }
 
     pub fn delete_agent(&self, scope: UiAgentScope, name: &str) -> Result<(), String> {

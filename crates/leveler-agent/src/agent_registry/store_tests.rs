@@ -33,7 +33,10 @@ impl Fx {
     }
 
     fn registry(&self) -> AgentRegistry {
-        AgentRegistry::load(&self.roots())
+        AgentRegistry::load(
+            &self.roots(),
+            &leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests(),
+        )
     }
 
     fn agents_dir(&self) -> PathBuf {

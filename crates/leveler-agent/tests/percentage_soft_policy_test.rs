@@ -204,7 +204,8 @@ async fn run_case(window: u32, reliable: u32, output: u32, percent: u8, rounds: 
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )

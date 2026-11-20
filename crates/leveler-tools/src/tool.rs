@@ -87,6 +87,11 @@ pub struct ExecutionResources {
     /// result looks authoritative while being meaningless. `ToolContext` is
     /// cloned into every child, so the `Arc` makes one gate for the whole run.
     pub command_gate: Arc<tokio::sync::Mutex<()>>,
+    /// This execution's frozen view of the definition trust store. The host
+    /// builds it from its own environment; every rule read, agent registry,
+    /// skill registry and tool in this execution reads the same snapshot. A
+    /// mid-turn file creation or edit cannot enter it.
+    pub definition_trust: Arc<leveler_definition_trust::DefinitionTrustView>,
     /// Host-owned memory access policy, when the user enabled the memory
     /// pipeline. Ordinary file tools route paths inside the configured memory
     /// roots through this policy so memory files keep their own containment,
@@ -98,6 +103,37 @@ pub struct ExecutionResources {
     /// model round of one turn sends the same bytes and the provider's prefix
     /// cache stays valid across rounds.
     pub memory_index: Option<Arc<str>>,
+}
+
+/// Compare two filesystem names after resolving an existing file or its
+/// parent. The trust-store check must not be defeated by a junction alias.
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    fn resolve(path: &std::path::Path) -> std::path::PathBuf {
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(canonical_parent) = parent.canonicalize()
+        {
+            return canonical_parent.join(name);
+        }
+        path.to_path_buf()
+    }
+    let left = resolve(left);
+    let right = resolve(right);
+    if cfg!(windows) {
+        fn simplify(path: std::path::PathBuf) -> String {
+            let text = path.to_string_lossy().into_owned();
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{rest}")
+            } else {
+                text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+            }
+        }
+        simplify(left).eq_ignore_ascii_case(&simplify(right))
+    } else {
+        left == right
+    }
 }
 
 /// Gates and budgets — the scope-varying part of the context. Per-engine
@@ -425,9 +461,14 @@ impl ToolContext {
         mode: PermissionProfile,
         environment: Arc<leveler_core::EnvSnapshot>,
     ) -> Self {
+        let definition_trust = Arc::new(leveler_definition_trust::DefinitionTrustView::load(
+            leveler_core::LevelerHome::resolve(&environment).root(),
+            workspace.as_ref().map(Workspace::root),
+        ));
         Self {
             execution: ExecutionResources {
                 workspace: workspace.map(Arc::new),
+                definition_trust,
                 runner: Arc::new(CommandRunner::with_environment(environment.clone())),
                 environment,
                 checkpoint: Arc::new(Checkpoint::new()),
@@ -466,6 +507,16 @@ impl ToolContext {
     }
 
     /// A structural execution prerequisite, independent of mutable grants.
+    /// Admit every definition for a test context. Compiled only for test
+    /// builds; production constructs the view from the real store and never
+    /// calls this.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trust_all_definitions_for_tests(mut self) -> Self {
+        self.execution.definition_trust =
+            Arc::new(leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests());
+        self
+    }
+
     pub fn require_workspace(&self) -> Result<&Workspace, ToolError> {
         self.execution
             .workspace
@@ -500,12 +551,173 @@ impl ToolContext {
         path: &str,
         capability: leveler_core::Capability,
     ) -> Option<String> {
+        // The trust stores are not ordinary external files. An exact-call
+        // resource grant may admit an external path, but it must never let a
+        // tool author a fake approval record or snapshot. The human approval
+        // surface is `leveler trust`; a file write is not that decision.
+        if let Some(denied) = self.security_control_write_denied(path) {
+            return Some(denied);
+        }
         if self.execution_workspace().is_ok_and(|workspace| {
             workspace.allows_resource_path(capability, std::path::Path::new(path))
         }) {
             return None;
         }
         self.policy.write_path_denied(path)
+    }
+
+    /// Whether `path` names one of the trust controls themselves. Reads stay
+    /// allowed; admission depends on the bytes, not on who may read them.
+    pub(crate) fn security_control_write_denied(&self, path: &str) -> Option<String> {
+        if self.policy.unrestricted_execution() {
+            return None;
+        }
+        let home = leveler_core::LevelerHome::resolve(&self.execution.environment)
+            .root()
+            .to_path_buf();
+        let workspace = self.execution_workspace().ok()?;
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.root().join(raw)
+        };
+        if leveler_definition_trust::is_trust_store_path(&home, &absolute) {
+            return Some(format!(
+                "`{path}` is the definition trust store, a security control. Approve \
+                 definitions with `leveler trust`; file tools cannot write this path."
+            ));
+        }
+        if leveler_definition_trust::is_runtime_control_path(&home, &absolute) {
+            return Some(format!(
+                "`{path}` is the runtime control namespace, a security control. File \
+                 tools cannot write or replace its socket, lock or credential."
+            ));
+        }
+        if same_path(&absolute, &leveler_execution::trust_store_path(&home)) {
+            return Some(format!(
+                "`{path}` is the in-repo configuration trust store, a security control. \
+                 Use `leveler trust`; file tools cannot write this path."
+            ));
+        }
+        None
+    }
+
+    /// Whether `path` names a runtime control a sandboxed agent must not read.
+    ///
+    /// The daemon's access token lives beside its Unix socket. A tool that read
+    /// it would let the model authenticate to the trusted-local runtime as the
+    /// user, so this refusal is independent of any filesystem resource grant.
+    /// FullAccess keeps its documented authority: that mode is the user opting
+    /// out of the restricted-execution threat model.
+    pub(crate) fn security_control_read_denied(&self, path: &str) -> Option<String> {
+        if self.policy.unrestricted_execution() {
+            return None;
+        }
+        let home = leveler_core::LevelerHome::resolve(&self.execution.environment)
+            .root()
+            .to_path_buf();
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            let Ok(workspace) = self.execution_workspace() else {
+                return None;
+            };
+            workspace.root().join(raw)
+        };
+        if leveler_definition_trust::is_runtime_control_path(&home, &absolute) {
+            return Some(format!(
+                "`{path}` is the runtime control namespace. Reading it would expose the \
+                 trusted-local daemon credential; file tools cannot read this path."
+            ));
+        }
+        None
+    }
+
+    /// Whether `path` is skill instruction content that may only be admitted
+    /// through the approval-bound package loader.
+    ///
+    /// `SKILL.md` and everything under a skill's `references/` tree are what the
+    /// trust approval binds. Reading them by path would hand the model bytes
+    /// that were not re-checked against the package digest, and would turn an
+    /// approved procedure into an unverified second-level read. `load_skill`
+    /// returns the verified text instead. Scripts and assets stay ordinary tool
+    /// resources; they are not instruction content.
+    pub(crate) fn skill_content_read_denied(&self, path: &str) -> Option<String> {
+        if self.policy.unrestricted_execution() {
+            return None;
+        }
+        let workspace = self.execution_workspace().ok();
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.as_ref()?.root().join(raw)
+        };
+        let canonical = absolute.canonicalize().unwrap_or(absolute);
+        let environment = &self.execution.environment;
+        let project_root = workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+            .unwrap_or_default();
+        let roots = leveler_skills::SkillRoots::for_project_in(&project_root, &|key| {
+            environment.var_os(key)
+        });
+        // Windows path identity is case-insensitive. Fold both sides for the
+        // containment test so a differently-cased spelling cannot slip past
+        // the reference guard.
+        let fold = |path: &std::path::Path| {
+            // Windows and the default macOS filesystems are case-insensitive.
+            // Fold for containment so a different casing cannot name the same
+            // skill file while slipping past the guard.
+            if cfg!(any(windows, target_os = "macos")) {
+                std::path::PathBuf::from(path.to_string_lossy().to_lowercase())
+            } else {
+                path.to_path_buf()
+            }
+        };
+        let canonical = fold(&canonical);
+        for root in roots.roots() {
+            let Ok(base) = root.dir.canonicalize() else {
+                continue;
+            };
+            let base = fold(&base);
+            let Ok(relative) = canonical.strip_prefix(&base) else {
+                continue;
+            };
+            let mut components = relative.components();
+            let Some(skill) = components.next() else {
+                continue;
+            };
+            let Some(skill) = skill.as_os_str().to_str() else {
+                continue;
+            };
+            if skill.is_empty() {
+                continue;
+            }
+            let file = components
+                .next()
+                .and_then(|part| part.as_os_str().to_str())
+                .map(|name| {
+                    if cfg!(any(windows, target_os = "macos")) {
+                        name.to_lowercase()
+                    } else {
+                        name.to_string()
+                    }
+                });
+            if file.as_deref() == Some("references")
+                || file.as_deref() == Some("SKILL.md")
+                || (cfg!(any(windows, target_os = "macos")) && file.as_deref() == Some("skill.md"))
+            {
+                return Some(format!(
+                    "`{path}` is approval-bound skill instruction content. Read the skill by \
+                     name with `load_skill` so the package digest is verified; file tools cannot \
+                     serve an unverified second-level reference."
+                ));
+            }
+        }
+        None
     }
 
     /// Point this context at a permission profile the SESSION owns, instead

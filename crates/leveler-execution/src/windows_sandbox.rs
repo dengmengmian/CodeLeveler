@@ -18,6 +18,9 @@
 //! - Medium labels on existing protected policy paths inside a Low root
 //!   (`.git`, agent/skill definitions, `AGENTS.md`), so the child cannot write
 //!   authority it was not admitted to
+//! - delete-sharing fences on those existing protected files, because
+//!   Mandatory Integrity Control does not govern deletion: delete, rename and
+//!   replace fail while the trusted runtime holds the fence
 //!
 //! Windows has no CodeLeveler backend for per-command network denial. The
 //! platform has the machinery — the Windows Filtering Platform filters at the

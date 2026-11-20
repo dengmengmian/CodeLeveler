@@ -452,7 +452,8 @@ fn coding_runtime(
             tool_context: ToolContext::new(
                 Workspace::new(root).unwrap(),
                 PermissionProfile::Assisted,
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,

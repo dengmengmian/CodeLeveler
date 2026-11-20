@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Repository context, project rules, and compaction."
 
 [dependencies]
+leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 leveler-model = { workspace = true }
 cap-std = { workspace = true }
@@ -16,5 +17,6 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+leveler-definition-trust = { workspace = true, features = ["test-support"] }
 leveler-project = { workspace = true }
 serde_json = { workspace = true }

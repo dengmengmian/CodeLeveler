@@ -21,8 +21,18 @@ pub(crate) fn cmd_doctor(layout: Layout, json: bool) -> anyhow::Result<std::proc
 
     let mut findings = leveler_app::doctor::run(&config);
     if let Some(root) = layout.primary_workspace() {
+        let home = leveler_core::LevelerHome::resolve(leveler_core::environment());
+        let trust = leveler_definition_trust::DefinitionTrustView::load(home.root(), Some(root));
         findings.push(leveler_app::doctor::agents_check(
             &leveler_agent::agent_registry::AgentRoots::for_project(root),
+            &trust,
+        ));
+        findings.push(leveler_app::doctor::definitions_check(
+            &leveler_definition_trust::DiscoveryRoots::resolve(
+                leveler_core::environment(),
+                Some(root.to_path_buf()),
+            ),
+            &trust,
         ));
     }
     // Terminal observations are real local facts; the CLI can collect them

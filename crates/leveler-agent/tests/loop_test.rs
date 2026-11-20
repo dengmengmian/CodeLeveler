@@ -263,7 +263,8 @@ async fn scoped_agents_rules_are_injected_after_reading_matching_path() {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
@@ -362,7 +363,8 @@ async fn scoped_rules_are_injected_at_most_once() {
     std::fs::write(dir.join("src/b.rs"), "pub fn b() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/a.rs"})),
         assistant_tool_call("c2", "read_file", serde_json::json!({"path": "src/b.rs"})),
@@ -464,7 +466,8 @@ async fn update_plan_tool_call_emits_a_plan_updated_event() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
@@ -533,7 +536,8 @@ async fn consecutive_plan_declarations_advance_the_authoritative_state() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "c1",
@@ -691,7 +695,8 @@ async fn renamed_plan_steps_replace_the_declared_list_before_blocked_closeout() 
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     )
@@ -756,7 +761,8 @@ async fn a_later_step_may_be_completed_while_an_earlier_one_is_still_open() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
@@ -894,7 +900,8 @@ async fn executor_forwards_reasoning_delta() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![assistant_reasoning_then_text(
         "thinking", "done",
@@ -936,7 +943,8 @@ async fn auto_reviewer_can_deny_before_user_approval() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -994,7 +1002,8 @@ async fn executor_reads_patches_and_finishes() {
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Script: read the file, apply a patch adding a function, then finish.
@@ -1062,7 +1071,8 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Round 1: the model goes quiet (no tool call) — must NOT finish in goal mode.
@@ -1129,7 +1139,8 @@ async fn goal_mode_read_only_first_round_is_not_followed_by_a_harness_edit_deman
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Round 1 reads a file and nothing else; round 2 resolves the goal. Nothing
@@ -1228,7 +1239,8 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -1342,7 +1354,8 @@ async fn goal_mode_update_goal_emits_completed_tool_event() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
@@ -1405,7 +1418,8 @@ async fn goal_mode_blocked_reports_blocked() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
@@ -1468,7 +1482,8 @@ async fn invalid_tool_call_json_is_fed_back_and_retried() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Round 1: the model "emits" a run_command whose JSON args fail to decode.
@@ -1557,7 +1572,8 @@ async fn project_agents_md_is_injected_before_the_first_user_message() {
     .unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1663,7 +1679,8 @@ async fn unreadable_rules_are_diagnosed_and_never_laundered_into_the_prompt() {
     std::fs::write(dir.join(".leveler/config.yaml"), "rules: [unclosed\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1739,6 +1756,76 @@ async fn unreadable_rules_are_diagnosed_and_never_laundered_into_the_prompt() {
 }
 
 #[tokio::test]
+async fn an_unapproved_rule_is_diagnosed_and_never_delivered() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-rules-unapproved-{}",
+        std::process::id() as u64 * 31 + 4
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "EVIL_RULE_SENTINEL").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    tool_context.execution.definition_trust =
+        Arc::new(leveler_definition_trust::DefinitionTrustView::deny_all());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(RecordingRuntime {
+        responses: Mutex::new(VecDeque::from(vec![assistant_text("ok")])),
+        seen: seen.clone(),
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        3,
+    )
+    .run(
+        "hello",
+        &mut move |event| observed.lock().unwrap().push(event),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let requests = seen.lock().unwrap();
+    let system_text = requests[0].control_context.text();
+    assert!(
+        !system_text.contains("EVIL_RULE_SENTINEL"),
+        "an unapproved rule body must not reach the prompt: {system_text}"
+    );
+    assert!(
+        !system_text.contains("Project rules:"),
+        "an unapproved rule must not be delivered as a source: {system_text}"
+    );
+    assert!(
+        system_text.contains("NOT trusted"),
+        "the model is told why: {system_text}"
+    );
+    let events = events.lock().unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::RuleDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn emits its rule-delivery audit");
+    assert_eq!(audit.report.untrusted.len(), 1, "{audit:?}");
+    assert_eq!(audit.report.untrusted[0].state, "unapproved");
+    assert!(
+        audit
+            .sources
+            .iter()
+            .any(|source| source.status == leveler_context::RuleSourceStatus::Untrusted)
+    );
+    drop(events);
+    drop(requests);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn dangerous_command_denied_is_fed_back_not_executed() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-deny-{}",
@@ -1747,7 +1834,8 @@ async fn dangerous_command_denied_is_fed_back_not_executed() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The model tries to delete outside the workspace; after the denial it gives up.
@@ -1809,7 +1897,8 @@ async fn a_long_chain_of_distinct_searches_is_never_refused() {
     std::fs::write(dir.join("src/other.rs"), "pub fn other() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Five searches in a row, every one with different arguments.
@@ -1875,7 +1964,8 @@ async fn an_identical_repeat_is_not_refused() {
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The IDENTICAL grep, over and over, returning the identical result.
@@ -1941,7 +2031,8 @@ async fn unsupported_task_alias_tells_the_model_to_use_spawn_agent() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -1993,7 +2084,8 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("你好！")]));
@@ -2112,7 +2204,7 @@ async fn configured_token_budget_stops_before_another_model_request() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )
@@ -2183,7 +2275,7 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )
@@ -2240,7 +2332,7 @@ async fn configured_cost_budget_requires_model_pricing_before_first_request() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )
@@ -2371,7 +2463,8 @@ async fn long_run_auto_compacts_when_over_budget() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // 16 distinct read rounds (enough transcript to have a compactible middle,
@@ -2531,7 +2624,8 @@ async fn a_no_output_stream_error_is_retried_not_fatal() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Drops before producing anything: a no-output interruption, safe to retry.
@@ -2578,7 +2672,8 @@ async fn a_partial_stream_error_is_not_retried() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(FlakyStreamRuntime {
@@ -2631,7 +2726,8 @@ async fn non_retryable_model_error_is_not_retried() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     struct AuthFailRuntime;
@@ -2705,7 +2801,8 @@ async fn nested_agents_rules_are_loaded_before_the_first_scoped_edit() {
     .unwrap();
     std::fs::write(dir.join("src/lib.rs"), "old\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n-old\n+new\n*** End Patch";
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -2853,7 +2950,8 @@ fn edit_call(id: &str, file: usize) -> ModelResponse {
 
 async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> Arc<MockRuntime> {
     let workspace = Workspace::new(dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(script));
     let executor = Executor::new(
         runtime.clone(),
@@ -2939,7 +3037,8 @@ async fn the_reminder_never_changes_a_single_plan_status() {
     script.push(assistant_text("done"));
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(script));
     let executor = Executor::new(
         runtime,
@@ -2978,7 +3077,8 @@ async fn the_reminder_never_changes_a_single_plan_status() {
 async fn a_resumed_turn_reactivates_the_persisted_plan_and_invents_no_other() {
     let dir = plan_freshness_dir("resume", 2);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let seeded = leveler_agent::PlanState {
         steps: vec![
             leveler_agent::PlanStep {
@@ -3053,7 +3153,8 @@ async fn an_until_terminal_turn_is_not_cut_off_by_a_hidden_round_count() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let mut responses: Vec<_> = (0..130)
@@ -3117,7 +3218,8 @@ async fn bounded_continuation_still_stops_at_its_window() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let responses: Vec<_> = (0..20)
@@ -3173,7 +3275,8 @@ async fn a_bounded_window_above_one_hundred_rounds_is_the_hard_edge() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let responses: Vec<_> = (0..140)
@@ -3236,7 +3339,8 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Far more responses than the ceiling — the loop must stop before using them.
@@ -3366,7 +3470,8 @@ async fn parallel_safe_tools_in_one_round_run_concurrently() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(BarrierTool {
@@ -3414,7 +3519,8 @@ async fn multiple_read_tools_are_all_run_and_results_kept_in_call_order() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Three read-only tools in one round, then finish.
@@ -3481,7 +3587,8 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The model goes quiet every round and never calls update_goal. Each quiet
@@ -3561,7 +3668,8 @@ async fn goal_mode_continuation_resumes_real_work_and_still_requires_a_terminal(
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("note.txt"), "partial work\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Round 1: a phase summary and no tool call — the bad-dogfood shape.
@@ -3639,7 +3747,8 @@ async fn conversational_turn_with_inert_change_answers_on_first_quiet_round() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("README.md"), "# Notes\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let (runtime, requests) = RequestRecordingRuntime::new(vec![
@@ -3698,7 +3807,8 @@ async fn evidence_gate_does_not_nudge_inert_changes() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("README.md"), "# Notes\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let (runtime, requests) = RequestRecordingRuntime::new(vec![
@@ -3752,7 +3862,8 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Round 1: update_goal without a status — must be rejected, not treated as
@@ -3830,7 +3941,8 @@ async fn a_user_decision_block_without_asking_is_repaired_once() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -3923,7 +4035,8 @@ async fn a_repeated_user_decision_block_settles_as_an_explicit_degradation() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -4009,7 +4122,8 @@ async fn a_blocked_goal_with_open_plan_steps_is_reconciled_once() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let plan = serde_json::json!({
@@ -4165,7 +4279,8 @@ async fn work_after_the_plan_block_repair_counts_and_a_confirmed_block_settles()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -4248,7 +4363,8 @@ async fn a_blocked_goal_after_the_plan_is_rewritten_is_accepted() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -4330,7 +4446,8 @@ async fn a_plan_refresh_does_not_reset_the_block_repair_budget() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -4435,7 +4552,8 @@ async fn a_blocked_goal_without_open_plan_steps_is_accepted_without_repair() {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
         let registry = Arc::new(default_registry());
         let expected_requests = script.len();
         let runtime = Arc::new(MockRuntime::new(script));
@@ -4487,7 +4605,8 @@ async fn a_cancelled_goal_is_not_continued_by_the_plan_reconciliation() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -4567,7 +4686,8 @@ async fn a_user_steer_reaches_the_model_during_the_plan_reconciliation() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -4651,7 +4771,8 @@ async fn a_blocked_window_resumes_with_its_plan_and_can_complete() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Window 1: the model blocks while its plan still has an open step, and
@@ -4742,7 +4863,8 @@ async fn a_completion_with_an_open_plan_is_not_reconciled() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -4807,7 +4929,8 @@ async fn a_provider_error_during_the_plan_reconciliation_does_not_settle() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::with_stream_errors(
         vec![
@@ -4877,7 +5000,8 @@ async fn a_user_decision_block_after_asking_is_not_repaired() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -4951,7 +5075,8 @@ async fn a_user_decision_block_after_work_following_the_answer_is_repaired() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn unchanged() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5053,7 +5178,8 @@ async fn a_repaired_user_decision_block_gets_the_round_it_was_told_to_take() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5160,7 +5286,8 @@ async fn cargo_command_is_completion_evidence() {
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // This test covers evidence classification, not OS sandbox integration.
@@ -5218,7 +5345,8 @@ async fn command_budget_is_enforced_before_the_call() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Two command rounds against a 1-command budget: the second must be
@@ -5298,7 +5426,8 @@ async fn modified_files_budget_blocks_further_edits() {
     std::fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(dir.join("src/b.rs"), "pub fn b() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5374,7 +5503,8 @@ async fn single_patch_cannot_exceed_task_file_budget() {
     std::fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(dir.join("src/b.rs"), "pub fn b() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5445,7 +5575,8 @@ async fn duration_budget_stops_the_run_between_rounds() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5511,7 +5642,8 @@ async fn a_whole_file_write_outside_the_allowlist_is_rejected_before_running() {
     std::fs::write(dir.join("src/ok.rs"), "pub fn ok() {}\n").unwrap();
     std::fs::write(dir.join("docs/out.md"), "keep me\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5571,7 +5703,8 @@ async fn apply_patch_outside_write_allowlist_is_rejected_before_running() {
     std::fs::create_dir_all(dir.join("docs")).unwrap();
     std::fs::write(dir.join("docs/out.md"), "keep me\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -5629,7 +5762,8 @@ async fn length_finished_text_is_continued_before_the_turn_finishes() {
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     );
@@ -5672,7 +5806,8 @@ async fn length_finished_tool_call_is_never_executed() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     );
@@ -5713,7 +5848,8 @@ async fn content_filtered_text_is_not_reported_as_completed() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     );
@@ -5741,7 +5877,8 @@ async fn stream_eof_without_terminal_event_is_interrupted_not_completed() {
     let executor = Executor::new(
         Arc::new(UnterminatedRuntime),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         2,
     );
@@ -5774,7 +5911,8 @@ async fn natural_stop_is_an_answer_end_not_proof_that_the_task_completed() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         2,
     );
@@ -5809,7 +5947,8 @@ async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         4,
     );
@@ -5930,7 +6069,8 @@ async fn auto_compaction_summarizes_the_elided_middle_with_the_model() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Distinct reads so the identical-call loop guard never refuses a round.
@@ -6050,7 +6190,8 @@ async fn dollar_skill_mention_injects_full_body_into_turn() {
     )
     .unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("done")]));
     let executor = Executor::new(
         runtime.clone(),
@@ -6091,7 +6232,8 @@ async fn unknown_dollar_skill_does_not_inject_fake_body() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("ok")]));
     let executor = Executor::new(
         runtime.clone(),
@@ -6135,7 +6277,8 @@ async fn a_clarification_and_its_answer_reach_the_event_stream() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let responses = vec![
         assistant_tool_call(
@@ -6226,7 +6369,8 @@ async fn request_user_input_routes_to_clarifier_like_ask_user() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let responses = vec![
         assistant_tool_call(
@@ -6280,7 +6424,8 @@ async fn legacy_ask_user_still_routes_to_clarifier() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let responses = vec![
         assistant_tool_call("q1", "ask_user", serde_json::json!({"question": "ok?"})),
@@ -6321,7 +6466,8 @@ async fn auto_approve_grants_a_network_permission_without_asking_a_human() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let responses = vec![
         assistant_tool_call(
@@ -6374,7 +6520,8 @@ async fn answer_audit_is_off_by_default() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let _executor = Executor::new(
         Arc::new(MockRuntime::new(vec![assistant_text("hi")])),
         Arc::new(default_registry()),
@@ -6395,7 +6542,8 @@ async fn simple_goal_does_not_seed_host_implicit_plan() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
         "g1",
         "update_goal",
@@ -6449,7 +6597,8 @@ async fn a_pending_plan_step_does_not_block_completion() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
@@ -6511,7 +6660,8 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
@@ -6593,7 +6743,8 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
 async fn chat_continues_when_its_own_plan_is_still_open() {
     let dir = plan_freshness_dir("final-reconcile-chat", 41);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -6703,7 +6854,8 @@ async fn chat_continues_when_its_own_plan_is_still_open() {
 async fn chat_ends_when_the_model_adjusts_its_plan_instead_of_doing_the_step() {
     let dir = plan_freshness_dir("plan-adjusted", 42);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -6782,7 +6934,8 @@ async fn chat_ends_when_the_model_adjusts_its_plan_instead_of_doing_the_step() {
 async fn a_model_claimed_confirmation_does_not_stop_an_authorized_task() {
     let dir = plan_freshness_dir("model-claimed-pause", 48);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -6865,7 +7018,8 @@ async fn a_model_claimed_confirmation_does_not_stop_an_authorized_task() {
 async fn an_open_plan_cannot_keep_a_chat_turn_alive_forever() {
     let dir = plan_freshness_dir("plan-loop", 44);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -6939,7 +7093,8 @@ async fn an_open_plan_cannot_keep_a_chat_turn_alive_forever() {
 async fn a_completed_plan_adds_no_closeout_round() {
     let dir = plan_freshness_dir("plan-complete", 45);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call("p1", &[("implement", "completed")]),
         edit_call("e1", 0),
@@ -6976,7 +7131,8 @@ async fn a_completed_plan_adds_no_closeout_round() {
 async fn an_ordinary_chat_turn_still_ends_on_its_answer() {
     let dir = plan_freshness_dir("plan-absent", 46);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text(
         "it is a text editor",
     )]));
@@ -7008,7 +7164,8 @@ async fn an_ordinary_chat_turn_still_ends_on_its_answer() {
 async fn a_step_added_mid_turn_is_what_the_closeout_reads() {
     let dir = plan_freshness_dir("plan-grow", 50);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call("p1", &[("implement", "in_progress")]),
         edit_call("e1", 0),
@@ -7069,7 +7226,8 @@ async fn a_step_added_mid_turn_is_what_the_closeout_reads() {
 async fn a_host_implicit_plan_never_buys_a_continuation() {
     let dir = plan_freshness_dir("plan-implicit", 47);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("answered")]));
     let executor = Executor::new(
         runtime.clone(),
@@ -7107,7 +7265,8 @@ async fn a_host_implicit_plan_never_buys_a_continuation() {
 async fn a_resumed_turn_with_an_open_seeded_plan_gets_the_same_continuation() {
     let dir = plan_freshness_dir("plan-resume", 49);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let seeded = leveler_agent::PlanState::from_model_explicit(vec![leveler_agent::PlanStep {
         step: "verify".into(),
         status: "in_progress".into(),
@@ -7158,7 +7317,8 @@ async fn a_resumed_turn_with_an_open_seeded_plan_gets_the_same_continuation() {
 async fn goal_mode_keeps_the_goal_continuation_and_not_a_plan_one() {
     let dir = plan_freshness_dir("plan-goal", 48);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -7223,7 +7383,8 @@ async fn goal_mode_keeps_the_goal_continuation_and_not_a_plan_one() {
 async fn goal_completion_does_not_require_plan_reconciliation() {
     let dir = plan_freshness_dir("final-reconcile-goal", 43);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -7292,7 +7453,8 @@ async fn goal_completion_does_not_require_plan_reconciliation() {
 async fn a_stale_plan_does_not_refuse_a_goal_completion() {
     let dir = plan_freshness_dir("gate-off-goal", 51);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call(
             "p1",
@@ -7353,7 +7515,8 @@ async fn a_stale_plan_does_not_refuse_a_goal_completion() {
 async fn a_stale_plan_does_not_force_a_chat_closeout_round() {
     let dir = plan_freshness_dir("gate-off-chat", 53);
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call("p1", &[("implement", "completed")]),
         edit_call("e1", 0),
@@ -7413,7 +7576,8 @@ async fn same_batch_serial_work_then_plan_is_recorded_without_a_freshness_rule()
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     );
@@ -7457,7 +7621,8 @@ async fn same_batch_parallel_read_then_plan_is_recorded_without_a_freshness_rule
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     );
@@ -7497,7 +7662,8 @@ async fn a_quiet_goal_gets_one_protocol_repair_and_no_coaching() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text("here is my answer"),
         assistant_tool_call(
@@ -7576,7 +7742,8 @@ async fn a_goal_that_stays_unresolved_is_continued_then_stops_within_bound() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text("still thinking 1"),
         assistant_text("still thinking 2"),
@@ -7633,7 +7800,8 @@ async fn epoch_command_budget_uses_seeded_cumulative_commands() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_tool_call(
         "c1",
         "run_command",
@@ -7693,7 +7861,8 @@ async fn tool_phase_command_spend_survives_into_seeded_second_drive() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Drive 1: one successful true command, then stop with text.
@@ -7801,7 +7970,8 @@ async fn complex_task_allows_readonly_explore_before_plan() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "read_file", serde_json::json!({"path": "note.txt"})),
         assistant_tool_call(
@@ -7865,7 +8035,8 @@ async fn a_long_explore_keeps_the_whole_surface_and_earns_no_plan_advisory() {
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
     std::fs::write(dir.join("b.txt"), "b\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
@@ -7969,7 +8140,8 @@ async fn text_only_after_explore_does_not_force_plan_repair() {
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
     std::fs::write(dir.join("b.txt"), "b\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "a.txt"})),
         assistant_tool_call("r2", "read_file", serde_json::json!({"path": "b.txt"})),
@@ -8030,7 +8202,8 @@ async fn shell_command_verification_is_recorded_as_command_evidence() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "m1",
@@ -8106,7 +8279,8 @@ async fn mixed_command_wrappers_share_one_freshness_rule() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "m1",
@@ -8180,7 +8354,8 @@ async fn failed_shell_command_is_not_command_evidence() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "m1",
@@ -8234,7 +8409,8 @@ async fn ordinary_shell_command_is_not_verification_evidence() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "m1",
@@ -8308,7 +8484,8 @@ async fn the_goal_text_is_not_reinterpreted_into_a_contract_block() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("ok")]));
     let executor = Executor::new(
         runtime.clone(),
@@ -8361,7 +8538,8 @@ async fn chat_second_message_rebinds_objective() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("docs updated")]));
     let executor = Executor::new(
@@ -8432,7 +8610,8 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         8,
     )
@@ -8545,7 +8724,8 @@ async fn execution_state_separates_cumulative_usage_caps_and_mechanical_breakers
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         8,
     )
@@ -8649,7 +8829,8 @@ async fn execution_context_bounds_large_declared_plans() {
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
-        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         2,
     )
@@ -8699,7 +8880,8 @@ async fn cancel_mid_serial_batch_commits_completed_results_and_spend() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // One round, two serial commands. Cancel fires the moment the first
@@ -8826,7 +9008,8 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
     std::fs::create_dir_all(dir.join("docs")).unwrap();
     std::fs::write(dir.join("docs/out.md"), "keep me\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The same out-of-scope write asks each round. The approver refuses it
@@ -8891,7 +9074,8 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
 
 fn goal_full_access(dir: &std::path::Path, runtime: Arc<MockRuntime>, steps: u32) -> Executor {
     let workspace = Workspace::new(dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
     Executor::new(
         runtime,
         Arc::new(default_registry()),
@@ -9001,7 +9185,8 @@ async fn a_mixed_citation_and_denial_round_is_not_progress() {
     ]));
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let outcome = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
@@ -9079,7 +9264,8 @@ async fn executed_work_resets_the_verification_recovery_count() {
     ]));
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess)
+        .trust_all_definitions_for_tests();
     let outcome = Executor::new(
         runtime.clone(),
         Arc::new(default_registry()),
@@ -9649,7 +9835,8 @@ async fn refused_spawn_rounds_count_as_no_progress() {
     ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // Every round re-issues a spawn the guard refuses before any agent
@@ -9714,7 +9901,8 @@ async fn token_budget_binds_when_the_gateway_reports_no_usage() {
         std::fs::write(dir.join(format!("src/g{i}.rs")), "pub fn g() {}\n").unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // MockRuntime reports TokenUsage::default() (all zeros) for every round.
@@ -9773,7 +9961,8 @@ async fn tool_calls_finish_without_calls_retries_instead_of_aborting() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text_finished("", FinishReason::ToolCalls),
@@ -9817,7 +10006,8 @@ async fn empty_tool_calls_repair_stops_after_two_reissues() {
         ToolContext::new(
             Workspace::new(dir.path()).unwrap(),
             PermissionProfile::Assisted,
-        ),
+        )
+        .trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     )
@@ -9844,7 +10034,8 @@ async fn stop_finish_with_tool_calls_executes_the_calls() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn here() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let stop_with_call = ModelResponse {
         request_id: RequestId::generate(),
@@ -9906,7 +10097,8 @@ async fn length_truncated_tool_call_recovers_with_a_smaller_reissue() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let truncated_call = ModelResponse {
         request_id: RequestId::generate(),
@@ -9977,7 +10169,8 @@ async fn empty_answer_gets_one_nudge_before_answered() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text(""),
@@ -10021,7 +10214,8 @@ async fn closeout_nudge_is_surfaced_and_persisted_for_resume() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -10125,7 +10319,7 @@ async fn round_limit_exit_publishes_the_final_epoch_spend() {
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         1,
     );
@@ -10170,7 +10364,8 @@ async fn minimal_policy_disables_the_identical_result_loop_guard() {
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     // The model re-reads the same file four rounds in a row. The loop guard
@@ -10244,7 +10439,8 @@ async fn minimal_policy_keeps_the_admission_boundary() {
     std::fs::write(&outside, "x").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -10308,7 +10504,8 @@ async fn assisted_runs_a_workdir_deletion_and_gates_one_outside_it() {
     std::fs::write(outside.join("keep.txt"), "must survive\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     // `rm`/`rmdir` are both in the destructive set; Windows needs the native
     // `rmdir` because Git Bash's MSYS `rm` cannot initialize under Low IL.
@@ -10388,7 +10585,8 @@ async fn observe_tools_including_git_status_run_without_a_plan() {
         .unwrap();
     std::fs::write(dir.join("a.txt"), "x\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "git_status", serde_json::json!({})),
@@ -10496,7 +10694,8 @@ async fn exhausted_request_start_timeout_is_retried() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(ExhaustedTimeoutRuntime {
         fails_left: Mutex::new(1),
         kind: leveler_model::ModelErrorKind::Timeout,
@@ -10546,7 +10745,8 @@ async fn exhausted_auth_failure_is_not_retried() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(ExhaustedTimeoutRuntime {
         fails_left: Mutex::new(5),
         kind: leveler_model::ModelErrorKind::Auth,
@@ -10596,7 +10796,8 @@ async fn secret_values_never_reach_the_model_or_the_provider() {
     )
     .unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -10661,7 +10862,8 @@ async fn source_code_mentioning_credentials_reaches_the_model_intact() {
     let source = "pub struct Creds {\n    pub password: String,\n}\n\nfn load(config: &Config) -> String {\n    let password = config.password;\n    password\n}\n";
     std::fs::write(dir.join("src/creds.rs"), source).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
 
     let runtime = Arc::new(MockRuntime::new(vec![
@@ -10725,7 +10927,8 @@ async fn human_denial_then_quiet_does_not_nudge() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "p1",
@@ -10778,7 +10981,8 @@ async fn human_denial_still_allows_workspace_tools() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "p1",
@@ -10827,7 +11031,8 @@ async fn same_or_broader_permission_is_not_prompted_again() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let asks = Arc::new(Mutex::new(0usize));
 
     struct CountingDeny {
@@ -10895,7 +11100,8 @@ async fn goal_mode_human_denial_quiet_is_blocked_not_stalled() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "p1",
@@ -10945,7 +11151,8 @@ async fn headless_denial_is_not_labeled_as_user_refusal() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "p1",
@@ -11026,7 +11233,7 @@ fn compaction_fixture(tag: &str, rounds: usize) -> (std::path::PathBuf, ToolCont
     let workspace = Workspace::new(&dir).unwrap();
     (
         dir,
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
     )
 }
 
@@ -11233,7 +11440,8 @@ async fn only_a_diverged_context_is_snapshotted() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let mut responses: Vec<ModelResponse> = (0..6)
         .map(|i| {
             assistant_tool_call(
@@ -11302,7 +11510,8 @@ async fn context_trace_persists_the_context_every_round() {
         .unwrap();
     }
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let mut responses: Vec<ModelResponse> = (0..6)
         .map(|i| {
             assistant_tool_call(
@@ -11358,7 +11567,8 @@ async fn scoped_rules_stay_out_of_the_durable_transcript() {
     std::fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/a.rs"})),
         assistant_text("done"),
@@ -11444,7 +11654,8 @@ async fn a_folds_summarization_is_recorded_as_a_compaction_call() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let mut responses: Vec<ModelResponse> = (0..16)
         .map(|i| {
@@ -11551,7 +11762,7 @@ async fn token_admission_spends_exactly_what_the_records_say() {
     let outcome = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )
@@ -11625,7 +11836,7 @@ async fn resumed_spend_continues_from_the_seeded_epoch_without_recounting() {
     let outcome = Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         0,
     )
@@ -11695,7 +11906,8 @@ fn escalate_dir(tag: &str) -> std::path::PathBuf {
 async fn an_approved_escalation_runs_the_command_in_the_same_round() {
     let dir = escalate_dir("approved");
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let asks = Arc::new(Mutex::new(0usize));
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -11777,6 +11989,7 @@ async fn session_escalation_keeps_network_while_once_returns_to_explicit_denial(
             Workspace::new(&dir).unwrap(),
             PermissionProfile::RequestApproval,
         )
+        .trust_all_definitions_for_tests()
         .with_sandbox(true);
         let asks = Arc::new(Mutex::new(0usize));
         let runtime = Arc::new(MockRuntime::new(vec![
@@ -11845,7 +12058,8 @@ async fn an_escalation_already_granted_for_the_turn_does_not_ask_again() {
     let tool_context = ToolContext::new(
         Workspace::new(&dir).unwrap(),
         PermissionProfile::RequestApproval,
-    );
+    )
+    .trust_all_definitions_for_tests();
     let asks = Arc::new(Mutex::new(0usize));
     let escalated = |id: &str, text: &str, escalate: serde_json::Value| {
         assistant_tool_call(
@@ -11905,7 +12119,8 @@ async fn an_escalation_for_more_than_the_turn_grant_still_asks() {
     let tool_context = ToolContext::new(
         Workspace::new(&dir).unwrap(),
         PermissionProfile::RequestApproval,
-    );
+    )
+    .trust_all_definitions_for_tests();
     let asks = Arc::new(Mutex::new(0usize));
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -11944,7 +12159,8 @@ async fn an_escalation_for_more_than_the_turn_grant_still_asks() {
 async fn a_denied_escalation_does_not_run_the_command() {
     let dir = escalate_dir("denied");
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
@@ -12007,7 +12223,8 @@ async fn a_refused_escalation_closes_the_call_it_announced() {
     ) -> (Vec<String>, Vec<String>) {
         let dir = escalate_dir(tag);
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .trust_all_definitions_for_tests();
         let runtime = Arc::new(MockRuntime::new(vec![
             assistant_tool_call("c1", "shell_command", args),
             assistant_text("stopped"),
@@ -12075,7 +12292,8 @@ async fn a_refused_escalation_closes_the_call_it_announced() {
 async fn a_second_escalation_after_a_denial_does_not_re_prompt() {
     let dir = escalate_dir("twice");
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let asks = Arc::new(Mutex::new(0usize));
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -12132,7 +12350,8 @@ async fn a_second_escalation_after_a_denial_does_not_re_prompt() {
 async fn an_escalation_naming_no_axis_is_refused_without_prompting() {
     let dir = escalate_dir("empty");
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let asks = Arc::new(Mutex::new(0usize));
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
@@ -12180,7 +12399,7 @@ async fn escalate_is_advertised_only_while_the_profile_confines() {
     ] {
         let dir = escalate_dir(&format!("advert-{}", mode.as_str()));
         let workspace = Workspace::new(&dir).unwrap();
-        let tool_context = ToolContext::new(workspace, mode);
+        let tool_context = ToolContext::new(workspace, mode).trust_all_definitions_for_tests();
         let runtime = Arc::new(MockRuntime::new(vec![assistant_text("hi")]));
         let executor = Executor::new(
             runtime.clone(),
@@ -12229,7 +12448,8 @@ async fn a_fix_bug_goal_may_complete_without_mutation_when_the_model_says_so() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn login() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
         assistant_tool_call(
@@ -12288,7 +12508,8 @@ async fn a_complex_task_without_a_plan_can_still_edit_and_run() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
         assistant_tool_call("r2", "grep", serde_json::json!({"pattern": "old"})),
@@ -12395,7 +12616,8 @@ async fn a_long_novel_exploration_is_not_interrupted_by_a_progress_heuristic() {
         serde_json::json!({"status": "complete", "summary": "surveyed every file"}),
     ));
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(responses));
     let executor = Executor::new(
         runtime.clone(),
@@ -12445,7 +12667,8 @@ async fn a_turn_advertises_the_harness_control_protocol_it_can_actually_use() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
     let runtime = Arc::new(MockRuntime::new(vec![assistant_text("done")]));
     let executor = Executor::new(
@@ -12530,7 +12753,8 @@ async fn volatile_execution_state_trails_the_transcript_on_the_projected_wire() 
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
         assistant_text("done"),
@@ -12654,7 +12878,7 @@ async fn a_round_row_records_the_projection_s_reasoning_channel() {
     Executor::new(
         runtime,
         Arc::new(default_registry()),
-        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests(),
         ModelRef::new("mock", "m"),
         10,
     )
@@ -12702,7 +12926,8 @@ async fn mixed_read_write_read_observes_the_edit_between_the_reads() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.txt"), "before\n").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let registry = Arc::new(default_registry());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_calls(vec![

@@ -63,6 +63,10 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
         EngineEvent::AssistantMessage { text, reasoning } => {
             AgentEvent::AssistantText { text, reasoning }
         }
+        // The turn's rule-delivery audit is durable local evidence. A headless
+        // JSONL consumer must be able to join it to the turn without opening
+        // the event store; the CLI renderer already knows this event.
+        EngineEvent::RuleDelivery { audit } => AgentEvent::RuleDelivery { audit },
         EngineEvent::ToolCallStarted {
             call_id,
             name,

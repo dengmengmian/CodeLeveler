@@ -223,7 +223,8 @@ async fn harness(responses: Vec<ModelResponse>, summary: Summary) -> Harness {
     )
     .unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let runtime = EntryRuntime::new(responses, summary);
     let db = Database::connect_in_memory().await.unwrap();
     let engine = CodingRuntime {

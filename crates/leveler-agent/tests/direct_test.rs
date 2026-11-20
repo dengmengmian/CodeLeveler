@@ -356,7 +356,8 @@ async fn harness_with_overrides(
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
     let db = Database::connect_in_memory().await.unwrap();
@@ -1860,7 +1861,8 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
                     std::env::current_dir().unwrap_or_default(),
                     std::env::temp_dir(),
                 )),
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
@@ -2505,7 +2507,8 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             std::env::current_dir().unwrap_or_default(),
             std::env::temp_dir(),
         )),
-    );
+    )
+    .trust_all_definitions_for_tests();
     let runtime = Arc::new(FailingProfileRuntime {
         inner: MockRuntime::new(vec![
             tool_call(
@@ -3894,7 +3897,8 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
                     std::env::current_dir().unwrap_or_default(),
                     std::env::temp_dir(),
                 )),
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,
@@ -5453,7 +5457,8 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
                     std::env::current_dir().unwrap_or_default(),
                     std::env::temp_dir(),
                 )),
-            ),
+            )
+            .trust_all_definitions_for_tests(),
             model: ModelRef::new("mock", "m"),
             commit_co_author: true,
             overrides: None,

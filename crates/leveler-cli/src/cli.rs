@@ -107,7 +107,7 @@ pub enum Command {
         socket: Option<PathBuf>,
         /// Also expose the daemon over loopback TCP at this address (e.g.
         /// `127.0.0.1:7878`) for external clients. The per-repo Unix
-        /// socket is still bound (ownership lock + token-less local clients).
+        /// socket is still bound (ownership lock + its own access token).
         /// The bearer token comes from LEVELER_DAEMON_TOKEN when set, else a
         /// fresh one is generated with the OS CSPRNG and printed once.
         #[arg(long, value_name = "ADDR")]
@@ -440,8 +440,18 @@ pub enum TrustCommand {
     },
     /// Show what is trusted, untrusted, or absent for this repository.
     Show,
+    /// Show the approved version against the current bytes for one definition.
+    Diff {
+        /// The path exactly as `leveler trust show` displays it.
+        path: String,
+    },
     /// Drop every trust record for this repository.
     Revoke,
+    /// Drop one definition approval (project or user scope).
+    RevokeDefinition {
+        /// The path exactly as `leveler trust show` displays it.
+        path: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

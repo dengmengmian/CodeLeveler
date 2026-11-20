@@ -99,6 +99,14 @@ impl Tool for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
+        // The runtime control namespace holds the trusted-local credential.
+        // Refuse it before opening anything, whatever path grant the call has.
+        if let Some(reason) = context.security_control_read_denied(&input.path) {
+            return Ok(ToolOutput::error(reason));
+        }
+        if let Some(reason) = context.skill_content_read_denied(&input.path) {
+            return Ok(ToolOutput::error(reason));
+        }
         // The handle is opened under the workspace's confinement decision, so
         // a path swapped after resolution cannot redirect the read: a review
         // seat reads the object it was authorised to read, not a path.
@@ -586,5 +594,121 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Skill instruction content is admitted only through the verified package
+    /// loader, not through a path read that skipped the digest check.
+    #[tokio::test]
+    async fn a_restricted_tool_reads_skill_content_only_through_load_skill() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-read-skill-workspace-{}",
+            super::super::test_ordinal()
+        ));
+        let skill = dir.join(".leveler/skills/demo");
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::create_dir_all(skill.join("scripts")).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo.\n---\nBODY\n",
+        )
+        .unwrap();
+        std::fs::write(skill.join("references/guide.md"), "APPROVED-GUIDE\n").unwrap();
+        std::fs::write(skill.join("scripts/run.sh"), "echo hi\n").unwrap();
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        for path in [
+            ".leveler/skills/demo/SKILL.md",
+            ".leveler/skills/demo/references/guide.md",
+        ] {
+            let out = ReadFileTool
+                .execute(
+                    serde_json::json!({"path": path}),
+                    ctx.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(out.is_error, "{path}: {out:?}");
+            assert!(
+                out.content.contains("approval-bound skill instruction"),
+                "{path}: {}",
+                out.content
+            );
+            assert!(!out.content.contains("APPROVED-GUIDE"));
+        }
+        // A script is an ordinary tool resource, not instruction content.
+        let script = ReadFileTool
+            .execute(
+                serde_json::json!({"path": ".leveler/skills/demo/scripts/run.sh"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!script.is_error, "{script:?}");
+        assert!(script.content.contains("echo hi"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The daemon credential is not ordinary host content: a restricted agent
+    /// that read it could authenticate to the trusted-local runtime as the
+    /// user. FullAccess keeps its documented authority.
+    #[tokio::test]
+    async fn a_restricted_tool_cannot_read_the_runtime_credential() {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-read-control-workspace-{}",
+            super::super::test_ordinal()
+        ));
+        let home = std::env::temp_dir().join(format!(
+            "leveler-read-control-home-{}",
+            super::super::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(home.join("run/sockets")).unwrap();
+        let token = home.join("run/sockets/repo.token");
+        std::fs::write(&token, "TOKEN-CANARY").unwrap();
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        vars.retain(|(key, _)| key != "LEVELER_HOME");
+        vars.push((
+            std::ffi::OsString::from("LEVELER_HOME"),
+            home.as_os_str().to_os_string(),
+        ));
+        let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+            vars,
+            dir.clone(),
+            std::env::temp_dir(),
+        ));
+        let ws = leveler_execution::Workspace::new(&dir).unwrap();
+        let restricted = ToolContext::with_environment(
+            ws.clone(),
+            leveler_execution::PermissionProfile::RequestApproval,
+            environment,
+        );
+        let out = ReadFileTool
+            .execute(
+                serde_json::json!({"path": token.display().to_string()}),
+                restricted,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("runtime control"), "{}", out.content);
+        assert!(!out.content.contains("TOKEN-CANARY"), "{}", out.content);
+
+        let full = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess);
+        let allowed = ReadFileTool
+            .execute(
+                serde_json::json!({"path": token.display().to_string()}),
+                full,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!allowed.is_error, "{allowed:?}");
+        assert!(allowed.content.contains("TOKEN-CANARY"));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 }

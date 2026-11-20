@@ -122,7 +122,8 @@ async fn project_rules_reach_the_wire_and_stay_identical_across_rounds() {
     );
 
     let workspace = Workspace::new(dir.path()).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let tool_context =
+        ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
     let executor = Executor::new(
         provider,
         Arc::new(leveler_tools::default_registry()),
