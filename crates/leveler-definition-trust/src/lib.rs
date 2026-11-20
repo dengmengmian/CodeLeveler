@@ -484,7 +484,39 @@ fn resolve_for_compare(path: &std::path::Path) -> std::path::PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    absolute.canonicalize().unwrap_or(absolute)
+    canonicalize_lenient(&absolute)
+}
+
+/// Canonicalize the deepest ancestor that exists and re-append the components
+/// that do not.
+///
+/// `std::fs::canonicalize` refuses a path that has not been created yet. Keeping
+/// the caller's spelling for that case disagrees with every existing root the
+/// result is compared against: on macOS `/var` is a symlink to `/private/var`,
+/// so a missing store inside a temp-rooted project read as outside it, and a
+/// missing snapshot under the trust store read as an ordinary file. Both are
+/// the fail-open direction for the trust and runtime-control boundaries.
+fn canonicalize_lenient(path: &std::path::Path) -> std::path::PathBuf {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            for name in missing.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        match (cursor.parent(), cursor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_owned());
+                cursor = parent;
+            }
+            // No component of the path resolves (or this is a filesystem
+            // root): the caller's spelling is the only one available.
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 fn normalize_absolute(path: &std::path::Path) -> String {
@@ -544,12 +576,13 @@ pub fn store_is_outside_project(
 /// file under its snapshot directory.
 ///
 /// Tool-facing writes must never author these files: a forged approval record
-/// is equivalent to a human approval. The comparison resolves an existing
-/// candidate and the candidate's parent, so a junction/symlink alias inside a
-/// writable workspace cannot spell the store as an innocent relative path.
+/// is equivalent to a human approval. The comparison resolves the deepest
+/// existing ancestor of an existing or not-yet-created candidate, so a
+/// junction/symlink alias inside a writable workspace cannot spell the store
+/// as an innocent relative path.
 pub fn is_trust_store_path(store_root: &std::path::Path, candidate: &std::path::Path) -> bool {
     let store = resolve_for_compare(store_root);
-    let candidate = resolve_candidate_for_compare(candidate);
+    let candidate = resolve_for_compare(candidate);
     if paths_equal(&candidate, &store.join(STORE_FILE_NAME))
         || paths_equal(&candidate, &crate::store::lock_path(&store))
     {
@@ -579,29 +612,8 @@ pub fn is_trust_store_path(store_root: &std::path::Path, candidate: &std::path::
 /// the OS sandbox masks the same directory for child commands.
 pub fn is_runtime_control_path(home_root: &std::path::Path, candidate: &std::path::Path) -> bool {
     let control = resolve_for_compare(home_root).join("run").join("sockets");
-    let candidate = resolve_candidate_for_compare(candidate);
+    let candidate = resolve_for_compare(candidate);
     path_is_under(&control, &candidate) || path_is_under(&candidate, &control)
-}
-
-fn resolve_candidate_for_compare(path: &std::path::Path) -> std::path::PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    if let Ok(canonical) = absolute.canonicalize() {
-        return canonical;
-    }
-    // A store file that does not exist yet still has a parent that may be a
-    // junction or symlink. Resolve that part before comparing the final name.
-    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
-        && let Ok(canonical_parent) = parent.canonicalize()
-    {
-        return canonical_parent.join(name);
-    }
-    absolute
 }
 
 fn paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {

@@ -163,7 +163,38 @@ fn resolve_for_compare(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    absolute.canonicalize().unwrap_or(absolute)
+    canonicalize_lenient(&absolute)
+}
+
+/// Canonicalize the deepest ancestor that exists and re-append the components
+/// that do not.
+///
+/// `std::fs::canonicalize` refuses a path that has not been created yet. Keeping
+/// the caller's spelling for that case disagrees with the existing repository
+/// root it is compared against: on macOS `/var` is a symlink to `/private/var`,
+/// so a missing home inside a temp-rooted repository read as outside it — the
+/// fail-open direction for the in-repo configuration trust gate.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            for name in missing.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        match (cursor.parent(), cursor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_owned());
+                cursor = parent;
+            }
+            // No component of the path resolves (or this is a filesystem
+            // root): the caller's spelling is the only one available.
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 impl TrustStore {
