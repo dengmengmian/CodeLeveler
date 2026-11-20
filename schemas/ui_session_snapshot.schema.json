@@ -3551,7 +3551,7 @@
           }
         },
         {
-          "description": "Best-effort, transient post-turn recap requested after an idle window. It is display-only and never becomes model-visible conversation.",
+          "description": "The durable one-line review of a settled turn (`※ 回顾`).\n\nThe runtime persists it under `(session_id, turn_id)` before publishing it, so a reconnect replays the same text instead of generating another review. It is display-only and never becomes model-visible conversation, and a draft in the composer does not discard it — only a new turn ends its window.",
           "type": "object",
           "required": [
             "text",
