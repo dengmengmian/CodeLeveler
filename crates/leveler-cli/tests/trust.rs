@@ -18,8 +18,14 @@ fn write(path: &Path, body: &str) {
 }
 
 fn run(home: &Path, repo: &Path, args: &[&str]) -> (bool, String) {
+    // Definition discovery also reads the user roots under `$HOME`
+    // (`~/.codex/skills`, `~/.agents/skills`, `~/.claude/skills`). Pin the OS
+    // home to the same empty temp directory as `LEVELER_HOME`, or a developer's
+    // own skills become pending definitions and change the counts here.
     let out = leveler()
         .env("LEVELER_HOME", home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
         .arg("--repo")
         .arg(repo)
         .args(args)
