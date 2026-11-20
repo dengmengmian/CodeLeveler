@@ -49,6 +49,27 @@ struct TestEnv {
     repo: PathBuf,
 }
 
+/// Send the local-runtime handshake on a raw test socket and require the ACK.
+/// The daemon rotates its token on every start, so callers re-read it after a
+/// restart rather than reusing an earlier value.
+async fn authenticate_unix(stream: &mut tokio::net::UnixStream, socket: &Path) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let token = std::fs::read_to_string(socket.with_extension("token")).unwrap();
+    let frame = serde_json::to_vec(&serde_json::json!({
+        "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+        "body": {"token": token},
+    }))
+    .unwrap();
+    stream.write_u32(frame.len() as u32).await.unwrap();
+    stream.write_all(&frame).await.unwrap();
+    stream.flush().await.unwrap();
+    let length = stream.read_u32().await.unwrap() as usize;
+    let mut reply = vec![0; length];
+    stream.read_exact(&mut reply).await.unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(response["body"]["type"], "ack", "{response}");
+}
+
 /// A fully isolated environment: its own home (state, sockets), config
 /// bundle (mock provider), and repository.
 fn test_env(base_url: &str) -> TestEnv {
@@ -656,6 +677,7 @@ async fn a_mute_endpoint_is_reported_as_an_unanswered_call_body() {
     // Bind but never answer. The kernel completes the connection, the runtime
     // never completes the handshake.
     let _mute = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::write(socket.with_extension("token"), "a".repeat(64)).unwrap();
     // The child a client would launch is gone before the probe: the state left
     // behind after `serve` refused an endpoint that already had a listener.
     use std::os::unix::fs::PermissionsExt;
@@ -2425,9 +2447,9 @@ async fn no_workspace_host_durably_admits_and_restores_after_process_restart_bod
     // Intentionally lose the response: send a real Deliver frame then close
     // without reading any ACK. Admission is proved independently below.
     use tokio::io::AsyncWriteExt;
-    let mut lost_ack_socket = tokio::net::UnixStream::connect(layout.socket_path())
-        .await
-        .unwrap();
+    let socket_path = layout.socket_path();
+    let mut lost_ack_socket = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    authenticate_unix(&mut lost_ack_socket, &socket_path).await;
     let request = serde_json::json!({
         "type": "deliver",
         "body": leveler_client_protocol::ProtocolEnvelope::wrap(envelope.clone()),
@@ -3084,6 +3106,7 @@ async fn create_session_lost_response_retries_one_durable_logical_identity_body(
         serde_json::to_vec(&leveler_client_protocol::ProtocolEnvelope::wrap(request)).unwrap();
     let socket = find_socket(&env);
     let mut lost = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    authenticate_unix(&mut lost, &socket).await;
     lost.write_u32(frame.len() as u32).await.unwrap();
     lost.write_all(&frame).await.unwrap();
     lost.flush().await.unwrap();
@@ -3149,9 +3172,11 @@ async fn create_session_lost_response_retries_one_durable_logical_identity_body(
         daemon.try_wait().unwrap().is_none(),
         "replacement daemon is live"
     );
-    let mut retry = tokio::net::UnixStream::connect(find_socket(&env))
+    let retry_socket = find_socket(&env);
+    let mut retry = tokio::net::UnixStream::connect(&retry_socket)
         .await
         .unwrap();
+    authenticate_unix(&mut retry, &retry_socket).await;
     retry.write_u32(frame.len() as u32).await.unwrap();
     retry.write_all(&frame).await.unwrap();
     retry.flush().await.unwrap();

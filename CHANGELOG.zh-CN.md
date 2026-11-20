@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- Trusted Definition Security Model 1.0 成为正式跨平台契约：未批准定义不会进入 Harness 的高信任上下文，批准绑定精确内容版本。Skill 批准现在覆盖 `SKILL.md` 与整个 `references/` 树，使用复合 SHA-256；编辑、新增或删除任一引用都会使批准失效。`load_skill` 直接返回经过校验的引用正文；受限文件工具（包括递归搜索）拒绝按路径读取这些内容。旧的单文件 Skill 批准会显示为 `changed`，需要重新批准一次。
+- Unix Runtime 控制 socket 除 `0600` 外，还要求每次绑定生成的随机访问令牌。令牌以 `0600` 写在 socket 旁的 `0700` 目录中，受限命令通过 Seatbelt 读拒绝或 bubblewrap tmpfs 看不到它；Linux 服务端还拒绝与 Runtime 不同 mount namespace 的 peer。文件工具拒绝该控制命名空间。TCP 上的 `ManageSchedule` 也改为仅可信本地可用。Windows 继续使用命名管道 ACL；FullAccess 仍是明确的用户权限边界。
+- Windows 缺失受保护路径的物理创建仍是已知 OS 限制：受限 Shell 仍可创建原本缺失的 `AGENTS.md`/`.leveler` 树，但它未经批准绝不会被采纳，既有受保护对象继续受 OS 栅栏保护。
 - 可信定义控制面新增两处 fail-closed：除 FullAccess 外，`write_file`/`apply_patch` 即使持有外部路径资源授权，也拒绝写入定义 Trust Store、其锁与快照目录、以及可执行配置 Trust Store；批准仍只能由 `leveler trust` 作出。损坏、未来版本或位于仓库内的 Store 现在会在触碰配置 Store 之前整体拒绝批准或撤销事务；位于 checkout 内的 Store 路径在文件尚不存在时也会被拒绝。受限命令运行 `leveler trust` 只能写入其每次命令的沙箱私有 home，Runtime 从不读取该 home；若显式指向宿主 home，OS 写边界会拒绝。
 - 全量测试中的两个负载敏感测试不再依赖墙钟阈值或外部 shell 程序：后台启动测试用测试二进制自身作为长生命周期进程，并发时长测试用两个子流之间的 rendezvous。
 - Windows 安全 canary 新增证明：真实 Low Integrity Shell 无法向 Runtime Store 自我批准、无法打开 Runtime 的 Medium 命名管道、无法通过 Task Scheduler 或 WMI 创建进程。FullAccess 仍是明确记录的用户权限边界。

@@ -685,7 +685,7 @@ fn a_changed_skill_body_is_refused_even_by_an_existing_registry() {
         "ORIGINAL",
     );
     let skill_md = project.join(".leveler/skills/helper/SKILL.md");
-    let body = std::fs::read(&skill_md).unwrap();
+    let package = leveler_definition_trust::read_skill_package(&skill_md).unwrap();
     let store = tmp.path().join("store");
     let identity = DefinitionIdentity::project(
         leveler_definition_trust::DefinitionKind::Skill,
@@ -695,7 +695,7 @@ fn a_changed_skill_body_is_refused_even_by_an_existing_registry() {
     approve(
         &store,
         &project,
-        &[ApprovalRequest::single(identity, &body)],
+        &[ApprovalRequest::skill_package(identity, &package)],
         ApprovalSurface::Cli,
     )
     .unwrap();
@@ -725,6 +725,293 @@ TAMPERED
 }
 
 #[test]
+fn an_approved_reference_is_returned_from_the_approved_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "guide",
+        "guide",
+        "Guide.",
+        "Read the reference.",
+    );
+    let dir = project.join(".leveler/skills/guide");
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    std::fs::write(dir.join("references/step.md"), "APPROVED-STEP\n").unwrap();
+    let skill_md = dir.join("SKILL.md");
+    let package = leveler_definition_trust::read_skill_package(&skill_md).unwrap();
+    let store = tmp.path().join("store");
+    let identity = DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::Skill,
+        ".leveler/skills/guide",
+    )
+    .unwrap();
+    approve(
+        &store,
+        &project,
+        &[ApprovalRequest::skill_package(identity, &package)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    let view = DefinitionTrustView::load(&store, Some(&project));
+    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let detail = registry.load_skill("guide").unwrap();
+    assert_eq!(detail.references, vec!["references/step.md".to_string()]);
+    assert_eq!(detail.reference_contents.len(), 1);
+    assert_eq!(detail.reference_contents[0].text, "APPROVED-STEP\n");
+    let rendered = leveler_skills::render_skill_package(&detail);
+    assert!(rendered.contains("APPROVED-STEP"), "{rendered}");
+    assert!(
+        !rendered.contains("Read with `read_file`"),
+        "reference text must not be delegated to an unverified path read: {rendered}"
+    );
+
+    // A post-approval reference edit invalidates the whole package, not just
+    // the file that was edited.
+    std::fs::write(dir.join("references/step.md"), "TAMPERED-STEP\n").unwrap();
+    match registry.load_skill("guide") {
+        Err(SkillLookupError::Untrusted { state, .. }) => assert_eq!(state, "changed"),
+        other => panic!("a changed reference must be refused: {other:?}"),
+    }
+    let fresh = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    assert!(fresh.get("guide").is_none());
+    assert_eq!(fresh.untrusted()[0].state, "changed");
+}
+
+#[test]
+fn a_new_reference_after_approval_is_not_admitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "guide",
+        "guide",
+        "Guide.",
+        "Body.",
+    );
+    let dir = project.join(".leveler/skills/guide");
+    let skill_md = dir.join("SKILL.md");
+    let package = leveler_definition_trust::read_skill_package(&skill_md).unwrap();
+    let store = tmp.path().join("store");
+    let identity = DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::Skill,
+        ".leveler/skills/guide",
+    )
+    .unwrap();
+    approve(
+        &store,
+        &project,
+        &[ApprovalRequest::skill_package(identity, &package)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    std::fs::write(dir.join("references/new.md"), "NEW\n").unwrap();
+    let view = DefinitionTrustView::load(&store, Some(&project));
+    let fresh = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    assert!(fresh.get("guide").is_none());
+    assert_eq!(fresh.untrusted()[0].state, "changed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_reference_makes_the_skill_invalid() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "guide",
+        "guide",
+        "Guide.",
+        "Body.",
+    );
+    let dir = project.join(".leveler/skills/guide");
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    let outside = tmp.path().join("outside.md");
+    std::fs::write(&outside, "OUTSIDE").unwrap();
+    symlink(&outside, dir.join("references/alias.md")).unwrap();
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &DefinitionTrustView::trust_everything_for_tests(),
+    );
+    assert!(registry.get("guide").is_none());
+    let problems = registry.problems();
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.error.contains("symlink")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn a_single_file_skill_approval_does_not_cover_the_package() {
+    // Upgrade safety: releases before package-digest support approved only the
+    // SKILL.md bytes. That record must not admit a package whose references
+    // were never hashed.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "legacy",
+        "legacy",
+        "Legacy.",
+        "BODY",
+    );
+    let dir = project.join(".leveler/skills/legacy");
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    std::fs::write(dir.join("references/extra.md"), "NEVER-APPROVED\n").unwrap();
+    let body = std::fs::read(dir.join("SKILL.md")).unwrap();
+    let store = tmp.path().join("store");
+    let identity = DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::Skill,
+        ".leveler/skills/legacy",
+    )
+    .unwrap();
+    approve(
+        &store,
+        &project,
+        &[ApprovalRequest::single(identity, &body)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    let view = DefinitionTrustView::load(&store, Some(&project));
+    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    assert!(registry.get("legacy").is_none());
+    assert_eq!(registry.untrusted()[0].state, "changed");
+    assert!(
+        matches!(
+            registry.load_skill("legacy"),
+            Err(SkillLookupError::NotFound { .. })
+        ),
+        "an unlisted skill is not loadable; its old single-file approval admits nothing"
+    );
+}
+
+#[test]
+fn deleting_or_renaming_a_reference_invalidates_the_approval() {
+    for mutation in ["delete", "rename"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        write_skill(
+            &project.join(".leveler/skills"),
+            "guide",
+            "guide",
+            "Guide.",
+            "Body.",
+        );
+        let dir = project.join(".leveler/skills/guide");
+        std::fs::create_dir_all(dir.join("references")).unwrap();
+        std::fs::write(dir.join("references/step.md"), "APPROVED\n").unwrap();
+        let skill_md = dir.join("SKILL.md");
+        let package = leveler_definition_trust::read_skill_package(&skill_md).unwrap();
+        let store = tmp.path().join("store");
+        let identity = DefinitionIdentity::project(
+            leveler_definition_trust::DefinitionKind::Skill,
+            ".leveler/skills/guide",
+        )
+        .unwrap();
+        approve(
+            &store,
+            &project,
+            &[ApprovalRequest::skill_package(identity, &package)],
+            ApprovalSurface::Cli,
+        )
+        .unwrap();
+        let view = DefinitionTrustView::load(&store, Some(&project));
+        let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+        assert!(registry.load_skill("guide").is_ok());
+        match mutation {
+            "delete" => std::fs::remove_file(dir.join("references/step.md")).unwrap(),
+            "rename" => {
+                std::fs::rename(
+                    dir.join("references/step.md"),
+                    dir.join("references/renamed.md"),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        match registry.load_skill("guide") {
+            Err(SkillLookupError::Untrusted { state, .. }) => assert_eq!(state, "changed"),
+            other => panic!("{mutation} must invalidate the package: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_reference_tree_over_the_inline_budget_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "huge",
+        "huge",
+        "Huge.",
+        "Body.",
+    );
+    let dir = project.join(".leveler/skills/huge");
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    std::fs::write(dir.join("references/large.md"), "x".repeat(33 * 1024)).unwrap();
+    let package = leveler_definition_trust::read_skill_package(&dir.join("SKILL.md")).unwrap();
+    let store = tmp.path().join("store");
+    let identity = DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::Skill,
+        ".leveler/skills/huge",
+    )
+    .unwrap();
+    approve(
+        &store,
+        &project,
+        &[ApprovalRequest::skill_package(identity, &package)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    let view = DefinitionTrustView::load(&store, Some(&project));
+    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    match registry.load_skill("huge") {
+        Err(SkillLookupError::Read { error, .. }) => {
+            assert!(error.contains("verified-content budget"), "{error}");
+        }
+        other => panic!("an oversized reference tree must fail closed: {other:?}"),
+    }
+}
+
+#[test]
+fn a_non_utf8_reference_makes_the_skill_invalid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "binary",
+        "binary",
+        "Binary.",
+        "Body.",
+    );
+    let dir = project.join(".leveler/skills/binary");
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    std::fs::write(dir.join("references/blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &DefinitionTrustView::trust_everything_for_tests(),
+    );
+    assert!(
+        registry
+            .get("binary")
+            .and_then(|entry| entry.invalid_reason())
+            .is_some_and(|reason| reason.contains("UTF-8")),
+        "{:?}",
+        registry.entries()
+    );
+    assert!(
+        registry.problems().is_empty(),
+        "a package with a bad reference is an invalid skill, not a missing one: {:?}",
+        registry.problems()
+    );
+}
+
+#[test]
 fn an_untrusted_skill_does_not_shadow_a_trusted_lower_precedence_skill() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("repo");
@@ -737,13 +1024,14 @@ fn an_untrusted_skill_does_not_shadow_a_trusted_lower_precedence_skill() {
         "PROJECT",
     );
     write_skill(&user, "dup", "dup", "User.", "USER");
-    let user_body = std::fs::read(user.join("dup/SKILL.md")).unwrap();
+    let user_body = user.join("dup/SKILL.md");
+    let package = leveler_definition_trust::read_skill_package(&user_body).unwrap();
     let store = tmp.path().join("store");
     let identity = DefinitionIdentity::user_skill("leveler", "dup").unwrap();
     approve(
         &store,
         &project,
-        &[ApprovalRequest::single(identity, &user_body)],
+        &[ApprovalRequest::skill_package(identity, &package)],
         ApprovalSurface::Cli,
     )
     .unwrap();

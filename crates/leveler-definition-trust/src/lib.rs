@@ -199,6 +199,201 @@ impl DefinitionIdentity {
     pub fn agent_digest(manifest: &[u8], instructions: &[u8]) -> String {
         digest_with_domain(b"definition-v1\0agent\0", &[manifest, instructions])
     }
+
+    /// The composite digest of a skill package: `SKILL.md` and every file under
+    /// its `references/` tree.
+    ///
+    /// The single-file digest is deliberately NOT used for skills. The loader
+    /// hands reference text to the model as part of the skill's procedure, so a
+    /// reference edit after approval must invalidate the approval exactly like a
+    /// `SKILL.md` edit. Scripts and assets stay ordinary tool resources: content
+    /// binding says what the model may trust as procedure, not what may execute.
+    pub fn skill_package_digest(parts: &[SkillPackagePart]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"definition-v1\0skill-package\0");
+        let mut order: Vec<usize> = (0..parts.len()).collect();
+        order.sort_by(|&left, &right| parts[left].relative.cmp(&parts[right].relative));
+        for index in order {
+            let part = &parts[index];
+            hasher.update((part.relative.len() as u64).to_le_bytes());
+            hasher.update(part.relative.as_bytes());
+            hasher.update((part.bytes.len() as u64).to_le_bytes());
+            hasher.update(&part.bytes);
+        }
+        let hex = hasher
+            .finalize()
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            });
+        format!("sha256:{hex}")
+    }
+}
+
+/// One file that contributes to a skill package approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackagePart {
+    /// Package-relative path with `/` separators (`SKILL.md`,
+    /// `references/guide.md`).
+    pub relative: String,
+    pub path: std::path::PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+/// Longest reference tree the trust gate will hash or hand to the model.
+///
+/// A package is human-approved instruction text, not an asset store. Bounding
+/// it keeps one skill from exhausting the tool result budget while still
+/// leaving room for the long references real skills ship. Scripts and assets
+/// are excluded from the bound because they are not content-admitted.
+pub const MAX_SKILL_PACKAGE_FILES: usize = 512;
+pub const MAX_SKILL_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read the exact bytes that make up a skill's approval: `SKILL.md` plus every
+/// regular file under `references/`, recursively.
+///
+/// The walk is deterministic (sorted by package-relative path), never follows a
+/// symlink, and rejects anything that is not a regular UTF-8 file. A symlinked
+/// or dangling reference would otherwise let the approved manifest name bytes
+/// that can change behind the digest. The result always contains `SKILL.md`
+/// first.
+pub fn read_skill_package(skill_md: &std::path::Path) -> Result<Vec<SkillPackagePart>, String> {
+    let Some(dir) = skill_md.parent() else {
+        return Err("the skill path has no package directory".into());
+    };
+    let mut parts = Vec::new();
+    let mut total = 0usize;
+
+    // A symlinked SKILL.md may name a real file inside the package (the
+    // existing loader supports that), but it may not point outside: the digest
+    // must bind a file this package owns.
+    let skill_meta =
+        std::fs::symlink_metadata(skill_md).map_err(|error| format!("SKILL.md: {error}"))?;
+    if skill_meta.file_type().is_symlink()
+        && let (Ok(target), Ok(base)) = (skill_md.canonicalize(), dir.canonicalize())
+        && !target.starts_with(&base)
+    {
+        return Err("SKILL.md is a symlink that points outside the skill directory".into());
+    }
+    let skill_bytes = read_regular_utf8(skill_md, "SKILL.md")?;
+    total = total.saturating_add(skill_bytes.len());
+    parts.push(SkillPackagePart {
+        relative: "SKILL.md".to_string(),
+        path: skill_md.to_path_buf(),
+        bytes: skill_bytes,
+    });
+
+    let references = dir.join("references");
+    match std::fs::symlink_metadata(&references) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err("the skill `references` directory is a symlink".into());
+            }
+            if !metadata.is_dir() {
+                return Err("the skill `references` path is not a directory".into());
+            }
+            walk_skill_references(&references, &references, &mut parts, &mut total)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: {error}", references.display())),
+    }
+
+    parts.sort_by(|left, right| left.relative.cmp(&right.relative));
+    if parts.first().is_none_or(|part| part.relative != "SKILL.md") {
+        return Err("the skill package has no readable SKILL.md".into());
+    }
+    Ok(parts)
+}
+
+fn walk_skill_references(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    parts: &mut Vec<SkillPackagePart>,
+    total: &mut usize,
+) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(current).map_err(|error| format!("{}: {error}", current.display()))?;
+    let mut listed = Vec::new();
+    for entry in entries {
+        listed.push(entry.map_err(|error| format!("{}: {error}", current.display()))?);
+    }
+    listed.sort_by_key(|entry| entry.file_name());
+    for entry in listed {
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "skill reference {} is a symlink; references must be regular files inside the package",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            walk_skill_references(root, &path, parts, total)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(format!(
+                "skill reference {} is not a regular file",
+                path.display()
+            ));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("{} escapes the references directory", path.display()))?
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "skill reference {} has a non-UTF-8 package-relative name",
+                    path.display()
+                )
+            })?
+            .replace('\\', "/");
+        let relative = format!("references/{relative}");
+        if parts.len() >= MAX_SKILL_PACKAGE_FILES {
+            return Err(format!(
+                "the skill has more than {MAX_SKILL_PACKAGE_FILES} approved files"
+            ));
+        }
+        if metadata.len() as usize > MAX_SKILL_PACKAGE_BYTES.saturating_sub(*total) {
+            return Err(format!(
+                "the skill's approved content exceeds {MAX_SKILL_PACKAGE_BYTES} bytes"
+            ));
+        }
+        let bytes = read_regular_utf8(&path, &relative)?;
+        *total = total.saturating_add(bytes.len());
+        if *total > MAX_SKILL_PACKAGE_BYTES {
+            return Err(format!(
+                "the skill's approved content exceeds {MAX_SKILL_PACKAGE_BYTES} bytes"
+            ));
+        }
+        parts.push(SkillPackagePart {
+            relative,
+            path,
+            bytes,
+        });
+    }
+    Ok(())
+}
+
+fn read_regular_utf8(path: &std::path::Path, label: &str) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| format!("{label}: {}", error))?;
+    if !metadata.is_file() {
+        return Err(format!("{label}: not a regular file"));
+    }
+    if metadata.len() > MAX_SKILL_PACKAGE_BYTES as u64 {
+        return Err(format!(
+            "{label}: larger than the {MAX_SKILL_PACKAGE_BYTES}-byte package budget"
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("{label}: {error}"))?;
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(format!("{label}: not valid UTF-8"));
+    }
+    Ok(bytes)
 }
 
 /// Normalize a workspace-relative path or name for use in a store key.
@@ -374,6 +569,20 @@ pub fn is_trust_store_path(store_root: &std::path::Path, candidate: &std::path::
             .is_some_and(|name| name.starts_with(&format!(".{STORE_FILE_NAME}.tmp-")))
 }
 
+/// Whether `candidate` is, is under, or contains the runtime's local-control
+/// namespace (`<home>/run/sockets`).
+///
+/// That namespace holds the daemon's access token, ownership lock and Unix
+/// socket. A sandboxed agent must not read the token (it could authenticate as
+/// a trusted local client) and must not be able to search a parent directory
+/// that recursively exposes it. File tools call this before any content read;
+/// the OS sandbox masks the same directory for child commands.
+pub fn is_runtime_control_path(home_root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    let control = resolve_for_compare(home_root).join("run").join("sockets");
+    let candidate = resolve_candidate_for_compare(candidate);
+    path_is_under(&control, &candidate) || path_is_under(&candidate, &control)
+}
+
 fn resolve_candidate_for_compare(path: &std::path::Path) -> std::path::PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -456,6 +665,92 @@ mod tests {
         assert_eq!(codex.scope, DefinitionScope::User);
         assert!(DefinitionIdentity::user_agent("reviewer").is_some());
     }
+
+    #[test]
+    fn a_skill_package_digest_binds_names_and_contents() {
+        let plain = vec![
+            SkillPackagePart {
+                relative: "SKILL.md".into(),
+                path: "SKILL.md".into(),
+                bytes: b"body".to_vec(),
+            },
+            SkillPackagePart {
+                relative: "references/a.md".into(),
+                path: "references/a.md".into(),
+                bytes: b"A".to_vec(),
+            },
+        ];
+        let mut renamed = plain.clone();
+        renamed[1].relative = "references/b.md".into();
+        let mut changed = plain.clone();
+        changed[1].bytes = b"B".to_vec();
+        let baseline = DefinitionIdentity::skill_package_digest(&plain);
+        assert_ne!(baseline, DefinitionIdentity::skill_package_digest(&renamed));
+        assert_ne!(baseline, DefinitionIdentity::skill_package_digest(&changed));
+        // Framing keeps a reference that starts like the previous one distinct.
+        let split = vec![
+            SkillPackagePart {
+                relative: "references/a".into(),
+                path: "references/a".into(),
+                bytes: b"bc".to_vec(),
+            },
+            SkillPackagePart {
+                relative: "references/b".into(),
+                path: "references/b".into(),
+                bytes: b"".to_vec(),
+            },
+        ];
+        let joined = vec![
+            SkillPackagePart {
+                relative: "references/a".into(),
+                path: "references/a".into(),
+                bytes: b"b".to_vec(),
+            },
+            SkillPackagePart {
+                relative: "references/b".into(),
+                path: "references/b".into(),
+                bytes: b"c".to_vec(),
+            },
+        ];
+        assert_ne!(
+            DefinitionIdentity::skill_package_digest(&split),
+            DefinitionIdentity::skill_package_digest(&joined)
+        );
+    }
+
+    #[test]
+    fn reading_a_skill_package_includes_nested_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "---\nname: x\n---\nbody\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("references/nested")).unwrap();
+        std::fs::write(dir.path().join("references/a.md"), "A").unwrap();
+        std::fs::write(dir.path().join("references/nested/b.md"), "B").unwrap();
+        let package = read_skill_package(&dir.path().join("SKILL.md")).unwrap();
+        let names: Vec<_> = package.iter().map(|part| part.relative.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["SKILL.md", "references/a.md", "references/nested/b.md"]
+        );
+        assert_eq!(package[0].bytes, b"---\nname: x\n---\nbody\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_reference_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "---\nname: x\n---\nbody\n").unwrap();
+        std::fs::write(outside.path().join("secret.md"), "SECRET").unwrap();
+        std::fs::create_dir_all(dir.path().join("references")).unwrap();
+        symlink(
+            outside.path().join("secret.md"),
+            dir.path().join("references/alias.md"),
+        )
+        .unwrap();
+        let error = read_skill_package(&dir.path().join("SKILL.md")).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +782,35 @@ mod path_boundary_tests {
         assert!(!store_is_outside_project(&store, project.path()));
         let view = DefinitionTrustView::load(&store, Some(project.path()));
         assert_eq!(view.status(), crate::store::StoreStatus::InsideProject);
+    }
+
+    #[test]
+    fn the_runtime_control_namespace_is_recognized_in_both_directions() {
+        let home = tempfile::tempdir().unwrap();
+        let sockets = home.path().join("run/sockets");
+        assert!(is_runtime_control_path(home.path(), &sockets));
+        assert!(is_runtime_control_path(
+            home.path(),
+            &sockets.join("repo.sock")
+        ));
+        assert!(is_runtime_control_path(
+            home.path(),
+            &sockets.join("repo.token")
+        ));
+        // A directory the token could be searched from names the boundary too.
+        assert!(is_runtime_control_path(home.path(), home.path()));
+        assert!(is_runtime_control_path(
+            home.path(),
+            &home.path().join("run")
+        ));
+        assert!(!is_runtime_control_path(
+            home.path(),
+            &home.path().join("cache/tools")
+        ));
+        assert!(!is_runtime_control_path(
+            home.path(),
+            &home.path().join("run/sandboxes/x")
+        ));
     }
 
     #[test]

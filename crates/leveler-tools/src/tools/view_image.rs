@@ -70,6 +70,12 @@ impl Tool for ViewImageTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
+        if let Some(reason) = context.security_control_read_denied(&input.path) {
+            return Ok(ToolOutput::error(reason));
+        }
+        if let Some(reason) = context.skill_content_read_denied(&input.path) {
+            return Ok(ToolOutput::error(reason));
+        }
         // Open under the workspace's confinement decision so the bytes read
         // are the bytes that were authorised, even if a path is swapped after
         // resolution.

@@ -193,6 +193,15 @@ const USER_ROOTS: &[(SkillSource, &str)] = &[
     (SkillSource::Claude, ".claude/skills"),
 ];
 
+/// Longest reference text a single `load_skill` may hand to the model.
+///
+/// References are content-bound, so they are returned as verified text rather
+/// than as paths the model must re-read. The bound leaves room under the
+/// registry's 48 KiB tool-result cap for the skill body and its framing; a
+/// larger package fails closed with an actionable error instead of returning
+/// unverified bytes or a silently truncated procedure.
+const MAX_INLINE_REFERENCE_BYTES: usize = 32 * 1024;
+
 fn user_home<F>(var: &F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -212,6 +221,16 @@ pub struct SkillSummary {
     pub source: SkillSource,
 }
 
+/// One verified reference file's text. The bytes were read and hashed as part of
+/// the package approval in the same pass that produced this value, so the model
+/// never receives text that a later edit could have swapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReferenceContent {
+    /// Package-relative path (`references/guide.md`).
+    pub relative: String,
+    pub text: String,
+}
+
 /// A skill's full content, loaded on demand or turn-injected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillDetail {
@@ -228,6 +247,9 @@ pub struct SkillDetail {
     pub scripts: Vec<String>,
     /// Paths relative to [`Self::dir`] under `references/` (and nested).
     pub references: Vec<String>,
+    /// Verified text of every reference file, in the same order as
+    /// [`Self::references`]. These are the bytes the trust approval bound.
+    pub reference_contents: Vec<SkillReferenceContent>,
     /// Other bundled files (not SKILL.md, not under scripts/ or references/).
     pub other_files: Vec<String>,
 }
@@ -565,17 +587,20 @@ impl SkillRegistry {
                 name: entry.name.clone(),
                 error: "the skill has no directory".to_string(),
             })?;
-        let bytes =
-            std::fs::read(dir.join("SKILL.md")).map_err(|error| SkillLookupError::Read {
+        // Read SKILL.md and every reference once. The digest covers exactly
+        // these bytes, and the text handed to the model comes from the same
+        // values, so a hash/read race cannot show unapproved instructions.
+        let package = leveler_definition_trust::read_skill_package(&dir.join("SKILL.md")).map_err(
+            |error| SkillLookupError::Read {
                 name: entry.name.clone(),
-                error: error.to_string(),
-            })?;
+                error,
+            },
+        )?;
         // Re-check the bytes actually about to be returned. A registry built
         // before an edit must not hand out content the approval never covered.
         if let Some(identity) = identity_for(entry.scope, entry.source, &entry.name) {
-            let decision = self
-                .trust
-                .check(&identity, &DefinitionIdentity::single_digest(&bytes));
+            let digest = DefinitionIdentity::skill_package_digest(&package);
+            let decision = self.trust.check(&identity, &digest);
             if !decision.admits() {
                 return Err(SkillLookupError::Untrusted {
                     name: entry.name.clone(),
@@ -585,6 +610,40 @@ impl SkillRegistry {
                 });
             }
         }
+        let mut skill_body = None;
+        let mut references = Vec::new();
+        let mut reference_contents = Vec::new();
+        let mut inline_bytes = 0usize;
+        for part in package {
+            if part.relative == "SKILL.md" {
+                skill_body = Some(part.bytes);
+                continue;
+            }
+            inline_bytes = inline_bytes.saturating_add(part.bytes.len());
+            if inline_bytes > MAX_INLINE_REFERENCE_BYTES {
+                return Err(SkillLookupError::Read {
+                    name: entry.name.clone(),
+                    error: format!(
+                        "the skill's references exceed the {MAX_INLINE_REFERENCE_BYTES}-byte \
+                         verified-content budget; split the procedure or move non-instruction \
+                         assets out of `references/`"
+                    ),
+                });
+            }
+            let text = String::from_utf8(part.bytes).map_err(|_| SkillLookupError::Read {
+                name: entry.name.clone(),
+                error: format!("{} is not valid UTF-8", part.relative),
+            })?;
+            references.push(part.relative.clone());
+            reference_contents.push(SkillReferenceContent {
+                relative: part.relative,
+                text,
+            });
+        }
+        let bytes = skill_body.ok_or_else(|| SkillLookupError::Read {
+            name: entry.name.clone(),
+            error: "SKILL.md is missing from the approved package".to_string(),
+        })?;
         let content = String::from_utf8(bytes).map_err(|_| SkillLookupError::Read {
             name: entry.name.clone(),
             error: "SKILL.md is not valid UTF-8".to_string(),
@@ -593,7 +652,7 @@ impl SkillRegistry {
             name: entry.name.clone(),
             error,
         })?;
-        let (scripts, references, other_files) = classify_bundled_files(&dir);
+        let (scripts, _, other_files) = classify_bundled_files(&dir);
         Ok(SkillDetail {
             name: entry.name.clone(),
             description: entry.description.clone().unwrap_or_default(),
@@ -603,6 +662,7 @@ impl SkillRegistry {
             dir,
             scripts,
             references,
+            reference_contents,
             other_files,
         })
     }
@@ -778,28 +838,22 @@ fn read_candidate(
         })
     };
     let skill_md = dir.join("SKILL.md");
-    let Ok(meta) = std::fs::symlink_metadata(&skill_md) else {
+    let package = match leveler_definition_trust::read_skill_package(&skill_md) {
+        Ok(package) => package,
+        Err(error) => return invalid(error),
+    };
+    let Some(bytes) = package
+        .iter()
+        .find(|part| part.relative == "SKILL.md")
+        .map(|part| part.bytes.clone())
+    else {
         return invalid("missing SKILL.md".to_string());
     };
-    // A symlinked SKILL.md may point at the package's real file, but not out of
-    // the package.
-    if meta.file_type().is_symlink()
-        && let (Ok(target), Ok(base)) = (skill_md.canonicalize(), dir.canonicalize())
-        && !target.starts_with(&base)
-    {
-        return invalid(
-            "SKILL.md is a symlink that points outside the skill directory".to_string(),
-        );
-    }
-    let Ok(bytes) = std::fs::read(&skill_md) else {
-        return invalid("SKILL.md could not be read".to_string());
-    };
     if let Some(identity) = identity_for(root.scope, root.source, name) {
-        let decision = trust.check(&identity, &DefinitionIdentity::single_digest(&bytes));
+        let digest = DefinitionIdentity::skill_package_digest(&package);
+        let decision = trust.check(&identity, &digest);
         if !decision.admits() {
-            return CandidateRead::Untrusted(
-                trust.audit(&identity, &DefinitionIdentity::single_digest(&bytes)),
-            );
+            return CandidateRead::Untrusted(trust.audit(&identity, &digest));
         }
     }
     let Ok(content) = String::from_utf8(bytes) else {

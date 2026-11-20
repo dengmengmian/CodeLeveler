@@ -158,7 +158,7 @@ pub struct ApprovalRequest {
 }
 
 impl ApprovalRequest {
-    /// A rule document or a skill's `SKILL.md`.
+    /// A rule document.
     pub fn single(identity: DefinitionIdentity, bytes: &[u8]) -> Self {
         let digest = DefinitionIdentity::single_digest(bytes);
         let snapshot = (bytes.len() <= MAX_SNAPSHOT_BYTES).then(|| bytes.to_vec());
@@ -166,6 +166,31 @@ impl ApprovalRequest {
             identity,
             digest,
             snapshot,
+        }
+    }
+
+    /// A skill package: `SKILL.md` plus every approved reference file.
+    ///
+    /// The caller must pass the bytes it read for this decision; the digest
+    /// binds package-relative names as well as contents, so swapping or
+    /// renaming a reference is a different approval.
+    pub fn skill_package(identity: DefinitionIdentity, parts: &[crate::SkillPackagePart]) -> Self {
+        let digest = DefinitionIdentity::skill_package_digest(parts);
+        let mut snapshot = Vec::new();
+        let total: usize = parts.iter().map(|part| part.bytes.len()).sum();
+        if total <= MAX_SNAPSHOT_BYTES {
+            for part in parts {
+                snapshot.extend_from_slice(format!("--- {} ---\n", part.relative).as_bytes());
+                snapshot.extend_from_slice(&part.bytes);
+                if !part.bytes.ends_with(b"\n") {
+                    snapshot.push(b'\n');
+                }
+            }
+        }
+        Self {
+            identity,
+            digest,
+            snapshot: (!snapshot.is_empty()).then_some(snapshot),
         }
     }
 

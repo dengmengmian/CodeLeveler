@@ -107,6 +107,13 @@ impl DefinitionCandidate {
     /// human; a difference means the file changed while the decision was being
     /// made, and no record may be written.
     pub fn approval_request(&self) -> Result<ApprovalRequest, String> {
+        if self.identity.kind == DefinitionKind::Skill {
+            let package = crate::read_skill_package(&self.primary_path)?;
+            return Ok(ApprovalRequest::skill_package(
+                self.identity.clone(),
+                &package,
+            ));
+        }
         let bytes: Vec<Vec<u8>> = self
             .parts
             .iter()
@@ -125,6 +132,7 @@ impl DefinitionCandidate {
                     &bytes[1],
                 ))
             }
+            DefinitionKind::Skill => unreachable!("handled above"),
             _ => {
                 let Some(body) = bytes.first() else {
                     return Err("the definition has no readable content".into());
@@ -136,8 +144,21 @@ impl DefinitionCandidate {
 
     /// The same representation the store snapshots, for a diff against the
     /// approved version. Agent files are framed so a manifest and an
-    /// instructions edit are both visible.
+    /// instructions edit are both visible; a skill package frames every file
+    /// that contributes to its approval.
     pub fn current_content(&self) -> Result<Vec<u8>, String> {
+        if self.identity.kind == DefinitionKind::Skill {
+            let package = crate::read_skill_package(&self.primary_path)?;
+            let mut out = Vec::new();
+            for part in package {
+                out.extend_from_slice(format!("--- {} ---\n", part.relative).as_bytes());
+                out.extend_from_slice(&part.bytes);
+                if !part.bytes.ends_with(b"\n") {
+                    out.push(b'\n');
+                }
+            }
+            return Ok(out);
+        }
         let bytes: Vec<Vec<u8>> = self
             .parts
             .iter()
@@ -411,7 +432,12 @@ fn discover_skills(dir: &Path, source: &str, user: bool, out: &mut Vec<Definitio
             )
         };
         if let Some(identity) = identity {
-            out.push(candidate(identity, vec![skill]));
+            // List every file the approval digest binds, so the inventory and
+            // `leveler trust show` name the same package the loader checks.
+            let parts = crate::read_skill_package(&skill)
+                .map(|package| package.into_iter().map(|part| part.path).collect())
+                .unwrap_or_else(|_| vec![skill.clone()]);
+            out.push(candidate(identity, parts));
         }
     }
 }
@@ -445,6 +471,13 @@ fn read_request_for(
     identity: &DefinitionIdentity,
     parts: &[PathBuf],
 ) -> Result<ApprovalRequest, String> {
+    if identity.kind == DefinitionKind::Skill {
+        let skill_md = parts
+            .first()
+            .ok_or_else(|| "the skill has no SKILL.md".to_string())?;
+        let package = crate::read_skill_package(skill_md)?;
+        return Ok(ApprovalRequest::skill_package(identity.clone(), &package));
+    }
     let bytes: Vec<Vec<u8>> = parts
         .iter()
         .map(|path| std::fs::read(path).map_err(|error| format!("{}: {error}", path.display())))

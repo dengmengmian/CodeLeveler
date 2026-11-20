@@ -178,6 +178,65 @@ longer delete or replace them. A protected path created after admission is
 still not covered there (see the trade-offs below); if it is a definition, the
 trust gate above still refuses to load it as authority.
 
+### Runtime control IPC is not the sandbox's socket
+
+The per-repository runtime socket serves privileged local operations (session
+and permission management, MCP and scheduler management, integrated terminals,
+trust-store diagnostics). A same-UID socket mode is not an authorization
+decision on Unix: a process confined by the execution sandbox shares the user's
+UID. The runtime therefore generates a fresh random access token on every bind,
+writes it `0600` beside the `0600` socket (a socket directory the bind creates is
+`0700`), and requires the token in a handshake before any request is parsed. A
+peer that does not present it is refused outright; it is not downgraded to the
+remote command set, because that set still includes session steering, approvals
+and policy changes.
+
+The token is not treated as readable by the sandbox. macOS Seatbelt denies
+reads of `<home>/run/sockets` (after the writable-root re-allow, so a home under
+a writable temp/workspace root cannot re-expose it). Linux bubblewrap mounts an
+empty tmpfs over that directory, and the server additionally refuses a peer
+whose mount namespace differs from its own, closing the `/proc/<pid>/root`
+path escape. File tools refuse reads of the same namespace even when an
+external-path resource grant is presented. FullAccess keeps its documented
+authority and is outside this restricted-execution threat model.
+
+The token is not a promise against an unconfined same-user process: such a
+process has the user's own file authority. It is a boundary against the
+sandboxed agent and against a confusing socket path.
+
+### Skill packages are content-bound
+
+A skill's approval binds `SKILL.md` and every file under its `references/`
+tree with one composite SHA-256 over sorted package-relative names and bytes.
+Editing, adding, deleting, renaming or replacing any reference invalidates the
+approval, exactly like a `SKILL.md` edit. References must be regular UTF-8
+files: a symlink inside `references/` makes the package invalid rather than
+letting the approved manifest name bytes that can change behind the digest.
+
+`load_skill` reads the package once, verifies the digest, and hands the model
+the verified reference text inline. The renderer no longer tells the model to
+`read_file` a reference path, and the file tools refuse a direct path read of
+`SKILL.md` or a reference in restricted modes; recursive search drops those
+paths from its results. The only verified channel is the package loader.
+
+`scripts/` and other bundled files are ordinary tool resources, not approved
+instruction content. Approving a skill does not authorize executing its
+scripts, and an edited script does not inherit skill trust. The renderer states
+that boundary explicitly.
+
+Existing skill approvals made before the package digest are not silently
+reused: the first run after upgrade reports the skill as `changed`, and the user
+re-approves the exact package once. A reference tree larger than 32 KiB fails
+closed instead of being truncated or returned unverified.
+
+**Windows missing-path creation remains a known OS limitation.** Property B
+(the admission gate above) is the release contract on every platform. Windows
+still lacks a name-based creation filter for an unprivileged token, so a
+confined shell can physically create a previously missing `AGENTS.md` or
+`.leveler` tree. Such a file is not admitted; the two facts are reported
+separately and the OS limitation is not claimed fixed. Existing protected
+objects remain write/delete/rename-fenced.
+
 ## Approval, rules and resource boundaries
 
 An approval decides whether a call may run; it does not silently widen the
@@ -204,9 +263,11 @@ oversights. Reports that only restate them will be closed as known.
 - **Shell reads are not filtered.** The file tools refuse sensitive paths
   (`.env`, `.ssh`, `.aws`, key material), but `run_command`/`shell_command` can
   read any file the OS sandbox allows — `cat .env` succeeds and its output
-  reaches the model. The sandbox confines *writes* and network, not reads. Keep
-  secrets out of workspaces you point an agent at, or run with a stricter OS
-  sandbox profile.
+  reaches the model. The sandbox confines *writes* and network, not reads. The
+  runtime control namespace is the one deliberate exception: Seatbelt/bwrap
+  hide `<home>/run/sockets`, and the access token is never readable from a
+  confined command. Keep secrets out of workspaces you point an agent at, or
+  run with a stricter OS sandbox profile.
 - **`leveler-tools` alone is not a security boundary.** Dangerous-command
   classification and approval prompts live in the executor layer
   (`leveler-execution` / `leveler-agent`). Embedding the tool registry without

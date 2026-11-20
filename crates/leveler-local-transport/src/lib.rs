@@ -627,12 +627,24 @@ impl WireError {
 }
 
 /// The first frame a TCP client must send: it presents the shared bearer token
-/// before any request is read. Unix-socket clients skip this — the socket file's
-/// `0600` permission is the trust boundary there; a TCP listener has none.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// before any request is read. Unix-socket clients present the same shape with
+/// the per-runtime access token; the socket's `0600` permission is not an
+/// authorization decision by itself (a sandboxed same-UID process can otherwise
+/// reach it).
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg(any(unix, windows))]
 struct Handshake {
     token: String,
+}
+
+#[cfg(any(unix, windows))]
+impl std::fmt::Debug for Handshake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Handshake")
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -641,7 +653,7 @@ const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(any(unix, windows))]
 mod transport {
     #[cfg(unix)]
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -666,6 +678,190 @@ mod transport {
     pub use windows_adapter::LocalSocketServer;
     #[cfg(windows)]
     use windows_adapter::connect_windows;
+
+    /// The access token beside a Unix socket. `repo.sock` → `repo.token`.
+    #[cfg(unix)]
+    fn access_token_path(socket: &Path) -> PathBuf {
+        socket.with_extension("token")
+    }
+
+    /// Generate and install a fresh per-runtime access token.
+    ///
+    /// The token is written `0600` beside the socket; a socket directory this
+    /// bind creates is `0700`. Every client that reaches the socket must
+    /// present it; the confined-execution sandbox masks this directory so a
+    /// same-UID sandboxed process cannot read it.
+    #[cfg(unix)]
+    fn write_access_token(socket: &Path) -> Result<Arc<str>, TransportError> {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+
+        let token_path = access_token_path(socket);
+        let parent = token_path.parent().ok_or_else(|| {
+            TransportError::Unavailable("the local socket has no parent directory".into())
+        })?;
+        let existed = parent.exists();
+        std::fs::create_dir_all(parent)?;
+        if !existed {
+            // Only tighten a directory this bind created. A caller may point
+            // `--socket` at an existing shared directory (a test temp root or
+            // an operator-chosen path); silently chmod-ing that directory
+            // would change unrelated files' access. The token itself is 0600.
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).map_err(|error| {
+            TransportError::Unavailable(format!("runtime access token CSPRNG failed: {error}"))
+        })?;
+        let mut token = String::with_capacity(64);
+        for byte in bytes {
+            let _ = write!(token, "{byte:02x}");
+        }
+
+        // Atomic replacement: a crashed writer must not leave a half token, and
+        // a token from the previous runtime must never be mistaken for this one.
+        let temp = token_path.with_extension(format!("token.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&temp);
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?;
+            file.write_all(token.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, &token_path)?;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Arc::from(token))
+    }
+
+    /// Read the token a client must present. A missing or unreadable token is a
+    /// hard error: connecting without it would let a peer that can reach the
+    /// socket fall back to the confused-deputy behaviour this gate removes.
+    #[cfg(unix)]
+    fn read_access_token(socket: &Path) -> Result<String, TransportError> {
+        let path = access_token_path(socket);
+        // A missing token keeps its io::NotFound identity: a caller probing an
+        // endpoint with no runtime behind it must read "absent", not "broken".
+        // A token that exists but cannot be read stays a hard failure.
+        let raw = std::fs::read(&path)?;
+        let token = String::from_utf8(raw).map_err(|_| {
+            TransportError::Unavailable(format!(
+                "local runtime access token {} is not UTF-8; restart the runtime",
+                path.display()
+            ))
+        })?;
+        let token = token.trim().to_string();
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(TransportError::Unavailable(format!(
+                "local runtime access token {} is malformed; restart the runtime",
+                path.display()
+            )));
+        }
+        Ok(token)
+    }
+
+    /// Compare two bearer tokens without an early-exit length-or-byte oracle.
+    #[cfg(unix)]
+    fn tokens_match(expected: &str, provided: &str) -> bool {
+        let expected = expected.as_bytes();
+        let provided = provided.as_bytes();
+        if expected.len() != provided.len() {
+            return false;
+        }
+        let mut difference = 0u8;
+        for (left, right) in expected.iter().zip(provided) {
+            difference |= left ^ right;
+        }
+        difference == 0
+    }
+
+    /// Whether the peer is in the same local session as this runtime.
+    ///
+    /// On Linux, a bubblewrap-confined child has its own mount namespace. The
+    /// socket file is still reachable in principle through `/proc/<runtime>/root`
+    /// even when the sandbox masks the directory, so the server refuses peers
+    /// that do not share its mount namespace. The token remains the primary
+    /// credential; this check closes that path-escape.
+    #[cfg(target_os = "linux")]
+    fn peer_is_local_session(stream: &UnixStream) -> bool {
+        let Ok(credentials) = stream.peer_cred() else {
+            return false;
+        };
+        if credentials.uid()
+            != std::fs::metadata("/proc/self")
+                .map(|m| m.uid())
+                .unwrap_or(u32::MAX)
+        {
+            return false;
+        }
+        let Some(pid) = credentials.pid() else {
+            return false;
+        };
+        let Ok(peer) = std::fs::read_link(format!("/proc/{pid}/ns/mnt")) else {
+            return false;
+        };
+        let Ok(own) = std::fs::read_link("/proc/self/ns/mnt") else {
+            return false;
+        };
+        peer == own
+    }
+
+    /// macOS has no mount namespaces. The token is protected by the Seatbelt
+    /// read-deny on the runtime control directory, so a confined shell cannot
+    /// read it; the credential itself is the gate here.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn peer_is_local_session(_stream: &UnixStream) -> bool {
+        true
+    }
+
+    /// Serve one authenticated local connection.
+    ///
+    /// The handshake happens before any request is parsed. A peer that cannot
+    /// read the token receives an error frame and never reaches a runtime
+    /// handler; it does not fall back to the unprivileged remote command set,
+    /// because those include session steering, approvals and policy changes.
+    #[cfg(unix)]
+    async fn authenticate_local_peer(
+        stream: &mut UnixStream,
+        expected: &str,
+    ) -> Result<(), TransportError> {
+        if !peer_is_local_session(stream) {
+            return Err(TransportError::Unavailable(
+                "the local runtime refuses a client outside its session namespace".into(),
+            ));
+        }
+        // Untagged so a legacy client that skipped the handshake gets an
+        // actionable refusal instead of a bare EOF.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Hello {
+            Handshake(Handshake),
+            Legacy(serde_json::Value),
+        }
+        let hello = read_frame::<Hello>(stream).await?;
+        match hello.body {
+            Hello::Handshake(handshake) => {
+                if !tokens_match(expected, &handshake.token) {
+                    return Err(TransportError::Unavailable(
+                        "local runtime authentication failed".into(),
+                    ));
+                }
+                send_response(stream, WireResponse::Ack).await?;
+                Ok(())
+            }
+            Hello::Legacy(value) => {
+                let _ = value;
+                Err(TransportError::Unavailable(
+                    "this client did not authenticate to the local runtime; restart it from the \
+                     current build"
+                        .into(),
+                ))
+            }
+        }
+    }
 
     async fn write_frame<T: Serialize>(
         writer: &mut (impl AsyncWrite + Unpin),
@@ -764,6 +960,7 @@ mod transport {
                             | ClientCommand::QueryDiagnostics { .. }
                             | ClientCommand::QuerySettings { .. }
                             | ClientCommand::ManageMcp { .. }
+                            | ClientCommand::ManageSchedule { .. }
                     )
                 {
                     return send_result(
@@ -812,6 +1009,7 @@ mod transport {
                             | ClientCommand::QueryDiagnostics { .. }
                             | ClientCommand::QuerySettings { .. }
                             | ClientCommand::ManageMcp { .. }
+                            | ClientCommand::ManageSchedule { .. }
                     )
                 {
                     return send_result(
@@ -1087,6 +1285,9 @@ mod transport {
         listener: UnixListener,
         runtime: Arc<dyn LocalRuntimeService>,
         local_waiters: LocalWaiters,
+        /// Bearer token every local client presents before a request is read.
+        /// Regenerated on each bind; the socket file alone is not authority.
+        access_token: Arc<str>,
         /// Exclusive `flock` on `<path>.lock`, held for the server's whole
         /// lifetime. This is the single-daemon guarantee: two processes
         /// racing a stale socket used to both pass the connect probe, both
@@ -1172,6 +1373,7 @@ mod transport {
             }
             let listener = UnixListener::bind(&path)?;
             tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+            let access_token = write_access_token(&path)?;
             let metadata = tokio::fs::symlink_metadata(&path).await?;
             Ok(Self {
                 path,
@@ -1180,6 +1382,7 @@ mod transport {
                 listener,
                 runtime,
                 local_waiters,
+                access_token,
                 _lock: lock,
             })
         }
@@ -1206,22 +1409,38 @@ mod transport {
                     _ = shutdown.cancelled() => break,
                     _ = reap.tick() => reap_finished_connections(&mut tasks),
                     accepted = self.listener.accept() => {
-                        let (stream, _) = accepted?;
+                        let (mut stream, _) = accepted?;
                         let runtime = self.runtime.clone();
                         let connection_shutdown = child_shutdown.clone();
                         let waiters = self.local_waiters.clone();
+                        let token = self.access_token.clone();
                         tasks.spawn(async move {
-                            // The per-repo Unix socket is the trusted-local transport.
-                            if let Err(error) = handle_connection(
-                                stream,
-                                runtime,
-                                connection_shutdown,
-                                waiters,
-                                /*transport_trusted*/ true,
-                            )
-                            .await
-                            {
-                                tracing::debug!(%error, "local socket connection ended");
+                            match authenticate_local_peer(&mut stream, &token).await {
+                                Ok(()) => {
+                                    // The per-repo Unix socket is the
+                                    // trusted-local transport only after the
+                                    // peer proved it can read this runtime's
+                                    // token.
+                                    if let Err(error) = handle_connection(
+                                        stream,
+                                        runtime,
+                                        connection_shutdown,
+                                        waiters,
+                                        /*transport_trusted*/ true,
+                                    )
+                                    .await
+                                    {
+                                        tracing::debug!(%error, "local socket connection ended");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "refused unauthenticated local client");
+                                    let _ = send_result(
+                                        &mut stream,
+                                        Err(ClientError::Runtime(error.to_string())),
+                                    )
+                                    .await;
+                                }
                             }
                         });
                         // One request per connection: a burst must not wait for
@@ -1630,6 +1849,7 @@ mod transport {
                         | ClientCommand::QueryDiagnostics { .. }
                         | ClientCommand::QuerySettings { .. }
                         | ClientCommand::ManageMcp { .. }
+                        | ClientCommand::ManageSchedule { .. }
                 )
             {
                 return Err(ClientError::Runtime(
@@ -1665,6 +1885,7 @@ mod transport {
                         | ClientCommand::QueryDiagnostics { .. }
                         | ClientCommand::QuerySettings { .. }
                         | ClientCommand::ManageMcp { .. }
+                        | ClientCommand::ManageSchedule { .. }
                 )
             {
                 return Err(ClientError::Runtime(
@@ -1761,8 +1982,9 @@ mod transport {
         }
     }
 
-    /// How a client reaches the runtime. A Unix client trusts the socket file's
-    /// `0600` perms; a TCP client presents a bearer token on every connection.
+    /// How a client reaches the runtime. Every local connection presents the
+    /// runtime's access token; a TCP client presents a bearer token on every
+    /// connection as well.
     #[derive(Clone)]
     enum Endpoint {
         #[cfg(unix)]
@@ -1782,11 +2004,22 @@ mod transport {
     #[cfg(windows)]
     type ClientStream = Either<NamedPipeClient, TcpStream>;
 
-    /// Open (and, for TCP, authenticate) one connection to the endpoint.
+    /// Open (and authenticate) one connection to the endpoint.
     async fn connect_endpoint(endpoint: &Endpoint) -> Result<ClientStream, TransportError> {
         match endpoint {
             #[cfg(unix)]
-            Endpoint::Unix(path) => Ok(Either::Left(UnixStream::connect(path).await?)),
+            Endpoint::Unix(path) => {
+                let token = read_access_token(path)?;
+                let mut stream = UnixStream::connect(path).await?;
+                write_frame(&mut stream, &ProtocolEnvelope::wrap(Handshake { token })).await?;
+                match read_frame::<WireResponse>(&mut stream).await?.into_body()? {
+                    WireResponse::Ack => Ok(Either::Left(stream)),
+                    WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
+                    other => Err(TransportError::Unavailable(format!(
+                        "unexpected local handshake response: {other:?}"
+                    ))),
+                }
+            }
             #[cfg(windows)]
             Endpoint::Windows(path) => Ok(Either::Left(connect_windows(path).await?)),
             Endpoint::Tcp { addr, token } => {
@@ -2612,6 +2845,175 @@ mod tests {
 
     use super::*;
 
+    /// Install the token a real client reads before connecting to a fake Unix
+    /// daemon. The fake daemon still has to acknowledge the handshake.
+    #[cfg(unix)]
+    fn install_test_token(path: &Path) -> String {
+        let token = "a".repeat(64);
+        std::fs::write(path.with_extension("token"), &token).unwrap();
+        token
+    }
+
+    #[cfg(unix)]
+    async fn read_json_frame(stream: &mut tokio::net::UnixStream) -> serde_json::Value {
+        use tokio::io::AsyncReadExt as _;
+        let length = stream.read_u32().await.unwrap() as usize;
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn write_json_frame(stream: &mut tokio::net::UnixStream, value: serde_json::Value) {
+        use tokio::io::AsyncWriteExt as _;
+        let bytes = serde_json::to_vec(&value).unwrap();
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn write_ack(stream: &mut tokio::net::UnixStream) {
+        write_json_frame(
+            stream,
+            serde_json::json!({
+                "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+                "body": {"type": "ack"}
+            }),
+        )
+        .await;
+    }
+
+    /// Read the handshake a current client sends, acknowledge it, and return
+    /// the first real request. A legacy client that skips the handshake is read
+    /// as its request directly, so these fake daemons keep their old wire shape.
+    #[cfg(unix)]
+    async fn read_request_after_handshake(
+        stream: &mut tokio::net::UnixStream,
+    ) -> serde_json::Value {
+        let request = read_json_frame(stream).await;
+        if request
+            .get("body")
+            .and_then(|body| body.get("token"))
+            .is_some()
+        {
+            write_ack(stream).await;
+            return read_json_frame(stream).await;
+        }
+        request
+    }
+
+    /// Connect as a current client to a real test server.
+    #[cfg(unix)]
+    async fn connect_authenticated(path: &Path) -> tokio::net::UnixStream {
+        use tokio::io::AsyncReadExt as _;
+        let token = std::fs::read_to_string(path.with_extension("token")).unwrap();
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        write_json_frame(
+            &mut stream,
+            serde_json::json!({
+                "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+                "body": {"token": token}
+            }),
+        )
+        .await;
+        let length = stream.read_u32().await.unwrap() as usize;
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["body"]["type"], "ack", "{response}");
+        stream
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_client_must_present_the_runtime_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sock");
+        let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+        let token_path = path.with_extension("token");
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the token must not be group/other readable"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the socket keeps its 0600 mode"
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the socket directory is private"
+        );
+
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+
+        // A legacy client that skips the handshake reaches no runtime handler.
+        let mut legacy = tokio::net::UnixStream::connect(&path).await.unwrap();
+        write_json_frame(
+            &mut legacy,
+            serde_json::json!({
+                "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+                "body": {"type": "ping"}
+            }),
+        )
+        .await;
+        let reply = read_json_frame(&mut legacy).await;
+        assert_eq!(reply["body"]["type"], "error", "{reply}");
+        assert!(
+            reply["body"]["body"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("authenticate"),
+            "{reply}"
+        );
+
+        // A wrong token is refused without naming the expected value.
+        let mut wrong = tokio::net::UnixStream::connect(&path).await.unwrap();
+        write_json_frame(
+            &mut wrong,
+            serde_json::json!({
+                "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+                "body": {"token": "b".repeat(64)}
+            }),
+        )
+        .await;
+        let reply = read_json_frame(&mut wrong).await;
+        assert_eq!(reply["body"]["type"], "error", "{reply}");
+        assert!(
+            !reply.to_string().contains(&token),
+            "the refusal must not echo the valid token"
+        );
+
+        // The real client handshake still works and reaches the runtime.
+        let mut authenticated = connect_authenticated(&path).await;
+        write_json_frame(
+            &mut authenticated,
+            serde_json::json!({
+                "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+                "body": {"type": "ping"}
+            }),
+        )
+        .await;
+        let reply = read_json_frame(&mut authenticated).await;
+        assert_eq!(reply["body"]["type"], "ack", "{reply}");
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn a_completed_connection_task_is_reaped_instead_of_held_forever() {
         let mut tasks = tokio::task::JoinSet::new();
@@ -2994,10 +3396,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn explicit_none_cannot_be_silently_downgraded_by_legacy_daemon() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let _ = install_test_token(&path);
         let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = creates.clone();
         let shutdown = CancellationToken::new();
@@ -3009,10 +3412,7 @@ mod tests {
                     _ = stop.cancelled() => return,
                     accepted = listener.accept() => accepted.unwrap(),
                 };
-                let length = stream.read_u32().await.unwrap() as usize;
-                let mut bytes = vec![0; length];
-                stream.read_exact(&mut bytes).await.unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let request = read_request_after_handshake(&mut stream).await;
                 let kind = request["body"]["type"].as_str().unwrap();
                 if kind != "subscribe" {
                     observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3065,10 +3465,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn identified_creation_is_refused_by_legacy_daemon_without_fallback() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let _ = install_test_token(&path);
         let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = creates.clone();
         let shutdown = CancellationToken::new();
@@ -3080,10 +3481,7 @@ mod tests {
                     _ = stop.cancelled() => return,
                     accepted = listener.accept() => accepted.unwrap(),
                 };
-                let length = stream.read_u32().await.unwrap() as usize;
-                let mut bytes = vec![0; length];
-                stream.read_exact(&mut bytes).await.unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let request = read_request_after_handshake(&mut stream).await;
                 let kind = request["body"]["type"].as_str().unwrap();
                 if kind != "subscribe" {
                     observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3136,10 +3534,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn versioned_setting_is_refused_by_legacy_daemon_without_effect_or_fallback() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let _ = install_test_token(&path);
         let renames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = renames.clone();
         let shutdown = CancellationToken::new();
@@ -3151,10 +3550,7 @@ mod tests {
                     _ = stop.cancelled() => return,
                     accepted = listener.accept() => accepted.unwrap(),
                 };
-                let length = stream.read_u32().await.unwrap() as usize;
-                let mut bytes = vec![0; length];
-                stream.read_exact(&mut bytes).await.unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let request = read_request_after_handshake(&mut stream).await;
                 let kind = request["body"]["type"].as_str().unwrap();
                 if kind != "subscribe" {
                     observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3248,7 +3644,7 @@ mod tests {
             let request =
                 ProtocolEnvelope::wrap(serde_json::json!({ "type": verb, "body": envelope }));
             let bytes = serde_json::to_vec(&request).unwrap();
-            let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+            let mut stream = connect_authenticated(&path).await;
             stream.write_u32(bytes.len() as u32).await.unwrap();
             stream.write_all(&bytes).await.unwrap();
             let len = stream.read_u32().await.unwrap();
@@ -3318,7 +3714,7 @@ mod tests {
         let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(server.serve(shutdown.clone()));
-        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let mut stream = connect_authenticated(&path).await;
         let mut envelope = serde_json::json!({"protocol":leveler_client_protocol::PROTOCOL_VERSION,"body":{"type":"snapshot","body":{"session_id":"s1"}}});
         if capable {
             envelope["capabilities"] = serde_json::json!(["optional_workspace"]);
@@ -3443,6 +3839,44 @@ mod tests {
                 .deliver(CommandEnvelope {
                     command_id: leveler_client_protocol::CommandId::new("diag-tcp-deliver"),
                     session_id: session,
+                    expected_version: None,
+                    issued_at: "now".into(),
+                    command,
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted local")
+        );
+        assert!(runtime.commands.lock().unwrap().is_empty());
+        assert!(runtime.deliveries.lock().unwrap().is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn tcp_scheduler_management_is_refused_and_never_reaches_the_runtime() {
+        let (addr, runtime, shutdown) = tcp_server("scheduler-token").await;
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, "scheduler-token")
+            .await
+            .unwrap();
+        let command = ClientCommand::ManageSchedule {
+            requester_session_id: SessionId::new("s1"),
+            query_id: leveler_client_protocol::CommandId::new("schedule-tcp"),
+            request: Box::new(leveler_client_protocol::schedule::ScheduleRequest::Status),
+        };
+        assert!(
+            client
+                .send(command.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted local")
+        );
+        assert!(
+            client
+                .deliver(CommandEnvelope {
+                    command_id: leveler_client_protocol::CommandId::new("schedule-tcp-deliver"),
+                    session_id: SessionId::new("s1"),
                     expected_version: None,
                     issued_at: "now".into(),
                     command,

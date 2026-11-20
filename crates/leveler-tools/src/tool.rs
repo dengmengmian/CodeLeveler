@@ -588,11 +588,134 @@ impl ToolContext {
                  definitions with `leveler trust`; file tools cannot write this path."
             ));
         }
+        if leveler_definition_trust::is_runtime_control_path(&home, &absolute) {
+            return Some(format!(
+                "`{path}` is the runtime control namespace, a security control. File \
+                 tools cannot write or replace its socket, lock or credential."
+            ));
+        }
         if same_path(&absolute, &leveler_execution::trust_store_path(&home)) {
             return Some(format!(
                 "`{path}` is the in-repo configuration trust store, a security control. \
                  Use `leveler trust`; file tools cannot write this path."
             ));
+        }
+        None
+    }
+
+    /// Whether `path` names a runtime control a sandboxed agent must not read.
+    ///
+    /// The daemon's access token lives beside its Unix socket. A tool that read
+    /// it would let the model authenticate to the trusted-local runtime as the
+    /// user, so this refusal is independent of any filesystem resource grant.
+    /// FullAccess keeps its documented authority: that mode is the user opting
+    /// out of the restricted-execution threat model.
+    pub(crate) fn security_control_read_denied(&self, path: &str) -> Option<String> {
+        if self.policy.unrestricted_execution() {
+            return None;
+        }
+        let home = leveler_core::LevelerHome::resolve(&self.execution.environment)
+            .root()
+            .to_path_buf();
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            let Ok(workspace) = self.execution_workspace() else {
+                return None;
+            };
+            workspace.root().join(raw)
+        };
+        if leveler_definition_trust::is_runtime_control_path(&home, &absolute) {
+            return Some(format!(
+                "`{path}` is the runtime control namespace. Reading it would expose the \
+                 trusted-local daemon credential; file tools cannot read this path."
+            ));
+        }
+        None
+    }
+
+    /// Whether `path` is skill instruction content that may only be admitted
+    /// through the approval-bound package loader.
+    ///
+    /// `SKILL.md` and everything under a skill's `references/` tree are what the
+    /// trust approval binds. Reading them by path would hand the model bytes
+    /// that were not re-checked against the package digest, and would turn an
+    /// approved procedure into an unverified second-level read. `load_skill`
+    /// returns the verified text instead. Scripts and assets stay ordinary tool
+    /// resources; they are not instruction content.
+    pub(crate) fn skill_content_read_denied(&self, path: &str) -> Option<String> {
+        if self.policy.unrestricted_execution() {
+            return None;
+        }
+        let workspace = self.execution_workspace().ok();
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.as_ref()?.root().join(raw)
+        };
+        let canonical = absolute.canonicalize().unwrap_or(absolute);
+        let environment = &self.execution.environment;
+        let project_root = workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+            .unwrap_or_default();
+        let roots = leveler_skills::SkillRoots::for_project_in(&project_root, &|key| {
+            environment.var_os(key)
+        });
+        // Windows path identity is case-insensitive. Fold both sides for the
+        // containment test so a differently-cased spelling cannot slip past
+        // the reference guard.
+        let fold = |path: &std::path::Path| {
+            // Windows and the default macOS filesystems are case-insensitive.
+            // Fold for containment so a different casing cannot name the same
+            // skill file while slipping past the guard.
+            if cfg!(any(windows, target_os = "macos")) {
+                std::path::PathBuf::from(path.to_string_lossy().to_lowercase())
+            } else {
+                path.to_path_buf()
+            }
+        };
+        let canonical = fold(&canonical);
+        for root in roots.roots() {
+            let Ok(base) = root.dir.canonicalize() else {
+                continue;
+            };
+            let base = fold(&base);
+            let Ok(relative) = canonical.strip_prefix(&base) else {
+                continue;
+            };
+            let mut components = relative.components();
+            let Some(skill) = components.next() else {
+                continue;
+            };
+            let Some(skill) = skill.as_os_str().to_str() else {
+                continue;
+            };
+            if skill.is_empty() {
+                continue;
+            }
+            let file = components
+                .next()
+                .and_then(|part| part.as_os_str().to_str())
+                .map(|name| {
+                    if cfg!(any(windows, target_os = "macos")) {
+                        name.to_lowercase()
+                    } else {
+                        name.to_string()
+                    }
+                });
+            if file.as_deref() == Some("references")
+                || file.as_deref() == Some("SKILL.md")
+                || (cfg!(any(windows, target_os = "macos")) && file.as_deref() == Some("skill.md"))
+            {
+                return Some(format!(
+                    "`{path}` is approval-bound skill instruction content. Read the skill by \
+                     name with `load_skill` so the package digest is verified; file tools cannot \
+                     serve an unverified second-level reference."
+                ));
+            }
         }
         None
     }

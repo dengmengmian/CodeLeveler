@@ -103,6 +103,9 @@ impl Tool for GrepTool {
         let rel = input.path.clone().unwrap_or_else(|| ".".to_string());
         let workspace = context.execution_workspace()?;
         let search_root = workspace.resolve_for_read(&rel)?;
+        if let Some(reason) = context.security_control_read_denied(&search_root.to_string_lossy()) {
+            return Ok(ToolOutput::error(reason));
+        }
         let confine = workspace.reads_confined().then(|| workspace.clone());
         if let Err(reason) = crate::memory_access::validate_read(&context, &search_root) {
             return Ok(ToolOutput::error(reason));
@@ -116,7 +119,7 @@ impl Tool for GrepTool {
             include: input.include,
             limit,
         };
-        let result = match WorkspaceSearch::grep(
+        let mut result = match WorkspaceSearch::grep(
             &search_root,
             context.require_workspace()?.root(),
             &query,
@@ -140,6 +143,13 @@ impl Tool for GrepTool {
             Err(SearchError::Cancelled) => return Ok(ToolOutput::error("grep cancelled")),
             Err(other) => return Err(ToolError::Io(format!("grep {rel}: {other:?}"))),
         };
+
+        // Recursive search must not be a side door around `load_skill`: an
+        // approval-bound skill file is dropped from the result exactly like a
+        // direct read is refused.
+        result
+            .matches
+            .retain(|matched| context.skill_content_read_denied(&matched.path).is_none());
 
         let mut body = String::new();
         let workspace_root = context.require_workspace()?.root().to_path_buf();
@@ -345,5 +355,29 @@ mod tests {
         )
         .await;
         assert_eq!(out.content.lines().count(), 2, "{}", out.content);
+    }
+
+    /// A recursive search is not a side door around `load_skill`: an
+    /// approval-bound reference match is dropped from the result.
+    #[tokio::test]
+    async fn a_skill_reference_match_is_dropped() {
+        let dir = tempfile::Builder::new()
+            .prefix("leveler-grep-skill-")
+            .tempdir()
+            .unwrap();
+        let reference = dir.path().join(".codex/skills/demo/references/guide.md");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::write(&reference, "REFERENCE-NEEDLE\n").unwrap();
+        std::fs::write(dir.path().join("ordinary.md"), "ORDINARY-NEEDLE\n").unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = grep(&ctx, serde_json::json!({"pattern": "NEEDLE", "path": "."})).await;
+        assert!(out.content.contains("ordinary.md"), "{}", out.content);
+        assert!(
+            !out.content.contains("REFERENCE-NEEDLE"),
+            "skill reference content must not surface through grep: {}",
+            out.content
+        );
+        assert!(!out.content.contains("guide.md"), "{}", out.content);
     }
 }

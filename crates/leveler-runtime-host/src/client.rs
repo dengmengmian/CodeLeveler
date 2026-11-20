@@ -124,6 +124,22 @@ enum EndpointProbe {
 async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe, TransportError> {
     match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
         Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
+        Ok(Err(TransportError::Io(error))) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A tokenless endpoint can mean two very different things. If a
+            // listener accepts, it is an older runtime that predates the
+            // trusted-local credential: report the migration fact instead of
+            // treating it as absent and racing a second bind. If nothing
+            // accepts, this is an ordinary stale socket.
+            #[cfg(unix)]
+            if tokio::net::UnixStream::connect(path).await.is_ok() {
+                return Err(TransportError::Unavailable(format!(
+                    "a local runtime at {} predates the access token; stop it and restart \
+                     from this build",
+                    path.display()
+                )));
+            }
+            Ok(EndpointProbe::Absent)
+        }
         Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
             tracing::debug!(%error, socket = %path.display(), "skipping unavailable local runtime");
             Ok(EndpointProbe::Absent)
@@ -1492,6 +1508,7 @@ mod probe_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stall.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::write(path.with_extension("token"), "a".repeat(64)).unwrap();
         let server = tokio::spawn(async move {
             let mut connections = Vec::new();
             loop {
@@ -2007,6 +2024,7 @@ mod generation_attach_tests {
         let socket = layout.socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::write(socket.with_extension("token"), "a".repeat(64)).unwrap();
         let serving = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let len = stream.read_u32().await.unwrap();
