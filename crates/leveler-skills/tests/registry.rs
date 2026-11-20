@@ -835,13 +835,20 @@ fn a_symlinked_reference_makes_the_skill_invalid() {
         &SkillRoots::for_project(&project),
         &DefinitionTrustView::trust_everything_for_tests(),
     );
-    assert!(registry.get("guide").is_none());
-    let problems = registry.problems();
+    let entry = registry
+        .get("guide")
+        .expect("a package with a symlinked reference is invalid, not missing");
     assert!(
-        problems
-            .iter()
-            .any(|problem| problem.error.contains("symlink")),
-        "{problems:?}"
+        entry
+            .invalid_reason()
+            .is_some_and(|reason| reason.contains("symlink")),
+        "{:?}",
+        registry.entries()
+    );
+    assert!(
+        registry.problems().is_empty(),
+        "a bad reference is an invalid skill, not a missing one: {:?}",
+        registry.problems()
     );
 }
 
