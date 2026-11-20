@@ -180,13 +180,19 @@ pub async fn wait_for_owned_runtime(
     let mut waited = Duration::ZERO;
     loop {
         if let Ok(bytes) = std::fs::read(ready_path) {
-            let ready: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(OwnedRuntimeError::InvalidReadyJson)?;
-            let socket = ready
-                .get("socket")
-                .and_then(|value| value.as_str())
-                .ok_or(OwnedRuntimeError::MissingSocket)?;
-            return Ok(PathBuf::from(socket));
+            // A writer that creates the file before filling it leaves a
+            // readable empty file for one poll. That is "not ready yet", not a
+            // broken contract; a non-empty file that does not parse still
+            // fails immediately.
+            if !bytes.is_empty() {
+                let ready: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(OwnedRuntimeError::InvalidReadyJson)?;
+                let socket = ready
+                    .get("socket")
+                    .and_then(|value| value.as_str())
+                    .ok_or(OwnedRuntimeError::MissingSocket)?;
+                return Ok(PathBuf::from(socket));
+            }
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(OwnedRuntimeError::ChildExited(status));
@@ -266,6 +272,28 @@ mod tests {
             wait_for_owned_runtime(&path, &mut child).await,
             Err(OwnedRuntimeError::MissingSocket)
         ));
+        let _ = child.start_kill();
+    }
+
+    #[tokio::test]
+    async fn an_empty_ready_file_is_not_a_finished_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ready.json");
+        let mut child = sleeping_child();
+        // The ready file is created before its JSON is written. A poll that
+        // lands in that window reads zero bytes; that is "not ready yet", not
+        // a broken contract. The observed launch failure was exactly this EOF.
+        std::fs::write(&path, b"").unwrap();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::write(&writer_path, br#"{"socket":"/tmp/codeleveler.sock"}"#).unwrap();
+        });
+        assert_eq!(
+            wait_for_owned_runtime(&path, &mut child).await.unwrap(),
+            PathBuf::from("/tmp/codeleveler.sock")
+        );
+        writer.join().unwrap();
         let _ = child.start_kill();
     }
 

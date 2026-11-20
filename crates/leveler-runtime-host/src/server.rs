@@ -138,10 +138,48 @@ pub async fn prepare_daemon(
     }
     if let Some(path) = ready_path {
         let ready = ready_json(socket_path, bound.tcp.as_ref(), runtime_id.as_str())?;
-        std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;
+        publish_ready_json(path, &serde_json::to_vec_pretty(&ready)?)?;
     }
     Ok(PreparedDaemon {
         bound,
         runtime_id: runtime_id.to_string(),
     })
+}
+
+/// Publish the readiness file in one step.
+///
+/// The parent polls this path while the daemon starts and treats a created but
+/// unparseable file as a failed launch. A plain `std::fs::write` truncates
+/// before it writes, so a poll in that window reads zero bytes and the launch
+/// fails on a healthy daemon. Writing beside the target and renaming means the
+/// path is either absent or complete.
+fn publish_ready_json(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the readiness path has no parent directory",
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the readiness path has no file name",
+            )
+        })?;
+    let staged = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&staged, path)
 }
