@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.0.28] - 2026-11-21
+
 - Trusted Definition Security Model 1.0 is the formal cross-platform contract: unapproved definitions never enter the harness's authority context, and approval binds the exact content version. A skill's approval now covers `SKILL.md` plus its whole `references/` tree with a composite SHA-256; editing, adding or deleting a reference invalidates it. `load_skill` returns the verified reference text inline, and restricted file tools (including recursive search) refuse direct path reads of that content. Existing single-file skill approvals re-appear as `changed` and need one re-approval.
 - The Unix runtime control socket now requires a per-runtime random access token in addition to its `0600` mode. The token is `0600` beside the socket in a `0700` directory, hidden from confined commands by Seatbelt read-denial or a bubblewrap tmpfs, and Linux additionally refuses peers outside the runtime's mount namespace. File tools refuse the control namespace. `ManageSchedule` is now trusted-local-only over TCP as well. Windows keeps its named-pipe ACL boundary; FullAccess remains the documented user-authority boundary.
 - Windows missing protected-path creation remains a known OS limitation under the new contract: a confined shell can still create a previously missing `AGENTS.md`/`.leveler` tree, but it is never admitted without approval and existing protected objects keep their OS fences.
@@ -47,6 +49,17 @@
 - A review honors the repository's existing `[limits]` token and cost caps and shares them with every investigation; a child cannot start a fresh budget. Review reads are opened through the workspace capability handle, so a path swapped between resolution and open cannot escape the reviewed workspace.
 - Automatic review is retired. A legacy `agents.independent_review: required` still loads but no longer starts a review at turn, goal, commit or delivery settlement. Explicit test/eval settings and crash recovery of a review that was already unsettled are unchanged.
 - macOS and Linux release archives are published as `.tar.xz`, about 40% smaller than the previous `.tar.gz`. `install.sh`, the Homebrew formula and `leveler update` fetch the xz archive; the `.tar.gz` sibling stays so a binary released before this change can still update itself, and both `install.sh` and `leveler update --version <old tag>` fall back to it for releases that predate the switch.
+- The legacy Web UI and the `leveler web` / `/web` entry points are retired. The terminal UI, CLI and the desktop client remain; release archives no longer carry the web bundle.
+- Daemon startup publishes the access token before the socket endpoint and writes the ready file atomically, so a client that observes readiness can connect. A startup stress gate holds the contract.
+- A goal's objective is one stable identity through crash recovery and context fold. Several deliverables are treated as multi-step work, the adopted objective is rebound instead of duplicated, and the pre-dispatch crash window is covered.
+- Completion evidence is matched to the argv that actually ran, including when the model cites a run by its display label. A requirement's mechanical kind is frozen once owed, new user words can lower a requirement but not silently raise it, and the terminal summary the schema promises is required.
+- Model usage is recorded once per physical attempt, so a retried stream cannot double-count a request.
+- A turn after a restart reads its context before acting, not only when the user explicitly resumed, and a first turn's own message is distinguished from prior work.
+- The TUI adds transcript search with turn navigation, protects running work on exit, rebuilds the MCP, project settings and help pages, and neutralizes bidi overrides in search snippets.
+- A cached MCP connection is dropped when its declaration changes, so an edited server entry cannot keep serving the previous process.
+- The schedule manager publishes the policy values it accepts, and the Windows logon trigger is registered for the current user.
+- Windows keeps a persistent execution host and shares write-root leases across CodeLeveler processes, so concurrent confined commands agree on the same write boundary.
+- Private user data is stored owner-only on disk.
 
 ## [1.0.27] - 2026-11-15
 

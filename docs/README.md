@@ -23,7 +23,6 @@
 
 ## Reference and project resources
 
-- [Goal scope contract](GOAL_SCOPE.md) · [User intent contract](INTENT_CONTRACT.md)
 - [Permissions, privacy, and security reporting](../SECURITY.md)
 - [Release notes](RELEASE.md) · [Full changelog](../CHANGELOG.md) · [Release downloads](https://github.com/dengmengmian/CodeLeveler/releases)
 - [Contributing guide](../CONTRIBUTING.md) · [Coding agent instructions](../AGENTS.md)
