@@ -201,11 +201,30 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
             Ok(EndpointProbe::Absent)
         }
         Ok(Err(TransportError::PeerClosed)) => {
-            // The peer accepted the connection and dropped it without a single
-            // response byte after receiving the handshake. A current runtime
-            // answers every handshake (an invalid token is an Error reply), so
-            // this is a listener that does not speak the handshake at all.
-            Err(TransportError::PredatesAccessToken(path.to_path_buf()))
+            // A peer that closes the handshake may be a live pre-token runtime
+            // that cannot decode it, or a current runtime that died while this
+            // call was in flight. One close cannot tell them apart: an
+            // accepted-then-killed listener produces the same EOF. Only a peer
+            // that accepts a second connection proves it is still alive and
+            // therefore that the close is a capability statement.
+            match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
+                Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
+                Ok(Err(TransportError::PeerClosed)) => {
+                    Err(TransportError::PredatesAccessToken(path.to_path_buf()))
+                }
+                Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
+                    // The listener is gone: the first close was a runtime
+                    // dying, not a runtime that refuses the handshake.
+                    Ok(EndpointProbe::Absent)
+                }
+                Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => {
+                    Ok(EndpointProbe::NoAnswer {
+                        timeout: Duration::from_millis(timeout_ms),
+                    })
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Ok(EndpointProbe::NoAnswer { timeout }),
+            }
         }
         Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => Ok(EndpointProbe::NoAnswer {
             timeout: Duration::from_millis(timeout_ms),
@@ -1715,11 +1734,19 @@ mod probe_tests {
     /// listening" — a startup failure that hid the only actionable fact.
     #[tokio::test]
     async fn a_live_listener_without_a_credential_predates_the_token() {
+        use tokio::io::AsyncReadExt;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let serving = tokio::spawn(async move {
-            let _ = listener.accept().await;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut frame = [0u8; 256];
+                let _ = stream.read(&mut frame).await;
+            }
         });
         let error = probe_endpoint(&path, Duration::from_millis(500))
             .await
@@ -1734,7 +1761,8 @@ mod probe_tests {
     /// A `.token` left behind by a stopped runtime is not proof that the live
     /// listener speaks the current handshake. A pre-token runtime reads the
     /// envelope, does not understand `handshake`, and closes without answering;
-    /// that EOF must not be folded into "nobody is listening".
+    /// that EOF must not be folded into "nobody is listening" as long as the
+    /// listener keeps accepting connections.
     #[tokio::test]
     async fn a_peer_that_closes_on_the_handshake_is_not_an_absent_endpoint() {
         use tokio::io::AsyncReadExt;
@@ -1743,18 +1771,64 @@ mod probe_tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         std::fs::write(path.with_extension("token"), "c".repeat(64)).unwrap();
         let serving = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut frame = [0u8; 256];
-            let _ = stream.read(&mut frame).await;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut frame = [0u8; 256];
+                let _ = stream.read(&mut frame).await;
+            }
         });
         let error = probe_endpoint(&path, Duration::from_millis(500))
             .await
             .err();
-        serving.await.unwrap();
+        serving.abort();
         assert!(
             matches!(&error, Some(TransportError::PredatesAccessToken(reported)) if reported == &path),
             "a peer that closes on the handshake must be a typed legacy fact, got {error:?}"
         );
+    }
+
+    /// A current runtime killed while a probe was in flight accepts the
+    /// connection and then disappears without answering. That EOF is not a
+    /// capability statement: the endpoint is absent, and startup must be able
+    /// to spawn its replacement instead of refusing with an upgrade message
+    /// about a runtime that no longer exists.
+    #[tokio::test]
+    async fn a_peer_that_died_after_accepting_the_handshake_is_an_absent_endpoint() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crashed.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::write(path.with_extension("token"), "d".repeat(64)).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut frame = [0u8; 256];
+            let _ = stream.read(&mut frame).await;
+            // The runtime died with the call in flight: the endpoint stops
+            // accepting before the in-flight connection ends without a reply.
+            drop(listener);
+            drop(stream);
+        });
+        let outcome = probe_endpoint(&path, Duration::from_millis(500)).await;
+        serving.await.unwrap();
+        match outcome {
+            Ok(EndpointProbe::Absent) => {}
+            Ok(EndpointProbe::Ready(_)) => {
+                panic!("a runtime that died after accepting must not be adopted")
+            }
+            Ok(EndpointProbe::NoAnswer { .. }) => {
+                panic!("a runtime that died after accepting is absent, not unanswered")
+            }
+            Ok(EndpointProbe::NotReady) => {
+                panic!("a runtime that died after accepting is absent, not starting")
+            }
+            Err(error) => panic!(
+                "a runtime that died after accepting must not be reported as a live \
+                 pre-token runtime: {error}"
+            ),
+        }
     }
 
     /// The drain budget is a policy with exactly one surprising value: `0`
