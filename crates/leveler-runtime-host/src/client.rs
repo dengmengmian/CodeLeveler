@@ -103,21 +103,64 @@ async fn connect_within(
     match probe_endpoint(path, timeout).await? {
         EndpointProbe::Ready(client) => Ok(Some(client)),
         EndpointProbe::Absent | EndpointProbe::NoAnswer { .. } => Ok(None),
+        #[cfg(unix)]
+        EndpointProbe::NotReady => Ok(None),
+    }
+}
+
+/// Test-only seam for the credential-publication race.
+///
+/// The window being modelled is BETWEEN a failed credential read and the
+/// liveness connect that follows it. A test installs a one-shot action that
+/// publishes the credential and binds the listener during that window; no
+/// production build contains this module or the call site it serves.
+#[cfg(all(test, unix))]
+mod credential_race_hook {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    type Action = Box<dyn Fn(&Path) + Send + Sync + 'static>;
+
+    static ACTION: Mutex<Option<Action>> = Mutex::new(None);
+
+    pub(super) fn install(action: Action) {
+        *ACTION.lock().unwrap() = Some(action);
+    }
+
+    pub(super) fn clear() {
+        *ACTION.lock().unwrap() = None;
+    }
+
+    pub(super) fn fire(path: &Path) {
+        let action = ACTION.lock().unwrap();
+        if let Some(action) = action.as_ref() {
+            action(path);
+        }
     }
 }
 
 /// What a bounded connect learned about an endpoint.
 ///
-/// `Absent` and `NoAnswer` are deliberately distinct: a refused connection is
-/// proof that nothing owns the endpoint, while a connection that is accepted
-/// and then never completes the handshake proves the opposite — somebody is
-/// listening, it just did not answer. Callers that report a failure must not
-/// collapse the second fact into the first.
+/// `Absent`, `NotReady` and `NoAnswer` are deliberately distinct: a refused
+/// connection is proof that nothing owns the endpoint; a listener whose
+/// credential was published while the probe was running is a runtime that is
+/// still starting; and a connection that is accepted and then never completes
+/// the handshake proves somebody is listening but did not answer. Callers that
+/// report a failure must not collapse these facts into one another.
 #[cfg(any(unix, windows))]
 enum EndpointProbe {
     Ready(LocalSocketRuntimeClient),
     Absent,
-    NoAnswer { timeout: Duration },
+    /// A listener is live and its credential was published while this probe
+    /// was running. The runtime is starting, not absent and not legacy; the
+    /// caller's bounded wait owns the next observation. The credential file
+    /// only exists on Unix local sockets, so only that platform can observe
+    /// this state.
+    #[cfg(unix)]
+    NotReady,
+    NoAnswer {
+        timeout: Duration,
+    },
 }
 
 #[cfg(any(unix, windows))]
@@ -125,18 +168,29 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
     match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
         Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
         Ok(Err(TransportError::Io(error))) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A tokenless endpoint can mean two very different things. If a
-            // listener accepts, it is an older runtime that predates the
-            // trusted-local credential: report the migration fact instead of
-            // treating it as absent and racing a second bind. If nothing
+            // A tokenless endpoint can mean three different things. If a
+            // listener accepts AND the credential is still missing, it is an
+            // older runtime that predates the trusted-local credential:
+            // report the migration fact instead of treating it as absent and
+            // racing a second bind. If the credential appeared between that
+            // read and this connect, it is a runtime that is starting right
+            // now — its bind sequence installs the credential first, so a
+            // visible listener can always be authenticated. If nothing
             // accepts, this is an ordinary stale socket.
             #[cfg(unix)]
-            if tokio::net::UnixStream::connect(path).await.is_ok() {
-                return Err(TransportError::Unavailable(format!(
-                    "a local runtime at {} predates the access token; stop it and restart \
-                     from this build",
-                    path.display()
-                )));
+            {
+                #[cfg(test)]
+                credential_race_hook::fire(path);
+                if tokio::net::UnixStream::connect(path).await.is_ok() {
+                    if leveler_local_transport::access_token_is_published(path)? {
+                        return Ok(EndpointProbe::NotReady);
+                    }
+                    return Err(TransportError::Unavailable(format!(
+                        "a local runtime at {} predates the access token; stop it and restart \
+                         from this build",
+                        path.display()
+                    )));
+                }
             }
             Ok(EndpointProbe::Absent)
         }
@@ -445,7 +499,8 @@ pub struct DetachedRuntimeLaunch {
 #[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupObservation {
-    /// Our child is alive and has not published readiness yet.
+    /// A runtime holds the endpoint but has not published readiness yet.
+    /// Usually our child; after an election loss it is the winner.
     Starting,
     /// Readiness was published but the endpoint did not answer the handshake.
     /// The process is NOT proven dead, so nothing may be killed or replaced on
@@ -1169,6 +1224,13 @@ pub async fn ensure_default_runtime(
                 match probe_endpoint(&socket_path, probe).await? {
                     EndpointProbe::Ready(client) => break client,
                     EndpointProbe::Absent => observation = StartupObservation::ChildExited,
+                    // A listener whose credential was published mid-probe is
+                    // another runtime still starting (typically the winner of
+                    // this election). The ensure deadline owns the verdict;
+                    // an immediate hard failure would turn a healthy start
+                    // into a transport error.
+                    #[cfg(unix)]
+                    EndpointProbe::NotReady => observation = StartupObservation::Starting,
                     EndpointProbe::NoAnswer { timeout } => {
                         return Err(TransportError::NoAnswer {
                             operation: "the startup handshake",
@@ -1527,6 +1589,57 @@ mod probe_tests {
 
     // The platform-independent endpoint classification test lives in
     // `endpoint_classification_tests`, so it also runs on Windows.
+
+    /// A runtime publishes its access token BEFORE it binds the socket, so a
+    /// listener that is visible can always be authenticated. The probe still
+    /// has a two-step observation (read the credential, then connect), and a
+    /// credential published between those two steps used to be reported as a
+    /// runtime that predates the token — a hard startup failure.
+    ///
+    /// The hook fires exactly between the failed read and the liveness
+    /// connect, so the interleaving is deterministic rather than timed.
+    #[tokio::test]
+    async fn a_credential_published_during_the_probe_is_not_a_legacy_runtime() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("starting.sock");
+        let listener_slot: Arc<std::sync::Mutex<Option<UnixListener>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = listener_slot.clone();
+        let expected = path.clone();
+        credential_race_hook::install(Box::new(move |probed: &Path| {
+            if probed != expected {
+                return;
+            }
+            // The starting runtime installs the credential, then publishes the
+            // endpoint — the order the fixed bind sequence guarantees.
+            std::fs::write(expected.with_extension("token"), "b".repeat(64)).unwrap();
+            *slot.lock().unwrap() = Some(UnixListener::bind(&expected).unwrap());
+        }));
+
+        let outcome = probe_endpoint(&path, Duration::from_millis(200)).await;
+        credential_race_hook::clear();
+        drop(listener_slot.lock().unwrap().take());
+
+        match outcome {
+            Ok(EndpointProbe::NotReady) => {}
+            Ok(EndpointProbe::Absent) => {
+                panic!("a live listener whose credential was published must not be reported absent")
+            }
+            Ok(EndpointProbe::Ready(_)) => {
+                panic!("an endpoint still starting must not be adopted as ready")
+            }
+            Ok(EndpointProbe::NoAnswer { .. }) => {
+                panic!("an endpoint still starting must not be reported as unanswered")
+            }
+            Err(TransportError::Unavailable(message)) => panic!(
+                "a credential published during the probe was misread as a runtime that \
+                 predates the token: {message}"
+            ),
+            Err(other) => panic!("unexpected probe failure: {other}"),
+        }
+    }
 
     /// The drain budget is a policy with exactly one surprising value: `0`
     /// means "wait forever". Everything unparseable must land on the default

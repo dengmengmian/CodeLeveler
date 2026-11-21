@@ -755,6 +755,24 @@ mod transport {
         Ok(token)
     }
 
+    /// Whether a complete access token is readable beside `path` right now.
+    ///
+    /// A missing token and a token that exists but cannot be used are
+    /// different facts: `Ok(false)` is only the former. A client that found no
+    /// token can call this after proving a listener is live to tell a runtime
+    /// that is publishing its credential right now from one that predates the
+    /// credential entirely.
+    #[cfg(unix)]
+    pub fn access_token_is_published(path: &Path) -> Result<bool, TransportError> {
+        match read_access_token(path) {
+            Ok(_) => Ok(true),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Compare two bearer tokens without an early-exit length-or-byte oracle.
     #[cfg(unix)]
     fn tokens_match(expected: &str, provided: &str) -> bool {
@@ -1374,9 +1392,14 @@ mod transport {
                 }
                 tokio::fs::remove_file(&path).await?;
             }
+            // Install the credential BEFORE publishing the endpoint. A client
+            // has to read the token before it connects, and it treats a live
+            // listener with no token as a runtime that predates the token.
+            // Binding first left exactly that state observable, so a client
+            // racing this startup failed with a legacy-runtime verdict.
+            let access_token = write_access_token(&path)?;
             let listener = UnixListener::bind(&path)?;
             tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
-            let access_token = write_access_token(&path)?;
             let metadata = tokio::fs::symlink_metadata(&path).await?;
             Ok(Self {
                 path,
@@ -2684,6 +2707,8 @@ mod transport {
     }
 }
 
+#[cfg(unix)]
+pub use transport::access_token_is_published;
 #[cfg(all(any(unix, windows), test))]
 pub(crate) use transport::tcp_request;
 #[cfg(any(unix, windows))]
@@ -2925,6 +2950,37 @@ mod tests {
         let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response["body"]["type"], "ack", "{response}");
         stream
+    }
+
+    /// The endpoint is only published after the credential that authenticates
+    /// it exists. A client that could connect to a socket with no token read
+    /// that as a runtime predating the token — a hard startup failure — so a
+    /// runtime that cannot install its credential must not become connectable
+    /// at all.
+    ///
+    /// The failure is deterministic: the writer's staging name is occupied by
+    /// a directory, so the token cannot be installed. What matters is where
+    /// the sequence stops, not why it failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_access_token_publication_never_publishes_the_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("publication.sock");
+        let staging = path.with_extension(format!("token.{}.tmp", std::process::id()));
+        std::fs::create_dir(&staging).unwrap();
+
+        let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
+        let result =
+            LocalSocketServer::bind_with_waiters(&path, runtime, LocalWaiters::new()).await;
+
+        assert!(
+            result.is_err(),
+            "a runtime that cannot install its credential must not start"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the endpoint became connectable before its credential was installed"
+        );
     }
 
     #[cfg(unix)]
