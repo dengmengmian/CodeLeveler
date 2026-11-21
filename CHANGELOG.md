@@ -60,6 +60,7 @@
 - The schedule manager publishes the policy values it accepts, and the Windows logon trigger is registered for the current user.
 - Windows keeps a persistent execution host and shares write-root leases across CodeLeveler processes, so concurrent confined commands agree on the same write boundary.
 - Private user data is stored owner-only on disk.
+- On Windows, a private state directory created by an elevated process is accepted when it is owned by the token's default owner (`BUILTIN\Administrators`); the protected DACL still names the interposed user. The Execution Host previously refused to start from an elevated account.
 
 ## [1.0.27] - 2026-11-15
 
