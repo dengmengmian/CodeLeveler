@@ -780,12 +780,13 @@ pub(crate) const TASK_COMMIT_GUIDANCE: &str = "TASK COMMITMENT: if the user aske
      completion and the request states a concrete deliverable that needs several steps, tracking or \
      acceptance (or the user said to finish everything before stopping), call `commit_task` before the \
      first edit — even if you expect to finish this turn; the commitment keeps the turn alive if the \
-     work outlasts it. Use the objective as the user stated it and the checks that will prove it. If \
-     you are already mid-task and about to end while requested work is unfinished, call `commit_task` \
-     instead of summarizing what remains. Do not call it for a question, an explanation, a status or \
-     verification check, a discussion, a single small fix, or when the user asked you not to modify \
-     anything; if unsure, do not call it. Once committed, the runtime keeps the turn running until \
-     update_goal resolves the task.";
+     work outlasts it. A request that names several distinct deliverables or stages is not a single \
+     small fix, even when each step is small. Use the objective as the user stated it and the checks \
+     that will prove it. If you are already mid-task and about to end while requested work is \
+     unfinished, call `commit_task` instead of summarizing what remains. Do not call it for a \
+     question, an explanation, a status or verification check, a discussion, a single small fix, or \
+     when the user asked you not to modify anything; if unsure, do not call it. Once committed, the \
+     runtime keeps the turn running until update_goal resolves the task.";
 
 /// The name of the injected request-permissions tool.
 pub(crate) const REQUEST_PERMISSIONS_TOOL: &str = "request_permissions";
@@ -2281,6 +2282,7 @@ mod tests {
             "question",
             "status or verification check",
             "explanation",
+            "several distinct deliverables",
             "if unsure, do not",
         ] {
             assert!(
