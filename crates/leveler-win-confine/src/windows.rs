@@ -15,7 +15,7 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, ACL_REVISION, AddMandatoryAce, CONTAINER_INHERIT_ACE, GetAce, GetLengthSid,
     InitializeAcl, LABEL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, PSID,
-    SYSTEM_MANDATORY_LABEL_ACE,
+    SYSTEM_MANDATORY_LABEL_ACE, TOKEN_INFORMATION_CLASS,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
@@ -454,10 +454,10 @@ pub(crate) fn restore(path: &Path, previous: &IntegrityLabel) -> io::Result<()> 
 /// `FILE_ALL_ACCESS` — every file right, used for the owner-only DACL.
 const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 
-/// The current process token's user SID, copied into an owned allocation.
-struct CurrentUserSid(PSID);
+/// A SID taken from the current process token, copied into its own allocation.
+struct TokenSid(PSID);
 
-impl Drop for CurrentUserSid {
+impl Drop for TokenSid {
     fn drop(&mut self) {
         if !self.0.is_null() {
             // SAFETY: the SID was allocated with GetTokenInformation into a
@@ -467,10 +467,16 @@ impl Drop for CurrentUserSid {
     }
 }
 
-fn current_user_sid() -> io::Result<CurrentUserSid> {
-    use windows_sys::Win32::Security::{
-        CopySid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
+/// Copy one SID out of the current process token.
+///
+/// `sid_of` reads the SID pointer out of the information class's structure:
+/// `TOKEN_USER` and `TOKEN_OWNER` place it at different offsets. `None` means
+/// the token carries no SID for that class (Windows permits a null owner).
+fn token_sid(
+    class: TOKEN_INFORMATION_CLASS,
+    sid_of: impl Fn(*const u8) -> PSID,
+) -> io::Result<Option<TokenSid>> {
+    use windows_sys::Win32::Security::{CopySid, GetTokenInformation, TOKEN_QUERY};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token: HANDLE = INVALID_HANDLE_VALUE;
@@ -484,7 +490,7 @@ fn current_user_sid() -> io::Result<CurrentUserSid> {
     // SAFETY: a zero-length query only reports the required size and fails
     // with ERROR_INSUFFICIENT_BUFFER, which is the documented probe.
     unsafe {
-        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed);
+        GetTokenInformation(token.0, class, null_mut(), 0, &mut needed);
     }
     if needed == 0 {
         return Err(io::Error::last_os_error());
@@ -494,7 +500,7 @@ fn current_user_sid() -> io::Result<CurrentUserSid> {
     if unsafe {
         GetTokenInformation(
             token.0,
-            TokenUser,
+            class,
             buffer.as_mut_ptr().cast(),
             needed,
             &mut needed,
@@ -503,12 +509,16 @@ fn current_user_sid() -> io::Result<CurrentUserSid> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: a successful TokenUser query wrote a TOKEN_USER at the start of
-    // the buffer; its Sid points into the same buffer, which outlives the copy.
-    let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
-    // SAFETY: `user.User.Sid` is a valid SID inside `buffer`.
-    let sid_len = unsafe { GetLengthSid(user.User.Sid) } as usize;
-    // SAFETY: LocalAlloc for the copy; freed by CurrentUserSid.
+    // SAFETY: a successful query wrote the class's structure at the start of
+    // `buffer`; `sid_of` reads the SID it points at inside the same buffer,
+    // which outlives the copy below.
+    let sid = sid_of(buffer.as_ptr());
+    if sid.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: `sid` is a valid SID inside `buffer`.
+    let sid_len = unsafe { GetLengthSid(sid) } as usize;
+    // SAFETY: LocalAlloc for the copy; freed by TokenSid.
     let owned: PSID = unsafe {
         windows_sys::Win32::System::Memory::LocalAlloc(
             windows_sys::Win32::System::Memory::LMEM_FIXED,
@@ -519,12 +529,40 @@ fn current_user_sid() -> io::Result<CurrentUserSid> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: both SIDs are valid; `owned` has exactly `sid_len` bytes.
-    if unsafe { CopySid(sid_len as u32, owned, user.User.Sid) } == 0 {
+    if unsafe { CopySid(sid_len as u32, owned, sid) } == 0 {
         // SAFETY: `owned` came from LocalAlloc above.
         unsafe { LocalFree(owned) };
         return Err(io::Error::last_os_error());
     }
-    Ok(CurrentUserSid(owned))
+    Ok(Some(TokenSid(owned)))
+}
+
+fn current_user_sid() -> io::Result<TokenSid> {
+    use windows_sys::Win32::Security::{TOKEN_USER, TokenUser};
+
+    // SAFETY: a successful TokenUser query wrote a TOKEN_USER at the start of
+    // the buffer passed to `sid_of`.
+    token_sid(TokenUser, |buffer| unsafe {
+        (*(buffer as *const TOKEN_USER)).User.Sid
+    })?
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process token has no user SID"))
+}
+
+/// The SID Windows assigns as owner to objects this process creates.
+///
+/// A UAC-elevated process keeps its user SID, but the token's default owner is
+/// `BUILTIN\Administrators`, so Windows stamps that group on the objects it
+/// creates. The state directory stays private to the interposed user through
+/// its DACL, which names the user SID; both identities are therefore valid
+/// owners of an object this principal created.
+fn current_owner_sid() -> io::Result<Option<TokenSid>> {
+    use windows_sys::Win32::Security::{TOKEN_OWNER, TokenOwner};
+
+    // SAFETY: a successful TokenOwner query wrote a TOKEN_OWNER at the start
+    // of the buffer passed to `sid_of`.
+    token_sid(TokenOwner, |buffer| unsafe {
+        (*(buffer as *const TOKEN_OWNER)).Owner
+    })
 }
 
 fn sid_equals(a: PSID, b: PSID) -> bool {
@@ -631,6 +669,7 @@ fn validate_private_security(path: &Path) -> io::Result<()> {
     };
 
     let user = current_user_sid()?;
+    let token_owner = current_owner_sid()?;
     let mut dacl_ptr: *mut ACL = null_mut();
     let mut owner_ptr: PSID = null_mut();
     let mut descriptor: *mut std::ffi::c_void = null_mut();
@@ -660,11 +699,16 @@ fn validate_private_security(path: &Path) -> io::Result<()> {
     if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner_ptr, &mut defaulted) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    if !sid_equals(owner_ptr, user.0) {
+    let owned_by_this_principal = sid_equals(owner_ptr, user.0)
+        || token_owner
+            .as_ref()
+            .is_some_and(|owner| sid_equals(owner_ptr, owner.0));
+    if !owned_by_this_principal {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "state directory {} is not owned by the current user",
+                "state directory {} is not owned by the current user or the \
+                 default owner of its process token",
                 path.display()
             ),
         ));
