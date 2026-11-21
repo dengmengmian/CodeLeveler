@@ -160,12 +160,15 @@ pub async fn resolve_global_task_source(
     let db = Database::connect_read_only(&path)
         .await
         .map_err(|e| ClientError::Runtime(e.to_string()))?;
-    let row = leveler_storage::SessionRepository::new(&db)
-        .get(session_id)
+    // Resolution must tolerate a store written by an older binary: `title`
+    // and later columns are not guaranteed to exist, and this read must not
+    // migrate. The schema-aware projection supplies the migration defaults.
+    let facts = db
+        .session_facts_for(session_id)
         .await
         .map_err(|e| ClientError::Runtime(e.to_string()))?
         .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
-    Ok((path, row.repository))
+    Ok((path, facts.session.repository))
 }
 
 #[cfg(test)]
@@ -329,6 +332,45 @@ mod tests {
                 .iter()
                 .all(|error| error.kind == UiGlobalTaskSourceErrorKind::Discovery)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_store_without_title_resolves_the_source_and_workspace() {
+        use sqlx::ConnectOptions;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = LevelerHome::from_root(tmp.path());
+        let dir = home.project_state_dir("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.db");
+        let db = Database::connect(&path).await.unwrap();
+        let record = leveler_storage::SessionRecord::new(
+            "/legacy/repo",
+            "legacy goal",
+            "m",
+            leveler_core::now(),
+        );
+        let id = SessionId::new(record.id.clone());
+        leveler_storage::SessionRepository::new(&db)
+            .create(&record)
+            .await
+            .unwrap();
+        // A store last written by a pre-title binary never has this column.
+        // Resolution reads it without migrating, so it must project the
+        // migration default instead of selecting the column unconditionally.
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE sessions DROP COLUMN title")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let (source, repository) = resolve_global_task_source(&home, &path.to_string_lossy(), &id)
+            .await
+            .unwrap();
+        assert_eq!(source, path);
+        assert_eq!(repository.as_deref(), Some("/legacy/repo"));
     }
 
     #[tokio::test]
