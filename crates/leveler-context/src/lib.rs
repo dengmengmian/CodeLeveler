@@ -17,7 +17,7 @@ pub use compaction::{
     ACTIVE_OBJECTIVE_MARKER, COMPACT_KEEP_RECENT, COMPACTION_SUMMARY_BUDGET_TOKENS,
     FoldRequirement, accepted_summary, compact_messages, compaction_span, estimate_tokens,
     objective_pin_message, retention_tail_budget, round_boundary, shrink_externalized_results,
-    summary_request,
+    summary_request, transcript_has_objective_pin,
 };
 pub use guard::{ContentFingerprint, FileStateTracker, Staleness};
 pub use repo_map::RepositoryMap;

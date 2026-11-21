@@ -591,6 +591,38 @@ fn a_fold_pins_the_task_instruction_and_prohibitions_with_the_objective() {
     );
 }
 
+/// A host pin inserted before the first user row is part of the fold's head.
+/// The fold must replace it, not add a second pin beside it: two identical
+/// pins in one request are two conflicting "active request" statements.
+#[test]
+fn a_fold_replaces_a_head_pin_instead_of_stacking_a_second() {
+    let objective = "继续";
+    let mut messages = vec![
+        Message::text(Role::System, "you are a coding agent"),
+        leveler_context::objective_pin_message(objective),
+        Message::user_input("fix the bug"),
+    ];
+    for index in 0..10 {
+        messages.extend(thought_round(index, "thinking", "result"));
+    }
+
+    let folded = compact_messages(&messages, 3, 0, Some("briefing"), Some(objective));
+    let pins: Vec<&Message> = folded
+        .iter()
+        .filter(|message| {
+            message
+                .text_content()
+                .contains(leveler_context::ACTIVE_OBJECTIVE_MARKER)
+        })
+        .collect();
+    assert_eq!(
+        pins.len(),
+        1,
+        "the fold stacked a second objective pin: {pins:?}"
+    );
+    assert!(pins[0].text_content().contains(objective), "{pins:?}");
+}
+
 /// Contract-1: on a raw-replay route, a retained assistant turn's reasoning
 /// cannot be stripped, truncated or rewritten by the requested retention arm.
 #[test]

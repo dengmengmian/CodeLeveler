@@ -200,7 +200,7 @@ pub fn objective_pin_message(objective: &str) -> Message {
 }
 
 /// Whether the transcript already carries a host pin for this objective text.
-pub(crate) fn transcript_has_objective_pin(messages: &[Message], objective: &str) -> bool {
+pub fn transcript_has_objective_pin(messages: &[Message], objective: &str) -> bool {
     let obj = objective.trim();
     if obj.is_empty() {
         return true;
@@ -325,14 +325,31 @@ pub fn compact_messages(
 
     let mut out =
         Vec::with_capacity(head_end + 1 + carried.len() + 1 + (messages.len() - tail_start));
-    out.extend_from_slice(&messages[..head_end]);
+    // A pin the head already carries (a resumed window can start with one) is
+    // the same host statement this fold is about to make: replace it instead
+    // of emitting two. Without an active objective nothing is rewritten.
+    let replaces_pin = pin.is_some();
+    let is_pin = |message: &Message| {
+        message.role == Role::User && message.text_content().contains(ACTIVE_OBJECTIVE_MARKER)
+    };
+    out.extend(
+        messages[..head_end]
+            .iter()
+            .filter(|message| !(replaces_pin && is_pin(message)))
+            .cloned(),
+    );
     // Host objective always re-pinned after fold (even if first User differs).
     if let Some(pin) = pin {
         out.push(pin);
     }
     out.extend(carried);
     out.push(breadcrumb);
-    out.extend_from_slice(&messages[tail_start..]);
+    out.extend(
+        messages[tail_start..]
+            .iter()
+            .filter(|message| !(replaces_pin && is_pin(message)))
+            .cloned(),
+    );
     out
 }
 
