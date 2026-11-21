@@ -4324,7 +4324,13 @@ impl CodingRuntime {
         // declaration is recovered: the turn is `继续`, the goal is the
         // objective the crash swallowed. The model must be told that
         // objective, so it gets the same host-pinned row a fold would use.
-        if objective_text.trim() != content_objective_text(&task.content).trim() {
+        // The transcript assembly already pins the objective when the
+        // session has history. Inserting the recovery pin unconditionally
+        // would stack a second identical row; a pin is a replacement, not an
+        // addition.
+        if objective_text.trim() != content_objective_text(&task.content).trim()
+            && !leveler_context::transcript_has_objective_pin(&prior, &objective_text)
+        {
             prior.insert(0, leveler_context::objective_pin_message(&objective_text));
         }
         let prior_epoch_open = self

@@ -18,8 +18,8 @@ use leveler_model::{
     ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
 use leveler_storage::{
-    Database, EngineStores, GoalState, ModelRequestRepository, SessionRecord, SessionRepository,
-    StorageError, TurnRecord, TurnRepository, TurnStore,
+    Database, EngineStores, GoalState, MessageRepository, ModelRequestRepository, SessionRecord,
+    SessionRepository, StorageError, TurnRecord, TurnRepository, TurnStore,
 };
 use leveler_tools::ToolContext;
 use std::collections::VecDeque;
@@ -145,6 +145,8 @@ struct Runtime {
     /// Per-main-round script: `text` answers in plain text, anything else is
     /// an `update_goal` status. Empty falls back to `status`.
     script: Mutex<VecDeque<&'static str>>,
+    /// Every prompt this runtime was asked to serve, in call order.
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 #[async_trait]
@@ -172,6 +174,7 @@ impl ModelRuntime for Runtime {
         request: ModelRequest,
         _: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
+        self.requests.lock().unwrap().push(request.messages.clone());
         if request.tools.is_empty() {
             return Ok(leveler_model::stream_from_response(ModelResponse {
                 request_id: RequestId::generate(),
@@ -284,6 +287,7 @@ async fn fixture_scripted(status: &'static str, script: Vec<&'static str>) -> Fi
         calls: AtomicU32::new(0),
         status: Mutex::new(status),
         script: Mutex::new(script.into()),
+        requests: Mutex::new(Vec::new()),
     });
     let mut stores = EngineStores::from_database(&db);
     let turns = Arc::new(FailNextStart::new(stores.turns.clone()));
@@ -426,6 +430,25 @@ async fn a_goal_without_its_turn_recovers_the_original_objective() {
         "the declaration survives the dead turn start; it is consumed only by a real start"
     );
 
+    // Prior history from an earlier window is what a resumed session carries.
+    // It also means the resumed request's transcript assembly already has a
+    // place for the host objective pin.
+    MessageRepository::new(&fx.db)
+        .append(
+            &fx.session,
+            &[
+                serde_json::to_string(&Message::text(
+                    Role::User,
+                    "earlier: read the crash window notes",
+                ))
+                .unwrap(),
+                serde_json::to_string(&Message::text(Role::Assistant, "noted")).unwrap(),
+            ],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
     // Recovery runs on a fresh runtime (the crashed boot is gone) and with a
     // working store. The user's next message is a continuation, not a new
     // objective.
@@ -483,6 +506,27 @@ async fn a_goal_without_its_turn_recovers_the_original_objective() {
     // The successful attempt's resolution and its delivery round; the failed
     // start bought none.
     assert_eq!(bodies.len(), 2, "the failed start bought no model call");
+    // The recovered continuation types `继续`, so the recovered objective is
+    // pinned for the model. The transcript assembly pins it once; the recovery
+    // pin must recognise that row, not stack a second identical one.
+    let requests = fx.runtime.requests.lock().unwrap();
+    let recovered = requests
+        .first()
+        .expect("the recovered goal drives the model");
+    let pins: Vec<_> = recovered
+        .iter()
+        .filter(|message| {
+            message
+                .text_content()
+                .contains(leveler_context::ACTIVE_OBJECTIVE_MARKER)
+        })
+        .collect();
+    assert_eq!(
+        pins.len(),
+        1,
+        "the recovered objective is pinned exactly once: {pins:#?}"
+    );
+    assert!(pins[0].text_content().contains(OBJECTIVE_A));
 }
 
 /// A crash after the turn WAL and goal bind, but before its terminal: the
