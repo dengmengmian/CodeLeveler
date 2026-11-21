@@ -109,6 +109,20 @@ fn text(value: &str) -> ModelResponse {
 }
 
 fn probe_call(id: &str) -> ModelResponse {
+    probe_call_with(id, serde_json::json!({"note": "once"}))
+}
+
+fn probe_call_with_path(id: &str, path: &std::path::Path) -> ModelResponse {
+    probe_call_with(
+        id,
+        serde_json::json!({
+            "note": "once",
+            "path": path.to_string_lossy(),
+        }),
+    )
+}
+
+fn probe_call_with(id: &str, arguments: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: leveler_core::RequestId::generate(),
         message: Message {
@@ -118,7 +132,7 @@ fn probe_call(id: &str) -> ModelResponse {
                 call: ToolCall {
                     id: leveler_core::ToolCallId::new(id),
                     name: "crash_probe".to_string(),
-                    arguments: serde_json::json!({"note": "once"}),
+                    arguments,
                 },
             }],
             route: None,
@@ -198,7 +212,12 @@ impl Tool for CrashProbe {
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
-            "properties": {"note": {"type": "string"}},
+            "properties": {
+                "note": {"type": "string"},
+                // A resume that re-executes in the test process passes its own
+                // target here; child scenarios use the inherited env var.
+                "path": {"type": "string"}
+            },
             "additionalProperties": false
         })
     }
@@ -213,12 +232,15 @@ impl Tool for CrashProbe {
 
     async fn execute(
         &self,
-        _input: serde_json::Value,
+        input: serde_json::Value,
         _context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let path = std::env::var("CL_CRASH_SIDE_EFFECT")
-            .map_err(|_| ToolError::Io("CL_CRASH_SIDE_EFFECT is not set".into()))?;
+        let path = match input.get("path").and_then(|value| value.as_str()) {
+            Some(path) => path.to_string(),
+            None => std::env::var("CL_CRASH_SIDE_EFFECT")
+                .map_err(|_| ToolError::Io("CL_CRASH_SIDE_EFFECT is not set".into()))?,
+        };
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -307,6 +329,7 @@ fn scenario_script(scenario: &str) -> (Vec<ModelResponse>, bool) {
         | "chat_after_turn_terminal"
         | "chat_after_task_terminal" => vec![text(ANSWER)],
         "goal_after_delivery" => vec![declared_answer()],
+        "tool_before_dispatch" => vec![probe_call("p1"), text(ANSWER)],
         "tool_after_started" => vec![probe_call("p1"), text(ANSWER)],
         "tool_during_effect" => vec![probe_call("p1"), text(ANSWER)],
         "tool_after_finished" => vec![probe_call("p1"), text(ANSWER)],
@@ -631,6 +654,46 @@ async fn goal_after_delivery_recovers_settlement_without_a_model_request() {
 }
 
 // ── tool / transcript scenarios ─────────────────────────────────────────────
+
+/// A: the process dies after the model asked for the tool but before
+/// admission recorded anything durable. No dispatch, approval, or result
+/// exists, so recovery must re-drive the turn and the side effect runs once —
+/// never zero times with a fake success, never twice.
+#[tokio::test]
+async fn a_crash_before_dispatch_executes_the_tool_once_on_resume() {
+    let (dir, session, db) = prepare("tool_before_dispatch", "before_tool_dispatch").await;
+    let side = dir.path().join("side-effects.log");
+    assert_eq!(
+        side_effects(&side),
+        0,
+        "the tool never ran before the crash"
+    );
+    let before = events(&db, &session).await;
+    assert!(
+        !before
+            .iter()
+            .any(|event| matches!(event, EngineEvent::ToolCallStarted { .. })),
+        "nothing durable records a dispatch: {before:?}"
+    );
+
+    // The child got this path through its own environment. Resume re-executes
+    // the call in THIS process (window A had no durable dispatch), so the
+    // probe carries the target in its arguments instead.
+    let report = resume(
+        dir.path(),
+        &db,
+        &session,
+        vec![probe_call_with_path("p1", &side), text(ANSWER)],
+    )
+    .await
+    .expect("a pre-dispatch crash resumes by re-driving the turn");
+    assert_eq!(report.final_text, ANSWER);
+    assert_eq!(
+        side_effects(&side),
+        1,
+        "the side effect happens exactly once across the crash"
+    );
+}
 
 #[tokio::test]
 async fn tool_started_but_not_executed_stops_without_a_side_effect() {
