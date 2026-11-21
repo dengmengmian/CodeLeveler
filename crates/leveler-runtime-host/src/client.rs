@@ -56,6 +56,12 @@ const DEFAULT_DRAIN_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(unix, windows))]
 const DRAIN_DECISION_TIMEOUT_ENV: &str = "LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS";
 
+/// A legacy `runtime_info` is one read on an endpoint that is already
+/// accepting. The bound keeps startup prompt; an unanswered observation means
+/// "cannot prove busy", which lands on the conservative refusal.
+#[cfg(unix)]
+const LEGACY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long a shell that cannot answer may wait for an old runtime to drain.
 ///
 /// A shell WITH a handover prompt keeps waiting for as long as the old runtime
@@ -185,11 +191,7 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
                     if leveler_local_transport::access_token_is_published(path)? {
                         return Ok(EndpointProbe::NotReady);
                     }
-                    return Err(TransportError::Unavailable(format!(
-                        "a local runtime at {} predates the access token; stop it and restart \
-                         from this build",
-                        path.display()
-                    )));
+                    return Err(TransportError::PredatesAccessToken(path.to_path_buf()));
                 }
             }
             Ok(EndpointProbe::Absent)
@@ -197,6 +199,13 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
         Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
             tracing::debug!(%error, socket = %path.display(), "skipping unavailable local runtime");
             Ok(EndpointProbe::Absent)
+        }
+        Ok(Err(TransportError::PeerClosed)) => {
+            // The peer accepted the connection and dropped it without a single
+            // response byte after receiving the handshake. A current runtime
+            // answers every handshake (an invalid token is an Error reply), so
+            // this is a listener that does not speak the handshake at all.
+            Err(TransportError::PredatesAccessToken(path.to_path_buf()))
         }
         Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => Ok(EndpointProbe::NoAnswer {
             timeout: Duration::from_millis(timeout_ms),
@@ -1097,7 +1106,14 @@ pub async fn reconcile_runtime_generation(
     layout: &Layout,
     ui: &dyn HandoffUi,
 ) -> anyhow::Result<Option<LocalSocketRuntimeClient>> {
-    let Some(client) = probe_default_runtime(socket_path).await? else {
+    let probed = match probe_default_runtime(socket_path).await {
+        Ok(probed) => probed,
+        Err(TransportError::PredatesAccessToken(observed)) => {
+            return Err(legacy_runtime_refusal(socket_path, &observed, ui).await);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(client) = probed else {
         return Ok(None);
     };
     match runtime_is_current(&client, layout).await? {
@@ -1129,6 +1145,53 @@ pub async fn reconcile_runtime_generation(
             Ok(None)
         }
     }
+}
+
+/// The verdict for a live runtime that cannot authenticate a current client.
+///
+/// A pre-token runtime cannot be retired atomically, so the endpoint needs its
+/// owner to exit. Whether that is a deferral or a blocking fact depends on the
+/// work it still owns: one read-only `runtime_info` (the request every
+/// generation has answered, sent without a handshake) tells them apart. When it
+/// cannot be read, the refusal stands — silence never proves idleness.
+#[cfg(any(unix, windows))]
+async fn legacy_runtime_refusal(
+    socket_path: &Path,
+    observed: &Path,
+    ui: &dyn HandoffUi,
+) -> anyhow::Error {
+    #[cfg(unix)]
+    if let Some(info) =
+        leveler_local_transport::legacy_runtime_info(observed, LEGACY_OBSERVATION_TIMEOUT).await
+    {
+        let active_turns = info.health.active_turns;
+        let active_background_tasks = info.health.active_background_tasks;
+        if active_turns > 0 || active_background_tasks > 0 {
+            ui.emit(HandoffEvent::UpgradeDeferred {
+                active_turns,
+                active_background_tasks,
+            });
+            return EnsureError::RetireBlocked {
+                waited_secs: 0,
+                active_turns,
+                active_background_tasks,
+            }
+            .into();
+        }
+    }
+    let reason = format!(
+        "the previous runtime at {} predates the access token and does not support atomic \
+         retirement; let it finish its work and exit normally, then restart this build",
+        observed.display()
+    );
+    ui.emit(HandoffEvent::MigrationFailed {
+        reason: reason.clone(),
+    });
+    EnsureError::LegacyMigrationRefused {
+        socket: socket_path.to_path_buf(),
+        reason,
+    }
+    .into()
 }
 
 /// Ask a running runtime to re-read its configuration sources and apply them.
@@ -1637,8 +1700,61 @@ mod probe_tests {
                 "a credential published during the probe was misread as a runtime that \
                  predates the token: {message}"
             ),
+            Err(TransportError::PredatesAccessToken(path)) => panic!(
+                "a credential published during the probe was misread as a runtime that \
+                 predates the token: {}",
+                path.display()
+            ),
             Err(other) => panic!("unexpected probe failure: {other}"),
         }
+    }
+
+    /// A live listener with no credential beside it is a runtime that predates
+    /// the access token, not an absent endpoint. Treating it as absent made the
+    /// client spawn a competitor, whose bind then failed with "already
+    /// listening" — a startup failure that hid the only actionable fact.
+    #[tokio::test]
+    async fn a_live_listener_without_a_credential_predates_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let serving = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let error = probe_endpoint(&path, Duration::from_millis(500))
+            .await
+            .err();
+        serving.abort();
+        assert!(
+            matches!(&error, Some(TransportError::PredatesAccessToken(reported)) if reported == &path),
+            "a live listener without a credential must be a typed legacy fact, got {error:?}"
+        );
+    }
+
+    /// A `.token` left behind by a stopped runtime is not proof that the live
+    /// listener speaks the current handshake. A pre-token runtime reads the
+    /// envelope, does not understand `handshake`, and closes without answering;
+    /// that EOF must not be folded into "nobody is listening".
+    #[tokio::test]
+    async fn a_peer_that_closes_on_the_handshake_is_not_an_absent_endpoint() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::write(path.with_extension("token"), "c".repeat(64)).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut frame = [0u8; 256];
+            let _ = stream.read(&mut frame).await;
+        });
+        let error = probe_endpoint(&path, Duration::from_millis(500))
+            .await
+            .err();
+        serving.await.unwrap();
+        assert!(
+            matches!(&error, Some(TransportError::PredatesAccessToken(reported)) if reported == &path),
+            "a peer that closes on the handshake must be a typed legacy fact, got {error:?}"
+        );
     }
 
     /// The drain budget is a policy with exactly one surprising value: `0`
@@ -2162,6 +2278,131 @@ mod generation_attach_tests {
             "{error}"
         );
         serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_predates_the_token_is_a_typed_migration_refusal() {
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // A `.token` left behind by a stopped candidate is not proof that the
+        // listener speaks the current handshake.
+        std::fs::write(socket.with_extension("token"), "d".repeat(64)).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut frame = [0u8; 256];
+            let _ = stream.read(&mut frame).await;
+        });
+        let ui = Ui::default();
+        let error = reconcile_runtime_generation(&socket, &layout, &ui)
+            .await
+            .err()
+            .expect("a runtime from before the access token cannot be attached to");
+        serving.await.unwrap();
+        match error.downcast_ref::<EnsureError>() {
+            Some(EnsureError::LegacyMigrationRefused {
+                socket: reported,
+                reason,
+            }) => {
+                assert_eq!(reported, &socket);
+                assert!(
+                    reason.contains("does not support atomic retirement"),
+                    "{reason}"
+                );
+                assert!(reason.contains("predates the access token"), "{reason}");
+            }
+            other => panic!("expected a typed migration refusal, got {other:?} ({error})"),
+        }
+        let events = ui.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HandoffEvent::MigrationFailed { .. })),
+            "the shell must be told the migration failed: {events:?}"
+        );
+    }
+
+    /// A busy runtime from before the access token is still BUSY. Telling its
+    /// owner to exit would interrupt real work, so the client reads the one
+    /// request every generation answered (`runtime_info`, unauthenticated,
+    /// read-only) and reports the same deferral a modern busy runtime gets.
+    #[tokio::test]
+    async fn a_busy_runtime_that_predates_the_token_is_deferred_not_told_to_exit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let serving = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // The probe's liveness connect writes nothing and is dropped.
+                let Ok(length) = stream.read_u32().await else {
+                    continue;
+                };
+                let mut request = vec![0; length as usize];
+                stream.read_exact(&mut request).await.unwrap();
+                let info = serde_json::json!({
+                    "type": "runtime_info",
+                    "body": {
+                        "runtime_id": "legacy-busy",
+                        "version": "1.0.11",
+                        "build": {
+                            "version": "1.0.11",
+                            "revision": "0000000000000000000000000000000000000000",
+                            "fingerprint": "legacy",
+                            "dirty": false
+                        },
+                        "config_fingerprint": null,
+                        "pid": std::process::id(),
+                        "health": {
+                            "accepting_work": true,
+                            "active_turns": 1,
+                            "active_background_tasks": 0,
+                            "quiescent": false,
+                            "shutting_down": false
+                        }
+                    }
+                });
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "protocol": {"major": 1, "minor": 0},
+                    "body": info
+                }))
+                .unwrap();
+                stream.write_u32(bytes.len() as u32).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+                break;
+            }
+        });
+        let ui = Ui::default();
+        let error = reconcile_runtime_generation(&socket, &layout, &ui)
+            .await
+            .err()
+            .expect("a busy legacy runtime is still not adopted");
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        match error.downcast_ref::<EnsureError>() {
+            Some(EnsureError::RetireBlocked {
+                waited_secs: 0,
+                active_turns: 1,
+                ..
+            }) => {}
+            other => panic!("expected a prompt deferral, got {other:?} ({error})"),
+        }
+        let events = ui.0.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                HandoffEvent::UpgradeDeferred {
+                    active_turns: 1,
+                    ..
+                }
+            )),
+            "the shell must see the deferral, not a migration failure: {events:?}"
+        );
     }
 
     #[tokio::test]

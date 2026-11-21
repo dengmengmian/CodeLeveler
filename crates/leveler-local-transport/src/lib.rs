@@ -303,6 +303,15 @@ pub enum TransportError {
     },
     #[error("local transport is unavailable: {0}")]
     Unavailable(String),
+    /// A live runtime on this endpoint does not speak the access-token
+    /// handshake. It predates the credential every current runtime publishes
+    /// before binding, so it cannot be shared or retired atomically; the
+    /// operator has to stop it before this build can own the endpoint.
+    #[error(
+        "the local runtime at {} predates the access token; stop it and restart from this build",
+        .0.display()
+    )]
+    PredatesAccessToken(std::path::PathBuf),
     /// The peer closed the connection without sending a single response byte.
     ///
     /// This is the shape an older runtime produces for a request whose tag it
@@ -753,6 +762,34 @@ mod transport {
             )));
         }
         Ok(token)
+    }
+
+    /// Read-only observation of a runtime that predates the access token.
+    ///
+    /// Such a runtime cannot be authenticated, but every generation answered
+    /// `runtime_info`. Reading it without a handshake sends no command and
+    /// adopts nothing: it lets a client tell an old runtime that still owes
+    /// work (leave it alone) from an idle one (only its owner can free the
+    /// endpoint) instead of guessing from silence.
+    #[cfg(unix)]
+    pub async fn legacy_runtime_info(
+        path: &Path,
+        timeout: Duration,
+    ) -> Option<leveler_client_protocol::RuntimeInfo> {
+        let observe = async {
+            let mut stream = UnixStream::connect(path).await.ok()?;
+            write_frame(
+                &mut stream,
+                &ProtocolEnvelope::wrap(WireRequest::RuntimeInfo),
+            )
+            .await
+            .ok()?;
+            match read_response_frame(&mut stream).await.ok()? {
+                WireResponse::RuntimeInfo(info) => Some(info),
+                _ => None,
+            }
+        };
+        tokio::time::timeout(timeout, observe).await.ok().flatten()
     }
 
     /// Whether a complete access token is readable beside `path` right now.
@@ -2038,7 +2075,10 @@ mod transport {
                 let token = read_access_token(path)?;
                 let mut stream = UnixStream::connect(path).await?;
                 write_frame(&mut stream, &ProtocolEnvelope::wrap(Handshake { token })).await?;
-                match read_frame::<WireResponse>(&mut stream).await?.into_body()? {
+                // A peer that closes without answering is a protocol fact, not
+                // a truncated reply: the dedicated EOF shape lets a probe tell
+                // "does not speak the handshake" from "connection broke".
+                match read_response_frame(&mut stream).await? {
                     WireResponse::Ack => Ok(Either::Left(stream)),
                     WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
                     other => Err(TransportError::Unavailable(format!(
@@ -2057,7 +2097,7 @@ mod transport {
                     }),
                 )
                 .await?;
-                match read_frame::<WireResponse>(&mut stream).await?.into_body()? {
+                match read_response_frame(&mut stream).await? {
                     WireResponse::Ack => Ok(Either::Right(stream)),
                     WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
                     other => Err(TransportError::Unavailable(format!(
@@ -2709,6 +2749,8 @@ mod transport {
 
 #[cfg(unix)]
 pub use transport::access_token_is_published;
+#[cfg(unix)]
+pub use transport::legacy_runtime_info;
 #[cfg(all(any(unix, windows), test))]
 pub(crate) use transport::tcp_request;
 #[cfg(any(unix, windows))]

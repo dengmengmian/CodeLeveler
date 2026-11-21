@@ -40,7 +40,7 @@
 
 ## 破坏性变化与已知限制
 
-- 旧版 Web UI 与 `leveler web` / `/web` 退役，终端、CLI 与桌面客户端保留。自动审查退役。旧的单文件 Skill 批准需要重新批准一次。权限文件中出现未知字段时按 degraded 规则集处理并要求批准，而不是扩大为 `Allow`。
+- 旧版 Web UI 与 `leveler web` / `/web` 退役，终端、CLI 与桌面客户端保留。自动审查退役。旧的单文件 Skill 批准需要重新批准一次。权限文件中出现未知字段时按 degraded 规则集处理并要求批准，而不是扩大为 `Allow`。由 1.0.28 之前的版本启动的 Runtime 不认识访问令牌握手，1.0.28 客户端不会原子替换它：若它仍在运行，请让它先完成当前工作并正常退出一次，再启动 1.0.28。客户端不会向它发送信号或抢占端点，工作不会丢失。
 - Windows 上受限 Shell 仍可创建原本缺失的 `AGENTS.md` 或 `.leveler` 树，但未经批准绝不会被采纳，既有受保护对象继续受 OS 栅栏保护。FullAccess 仍是明确的用户权限边界，而不是 OS 保证。安装包未经过 Apple 公证或 Microsoft 签名。
 
 本版命令行安装包支持 macOS（Apple Silicon、Intel）、Linux x86_64 和 Windows x86_64。没有 Linux ARM 包。桌面客户端需从源码构建，不包含在发布包中。安装和更新见[首页](../README.zh-CN.md)，完整版本历史见[更新日志](../CHANGELOG.zh-CN.md)。
