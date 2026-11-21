@@ -2366,16 +2366,23 @@ mod generation_attach_tests {
         // listener speaks the current handshake.
         std::fs::write(socket.with_extension("token"), "d".repeat(64)).unwrap();
         let serving = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut frame = [0u8; 256];
-            let _ = stream.read(&mut frame).await;
+            // A live pre-token runtime keeps listening after it closes the
+            // handshake it cannot decode. A one-shot listener would be a
+            // runtime that died, which is a different fact.
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut frame = [0u8; 256];
+                let _ = stream.read(&mut frame).await;
+            }
         });
         let ui = Ui::default();
         let error = reconcile_runtime_generation(&socket, &layout, &ui)
             .await
             .err()
             .expect("a runtime from before the access token cannot be attached to");
-        serving.await.unwrap();
+        serving.abort();
         match error.downcast_ref::<EnsureError>() {
             Some(EnsureError::LegacyMigrationRefused {
                 socket: reported,
