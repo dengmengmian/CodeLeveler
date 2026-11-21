@@ -5815,6 +5815,18 @@ impl AgentHarness for Drive<'_> {
                                                     });
                                             let joined = !bound.opened
                                                 || bound_objective != goal_objective;
+                                            if joined {
+                                                // This Chat turn adopted a goal the
+                                                // session already owed: the active
+                                                // request is the goal's objective,
+                                                // not the line that asked to resume
+                                                // it. Mirrors the resume path
+                                                // (`lineage_was_chat`).
+                                                self.objective =
+                                                    ObjectiveAnchor::from_session_goal(
+                                                        bound_objective.clone(),
+                                                    );
+                                            }
                                             let checks = bound_acceptance
                                                 .iter()
                                                 .map(|check| format!("- {check}"))
@@ -7527,6 +7539,10 @@ impl AgentHarness for Drive<'_> {
             // running after the call returns; its terminal result supplies the
             // end of the window.
             let mut execution_versions: Option<(u64, u64)> = None;
+            // Window A: the model asked for a tool and the process died before
+            // admission recorded anything durable. Nothing can prove the call
+            // ran, so recovery may re-drive it; this cut exists to observe that.
+            leveler_core::test_crash::point("before_tool_dispatch");
             let (
                 content,
                 is_error,
