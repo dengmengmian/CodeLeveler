@@ -1777,40 +1777,45 @@ async fn child_cancelled_mid_run_rolls_up_partial_command_spend() {
     let tool_context =
         ToolContext::new(workspace, PermissionProfile::Assisted).trust_all_definitions_for_tests();
 
-    let runtime = Arc::new(SleepyRuntime::new(
-        vec![
-            assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({"task": "spend then hang"}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // Child: command first (fast enough to commit).
-            assistant_with(
-                vec![tool_call_part(
-                    "c1",
-                    "run_command",
-                    serde_json::json!({"program": "echo", "args": ["spent"]}),
-                )],
-                FinishReason::ToolCalls,
-            ),
-            // Second child model call is slow — cancel during this stream.
-            assistant_text("still working"),
-            assistant_text("parent unused"),
-        ],
-        // Every stream sleeps this long. Timeline with cancel@220ms:
-        // 0–80 parent spawn stream; 80–160 child tool stream + shell;
-        // 160–240 child second stream — cancel lands mid-stream after spend.
-        Duration::from_millis(80),
-    ));
-
     let token = CancellationToken::new();
-    let cancel = token.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(220)).await;
-        cancel.cancel();
-    });
+    let runtime = Arc::new(
+        SleepyRuntime::new(
+            vec![
+                assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"task": "spend then hang"}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Child: command first (fast enough to commit).
+                assistant_with(
+                    vec![tool_call_part(
+                        "c1",
+                        "run_command",
+                        serde_json::json!({"program": "echo", "args": ["spent"]}),
+                    )],
+                    FinishReason::ToolCalls,
+                ),
+                // Second child model call is slow — cancel during this stream.
+                assistant_text("still working"),
+                assistant_text("parent unused"),
+            ],
+            Duration::from_millis(20),
+        )
+        // Cancel when the child asks for its SECOND model step. That request
+        // can only be made after the first step's command result was
+        // processed and accounted, so the spend under test has definitely
+        // landed; a wall-clock timer cannot prove that on a loaded host.
+        .with_stream_hook({
+            let cancel = token.clone();
+            move |index| {
+                if index == 2 {
+                    cancel.cancel();
+                }
+            }
+        }),
+    );
 
     let mut events = Vec::new();
     let result = Executor::new(
