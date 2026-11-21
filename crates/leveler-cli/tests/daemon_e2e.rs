@@ -18,6 +18,7 @@
 mod observed_command;
 use observed_command::ObservedSettings;
 
+use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -3410,4 +3411,550 @@ async fn recovered_unknown_tool_requires_reconciliation_without_replaying_effect
     drop(recovered);
     drop(client);
     stop_daemon(&mut replacement);
+}
+
+// ---------------------------------------------------------------------------
+// Daemon startup stress gate
+//
+// Manual gate, not part of the normal suite: it launches 100+ real daemons.
+// `LEVELER_STRESS_ROUNDS` (default 100) and `LEVELER_STRESS_RECORD` (JSONL
+// path) control the run. Every round owns an isolated HOME, config bundle,
+// socket, token and log; nothing here touches a user's runtime.
+// ---------------------------------------------------------------------------
+
+fn stress_rounds(default: u32) -> u32 {
+    std::env::var("LEVELER_STRESS_ROUNDS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(default)
+}
+
+fn record_stress(line: &serde_json::Value) {
+    let Ok(path) = std::env::var("LEVELER_STRESS_RECORD") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn send_signal(pid: u32, signal: &str) {
+    // Captured: a liveness poll legitimately races the exit it is looking
+    // for, and `kill` would otherwise print "No such process" into the test
+    // log for every observed death.
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .output();
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    condition()
+}
+
+/// Live `leveler serve` processes that belong to this environment, found by
+/// the unique repository its daemons were launched for. Used to prove an
+/// election left exactly one.
+fn live_daemons(repo: &Path) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .expect("ps");
+    let needle = repo.to_string_lossy();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(needle.as_ref()) && line.contains(" serve"))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+fn token_facts(socket: &Path) -> (bool, Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = socket.with_extension("token");
+    match std::fs::metadata(&path) {
+        Ok(metadata) => {
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            assert_eq!(raw.len(), 64, "a published token is always complete");
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "a published token is never group/other readable"
+            );
+            (true, Some(mode))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(error) => panic!("token metadata: {error}"),
+    }
+}
+
+/// One isolated start → ready → authenticate → first request → second client
+/// attach → graceful stop cycle. Returns the facts the stress report records.
+async fn stress_cycle(round: u32) -> serde_json::Value {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, guard) = detached_host_launch(&env);
+
+    let started = Instant::now();
+    let client = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .unwrap_or_else(|error| panic!("round {round}: daemon did not start: {error:#}"));
+    let startup_ms = started.elapsed().as_millis() as u64;
+    let info = LocalRuntimeService::runtime_info(&client)
+        .await
+        .expect("first request after startup");
+    assert_eq!(
+        info.pid,
+        guard.pid(),
+        "round {round}: the adopted runtime is the process this launch started"
+    );
+    assert_eq!(
+        live_daemons(&env.repo).len(),
+        1,
+        "round {round}: one environment must serve from exactly one daemon"
+    );
+
+    let socket = layout.socket_path();
+    assert!(
+        std::fs::symlink_metadata(&socket)
+            .expect("the socket is published")
+            .file_type()
+            .is_socket(),
+        "round {round}: the published endpoint is a socket"
+    );
+    let (token_published, token_mode) = token_facts(&socket);
+    assert!(
+        token_published,
+        "round {round}: a ready runtime has a token"
+    );
+
+    // A second client attaches to the same runtime instead of starting one.
+    let second = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .unwrap_or_else(|error| panic!("round {round}: second client attach: {error:#}"));
+    let second_info = LocalRuntimeService::runtime_info(&second)
+        .await
+        .expect("second client request");
+    assert_eq!(second_info.pid, info.pid, "round {round}: two runtimes");
+
+    // Ctrl+C is the documented graceful stop. The socket must disappear with
+    // the process; the token may remain (it is re-issued on the next bind).
+    send_signal(info.pid, "INT");
+    let reaped = wait_until(Duration::from_secs(10), || !process_exists(info.pid));
+    let socket_gone = wait_until(Duration::from_secs(5), || !socket.exists());
+    let (token_after_stop, _) = token_facts(&socket);
+    assert!(reaped, "round {round}: the daemon did not exit on SIGINT");
+    assert!(
+        socket_gone,
+        "round {round}: the socket survived the daemon that owned it"
+    );
+    assert_eq!(
+        live_daemons(&env.repo).len(),
+        0,
+        "round {round}: no daemon may survive its stop"
+    );
+    drop(client);
+    drop(second);
+
+    serde_json::json!({
+        "scenario": "start_attach_stop",
+        "round": round,
+        "startup_ms": startup_ms,
+        "pid": info.pid,
+        "runtime_id": info.runtime_id.as_str(),
+        "adopted_pid": second_info.pid,
+        "token_published": token_published,
+        "token_mode": token_mode,
+        "reaped": reaped,
+        "socket_after_stop": socket.exists(),
+        "token_after_stop": token_after_stop,
+    })
+}
+
+/// Several clients start together; the election must leave one daemon, and a
+/// client cancelled mid-startup must not cost the winner its runtime.
+async fn stress_concurrent(round: u32) -> serde_json::Value {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, guard) = detached_host_launch(&env);
+
+    let (first, second, third) = tokio::join!(
+        ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi)),
+        ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi)),
+        ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi)),
+    );
+    let first = first.unwrap_or_else(|e| panic!("round {round}: first: {e:#}"));
+    let second = second.unwrap_or_else(|e| panic!("round {round}: second: {e:#}"));
+    let third = third.unwrap_or_else(|e| panic!("round {round}: third: {e:#}"));
+    let pids = [
+        LocalRuntimeService::runtime_info(&first).await.unwrap().pid,
+        LocalRuntimeService::runtime_info(&second)
+            .await
+            .unwrap()
+            .pid,
+        LocalRuntimeService::runtime_info(&third).await.unwrap().pid,
+    ];
+    assert_eq!(pids[0], pids[1], "round {round}: concurrent clients split");
+    assert_eq!(pids[0], pids[2], "round {round}: concurrent clients split");
+    let live = live_daemons(&env.repo);
+    assert_eq!(live.len(), 1, "round {round}: duplicate daemons: {live:?}");
+    assert_eq!(live[0], pids[0], "round {round}: adopted a dead election");
+
+    let recorded = guard.pid();
+    send_signal(pids[0], "KILL");
+    assert!(wait_until(Duration::from_secs(10), || !process_exists(
+        pids[0]
+    )));
+    drop(first);
+    drop(second);
+    drop(third);
+
+    serde_json::json!({
+        "scenario": "concurrent_start",
+        "round": round,
+        "pids": pids,
+        "recorded_launch_pid": recorded,
+        "live_daemons": live.len(),
+        "crash_cleanup": !process_exists(pids[0]),
+    })
+}
+
+/// A client that gives up mid-startup must not leave the environment broken:
+/// the daemon it launched is detached and a later client adopts it.
+async fn stress_cancelled_client() -> serde_json::Value {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, guard) = detached_host_launch(&env);
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(20),
+        ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi)),
+    )
+    .await;
+    let survivor = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .expect("a later client adopts the daemon the cancelled one launched");
+    let info = LocalRuntimeService::runtime_info(&survivor).await.unwrap();
+    // The later client may race its own launch against the daemon the
+    // cancelled client started; whichever wins, exactly one serves and it is
+    // the one every attached client sees.
+    assert_eq!(live_daemons(&env.repo), vec![info.pid]);
+    send_signal(info.pid, "KILL");
+    assert!(wait_until(Duration::from_secs(10), || !process_exists(
+        info.pid
+    )));
+
+    serde_json::json!({
+        "scenario": "cancelled_client",
+        "cancelled": cancelled.is_err(),
+        "adopted_pid": info.pid,
+        "recorded_launch_pid": guard.pid(),
+        "live_daemons": 1,
+    })
+}
+
+/// Clients sharing one runtime own separate sessions: a session created by
+/// one client is readable by another, and closing one client never closes the
+/// other's work.
+async fn stress_session_isolation() -> serde_json::Value {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, _guard) = detached_host_launch(&env);
+    let first = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .expect("runtime");
+    let info = LocalRuntimeService::runtime_info(&first).await.unwrap();
+    let session = first
+        .create_session(CreateSessionRequest {
+            request_id: None,
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "session isolation".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .expect("the first client creates a session")
+        .session
+        .id;
+
+    let second = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .expect("the second client attaches");
+    let seen = second
+        .snapshot(&session)
+        .await
+        .expect("the second client reads a session it did not create");
+    assert_eq!(seen.id, session, "the second client saw another session");
+    drop(second);
+    let after = first
+        .snapshot(&session)
+        .await
+        .expect("dropping another client must not close this session");
+    assert_eq!(after.id, session);
+
+    send_signal(info.pid, "KILL");
+    assert!(wait_until(Duration::from_secs(10), || !process_exists(
+        info.pid
+    )));
+    serde_json::json!({
+        "scenario": "session_isolation",
+        "session": session.as_str(),
+        "second_client_read": true,
+        "survived_second_client_drop": true,
+    })
+}
+
+/// Failure injection, all deterministic and isolated.
+async fn stress_failures() -> Vec<serde_json::Value> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut facts = Vec::new();
+
+    // 1. Token publication fails: the runtime must not become connectable and
+    //    the client must report a startup failure, not a false ready.
+    {
+        let env = test_env("http://127.0.0.1:9");
+        let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+        let (launch, _guard) = detached_host_launch(&env);
+        let run_dir = env.home.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = match ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi)).await
+        {
+            Ok(_) => panic!("a runtime that cannot publish a token must not start"),
+            Err(error) => error,
+        };
+        let socket_published = layout.socket_path().exists();
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!socket_published, "no endpoint without a credential");
+        assert!(
+            !error.to_string().is_empty(),
+            "the startup failure carries the daemon's reason"
+        );
+        facts.push(serde_json::json!({
+            "scenario": "token_publication_failure",
+            "socket_published": socket_published,
+            "error": error.to_string(),
+        }));
+    }
+
+    // 2. The endpoint is owned by a listener that has no credential: the
+    //    legacy migration verdict must survive the fix, and no second daemon
+    //    may bind over it.
+    {
+        let env = test_env("http://127.0.0.1:9");
+        let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+        let (launch, _guard) = detached_host_launch(&env);
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let placeholder = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = match ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi)).await
+        {
+            Ok(_) => panic!("an unauthenticated listener is never adopted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("predates the access token"),
+            "the migration fact must stay actionable: {error}"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || live_daemons(&env.repo)
+                .is_empty()),
+            "no replacement daemon"
+        );
+        drop(placeholder);
+        facts.push(serde_json::json!({
+            "scenario": "credential_absent_listener",
+            "error": error.to_string(),
+            "replacement_daemons": 0,
+        }));
+    }
+
+    // 3. The process dies before readiness; a later client still starts.
+    {
+        let env = test_env("http://127.0.0.1:9");
+        let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+        let (launch, _guard) = detached_host_launch(&env);
+        let ready = env.home.join("never-ready.json");
+        let mut child = spawn_serve(&env, &ready);
+        let dead_pid = child.id();
+        child.kill().expect("kill before ready");
+        let _ = child.wait();
+        assert!(
+            !ready.exists(),
+            "the killed process never published readiness"
+        );
+
+        let client = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+            .await
+            .expect("startup recovers from a pre-readiness death");
+        let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+        assert_ne!(info.pid, dead_pid);
+        assert_eq!(live_daemons(&env.repo).len(), 1);
+        send_signal(info.pid, "KILL");
+        assert!(wait_until(Duration::from_secs(10), || !process_exists(
+            info.pid
+        )));
+        facts.push(serde_json::json!({
+            "scenario": "death_before_ready",
+            "dead_pid": dead_pid,
+            "recovered_pid": info.pid,
+        }));
+    }
+
+    // 4. SIGKILL after readiness leaves a stale socket and token. The next
+    //    ensure must replace the endpoint and keep the durable RuntimeId.
+    {
+        let env = test_env("http://127.0.0.1:9");
+        let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+        let (launch, _guard) = detached_host_launch(&env);
+        let first = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+            .await
+            .expect("first runtime");
+        let before = LocalRuntimeService::runtime_info(&first).await.unwrap();
+        send_signal(before.pid, "KILL");
+        assert!(wait_until(Duration::from_secs(10), || !process_exists(
+            before.pid
+        )));
+        let socket = layout.socket_path();
+        assert!(socket.exists(), "SIGKILL leaves the socket file behind");
+
+        let second = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+            .await
+            .expect("a stale endpoint is replaced");
+        let after = LocalRuntimeService::runtime_info(&second).await.unwrap();
+        assert_ne!(after.pid, before.pid, "the dead process is not reused");
+        assert_eq!(
+            after.runtime_id, before.runtime_id,
+            "the durable identity survives the crash"
+        );
+        assert_eq!(live_daemons(&env.repo).len(), 1);
+        send_signal(after.pid, "KILL");
+        assert!(wait_until(Duration::from_secs(10), || !process_exists(
+            after.pid
+        )));
+        facts.push(serde_json::json!({
+            "scenario": "crash_after_ready",
+            "old_pid": before.pid,
+            "new_pid": after.pid,
+            "same_runtime_id": after.runtime_id == before.runtime_id,
+            "stale_socket_present": true,
+        }));
+    }
+
+    // 5. Authentication is never skipped: no handshake and a wrong token are
+    //    both refused with a diagnosis the operator can act on.
+    {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let env = test_env("http://127.0.0.1:9");
+        let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+        let (launch, _guard) = detached_host_launch(&env);
+        let client = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+            .await
+            .expect("runtime");
+        let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+        let socket = layout.socket_path();
+
+        let mut unauthenticated = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+            "body": {"type": "ping"}
+        }))
+        .unwrap();
+        unauthenticated.write_u32(frame.len() as u32).await.unwrap();
+        unauthenticated.write_all(&frame).await.unwrap();
+        let length = unauthenticated.read_u32().await.unwrap() as usize;
+        let mut reply = vec![0; length];
+        unauthenticated.read_exact(&mut reply).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["body"]["type"], "error", "{reply}");
+
+        let mut wrong = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+            "body": {"token": "0".repeat(64)}
+        }))
+        .unwrap();
+        wrong.write_u32(frame.len() as u32).await.unwrap();
+        wrong.write_all(&frame).await.unwrap();
+        let length = wrong.read_u32().await.unwrap() as usize;
+        let mut reply = vec![0; length];
+        wrong.read_exact(&mut reply).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["body"]["type"], "error", "{reply}");
+        let message = reply["body"]["body"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("local runtime authentication failed"),
+            "the refusal must name authentication, not leak or guess: {message}"
+        );
+
+        send_signal(info.pid, "KILL");
+        assert!(wait_until(Duration::from_secs(10), || !process_exists(
+            info.pid
+        )));
+        facts.push(serde_json::json!({
+            "scenario": "ipc_authentication",
+            "unauthenticated_refused": true,
+            "wrong_token_refused": true,
+        }));
+    }
+
+    facts
+}
+
+#[test]
+#[ignore = "stress gate: launches 100+ real daemons; run explicitly"]
+fn daemon_startup_stress() {
+    leveler_test_support::bounded_test(
+        "daemon_startup_stress",
+        Duration::from_secs(60 * 45),
+        daemon_startup_stress_body,
+    );
+}
+
+async fn daemon_startup_stress_body() {
+    let rounds = stress_rounds(100);
+    record_stress(&serde_json::json!({
+        "scenario": "begin",
+        "rounds": rounds,
+        "binary": env!("CARGO_BIN_EXE_leveler"),
+    }));
+
+    for round in 0..rounds {
+        record_stress(&stress_cycle(round).await);
+    }
+    for round in 0..rounds / 5 {
+        record_stress(&stress_concurrent(round).await);
+    }
+    record_stress(&stress_cancelled_client().await);
+    record_stress(&stress_session_isolation().await);
+    for fact in stress_failures().await {
+        record_stress(&fact);
+    }
+    record_stress(&serde_json::json!({"scenario": "done", "rounds": rounds}));
 }
