@@ -92,6 +92,11 @@ pub struct ExecutionResources {
     /// skill registry and tool in this execution reads the same snapshot. A
     /// mid-turn file creation or edit cannot enter it.
     pub definition_trust: Arc<leveler_definition_trust::DefinitionTrustView>,
+    /// The host's human approval surface for an untrusted definition a tool
+    /// needs mid-turn. `None` means no person can answer (headless run, eval,
+    /// disconnected client), so the safe refusal is final.
+    pub definition_trust_authorizer:
+        Option<Arc<dyn crate::definition_trust::DefinitionTrustAuthorizer>>,
     /// Host-owned memory access policy, when the user enabled the memory
     /// pipeline. Ordinary file tools route paths inside the configured memory
     /// roots through this policy so memory files keep their own containment,
@@ -469,6 +474,7 @@ impl ToolContext {
             execution: ExecutionResources {
                 workspace: workspace.map(Arc::new),
                 definition_trust,
+                definition_trust_authorizer: None,
                 runner: Arc::new(CommandRunner::with_environment(environment.clone())),
                 environment,
                 checkpoint: Arc::new(Checkpoint::new()),
@@ -515,6 +521,37 @@ impl ToolContext {
         self.execution.definition_trust =
             Arc::new(leveler_definition_trust::DefinitionTrustView::trust_everything_for_tests());
         self
+    }
+
+    /// Attach the session's allowances and FullAccess baseline to this
+    /// execution's frozen trust view.
+    ///
+    /// Stored on the view, not the view's `Arc`, so every tool of the turn
+    /// reads the session decisions while the persistent store stays frozen.
+    pub fn with_session_definition_trust(
+        mut self,
+        session: Arc<leveler_definition_trust::SessionDefinitionTrust>,
+    ) -> Self {
+        let view = (*self.execution.definition_trust)
+            .clone()
+            .with_session(session);
+        self.execution.definition_trust = Arc::new(view);
+        self
+    }
+
+    /// Attach the host's human approval surface for untrusted definitions.
+    pub fn with_definition_trust_authorizer(
+        mut self,
+        authorizer: Arc<dyn crate::definition_trust::DefinitionTrustAuthorizer>,
+    ) -> Self {
+        self.execution.definition_trust_authorizer = Some(authorizer);
+        self
+    }
+
+    pub fn definition_trust_authorizer(
+        &self,
+    ) -> Option<&Arc<dyn crate::definition_trust::DefinitionTrustAuthorizer>> {
+        self.execution.definition_trust_authorizer.as_ref()
     }
 
     pub fn require_workspace(&self) -> Result<&Workspace, ToolError> {

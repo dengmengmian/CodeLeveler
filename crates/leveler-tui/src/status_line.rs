@@ -407,7 +407,9 @@ pub(crate) enum StatusPhase {
 pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
     if let Some(overlay) = &state.overlay {
         match overlay {
-            crate::overlay::Overlay::Approval(_) | crate::overlay::Overlay::Clarification(_) => {
+            crate::overlay::Overlay::Approval(_)
+            | crate::overlay::Overlay::Clarification(_)
+            | crate::overlay::Overlay::DefinitionTrust(_) => {
                 return StatusPhase::AwaitingUser;
             }
             // The exit dialog asks the user what to do, but the runtime keeps

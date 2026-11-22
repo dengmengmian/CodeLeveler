@@ -6,6 +6,7 @@ use leveler_client_protocol::{
 use crate::overlay::Overlay;
 use crate::overlay::approval::ApprovalOverlay;
 use crate::overlay::clarification::ClarificationOverlay;
+use crate::overlay::definition_trust::DefinitionTrustOverlay;
 use crate::state::{AppState, Notification, PendingInteraction};
 use crate::transcript::{InputDelivery, TurnEndStatus};
 
@@ -223,6 +224,25 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 ))));
             }
         }
+        RuntimeEvent::DefinitionTrustRequested { request } => {
+            // The compat stream carries every session's events. A prompt for a
+            // session this client is not viewing must not appear here; the
+            // session-specific stream still delivers it to its own client.
+            if request.session_id != state.session_id {
+                return;
+            }
+            // A parked prompt keeps its runtime waiter alive; the same rule as
+            // approvals. Nothing is approved by opening or parking it.
+            if state.overlay.is_some() {
+                state
+                    .pending_interactions
+                    .push_back(PendingInteraction::DefinitionTrust(Box::new(request)));
+            } else {
+                state.overlay = Some(Overlay::DefinitionTrust(Box::new(
+                    DefinitionTrustOverlay::new(request),
+                )));
+            }
+        }
         // Another client (or a timeout/cancel) answered this request. Dismiss the
         // matching prompt here so a second answer can't hit an already-resolved
         // approval. Harmless when this client is the one that just answered.
@@ -242,6 +262,16 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 |p| matches!(p, PendingInteraction::Clarification(r) if r.id == id),
             );
             if matches!(&state.overlay, Some(Overlay::Clarification(ov)) if ov.request.id == id) {
+                state.overlay = None;
+                crate::reducer::overlay_keys::advance_overlay(state);
+            }
+        }
+        RuntimeEvent::DefinitionTrustResolved { id } => {
+            dismiss_resolved_interaction(
+                state,
+                |p| matches!(p, PendingInteraction::DefinitionTrust(r) if r.id == id),
+            );
+            if matches!(&state.overlay, Some(Overlay::DefinitionTrust(ov)) if ov.request.id == id) {
                 state.overlay = None;
                 crate::reducer::overlay_keys::advance_overlay(state);
             }
@@ -3011,7 +3041,9 @@ fn apply_session_with(
     if adoption == TranscriptAdoption::Replace {
         if matches!(
             state.overlay,
-            Some(Overlay::Approval(_)) | Some(Overlay::Clarification(_))
+            Some(Overlay::Approval(_))
+                | Some(Overlay::Clarification(_))
+                | Some(Overlay::DefinitionTrust(_))
         ) {
             state.overlay = None;
         }
@@ -3024,6 +3056,9 @@ fn apply_session_with(
                 leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
                     PendingInteraction::Clarification(request)
                 }
+                leveler_client_protocol::UiPendingInteraction::DefinitionTrust(request) => {
+                    PendingInteraction::DefinitionTrust(Box::new(request))
+                }
             };
             if state.overlay.is_none() {
                 state.overlay = Some(match pending {
@@ -3032,6 +3067,9 @@ fn apply_session_with(
                     }
                     PendingInteraction::Clarification(request) => {
                         Overlay::Clarification(Box::new(ClarificationOverlay::new(request)))
+                    }
+                    PendingInteraction::DefinitionTrust(request) => {
+                        Overlay::DefinitionTrust(Box::new(DefinitionTrustOverlay::new(*request)))
                     }
                 });
             } else {

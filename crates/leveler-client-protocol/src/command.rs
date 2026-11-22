@@ -6,9 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId, ToolCallId};
+use leveler_core::{
+    ApprovalId, CheckpointId, ClarificationId, CommandId, DefinitionTrustRequestId, SessionId,
+    ToolCallId,
+};
 use leveler_model::{ModelRef, ThinkingLevel};
 
+use super::definition_trust::DefinitionTrustDecision;
 use super::media::AttachmentRef;
 use super::snapshot::MessageId;
 use super::{ApprovalDecision, PermissionProfile};
@@ -268,6 +272,17 @@ pub enum ClientCommand {
     ApprovalDecision {
         request_id: ApprovalId,
         decision: ApprovalDecision,
+    },
+    /// Resolve a pending definition-trust request raised by a running tool.
+    ///
+    /// This answers "may this exact definition content be used", not "may this
+    /// action run". `session_id` binds the answer to the session that owns the
+    /// waiter; a runtime that has no live waiter refuses rather than guessing.
+    DefinitionTrustDecision {
+        request_id: DefinitionTrustRequestId,
+        decision: DefinitionTrustDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
     },
     /// Answer a pending clarification (spec §35). An empty answer means "skip".
     AnswerClarification {
@@ -876,6 +891,7 @@ impl ClientCommand {
                 requester_session_id,
                 ..
             } => Some(requester_session_id),
+            ClientCommand::DefinitionTrustDecision { session_id, .. } => session_id.as_ref(),
             ClientCommand::ApprovalDecision { .. }
             | ClientCommand::AnswerClarification { .. }
             | ClientCommand::ReloadConfig { .. }

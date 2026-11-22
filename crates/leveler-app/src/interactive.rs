@@ -692,6 +692,10 @@ pub struct InProcessRuntimeClient {
     session_events: Arc<SessionStreams>,
     pending: PendingApprovals,
     pending_clarify: PendingClarifications,
+    /// Tool calls waiting for the user to admit untrusted definition content.
+    /// Separate from permission approvals: the decision and its persistence
+    /// rules differ.
+    pending_trust: crate::definition_trust_bridge::PendingDefinitionTrusts,
     /// Serializes durable clarification settlement with turn admission.
     ///
     /// A client answer settles the request and then starts the continuation.
@@ -2022,6 +2026,7 @@ impl InProcessRuntimeClient {
             session_events,
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
+            pending_trust: Arc::new(Mutex::new(HashMap::new())),
             durable_clarify: Arc::new(tokio::sync::Mutex::new(())),
             goal_steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -5051,6 +5056,26 @@ impl InProcessRuntimeClient {
         }
     }
 
+    fn definition_trust_authorizer(
+        &self,
+        session_id: &SessionId,
+        events: crate::event_bridge::RuntimeEventSender,
+        cancel: CancellationToken,
+        fallback_mode: PermissionProfile,
+    ) -> Arc<dyn leveler_tools::DefinitionTrustAuthorizer> {
+        Arc::new(
+            crate::definition_trust_bridge::ChannelDefinitionTrustAuthorizer {
+                app: self.app.clone(),
+                events,
+                pending: self.pending_trust.clone(),
+                cancel,
+                session_id: session_id.clone(),
+                fallback_mode,
+                serial: Arc::new(tokio::sync::Mutex::new(())),
+            },
+        )
+    }
+
     fn spawn_turn(
         &self,
         session_id: SessionId,
@@ -5154,6 +5179,8 @@ impl InProcessRuntimeClient {
         // Text the user sends while this turn runs lands here and is injected
         // at the top of the next round.
         let steering = self.steering_for(&session_id, admission.steering());
+        let trust_authorizer =
+            self.definition_trust_authorizer(&session_id, events.clone(), cancel.clone(), mode);
         let (accepted_tx, accepted_rx) = oneshot::channel();
 
         let handle = tokio::runtime::Handle::current();
@@ -5237,6 +5264,7 @@ impl InProcessRuntimeClient {
                                 recovery_context.take(),
                                 &mut observer,
                                 cancel.clone(),
+                                Some(trust_authorizer.clone()),
                             )
                             .await
                         }
@@ -5870,6 +5898,14 @@ impl InProcessRuntimeClient {
         let approver = self.approver(&session_id, cancel.clone());
         let clarifier = self.clarifier(&session_id, cancel.clone());
         let steering = self.steering_for(&session_id, admission.steering());
+        let trust_authorizer = self.definition_trust_authorizer(
+            &session_id,
+            events.clone(),
+            cancel.clone(),
+            self.app
+                .live_permission_profile(session_id.as_str())
+                .unwrap_or(PermissionProfile::Assisted),
+        );
         let (accepted_tx, accepted_rx) = oneshot::channel();
 
         let handle = tokio::runtime::Handle::current();
@@ -5911,6 +5947,7 @@ impl InProcessRuntimeClient {
                         admission.task_cancel(),
                         &mut observer,
                         cancel,
+                        Some(trust_authorizer),
                     )
                     .await
                 };
@@ -6693,6 +6730,8 @@ impl InProcessRuntimeClient {
         // Steers and per-child cancels reach this chat turn through the same
         // source the goal turn uses.
         let steering = self.steering_for(&session_id, admission.steering());
+        let trust_authorizer =
+            self.definition_trust_authorizer(&session_id, events.clone(), cancel.clone(), mode);
         let (accepted_tx, accepted_rx) = oneshot::channel();
 
         // The runtime's observer is `&mut dyn FnMut`, so the turn future is not
@@ -6755,6 +6794,7 @@ impl InProcessRuntimeClient {
                                 admission.task_cancel(),
                                 &mut observer,
                                 cancel.clone(),
+                                Some(trust_authorizer.clone()),
                             )
                             .await
                         } else {
@@ -6767,6 +6807,7 @@ impl InProcessRuntimeClient {
                                 recovery_context.take(),
                                 &mut observer,
                                 cancel.clone(),
+                                Some(trust_authorizer.clone()),
                             )
                             .await
                         }
@@ -7577,6 +7618,16 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 request_id,
                 decision,
             } => resolve_approval(&self.pending, &request_id, execution_decision(decision)),
+            ClientCommand::DefinitionTrustDecision {
+                request_id,
+                decision,
+                session_id,
+            } => crate::definition_trust_bridge::resolve_definition_trust(
+                &self.pending_trust,
+                &request_id,
+                session_id.as_ref(),
+                decision,
+            ),
             ClientCommand::AnswerClarification {
                 request_id,
                 answer,
@@ -9187,6 +9238,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
     }
 
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+        // A session this process did not create may already have run an agent
+        // in an earlier process. It gets no FullAccess baseline, so nothing in
+        // it can be auto-adopted; `/trust` remains the human surface.
+        self.app
+            .register_resumed_definition_session(session_id.as_str());
         // A crash between the durable answer and its continuation leaves the
         // goal owed with nobody driving it. Opening the session is the moment
         // to finish that work — the user does not retype anything, and the
@@ -9341,6 +9397,18 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     )
                 }),
         );
+        pending_interactions.extend(
+            self.pending_trust
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .filter(|pending| pending.session_id == *session_id)
+                .map(|pending| {
+                    leveler_client_protocol::UiPendingInteraction::DefinitionTrust(
+                        pending.request.clone(),
+                    )
+                }),
+        );
         // A question outlives the turn that asked it. When no live turn owns
         // the session, the durable pending rows are the authority: a client
         // that reconnects after a restart restores a card it can still answer,
@@ -9353,6 +9421,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         request.id.as_str().to_string()
                     }
                     leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
+                        request.id.as_str().to_string()
+                    }
+                    leveler_client_protocol::UiPendingInteraction::DefinitionTrust(request) => {
                         request.id.as_str().to_string()
                     }
                 })
@@ -9386,6 +9457,9 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 request.id.as_str().to_string()
             }
             leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
+                request.id.as_str().to_string()
+            }
+            leveler_client_protocol::UiPendingInteraction::DefinitionTrust(request) => {
                 request.id.as_str().to_string()
             }
         });

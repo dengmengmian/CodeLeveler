@@ -34,11 +34,11 @@ pub use name::{MAX_SKILL_NAME_LEN, is_mentionable, validate_read_name, validate_
 pub use registry::{
     ShadowedSkill, SkillDetail, SkillEntry, SkillLookupError, SkillMentionResolution, SkillProblem,
     SkillRegistry, SkillRoot, SkillRoots, SkillScope, SkillSource, SkillState, SkillSummary,
-    describe, discover, load, resolve_mentions,
+    UntrustedSkill, UntrustedSkillSummary, describe, discover, load, resolve_mentions,
 };
 pub use render::{
     MAX_SKILL_INDEX_BYTES, SKILLS_HOW_TO_USE, parse_skill_mentions, render_capped_index,
-    render_index, render_skill_package, render_turn_injection,
+    render_capped_index_with_pending, render_index, render_skill_package, render_turn_injection,
 };
 pub use store::{
     MAX_BODY_BYTES, MAX_BUNDLED_BYTES, MAX_BUNDLED_FILES, MAX_DESCRIPTION_CHARS, MAX_FILE_BYTES,

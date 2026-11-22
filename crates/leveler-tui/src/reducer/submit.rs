@@ -605,6 +605,7 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         // Same page, other section: one implementation, two entry points.
         "usage" => open_stats(state, crate::screen::StatsSection::Usage),
         "clean" => open_clean(state),
+        "trust" => crate::trust::open(state),
         "schedules" => crate::schedules::open(state),
         "memory" => crate::memory::open(state),
         "remember" => remember_memory(state, command),

@@ -10,6 +10,7 @@
 
 pub mod approval;
 pub mod clarification;
+pub mod definition_trust;
 pub mod exit_confirm;
 pub mod selection;
 
@@ -27,6 +28,7 @@ use crate::theme::Theme;
 
 pub use approval::{ApprovalOutcome, ApprovalOverlay};
 pub use clarification::{ClarificationOutcome, ClarificationOverlay};
+pub use definition_trust::{DefinitionTrustOutcome, DefinitionTrustOverlay};
 pub use exit_confirm::ExitConfirmOverlay;
 pub use selection::{SelectionModel, SelectionOption, SelectionOutcome};
 
@@ -46,6 +48,10 @@ pub enum Overlay {
     Approval(Box<ApprovalOverlay>),
     /// The agent asked the user a question mid-task (spec §35).
     Clarification(Box<ClarificationOverlay>),
+    /// A running tool needs the user to admit untrusted definition content
+    /// before it can continue. Distinct from a permission approval: the
+    /// options and the durable effect are about content trust.
+    DefinitionTrust(Box<DefinitionTrustOverlay>),
     /// Shown when attachments are present but the model has no vision (spec §42).
     UnsupportedMedia(Box<SelectionModel>),
     /// Pick a conversation checkpoint to restore (spec §68).
@@ -88,6 +94,7 @@ impl Overlay {
         match self {
             Overlay::Approval(_) => Some(t.overlay_approval),
             Overlay::Clarification(_) => Some(t.overlay_clarify),
+            Overlay::DefinitionTrust(_) => Some(t.trust.overlay_title),
             Overlay::UnsupportedMedia(_) => Some(t.overlay_media),
             Overlay::ModelPicker(_)
             | Overlay::DefaultModelPicker(_)
@@ -137,6 +144,7 @@ impl Overlay {
                 true
             }
             Overlay::Approval(_)
+            | Overlay::DefinitionTrust(_)
             | Overlay::ThinkingPicker(_)
             | Overlay::ConfirmSchedule(_)
             | Overlay::ConfirmExit(_) => false,
@@ -351,6 +359,7 @@ fn build_content(
         | Overlay::ThinkingPicker(model)
         | Overlay::ReviewScopePicker(model) => selection_content(model, theme, width, locale),
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
+        Overlay::DefinitionTrust(ov) => definition_trust_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
         Overlay::ConfirmSchedule(ov) => selection_content(&ov.model, theme, width, locale),
         Overlay::ConfirmExit(ov) => exit_content(ov, theme, width, locale),
@@ -1340,6 +1349,156 @@ fn decision_rule(theme: &Theme, width: usize) -> Line<'static> {
         "─".repeat(width),
         Style::default().fg(theme.border.normal),
     ))
+}
+
+fn definition_trust_content(
+    ov: &DefinitionTrustOverlay,
+    theme: &Theme,
+    width: usize,
+    locale: crate::i18n::Locale,
+) -> RawContent {
+    use leveler_client_protocol::UiDefinitionTrustState;
+    let t = locale.text();
+    let req = &ov.request;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(decision_rule(theme, width));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{}: ", t.trust.overlay_needs),
+            Style::default().fg(theme.text.muted),
+        ),
+        Span::styled(
+            leveler_definition_trust::sanitize_line(&req.display),
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{}: ", t.trust.overlay_source),
+            Style::default().fg(theme.text.muted),
+        ),
+        Span::styled(
+            leveler_definition_trust::sanitize_line(&format!("{} · {}", req.source, req.location)),
+            Style::default().fg(theme.text.secondary),
+        ),
+    ]));
+    let state = match req.state {
+        UiDefinitionTrustState::Unapproved => t.trust.state_unapproved,
+        UiDefinitionTrustState::Changed => t.trust.state_changed,
+        UiDefinitionTrustState::StoreUnavailable => t.trust.state_unavailable,
+        UiDefinitionTrustState::Other => t.trust.state_unreadable,
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{}: ", t.trust.overlay_state),
+            Style::default().fg(theme.text.muted),
+        ),
+        Span::styled(
+            state,
+            Style::default().fg(if matches!(req.state, UiDefinitionTrustState::Changed) {
+                theme.status.warning
+            } else {
+                theme.text.secondary
+            }),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    let total = 3;
+    let labels = [
+        t.trust.overlay_once,
+        t.trust.overlay_trust,
+        t.trust.overlay_deny,
+    ];
+    let mut cursor_row = None;
+    let mut focus_first = None;
+    let mut focus_last = None;
+    for (index, label) in labels.iter().enumerate() {
+        let row = lines.len();
+        focus_first.get_or_insert(row);
+        focus_last = Some(row);
+        let text = format!("{} {label}", option_number(index, total));
+        if index == ov.cursor() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", crate::presentation::tokens::FOCUS_CURSOR),
+                    Style::default().fg(theme.accent.primary),
+                ),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            cursor_row = Some(row);
+        } else {
+            lines.push(Line::from(Span::raw(format!("  {text}"))));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if ov.detail_open {
+            format!("v {}", t.trust.overlay_hide)
+        } else {
+            format!("v {}", t.trust.overlay_view)
+        },
+        Style::default().fg(theme.accent.primary),
+    )));
+    lines.push(Line::from(Span::styled(
+        t.trust.overlay_withheld,
+        Style::default().fg(theme.text.muted),
+    )));
+    if ov.detail_open {
+        lines.push(Line::from(""));
+        let changed = matches!(req.state, UiDefinitionTrustState::Changed);
+        let body: Vec<String> = if changed {
+            match &req.approved_content {
+                Some(old) => leveler_definition_trust::unified_diff(old, &req.current_content, 400)
+                    .unwrap_or_else(|| vec!["(too large to diff here)".to_string()]),
+                None => vec![t.trust.no_snapshot.to_string()],
+            }
+        } else {
+            req.current_content
+                .lines()
+                .map(leveler_definition_trust::sanitize_line)
+                .collect()
+        };
+        let header = if changed {
+            t.trust.diff
+        } else {
+            t.trust.content
+        };
+        lines.push(Line::from(Span::styled(
+            header,
+            Style::default()
+                .fg(theme.accent.primary)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for line in body.iter().skip(ov.detail_scroll).take(60) {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
+        if ov.detail_scroll + 60 < body.len() {
+            lines.push(Line::from(Span::styled(
+                "  … (PageDown for more)",
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+    }
+    let tail_from = Some(lines.len());
+    lines.push(help_line(theme, t.trust.overlay_hint));
+    RawContent {
+        title: t.trust.overlay_title.to_string(),
+        lines,
+        cursor: None,
+        cursor_row,
+        focus_block: focus_first.zip(focus_last),
+        tail_from,
+    }
 }
 
 fn approval_content(

@@ -7,9 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
+use leveler_core::{ApprovalId, ClarificationId, CommandId, DefinitionTrustRequestId, ToolCallId};
 
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
+use super::definition_trust::UiDefinitionTrustRequest;
 use super::media::AttachmentRef;
 use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan};
 use super::snapshot::{
@@ -340,6 +341,12 @@ pub enum RuntimeEvent {
     /// timeout/cancel). Clients dismiss the matching prompt so a second client
     /// never answers an approval that no longer exists.
     ApprovalResolved { id: ApprovalId },
+    /// A running tool needs the user to admit untrusted definition content
+    /// before it can continue.
+    DefinitionTrustRequested { request: UiDefinitionTrustRequest },
+    /// A pending definition-trust request was resolved (by any client, a turn
+    /// cancellation, or a disconnect). Clients dismiss the matching prompt.
+    DefinitionTrustResolved { id: DefinitionTrustRequestId },
     /// The agent is asking the user a clarifying question (spec §35).
     ClarificationRequested { request: UiClarificationRequest },
     /// A pending clarification was resolved (by any client, timeout, or cancel).

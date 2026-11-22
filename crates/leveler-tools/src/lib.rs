@@ -8,6 +8,7 @@
 
 pub mod answer_effect;
 pub mod capabilities;
+pub mod definition_trust;
 pub mod mcp;
 pub(crate) mod memory_access;
 pub(crate) mod network;
@@ -22,6 +23,10 @@ pub use answer_effect::{
     BOOKKEEPING_TOOLS, acts_on_answer, is_silent_shell_probe, update_goal_is_blocked,
 };
 pub use capabilities::Capabilities;
+pub use definition_trust::{
+    DefinitionTrustAuthorizationOutcome, DefinitionTrustAuthorizationRequest,
+    DefinitionTrustAuthorizer, DefinitionTrustDecision, MAX_AUTHORIZATION_PREVIEW_BYTES,
+};
 pub use registry::{
     CapabilityPacks, MODEL_SURFACE_TOOLS, OBSERVE_CLASS_TOOLS, ToolRegistry, core_surface,
     default_registry, is_observe_class_tool, model_surface,

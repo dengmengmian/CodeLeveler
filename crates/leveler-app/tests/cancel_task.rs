@@ -749,6 +749,7 @@ async fn cancelling_the_continued_window_ends_the_logical_goal() {
             None,
             &mut |_| {},
             CancellationToken::new(),
+            None,
         )
         .await;
     assert!(

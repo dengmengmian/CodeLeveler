@@ -42,6 +42,7 @@ pub struct PendingSubmission {
 pub enum PendingInteraction {
     Approval(UiApprovalRequest),
     Clarification(UiClarificationRequest),
+    DefinitionTrust(Box<leveler_client_protocol::UiDefinitionTrustRequest>),
 }
 
 impl PendingInteraction {
@@ -50,6 +51,7 @@ impl PendingInteraction {
         match self {
             Self::Approval(r) => format!("a:{}", r.id.as_str()),
             Self::Clarification(r) => format!("c:{}", r.id.as_str()),
+            Self::DefinitionTrust(r) => format!("d:{}", r.id.as_str()),
         }
     }
 }
@@ -452,6 +454,8 @@ pub struct AppState {
     /// `/clean` page state: scan/cleanup stage, the plan, and the result.
     /// Presentation-only; the CLI host owns the scan and the deletion.
     pub clean: crate::clean::CleanState,
+    /// `/trust` page: discovered definitions, selection and previews.
+    pub trust: crate::trust::TrustState,
     /// `/schedules`: a view over the runtime's scheduled-automation API. The
     /// page owns no definitions, runs or grants; it only holds their last
     /// authoritative projection and the query ids it is waiting on.
@@ -924,6 +928,7 @@ impl AppState {
             trace: crate::observability::TraceView::default(),
             context: crate::context::ContextView::default(),
             clean: crate::clean::CleanState::default(),
+            trust: crate::trust::TrustState::default(),
             schedule: crate::schedules::ScheduleState::default(),
             memory: crate::memory::MemoryState::default(),
             tasks: crate::tasks::TasksState::default(),

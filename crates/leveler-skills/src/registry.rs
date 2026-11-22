@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use leveler_definition_trust::{
-    DefinitionIdentity, DefinitionKind, DefinitionTrustView, TrustAuditEntry,
+    DefinitionIdentity, DefinitionKind, DefinitionTrust, DefinitionTrustView, TrustAuditEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -221,6 +221,18 @@ pub struct SkillSummary {
     pub source: SkillSource,
 }
 
+/// A present-but-untrusted skill, as the index may name it.
+///
+/// It deliberately carries no description: unapproved package metadata must
+/// not be presented as usable instruction. The name and provenance are what
+/// the model needs to request the skill, which triggers the human decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedSkillSummary {
+    pub name: String,
+    pub scope: SkillScope,
+    pub source: SkillSource,
+}
+
 /// One verified reference file's text. The bytes were read and hashed as part of
 /// the package approval in the same pass that produced this value, so the model
 /// never receives text that a later edit could have swapped.
@@ -292,12 +304,74 @@ pub enum SkillLookupError {
         error: String,
     },
     /// The package exists but its exact bytes are not approved.
+    ///
+    /// The bulky detail lives behind a box: this refusal crosses every
+    /// resolution call, and the common successful path must not pay for it in
+    /// the error type's stack width.
     Untrusted {
         name: String,
         scope: SkillScope,
         source: SkillSource,
         state: String,
+        package: Option<Box<UntrustedSkill>>,
     },
+}
+
+impl SkillLookupError {
+    /// The package an authorization request must name, when this is an
+    /// untrusted-content refusal.
+    pub fn untrusted_package(&self) -> Option<UntrustedSkill> {
+        match self {
+            Self::Untrusted { package, .. } => package.as_deref().cloned(),
+            _ => None,
+        }
+    }
+}
+
+/// A package that exists but was refused by the trust gate.
+///
+/// It is kept apart from the resolved entries: an unapproved package must not
+/// shadow a trusted lower-precedence skill, and its description must never be
+/// presented as usable metadata. The name, scope, source and location are the
+/// facts an authorization request needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedSkill {
+    pub name: String,
+    pub scope: SkillScope,
+    pub source: SkillSource,
+    pub location: PathBuf,
+    pub identity: Option<DefinitionIdentity>,
+    pub digest: String,
+    /// The full decision (state + any approved digest).
+    pub decision: DefinitionTrust,
+}
+
+impl UntrustedSkill {
+    pub fn state(&self) -> &'static str {
+        self.decision.audit_state()
+    }
+
+    /// Flatten to the audit record the registry has always exposed.
+    pub fn audit(&self) -> TrustAuditEntry {
+        TrustAuditEntry {
+            id: self
+                .identity
+                .as_ref()
+                .map(|identity| identity.id.clone())
+                .unwrap_or_else(|| format!("skill:{}", self.name)),
+            display: self
+                .identity
+                .as_ref()
+                .map(|identity| identity.display.clone())
+                .unwrap_or_else(|| self.name.clone()),
+            scope: self.scope.as_str().to_string(),
+            kind: "skill".to_string(),
+            state: self.state().to_string(),
+            approved_digest: self.decision.approved_digest().map(str::to_string),
+            store_status: None,
+            session_source: None,
+        }
+    }
 }
 
 impl std::fmt::Display for SkillLookupError {
@@ -333,10 +407,11 @@ impl std::fmt::Display for SkillLookupError {
                 scope,
                 source,
                 state,
+                ..
             } => write!(
                 f,
                 "skill `{name}` ({source} · {scope}) is present but not trusted ({state}); \
-                 approve it with `leveler trust`"
+                 the user can review and approve it with /trust"
             ),
         }
     }
@@ -417,6 +492,10 @@ pub struct SkillRegistry {
     /// Packages present but refused by the trust gate. They are not entries:
     /// an unapproved package never shadows a trusted one.
     untrusted: Vec<TrustAuditEntry>,
+    /// The same refusals with the fields an authorization request needs.
+    /// Ordered by root precedence, so the first match for a name is the one
+    /// the loader would have used.
+    untrusted_skills: Vec<UntrustedSkill>,
     /// The snapshot `load_skill` re-checks before returning a body.
     trust: DefinitionTrustView,
 }
@@ -427,6 +506,7 @@ impl Default for SkillRegistry {
             entries: Vec::new(),
             problems: Vec::new(),
             untrusted: Vec::new(),
+            untrusted_skills: Vec::new(),
             trust: DefinitionTrustView::deny_all(),
         }
     }
@@ -437,6 +517,7 @@ impl PartialEq for SkillRegistry {
         self.entries == other.entries
             && self.problems == other.problems
             && self.untrusted == other.untrusted
+            && self.untrusted_skills == other.untrusted_skills
     }
 }
 
@@ -450,6 +531,7 @@ impl SkillRegistry {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut problems: Vec<SkillProblem> = Vec::new();
         let mut untrusted: Vec<TrustAuditEntry> = Vec::new();
+        let mut untrusted_skills: Vec<UntrustedSkill> = Vec::new();
         for (rank, root) in roots.roots.iter().enumerate() {
             read_root(
                 root,
@@ -458,6 +540,7 @@ impl SkillRegistry {
                 &mut candidates,
                 &mut problems,
                 &mut untrusted,
+                &mut untrusted_skills,
             );
         }
         let builtin_rank = roots.roots.len();
@@ -503,6 +586,7 @@ impl SkillRegistry {
             entries,
             problems,
             untrusted,
+            untrusted_skills,
             trust: trust.clone(),
         }
     }
@@ -510,6 +594,22 @@ impl SkillRegistry {
     /// Packages present but not admitted by the trust gate.
     pub fn untrusted(&self) -> &[TrustAuditEntry] {
         &self.untrusted
+    }
+
+    /// The refused packages with the identity and digest an authorization
+    /// request needs, in precedence order.
+    pub fn untrusted_skills(&self) -> &[UntrustedSkill] {
+        &self.untrusted_skills
+    }
+
+    /// The highest-precedence refused package for `name`.
+    ///
+    /// This is only consulted when no trusted entry owns the name, so an
+    /// unapproved package can never shadow a usable one.
+    pub fn untrusted_skill(&self, name: &str) -> Option<&UntrustedSkill> {
+        self.untrusted_skills
+            .iter()
+            .find(|skill| skill.name == name)
     }
 
     pub fn entries(&self) -> &[SkillEntry] {
@@ -549,11 +649,43 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Refused names that do not collide with a usable entry.
+    ///
+    /// The index names these so the model can request one, but only when no
+    /// trusted entry owns the name: an unapproved package never shadows a
+    /// usable skill, in the index or in resolution.
+    pub fn untrusted_summaries(&self) -> Vec<UntrustedSkillSummary> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for skill in &self.untrusted_skills {
+            if self.get(&skill.name).is_some() || !seen.insert(skill.name.clone()) {
+                continue;
+            }
+            out.push(UntrustedSkillSummary {
+                name: skill.name.clone(),
+                scope: skill.scope,
+                source: skill.source,
+            });
+        }
+        out
+    }
+
     /// Resolve a name to a usable entry. Never falls back: an invalid active
     /// definition is refused with its reason rather than skipped.
     pub fn resolve(&self, name: &str) -> Result<&SkillEntry, SkillLookupError> {
         let requested = name.trim();
         let Some(entry) = self.get(requested) else {
+            // A package that exists but was refused is not a typo. Name it so
+            // the caller can ask the user instead of the model guessing.
+            if let Some(untrusted) = self.untrusted_skill(requested) {
+                return Err(SkillLookupError::Untrusted {
+                    name: untrusted.name.clone(),
+                    scope: untrusted.scope,
+                    source: untrusted.source,
+                    state: untrusted.state().to_string(),
+                    package: Some(Box::new(untrusted.clone())),
+                });
+            }
             return Err(SkillLookupError::NotFound {
                 name: requested.to_string(),
                 available: self.available_names(),
@@ -602,11 +734,21 @@ impl SkillRegistry {
             let digest = DefinitionIdentity::skill_package_digest(&package);
             let decision = self.trust.check(&identity, &digest);
             if !decision.admits() {
-                return Err(SkillLookupError::Untrusted {
+                let package = UntrustedSkill {
                     name: entry.name.clone(),
                     scope: entry.scope,
                     source: entry.source,
-                    state: decision.audit_state().to_string(),
+                    location: dir,
+                    identity: Some(identity),
+                    digest,
+                    decision,
+                };
+                return Err(SkillLookupError::Untrusted {
+                    name: package.name.clone(),
+                    scope: package.scope,
+                    source: package.source,
+                    state: package.state().to_string(),
+                    package: Some(Box::new(package)),
                 });
             }
         }
@@ -679,8 +821,11 @@ impl SkillRegistry {
                 Err(SkillLookupError::Invalid { name, error, .. })
                 | Err(SkillLookupError::Read { name, error }) => invalid.push((name, error)),
                 Err(SkillLookupError::Untrusted { name, state, .. }) => invalid.push((
-                    name,
-                    format!("not trusted ({state}); the user can approve it with `leveler trust`"),
+                    name.clone(),
+                    format!(
+                        "not trusted ({state}); call `load_skill(\"{name}\")` to ask the user to \
+                         admit it, or the user can review it with /trust"
+                    ),
                 )),
             }
         }
@@ -725,6 +870,7 @@ fn read_root(
     candidates: &mut Vec<Candidate>,
     problems: &mut Vec<SkillProblem>,
     untrusted: &mut Vec<TrustAuditEntry>,
+    untrusted_skills: &mut Vec<UntrustedSkill>,
 ) {
     let Ok(listing) = std::fs::read_dir(&root.dir) else {
         return;
@@ -796,7 +942,7 @@ fn read_root(
         }
         match read_candidate(root, rank, &path, &dir_name, trust) {
             CandidateRead::Candidate(candidate) => candidates.push(candidate),
-            CandidateRead::Untrusted(entry) => {
+            CandidateRead::Untrusted(untrusted_skill) => {
                 // Do not enter the name: an unapproved package must not shadow
                 // a trusted lower-precedence skill.
                 problems.push(SkillProblem {
@@ -804,11 +950,12 @@ fn read_root(
                     source: root.source,
                     location: path,
                     error: format!(
-                        "the skill is not trusted ({}); approve it with `leveler trust`",
-                        entry.state
+                        "the skill is not trusted ({}); the user can approve it with /trust",
+                        untrusted_skill.state()
                     ),
                 });
-                untrusted.push(entry);
+                untrusted.push(untrusted_skill.audit());
+                untrusted_skills.push(untrusted_skill);
             }
         }
     }
@@ -816,7 +963,7 @@ fn read_root(
 
 enum CandidateRead {
     Candidate(Candidate),
-    Untrusted(TrustAuditEntry),
+    Untrusted(UntrustedSkill),
 }
 
 fn read_candidate(
@@ -853,7 +1000,15 @@ fn read_candidate(
         let digest = DefinitionIdentity::skill_package_digest(&package);
         let decision = trust.check(&identity, &digest);
         if !decision.admits() {
-            return CandidateRead::Untrusted(trust.audit(&identity, &digest));
+            return CandidateRead::Untrusted(UntrustedSkill {
+                name: name.to_string(),
+                scope: root.scope,
+                source: root.source,
+                location: dir.to_path_buf(),
+                identity: Some(identity.clone()),
+                digest,
+                decision,
+            });
         }
     }
     let Ok(content) = String::from_utf8(bytes) else {

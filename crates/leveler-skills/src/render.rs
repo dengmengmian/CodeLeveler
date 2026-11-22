@@ -6,7 +6,7 @@
 //! `$skill`. That split is what keeps a growing skill library from
 //! consuming context linearly.
 
-use crate::registry::{SkillDetail, SkillMentionResolution, SkillSummary};
+use crate::registry::{SkillDetail, SkillMentionResolution, SkillSummary, UntrustedSkillSummary};
 
 /// Extract `$skill-name` tokens from user text.
 ///
@@ -119,6 +119,62 @@ pub fn render_capped_index(skills: &[SkillSummary], max_bytes: usize) -> String 
             break;
         }
         s.push_str(&line);
+    }
+    s.push('\n');
+    s.push_str(SKILLS_HOW_TO_USE);
+    s
+}
+
+/// Like [`render_capped_index`], plus the names of packages that exist but are
+/// not trusted.
+///
+/// An untrusted package's name lets the model request it, which is what raises
+/// the human authorization prompt. Its description and body are NOT included:
+/// until a human decides, the package is data the user has not admitted.
+pub fn render_capped_index_with_pending(
+    skills: &[SkillSummary],
+    pending: &[UntrustedSkillSummary],
+    max_bytes: usize,
+) -> String {
+    if skills.is_empty() && pending.is_empty() {
+        return String::new();
+    }
+    let reserve = SKILLS_HOW_TO_USE.len() + 256;
+    let mut s = String::from(INDEX_HEADER);
+    for (shown, skill) in skills.iter().enumerate() {
+        let line = index_line(skill);
+        if s.len() + line.len() + reserve > max_bytes {
+            s.push_str(&format!(
+                "- … and {} more skills not listed; name one to load it.\n",
+                skills.len() - shown
+            ));
+            break;
+        }
+        s.push_str(&line);
+    }
+    if !pending.is_empty() {
+        let header = "Present but not trusted (no description or instructions \
+                      are available until the user approves them; name one with \
+                      `load_skill` to ask):\n";
+        if s.len() + header.len() + reserve <= max_bytes {
+            s.push_str(header);
+            for skill in pending {
+                let line = format!(
+                    "- {} [{} · {}]: requires user approval\n",
+                    skill.name,
+                    skill.scope.as_str(),
+                    skill.source.as_str()
+                );
+                if s.len() + line.len() + reserve > max_bytes {
+                    let omitted = pending.len();
+                    s.push_str(&format!(
+                        "- … and {omitted} more untrusted skills not listed.\n"
+                    ));
+                    break;
+                }
+                s.push_str(&line);
+            }
+        }
     }
     s.push('\n');
     s.push_str(SKILLS_HOW_TO_USE);
@@ -332,5 +388,22 @@ mod tests {
         assert!(capped.contains("more skills not listed"), "{capped}");
         assert!(capped.contains("How to use skills"), "{capped}");
         assert!(!capped.contains("skill-199"), "{capped}");
+    }
+
+    #[test]
+    fn an_untrusted_name_is_listed_without_its_description_or_body() {
+        let pending = vec![UntrustedSkillSummary {
+            name: "secret-pack".into(),
+            scope: SkillScope::Project,
+            source: SkillSource::Native,
+        }];
+        let index = render_capped_index_with_pending(&[], &pending, 4096);
+        assert!(index.contains("secret-pack"), "{index}");
+        assert!(index.contains("requires user approval"), "{index}");
+        assert!(!index.contains("SECRET BODY"), "{index}");
+        // The header says it is present but not trusted, and no description
+        // field is emitted for it.
+        assert!(index.contains("Present but not trusted"), "{index}");
+        assert!(!index.contains("secret-pack [project]:"), "{index}");
     }
 }

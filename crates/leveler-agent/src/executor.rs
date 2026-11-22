@@ -3506,8 +3506,9 @@ impl Executor {
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
             &self.definition_trust(),
         );
-        let index = leveler_skills::render_capped_index(
+        let index = leveler_skills::render_capped_index_with_pending(
             &registry.summaries(),
+            &registry.untrusted_summaries(),
             leveler_skills::MAX_SKILL_INDEX_BYTES,
         );
         (!index.is_empty()).then_some(index)

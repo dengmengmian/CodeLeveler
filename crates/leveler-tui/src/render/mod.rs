@@ -1400,6 +1400,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_stats_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
+        Screen::Trust => crate::trust::render_screen(frame, area, state),
         Screen::Schedules => crate::schedules::render_screen(frame, area, state),
         Screen::Output => render_output_screen(frame, area, state),
     }

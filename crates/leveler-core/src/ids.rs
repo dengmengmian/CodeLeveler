@@ -93,6 +93,12 @@ string_id!(
     ApprovalId
 );
 string_id!(
+ /// Identifies one mid-turn request to admit untrusted definition content.
+ /// Distinct from [`ApprovalId`]: it resolves a trust decision, never a
+ /// permission grant.
+    DefinitionTrustRequestId
+);
+string_id!(
  /// Identifies a pending clarification (ask-user) request.
     ClarificationId
 );

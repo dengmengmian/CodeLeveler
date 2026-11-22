@@ -671,6 +671,21 @@ fn an_unapproved_project_skill_is_not_available() {
     assert_eq!(registry.untrusted().len(), 1, "{:?}", registry.untrusted());
     assert_eq!(registry.untrusted()[0].state, "unapproved");
     assert!(registry.load_skill("evil").is_err());
+    // The refusal names the package (not a typo) and carries the exact digest,
+    // so `load_skill` can raise a human authorization request for it.
+    let Err(error @ SkillLookupError::Untrusted { .. }) = registry.load_skill("evil") else {
+        panic!("an untrusted package must resolve as Untrusted");
+    };
+    let package = error.untrusted_package().expect("package detail");
+    assert!(package.identity.is_some());
+    assert!(!package.digest.is_empty());
+    assert_eq!(package.decision.audit_state(), "unapproved");
+    assert!(
+        registry
+            .untrusted_summaries()
+            .iter()
+            .any(|skill| skill.name == "evil")
+    );
 }
 
 #[test]
@@ -890,9 +905,10 @@ fn a_single_file_skill_approval_does_not_cover_the_package() {
     assert!(
         matches!(
             registry.load_skill("legacy"),
-            Err(SkillLookupError::NotFound { .. })
+            Err(SkillLookupError::Untrusted { .. })
         ),
-        "an unlisted skill is not loadable; its old single-file approval admits nothing"
+        "an unlisted skill is not loadable; its old single-file approval admits nothing, \
+         and the refusal names it as untrusted rather than as a typo"
     );
 }
 
@@ -1080,4 +1096,50 @@ fn an_unapproved_user_skill_is_not_available() {
     assert_eq!(registry.untrusted().len(), 1);
     assert_eq!(registry.untrusted()[0].state, "unapproved");
     assert!(registry.load_skill("global-evil").is_err());
+}
+
+#[test]
+fn full_adopts_the_creation_baseline_and_a_later_edit_is_untrusted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    write_skill(
+        &project.join(".leveler/skills"),
+        "demo",
+        "demo",
+        "Demo.",
+        "BASELINE BODY",
+    );
+    let store = tmp.path().join("store");
+    let baseline = leveler_definition_trust::SessionDefinitionBaseline::capture(&project);
+    let session = leveler_definition_trust::SessionDefinitionTrust::created(
+        baseline,
+        leveler_definition_trust::BaselineProvenance::CreatedThisProcess,
+        true,
+    );
+    let view = DefinitionTrustView::load(&store, Some(&project))
+        .with_session(std::sync::Arc::new(session));
+    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let loaded = registry.load_skill("demo").expect("baseline is adopted");
+    assert!(loaded.body.contains("BASELINE BODY"));
+    // Nothing was written to the persistent store.
+    assert_eq!(
+        leveler_definition_trust::DefinitionTrustStore::load(&store).status(),
+        &leveler_definition_trust::StoreStatus::Missing
+    );
+
+    // An agent edit after the baseline is not the adopted content. Rebuild the
+    // registry the way the next turn would.
+    write_skill(
+        &project.join(".leveler/skills"),
+        "demo",
+        "demo",
+        "Demo.",
+        "AGENT EDIT",
+    );
+    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    assert!(registry.get("demo").is_none());
+    let Err(SkillLookupError::Untrusted { state, .. }) = registry.load_skill("demo") else {
+        panic!("an edited definition must not be adopted");
+    };
+    assert_eq!(state, "unapproved");
 }

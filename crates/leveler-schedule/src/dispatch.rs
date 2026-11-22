@@ -1754,6 +1754,7 @@ fn describe_interactions(interactions: &[leveler_client_protocol::UiPendingInter
         .map(|interaction| match interaction {
             leveler_client_protocol::UiPendingInteraction::Approval(_) => "approval",
             leveler_client_protocol::UiPendingInteraction::Clarification(_) => "clarification",
+            leveler_client_protocol::UiPendingInteraction::DefinitionTrust(_) => "definition trust",
         })
         .collect();
     format!(" ({})", kinds.join(", "))

@@ -375,7 +375,10 @@ pub fn definitions_check(
             continue;
         };
         match trust.check(&candidate.identity, digest) {
-            DefinitionTrust::Trusted { .. } | DefinitionTrust::Builtin => {}
+            DefinitionTrust::Trusted { .. }
+            | DefinitionTrust::Builtin
+            | DefinitionTrust::SessionTrusted { .. }
+            | DefinitionTrust::FullAdopted => {}
             DefinitionTrust::Unapproved => pending.push(format!(
                 "{} [{}] new (not trusted)",
                 candidate.identity.display,

@@ -84,6 +84,10 @@ pub enum Screen {
     /// its user turns. A view over the transcript the client already holds;
     /// it never changes the turn, the goal or the runtime.
     Find,
+    /// `/trust`: project definitions the trust gate can see, their exact
+    /// digests, and the human-only approve/revoke actions. Reads the same
+    /// store and discovery the CLI and the runtime use.
+    Trust,
 }
 
 /// Which section of the Context & Usage page an entry point reveals.
@@ -469,6 +473,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // Project instruction and skill trust. Reads the same store and discovery
+    // the CLI and the runtime use; every approval is a human action here, and
+    // it is never sent to the model.
+    slash(
+        "/trust",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Scheduled automation. Management is the runtime's; the page never
     // schedules anything itself.
     slash(
@@ -718,6 +732,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/mcp" => s.mcp,
         "/settings" => s.settings,
         "/clean" => s.clean,
+        "/trust" => s.trust,
         "/schedules" => s.schedules,
         "/update" | "/upgrade" => s.update,
         "/reload" => s.reload,
@@ -1059,6 +1074,7 @@ mod surface_tests {
                 "/mcp",
                 "/settings",
                 "/clean",
+                "/trust",
                 "/schedules",
                 "/memory",
                 "/remember",
@@ -1576,6 +1592,7 @@ mod reachability_tests {
             Screen::Settings => Some("`/settings` — settings::open"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
+            Screen::Trust => Some("`/trust` — reducer/submit.rs"),
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
             Screen::Memory => Some("`/memory` — reducer/submit.rs"),
             Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
@@ -1609,6 +1626,8 @@ mod reachability_tests {
             Screen::Review,
             Screen::Schedules,
             Screen::Memory,
+            Screen::Clean,
+            Screen::Trust,
             Screen::Output,
             Screen::PendingSteer,
         ];

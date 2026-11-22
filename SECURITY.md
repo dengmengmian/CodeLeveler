@@ -111,16 +111,34 @@ when a human approved the exact bytes on disk:
 - Git-tracked or Git-committed status is not approval. A clone, a commit, a
   rename, a copy, a runtime restart or a resumed session does not inherit a
   trust record for different bytes.
-- The approval surface is the human CLI. `leveler trust` lists pending
-  definitions and approves the exact digests it displayed; `leveler trust
-  show` lists the state; `leveler trust diff <path>` shows the approved version
-  against the current bytes; `leveler trust revoke-definition <path>` removes
-  one approval. The agent has no tool that writes a trust record, and neither a
-  permission mode nor model text creates one. In every mode except FullAccess,
-  the file tools refuse to write the trust-store files themselves (the store,
-  its lock, its snapshot directory, and the executable-config store), even when
-  an external-path resource grant is presented: a forged record is not a human
-  decision.
+- The human approval surfaces are `leveler trust` and the TUI's native
+  `/trust` page. Both list pending definitions and approve the exact digests
+  they displayed; `leveler trust show` lists the state; `leveler trust diff
+  <path>` shows the approved version against the current bytes; `leveler trust
+  revoke-definition <path>` removes one approval. The TUI never sends `/trust`
+  to the model and never executes the CLI through a shell. The agent has no tool
+  that writes a trust record, and neither a permission mode nor model text
+  creates one. In every mode except FullAccess, the file tools refuse to write
+  the trust-store files themselves (the store, its lock, its snapshot
+  directory, and the executable-config store), even when an external-path
+  resource grant is presented: a forged record is not a human decision.
+- A running tool may ask the user to admit one untrusted skill's exact bytes
+  (`load_skill`). The request is a typed protocol event with its own decision
+  vocabulary — allow once, trust this content version, deny — never a
+  permission approval. Allow-once is session-scoped and writes no record;
+  trust-current re-reads the package and refuses if the digest moved before the
+  write; a denial suppresses the same identity+digest for the rest of the
+  session. The tool call keeps its identity and continues after the decision;
+  the turn, goal and plan are not restarted.
+- FullAccess adopts only what the **session creation baseline** captured, and
+  only for rule/skill content. The baseline is taken when this process creates
+  the session, before the first model call or tool execution. An agent-authored
+  edit therefore never equals its baseline entry, and a session resumed in a
+  new process has no credible baseline at all, so Full adopts nothing there
+  without a persistent approval. Adoption writes no store record, and switching
+  back to a non-Full mode stops it immediately. Declarative agent definitions
+  are never auto-adopted; their child tool surface still needs a persistent
+  approval.
 - A corrupt, future-schema, or inside-project store fails the whole
   `leveler trust` approval or revocation transaction before the separate
   executable-config store is touched. A missing store is the normal first-run
@@ -148,9 +166,13 @@ created but not admitted; the two facts are reported separately.
 
 **FullAccess is a grant of the user's own authority, not a definition
 approval.** A FullAccess agent can write any user file, including the trust
-store, by design. Do not run an untrusted workspace with FullAccess and expect
-the trust gate to constrain the agent. The gate's threat model is bounded
-execution and non-user surfaces.
+store, by design. The session-baseline adoption above prevents Full from
+promoting content the agent wrote *during the session* as authority, but it
+does not make a permanent trust record unforgeable on the host: an agent with
+Full shell authority can edit the store file directly. Do not run an untrusted
+workspace with FullAccess and expect the trust gate to constrain the agent. The
+gate's threat model is bounded execution and non-user surfaces; the application
+authorization interface itself still has no model-callable approval action.
 
 The workspace layer additionally refuses **writes** to the hooks and
 permissions files, so the agent cannot grant itself hooks or standing

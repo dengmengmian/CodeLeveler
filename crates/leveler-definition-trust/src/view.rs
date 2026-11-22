@@ -7,9 +7,11 @@
 //! a stale view can only deny, never grant.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::{SessionDefinitionTrust, SessionTrustSource};
 use crate::store::{DefinitionTrustStore, StoreStatus};
 use crate::{
     DefinitionIdentity, DefinitionScope, USER_DOMAIN, project_domain, store_is_outside_project,
@@ -18,7 +20,7 @@ use crate::{
 /// What the gate says about one definition's exact current bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefinitionTrust {
-    /// These exact bytes were approved by a human.
+    /// These exact bytes were approved by a human and recorded in the store.
     Trusted { approval_version: u64 },
     /// No record for this identity, or no record at all.
     Unapproved,
@@ -29,9 +31,14 @@ pub enum DefinitionTrust {
     StoreUnavailable { status: StoreStatus },
     /// Compiled into the binary; this crate is not the authority.
     Builtin,
+    /// A human allowed these exact bytes for this session only.
+    SessionTrusted { source: SessionTrustSource },
+    /// FullAccess adopted these exact bytes from the pre-session baseline.
+    FullAdopted,
 }
 
 impl DefinitionTrust {
+    /// Persistent human approval (not a session-only decision).
     pub fn is_trusted(&self) -> bool {
         matches!(self, Self::Trusted { .. })
     }
@@ -44,6 +51,13 @@ impl DefinitionTrust {
             Self::Changed { .. } => "changed",
             Self::StoreUnavailable { .. } => "store_unavailable",
             Self::Builtin => "builtin",
+            Self::SessionTrusted { source } => match source {
+                SessionTrustSource::FullAdoption => "full_adopted",
+                SessionTrustSource::AllowOnce | SessionTrustSource::TrustCurrent => {
+                    "session_allowed"
+                }
+            },
+            Self::FullAdopted => "full_adopted",
         }
     }
 
@@ -54,9 +68,21 @@ impl DefinitionTrust {
         }
     }
 
+    /// The session decision that admitted these bytes, when one did.
+    pub fn session_source(&self) -> Option<SessionTrustSource> {
+        match self {
+            Self::SessionTrusted { source } => Some(*source),
+            Self::FullAdopted => Some(SessionTrustSource::FullAdoption),
+            _ => None,
+        }
+    }
+
     /// Whether the definition may enter the model's control context.
     pub fn admits(&self) -> bool {
-        matches!(self, Self::Trusted { .. } | Self::Builtin)
+        matches!(
+            self,
+            Self::Trusted { .. } | Self::Builtin | Self::SessionTrusted { .. } | Self::FullAdopted
+        )
     }
 }
 
@@ -72,6 +98,10 @@ pub struct TrustAuditEntry {
     pub approved_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_status: Option<String>,
+    /// `allow_once` / `trust_current` / `full_adoption` when a session-scoped
+    /// decision admitted the bytes. Absent for persistent approvals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_source: Option<String>,
 }
 
 /// One project's view of the trust store.
@@ -81,6 +111,8 @@ pub struct DefinitionTrustView {
     project_domain: Option<String>,
     /// The store cannot be protected from this project's sandboxed execution.
     inside_project: bool,
+    /// Session-scoped allowances and the FullAccess baseline.
+    session: Option<Arc<SessionDefinitionTrust>>,
     /// Test-only admission of every definition. Only compiled with the
     /// `test-support` feature, which production crates do not enable.
     #[cfg(feature = "test-support")]
@@ -106,6 +138,7 @@ impl DefinitionTrustView {
             store,
             project_domain: project_root.map(project_domain),
             inside_project,
+            session: None,
             #[cfg(feature = "test-support")]
             allow_all: false,
         }
@@ -118,9 +151,24 @@ impl DefinitionTrustView {
             store: DefinitionTrustStore::empty(),
             project_domain: None,
             inside_project: false,
+            session: None,
             #[cfg(feature = "test-support")]
             allow_all: false,
         }
+    }
+
+    /// Attach the session's allowances and FullAccess baseline.
+    ///
+    /// The persistent store snapshot stays frozen; session decisions are live
+    /// because a human answer during the same turn must be effective for the
+    /// operation that is waiting on it.
+    pub fn with_session(mut self, session: Arc<SessionDefinitionTrust>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    pub fn session(&self) -> Option<&Arc<SessionDefinitionTrust>> {
+        self.session.as_ref()
     }
 
     /// Admit every definition. Compiled only for test builds; production
@@ -132,6 +180,8 @@ impl DefinitionTrustView {
             store: DefinitionTrustStore::empty(),
             project_domain: None,
             inside_project: false,
+            session: None,
+            #[cfg(feature = "test-support")]
             allow_all: true,
         }
     }
@@ -176,24 +226,35 @@ impl DefinitionTrustView {
             }
         }
         let domain = match identity.scope {
-            DefinitionScope::Project => {
-                let Some(domain) = self.project_domain.as_deref() else {
-                    return DefinitionTrust::Unapproved;
-                };
-                domain
-            }
-            DefinitionScope::User => USER_DOMAIN,
+            DefinitionScope::Project => self.project_domain.as_deref(),
+            DefinitionScope::User => Some(USER_DOMAIN),
             DefinitionScope::Builtin => return DefinitionTrust::Builtin,
         };
-        match self.store.approval_record(domain, identity) {
-            Some(record) if record.digest == digest => DefinitionTrust::Trusted {
-                approval_version: record.approval_version,
-            },
-            Some(record) => DefinitionTrust::Changed {
-                approved_digest: record.digest.clone(),
-            },
-            None => DefinitionTrust::Unapproved,
+        let persistent =
+            match domain.and_then(|domain| self.store.approval_record(domain, identity)) {
+                Some(record) if record.digest == digest => DefinitionTrust::Trusted {
+                    approval_version: record.approval_version,
+                },
+                Some(record) => DefinitionTrust::Changed {
+                    approved_digest: record.digest.clone(),
+                },
+                None => DefinitionTrust::Unapproved,
+            };
+        // A persistent human approval is the strongest decision. Otherwise the
+        // session may hold a user allowance for these exact bytes or, in Full,
+        // the creation baseline. A corrupt store never reaches this point:
+        // session state cannot repair a store nobody can verify.
+        if persistent.admits() {
+            return persistent;
         }
+        if let Some(overlay) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.overlay(identity, digest))
+        {
+            return overlay;
+        }
+        persistent
     }
 
     /// The same decision, flattened for a durable audit event.
@@ -211,6 +272,9 @@ impl DefinitionTrustView {
                 DefinitionTrust::StoreUnavailable { .. } | DefinitionTrust::Unapproved
             )
             .then(|| self.status().as_str().to_string()),
+            session_source: trust
+                .session_source()
+                .map(|source| source.as_str().to_string()),
         }
     }
 }
@@ -329,6 +393,80 @@ mod tests {
             DefinitionTrust::StoreUnavailable {
                 status: StoreStatus::InsideProject
             }
+        );
+    }
+
+    #[test]
+    fn a_session_allowance_admits_only_the_exact_bytes_and_is_not_persistent() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session = std::sync::Arc::new(SessionDefinitionTrust::unknown());
+        let view = DefinitionTrustView::load(home.path(), Some(project.path()))
+            .with_session(session.clone());
+        let digest = DefinitionIdentity::single_digest(b"SESSION");
+        assert_eq!(
+            view.check(&identity(), &digest),
+            DefinitionTrust::Unapproved
+        );
+        session.allow(&identity(), &digest, SessionTrustSource::AllowOnce);
+        assert_eq!(
+            view.check(&identity(), &digest),
+            DefinitionTrust::SessionTrusted {
+                source: SessionTrustSource::AllowOnce
+            }
+        );
+        // An edit invalidates the allowance exactly like a store approval.
+        assert_eq!(
+            view.check(&identity(), &DefinitionIdentity::single_digest(b"EDITED")),
+            DefinitionTrust::Unapproved
+        );
+        // Nothing reached the store.
+        assert_eq!(
+            DefinitionTrustStore::load(home.path()).status(),
+            &StoreStatus::Missing
+        );
+    }
+
+    #[test]
+    fn full_adoption_requires_a_baseline_from_this_process() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            identity().id,
+            DefinitionIdentity::single_digest(b"BASELINE"),
+        );
+        let baseline = crate::SessionDefinitionBaseline::from_entries_for_tests(map);
+        let created = std::sync::Arc::new(SessionDefinitionTrust::created(
+            baseline.clone(),
+            crate::BaselineProvenance::CreatedThisProcess,
+            true,
+        ));
+        let view =
+            DefinitionTrustView::load(home.path(), Some(project.path())).with_session(created);
+        let digest = DefinitionIdentity::single_digest(b"BASELINE");
+        assert_eq!(
+            view.check(&identity(), &digest),
+            DefinitionTrust::FullAdopted
+        );
+        assert_eq!(
+            view.check(
+                &identity(),
+                &DefinitionIdentity::single_digest(b"AGENT-EDIT")
+            ),
+            DefinitionTrust::Unapproved
+        );
+        // The same baseline in a resumed process proves nothing.
+        let resumed = std::sync::Arc::new(SessionDefinitionTrust::created(
+            baseline,
+            crate::BaselineProvenance::Resumed,
+            true,
+        ));
+        let view =
+            DefinitionTrustView::load(home.path(), Some(project.path())).with_session(resumed);
+        assert_eq!(
+            view.check(&identity(), &digest),
+            DefinitionTrust::Unapproved
         );
     }
 }

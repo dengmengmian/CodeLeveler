@@ -1644,6 +1644,9 @@ pub(crate) async fn cmd_run_resume(
                     leveler_app::forward_engine_event(event, &mut |e| render_event(e, output))
                 },
                 cancellation,
+                // Headless resume: no human surface for a mid-turn trust
+                // decision, so the safe refusal is final.
+                None,
             )
             .await
         }

@@ -52,6 +52,28 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 }]
             }
         },
+        Overlay::DefinitionTrust(mut ov) => match ov.on_key(effective) {
+            crate::overlay::DefinitionTrustOutcome::None => {
+                state.overlay = Some(Overlay::DefinitionTrust(ov));
+                Vec::new()
+            }
+            crate::overlay::DefinitionTrustOutcome::Decide(decision) => {
+                let restore = PendingInteraction::DefinitionTrust(Box::new(ov.request));
+                let command_id = take_or_new_command_id(state, &restore);
+                vec![Effect::SendInteraction {
+                    command: ClientCommand::DefinitionTrustDecision {
+                        request_id: match &restore {
+                            PendingInteraction::DefinitionTrust(r) => r.id.clone(),
+                            _ => unreachable!(),
+                        },
+                        decision,
+                        session_id: Some(state.session_id.clone()),
+                    },
+                    restore,
+                    command_id,
+                }]
+            }
+        },
         Overlay::ModelPicker(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::ModelPicker(sel));
@@ -444,6 +466,9 @@ pub fn advance_overlay(state: &mut AppState) {
         Some(PendingInteraction::Clarification(request)) => Some(Overlay::Clarification(Box::new(
             ClarificationOverlay::new(request),
         ))),
+        Some(PendingInteraction::DefinitionTrust(request)) => Some(Overlay::DefinitionTrust(
+            Box::new(crate::overlay::DefinitionTrustOverlay::new(*request)),
+        )),
         None => None,
     };
 }
@@ -457,6 +482,9 @@ pub fn restore_interaction_overlay(state: &mut AppState, restore: PendingInterac
             Overlay::Clarification(ov) => state
                 .pending_interactions
                 .push_front(PendingInteraction::Clarification(ov.request)),
+            Overlay::DefinitionTrust(ov) => state
+                .pending_interactions
+                .push_front(PendingInteraction::DefinitionTrust(Box::new(ov.request))),
             other => state.overlay = Some(other),
         }
     }
@@ -467,6 +495,9 @@ pub fn restore_interaction_overlay(state: &mut AppState, restore: PendingInterac
         PendingInteraction::Clarification(request) => {
             Overlay::Clarification(Box::new(ClarificationOverlay::new(request)))
         }
+        PendingInteraction::DefinitionTrust(request) => Overlay::DefinitionTrust(Box::new(
+            crate::overlay::DefinitionTrustOverlay::new(*request),
+        )),
     });
 }
 

@@ -13,6 +13,7 @@ mod children;
 mod collaboration;
 pub mod config_manager;
 pub mod contribution_query;
+mod definition_trust_bridge;
 pub mod doctor;
 mod doctor_text;
 /// Engine events -> client events. Public so a recorded session can be replayed
@@ -999,6 +1000,12 @@ pub struct Application {
     permission_profiles: std::sync::Mutex<
         std::collections::HashMap<String, leveler_execution::SharedPermissionProfile>,
     >,
+    /// Session-scoped definition trust: user "allow once" decisions and the
+    /// FullAccess creation baseline. Keyed by session scope, like the live
+    /// permission cell, because one process hosts several sessions.
+    definition_trust_sessions: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<leveler_definition_trust::SessionDefinitionTrust>>,
+    >,
     /// The activated capability packs of each session, keyed by session scope.
     ///
     /// Same owner pattern as `permission_profiles`, and for the same reason:
@@ -1091,13 +1098,121 @@ impl Application {
             .permission_profiles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match map.get(scope) {
+        let live = match map.get(scope) {
             Some(profile) => {
                 profile.set(mode);
                 true
             }
             None => false,
+        };
+        drop(map);
+        if let Some(session) = self.definition_trust_session(scope) {
+            session.set_full_adoption(mode == PermissionProfile::FullAccess);
         }
+        live
+    }
+
+    /// Capture the definition baseline for a session this process just
+    /// created. Called before any model call, so nothing the agent can write
+    /// afterwards equals its baseline entry.
+    pub(crate) async fn register_created_definition_session(
+        &self,
+        session_id: &str,
+        mode: PermissionProfile,
+    ) {
+        let root = self
+            .layout
+            .primary_workspace()
+            .map(|root| root.to_path_buf());
+        // Discovery hashes every candidate skill package, so it belongs off the
+        // async runtime thread.
+        let baseline = match root {
+            Some(root) => tokio::task::spawn_blocking(move || {
+                leveler_definition_trust::SessionDefinitionBaseline::capture(&root)
+            })
+            .await
+            .unwrap_or_default(),
+            None => Default::default(),
+        };
+        let session = leveler_definition_trust::SessionDefinitionTrust::created(
+            baseline,
+            leveler_definition_trust::BaselineProvenance::CreatedThisProcess,
+            mode == PermissionProfile::FullAccess,
+        )
+        .shared();
+        tracing::info!(
+            event = "definition_trust_baseline",
+            session = %session_id,
+            full_adoption = mode == PermissionProfile::FullAccess,
+            entries = session.baseline_entries(),
+        );
+        self.definition_trust_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), session);
+    }
+
+    /// Mark a session whose earlier process may already have run an agent.
+    /// FullAccess has no trustworthy baseline here, so nothing is auto-adopted.
+    pub(crate) fn register_resumed_definition_session(&self, session_id: &str) {
+        self.definition_trust_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                leveler_definition_trust::SessionDefinitionTrust::created(
+                    leveler_definition_trust::SessionDefinitionBaseline::default(),
+                    leveler_definition_trust::BaselineProvenance::Resumed,
+                    false,
+                )
+                .shared()
+            });
+    }
+
+    pub(crate) fn definition_trust_session(
+        &self,
+        scope: &str,
+    ) -> Option<Arc<leveler_definition_trust::SessionDefinitionTrust>> {
+        self.definition_trust_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(scope)
+            .cloned()
+    }
+
+    /// Drop one session's in-memory allowances and baseline. Called only when
+    /// the session row itself is deleted, so a recreated id cannot inherit
+    /// decisions made for the old conversation.
+    pub(crate) fn forget_definition_trust_session(&self, scope: &str) {
+        self.definition_trust_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(scope);
+    }
+
+    /// The session trust state every view of this session must share.
+    ///
+    /// A session this process never registered has unknown provenance; it is
+    /// created empty so a later `/trust` approval can still be recorded for
+    /// the rest of the session, but Full access cannot adopt anything.
+    pub(crate) fn definition_trust_for_session(
+        &self,
+        scope: &str,
+        mode: PermissionProfile,
+    ) -> Arc<leveler_definition_trust::SessionDefinitionTrust> {
+        let session = {
+            let mut map = self
+                .definition_trust_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.entry(scope.to_string())
+                .or_insert_with(|| {
+                    leveler_definition_trust::SessionDefinitionTrust::unknown().shared()
+                })
+                .clone()
+        };
+        session.set_full_adoption(mode == PermissionProfile::FullAccess);
+        session
     }
 
     /// The profile a session's execution is authorizing under right now.
@@ -1209,6 +1324,7 @@ impl Application {
             memory,
             default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            definition_trust_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             capability_activations: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -1735,10 +1851,15 @@ impl Application {
         // live cell, not the value captured here: a user who switches profile
         // while this turn runs must be obeyed by it and by every agent it has
         // already delegated to, at their next authorization decision.
-        let tool_context =
-            tool_context.with_permission_profile(self.permission_profile_for(session_scope, mode));
+        let live_profile = self.permission_profile_for(session_scope, mode);
+        let live_mode = live_profile.get();
+        let tool_context = tool_context.with_permission_profile(live_profile);
         let tool_context = match session_scope {
-            Some(scope) => tool_context.with_session_scope(scope),
+            Some(scope) => tool_context
+                .with_session_scope(scope)
+                // Full adoption follows the LIVE mode, not the caller's
+                // possibly stale `mode` argument.
+                .with_session_definition_trust(self.definition_trust_for_session(scope, live_mode)),
             None => tool_context,
         };
         // Memory paths are ordinary files to the model. The access policy is

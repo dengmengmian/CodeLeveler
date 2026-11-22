@@ -1847,6 +1847,21 @@ impl CodingRuntime {
         self
     }
 
+    /// Attach the host's human approval surface for untrusted definition
+    /// content. Headless runs leave it unset, which makes the safe refusal
+    /// final.
+    pub fn with_definition_trust_authorizer(
+        mut self,
+        authorizer: Arc<dyn leveler_tools::DefinitionTrustAuthorizer>,
+    ) -> Self {
+        self.factory.tool_context = self
+            .factory
+            .tool_context
+            .clone()
+            .with_definition_trust_authorizer(authorizer);
+        self
+    }
+
     /// Shared terminal handling for run/chat/resume: derive the lifecycle
     /// columns from the result and commit them with the TaskFinished event.
     async fn finish_from_result(

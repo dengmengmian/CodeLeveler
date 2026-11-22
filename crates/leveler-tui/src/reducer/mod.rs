@@ -1161,6 +1161,9 @@ fn snapshot_awaits_interaction(
             leveler_client_protocol::UiPendingInteraction::Clarification(request) => {
                 format!("c:{}", request.id.as_str()) == key
             }
+            leveler_client_protocol::UiPendingInteraction::DefinitionTrust(request) => {
+                format!("d:{}", request.id.as_str()) == key
+            }
         })
 }
 

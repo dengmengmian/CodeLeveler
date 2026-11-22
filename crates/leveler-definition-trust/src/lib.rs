@@ -20,13 +20,20 @@
 //! Built-ins compiled into the binary are a separate source rule; callers do
 //! not ask this gate about them.
 
+mod diff;
 mod discovery;
+mod session;
 mod store;
 mod view;
+
+pub use diff::{MAX_DIFF_CELLS, sanitize_line, unified_diff};
 
 pub use discovery::{
     DefinitionCandidate, DiscoveryRoots, discover, discover_project, discover_user,
     read_candidate_digest,
+};
+pub use session::{
+    BaselineProvenance, SessionDefinitionBaseline, SessionDefinitionTrust, SessionTrustSource,
 };
 pub use store::{
     ApprovalReport, ApprovalRequest, ApprovalSurface, DefinitionTrustStore, StoreLoad, StoreStatus,
@@ -84,6 +91,15 @@ impl DefinitionKind {
             Self::Agent => "agent",
             Self::Skill => "skill",
         }
+    }
+
+    /// Whether FullAccess may adopt this kind from the session baseline.
+    ///
+    /// Rules and skills are instruction/procedure text. A declarative agent
+    /// definition configures a child execution with its own tool surface, so
+    /// it keeps requiring the persistent human approval even in Full.
+    pub fn is_full_adoptable(self) -> bool {
+        !matches!(self, Self::Agent)
     }
 }
 

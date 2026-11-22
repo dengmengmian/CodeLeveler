@@ -704,7 +704,8 @@ impl Application {
         collaboration: leveler_lifecycle::CollaborationMode,
         model_pinned: bool,
     ) -> Result<leveler_core::SessionId, AppError> {
-        self.task_engine(db)?
+        let id = self
+            .task_engine(db)?
             .create_task(&leveler_engine::NewSession {
                 workspace: self
                     .layout
@@ -721,7 +722,15 @@ impl Application {
                 model_pinned,
             })
             .await
-            .map_err(app_error_from_engine)
+            .map_err(app_error_from_engine)?;
+        // Capture the FullAccess adoption baseline now, before this session's
+        // first model call or tool execution. A definition the agent writes
+        // later can never equal its baseline entry, so Full cannot promote an
+        // agent-authored instruction. A resumed session does not pass through
+        // here and gets no baseline (see `register_resumed_definition_session`).
+        self.register_created_definition_session(id.as_str(), mode)
+            .await;
+        Ok(id)
     }
 
     /// The durable permission mode of an existing session, if it has a row.
@@ -758,6 +767,7 @@ impl Application {
         let db = self.open_database().await?;
         let deleted = SessionRepository::new(&db).delete(session_id).await?;
         if deleted {
+            self.forget_definition_trust_session(session_id.as_str());
             crate::user_shell::remove_session_output(&self.layout.state_dir, session_id);
         }
         Ok(deleted)
@@ -858,6 +868,7 @@ impl Application {
             // carries the mechanical safety ceiling.
             leveler_agent::ContinuationPolicy::UntilTerminal,
             unattended_limits(self.top_level_limits()),
+            None,
         )
         .await
     }
@@ -896,6 +907,7 @@ impl Application {
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
             self.top_level_limits(),
+            None,
         )
         .await
     }
@@ -935,6 +947,7 @@ impl Application {
             cancellation,
             leveler_agent::ContinuationPolicy::bounded(max_rounds),
             leveler_agent::StepLimits::default(),
+            None,
         )
         .await
     }
@@ -970,6 +983,7 @@ impl Application {
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
         limits: leveler_agent::StepLimits,
+        definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
 
@@ -994,6 +1008,10 @@ impl Application {
             .await?
             .with_steering(steering)
             .with_task_cancel(task_cancel);
+        let engine = match definition_trust_authorizer {
+            Some(authorizer) => engine.with_definition_trust_authorizer(authorizer),
+            None => engine,
+        };
         // A review is not a turn, so an ordinary agent cannot learn its state
         // from the turn it is in. This read-only tool answers from the live
         // review registry plus the durable rows, bound to THIS session.
@@ -1058,6 +1076,7 @@ impl Application {
         task_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
+        definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
 
@@ -1077,6 +1096,10 @@ impl Application {
             .await?
             .with_steering(steering)
             .with_task_cancel(task_cancel);
+        let engine = match definition_trust_authorizer {
+            Some(authorizer) => engine.with_definition_trust_authorizer(authorizer),
+            None => engine,
+        };
         // A review is not a turn, so an ordinary agent cannot learn its state
         // from the turn it is in. This read-only tool answers from the live
         // review registry plus the durable rows, bound to THIS session.
@@ -1266,6 +1289,7 @@ impl Application {
                 approver,
                 Arc::new(AutoClarify),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await?;
         let result = engine
@@ -1304,10 +1328,17 @@ impl Application {
         task_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
         cancellation: CancellationToken,
+        definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
     ) -> Result<AgentOutcome, AppError> {
         crate::interactive::reconcile_background_evidence(self, session_id).await;
         let (engine, spec, model) = self
-            .resume_prepare(session_id, approver, clarifier, task_cancel)
+            .resume_prepare(
+                session_id,
+                approver,
+                clarifier,
+                task_cancel,
+                definition_trust_authorizer,
+            )
             .await?;
         let engine = engine.with_steering(steering);
         let result = engine
@@ -1344,10 +1375,17 @@ impl Application {
         recovery: Option<leveler_agent::coding::GoalRecoveryContext>,
         observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
         cancellation: CancellationToken,
+        definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
     ) -> Result<AgentOutcome, AppError> {
         crate::interactive::reconcile_background_evidence(self, session_id).await;
         let (engine, spec, model) = self
-            .resume_prepare(session_id, approver, clarifier, task_cancel)
+            .resume_prepare(
+                session_id,
+                approver,
+                clarifier,
+                task_cancel,
+                definition_trust_authorizer,
+            )
             .await?;
         let engine = engine.with_steering(steering);
         let result = engine
@@ -1370,6 +1408,7 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         task_cancel: Arc<AtomicBool>,
+        definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
     ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec, ModelRef), AppError> {
         let db = self.open_database().await?;
 
@@ -1407,6 +1446,10 @@ impl Application {
             )
             .await?
             .with_task_cancel(task_cancel);
+        let engine = match definition_trust_authorizer {
+            Some(authorizer) => engine.with_definition_trust_authorizer(authorizer),
+            None => engine,
+        };
         self.validate_session_workspace(record.repository.as_deref())?;
         let mut spec = self.direct_spec(record.goal.clone(), mode, sandbox);
         // Resume with the persisted strategy, not an assumed one.

@@ -101,6 +101,7 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
             }
         },
         Screen::Clean => state.clean.move_selection(notches),
+        Screen::Trust => crate::trust::wheel(state, notches),
         Screen::Schedules => crate::schedules::wheel(state, notches),
         Screen::Memory => crate::memory::wheel(state, notches),
         Screen::Find => crate::find::wheel(state, notches),
@@ -168,6 +169,7 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
                 state.clean.selected = index;
             }
         }
+        Screen::Trust => crate::trust::select_row(state, key),
         Screen::Schedules => crate::schedules::select_row(state, key),
         Screen::Memory => crate::memory::select_row(state, key),
         Screen::Find => crate::find::select_row(state, key),
@@ -448,6 +450,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         Screen::Doctor => return crate::doctor::handle_key(state, key),
         Screen::Mcp => return crate::mcp::handle_key(state, key),
         Screen::Settings => return crate::settings::handle_key(state, key),
+        Screen::Trust => return crate::trust::handle_key(state, key),
         Screen::Tasks => return crate::tasks::handle_key(state, key),
         Screen::Trace => {
             use crate::observability::TraceTab;
@@ -629,6 +632,9 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
             }
         }
         Screen::Settings => crate::settings::close(state),
+        Screen::Trust => {
+            crate::trust::back(state);
+        }
         Screen::Help => {
             if state.help.detail.is_some() {
                 state.help.detail = None;

@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- Trust now has a product surface. `/trust` opens a native TUI page over the same store and discovery the CLI uses: list all/untrusted/trusted/changed definitions, inspect content and the approved→current diff, mark rows, approve one or many, and revoke. Startup no longer prints the whole untrusted-definition list; an untrusted root `AGENTS.md` gets one lightweight hint per project (persisted), and untrusted skills are skipped silently. In ordinary modes, a running `load_skill` for an untrusted skill raises a structured authorization prompt (allow once / trust this content version / deny) and the same tool call continues after the decision; allow-once never writes the store, a denial is remembered for that exact digest, and disconnected or cancelled waits refuse safely instead of hanging. FullAccess adopts rule and skill content captured in a session-creation baseline taken before the agent can write, without prompting or persisting a record; content edited after the baseline, and any resumed session without credible provenance, is never auto-adopted. Declarative agent definitions still require a persistent approval.
+
 ## [1.0.28] - 2026-11-21
 
 - Trusted Definition Security Model 1.0 is the formal cross-platform contract: unapproved definitions never enter the harness's authority context, and approval binds the exact content version. A skill's approval now covers `SKILL.md` plus its whole `references/` tree with a composite SHA-256; editing, adding or deleting a reference invalidates it. `load_skill` returns the verified reference text inline, and restricted file tools (including recursive search) refuse direct path reads of that content. Existing single-file skill approvals re-appear as `changed` and need one re-approval.

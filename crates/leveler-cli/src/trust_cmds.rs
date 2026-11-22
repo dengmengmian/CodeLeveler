@@ -111,6 +111,15 @@ fn definition_rows(home: &Path, repo: &Path) -> Vec<DefinitionRow> {
                         digest: digest.clone(),
                         version: 0,
                     },
+                    // The CLI reads the persistent store without a session
+                    // overlay; these cannot occur here. Map them to the state
+                    // their admission means rather than inventing an approval.
+                    DefinitionTrust::SessionTrusted { .. } | DefinitionTrust::FullAdopted => {
+                        DefinitionState::Trusted {
+                            digest: digest.clone(),
+                            version: 0,
+                        }
+                    }
                 },
             };
             DefinitionRow {
@@ -464,76 +473,26 @@ fn print_definition_diff(home: &Path, repo: &Path, path: &str) {
 }
 
 /// A compact line diff. This is a review aid, not a patch format: unchanged
-/// runs are reduced to three lines of context around each change.
+/// runs are reduced to three lines of context around each change. It shares
+/// the TUI's implementation so both surfaces describe the same edit.
 fn print_unified_diff(old: &str, new: &str) {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-    if old_lines.len().saturating_mul(new_lines.len()) > 4_000_000 {
+    let Some(rows) = leveler_definition_trust::unified_diff(old, new, 400) else {
         println!("  (definitions are too large to diff here; inspect the files directly)");
         return;
-    }
-    // Longest common subsequence lengths.
-    let mut dp = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
-    for i in (0..old_lines.len()).rev() {
-        for j in (0..new_lines.len()).rev() {
-            dp[i][j] = if old_lines[i] == new_lines[j] {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let mut script: Vec<(char, &str)> = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < old_lines.len() || j < new_lines.len() {
-        if i < old_lines.len() && j < new_lines.len() && old_lines[i] == new_lines[j] {
-            script.push((' ', old_lines[i]));
-            i += 1;
-            j += 1;
-        } else if j < new_lines.len() && (i == old_lines.len() || dp[i][j + 1] >= dp[i + 1][j]) {
-            script.push(('+', new_lines[j]));
-            j += 1;
-        } else if i < old_lines.len() {
-            script.push(('-', old_lines[i]));
-            i += 1;
-        }
-    }
-    let mut last = 0usize;
-    let mut printed = 0usize;
-    for (index, (op, line)) in script.iter().enumerate() {
-        if *op == ' ' {
-            continue;
-        }
-        let start = index.saturating_sub(3);
-        if start > last {
-            println!("  …");
-        }
-        for (context_index, (context_op, context_line)) in
-            script.iter().enumerate().take(index).skip(start)
-        {
-            if context_index >= last {
-                println!("  {context_op} {}", sanitize_line(context_line));
-                printed += 1;
-            }
-        }
-        println!("  {op} {}", sanitize_line(line));
-        printed += 1;
-        last = index + 1;
-        if printed >= 400 {
-            println!("  … (diff truncated)");
-            return;
-        }
-    }
-    if printed == 0 {
-        println!("  (no textual difference; only the digest changed)");
+    };
+    for row in rows {
+        println!("  {row}");
     }
 }
 
-/// Ignored in-repo config and definitions as display paths, for the TUI boot
-/// notice.
+/// Ignored in-repo config as display paths, for the TUI boot notice.
+///
+/// Definitions are deliberately absent: an untrusted skill or AGENTS.md is
+/// skipped silently at startup. The one lightweight AGENTS.md hint is
+/// [`definition_trust_notice`], printed once per project by the launcher.
 pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<String> {
     let home = leveler_home();
-    let mut out: Vec<String> = leveler_execution::untrusted_project_files(&home, repo_root)
+    leveler_execution::untrusted_project_files(&home, repo_root)
         .into_iter()
         .filter(|entry| !is_config(entry) || project_config_widens(repo_root))
         .map(|entry| {
@@ -544,24 +503,123 @@ pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<Strin
                 .display()
                 .to_string()
         })
-        .collect();
-    out.extend(
-        definition_rows(&home, repo_root)
-            .into_iter()
-            .filter(|row| row.state.is_pending())
-            .map(|row| format!("{} [{}] {}", row.display, row.kind, row.state.label())),
-    );
-    out
+        .collect()
 }
 
-/// Definitions ignored at startup, for the stderr notice.
-pub(crate) fn untrusted_definition_notices(repo_root: &std::path::Path) -> Vec<String> {
-    let home = leveler_home();
-    definition_rows(&home, repo_root)
-        .into_iter()
-        .filter(|row| row.state.is_pending())
-        .map(|row| format!("{} [{}] {}", row.display, row.kind, row.state.label()))
-        .collect()
+/// A store the gate cannot use is not a quiet skip: no project definition can
+/// be admitted until it is repaired. Printed on every launch (it is a
+/// configuration failure, not a one-time hint).
+pub(crate) fn definition_trust_store_warning(repo_root: &std::path::Path) -> Option<String> {
+    definition_trust_store_warning_in(&leveler_home(), repo_root)
+}
+
+fn definition_trust_store_warning_in(home: &Path, repo_root: &std::path::Path) -> Option<String> {
+    let status = DefinitionTrustView::load(home, Some(repo_root)).status();
+    matches!(
+        status,
+        StoreStatus::Corrupt { .. }
+            | StoreStatus::UnsupportedVersion { .. }
+            | StoreStatus::InsideProject
+    )
+    .then(|| {
+        format!(
+            "⚠ 定义信任库不可用（{}）；本轮不会加载任何项目定义。运行 leveler doctor 查看。",
+            status.as_str()
+        )
+    })
+}
+
+/// The one lightweight startup hint for an untrusted root `AGENTS.md`.
+///
+/// Shown once per (project, exact digest) on this machine: a marker under the
+/// Leveler home records the canonical project domain and the digest, so a
+/// session resume, TUI redraw or relaunch of the same bytes does not repeat it,
+/// while a later content change is a new fact worth one notice. FullAccess
+/// adopts the session baseline and suppresses the hint entirely. A store/config
+/// failure is not hidden by this quiet path; `leveler doctor` and `/trust`
+/// still report it.
+pub(crate) fn definition_trust_notice(
+    repo_root: &std::path::Path,
+    full_access: bool,
+) -> Option<String> {
+    definition_trust_notice_in(&leveler_home(), repo_root, full_access)
+}
+
+fn definition_trust_notice_in(
+    home: &Path,
+    repo_root: &std::path::Path,
+    full_access: bool,
+) -> Option<String> {
+    if full_access {
+        return None;
+    }
+    // Only the root AGENTS.md matters for this hint. Hashing every skill in
+    // the project just to announce one file would be a startup regression.
+    let path = repo_root.join("AGENTS.md");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // A missing file is not a hint. An existing but unreadable one is an
+        // error path; say so rather than hiding it behind the quiet default.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(format!(
+                "⚠ 无法读取项目指令 AGENTS.md（{error}）；其内容不会进入模型上下文。"
+            ));
+        }
+    };
+    let identity = leveler_definition_trust::DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::RootAgents,
+        "AGENTS.md",
+    )?;
+    let digest = leveler_definition_trust::DefinitionIdentity::single_digest(&bytes);
+    let view = DefinitionTrustView::load(home, Some(repo_root));
+    let state = match view.check(&identity, &digest) {
+        DefinitionTrust::Unapproved => DefinitionState::Unapproved {
+            digest: Some(digest.clone()),
+        },
+        DefinitionTrust::Changed { approved_digest } => DefinitionState::Changed {
+            digest: digest.clone(),
+            approved: approved_digest,
+        },
+        // Trusted, a session/full admission that cannot occur on this surface,
+        // or a store the separate warning already explains.
+        _ => return None,
+    };
+    // One notice per (project, exact root-AGENTS digest). The first appearance
+    // and a later content change are different facts; a resume, a redraw or a
+    // relaunch of the same bytes is not.
+    let domain = leveler_definition_trust::project_domain(repo_root);
+    let marker = home.join("state").join("trust-notice-seen");
+    let key = format!("{domain}\t{digest}");
+    let already = std::fs::read_to_string(&marker)
+        .ok()
+        .is_some_and(|seen| seen.lines().any(|line| line == key));
+    if already {
+        return None;
+    }
+    if let Some(parent) = marker.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+    {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(&marker) {
+            let _ = writeln!(file, "{key}");
+        }
+    }
+    let display = identity.display;
+    let message = match state {
+        DefinitionState::Changed { .. } => {
+            format!("ℹ 项目指令 {display} 内容已变化，输入 /trust 查看差异并重新信任。")
+        }
+        _ => format!("ℹ 项目指令 {display} 尚未信任，输入 /trust 可管理。"),
+    };
+    Some(message)
 }
 
 /// The startup notice names config files that are ignored. An untrusted
@@ -823,5 +881,57 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn the_agents_hint_is_once_per_digest_and_returns_on_a_change() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("AGENTS.md"), "ONE\n").unwrap();
+        let first = definition_trust_notice_in(home.path(), repo.path(), false).unwrap();
+        assert!(first.contains("尚未信任"), "{first}");
+        assert!(
+            definition_trust_notice_in(home.path(), repo.path(), false).is_none(),
+            "the same bytes must not be announced twice"
+        );
+        // Approve the first version, then edit it: the new digest is `changed`
+        // and gets one fresh hint.
+        let row = definition_rows(home.path(), repo.path())
+            .into_iter()
+            .find(|row| row.display == "AGENTS.md")
+            .unwrap();
+        approve(
+            home.path(),
+            repo.path(),
+            &[row.candidate.approval_request().unwrap()],
+            ApprovalSurface::Cli,
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("AGENTS.md"), "TWO\n").unwrap();
+        let changed = definition_trust_notice_in(home.path(), repo.path(), false).unwrap();
+        assert!(changed.contains("内容已变化"), "{changed}");
+        assert!(
+            definition_trust_notice_in(home.path(), repo.path(), false).is_none(),
+            "the changed digest is announced once"
+        );
+        std::fs::write(repo.path().join("AGENTS.md"), "THREE\n").unwrap();
+        assert!(
+            definition_trust_notice_in(home.path(), repo.path(), true).is_none(),
+            "FullAccess suppresses the hint"
+        );
+    }
+
+    #[test]
+    fn a_broken_store_is_never_hidden_by_the_quiet_startup_default() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        assert!(definition_trust_store_warning_in(home.path(), repo.path()).is_none());
+        std::fs::write(
+            leveler_definition_trust::store_path(home.path()),
+            "!! not yaml !!",
+        )
+        .unwrap();
+        let warning = definition_trust_store_warning_in(home.path(), repo.path()).unwrap();
+        assert!(warning.contains("不可用"), "{warning}");
     }
 }

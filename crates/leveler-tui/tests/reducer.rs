@@ -39,12 +39,14 @@ fn approve_project(root: &Path) {
 
 use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
-    AnswerEffect, ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId,
-    NotificationLevel, PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall,
-    UiApprovalRequest, UiCheckpoint, UiCompletionReport, UiHistoryEntry, UiMessage, UiPlan,
-    UiPlanState, UiPlanStep, UiRole, UiSessionHistory, UiSessionSnapshot, UiThinkingAccess,
-    UiThinkingState,
+    AnswerEffect, ApprovalDecision, ApprovalId, ClientCommand, DefinitionTrustDecision,
+    FinalizationStage, MessageId, NotificationLevel, PermissionProfile, RuntimeEvent,
+    RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest, UiCheckpoint,
+    UiCompletionReport, UiDefinitionTrustRequest, UiDefinitionTrustState, UiHistoryEntry,
+    UiMessage, UiPlan, UiPlanState, UiPlanStep, UiRole, UiSessionHistory, UiSessionSnapshot,
+    UiThinkingAccess, UiThinkingState,
 };
+use leveler_core::DefinitionTrustRequestId;
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::btw::{BtwToolState, BtwTurnState, SurfaceFocus};
 use leveler_tui::multi_agent::{ChildStatus, ChildUpdate};
@@ -17025,4 +17027,121 @@ fn the_custom_range_row_prefills_the_existing_directive() {
     assert!(effects.is_empty(), "{effects:?}");
     assert_eq!(s.composer.text(), "/review @branch ");
     assert!(s.overlay.is_none());
+}
+
+fn definition_trust_req() -> UiDefinitionTrustRequest {
+    UiDefinitionTrustRequest {
+        id: DefinitionTrustRequestId::new("d1"),
+        session_id: SessionId::new("s1"),
+        call_id: "call-1".into(),
+        identity: "skill:.leveler/skills/demo".into(),
+        display: ".leveler/skills/demo".into(),
+        kind: "skill".into(),
+        scope: "project".into(),
+        source: "CodeLeveler".into(),
+        location: "/repo/.leveler/skills/demo".into(),
+        state: UiDefinitionTrustState::Unapproved,
+        approved_digest: None,
+        current_digest: "sha256:new".into(),
+        current_content: "BODY\n".into(),
+        approved_content: None,
+        content_truncated: false,
+    }
+}
+
+#[test]
+fn a_definition_trust_request_is_its_own_prompt_and_answers_in_trust_vocabulary() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DefinitionTrustRequested {
+            request: definition_trust_req(),
+        }),
+    );
+    assert!(
+        matches!(&s.overlay, Some(Overlay::DefinitionTrust(ov)) if ov.request.display == ".leveler/skills/demo"),
+        "{:?}",
+        s.overlay
+    );
+    // Enter on the first option is "allow once", not a permission decision.
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    match effects.as_slice() {
+        [
+            Effect::SendInteraction {
+                command:
+                    ClientCommand::DefinitionTrustDecision {
+                        decision,
+                        request_id,
+                        ..
+                    },
+                restore: PendingInteraction::DefinitionTrust(request),
+                ..
+            },
+        ] => {
+            assert_eq!(*decision, DefinitionTrustDecision::AllowOnce);
+            assert_eq!(request_id.as_str(), "d1");
+            assert_eq!(request.id.as_str(), "d1");
+        }
+        other => panic!("expected a definition-trust decision, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_definition_trust_prompt_parks_behind_another_overlay_and_restores() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DefinitionTrustRequested {
+            request: definition_trust_req(),
+        }),
+    );
+    // A second request parks rather than clobbering the first waiter.
+    let mut second = definition_trust_req();
+    second.id = DefinitionTrustRequestId::new("d2");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DefinitionTrustRequested { request: second }),
+    );
+    assert_eq!(s.pending_interactions.len(), 1);
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendInteraction {
+                command: ClientCommand::DefinitionTrustDecision {
+                    decision: DefinitionTrustDecision::Deny,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{effects:?}"
+    );
+}
+
+/// `/trust` is a local page command: it opens the trust surface and never
+/// becomes a model message or a CLI invocation through a shell.
+#[test]
+fn trust_slash_opens_the_native_page_without_a_model_turn() {
+    let repo = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("AGENTS.md"), "ROOT\n").unwrap();
+    let mut s = opened();
+    s.repository = Some(repo.path().display().to_string());
+    s.trust.store_root = Some(home.path().to_path_buf());
+    s.composer.replace("/trust");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Trust);
+    assert!(effects.is_empty(), "no runtime command: {effects:?}");
+    assert!(
+        s.trust
+            .rows
+            .iter()
+            .any(|row| row.display() == "AGENTS.md" && row.is_pending()),
+        "{:?}",
+        s.trust.rows
+    );
+    // Esc returns to the conversation; the draft is not consumed as input.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
 }

@@ -42,6 +42,8 @@ mod client;
 mod command;
 mod command_envelope;
 mod contribution;
+/// Mid-turn authorization for untrusted definition content.
+pub mod definition_trust;
 /// Structured diagnostics shared by the CLI doctor and UI clients.
 pub mod diagnostics;
 mod event;
@@ -85,6 +87,9 @@ pub use client::{ClientError, InteractiveRuntimeClient, SteerConflict};
 pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
+pub use definition_trust::{
+    DefinitionTrustDecision, UiDefinitionTrustRequest, UiDefinitionTrustState,
+};
 pub use diagnostics::{
     DiagnosticCategory, DiagnosticFinding, DiagnosticReport, DiagnosticSeverity, DiagnosticStatus,
     action_id, finding_id,

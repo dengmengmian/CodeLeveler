@@ -218,23 +218,33 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
     eprintln!("  它可以执行命令、授予免批准权限或提高默认权限模式。确认内容后运行：leveler trust");
 }
 
-/// Tell the user when this repository (or their user-wide skill/agent roots)
-/// contains definitions the trust gate will not inject.
-fn warn_untrusted_definitions(layout: &leveler_project::Layout) {
+/// One lightweight notice for an untrusted root `AGENTS.md`. Skills and other
+/// definitions are skipped silently at startup; `/trust` lists them.
+fn warn_untrusted_definitions(layout: &leveler_project::Layout, full_access: bool) {
     let Some(repo) = layout.primary_workspace() else {
         return;
     };
-    let notices = crate::trust_cmds::untrusted_definition_notices(repo);
-    if notices.is_empty() {
-        return;
+    if let Some(warning) = crate::trust_cmds::definition_trust_store_warning(repo) {
+        eprintln!("{warning}");
     }
-    for notice in &notices {
-        eprintln!(
-            "{} 忽略未信任的项目定义：{notice}",
-            crate::output::Line::warn("!")
-        );
+    if let Some(notice) = crate::trust_cmds::definition_trust_notice(repo, full_access) {
+        eprintln!("{notice}");
     }
-    eprintln!("  它们不会进入模型的可信指令。核对内容后运行：leveler trust");
+}
+
+/// Whether this launch runs under FullAccess. An explicit `--permission`
+/// wins; otherwise the project's configured default is the fallback. Commands
+/// that cannot start an interactive definition path are not asked about.
+fn launch_is_full_access(command: &Option<Command>, layout: &leveler_project::Layout) -> bool {
+    let explicit = match command {
+        None => None,
+        Some(Command::Tui { mode, .. })
+        | Some(Command::Run { mode, .. })
+        | Some(Command::Serve { mode, .. }) => *mode,
+        _ => return false,
+    };
+    crate::common::resolve_mode(explicit, crate::common::project_default_mode(layout))
+        == leveler_execution::PermissionProfile::FullAccess
 }
 
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
@@ -279,7 +289,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         &args.command,
         None | Some(Command::Tui { .. }) | Some(Command::Run { .. }) | Some(Command::Serve { .. })
     ) {
-        warn_untrusted_definitions(&layout);
+        warn_untrusted_definitions(&layout, launch_is_full_access(&args.command, &layout));
     }
 
     // No subcommand (or explicit `tui`) opens the interactive terminal UI.

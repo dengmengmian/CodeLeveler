@@ -145,6 +145,7 @@ impl UiClarificationRequest {
 pub enum UiPendingInteraction {
     Approval(UiApprovalRequest),
     Clarification(UiClarificationRequest),
+    DefinitionTrust(super::definition_trust::UiDefinitionTrustRequest),
 }
 
 #[cfg(test)]

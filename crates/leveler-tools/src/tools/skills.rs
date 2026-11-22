@@ -54,13 +54,216 @@ impl Tool for LoadSkillTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: LoadInput = super::parse_input(self.name(), input)?;
-        match registry_for(&context)?.load_skill(&input.name) {
+        // First the turn's frozen view (which carries the session allowances
+        // and any test admission). If that refuses, ask the CURRENT persistent
+        // store before prompting: a human approval made through `/trust` while
+        // this turn runs must be honoured, not answered with a duplicate
+        // prompt. The frozen view remains the authority for rules, which are
+        // already in the prompt.
+        let registry = registry_for(&context)?;
+        match registry.load_skill(&input.name) {
             Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
                 &detail,
             ))),
+            Err(leveler_skills::SkillLookupError::Untrusted { .. }) => {
+                let fresh = load_registry_for(&context)?;
+                match fresh.load_skill(&input.name) {
+                    Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
+                        &detail,
+                    ))),
+                    // A package that exists but was never admitted is a human
+                    // decision, not a typo. Ask the host's approval surface
+                    // while this call is still the thing that is waiting; on
+                    // approval, reload and continue the original operation.
+                    Err(error @ leveler_skills::SkillLookupError::Untrusted { .. }) => {
+                        self.authorize_and_load(&input.name, error, &context).await
+                    }
+                    Err(error) => Ok(ToolOutput::error(error.to_string())),
+                }
+            }
             Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
     }
+}
+
+impl LoadSkillTool {
+    async fn authorize_and_load(
+        &self,
+        name: &str,
+        error: leveler_skills::SkillLookupError,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let Some(package) = error.untrusted_package() else {
+            return Ok(ToolOutput::error(error.to_string()));
+        };
+        let (Some(identity), scope) = (
+            package.identity.clone(),
+            match package.scope {
+                leveler_skills::SkillScope::Project => {
+                    leveler_definition_trust::DefinitionScope::Project
+                }
+                leveler_skills::SkillScope::User => leveler_definition_trust::DefinitionScope::User,
+                leveler_skills::SkillScope::Builtin => {
+                    return Ok(ToolOutput::error(error.to_string()));
+                }
+            },
+        ) else {
+            return Ok(ToolOutput::error(error.to_string()));
+        };
+        // A store nobody can verify is not a question for the user: an
+        // allow-once would still fail the reload, and a persistent approval
+        // cannot be written. Say what is actually wrong.
+        if matches!(
+            package.decision,
+            leveler_definition_trust::DefinitionTrust::StoreUnavailable { .. }
+        ) {
+            return Ok(ToolOutput::error(format!(
+                "skill `{name}` is present, but the definition trust store is unavailable ({}), \
+                 so no definition can be admitted. Its content was NOT loaded. Repair the store \
+                 (see `leveler doctor`) and use /trust.",
+                package.state()
+            )));
+        }
+        let Some(authorizer) = context.definition_trust_authorizer().cloned() else {
+            return Ok(ToolOutput::error(format!(
+                "skill `{name}` is present but not trusted ({}). No human approval surface is \
+                 attached to this execution, so the content was NOT loaded. In an interactive \
+                 session the user can review it with /trust.",
+                package.state()
+            )));
+        };
+        let (current_content, current_digest, content_truncated) =
+            match skill_package_preview(&package.location) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!(
+                        "skill `{name}` is present but not trusted, and its current content \
+                         could not be read for review ({error}); it was NOT loaded."
+                    )));
+                }
+            };
+        // The refusal may be about bytes newer than the error's digest if the
+        // file changed between the registry scan and this call. Bind the
+        // request to what was actually read now, and refuse if reading moved
+        // the identity away from the five-line package the scan refused.
+        let approved_content = package
+            .decision
+            .approved_digest()
+            .and_then(|digest| {
+                let home = leveler_core::LevelerHome::resolve(&context.execution.environment);
+                leveler_definition_trust::read_snapshot(home.root(), digest)
+            })
+            .map(|bytes| bounded_preview(&String::from_utf8_lossy(&bytes)));
+        let request = crate::definition_trust::DefinitionTrustAuthorizationRequest {
+            call_id: context
+                .tool_call_scope
+                .as_deref()
+                .unwrap_or("load_skill")
+                .to_string(),
+            identity,
+            kind: leveler_definition_trust::DefinitionKind::Skill,
+            scope,
+            source: package.source.label().to_string(),
+            location: package.location.clone(),
+            state: package.decision.clone(),
+            current_digest,
+            current_content,
+            approved_content,
+            content_truncated,
+        };
+        let outcome = authorizer.authorize(request).await;
+        match outcome {
+            crate::definition_trust::DefinitionTrustAuthorizationOutcome::Denied => {
+                Ok(ToolOutput::error(format!(
+                    "the user declined to admit skill `{name}`. Its content was NOT loaded and \
+                     no trust record was written. Continue without it."
+                )))
+            }
+            crate::definition_trust::DefinitionTrustAuthorizationOutcome::ContentChanged => {
+                Ok(ToolOutput::error(format!(
+                    "skill `{name}` changed while the approval was being decided, so the \
+                     decision did not cover the current bytes. It was NOT loaded; the user can \
+                     review the current version with /trust."
+                )))
+            }
+            crate::definition_trust::DefinitionTrustAuthorizationOutcome::Unavailable => {
+                Ok(ToolOutput::error(format!(
+                    "skill `{name}` is present but not trusted ({}), and this execution cannot \
+                     ask a human to admit it (FullAccess without a trusted session baseline, or \
+                     no attached client). It was NOT loaded; use /trust to review it.",
+                    package.state()
+                )))
+            }
+            crate::definition_trust::DefinitionTrustAuthorizationOutcome::Failed(reason) => {
+                Ok(ToolOutput::error(format!(
+                    "the approval for skill `{name}` could not be recorded ({reason}). Its \
+                     content was NOT loaded; the user can review it with /trust."
+                )))
+            }
+            crate::definition_trust::DefinitionTrustAuthorizationOutcome::AllowedOnce
+            | crate::definition_trust::DefinitionTrustAuthorizationOutcome::Trusted => {
+                // Re-read through a fresh view. If the bytes moved after the
+                // human decision, this refuses instead of handing out content
+                // the decision never covered.
+                let registry = load_registry_for(context)?;
+                match registry.load_skill(name) {
+                    Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
+                        &detail,
+                    ))),
+                    Err(error) => Ok(ToolOutput::error(format!(
+                        "skill `{name}` was admitted, but its content could not be verified \
+                         afterwards and was NOT loaded: {error}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// Frame the exact package for display and report its digest. The preview is
+/// bounded; the digest is always over the complete package.
+fn skill_package_preview(location: &std::path::Path) -> Result<(String, String, bool), String> {
+    let package = leveler_definition_trust::read_skill_package(&location.join("SKILL.md"))?;
+    let digest = leveler_definition_trust::DefinitionIdentity::skill_package_digest(&package);
+    let mut out = String::new();
+    let mut truncated = false;
+    for part in package {
+        let framed = format!(
+            "--- {} ---\n{}{}",
+            part.relative,
+            String::from_utf8_lossy(&part.bytes),
+            if part.bytes.ends_with(b"\n") {
+                ""
+            } else {
+                "\n"
+            }
+        );
+        let remaining =
+            crate::definition_trust::MAX_AUTHORIZATION_PREVIEW_BYTES.saturating_sub(out.len());
+        if framed.len() > remaining {
+            truncated = true;
+            let mut end = remaining.min(framed.len());
+            while !framed.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&framed[..end]);
+            out.push_str("\n… (preview truncated; the approval binds every package file)\n");
+            break;
+        }
+        out.push_str(&framed);
+    }
+    Ok((out, digest, truncated))
+}
+
+fn bounded_preview(text: &str) -> String {
+    if text.len() <= crate::definition_trust::MAX_AUTHORIZATION_PREVIEW_BYTES {
+        return text.to_string();
+    }
+    let mut end = crate::definition_trust::MAX_AUTHORIZATION_PREVIEW_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… (preview truncated)\n", &text[..end])
 }
 
 /// The scope a client may write a skill into. Mirrors the client protocol's
@@ -179,6 +382,22 @@ fn registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
     Ok(SkillRegistry::load(
         &SkillRoots::for_project_in(root, &|key| context.execution.environment.var_os(key)),
         context.execution.definition_trust.as_ref(),
+    ))
+}
+
+/// The registry `load_skill` uses: a fresh store read plus this execution's
+/// session allowances. The persistent store is the human authority; the turn's
+/// frozen view is the authority for everything that must not change mid-turn.
+fn load_registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
+    let root = context.require_workspace()?.root();
+    let home = leveler_core::LevelerHome::resolve(&context.execution.environment);
+    let mut trust = leveler_definition_trust::DefinitionTrustView::load(home.root(), Some(root));
+    if let Some(session) = context.execution.definition_trust.session() {
+        trust = trust.with_session(session.clone());
+    }
+    Ok(SkillRegistry::load(
+        &SkillRoots::for_project_in(root, &|key| context.execution.environment.var_os(key)),
+        &trust,
     ))
 }
 
@@ -621,9 +840,289 @@ mod tests {
 #[cfg(test)]
 mod trust_tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use leveler_definition_trust::{
+        DefinitionTrustView, SessionDefinitionTrust, SessionTrustSource,
+    };
+
+    struct FakeAuthorizer {
+        session: Arc<SessionDefinitionTrust>,
+        decision: crate::definition_trust::DefinitionTrustAuthorizationOutcome,
+        seen: Mutex<Vec<crate::definition_trust::DefinitionTrustAuthorizationRequest>>,
+        mutate: Option<(std::path::PathBuf, String)>,
+    }
+
+    #[async_trait]
+    impl crate::definition_trust::DefinitionTrustAuthorizer for FakeAuthorizer {
+        async fn authorize(
+            &self,
+            request: crate::definition_trust::DefinitionTrustAuthorizationRequest,
+        ) -> crate::definition_trust::DefinitionTrustAuthorizationOutcome {
+            self.seen.lock().unwrap().push(request.clone());
+            if let Some((path, body)) = &self.mutate {
+                std::fs::write(path, body).unwrap();
+            }
+            match self.decision.clone() {
+                crate::definition_trust::DefinitionTrustAuthorizationOutcome::AllowedOnce => {
+                    self.session.allow(
+                        &request.identity,
+                        &request.current_digest,
+                        SessionTrustSource::AllowOnce,
+                    );
+                    crate::definition_trust::DefinitionTrustAuthorizationOutcome::AllowedOnce
+                }
+                other => other,
+            }
+        }
+    }
+
+    fn untrusted_context(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        authorizer: Option<Arc<dyn crate::definition_trust::DefinitionTrustAuthorizer>>,
+        session: &Arc<SessionDefinitionTrust>,
+    ) -> ToolContext {
+        // The tool resolves the live store from its own environment snapshot.
+        // Point that snapshot at the test home so the frozen view and the
+        // fresh store read name the same store, as they do in production.
+        let env = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.as_os_str().to_os_string(),
+            )],
+            root.to_path_buf(),
+            std::env::temp_dir(),
+        );
+        let mut ctx = ToolContext::with_environment(
+            leveler_execution::Workspace::new(root).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+            Arc::new(env),
+        );
+        let view = DefinitionTrustView::load(home, Some(root)).with_session(session.clone());
+        ctx.execution.definition_trust = Arc::new(view);
+        ctx.execution.definition_trust_authorizer = authorizer;
+        ctx
+    }
+
+    fn write_evil(root: &std::path::Path) -> std::path::PathBuf {
+        let dir = root.join(".leveler/skills/evil");
+        std::fs::create_dir_all(&dir).unwrap();
+        let skill = dir.join("SKILL.md");
+        std::fs::write(
+            &skill,
+            "---\nname: evil\ndescription: Evil.\n---\n\nEVIL_SKILL_BODY\n",
+        )
+        .unwrap();
+        skill
+    }
 
     #[tokio::test]
     async fn an_unapproved_skill_body_is_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_evil(dir.path());
+        let session = Arc::new(SessionDefinitionTrust::unknown());
+        let ctx = untrusted_context(dir.path(), home.path(), None, &session);
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            !out.content.contains("EVIL_SKILL_BODY"),
+            "unapproved skill body leaked: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("/trust") || out.content.contains("not trusted"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allow_once_decision_resumes_the_same_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_evil(dir.path());
+        let session = Arc::new(SessionDefinitionTrust::unknown());
+        let authorizer = Arc::new(FakeAuthorizer {
+            session: session.clone(),
+            decision: crate::definition_trust::DefinitionTrustAuthorizationOutcome::AllowedOnce,
+            seen: Mutex::new(Vec::new()),
+            mutate: None,
+        });
+        let ctx = untrusted_context(dir.path(), home.path(), Some(authorizer.clone()), &session);
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("EVIL_SKILL_BODY"), "{}", out.content);
+        let seen = authorizer.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].identity.kind,
+            leveler_definition_trust::DefinitionKind::Skill
+        );
+        assert!(seen[0].current_content.contains("EVIL_SKILL_BODY"));
+        assert!(seen[0].current_digest.starts_with("sha256:"));
+        // Nothing was written to the persistent store by an allow-once.
+        assert_eq!(
+            leveler_definition_trust::DefinitionTrustStore::load(home.path()).status(),
+            &leveler_definition_trust::StoreStatus::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_decision_returns_a_refusal_without_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_evil(dir.path());
+        let session = Arc::new(SessionDefinitionTrust::unknown());
+        let authorizer = Arc::new(FakeAuthorizer {
+            session: session.clone(),
+            decision: crate::definition_trust::DefinitionTrustAuthorizationOutcome::Denied,
+            seen: Mutex::new(Vec::new()),
+            mutate: None,
+        });
+        let ctx = untrusted_context(dir.path(), home.path(), Some(authorizer), &session);
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(!out.content.contains("EVIL_SKILL_BODY"));
+        assert!(out.content.contains("declined"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn content_changed_under_the_decision_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let skill = write_evil(dir.path());
+        let session = Arc::new(SessionDefinitionTrust::unknown());
+        let authorizer = Arc::new(FakeAuthorizer {
+            session: session.clone(),
+            decision: crate::definition_trust::DefinitionTrustAuthorizationOutcome::AllowedOnce,
+            seen: Mutex::new(Vec::new()),
+            mutate: Some((
+                skill,
+                "---\nname: evil\ndescription: Evil.\n---\n\nREPLACED_BODY\n".into(),
+            )),
+        });
+        let ctx = untrusted_context(dir.path(), home.path(), Some(authorizer), &session);
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!out.content.contains("EVIL_SKILL_BODY"));
+        assert!(!out.content.contains("REPLACED_BODY"));
+        assert!(
+            out.content.contains("verified") || out.content.contains("could not"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trust_page_approval_during_a_turn_is_honoured_without_a_second_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_evil(dir.path());
+        let session = Arc::new(SessionDefinitionTrust::unknown());
+        // The turn started before the approval: its frozen view refuses.
+        let ctx = untrusted_context(dir.path(), home.path(), None, &session);
+        let frozen = (*ctx.execution.definition_trust).clone();
+        let candidate = leveler_definition_trust::discover_project(dir.path())
+            .into_iter()
+            .find(|candidate| candidate.identity.display.contains(".leveler/skills/evil"))
+            .unwrap();
+        assert!(
+            !frozen
+                .check(&candidate.identity, candidate.digest.as_deref().unwrap())
+                .admits()
+        );
+        // `/trust` writes the exact bytes mid-turn.
+        leveler_definition_trust::approve(
+            home.path(),
+            dir.path(),
+            &[candidate.approval_request().unwrap()],
+            leveler_definition_trust::ApprovalSurface::Tui,
+        )
+        .unwrap();
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.is_error,
+            "the persistent approval must be read at load time: {}",
+            out.content
+        );
+        assert!(out.content.contains("EVIL_SKILL_BODY"));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_store_is_reported_without_a_prompt_or_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_evil(dir.path());
+        std::fs::write(
+            leveler_definition_trust::store_path(home.path()),
+            "!! not yaml !!",
+        )
+        .unwrap();
+        let session = Arc::new(SessionDefinitionTrust::unknown());
+        let authorizer = Arc::new(FakeAuthorizer {
+            session: session.clone(),
+            decision: crate::definition_trust::DefinitionTrustAuthorizationOutcome::AllowedOnce,
+            seen: Mutex::new(Vec::new()),
+            mutate: None,
+        });
+        let ctx = untrusted_context(dir.path(), home.path(), Some(authorizer.clone()), &session);
+        let out = LoadSkillTool
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!out.content.contains("EVIL_SKILL_BODY"));
+        assert!(out.content.contains("unavailable"), "{}", out.content);
+        assert!(
+            authorizer.seen.lock().unwrap().is_empty(),
+            "a corrupt store must not raise an approval prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_skill_body_is_not_returned_with_deny_all() {
         let dir = tempfile::tempdir().unwrap();
         let skill = dir.path().join(".leveler/skills/evil");
         std::fs::create_dir_all(&skill).unwrap();

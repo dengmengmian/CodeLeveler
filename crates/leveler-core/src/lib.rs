@@ -29,9 +29,9 @@ pub use environment::{
 };
 pub use home::{LevelerHome, TOOL_CACHE_LAST_USED_FILE, TOOL_CACHE_LOCK_FILE};
 pub use ids::{
-    AgentId, ApprovalId, ArtifactId, BootId, CheckpointId, ClarificationId, CommandId, EventId,
-    GoalCheckpointId, GoalId, RequestId, RuntimeId, SessionId, TaskId, TaskNodeId, ToolCallId,
-    TurnId, UserShellId, new_uuid_string,
+    AgentId, ApprovalId, ArtifactId, BootId, CheckpointId, ClarificationId, CommandId,
+    DefinitionTrustRequestId, EventId, GoalCheckpointId, GoalId, RequestId, RuntimeId, SessionId,
+    TaskId, TaskNodeId, ToolCallId, TurnId, UserShellId, new_uuid_string,
 };
 pub use ownership::{BootLiveness, BootLivenessProbe, OwnerEpoch, OwnershipToken};
 pub use secret::{

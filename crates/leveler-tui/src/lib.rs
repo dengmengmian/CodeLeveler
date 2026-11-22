@@ -89,6 +89,8 @@ mod tool_cell;
 mod tool_result;
 pub mod tool_taxonomy;
 pub mod transcript;
+/// `/trust`: the human surface over project definition trust.
+pub mod trust;
 pub mod unfinished_goals;
 pub mod update;
 mod url_link;
