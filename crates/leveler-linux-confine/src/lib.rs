@@ -1722,7 +1722,9 @@ fn readlink_at(parent: RawFd, name: &OsStr) -> Option<OsString> {
 }
 
 /// Split a path into parent bytes and final component. Trailing slashes are
-/// stripped; a path with no new name (root, `.`, `..`) returns `None`.
+/// stripped; a path with no new name (root, `.`, `..`) returns `None`. An
+/// absolute path with one component keeps `/` as its parent, not an empty
+/// (cwd-relative) prefix.
 fn split_parent(path: &[u8]) -> Option<(&[u8], OsString)> {
     let mut end = path.len();
     while end > 1 && path[end - 1] == b'/' {
@@ -1733,6 +1735,7 @@ fn split_parent(path: &[u8]) -> Option<(&[u8], OsString)> {
         return None;
     }
     let (parent, name) = match trimmed.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => (&trimmed[..1], &trimmed[1..]),
         Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
         None => (&trimmed[..0], trimmed),
     };
@@ -1844,7 +1847,15 @@ mod tests {
             Some((&b"/ws/a"[..], OsString::from("b")))
         );
         assert!(split_parent(b"/").is_none());
-        assert!(split_parent(b"/ws/").is_none());
+        // One absolute component still has a parent: `/`, not the process cwd.
+        assert_eq!(
+            split_parent(b"/ws/"),
+            Some((&b"/"[..], OsString::from("ws")))
+        );
+        assert_eq!(
+            split_parent(b"/AGENTS.md"),
+            Some((&b"/"[..], OsString::from("AGENTS.md")))
+        );
         assert!(split_parent(b"/ws/.").is_none());
         assert!(split_parent(b"/ws/..").is_none());
     }
