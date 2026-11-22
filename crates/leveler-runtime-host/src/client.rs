@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(any(unix, windows))]
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RestartReason};
+use leveler_client_protocol::{
+    ClientCommand, InteractiveRuntimeClient, RestartReason, RetireRequest,
+};
 use leveler_client_protocol::{RuntimeHealth, RuntimeInfo, SessionId};
 #[cfg(any(unix, windows))]
 use leveler_local_transport::{LocalRuntimeService, RuntimeReviver};
@@ -154,7 +156,7 @@ mod credential_race_hook {
 /// the handshake proves somebody is listening but did not answer. Callers that
 /// report a failure must not collapse these facts into one another.
 #[cfg(any(unix, windows))]
-enum EndpointProbe {
+pub(super) enum EndpointProbe {
     Ready(LocalSocketRuntimeClient),
     Absent,
     /// A listener is live and its credential was published while this probe
@@ -171,7 +173,22 @@ enum EndpointProbe {
 
 #[cfg(any(unix, windows))]
 async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe, TransportError> {
-    match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
+    probe_endpoint_as(
+        path,
+        timeout,
+        leveler_local_transport::ClientKind::LocalInteractive,
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+pub(super) async fn probe_endpoint_as(
+    path: &Path,
+    timeout: Duration,
+    kind: leveler_local_transport::ClientKind,
+) -> Result<EndpointProbe, TransportError> {
+    let connect = || LocalSocketRuntimeClient::connect_as(path, kind);
+    match tokio::time::timeout(timeout, connect()).await {
         Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
         Ok(Err(TransportError::Io(error))) if error.kind() == std::io::ErrorKind::NotFound => {
             // A tokenless endpoint can mean three different things. If a
@@ -187,11 +204,16 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
             {
                 #[cfg(test)]
                 credential_race_hook::fire(path);
-                if tokio::net::UnixStream::connect(path).await.is_ok() {
-                    if leveler_local_transport::access_token_is_published(path)? {
-                        return Ok(EndpointProbe::NotReady);
+                match tokio::time::timeout(timeout, tokio::net::UnixStream::connect(path)).await {
+                    Ok(Ok(_)) => {
+                        if leveler_local_transport::access_token_is_published(path)? {
+                            return Ok(EndpointProbe::NotReady);
+                        }
+                        return Err(TransportError::PredatesAccessToken(path.to_path_buf()));
                     }
-                    return Err(TransportError::PredatesAccessToken(path.to_path_buf()));
+                    Ok(Err(error)) if endpoint_unavailable(&error) => {}
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(_) => return Ok(EndpointProbe::NoAnswer { timeout }),
                 }
             }
             Ok(EndpointProbe::Absent)
@@ -207,7 +229,7 @@ async fn probe_endpoint(path: &Path, timeout: Duration) -> Result<EndpointProbe,
             // accepted-then-killed listener produces the same EOF. Only a peer
             // that accepts a second connection proves it is still alive and
             // therefore that the close is a capability statement.
-            match tokio::time::timeout(timeout, LocalSocketRuntimeClient::connect(path)).await {
+            match tokio::time::timeout(timeout, connect()).await {
                 Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
                 Ok(Err(TransportError::PeerClosed)) => {
                     Err(TransportError::PredatesAccessToken(path.to_path_buf()))
@@ -358,26 +380,18 @@ pub fn expected_config_fingerprint(layout: &Layout) -> std::io::Result<String> {
     leveler_app::runtime_config_fingerprint(layout)
 }
 
-#[cfg(any(unix, windows))]
-async fn runtime_is_current(
-    client: &LocalSocketRuntimeClient,
-    layout: &Layout,
-) -> anyhow::Result<RuntimeConsistency> {
-    let expected = leveler_core::BuildIdentity::current();
-    let reported = LocalRuntimeService::runtime_info(client).await.ok();
-    let expected_config = leveler_app::runtime_config_fingerprint(layout)?;
-    Ok(classify_runtime_generation(
-        reported.as_ref(),
-        &expected,
-        &expected_config,
-    ))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffAction {
     Interrupt,
     Force,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyHandoffBlock {
+    AccessTokenUnavailable,
+    AtomicRetirementUnavailable,
 }
 
 /// What a handover observed. The typed form IS the cross-shell contract: a
@@ -427,6 +441,12 @@ pub enum HandoffEvent {
     MigrationFailed {
         reason: String,
     },
+    /// The shell is waiting for the previous owner to exit on its own.
+    LegacyExitRequired {
+        block: LegacyHandoffBlock,
+        version: Option<String>,
+        pid: Option<u32>,
+    },
     /// A runtime too old to retire atomically was verified and is being
     /// replaced.
     ///
@@ -462,6 +482,11 @@ pub trait HandoffUi: Send + Sync {
     /// anything. A shell that returns `false` gets the bounded
     /// [`EnsureError::RetireBlocked`] outcome instead of an unbounded wait.
     fn interactive(&self) -> bool {
+        false
+    }
+    /// An initial terminal launch can keep observing a legacy endpoint until
+    /// the operator exits the old instance or cancels this launch.
+    fn waits_for_legacy_exit(&self) -> bool {
         false
     }
     fn render_ensure_error(&self, error: &EnsureError) -> String {
@@ -738,6 +763,9 @@ pub enum DrainOutcome {
     /// previous runtime either refused a forced migration or never answered the
     /// atomic question. Nothing was signalled and nothing was changed.
     MigrationBlocked { reason: String },
+    /// The connected peer cannot confirm atomic retirement. A startup shell
+    /// can keep observing after dropping its interactive subscription.
+    LegacyExitRequired(Box<RuntimeInfo>),
 }
 
 /// Wait for the old owner to drain. A replacement PID on the same socket
@@ -775,7 +803,7 @@ async fn observe_retiring_runtime_with_grace(
     interval: Duration,
     grace: Duration,
     ui: &dyn HandoffUi,
-    requested: Option<RestartReason>,
+    requested: Option<RetireRequest>,
 ) -> DrainOutcome {
     let mut last = String::new();
     let mut input: Option<UnboundedReceiver<HandoffAction>> = None;
@@ -787,40 +815,40 @@ async fn observe_retiring_runtime_with_grace(
     // default drain budget is longer than one refresh, so a shell sees
     // "still waiting" several times before it ever sees a deadline.
     let mut next_report = HANDOVER_STATUS_REFRESH;
-    // `Some(reason)` until this runtime has actually committed to retiring.
+    // `Some(request)` until this runtime has actually committed to retiring.
     // While it is still `Some`, the runtime has NOT closed admission, so other
     // clients keep working; the upgrade is deferred, not forced.
-    let mut pending = requested;
+    let mut pending = requested.as_ref();
     let mut deferral_reported: Option<String> = None;
     let mut generation_changes = 0u32;
     loop {
         let info = LocalRuntimeService::runtime_info(client).await.ok();
         if info.is_none()
-            // Bounded: an endpoint that accepts and then stalls must not be
-            // able to hold the handover wait open by refusing to answer, and a
-            // refused endpoint means the retiring runtime is gone.
-            && connect_within(socket_path, DEFAULT_DAEMON_CONNECT_TIMEOUT)
-                .await
-                .ok()
-                .flatten()
-                .is_none()
+            && matches!(
+                probe_endpoint_as(
+                    socket_path,
+                    DEFAULT_DAEMON_CONNECT_TIMEOUT,
+                    leveler_local_transport::ClientKind::Remote,
+                )
+                .await,
+                Ok(EndpointProbe::Absent)
+            )
         {
             return DrainOutcome::Drained;
         }
         if let Some(info) = info.as_ref()
-            && observed_pid.is_some_and(|pid| info.pid != pid)
+            && (observed_pid.is_some_and(|pid| info.pid != pid)
+                || requested
+                    .as_ref()
+                    .is_some_and(|request| info.build != request.expected_build))
         {
             return DrainOutcome::Drained;
         }
         let health = info.as_ref().map(|info| info.health.clone());
         // ---- Ask for the decision, when it has not been made yet -----------
-        if let (Some(reason), Some(info)) = (pending, info.as_ref()) {
-            let request = leveler_client_protocol::RetireRequest {
-                reason,
-                expected_build: info.build.clone(),
-                expected_pid: info.pid,
-            };
-            match client.try_retire_if_idle(request).await {
+        if let (Some(request), Some(info)) = (pending, info.as_ref()) {
+            let reason = request.reason;
+            match client.try_retire_if_idle(request.clone()).await {
                 Ok(leveler_client_protocol::RetireDecision::Accepted) => {
                     tracing::info!(?reason, "the previous runtime accepted retirement");
                     pending = None;
@@ -880,6 +908,9 @@ async fn observe_retiring_runtime_with_grace(
                     // apparent idleness can race a newly admitted turn. Keep
                     // the old owner untouched; only it may settle its work and
                     // exit normally before a replacement starts.
+                    if ui.waits_for_legacy_exit() {
+                        return DrainOutcome::LegacyExitRequired(Box::new(info.clone()));
+                    }
                     if let Some(health) = health.as_ref()
                         && (health.active_turns > 0 || health.active_background_tasks > 0)
                     {
@@ -1014,23 +1045,27 @@ async fn observe_retiring_runtime_with_grace(
 /// disagree about what this client is waiting for.
 #[cfg(any(unix, windows))]
 async fn retire_runtime(
-    client: &LocalSocketRuntimeClient,
+    client: LocalSocketRuntimeClient,
     socket_path: &Path,
+    observed: &RuntimeInfo,
     reason: RestartReason,
     ui: &dyn HandoffUi,
 ) -> anyhow::Result<()> {
-    let observed_pid = LocalRuntimeService::runtime_info(client)
-        .await
-        .ok()
-        .map(|info| info.pid);
+    // Each IPC call reconnects. Only the generation that was classified as
+    // outdated may be retired, even if another launch takes over now.
+    let request = RetireRequest {
+        reason,
+        expected_build: observed.build.clone(),
+        expected_pid: observed.pid,
+    };
     let outcome = observe_retiring_runtime_with_grace(
-        client,
+        &client,
         socket_path,
-        observed_pid,
+        Some(observed.pid),
         HANDOVER_STATUS_INTERVAL,
         HANDOVER_CANCEL_GRACE,
         ui,
-        Some(reason),
+        Some(request),
     )
     .await;
     match outcome {
@@ -1059,6 +1094,19 @@ async fn retire_runtime(
             reason,
         }
         .into()),
+        DrainOutcome::LegacyExitRequired(info) => {
+            // The startup probe has a local subscription. Keeping it while
+            // we wait would prevent an idle legacy runtime from self-evicting.
+            drop(client);
+            wait_for_legacy_exit(
+                socket_path,
+                LegacyHandoffBlock::AtomicRetirementUnavailable,
+                Some(&info),
+                ui,
+            )
+            .await;
+            Ok(())
+        }
     }
 }
 
@@ -1125,64 +1173,154 @@ pub async fn reconcile_runtime_generation(
     layout: &Layout,
     ui: &dyn HandoffUi,
 ) -> anyhow::Result<Option<LocalSocketRuntimeClient>> {
-    let probed = match probe_default_runtime(socket_path).await {
-        Ok(probed) => probed,
-        Err(TransportError::PredatesAccessToken(observed)) => {
-            return Err(legacy_runtime_refusal(socket_path, &observed, ui).await);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(client) = probed else {
-        return Ok(None);
-    };
-    match runtime_is_current(&client, layout).await? {
-        RuntimeConsistency::Current => Ok(Some(client)),
-        RuntimeConsistency::Unknown => Err(EnsureError::UnknownGeneration.into()),
-        RuntimeConsistency::Outdated { runtime, expected } => {
-            tracing::info!(
-                runtime = %runtime.diagnostic(),
-                expected = %expected.diagnostic(),
-                "local runtime is a different build; asking it to retire"
-            );
-            retire_runtime(&client, socket_path, RestartReason::BuildMismatch, ui).await?;
-            Ok(None)
-        }
-        RuntimeConsistency::ConfigChanged => {
-            // A same-build runtime serving an older configuration generation is
-            // NOT a reason to replace it: the configuration is hot-reloadable
-            // state. Ask it to re-read the files instead. A runtime that does
-            // not understand the command (an older build) answers with a
-            // transport error; only then is a replacement the right answer.
-            tracing::info!(
-                "local runtime loaded an older configuration generation; asking it to reload"
-            );
-            if reload_runtime_config(&client).await.is_ok() {
-                return Ok(Some(client));
+    for _ in 0..=MAX_GENERATION_CHANGES {
+        let probe = match probe_endpoint(socket_path, DEFAULT_DAEMON_CONNECT_TIMEOUT).await {
+            Ok(EndpointProbe::NoAnswer { .. }) => {
+                probe_endpoint(socket_path, READY_CONNECT_TIMEOUT).await
             }
-            tracing::info!("runtime cannot reload configuration in place; asking it to retire");
-            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui).await?;
-            Ok(None)
+            #[cfg(unix)]
+            Ok(EndpointProbe::NotReady) => probe_endpoint(socket_path, READY_CONNECT_TIMEOUT).await,
+            other => other,
+        };
+        let client = match probe {
+            Ok(EndpointProbe::Ready(client)) => client,
+            Ok(EndpointProbe::Absent) => return Ok(None),
+            Ok(EndpointProbe::NoAnswer { timeout }) => {
+                return Err(TransportError::NoAnswer {
+                    operation: "the startup handshake",
+                    timeout_ms: timeout.as_millis() as u64,
+                }
+                .into());
+            }
+            #[cfg(unix)]
+            Ok(EndpointProbe::NotReady) => return Err(EnsureError::UnknownGeneration.into()),
+            Err(TransportError::PredatesAccessToken(observed)) => {
+                let info = observe_legacy_runtime(&observed).await;
+                if !ui.waits_for_legacy_exit() {
+                    return Err(legacy_runtime_refusal(socket_path, info.as_ref(), ui));
+                }
+                wait_for_legacy_exit(
+                    &observed,
+                    LegacyHandoffBlock::AccessTokenUnavailable,
+                    info.as_ref(),
+                    ui,
+                )
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let info = LocalRuntimeService::runtime_info(&client)
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "could not observe serving runtime generation");
+                EnsureError::UnknownGeneration
+            })?;
+        let expected_config = leveler_app::runtime_config_fingerprint(layout)?;
+        let reason = match classify_runtime_generation(
+            Some(&info),
+            &leveler_core::BuildIdentity::current(),
+            &expected_config,
+        ) {
+            RuntimeConsistency::Current => return Ok(Some(client)),
+            RuntimeConsistency::Unknown => return Err(EnsureError::UnknownGeneration.into()),
+            RuntimeConsistency::Outdated { runtime, expected } => {
+                tracing::info!(
+                    runtime = %runtime.diagnostic(),
+                    expected = %expected.diagnostic(),
+                    "local runtime is a different build; asking it to retire"
+                );
+                RestartReason::BuildMismatch
+            }
+            RuntimeConsistency::ConfigChanged => {
+                // Configuration normally reloads without replacing the process.
+                tracing::info!(
+                    "local runtime loaded an older configuration generation; asking it to reload"
+                );
+                if reload_runtime_config(&client).await.is_ok() {
+                    return Ok(Some(client));
+                }
+                tracing::info!("runtime cannot reload configuration in place; asking it to retire");
+                RestartReason::ConfigChanged
+            }
+        };
+        retire_runtime(client, socket_path, &info, reason, ui).await?;
+    }
+    Err(EnsureError::UnknownGeneration.into())
+}
+
+#[cfg(any(unix, windows))]
+async fn observe_legacy_runtime(_socket_path: &Path) -> Option<RuntimeInfo> {
+    #[cfg(unix)]
+    return leveler_local_transport::legacy_runtime_info(_socket_path, LEGACY_OBSERVATION_TIMEOUT)
+        .await;
+    #[cfg(windows)]
+    None
+}
+
+/// A passive wait never asks a legacy peer to change state. When the endpoint
+/// is released or its owner changes, the caller will use normal discovery and
+/// ownership election. Failed observations do not prove release.
+#[cfg(any(unix, windows))]
+async fn wait_for_legacy_exit(
+    socket_path: &Path,
+    block: LegacyHandoffBlock,
+    previous: Option<&RuntimeInfo>,
+    ui: &dyn HandoffUi,
+) {
+    tracing::info!(
+        ?block,
+        socket = %socket_path.display(),
+        pid = previous.map(|info| info.pid),
+        build = previous.map(|info| info.build.diagnostic()),
+        "waiting for legacy runtime exit"
+    );
+    ui.emit(HandoffEvent::LegacyExitRequired {
+        block,
+        version: previous.and_then(|info| (!info.version.is_empty()).then(|| info.version.clone())),
+        pid: previous.and_then(|info| (info.pid != 0).then_some(info.pid)),
+    });
+    loop {
+        tokio::time::sleep(HANDOVER_STATUS_INTERVAL).await;
+        match probe_endpoint_as(
+            socket_path,
+            DEFAULT_DAEMON_CONNECT_TIMEOUT,
+            leveler_local_transport::ClientKind::Remote,
+        )
+        .await
+        {
+            Ok(EndpointProbe::Absent) => return,
+            Ok(EndpointProbe::Ready(client)) => {
+                if block == LegacyHandoffBlock::AccessTokenUnavailable {
+                    return;
+                }
+                if let Some(previous) = previous
+                    && let Ok(Ok(observed)) = tokio::time::timeout(
+                        READY_CONNECT_TIMEOUT,
+                        LocalRuntimeService::runtime_info(&client),
+                    )
+                    .await
+                    && (observed.pid != previous.pid
+                        || observed.runtime_id != previous.runtime_id
+                        || observed.build != previous.build)
+                {
+                    return;
+                }
+            }
+            Ok(_) | Err(TransportError::PredatesAccessToken(_)) => {}
+            Err(error) => tracing::debug!(%error, "could not observe legacy runtime exit"),
         }
     }
 }
 
-/// The verdict for a live runtime that cannot authenticate a current client.
-///
-/// A pre-token runtime cannot be retired atomically, so the endpoint needs its
-/// owner to exit. Whether that is a deferral or a blocking fact depends on the
-/// work it still owns: one read-only `runtime_info` (the request every
-/// generation has answered, sent without a handshake) tells them apart. When it
-/// cannot be read, the refusal stands — silence never proves idleness.
+/// Unattended callers report a legacy block without waiting on the operator.
 #[cfg(any(unix, windows))]
-async fn legacy_runtime_refusal(
+fn legacy_runtime_refusal(
     socket_path: &Path,
-    observed: &Path,
+    info: Option<&RuntimeInfo>,
     ui: &dyn HandoffUi,
 ) -> anyhow::Error {
-    #[cfg(unix)]
-    if let Some(info) =
-        leveler_local_transport::legacy_runtime_info(observed, LEGACY_OBSERVATION_TIMEOUT).await
-    {
+    if let Some(info) = info {
         let active_turns = info.health.active_turns;
         let active_background_tasks = info.health.active_background_tasks;
         if active_turns > 0 || active_background_tasks > 0 {
@@ -1199,9 +1337,9 @@ async fn legacy_runtime_refusal(
         }
     }
     let reason = format!(
-        "the previous runtime at {} predates the access token and does not support atomic \
+        "the previous runtime at {} predates the access token required for authenticated \
          retirement; let it finish its work and exit normally, then restart this build",
-        observed.display()
+        socket_path.display()
     );
     ui.emit(HandoffEvent::MigrationFailed {
         reason: reason.clone(),
@@ -2027,6 +2165,9 @@ mod generation_attach_tests {
     struct Runtime {
         info: RuntimeInfo,
         decision: RetireDecision,
+        presence: leveler_local_transport::LocalWaiters,
+        replace_after_first_observation: AtomicBool,
+        info_reads: AtomicUsize,
         retire_calls: AtomicUsize,
         retire_before_confirmation: AtomicBool,
         commands: AtomicUsize,
@@ -2058,6 +2199,12 @@ mod generation_attach_tests {
         }
         async fn runtime_info(&self) -> Result<RuntimeInfo, ClientError> {
             let mut info = self.info.clone();
+            if self.replace_after_first_observation.load(Ordering::SeqCst)
+                && self.info_reads.fetch_add(1, Ordering::SeqCst) > 0
+            {
+                info.build = leveler_core::BuildIdentity::current();
+                info.pid += 1;
+            }
             if self.retire_before_confirmation.load(Ordering::SeqCst)
                 && self.retire_calls.load(Ordering::SeqCst) > 0
             {
@@ -2070,8 +2217,9 @@ mod generation_attach_tests {
             &self,
             request: RetireRequest,
         ) -> Result<RetireDecision, ClientError> {
-            assert_eq!(request.expected_build, self.info.build);
-            assert_eq!(request.expected_pid, self.info.pid);
+            let info = self.runtime_info().await.unwrap();
+            assert_eq!(request.expected_build, info.build);
+            assert_eq!(request.expected_pid, info.pid);
             self.retire_calls.fetch_add(1, Ordering::SeqCst);
             if self.decision.admits_replacement() {
                 self.retired.notify_one();
@@ -2090,6 +2238,31 @@ mod generation_attach_tests {
             None
         }
         fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct WaitingUi {
+        events: std::sync::Mutex<Vec<HandoffEvent>>,
+        reported: Notify,
+    }
+
+    impl HandoffUi for WaitingUi {
+        fn emit(&self, event: HandoffEvent) {
+            self.events.lock().unwrap().push(event);
+            self.reported.notify_one();
+        }
+
+        fn input(&self) -> Option<UnboundedReceiver<HandoffAction>> {
+            panic!("a passive legacy wait must not open handover input")
+        }
+
+        fn interactive(&self) -> bool {
+            true
+        }
+
+        fn waits_for_legacy_exit(&self) -> bool {
             true
         }
     }
@@ -2114,6 +2287,7 @@ mod generation_attach_tests {
                 build,
                 config_fingerprint: Some(expected_config_fingerprint(layout).unwrap()),
                 pid: std::process::id(),
+                idle_eviction: None,
                 health: RuntimeHealth {
                     accepting_work: true,
                     active_background_tasks: if matches!(
@@ -2128,6 +2302,9 @@ mod generation_attach_tests {
                 },
             },
             decision,
+            presence: leveler_local_transport::LocalWaiters::new(),
+            replace_after_first_observation: AtomicBool::new(false),
+            info_reads: AtomicUsize::new(0),
             retire_calls: AtomicUsize::new(0),
             retire_before_confirmation: AtomicBool::new(false),
             commands: AtomicUsize::new(0),
@@ -2136,9 +2313,13 @@ mod generation_attach_tests {
         });
         let socket = layout.socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let server = LocalSocketServer::bind(&socket, runtime.clone())
-            .await
-            .unwrap();
+        let server = LocalSocketServer::bind_with_waiters(
+            &socket,
+            runtime.clone(),
+            runtime.presence.clone(),
+        )
+        .await
+        .unwrap();
         let retired = runtime.retired.clone();
         let serving = tokio::spawn(async move {
             tokio::select! {
@@ -2271,6 +2452,28 @@ mod generation_attach_tests {
     }
 
     #[tokio::test]
+    async fn a_same_build_election_winner_is_not_retired_after_observing_the_old_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (runtime, serving) = runtime(&layout, previous_build(), RetireDecision::Accepted).await;
+        runtime
+            .replace_after_first_observation
+            .store(true, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            reconcile_runtime_generation(&layout.socket_path(), &layout, &Ui::default()),
+        )
+        .await
+        .expect("the already-ready replacement should be adopted promptly")
+        .unwrap();
+        serving.abort();
+
+        assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 0);
+        assert!(result.is_some(), "adopt the winner of the other launch");
+    }
+
+    #[tokio::test]
     async fn a_runtime_without_known_identity_is_not_adopted() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = layout(tmp.path());
@@ -2317,6 +2520,79 @@ mod generation_attach_tests {
         );
         assert_eq!(runtime.retire_calls.load(Ordering::SeqCst), 1);
         serving.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_authenticated_runtime_is_observed_until_another_owner_takes_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let (old_runtime, old_serving) =
+            runtime(&layout, previous_build(), RetireDecision::Unsupported).await;
+        let ui = Arc::new(WaitingUi::default());
+        let reconciling = tokio::spawn({
+            let ui = ui.clone();
+            let layout = layout.clone();
+            async move {
+                reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()).await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), ui.reported.notified())
+            .await
+            .expect("the shell reports why it needs the previous runtime to exit");
+        assert!(matches!(
+            ui.events.lock().unwrap().as_slice(),
+            [HandoffEvent::LegacyExitRequired {
+                block: LegacyHandoffBlock::AtomicRetirementUnavailable,
+                version: Some(version),
+                pid: Some(pid),
+            }] if version == "previous" && *pid == std::process::id()
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while old_runtime.presence.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a passive waiter must not prevent the previous runtime from self-evicting");
+        old_serving.abort();
+        assert!(old_serving.await.unwrap_err().is_cancelled());
+        let (new_runtime, new_serving) = runtime(
+            &layout,
+            leveler_core::BuildIdentity::current(),
+            RetireDecision::Accepted,
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(10), reconciling)
+            .await
+            .expect("the same launch recognizes the replacement")
+            .unwrap();
+        assert!(matches!(result, Ok(Some(_))), "{:?}", result.err());
+        assert_eq!(old_runtime.retire_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(old_runtime.commands.load(Ordering::SeqCst), 0);
+        assert_eq!(new_runtime.retire_calls.load(Ordering::SeqCst), 0);
+        new_serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_live_listener_that_does_not_answer_is_not_available_for_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::write(socket.with_extension("token"), "a".repeat(64)).unwrap();
+
+        let result = reconcile_runtime_generation(&socket, &layout, &Ui::default()).await;
+        assert!(matches!(
+            result
+                .err()
+                .and_then(|error| error.downcast::<TransportError>().ok()),
+            Some(TransportError::NoAnswer {
+                operation: "the startup handshake",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2390,7 +2666,7 @@ mod generation_attach_tests {
             }) => {
                 assert_eq!(reported, &socket);
                 assert!(
-                    reason.contains("does not support atomic retirement"),
+                    reason.contains("required for authenticated retirement"),
                     "{reason}"
                 );
                 assert!(reason.contains("predates the access token"), "{reason}");
@@ -2404,6 +2680,56 @@ mod generation_attach_tests {
                 .any(|event| matches!(event, HandoffEvent::MigrationFailed { .. })),
             "the shell must be told the migration failed: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_shell_rechecks_after_the_tokenless_owner_releases_its_socket() {
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let serving = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if let Ok(length) = stream.read_u32().await {
+                    let mut frame = vec![0; length as usize];
+                    stream.read_exact(&mut frame).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+                    assert_eq!(request["body"]["type"], "runtime_info");
+                }
+            }
+        });
+        let ui = Arc::new(WaitingUi::default());
+        let reconciling = tokio::spawn({
+            let ui = ui.clone();
+            let layout = layout.clone();
+            async move {
+                reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()).await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), ui.reported.notified())
+            .await
+            .expect("the shell is told why it must wait");
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+        assert!(socket.exists(), "the stale socket file is still in place");
+        let result = tokio::time::timeout(Duration::from_secs(10), reconciling)
+            .await
+            .expect("the same launch rechecks the endpoint after its owner exits")
+            .unwrap();
+        assert!(matches!(result, Ok(None)), "{:?}", result.err());
+        assert!(matches!(
+            ui.events.lock().unwrap().as_slice(),
+            [HandoffEvent::LegacyExitRequired {
+                block: LegacyHandoffBlock::AccessTokenUnavailable,
+                version: None,
+                pid: None,
+            }]
+        ));
     }
 
     /// A busy runtime from before the access token is still BUSY. Telling its

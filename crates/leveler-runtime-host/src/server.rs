@@ -12,8 +12,15 @@ pub const DAEMON_TOKEN_ENV: &str = "LEVELER_DAEMON_TOKEN";
 const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub fn daemon_idle_timeout() -> Duration {
-    std::env::var("LEVELER_DAEMON_IDLE_TIMEOUT_SECS")
-        .ok()
+    parse_idle_timeout(
+        std::env::var("LEVELER_DAEMON_IDLE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_idle_timeout(value: Option<&str>) -> Duration {
+    value
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
@@ -105,8 +112,6 @@ pub async fn prepare_daemon(
     let service: Arc<dyn LocalRuntimeService> = runtime.clone();
     let bound = bind_daemon_transports(socket_path, tcp, token, service, local_waiters).await?;
     app.reconcile_execution_services().await?;
-    runtime.spawn_idle_eviction(daemon_idle_timeout());
-
     let runtime_id = app.runtime_id()?;
     let db = app.open_database().await?;
     let engine = app.task_engine(&db)?;
@@ -182,4 +187,17 @@ fn publish_ready_json(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.sync_all()?;
     }
     std::fs::rename(&staged, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_timeout_defaults_to_thirty_minutes_and_accepts_positive_overrides() {
+        for value in [None, Some("0"), Some("-1"), Some("bad")] {
+            assert_eq!(parse_idle_timeout(value), Duration::from_secs(1800));
+        }
+        assert_eq!(parse_idle_timeout(Some(" 5 ")), Duration::from_secs(5));
+    }
 }

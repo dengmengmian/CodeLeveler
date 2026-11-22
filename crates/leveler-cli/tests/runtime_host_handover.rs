@@ -227,6 +227,7 @@ impl LocalRuntimeService for FakeOldRuntime {
             build: self.build.clone(),
             config_fingerprint: None,
             pid: state.pid,
+            idle_eviction: None,
             health: state.health.clone(),
         })
     }
@@ -585,6 +586,7 @@ impl LocalRuntimeService for AnonymousRuntime {
             build: BuildIdentity::default(),
             config_fingerprint: None,
             pid: std::process::id(),
+            idle_eviction: None,
             health: RuntimeHealth {
                 accepting_work: true,
                 quiescent: true,

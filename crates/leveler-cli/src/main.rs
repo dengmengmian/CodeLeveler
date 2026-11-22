@@ -27,6 +27,7 @@ mod output;
 mod permissions_cmds;
 mod render;
 mod run_cmds;
+mod runtime_cmd;
 mod schedule_cmd;
 mod sessions_cmd;
 mod skills_cmds;
@@ -144,7 +145,8 @@ fn init_tracing(verbose: u8, is_tui: bool) {
         1 => "info",
         _ => "debug",
     };
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| format!("leveler={level}"));
+    let filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| format!("leveler={level},leveler_runtime_lifecycle=info"));
     if is_tui {
         // The TUI owns the terminal; stderr must stay clean. Redirect to a log
         // file, or disable logging entirely — never fall back to stderr, which
@@ -363,6 +365,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             .await
         }
         Command::Doctor { json } => cmd_doctor(layout, json),
+        Command::Runtime { command } => runtime_cmd::run(&layout, command).await,
         Command::Native(command) => Ok(native_cmd::cmd_native(command).await),
         Command::Schedule(command) => {
             schedule_cmd::cmd_schedule(layout, schedule_config_dir, command)

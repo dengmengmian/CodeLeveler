@@ -7,15 +7,24 @@ use windows_sys::Win32::{
     Foundation::*, Security::Authorization::*, Security::*, System::Pipes::*, System::Threading::*,
 };
 
+fn open_process(pid: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: OpenProcess takes a PID and an access mask and returns an owned handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a non-null successful result is owned by this caller.
+    Ok(unsafe { OwnedHandle::from_raw_handle(process) })
+}
+
 fn process_sid(pid: u32) -> io::Result<String> {
+    process_handle_sid(&open_process(pid)?)
+}
+
+fn process_handle_sid(process: &OwnedHandle) -> io::Result<String> {
     // SAFETY: process and token handles are owned below; API output buffers
     // remain allocated through each call and SID conversion.
     unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if process.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let process = OwnedHandle::from_raw_handle(process);
         let mut token = ptr::null_mut();
         if OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) == 0 {
             return Err(io::Error::last_os_error());
@@ -120,16 +129,48 @@ pub fn retain_instance(server: &NamedPipeServer) -> io::Result<OwnedHandle> {
     }
 }
 pub fn verify_server(client: &NamedPipeClient) -> io::Result<()> {
+    verified_server_process(client).map(drop)
+}
+
+/// The authenticated server process object. Holding its kernel handle keeps
+/// its PID from being assigned to another process, even after server exit.
+pub struct VerifiedServerProcess {
+    pid: u32,
+    handle: OwnedHandle,
+}
+
+impl VerifiedServerProcess {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Verify a newly connected pipe before sending to this exact process.
+    pub fn verify_same_server(&self, client: &NamedPipeClient) -> io::Result<bool> {
+        if pipe_server_pid(client)? != self.pid {
+            return Ok(false);
+        }
+        verify_process_sid(&self.handle)?;
+        verify_pipe_owner(client)?;
+        Ok(true)
+    }
+}
+
+pub fn verified_server_process(client: &NamedPipeClient) -> io::Result<VerifiedServerProcess> {
+    let pid = pipe_server_pid(client)?;
+    let handle = open_process(pid)?;
+    verify_process_sid(&handle)?;
+    // Bind the process identity to the connected kernel object as well.
+    verify_pipe_owner(client)?;
+    Ok(VerifiedServerProcess { pid, handle })
+}
+
+fn pipe_server_pid(client: &NamedPipeClient) -> io::Result<u32> {
     let mut pid = 0;
     // SAFETY: client handle stays alive and pid is writable.
     if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle(), &mut pid) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    verify_sid(pid)?;
-    // Bind identity to the connected kernel object as well as its process PID.
-    // A terminated server's PID can be reused while a duplicated pipe handle
-    // remains open elsewhere; a SID lookup by PID alone would be insufficient.
-    verify_pipe_owner(client)
+    Ok(pid)
 }
 fn verify_pipe_owner(client: &NamedPipeClient) -> io::Result<()> {
     let expected = current_sid()?;
@@ -183,7 +224,11 @@ pub fn verify_client(server: &NamedPipeServer) -> io::Result<()> {
     verify_sid(pid)
 }
 fn verify_sid(pid: u32) -> io::Result<()> {
-    if process_sid(pid)? == current_sid()? {
+    verify_process_sid(&open_process(pid)?)
+}
+
+fn verify_process_sid(process: &OwnedHandle) -> io::Result<()> {
+    if process_handle_sid(process)? == current_sid()? {
         Ok(())
     } else {
         Err(io::Error::new(

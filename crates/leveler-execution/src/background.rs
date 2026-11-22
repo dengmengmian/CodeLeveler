@@ -75,6 +75,8 @@ const GROUP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// the workload has been killed. A zombie that nobody reaps cannot mutate, so
 /// it must not hold the durable terminal fact forever.
 const GROUP_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A failed inventory observation cannot authorize retirement.
+const UPDATE_BLOCKER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the reaper lets the output pumps flush after the process group is
 /// confirmed gone, before it finishes the task anyway. Bounded on purpose: an
@@ -95,10 +97,9 @@ pub enum BackgroundTaskStatus {
 
 /// How long the runtime retains ownership of a background process.
 ///
-/// Every lifetime retains its creating session. Goal is local, turn-scoped
-/// work. Runtime, Session and Persistent run in the independent execution
-/// substrate, so a dev server or watcher outlives the runtime generation that
-/// launched it.
+/// Every lifetime retains its creating session. Goal work belongs to the
+/// admitting runtime even when supervised by the Execution Host. Runtime,
+/// Session and Persistent services can outlive the generation that launched them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackgroundTaskLifetime {
     /// Default: stop the process when the creating goal reaches a terminal state.
@@ -528,6 +529,9 @@ pub struct BackgroundTaskRegistry {
     supervisor_unavailable: Arc<std::sync::atomic::AtomicBool>,
     retain_process_facts: bool,
     hosted_monitors: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Goal spawn requests issued by this registry without a definitive reply.
+    /// A durable active intent for one of these IDs is work this boot still owes.
+    uncertain_goal_spawns: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The runtime generation this registry belongs to. Startup reconciliation
     /// uses it to prove whether the generation that admitted a hosted goal
     /// task still exists. Unbound (tests, standalone helpers) disables
@@ -680,6 +684,9 @@ impl BackgroundTaskRegistry {
             supervisor_unavailable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retain_process_facts: false,
             hosted_monitors: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            uncertain_goal_spawns: Arc::new(
+                std::sync::Mutex::new(std::collections::HashSet::new()),
+            ),
             runtime_boot: Arc::new(std::sync::Mutex::new(None)),
             runner: CommandRunner::with_environment(environment).without_parent_death_signal(),
             lifecycle_events,
@@ -1192,11 +1199,53 @@ impl BackgroundTaskRegistry {
             .collect())
     }
 
-    /// Only locally owned, nonrecoverable tasks prevent runtime replacement.
+    /// Work that graceful Quit would end must finish before retirement.
     pub async fn try_update_blockers(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
-        // Validate remote owner availability too: incompatibility is never idle success.
-        self.try_active_snapshots().await?;
-        Ok(self.active_snapshots().await)
+        tokio::time::timeout(UPDATE_BLOCKER_TIMEOUT, self.observe_update_blockers())
+            .await
+            .map_err(|_| "timed out observing retirement background work".to_string())?
+    }
+
+    async fn observe_update_blockers(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        let mut blockers = Vec::new();
+        if let Some(config) = &self.execution_host {
+            // Keep observation independent from settlement and acknowledgement.
+            // A failed RPC leaves the idle decision unknown.
+            let probe = crate::execution_host::ExecutionHostClient::probe(config).await?;
+            if let Some(client) = probe.client {
+                let current_boot = self.owner_boot_wire();
+                blockers.extend(
+                    client
+                        .list()
+                        .await?
+                        .into_iter()
+                        .filter(|task| Self::quit_owns_hosted_task(task, current_boot.as_deref()))
+                        .map(|task| task.snapshot),
+                );
+            }
+            let mut uncertain = self.uncertain_goal_spawns.lock().unwrap();
+            if !uncertain.is_empty() {
+                let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
+                uncertain.retain(|id| records.has_active_intent(id));
+                if !uncertain.is_empty() {
+                    return Err("a Goal spawn from this runtime still has an active intent".into());
+                }
+            }
+        }
+        blockers.extend(self.active_snapshots().await);
+        Ok(blockers)
+    }
+
+    fn quit_owns_hosted_task(
+        task: &crate::execution_host::HostedTask,
+        current_boot: Option<&str>,
+    ) -> bool {
+        task.lifetime == BackgroundTaskLifetime::Goal
+            && task.snapshot.status.is_active()
+            && match (current_boot, task.owner_boot.as_deref()) {
+                (Some(current), Some(owner)) => owner == current,
+                _ => true,
+            }
     }
 
     pub async fn kill_session(&self, owner: &str) -> Result<(), String> {
@@ -1463,7 +1512,12 @@ impl BackgroundTaskRegistry {
                 self.journal()?.abandon_prepared(&id)?;
                 return Err(error);
             }
-            Err(crate::execution_host::SpawnError::OutcomeUnknown(error)) => return Err(error),
+            Err(crate::execution_host::SpawnError::OutcomeUnknown(error)) => {
+                if lifetime == BackgroundTaskLifetime::Goal {
+                    self.uncertain_goal_spawns.lock().unwrap().insert(id);
+                }
+                return Err(error);
+            }
         };
         let _ = self.lifecycle_events.send(BackgroundTaskEvent::Started {
             owner_scope: Some(owner.into()),
@@ -3224,14 +3278,7 @@ impl BackgroundTaskRegistry {
             ids.extend(
                 tasks
                     .into_iter()
-                    .filter(|task| {
-                        task.lifetime == BackgroundTaskLifetime::Goal
-                            && task.snapshot.status.is_active()
-                            && match (current_boot.as_deref(), task.owner_boot.as_deref()) {
-                                (Some(current), Some(owner)) => owner == current,
-                                _ => true,
-                            }
-                    })
+                    .filter(|task| Self::quit_owns_hosted_task(task, current_boot.as_deref()))
                     .map(|task| task.snapshot.id),
             );
         }
@@ -5481,6 +5528,7 @@ mod tests {
             records.task(&owned).unwrap().owner_loss.is_none(),
             "the live generation's task must stay attributed to it"
         );
+        let retirement_blockers = current.try_update_blockers().await.unwrap();
 
         current.kill_all().await;
 
@@ -5503,7 +5551,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!process_alive(orphan_pid), "explicit cleanup must reap it");
+        let intent_id = "host-00112233445566778899aabbccddeeff";
+        let active_intents = config.state_dir.join("intents.json");
+        std::fs::write(
+            &active_intents,
+            serde_json::to_vec(&serde_json::json!([{
+                "id": intent_id, "owner": "session-1", "program": "sh", "args": [],
+                "cwd": repo, "started_at_ms": 0
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign_intent = current.try_update_blockers().await;
+        current
+            .uncertain_goal_spawns
+            .lock()
+            .unwrap()
+            .insert(intent_id.into());
+        let attributable_intent = current.try_update_blockers().await;
+        std::fs::remove_file(active_intents).unwrap();
+        let resolved_intent = current.try_update_blockers().await;
         server.abort();
+        assert_eq!(
+            retirement_blockers
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![owned.as_str()],
+            "retirement must wait for the hosted work ownership would let Quit kill"
+        );
+        assert!(
+            foreign_intent.is_ok(),
+            "unknown attribution cannot name work of this boot"
+        );
+        assert!(
+            attributable_intent.is_err(),
+            "an active intent prevents a claim of quiescence"
+        );
+        assert!(resolved_intent.is_ok(), "no still-active intent remains");
     }
 
     /// R004 F7 / T7: kill_all reaps everything for daemon shutdown paths.

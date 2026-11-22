@@ -75,7 +75,13 @@ pub enum ClientKind {
 /// dropped connection decrements even when the client vanished without saying
 /// goodbye.
 #[derive(Debug, Clone, Default)]
-pub struct LocalWaiters(Arc<std::sync::atomic::AtomicUsize>);
+pub struct LocalWaiters(Arc<std::sync::Mutex<LocalPresence>>);
+
+#[derive(Debug, Default)]
+struct LocalPresence {
+    count: usize,
+    epoch: u64,
+}
 
 impl LocalWaiters {
     pub fn new() -> Self {
@@ -83,23 +89,48 @@ impl LocalWaiters {
     }
 
     pub fn count(&self) -> usize {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.0.lock().unwrap().count
+    }
+
+    /// A brief attachment invalidates a previously observed empty interval.
+    pub fn idle_epoch(&self) -> Option<u64> {
+        let presence = self.0.lock().unwrap();
+        (presence.count == 0).then_some(presence.epoch)
+    }
+
+    /// Run the synchronous shutdown commit while no local client can attach.
+    pub fn with_idle_epoch<T>(&self, epoch: u64, commit: impl FnOnce() -> T) -> Option<T> {
+        let presence = self.0.lock().unwrap();
+        (presence.count == 0 && presence.epoch == epoch).then(commit)
     }
 
     /// Count one attached local UI until the returned guard drops.
     pub fn attach(&self) -> LocalWaiterGuard {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut presence = self.0.lock().unwrap();
+        presence.count += 1;
+        presence.epoch = presence.epoch.wrapping_add(1);
         LocalWaiterGuard(self.0.clone())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn attach_while_serving(&self, shutdown: &CancellationToken) -> Option<LocalWaiterGuard> {
+        let mut presence = self.0.lock().unwrap();
+        if shutdown.is_cancelled() {
+            return None;
+        }
+        presence.count += 1;
+        presence.epoch = presence.epoch.wrapping_add(1);
+        Some(LocalWaiterGuard(self.0.clone()))
     }
 }
 
 /// Decrements its [`LocalWaiters`] on drop.
 #[derive(Debug)]
-pub struct LocalWaiterGuard(Arc<std::sync::atomic::AtomicUsize>);
+pub struct LocalWaiterGuard(Arc<std::sync::Mutex<LocalPresence>>);
 
 impl Drop for LocalWaiterGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.lock().unwrap().count -= 1;
     }
 }
 
@@ -679,6 +710,7 @@ mod transport {
     use tokio_util::either::Either;
 
     use super::*;
+    use leveler_client_protocol::{RestartReason, RetireDecision, RetireRequest, RuntimeInfo};
     #[cfg(windows)]
     mod windows_adapter {
         include!("windows.rs");
@@ -686,7 +718,7 @@ mod transport {
     #[cfg(windows)]
     pub use windows_adapter::LocalSocketServer;
     #[cfg(windows)]
-    use windows_adapter::connect_windows;
+    use windows_adapter::{connect_windows, open_windows_pipe};
 
     /// The access token beside a Unix socket. `repo.sock` → `repo.token`.
     #[cfg(unix)]
@@ -776,18 +808,33 @@ mod transport {
         path: &Path,
         timeout: Duration,
     ) -> Option<leveler_client_protocol::RuntimeInfo> {
+        match legacy_read(path, timeout, WireRequest::RuntimeInfo).await? {
+            WireResponse::RuntimeInfo(info) => Some(info),
+            _ => None,
+        }
+    }
+
+    /// Read legacy presence without subscribing or changing the count.
+    #[cfg(unix)]
+    pub async fn legacy_local_waiter_count(path: &Path, timeout: Duration) -> Option<usize> {
+        match legacy_read(path, timeout, WireRequest::LocalWaiters).await? {
+            WireResponse::LocalWaiters(count) => Some(count),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn legacy_read(
+        path: &Path,
+        timeout: Duration,
+        request: WireRequest,
+    ) -> Option<WireResponse> {
         let observe = async {
             let mut stream = UnixStream::connect(path).await.ok()?;
-            write_frame(
-                &mut stream,
-                &ProtocolEnvelope::wrap(WireRequest::RuntimeInfo),
-            )
-            .await
-            .ok()?;
-            match read_response_frame(&mut stream).await.ok()? {
-                WireResponse::RuntimeInfo(info) => Some(info),
-                _ => None,
-            }
+            write_frame(&mut stream, &ProtocolEnvelope::wrap(request))
+                .await
+                .ok()?;
+            read_response_frame(&mut stream).await.ok()
         };
         tokio::time::timeout(timeout, observe).await.ok().flatten()
     }
@@ -946,7 +993,14 @@ mod transport {
         stream: &mut S,
         response: WireResponse,
     ) -> Result<(), TransportError> {
-        write_frame(stream, &ProtocolEnvelope::wrap(response)).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            write_frame(stream, &ProtocolEnvelope::wrap(response)),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "response write timed out")
+        })?
     }
 
     async fn send_result<S: AsyncWrite + Unpin>(
@@ -969,7 +1023,11 @@ mod transport {
         // trusted to grant AutoApprove, whatever `ClientKind` it declares.
         transport_trusted: bool,
     ) -> Result<(), TransportError> {
-        let envelope = read_frame::<WireRequest>(&mut stream).await?;
+        let envelope = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            envelope = read_frame::<WireRequest>(&mut stream) => envelope?,
+        };
         let understands_optional_workspace = envelope
             .capabilities
             .contains(&leveler_client_protocol::ProtocolCapability::OptionalWorkspace);
@@ -1259,15 +1317,18 @@ mod transport {
                 session_id,
                 client_kind,
             } => {
-                send_response(&mut stream, WireResponse::Ack).await?;
                 // Held for exactly as long as this subscription is served, so
                 // a client that dies without closing still decrements.
                 let _waiter = match client_kind {
                     ClientKind::LocalInteractive if transport_trusted => {
-                        Some(local_waiters.attach())
+                        let Some(waiter) = local_waiters.attach_while_serving(&shutdown) else {
+                            return Ok(());
+                        };
+                        Some(waiter)
                     }
                     _ => None,
                 };
+                send_response(&mut stream, WireResponse::Ack).await?;
                 let mut events = match session_id {
                     Some(session_id) => runtime.subscribe_session(&session_id),
                     None => runtime.subscribe(),
@@ -1290,7 +1351,11 @@ mod transport {
                                 if !transport_trusted || client_kind == ClientKind::Remote => continue,
                             Ok(event) => {
                                 if let Some(event) = event_for_tool_timing_peer(event, understands_tool_timing) {
-                                    send_response(&mut writer, WireResponse::Event(event)).await?;
+                                    tokio::select! {
+                                        _ = shutdown.cancelled() => return Ok(()),
+                                        _ = reader.read_u8() => return Ok(()),
+                                        result = send_response(&mut writer, WireResponse::Event(event)) => result?,
+                                    }
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1463,22 +1528,39 @@ mod transport {
             self.local_waiters.clone()
         }
 
-        pub async fn serve(self, shutdown: CancellationToken) -> Result<(), TransportError> {
+        pub async fn serve(mut self, shutdown: CancellationToken) -> Result<(), TransportError> {
+            self.serve_until_shutdown(shutdown).await
+        }
+
+        /// Stop accepting and drain dispatched requests while retaining endpoint ownership.
+        pub async fn serve_until_shutdown(
+            &mut self,
+            shutdown: CancellationToken,
+        ) -> Result<(), TransportError> {
             let child_shutdown = shutdown.child_token();
             let mut tasks = tokio::task::JoinSet::new();
             let mut reap = connection_reaper();
-            loop {
+            let result = loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
+                    biased;
+                    _ = shutdown.cancelled() => break Ok(()),
                     _ = reap.tick() => reap_finished_connections(&mut tasks),
                     accepted = self.listener.accept() => {
-                        let (mut stream, _) = accepted?;
+                        let (mut stream, _) = match accepted {
+                            Ok(peer) => peer,
+                            Err(error) => break Err(error.into()),
+                        };
                         let runtime = self.runtime.clone();
                         let connection_shutdown = child_shutdown.clone();
                         let waiters = self.local_waiters.clone();
                         let token = self.access_token.clone();
                         tasks.spawn(async move {
-                            match authenticate_local_peer(&mut stream, &token).await {
+                            let authentication = tokio::select! {
+                                biased;
+                                _ = connection_shutdown.cancelled() => return,
+                                result = authenticate_local_peer(&mut stream, &token) => result,
+                            };
+                            match authentication {
                                 Ok(()) => {
                                     // The per-repo Unix socket is the
                                     // trusted-local transport only after the
@@ -1511,10 +1593,10 @@ mod transport {
                         crate::transport::reap_finished_connections(&mut tasks);
                     }
                 }
-            }
+            };
             child_shutdown.cancel();
             while tasks.join_next().await.is_some() {}
-            Ok(())
+            result
         }
     }
 
@@ -1533,7 +1615,128 @@ mod transport {
         reviver: Arc<std::sync::OnceLock<Arc<dyn RuntimeReviver>>>,
     }
 
+    /// An authenticated runtime observation for a subsequent retirement decision.
+    /// The platform evidence is private and never included in diagnostics.
+    pub struct RetirementTarget {
+        info: RuntimeInfo,
+        path: PathBuf,
+        #[cfg(unix)]
+        token: String,
+        #[cfg(windows)]
+        server: leveler_win_local_ipc::VerifiedServerProcess,
+    }
+
+    impl RetirementTarget {
+        pub fn info(&self) -> &RuntimeInfo {
+            &self.info
+        }
+    }
+
     impl LocalSocketRuntimeClient {
+        fn local_retirement_path(&self) -> Result<&Path, ClientError> {
+            match &self.endpoint {
+                #[cfg(unix)]
+                Endpoint::Unix(path) => Ok(path),
+                #[cfg(windows)]
+                Endpoint::Windows(path) => Ok(path),
+                Endpoint::Tcp { .. } => Err(ClientError::Runtime(
+                    "a retirement target requires local IPC".into(),
+                )),
+            }
+        }
+
+        pub async fn observe_retirement_target(&self) -> Result<RetirementTarget, ClientError> {
+            let path = self.local_retirement_path()?;
+            bounded_retirement_rpc("runtime_info", async {
+                #[cfg(unix)]
+                let token = read_access_token(path).map_err(transport_client_error)?;
+                #[cfg(unix)]
+                let mut stream = connect_unix_with_token(path, &token)
+                    .await
+                    .map_err(transport_client_error)?;
+                #[cfg(windows)]
+                let mut stream = open_windows_pipe(path).await.map_err(transport_client_error)?;
+                #[cfg(windows)]
+                let server = leveler_win_local_ipc::verified_server_process(&stream)
+                    .map_err(|error| transport_client_error(error.into()))?;
+                let info = match exchange_request(&mut stream, WireRequest::RuntimeInfo)
+                    .await
+                    .map_err(transport_client_error)?
+                {
+                    WireResponse::RuntimeInfo(info) => info,
+                    WireResponse::Error(error) => return Err(error.into_client_error()),
+                    response => return Err(unexpected_response(response)),
+                };
+                #[cfg(windows)]
+                if info.pid != server.pid() {
+                    return Err(ClientError::Runtime(
+                        "the runtime PID does not match the verified named-pipe process".into(),
+                    ));
+                }
+                Ok(RetirementTarget {
+                    info,
+                    path: path.to_path_buf(),
+                    #[cfg(unix)]
+                    token,
+                    #[cfg(windows)]
+                    server,
+                })
+            })
+            .await
+        }
+
+        /// Send an atomic retirement question only to the observed process.
+        pub async fn try_retire_observed(
+            &self,
+            target: &RetirementTarget,
+            reason: RestartReason,
+        ) -> Result<RetireDecision, ClientError> {
+            let path = self.local_retirement_path()?;
+            if path != target.path {
+                return Ok(RetireDecision::GenerationChanged);
+            }
+            bounded_retirement_rpc("try_retire_if_idle", async {
+                #[cfg(unix)]
+                let mut stream = {
+                    let token = read_access_token(path);
+                    if matches!(token, Ok(ref value) if !tokens_match(value, &target.token))
+                        || matches!(token, Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return Ok(RetireDecision::GenerationChanged);
+                    }
+                    token.map_err(transport_client_error)?;
+                    match connect_unix_with_token(path, &target.token).await {
+                        Ok(stream) => stream,
+                        Err(_) if read_access_token(path)
+                            .is_ok_and(|token| !tokens_match(&token, &target.token)) =>
+                        {
+                            return Ok(RetireDecision::GenerationChanged);
+                        }
+                        Err(error) => return Err(transport_client_error(error)),
+                    }
+                };
+                #[cfg(windows)]
+                let mut stream = {
+                    let stream = open_windows_pipe(path).await.map_err(transport_client_error)?;
+                    let same_server = target.server.verify_same_server(&stream)
+                        .map_err(|error| transport_client_error(error.into()))?;
+                    if !same_server {
+                        return Ok(RetireDecision::GenerationChanged);
+                    }
+                    stream
+                };
+                let request = RetireRequest {
+                    reason,
+                    expected_build: target.info.build.clone(),
+                    expected_pid: target.info.pid,
+                };
+                decode_retirement_response(
+                    exchange_request(&mut stream, WireRequest::TryRetireIfIdle { request }).await,
+                )
+            })
+            .await
+        }
+
         pub async fn connect(path: impl AsRef<Path>) -> Result<Self, TransportError> {
             Self::connect_as(path, ClientKind::LocalInteractive).await
         }
@@ -1856,26 +2059,9 @@ mod transport {
             // (a second attempt could close admission on a premise the first
             // attempt already invalidated), so the raw transport error is both
             // safe and more informative here.
-            match request_endpoint(&self.endpoint, WireRequest::TryRetireIfIdle { request }).await {
-                Ok(WireResponse::RetireDecision(decision)) => Ok(decision),
-                Ok(WireResponse::Error(error)) => Err(error.into_client_error()),
-                Ok(response) => Err(unexpected_response(response)),
-                // A runtime that cannot DECODE the request answers nothing at
-                // all: an older build reads the envelope, fails on the unknown
-                // request tag, and drops the connection. That is the "no atomic
-                // retirement" fact, expressed as the value that says so, so
-                // callers have one branch instead of two. A reply that decoded
-                // as garbage is the same statement by other means.
-                Err(TransportError::PeerClosed)
-                | Err(TransportError::Json(_))
-                | Err(TransportError::Protocol(_)) => {
-                    Ok(leveler_client_protocol::RetireDecision::Unsupported)
-                }
-                // A timeout, a refused connection, a permission failure and a
-                // truncated reply all keep their own meaning: none of them is a
-                // statement about what the peer can understand.
-                Err(error) => Err(transport_client_error(error)),
-            }
+            decode_retirement_response(
+                request_endpoint(&self.endpoint, WireRequest::TryRetireIfIdle { request }).await,
+            )
         }
 
         async fn fetch_attachment(&self, sha256: &str) -> Result<AttachmentBytes, ClientError> {
@@ -2067,25 +2253,26 @@ mod transport {
     #[cfg(windows)]
     type ClientStream = Either<NamedPipeClient, TcpStream>;
 
+    #[cfg(unix)]
+    async fn connect_unix_with_token(path: &Path, token: &str) -> Result<UnixStream, TransportError> {
+        let mut stream = UnixStream::connect(path).await?;
+        write_frame(&mut stream, &ProtocolEnvelope::wrap(Handshake { token: token.to_owned() })).await?;
+        // A peer that closes without answering is a protocol fact, not a
+        // truncated reply. Keep it distinct for legacy discovery.
+        match read_response_frame(&mut stream).await? {
+            WireResponse::Ack => Ok(stream),
+            WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
+            other => Err(TransportError::Unavailable(format!(
+                "unexpected local handshake response: {other:?}"
+            ))),
+        }
+    }
+
     /// Open (and authenticate) one connection to the endpoint.
     async fn connect_endpoint(endpoint: &Endpoint) -> Result<ClientStream, TransportError> {
         match endpoint {
             #[cfg(unix)]
-            Endpoint::Unix(path) => {
-                let token = read_access_token(path)?;
-                let mut stream = UnixStream::connect(path).await?;
-                write_frame(&mut stream, &ProtocolEnvelope::wrap(Handshake { token })).await?;
-                // A peer that closes without answering is a protocol fact, not
-                // a truncated reply: the dedicated EOF shape lets a probe tell
-                // "does not speak the handshake" from "connection broke".
-                match read_response_frame(&mut stream).await? {
-                    WireResponse::Ack => Ok(Either::Left(stream)),
-                    WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
-                    other => Err(TransportError::Unavailable(format!(
-                        "unexpected local handshake response: {other:?}"
-                    ))),
-                }
-            }
+            Endpoint::Unix(path) => Ok(Either::Left(connect_unix_with_token(path, &read_access_token(path)?).await?)),
             #[cfg(windows)]
             Endpoint::Windows(path) => Ok(Either::Left(connect_windows(path).await?)),
             Endpoint::Tcp { addr, token } => {
@@ -2178,8 +2365,45 @@ mod transport {
         request: WireRequest,
     ) -> Result<WireResponse, TransportError> {
         let mut stream = connect_endpoint(endpoint).await?;
-        write_frame(&mut stream, &ProtocolEnvelope::wrap(request)).await?;
-        read_response_frame(&mut stream).await
+        exchange_request(&mut stream, request).await
+    }
+
+    async fn exchange_request<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        request: WireRequest,
+    ) -> Result<WireResponse, TransportError> {
+        write_frame(stream, &ProtocolEnvelope::wrap(request)).await?;
+        read_response_frame(stream).await
+    }
+
+    async fn bounded_retirement_rpc<T>(
+        operation: &'static str,
+        rpc: impl Future<Output = Result<T, ClientError>>,
+    ) -> Result<T, ClientError> {
+        let Some(timeout) = request_timeout() else {
+            return rpc.await;
+        };
+        tokio::time::timeout(timeout, rpc).await.map_err(|_| {
+            transport_client_error(TransportError::NoAnswer {
+                operation,
+                timeout_ms: timeout.as_millis() as u64,
+            })
+        })?
+    }
+
+    fn decode_retirement_response(
+        response: Result<WireResponse, TransportError>,
+    ) -> Result<RetireDecision, ClientError> {
+        match response {
+            Ok(WireResponse::RetireDecision(decision)) => Ok(decision),
+            Ok(WireResponse::Error(error)) => Err(error.into_client_error()),
+            Ok(response) => Err(unexpected_response(response)),
+            // A peer unable to decode the request can close without a reply.
+            Err(TransportError::PeerClosed | TransportError::Json(_) | TransportError::Protocol(_)) => {
+                Ok(RetireDecision::Unsupported)
+            }
+            Err(error) => Err(transport_client_error(error)),
+        }
     }
 
     /// Read one response frame, preserving the difference between "the peer
@@ -2584,7 +2808,11 @@ mod transport {
         shutdown: CancellationToken,
         local_waiters: LocalWaiters,
     ) -> Result<(), TransportError> {
-        let presented = read_frame::<Handshake>(&mut stream).await?.into_body()?;
+        let presented = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            frame = read_frame::<Handshake>(&mut stream) => frame?.into_body()?,
+        };
         if !constant_time_eq(presented.token.as_bytes(), token.as_bytes()) {
             send_response(
                 &mut stream,
@@ -2671,12 +2899,16 @@ mod transport {
             let child_shutdown = shutdown.child_token();
             let mut tasks = tokio::task::JoinSet::new();
             let mut reap = connection_reaper();
-            loop {
+            let result = loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
+                    biased;
+                    _ = shutdown.cancelled() => break Ok(()),
                     _ = reap.tick() => reap_finished_connections(&mut tasks),
                     accepted = self.listener.accept() => {
-                        let (stream, _peer) = accepted?;
+                        let (stream, _peer) = match accepted {
+                            Ok(peer) => peer,
+                            Err(error) => break Err(error.into()),
+                        };
                         // Loopback only: never serve a non-loopback peer even if
                         // the OS routed one here (defence in depth vs a misbind).
                         if !stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false) {
@@ -2703,10 +2935,10 @@ mod transport {
                         crate::transport::reap_finished_connections(&mut tasks);
                     }
                 }
-            }
+            };
             child_shutdown.cancel();
             while tasks.join_next().await.is_some() {}
-            Ok(())
+            result
         }
     }
 
@@ -2749,12 +2981,12 @@ mod transport {
 
 #[cfg(unix)]
 pub use transport::access_token_is_published;
-#[cfg(unix)]
-pub use transport::legacy_runtime_info;
 #[cfg(all(any(unix, windows), test))]
 pub(crate) use transport::tcp_request;
 #[cfg(any(unix, windows))]
-pub use transport::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
+pub use transport::{LocalSocketRuntimeClient, LocalSocketServer, RetirementTarget, TcpRuntimeServer};
+#[cfg(unix)]
+pub use transport::{legacy_local_waiter_count, legacy_runtime_info};
 
 #[cfg(not(any(unix, windows)))]
 mod unsupported {
@@ -2789,6 +3021,15 @@ mod unsupported {
         pub async fn serve(self, _shutdown: CancellationToken) -> Result<(), TransportError> {
             Err(TransportError::Unavailable(
                 "Unix sockets are not supported on this platform".to_string(),
+            ))
+        }
+
+        pub async fn serve_until_shutdown(
+            &mut self,
+            _shutdown: CancellationToken,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Unavailable(
+                "local runtime endpoints are not supported on this platform".to_string(),
             ))
         }
     }
@@ -3023,6 +3264,53 @@ mod tests {
             std::fs::symlink_metadata(&path).is_err(),
             "the endpoint became connectable before its credential was installed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connected_peer_awaiting_its_request_does_not_block_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let server = LocalSocketServer::bind(&path, Arc::new(TestRuntime::new()))
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+        // The handshake acknowledgement proves this peer has been accepted.
+        // Keep its socket open while the daemon waits for the request frame.
+        let _peer = connect_authenticated(&path).await;
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("a peer that sent no request cannot hold the endpoint open")
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+        LocalSocketServer::bind(&path, Arc::new(TestRuntime::new()))
+            .await
+            .expect("the previous server released its lock");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn draining_the_listener_can_retain_the_runtime_ownership_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let mut owner = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        owner.serve_until_shutdown(shutdown).await.unwrap();
+        assert!(matches!(
+            LocalSocketServer::bind(&path, runtime.clone()).await,
+            Err(TransportError::AlreadyRunning(_))
+        ));
+        drop(owner);
+        LocalSocketServer::bind(&path, runtime)
+            .await
+            .expect("the endpoint can be reacquired after cleanup");
     }
 
     #[cfg(unix)]
@@ -3325,6 +3613,7 @@ mod tests {
                 build: leveler_client_protocol::BuildIdentity::default(),
                 config_fingerprint: None,
                 pid: std::process::id(),
+                idle_eviction: None,
                 health: leveler_client_protocol::RuntimeHealth {
                     accepting_work: true,
                     active_turns: 0,
@@ -4419,6 +4708,7 @@ mod tests {
                 build: self.build.lock().unwrap().clone(),
                 config_fingerprint: None,
                 pid: self.pid.load(std::sync::atomic::Ordering::SeqCst),
+                idle_eviction: None,
                 health: leveler_client_protocol::RuntimeHealth {
                     accepting_work: true,
                     active_turns: 0,

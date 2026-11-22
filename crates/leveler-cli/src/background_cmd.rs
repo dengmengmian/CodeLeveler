@@ -472,6 +472,7 @@ mod tests {
                 build: leveler_core::BuildIdentity::current(),
                 config_fingerprint: None,
                 pid: std::process::id(),
+                idle_eviction: None,
                 health: RuntimeHealth {
                     active_background_tasks: 1,
                     blockers: vec![UiBackgroundTaskBlocker {

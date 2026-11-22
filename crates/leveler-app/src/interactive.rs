@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+mod idle_eviction;
 pub(crate) mod review;
 mod review_memory;
 mod review_prefetch;
@@ -588,17 +589,17 @@ type BtwThreads = Arc<Mutex<HashMap<SessionId, BtwSession>>>;
 ///
 /// The retire drain and `runtime_info` both build it from [`runtime_quiescence`],
 /// so "the runtime is idle" means exactly one thing: no main turn and no
-/// runtime-owned background task left. Independently hosted services are not
-/// retiring runtime work; their owner stays alive through an engine update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RuntimeQuiescence {
-    pub(crate) active_turns: u32,
-    pub(crate) active_background_tasks: u32,
+/// runtime-owned background task left. Goal work belongs to this generation
+/// even when supervised by a host. Independently owned services stay alive.
+struct RuntimeQuiescence {
+    active_turns: u32,
+    turn_capacity: u32,
+    background_tasks: Vec<leveler_execution::BackgroundTaskSnapshot>,
 }
 
 impl RuntimeQuiescence {
-    pub(crate) fn quiescent(self) -> bool {
-        self.active_turns == 0 && self.active_background_tasks == 0
+    fn quiescent(&self) -> bool {
+        self.active_turns == 0 && self.background_tasks.is_empty()
     }
 }
 
@@ -610,14 +611,15 @@ async fn runtime_quiescence(
     active: &ActiveTurns,
     background: &leveler_execution::BackgroundTaskRegistry,
 ) -> Result<RuntimeQuiescence, ClientError> {
-    let (turns, _) = active.load();
+    let background_tasks = background
+        .try_update_blockers()
+        .await
+        .map_err(ClientError::Runtime)?;
+    let (turns, capacity) = active.load();
     Ok(RuntimeQuiescence {
         active_turns: turns as u32,
-        active_background_tasks: background
-            .try_update_blockers()
-            .await
-            .map_err(ClientError::Runtime)?
-            .len() as u32,
+        turn_capacity: capacity as u32,
+        background_tasks,
     })
 }
 
@@ -732,6 +734,7 @@ pub struct InProcessRuntimeClient {
     /// dropped client decrements it even after an abrupt disconnect. `None`
     /// for an in-process runtime, which has no transport to count.
     client_presence: Option<leveler_local_transport::LocalWaiters>,
+    idle_eviction: idle_eviction::IdleEviction,
     /// Commands this boot is handling. A command enters before its receipt is
     /// written and leaves only once the receipt is settled — or once the path
     /// handling it has ended without settling it — so a `dispatching` receipt
@@ -1849,38 +1852,48 @@ impl InProcessRuntimeClient {
         let Some(clients) = self.client_presence.clone() else {
             return;
         };
-        let active = self.active.clone();
-        let background = self.app.background_tasks().clone();
-        let shutting_down = self.shutting_down.clone();
-        tokio::spawn(async move {
-            // Probe often enough that the timeout is honoured closely, without
-            // a busy loop when the timeout is long.
-            let poll = (idle_timeout / 5).max(std::time::Duration::from_millis(20));
-            let mut idle_since = tokio::time::Instant::now();
-            loop {
-                // Retiring/Quit own the shutdown; never race them.
-                if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                let quiescence = runtime_quiescence(&active, &background).await;
-                if let Err(error) = &quiescence {
-                    tracing::error!(%error, "cannot observe idle runtime blockers");
-                }
-                if quiescence.is_ok_and(RuntimeQuiescence::quiescent) && clients.count() == 0 {
-                    if idle_since.elapsed() >= idle_timeout {
-                        tracing::info!(
-                            idle_secs = idle_timeout.as_secs(),
-                            "no clients and no work; retiring the idle runtime"
-                        );
-                        token.cancel();
-                        return;
-                    }
-                } else {
-                    idle_since = tokio::time::Instant::now();
-                }
-                tokio::time::sleep(poll).await;
+        self.idle_eviction.spawn(
+            token,
+            clients,
+            self.active.clone(),
+            self.app.background_tasks().clone(),
+            idle_timeout,
+        );
+    }
+
+    /// Complete a daemon retirement after the transport has drained accepted requests.
+    pub async fn finish_daemon_retirement(&self) -> Result<(), ClientError> {
+        self.finish_shutdown(false).await
+    }
+
+    async fn finish_shutdown(&self, cancel_owned_work: bool) -> Result<(), ClientError> {
+        if cancel_owned_work {
+            self.active.cancel_all();
+        }
+        // Only reconcile this boot. Other owners may still use the repository.
+        let reap = self
+            .reap_running_turns(None, leveler_engine::ReapScope::OwnBoot)
+            .await;
+        if cancel_owned_work {
+            let killed = self.app.background_tasks().kill_all().await;
+            if killed > 0 {
+                tracing::info!("shutdown reaped {killed} background task(s)");
             }
-        });
+        }
+        let terminal = self
+            .app
+            .background_tasks()
+            .local_terminal_snapshots_for_scope(None, |_| true, usize::MAX)
+            .await;
+        for task in terminal {
+            if let Some(owner) = &task.owner_scope {
+                persist_background_task_finished(&self.app, SessionId::new(owner.clone()), &task)
+                    .await;
+            }
+        }
+        self.app.browser().shutdown().await;
+        self.app.memory().shutdown_workers().await;
+        reap.map(|_| ())
     }
 
     /// Whether this process currently holds a main-turn or context-op lease
@@ -2044,6 +2057,7 @@ impl InProcessRuntimeClient {
             retiring_reason: Arc::new(std::sync::Mutex::new(None)),
             process_shutdown: None,
             client_presence: None,
+            idle_eviction: idle_eviction::IdleEviction::default(),
             in_flight,
         }
     }
@@ -8967,43 +8981,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::Quit => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                self.active.cancel_all();
-                // Process is exiting: reaper is the safety net for turns that
-                // never got finish() because the OS killed the process mid-flight.
-                // Only this boot's own: a sibling process sharing the
-                // repository keeps running its turns.
-                self.reap_running_turns(None, leveler_engine::ReapScope::OwnBoot)
-                    .await?;
-                // Runtime-owned OS resources must not outlive the runtime:
-                // local (goal-scoped) background tasks and the browser tree are
-                // reaped explicitly — Drop never runs on exit paths that call
-                // `std::process::exit` or die to SIGTERM (R004 F7). Tasks owned
-                // by the persistent Execution Host are deliberately left
-                // running: they are the user's services, not this generation's.
-                let killed = self.app.background_tasks().kill_all().await;
-                if killed > 0 {
-                    tracing::info!("shutdown reaped {killed} background task(s)");
-                }
-                let terminal = self
-                    .app
-                    .background_tasks()
-                    .local_terminal_snapshots_for_scope(None, |_| true, usize::MAX)
-                    .await;
-                for task in terminal {
-                    if let Some(owner) = &task.owner_scope {
-                        persist_background_task_finished(
-                            &self.app,
-                            SessionId::new(owner.clone()),
-                            &task,
-                        )
-                        .await;
-                    }
-                }
-                self.app.browser().shutdown().await;
-                // `process::exit` skips Drop, so this is the only chance for a
-                // capture or Dream worker to release the lease it still owns.
-                self.app.memory().shutdown_workers().await;
-                Ok(())
+                self.finish_shutdown(true).await
             }
         }
     }
@@ -10404,25 +10382,18 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             .app
             .runtime_id()
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        let (active, capacity) = self.active.load();
+        // Read the same blocker inventory once for both counts and details.
+        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await?;
         let shutting_down = self.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
         let retiring_reason = self
             .retiring_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .to_owned();
-        // The SAME reading the drain waits on: a client's view of "idle" is
-        // never a second accounting.
-        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await?;
-        // Name the tasks behind the count, from the same registry the drain
-        // waits on. Read-only: stopping one still goes through
-        // `CancelBackgroundTask`.
-        let blockers = self
-            .app
-            .background_tasks()
-            .try_update_blockers()
-            .await
-            .map_err(ClientError::Runtime)?
+        let quiescent = quiescence.quiescent();
+        let active_background_tasks = quiescence.background_tasks.len() as u32;
+        let blockers = quiescence
+            .background_tasks
             .into_iter()
             .map(|task| leveler_client_protocol::UiBackgroundTaskBlocker {
                 task_id: task.id,
@@ -10455,14 +10426,16 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             build: leveler_core::BuildIdentity::current(),
             config_fingerprint: Some(self.app.config_fingerprint().to_string()),
             pid: std::process::id(),
+            idle_eviction: self.idle_eviction.status(),
             health: leveler_client_protocol::RuntimeHealth {
                 // Health is admission state, never authority: task writes
                 // still require a current OwnershipToken regardless.
-                accepting_work: !shutting_down && active < capacity,
+                accepting_work: !shutting_down
+                    && quiescence.active_turns < quiescence.turn_capacity,
                 active_turns: quiescence.active_turns,
-                active_background_tasks: quiescence.active_background_tasks,
-                quiescent: quiescence.quiescent(),
-                turn_capacity: Some(capacity as u32),
+                active_background_tasks,
+                quiescent,
+                turn_capacity: Some(quiescence.turn_capacity),
                 shutting_down,
                 retiring_reason,
                 blockers,
@@ -10486,9 +10459,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
     ///    stays open and other clients keep working;
     /// 4. only an idle runtime commits, atomically with closing admission.
     ///
-    /// A task owned by the persistent Execution Host is deliberately NOT owed
-    /// work here: it outlives the generation that launched it, and the
-    /// replacement keeps it running.
+    /// Independently owned services keep running through retirement.
     async fn try_retire_if_idle(
         &self,
         request: leveler_client_protocol::RetireRequest,
@@ -10497,9 +10468,11 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
 
         // The generation proof comes first and changes nothing: a decision
         // about a runtime the caller never examined would be worthless.
-        let info = self.runtime_info().await?;
-        if (request.expected_pid != 0 && request.expected_pid != info.pid)
-            || !self_matches_generation(&request.expected_build, &info.build)
+        if (request.expected_pid != 0 && request.expected_pid != std::process::id())
+            || !self_matches_generation(
+                &request.expected_build,
+                &leveler_core::BuildIdentity::current(),
+            )
         {
             return Ok(RetireDecision::GenerationChanged);
         }
@@ -10512,30 +10485,21 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             return Ok(RetireDecision::AlreadyRetiring { reason });
         }
 
-        // Read the background accounting BEFORE committing. It is a separate
-        // owner from turn admission, so it cannot be folded into the same
-        // critical section; reading it first can only make the decision more
-        // conservative, never optimistically wrong.
-        let (active_turns, capacity) = self.active.load();
-        let background = self
-            .app
-            .background_tasks()
-            .try_update_blockers()
-            .await
-            .map_err(ClientError::Runtime)?
-            .len() as u32;
+        // Background launches can outlive the turn that starts them. A turn
+        // admitted across the inventory check invalidates its idle proof.
+        let idle_epoch = self.active.idle_epoch();
+        let work = runtime_quiescence(&self.active, self.app.background_tasks()).await?;
+        let background = work.background_tasks.len() as u32;
         if background > 0 {
             return Ok(RetireDecision::Busy {
-                active_turns: active_turns as u32,
+                active_turns: work.active_turns,
                 active_background_tasks: background,
             });
         }
-        let _ = capacity;
-
         // Commit: decide, close admission and record the reason. A caller that
         // then sees `Accepted` knows no new work can be admitted, and this
         // runtime exits once whatever it still holds finishes.
-        match self.active.retire_if_idle() {
+        match self.active.retire_if_idle(idle_epoch) {
             RetireAdmission::Accepted => {
                 *self
                     .retiring_reason

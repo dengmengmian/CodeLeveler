@@ -1194,13 +1194,14 @@ impl EvictionHarness {
 }
 
 async fn eviction_harness(base_url: &str, timeout: std::time::Duration) -> EvictionHarness {
+    isolate_global_config();
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), base_url);
-    let layout = Layout::from_parts(
-        tmp.path().to_path_buf(),
-        tmp.path().join("configs"),
-        tmp.path().join("state"),
-    );
+    // State sits beside the repository. An Execution Host refuses a state
+    // directory inside the workspace it is allowed to write.
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let layout = Layout::from_parts(repo, tmp.path().join("configs"), tmp.path().join("state"));
     let app = Arc::new(Application::assemble(layout).unwrap());
     let token = CancellationToken::new();
     let waiters = LocalWaiters::new();
@@ -1270,6 +1271,17 @@ async fn the_last_client_leaving_evicts_an_idle_runtime() {
     tokio::time::timeout(std::time::Duration::from_secs(5), h.token.cancelled())
         .await
         .expect("an idle runtime with no clients retires after its timeout");
+    let info = h.runtime.runtime_info().await.unwrap();
+    assert!(
+        !info.health.accepting_work,
+        "idle retirement must close work admission before requesting shutdown"
+    );
+    let eviction = info.idle_eviction.expect("daemon observes idle eviction");
+    assert_eq!(
+        eviction.state,
+        leveler_client_protocol::RuntimeIdleEvictionState::Retiring
+    );
+    assert!(eviction.idle_for_ms.unwrap() >= 250);
     let _ = h.serve.await;
 }
 
@@ -1353,6 +1365,57 @@ async fn a_background_task_blocks_idle_eviction() {
         .await
         .expect("once the background work settles, the idle daemon retires");
     let _ = h.serve.await;
+}
+
+#[tokio::test]
+async fn retirement_cleanup_preserves_a_late_hosted_goal_process() {
+    use leveler_execution::execution_host::{ExecutionHostClient, serve};
+    use std::time::Duration;
+
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let h = eviction_harness(&base_url, Duration::from_millis(250)).await;
+    tokio::time::timeout(Duration::from_secs(5), h.token.cancelled())
+        .await
+        .expect("the idle daemon commits retirement");
+    h.serve.await.unwrap().unwrap();
+
+    let config = leveler_app::execution_host_config(&h.app.layout).unwrap();
+    let host = tokio::spawn(serve(config.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ExecutionHostClient::connect(config.clone()).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the isolated execution host becomes reachable");
+    // Model a previously sent Goal spawn reaching the independent host after
+    // the retiring daemon's final inventory.
+    let registry = h.app.background_tasks();
+    let task = registry
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".into()],
+                h.app.layout.primary_workspace().unwrap().to_path_buf(),
+            ),
+            None,
+            Some("late-goal-session"),
+        )
+        .await
+        .expect("start the late Goal process");
+    let cleanup = h.runtime.finish_daemon_retirement().await;
+    let observed = registry.get_owned(&task, "late-goal-session").await;
+    registry
+        .kill_owned(&task, "late-goal-session")
+        .await
+        .unwrap();
+    host.abort();
+    cleanup.unwrap();
+    assert!(task.starts_with("host-"));
+    assert_eq!(
+        observed.unwrap().status,
+        leveler_execution::BackgroundTaskStatus::Running
+    );
 }
 
 #[tokio::test]

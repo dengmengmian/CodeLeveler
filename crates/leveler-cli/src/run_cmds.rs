@@ -538,7 +538,11 @@ fn spawn_handover_input() -> Option<tokio::sync::mpsc::UnboundedReceiver<Handove
 /// Render lifecycle observations in the current terminal language. The host
 /// owns the handoff state machine; this shell owns user-visible text and input.
 #[cfg(any(unix, windows))]
-struct TuiHandoffUi;
+#[derive(Default)]
+struct TuiHandoffUi {
+    startup: bool,
+    workspace: Option<String>,
+}
 
 #[cfg(any(unix, windows))]
 impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
@@ -712,16 +716,12 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
                     "The previous version exited and released the endpoint; starting the current version.",
                 )
             ),
-            HandoffEvent::MigrationFailed { reason } => eprintln!(
-                "{}\n  {reason}\n  {}",
-                lang.pick(
-                    "无法安全替换旧版本，已放弃自动升级（未终止任何进程）",
-                    "The previous version cannot be safely replaced; automatic upgrade abandoned (nothing was terminated)",
-                ),
-                lang.pick(
-                    "请手动退出旧版本 CodeLeveler 后重新启动；不会盲目终止进程。",
-                    "Exit the previous CodeLeveler version manually and start again; no process is terminated on a guess.",
-                ),
+            HandoffEvent::MigrationFailed { reason } => {
+                tracing::warn!(%reason, "runtime handoff could not be confirmed");
+            }
+            HandoffEvent::LegacyExitRequired { block, version, pid } => eprintln!(
+                "{}",
+                legacy_exit_message(lang, block, self.workspace.as_deref(), version.as_deref(), pid)
             ),
         }
     }
@@ -740,9 +740,74 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
         std::io::stdin().is_terminal()
     }
 
+    fn waits_for_legacy_exit(&self) -> bool {
+        self.startup && self.interactive()
+    }
+
     fn render_ensure_error(&self, error: &leveler_runtime_host::EnsureError) -> String {
         format_ensure_error(error)
     }
+}
+
+#[cfg(any(unix, windows))]
+fn legacy_exit_message(
+    lang: HandoffLang,
+    block: leveler_runtime_host::LegacyHandoffBlock,
+    workspace: Option<&str>,
+    version: Option<&str>,
+    pid: Option<u32>,
+) -> String {
+    use std::fmt::Write as _;
+
+    use leveler_runtime_host::LegacyHandoffBlock;
+    let mut message = lang
+        .pick(
+            "CodeLeveler 无法安全接管旧版 Runtime",
+            "CodeLeveler cannot safely take over the previous runtime",
+        )
+        .to_string();
+    if let Some(workspace) = workspace {
+        let workspace = leveler_core::sanitize_terminal_output(workspace).replace('\n', " ");
+        let _ = write!(
+            message,
+            "\n  {} {workspace}",
+            lang.pick("项目：", "Project:")
+        );
+    }
+    if let Some(version) = version {
+        let version = leveler_core::sanitize_terminal_output(version).replace('\n', " ");
+        let _ = write!(
+            message,
+            "\n  {} {version}",
+            lang.pick("旧版本：", "Previous version:")
+        );
+    }
+    if let Some(pid) = pid {
+        let _ = write!(message, "\n  {} {pid}", lang.pick("进程：", "PID:"));
+    }
+    let reason = match block {
+        LegacyHandoffBlock::AccessTokenUnavailable => lang.pick(
+            "无法完成安全交接所需的身份验证。",
+            "The previous runtime cannot authenticate a safe handover.",
+        ),
+        LegacyHandoffBlock::AtomicRetirementUnavailable => lang.pick(
+            "旧版 Runtime 无法确认安全交接。",
+            "The previous runtime could not confirm safe handover.",
+        ),
+    };
+    let _ = write!(
+        message,
+        "\n  {reason}\n\n  {}\n  {}",
+        lang.pick(
+            "旧实例仍由原进程管理，正在执行的任务会继续运行。",
+            "The previous instance remains in control and any running tasks can continue.",
+        ),
+        lang.pick(
+            "请等待任务完成并让旧实例正常退出，随后自动继续启动。可按 Ctrl+C 取消本次启动。",
+            "Let any running work finish and the previous instance exit normally. Startup will then resume automatically. Press Ctrl+C to cancel this launch.",
+        ),
+    );
+    message
 }
 
 #[cfg(any(unix, windows))]
@@ -798,17 +863,17 @@ fn format_ensure_error(host: &leveler_runtime_host::EnsureError) -> String {
                 ),
             )
         }
-        EnsureError::LegacyMigrationRefused { reason, .. } => {
+        EnsureError::LegacyMigrationRefused { .. } => {
             let lang = HandoffLang::current();
             format!(
-                "{}\n  {reason}\n  {}",
+                "{}\n  {}",
                 lang.pick(
-                    "旧版本无法自动替换，且不能安全强制迁移。",
-                    "The previous version cannot be replaced automatically, and cannot be force-migrated safely.",
+                    "无法确认旧版 Runtime 支持安全交接。",
+                    "A safe handover from the previous runtime could not be confirmed.",
                 ),
                 lang.pick(
-                    "未终止任何进程，也未取消任何任务；请手动退出旧版本后重新启动。",
-                    "No process was terminated and no work was cancelled; exit the previous version manually and start again.",
+                    "请等待任务完成并让旧实例正常退出，然后重新启动 CodeLeveler。",
+                    "Let any running work finish and the previous instance exit normally, then start CodeLeveler again.",
                 ),
             )
         }
@@ -887,7 +952,13 @@ async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntim
     let client = leveler_runtime_host::ensure_default_runtime(
         layout,
         &daemon_launch()?,
-        Arc::new(TuiHandoffUi),
+        Arc::new(TuiHandoffUi {
+            startup: true,
+            workspace: layout.primary_workspace().and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            }),
+        }),
     )
     .await
     .map_err(map_ensure_error)?;
@@ -935,7 +1006,7 @@ async fn observe_retiring_runtime(
         socket_path,
         observed_pid,
         interval,
-        &TuiHandoffUi,
+        &TuiHandoffUi::default(),
     )
     .await
 }
@@ -1041,7 +1112,7 @@ pub(crate) async fn cmd_tui(
             client.set_reviver(Arc::new(leveler_runtime_host::DaemonReviver::new(
                 layout.clone(),
                 daemon_launch()?,
-                Arc::new(TuiHandoffUi),
+                Arc::new(TuiHandoffUi::default()),
             )));
             Some(client)
         }
@@ -1400,7 +1471,7 @@ pub(crate) async fn cmd_serve(
         local_waiters,
     )
     .await?;
-    let bound = prepared.bound;
+    let mut bound = prepared.bound;
     let runtime_id = prepared.runtime_id;
     // The daemon is the workspace's runtime for every attached client. Resume
     // capture work a previous process left claimable; without this the daemon
@@ -1429,6 +1500,8 @@ pub(crate) async fn cmd_serve(
     println!("  press Ctrl+C to stop the daemon");
 
     let signal_shutdown = shutdown.clone();
+    let signalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_received = signalled.clone();
     tokio::spawn(async move {
         // Ctrl-C and SIGTERM both reach the graceful path: a plain `kill`
         // must not orphan background tasks / the browser tree (R004 F7).
@@ -1447,32 +1520,51 @@ pub(crate) async fn cmd_serve(
                 _ = term.recv() => {}
                 _ = hup.recv() => {}
             }
-            signal_shutdown.cancel();
         }
         #[cfg(not(unix))]
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_shutdown.cancel();
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
         }
+        signal_received.store(true, std::sync::atomic::Ordering::Release);
+        signal_shutdown.cancel();
     });
+    runtime.spawn_idle_eviction(leveler_runtime_host::daemon_idle_timeout());
     let unix_serve = async {
-        match bound.unix {
-            Some(server) => server.serve(shutdown.clone()).await,
+        let result = match bound.unix.as_mut() {
+            Some(server) => server.serve_until_shutdown(shutdown.clone()).await,
             None => Ok(()),
+        };
+        if result.is_err() {
+            shutdown.cancel();
         }
+        result
     };
     let tcp_serve = async {
-        match bound.tcp {
+        let result = match bound.tcp.take() {
             Some((server, _)) => server.serve(shutdown.clone()).await,
             None => Ok(()),
+        };
+        if result.is_err() {
+            shutdown.cancel();
         }
+        result
     };
-    let result = tokio::try_join!(unix_serve, tcp_serve);
-    // Stopping the daemon is an explicit runtime shutdown, unlike closing a
-    // TUI client. Cancel and reap any remaining turns before process exit.
-    let _ = runtime
-        .send(leveler_client_protocol::ClientCommand::Quit)
-        .await;
-    result?;
+    let (unix_result, tcp_result) = tokio::join!(unix_serve, tcp_serve);
+    // Keep endpoint ownership through cleanup. A retirement committed against
+    // an idle snapshot must preserve any independent work observed afterward.
+    let cleanup = if signalled.load(std::sync::atomic::Ordering::Acquire)
+        || unix_result.is_err()
+        || tcp_result.is_err()
+    {
+        runtime
+            .send(leveler_client_protocol::ClientCommand::Quit)
+            .await
+    } else {
+        runtime.finish_daemon_retirement().await
+    };
+    unix_result?;
+    tcp_result?;
+    cleanup?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -2427,6 +2519,7 @@ mod runtime_consistency_tests {
             build,
             config_fingerprint: fingerprint.map(str::to_string),
             pid: 1,
+            idle_eviction: None,
             health: RuntimeHealth::default(),
         }
     }
@@ -2944,6 +3037,33 @@ mod handoff_status_tests {
             session_id: None,
             log_tail: String::new(),
         }
+    }
+
+    #[test]
+    fn legacy_wait_copy_only_shows_available_identity_fields() {
+        use leveler_runtime_host::LegacyHandoffBlock;
+
+        let zh = legacy_exit_message(
+            HandoffLang::Zh,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            Some("AgentGate"),
+            Some("\x1b[31m1.0.27\x1b[0m"),
+            Some(42),
+        );
+        assert!(zh.contains("AgentGate") && zh.contains("1.0.27") && zh.contains("42"));
+        assert!(zh.contains("身份验证") && zh.contains("自动继续启动"));
+        assert!(!zh.contains('\x1b'));
+
+        let en = legacy_exit_message(
+            HandoffLang::En,
+            LegacyHandoffBlock::AtomicRetirementUnavailable,
+            None,
+            None,
+            None,
+        );
+        assert!(en.contains("could not confirm safe handover"));
+        assert!(en.contains("resume automatically"));
+        assert!(!en.contains("Previous version:") && !en.contains("PID:"));
     }
 
     /// PV1/PV2 — the version-handover copy is bilingual product text, and the

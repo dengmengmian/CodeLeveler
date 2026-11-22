@@ -119,6 +119,12 @@ pub enum Command {
         ready_json: Option<PathBuf>,
     },
 
+    /// Inspect or safely stop the local runtime for this workspace.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
+
     /// Diagnose the environment, tooling, and configuration.
     Doctor {
         /// Print the structured findings as JSON.
@@ -402,6 +408,18 @@ pub enum Command {
 /// Durable permission rules (`~/.leveler/permissions.yaml` + project
 /// `.leveler/permissions.yaml`). Written by interactive **Always** approvals
 /// and by hand-editing the YAML files; evaluated before the permission profile.
+#[derive(Debug, Subcommand)]
+pub enum RuntimeCommand {
+    /// Read the running instance's identity, work, and idle eviction status.
+    Status {
+        /// Print structured status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the runtime to exit if no work would be interrupted.
+    Stop,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum PermissionsCommand {
     /// List global and project permission rules.

@@ -200,7 +200,40 @@ async fn run(root: &Path) {
     );
     assert_eq!(replacement.snapshot(&session).await.unwrap().id, session);
     drop(replacement);
-    assert!(kill(info.pid));
+
+    let mut management = tokio::process::Command::new(env!("CARGO_BIN_EXE_leveler"));
+    management
+        .arg("--repo")
+        .arg(root.join("repo"))
+        .args(["runtime", "status", "--json"]);
+    let output = management.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["pid"], info.pid);
+    assert!(
+        status["process_start_identity"]
+            .as_str()
+            .unwrap()
+            .starts_with("windows:")
+    );
+    assert!(status["idle_eviction"]["effective_idle_timeout_secs"].is_u64());
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_leveler"))
+        .arg("--repo")
+        .arg(root.join("repo"))
+        .args(["runtime", "stop"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     guard.0.retain(|pid| *pid != info.pid);
     wait_absent(&layout).await;
     concurrent_owner(root, &layout).await;

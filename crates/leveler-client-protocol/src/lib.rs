@@ -141,7 +141,8 @@ pub use review::{
     UiReviewStatus, UiReviewSummary, UiReviewUsage, UiReviewVerdict,
 };
 pub use snapshot::{
-    MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
+    MessageId, RuntimeHealth, RuntimeIdleEviction, RuntimeIdleEvictionError,
+    RuntimeIdleEvictionState, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
     UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiBackgroundTaskRecord,
     UiBackgroundTaskState, UiCheckpoint, UiExecutionTask, UiInputState, UiInterruptedCallState,
     UiInterruptedToolCall, UiMessage, UiMessageKind, UiRole, UiSessionHistory, UiSessionSnapshot,

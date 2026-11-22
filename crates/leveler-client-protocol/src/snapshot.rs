@@ -67,6 +67,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_idle_telemetry_is_optional_and_round_trips() {
+        let legacy = serde_json::json!({"runtime_id": "legacy"});
+        let mut decoded: RuntimeInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.idle_eviction, None);
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("idle_eviction")
+                .is_none()
+        );
+        decoded.idle_eviction = Some(RuntimeIdleEviction {
+            effective_idle_timeout_secs: 1800,
+            idle_for_ms: Some(20),
+            state: RuntimeIdleEvictionState::Counting,
+            last_error: Some(RuntimeIdleEvictionError::BlockerObservationFailed),
+        });
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["idle_eviction"]["state"], "counting");
+        assert_eq!(
+            serde_json::from_value::<RuntimeInfo>(encoded).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
     fn session_summary_preserves_declaration_and_accepts_legacy_rows() {
         let legacy = serde_json::json!({"id":"s", "goal":"g", "status":"completed", "model":"m", "updated_at":"now"});
         let row: UiSessionSummary = serde_json::from_value(legacy.clone()).unwrap();
@@ -379,6 +404,39 @@ pub struct RuntimeInfo {
     /// healthy-shaped default.
     #[serde(default)]
     pub health: RuntimeHealth,
+    /// Idle-eviction observations are unavailable on runtimes predating them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_eviction: Option<RuntimeIdleEviction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeIdleEviction {
+    pub effective_idle_timeout_secs: u64,
+    /// Time since the first successful idle observation in the current window.
+    pub idle_for_ms: Option<u64>,
+    /// The supervisor's last observation. Live counts may change between polls.
+    pub state: RuntimeIdleEvictionState,
+    pub last_error: Option<RuntimeIdleEvictionError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdleEvictionState {
+    Observing,
+    Busy,
+    Counting,
+    ObservationFailed,
+    Retiring,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdleEvictionError {
+    BlockerObservationFailed,
+    SupervisorPanicked,
 }
 
 /// The runtime's admission/lifecycle health at answer time.
@@ -408,9 +466,8 @@ pub struct RuntimeHealth {
     /// the real ActiveTurns capacity, not an invented number.
     #[serde(default)]
     pub turn_capacity: Option<u32>,
-    /// The runtime has begun a shutdown. Two reasons share this commit point:
-    /// an explicit `Quit`, and retirement for a generation handover — the
-    /// second carries `retiring_reason`.
+    /// The runtime has begun shutdown due to an explicit `Quit`, idle
+    /// eviction, or a generation handover. Handover carries `retiring_reason`.
     #[serde(default)]
     pub shutting_down: bool,
     /// Why the runtime is retiring, when it is doing so for a generation

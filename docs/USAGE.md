@@ -69,7 +69,12 @@ Use `leveler resume` to continue a session. On macOS and Linux, `leveler serve` 
 
 If the process that owns background services is lost (crash or kill), `leveler tui` keeps starting: affected tasks become `unknown`, and the startup notice says whether their process was still present. CodeLeveler never signals or re-runs them in that state; use `leveler background list` to inspect what was left, `leveler background logs` for the retained output, and `leveler background journal list` for write reservations that remain unresolved.
 
-TUIs in the same project share a runtime. During an upgrade, a client with a compatible protocol and matching configuration can reconnect to a busy runtime. A later startup retries the upgrade once the runtime is idle.
+TUIs in the same project share a runtime. After the last UI disconnects, the runtime keeps working on existing tasks. The idle timer starts when there are no active turns, runtime-owned background tasks, or attached local UIs. It defaults to 30 consecutive idle minutes. `LEVELER_DAEMON_IDLE_TIMEOUT_SECS` sets the timeout in positive whole seconds for a runtime at startup.
+
+During an upgrade, interactive startup waits for a safe handoff if the previous runtime is busy. If a safe handoff cannot be verified, let the old instance finish its work and exit it normally. Keep the new terminal open and `leveler` continues startup once the endpoint is released. Press Ctrl+C to stop waiting.
+
+- `leveler runtime status` shows the workspace's runtime identity, build, work counts, and idle eviction status. Use `--json` for structured output. Unavailable fields are `null`.
+- `leveler runtime stop` requests a clean exit when the runtime can safely retire. It reports a reason and returns a nonzero exit code if work is active, the runtime changes, or safe retirement cannot be verified.
 
 A normal TUI exit cancels the active turn and stops background tasks in that session, waits for cleanup, and leaves other sessions running. Tasks in the shared runtime continue when a connection drops or the client is forcibly stopped.
 

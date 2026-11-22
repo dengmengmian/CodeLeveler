@@ -6,6 +6,8 @@
 mod client;
 mod legacy;
 mod lifecycle_state;
+#[cfg(any(unix, windows))]
+mod management;
 mod server;
 #[cfg(any(unix, windows))]
 pub use client::{
@@ -14,11 +16,14 @@ pub use client::{
     observe_retiring_runtime, reconcile_runtime_generation,
 };
 pub use client::{
-    EnsureError, HandoffAction, HandoffEvent, HandoffUi, RuntimeConsistency, classify_runtime,
-    classify_runtime_generation, expected_config_fingerprint, force_handover_allowed, handoff_key,
-    probe_default_runtime, stalled_turn_sessions, verify_replacement,
+    EnsureError, HandoffAction, HandoffEvent, HandoffUi, LegacyHandoffBlock, RuntimeConsistency,
+    classify_runtime, classify_runtime_generation, expected_config_fingerprint,
+    force_handover_allowed, handoff_key, probe_default_runtime, stalled_turn_sessions,
+    verify_replacement,
 };
 pub use lifecycle_state::{LifecycleAction, RuntimeLifecycleState};
+#[cfg(any(unix, windows))]
+pub use management::{RuntimeInspection, StopRuntime, inspect_runtime, stop_runtime};
 mod owned;
 pub use legacy::{
     LegacyRuntimeTarget, MigrationRefusal, OwnershipEvidence, ProcessWitness, SocketObject,

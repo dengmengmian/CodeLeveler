@@ -18,14 +18,17 @@ pub(super) fn pipe_name(path: &Path) -> std::io::Result<String> {
 }
 
 pub(super) async fn connect_windows(path: &Path) -> Result<NamedPipeClient, TransportError> {
+    let client = open_windows_pipe(path).await?;
+    leveler_win_local_ipc::verify_server(&client)?;
+    Ok(client)
+}
+
+pub(super) async fn open_windows_pipe(path: &Path) -> Result<NamedPipeClient, TransportError> {
     let name = pipe_name(path)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match ClientOptions::new().open(&name) {
-            Ok(client) => {
-                leveler_win_local_ipc::verify_server(&client)?;
-                return Ok(client);
-            }
+            Ok(client) => return Ok(client),
             // ERROR_PIPE_BUSY is a transient lack of available listener instances.
             Err(error)
                 if error.raw_os_error() == Some(231) && tokio::time::Instant::now() < deadline =>
@@ -86,11 +89,20 @@ impl LocalSocketServer {
         self.local_waiters.clone()
     }
     pub async fn serve(mut self, shutdown: CancellationToken) -> Result<(), TransportError> {
+        self.serve_until_shutdown(shutdown).await
+    }
+
+    /// Stop accepting and drain dispatched requests while retaining endpoint ownership.
+    pub async fn serve_until_shutdown(
+        &mut self,
+        shutdown: CancellationToken,
+    ) -> Result<(), TransportError> {
         let child_shutdown = shutdown.child_token();
         let mut tasks = tokio::task::JoinSet::new();
         let mut reap = super::connection_reaper();
         let result = loop {
             tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => break Ok(()),
                 _ = reap.tick() => super::reap_finished_connections(&mut tasks),
                 accepted = self.listener.connect() => {

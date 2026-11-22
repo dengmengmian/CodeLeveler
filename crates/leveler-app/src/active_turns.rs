@@ -87,7 +87,7 @@ pub(crate) struct ActiveSteering {
 pub(crate) enum RetireAdmission {
     /// Admission is now closed and nothing was owed.
     Accepted,
-    /// Work is still owed. NOTHING was changed: the runtime keeps admitting.
+    /// Work is still owed or the idle observation expired. Admission stays open.
     Busy { active_turns: u32 },
     /// A previous request already closed admission.
     AlreadyRetiring,
@@ -141,6 +141,17 @@ impl ActiveTurns {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
         (active, self.capacity)
+    }
+
+    /// A completed turn still changes the epoch of the idle interval.
+    pub(crate) fn idle_epoch(&self) -> Option<u64> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active
+            .is_empty()
+            .then(|| self.next_generation.load(Ordering::Relaxed))
     }
 
     pub(crate) fn admit(&self, session_id: &SessionId) -> Result<TurnLease, TurnAdmissionError> {
@@ -197,9 +208,9 @@ impl ActiveTurns {
     /// so the caller would be told "idle" about a runtime that is no longer
     /// idle. Sharing `admit`'s lock makes that interleaving impossible.
     ///
-    /// Returns the turns still running rather than a bare verdict, so the
-    /// caller can report what blocked it without a second, later read.
-    pub(crate) fn retire_if_idle(&self) -> RetireAdmission {
+    /// A busy verdict reports the turns still running. A zero count means the
+    /// idle observation changed and the caller must sample background work again.
+    pub(crate) fn retire_if_idle(&self, idle_epoch: Option<u64>) -> RetireAdmission {
         let active = self
             .active
             .lock()
@@ -207,7 +218,7 @@ impl ActiveTurns {
         if self.retiring.load(Ordering::SeqCst) {
             return RetireAdmission::AlreadyRetiring;
         }
-        if !active.is_empty() {
+        if !active.is_empty() || idle_epoch != Some(self.next_generation.load(Ordering::Relaxed)) {
             return RetireAdmission::Busy {
                 active_turns: active.len() as u32,
             };
@@ -215,8 +226,13 @@ impl ActiveTurns {
         // Commit while still holding the lock: from this instant no new turn can
         // be admitted, and the emptiness this decision was based on cannot
         // change underneath it.
-        self.retiring.store(true, Ordering::SeqCst);
-        RetireAdmission::Accepted
+        match self
+            .retiring
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => RetireAdmission::Accepted,
+            Err(_) => RetireAdmission::AlreadyRetiring,
+        }
     }
 
     /// Whether admission is closed for retirement.
@@ -426,7 +442,7 @@ mod tests {
         let lease = turns.admit(&running).unwrap();
 
         assert_eq!(
-            turns.retire_if_idle(),
+            turns.retire_if_idle(turns.idle_epoch()),
             RetireAdmission::Busy { active_turns: 1 }
         );
         assert!(!turns.is_retiring(), "a refusal must not close admission");
@@ -445,13 +461,32 @@ mod tests {
     #[test]
     fn an_idle_retirement_decision_closes_admission_atomically() {
         let turns = ActiveTurns::default();
-        assert_eq!(turns.retire_if_idle(), RetireAdmission::Accepted);
+        assert_eq!(
+            turns.retire_if_idle(turns.idle_epoch()),
+            RetireAdmission::Accepted
+        );
         assert!(turns.is_retiring());
         assert!(matches!(
             turns.admit(&SessionId::new("late")),
             Err(TurnAdmissionError::Retiring)
         ));
-        assert_eq!(turns.retire_if_idle(), RetireAdmission::AlreadyRetiring);
+        assert_eq!(
+            turns.retire_if_idle(turns.idle_epoch()),
+            RetireAdmission::AlreadyRetiring
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_invalidates_an_earlier_idle_observation() {
+        let turns = ActiveTurns::default();
+        let epoch = turns.idle_epoch();
+        let lease = turns.admit(&SessionId::new("brief")).unwrap();
+        assert!(turns.finish(&lease));
+        assert_eq!(
+            turns.retire_if_idle(epoch),
+            RetireAdmission::Busy { active_turns: 0 }
+        );
+        assert!(!turns.is_retiring());
     }
 
     /// The race the atomic decision exists for: a turn must never be admitted
@@ -465,7 +500,7 @@ mod tests {
 
             let retirer = {
                 let turns = turns.clone();
-                std::thread::spawn(move || turns.retire_if_idle())
+                std::thread::spawn(move || turns.retire_if_idle(turns.idle_epoch()))
             };
             let admitter = {
                 let turns = turns.clone();

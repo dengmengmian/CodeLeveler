@@ -126,6 +126,14 @@ compatibility:
 }
 
 fn spawn_serve(env: &TestEnv, ready: &Path) -> ManagedChild {
+    spawn_serve_with_idle_timeout(env, ready, None)
+}
+
+fn spawn_serve_with_idle_timeout(
+    env: &TestEnv,
+    ready: &Path,
+    idle_timeout: Option<&str>,
+) -> ManagedChild {
     let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
     command
         .arg("--repo")
@@ -138,6 +146,11 @@ fn spawn_serve(env: &TestEnv, ready: &Path) -> ManagedChild {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(idle_timeout) = idle_timeout {
+        command.env("LEVELER_DAEMON_IDLE_TIMEOUT_SECS", idle_timeout);
+    } else {
+        command.env_remove("LEVELER_DAEMON_IDLE_TIMEOUT_SECS");
+    }
     ManagedChild::spawn(&mut command).expect("spawn leveler serve")
 }
 
@@ -337,6 +350,7 @@ impl LocalRuntimeService for OldBuildRuntime {
             build: self.build.clone(),
             config_fingerprint: None,
             pid: std::process::id(),
+            idle_eviction: None,
             health: RuntimeHealth {
                 accepting_work: true,
                 quiescent: true,
@@ -1149,6 +1163,13 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_b
         daemon_owner.boot.as_ref().map(|b| b.as_str()),
         daemon_turn.owner_boot_id.as_deref()
     );
+
+    let status = runtime_status(&env).await;
+    assert_eq!(status["active_turns"], 1);
+    let stop = runtime_command(&env).arg("stop").output().await.unwrap();
+    assert_eq!(stop.status.code(), Some(1));
+    assert_eq!(runtime_status(&env).await["pid"], status["pid"]);
+    assert_eq!(running_turns(&db).await[0].id, daemon_turn.id);
 
     // A second host on the same repository: `leveler run` creates a session
     // (with its startup recovery) and starts its own turn.
@@ -2141,6 +2162,111 @@ async fn health_reports_identity_and_admission_body() {
 
     drop(client);
     stop_daemon(&mut daemon);
+}
+
+fn runtime_command(env: &TestEnv) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_leveler"));
+    command
+        .env("LEVELER_HOME", &env.home)
+        .env("LEVELER_CONFIG_DIR", &env.config_dir)
+        .arg("--repo")
+        .arg(&env.repo)
+        .arg("runtime");
+    command
+}
+
+async fn runtime_status(env: &TestEnv) -> serde_json::Value {
+    let output = runtime_command(env)
+        .args(["status", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn runtime_management_reads_and_stops_the_existing_owner() {
+    let env = test_env("http://127.0.0.1:9");
+    let absent = runtime_status(&env).await;
+    assert_eq!(absent["presence"], "absent");
+    assert!(absent["active_turns"].is_null());
+
+    let ready = env.home.join("ready.json");
+    let mut daemon = spawn_serve(&env, &ready);
+    let ready_doc = wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let path = PathBuf::from(ready_doc["socket"].as_str().unwrap());
+    let status = runtime_status(&env).await;
+    assert_eq!(status["presence"], "authenticated");
+    assert_eq!(status["runtime_id"], ready_doc["runtime_id"]);
+    assert_eq!(status["pid"], ready_doc["pid"]);
+    assert!(status["process_start_identity"].is_string());
+    assert_eq!(status["active_turns"], 0);
+    assert_eq!(status["local_waiters"], 0, "status must not count itself");
+    assert_eq!(status["idle_eviction"]["effective_idle_timeout_secs"], 1800);
+
+    let stopped = runtime_command(&env).arg("stop").output().await.unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    await_clean_daemon_exit(&mut daemon).await;
+    assert!(!path.exists());
+    assert_eq!(runtime_status(&env).await["presence"], "absent");
+}
+
+async fn await_clean_daemon_exit(daemon: &mut ManagedChild) {
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon must exit even with an incomplete IPC request");
+    assert!(status.success(), "{status}");
+}
+
+#[tokio::test]
+async fn idle_eviction_releases_the_owner_with_a_silent_authenticated_peer() {
+    let env = test_env("http://127.0.0.1:9");
+    let ready = env.home.join("ready.json");
+    let mut daemon = spawn_serve_with_idle_timeout(&env, &ready, Some("2"));
+    let ready_doc = wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let path = PathBuf::from(ready_doc["socket"].as_str().unwrap());
+    let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+    let mut silent = tokio::net::UnixStream::connect(&path).await.unwrap();
+    authenticate_unix(&mut silent, &path).await;
+
+    // Over one full threshold elapses with a real subscription attached.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let status = runtime_status(&env).await;
+    assert_eq!(status["local_waiters"], 1);
+    assert_eq!(status["idle_eviction"]["effective_idle_timeout_secs"], 2);
+    assert!(daemon.try_wait().unwrap().is_none());
+    let detached_at = Instant::now();
+    drop(client);
+
+    await_clean_daemon_exit(&mut daemon).await;
+    assert!(detached_at.elapsed() >= Duration::from_secs(2));
+    assert!(!path.exists());
+    drop(silent);
+
+    // The same endpoint can elect a new daemon without deleting its lock file.
+    let next_ready = env.home.join("next-ready.json");
+    let mut next = spawn_serve(&env, &next_ready);
+    let next_doc = wait_ready(&next_ready, &mut next, Duration::from_secs(30));
+    assert_eq!(next_doc["socket"], ready_doc["socket"]);
+    assert_eq!(next_doc["runtime_id"], ready_doc["runtime_id"]);
+    assert_ne!(next_doc["pid"], ready_doc["pid"]);
+    stop_daemon(&mut next);
 }
 
 /// Gate Scenarios C+D: the daemon dies (SIGKILL) under a connected client
