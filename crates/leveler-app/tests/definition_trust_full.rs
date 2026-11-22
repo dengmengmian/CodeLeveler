@@ -81,6 +81,21 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
         view.check(&skill_id, &skill_digest),
         DefinitionTrust::FullAdopted
     );
+    // The rule loader uses the same view: the baseline AGENTS.md is actually
+    // delivered as project instruction, not merely reported as admitted.
+    let loaded = leveler_context::load_rules(&repo, &view);
+    assert!(
+        loaded
+            .documents
+            .iter()
+            .any(|rule| rule.source == "AGENTS.md"),
+        "Full must deliver the baseline AGENTS.md: {:?}",
+        loaded
+            .documents
+            .iter()
+            .map(|rule| &rule.source)
+            .collect::<Vec<_>>()
+    );
     // A declarative agent is not adopted even in Full: it can start a child
     // with its own tool surface, so it keeps requiring a persistent approval.
     std::fs::create_dir_all(repo.join(".leveler/agents/x")).unwrap();
@@ -112,6 +127,17 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
     assert_eq!(
         (*engine.factory.tool_context.execution.definition_trust).check(&agents_id, &edited),
         DefinitionTrust::Unapproved
+    );
+    let loaded = leveler_context::load_rules(
+        &repo,
+        &engine.factory.tool_context.execution.definition_trust,
+    );
+    assert!(
+        !loaded
+            .documents
+            .iter()
+            .any(|rule| rule.source == "AGENTS.md"),
+        "an agent edit after the baseline must not be delivered as authority"
     );
 
     // Leaving Full stops adoption; the persistent store was never written.
