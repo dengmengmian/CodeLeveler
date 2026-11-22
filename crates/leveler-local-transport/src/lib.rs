@@ -1655,7 +1655,9 @@ mod transport {
                     .await
                     .map_err(transport_client_error)?;
                 #[cfg(windows)]
-                let mut stream = open_windows_pipe(path).await.map_err(transport_client_error)?;
+                let mut stream = open_windows_pipe(path)
+                    .await
+                    .map_err(transport_client_error)?;
                 #[cfg(windows)]
                 let server = leveler_win_local_ipc::verified_server_process(&stream)
                     .map_err(|error| transport_client_error(error.into()))?;
@@ -2254,9 +2256,18 @@ mod transport {
     type ClientStream = Either<NamedPipeClient, TcpStream>;
 
     #[cfg(unix)]
-    async fn connect_unix_with_token(path: &Path, token: &str) -> Result<UnixStream, TransportError> {
+    async fn connect_unix_with_token(
+        path: &Path,
+        token: &str,
+    ) -> Result<UnixStream, TransportError> {
         let mut stream = UnixStream::connect(path).await?;
-        write_frame(&mut stream, &ProtocolEnvelope::wrap(Handshake { token: token.to_owned() })).await?;
+        write_frame(
+            &mut stream,
+            &ProtocolEnvelope::wrap(Handshake {
+                token: token.to_owned(),
+            }),
+        )
+        .await?;
         // A peer that closes without answering is a protocol fact, not a
         // truncated reply. Keep it distinct for legacy discovery.
         match read_response_frame(&mut stream).await? {
@@ -2272,7 +2283,9 @@ mod transport {
     async fn connect_endpoint(endpoint: &Endpoint) -> Result<ClientStream, TransportError> {
         match endpoint {
             #[cfg(unix)]
-            Endpoint::Unix(path) => Ok(Either::Left(connect_unix_with_token(path, &read_access_token(path)?).await?)),
+            Endpoint::Unix(path) => Ok(Either::Left(
+                connect_unix_with_token(path, &read_access_token(path)?).await?,
+            )),
             #[cfg(windows)]
             Endpoint::Windows(path) => Ok(Either::Left(connect_windows(path).await?)),
             Endpoint::Tcp { addr, token } => {
@@ -2399,9 +2412,9 @@ mod transport {
             Ok(WireResponse::Error(error)) => Err(error.into_client_error()),
             Ok(response) => Err(unexpected_response(response)),
             // A peer unable to decode the request can close without a reply.
-            Err(TransportError::PeerClosed | TransportError::Json(_) | TransportError::Protocol(_)) => {
-                Ok(RetireDecision::Unsupported)
-            }
+            Err(
+                TransportError::PeerClosed | TransportError::Json(_) | TransportError::Protocol(_),
+            ) => Ok(RetireDecision::Unsupported),
             Err(error) => Err(transport_client_error(error)),
         }
     }
@@ -2984,7 +2997,9 @@ pub use transport::access_token_is_published;
 #[cfg(all(any(unix, windows), test))]
 pub(crate) use transport::tcp_request;
 #[cfg(any(unix, windows))]
-pub use transport::{LocalSocketRuntimeClient, LocalSocketServer, RetirementTarget, TcpRuntimeServer};
+pub use transport::{
+    LocalSocketRuntimeClient, LocalSocketServer, RetirementTarget, TcpRuntimeServer,
+};
 #[cfg(unix)]
 pub use transport::{legacy_local_waiter_count, legacy_runtime_info};
 
