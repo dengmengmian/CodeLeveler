@@ -1,0 +1,102 @@
+{
+  "verified_at": "2026-11-22T06:01:55Z",
+  "channel": "GitHub Releases",
+  "artifacts": [
+    {
+      "name": "leveler-v1.0.28-aarch64-apple-darwin.tar.gz",
+      "platform": "macOS arm64",
+      "checksum": "sha256:9e9bc616736d7afcdf7352a139fc528118f939277ca2bddaace721e5bdd8c5b5",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-aarch64-apple-darwin.tar.gz"
+    },
+    {
+      "name": "leveler-v1.0.28-aarch64-apple-darwin.tar.xz",
+      "platform": "macOS arm64",
+      "checksum": "sha256:c4d2a1b8aef92d2b536f32d1b034a3322e88982f2994782119fc061a3e3ca5d5",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-aarch64-apple-darwin.tar.xz"
+    },
+    {
+      "name": "leveler-v1.0.28-x86_64-apple-darwin.tar.gz",
+      "platform": "macOS x86_64",
+      "checksum": "sha256:3b8bb71267394cb6923a346e860b01b707f0b0ce333092d5b1e2f50b812edc1f",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-x86_64-apple-darwin.tar.gz"
+    },
+    {
+      "name": "leveler-v1.0.28-x86_64-apple-darwin.tar.xz",
+      "platform": "macOS x86_64",
+      "checksum": "sha256:555767ff4a984c2bb3214475f1d8d08777cb94f2a5da28967a46b937f0e129d2",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-x86_64-apple-darwin.tar.xz"
+    },
+    {
+      "name": "leveler-v1.0.28-x86_64-pc-windows-msvc.zip",
+      "platform": "Windows x86_64",
+      "checksum": "sha256:eeac133f12edadf25a0c696ac5babcebb8fdae4111440b72838cf9de3fef89b9",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-x86_64-pc-windows-msvc.zip"
+    },
+    {
+      "name": "leveler-v1.0.28-x86_64-unknown-linux-gnu.tar.gz",
+      "platform": "Linux x86_64",
+      "checksum": "sha256:2cd0dbbe4975e7e4afedee011c02b4ceef8273ae11f78719a8679c43bc3210b3",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-x86_64-unknown-linux-gnu.tar.gz"
+    },
+    {
+      "name": "leveler-v1.0.28-x86_64-unknown-linux-gnu.tar.xz",
+      "platform": "Linux x86_64",
+      "checksum": "sha256:5a9538b638fa984659da42c2ec724f73a85924e49ed02996f5109f8e45bf7ed9",
+      "checksum_verified": true,
+      "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.28/leveler-v1.0.28-x86_64-unknown-linux-gnu.tar.xz"
+    }
+  ],
+  "fresh_install": {
+    "status": "PASS",
+    "detail": "downloaded leveler-v1.0.28-aarch64-apple-darwin.tar.xz/.tar.gz, verified every published sha256, ran --version, started the TUI on a real PTY, and ran one real provider turn that executed `git --version` with run_command",
+    "version_output": "1.0.28 (6464904bdf6a)",
+    "tui_start": true,
+    "provider_call": true,
+    "tool_execution": true
+  },
+  "upgrade": {
+    "status": "PASS",
+    "from": "v1.0.27",
+    "detail": "installed the published previous binary, created a config and ran one real turn, replaced the binary with the published new one, then re-read the session",
+    "config_preserved": true,
+    "sessions_readable": true
+  },
+  "known_issues": [
+    "On Windows, a confined shell can create a previously missing AGENTS.md or .leveler tree; the file is never admitted without approval, and existing protected objects keep their OS fences.",
+    "FullAccess is a documented user-authority boundary, not an OS guarantee.",
+    "Release packages are not Apple-notarized or Microsoft-signed.",
+    "There is no Linux ARM archive; the desktop client is built from source and is not part of this archive."
+  ],
+  "not_verified": [
+    "Windows x86_64 runtime: the published zip was not executed on a Windows host",
+    "Linux x86_64 runtime: the published tarball was not executed on a Linux host",
+    "macOS x86_64 runtime: the published tarball was not executed on an Intel host",
+    "long-duration soak and physical display flicker are not exercised by this acceptance",
+    "upgrade migration step: the session was read by the new build, but no separate migration action was observed"
+  ],
+  "performance": {
+    "method": "same host, published binaries, interleaved samples, fresh HOME per TUI sample",
+    "rows": [
+      {
+        "metric": "leveler --version (process start-to-exit)",
+        "previous": "9 ms",
+        "current": "7 ms",
+        "delta": "-17.6%",
+        "verdict": "MEASURED"
+      },
+      {
+        "metric": "TUI first frame on a real PTY (composer visible)",
+        "previous": "1760 ms",
+        "current": "1830 ms",
+        "delta": "+4.0%",
+        "verdict": "MEASURED"
+      }
+    ]
+  }
+}
