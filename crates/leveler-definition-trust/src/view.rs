@@ -31,6 +31,9 @@ pub enum DefinitionTrust {
     StoreUnavailable { status: StoreStatus },
     /// Compiled into the binary; this crate is not the authority.
     Builtin,
+    /// `AGENTS.md` project instructions. Loaded by default in every mode; the
+    /// trust store is not consulted and no approval is required.
+    DefaultLoaded,
     /// A human allowed these exact bytes for this session only.
     SessionTrusted { source: SessionTrustSource },
     /// FullAccess adopted these exact bytes from the pre-session baseline.
@@ -51,6 +54,7 @@ impl DefinitionTrust {
             Self::Changed { .. } => "changed",
             Self::StoreUnavailable { .. } => "store_unavailable",
             Self::Builtin => "builtin",
+            Self::DefaultLoaded => "default_loaded",
             Self::SessionTrusted { source } => match source {
                 SessionTrustSource::FullAdoption => "full_adopted",
                 SessionTrustSource::AllowOnce | SessionTrustSource::TrustCurrent => {
@@ -81,7 +85,11 @@ impl DefinitionTrust {
     pub fn admits(&self) -> bool {
         matches!(
             self,
-            Self::Trusted { .. } | Self::Builtin | Self::SessionTrusted { .. } | Self::FullAdopted
+            Self::Trusted { .. }
+                | Self::Builtin
+                | Self::DefaultLoaded
+                | Self::SessionTrusted { .. }
+                | Self::FullAdopted
         )
     }
 }
@@ -204,6 +212,13 @@ impl DefinitionTrustView {
         if identity.scope == DefinitionScope::Builtin {
             return DefinitionTrust::Builtin;
         }
+        // Project instructions are default context, not a trust object. This
+        // decision deliberately precedes the store checks: a missing, corrupt
+        // or inside-project store must not turn AGENTS.md into a hidden rule
+        // set. The reader still enforces containment and structured errors.
+        if identity.kind.is_default_loaded() {
+            return DefinitionTrust::DefaultLoaded;
+        }
         #[cfg(feature = "test-support")]
         if self.allow_all {
             return DefinitionTrust::Trusted {
@@ -287,7 +302,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn identity() -> DefinitionIdentity {
-        DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap()
+        DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/rule.md").unwrap()
     }
 
     #[test]
@@ -394,6 +409,48 @@ mod tests {
                 status: StoreStatus::InsideProject
             }
         );
+    }
+
+    #[test]
+    fn agents_md_is_project_context_and_bypasses_the_trust_store() {
+        let root = DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap();
+        let nested =
+            DefinitionIdentity::project(DefinitionKind::NestedAgents, "src/AGENTS.md").unwrap();
+        let gated =
+            DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/x.md").unwrap();
+        let digest = DefinitionIdentity::single_digest(b"ROOT");
+        for (store, project) in [
+            {
+                let home = tempdir().unwrap();
+                let project = tempdir().unwrap();
+                (home, project)
+            },
+            {
+                let home = tempdir().unwrap();
+                let project = tempdir().unwrap();
+                std::fs::write(crate::store_path(home.path()), "!! not yaml !!").unwrap();
+                (home, project)
+            },
+        ] {
+            let view = DefinitionTrustView::load(store.path(), Some(project.path()));
+            assert_eq!(view.check(&root, &digest), DefinitionTrust::DefaultLoaded);
+            assert_eq!(view.check(&nested, &digest), DefinitionTrust::DefaultLoaded);
+            assert!(
+                !view.check(&gated, &digest).admits(),
+                "AGENTS default loading must not admit .leveler/rules"
+            );
+        }
+
+        // A store that lives inside the project cannot gate AGENTS either.
+        let project = tempdir().unwrap();
+        let home = project.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let view = DefinitionTrustView::load(&home, Some(project.path()));
+        assert_eq!(view.check(&root, &digest), DefinitionTrust::DefaultLoaded);
+        assert!(matches!(
+            view.check(&gated, &digest),
+            DefinitionTrust::StoreUnavailable { .. }
+        ));
     }
 
     #[test]

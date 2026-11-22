@@ -17134,12 +17134,17 @@ fn trust_slash_opens_the_native_page_without_a_model_turn() {
     assert_eq!(s.active_screen, Screen::Trust);
     assert!(effects.is_empty(), "no runtime command: {effects:?}");
     assert!(
-        s.trust
-            .rows
-            .iter()
-            .any(|row| row.display() == "AGENTS.md" && row.is_pending()),
-        "{:?}",
+        !s.trust.rows.iter().any(|row| row.display() == "AGENTS.md"),
+        "AGENTS.md is default project context, not a pending trust item: {:?}",
         s.trust.rows
+    );
+    assert!(
+        s.trust
+            .instructions
+            .iter()
+            .any(|item| item.display == "AGENTS.md" && item.loaded),
+        "{:?}",
+        s.trust.instructions
     );
     // Esc returns to the conversation; the draft is not consumed as input.
     reduce(&mut s, key(KeyCode::Esc));

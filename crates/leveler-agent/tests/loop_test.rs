@@ -1762,7 +1762,8 @@ async fn an_unapproved_rule_is_diagnosed_and_never_delivered() {
         std::process::id() as u64 * 31 + 4
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("AGENTS.md"), "EVIL_RULE_SENTINEL").unwrap();
+    std::fs::create_dir_all(dir.join(".leveler/rules")).unwrap();
+    std::fs::write(dir.join(".leveler/rules/evil.md"), "EVIL_RULE_SENTINEL").unwrap();
     let workspace = Workspace::new(&dir).unwrap();
     let mut tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     tool_context.execution.definition_trust =

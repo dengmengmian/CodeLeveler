@@ -1464,8 +1464,9 @@ mod tests {
             "rules:\n  always_delivered: [Release marker]\n  budget_bytes: 16000\n",
         )
         .unwrap();
+        std::fs::create_dir_all(root.join(".leveler/rules")).unwrap();
         std::fs::write(
-            root.join("AGENTS.md"),
+            root.join(".leveler/rules/secret.md"),
             "# Project rules\n\n## Release marker\nEVIL-CONFIG-SELECTED\n",
         )
         .unwrap();
@@ -2156,61 +2157,56 @@ mod tests {
     }
 
     #[test]
-    fn an_unapproved_root_rule_is_not_delivered() {
-        let dir = temp_dir("unapproved-root");
-        std::fs::write(dir.join("AGENTS.md"), "EVIL-MARKER").unwrap();
+    fn agents_md_is_default_context_and_edits_apply_at_the_next_read() {
+        let dir = temp_dir("agents-default");
+        std::fs::write(dir.join("AGENTS.md"), "FIRST-RULE").unwrap();
         let loaded = load_rules(&dir, &untrusted());
-        assert!(loaded.documents.is_empty(), "{loaded:?}");
-        assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
-        assert_eq!(loaded.untrusted[0].state, "unapproved");
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert!(loaded.untrusted.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.documents.len(), 1, "{loaded:?}");
+        assert!(loaded.documents[0].content.contains("FIRST-RULE"));
         let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default(), &untrusted());
-        assert!(plan.documents.is_empty());
-        assert_eq!(plan.report.untrusted.len(), 1);
-        assert_eq!(
-            plan.sources
-                .iter()
-                .find(|source| source.source == "AGENTS.md")
-                .map(|source| source.status),
-            Some(RuleSourceStatus::Untrusted)
-        );
+        assert!(plan.documents.iter().any(|rule| rule.source == "AGENTS.md"));
+
+        std::fs::write(dir.join("AGENTS.md"), "SECOND-RULE").unwrap();
+        let loaded = load_rules(&dir, &untrusted());
+        assert!(loaded.documents[0].content.contains("SECOND-RULE"));
+
+        std::fs::remove_file(dir.join("AGENTS.md")).unwrap();
+        assert!(load_rules(&dir, &untrusted()).documents.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_changed_rule_stays_out_until_the_new_bytes_are_approved() {
-        let dir = temp_dir("changed-root");
-        std::fs::write(dir.join("AGENTS.md"), "APPROVED-A").unwrap();
-        let first = trust_all(&dir);
-        assert!(
-            load_rules(&dir, &first).documents[0]
-                .content
-                .contains("APPROVED-A")
-        );
-
-        std::fs::write(dir.join("AGENTS.md"), "APPROVED-B").unwrap();
-        let loaded = load_rules(&dir, &first);
-        assert!(
-            loaded.documents.is_empty(),
-            "changed bytes must not load: {loaded:?}"
-        );
-        assert_eq!(loaded.untrusted[0].state, "changed");
-
-        // Re-approval is the only path to the new bytes.
-        let second = trust_all(&dir);
-        assert!(
-            load_rules(&dir, &second).documents[0]
-                .content
-                .contains("APPROVED-B")
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_corrupt_store_fails_closed_for_every_rule() {
-        let dir = temp_dir("corrupt-store");
+    fn nested_agents_md_is_scoped_and_default_loaded() {
+        let dir = temp_dir("nested-default");
+        std::fs::create_dir_all(dir.join("src/npc")).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "ROOT").unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/AGENTS.md"), "NESTED").unwrap();
+        std::fs::write(dir.join("src/AGENTS.md"), "SRC-V1").unwrap();
+        std::fs::write(dir.join("src/npc/AGENTS.md"), "NPC").unwrap();
+        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &untrusted());
+        assert!(scoped.errors.is_empty(), "{:?}", scoped.errors);
+        assert!(scoped.untrusted.is_empty(), "{scoped:?}");
+        assert_eq!(
+            scoped
+                .documents
+                .iter()
+                .map(|rule| rule.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/AGENTS.md"]
+        );
+        std::fs::write(dir.join("src/AGENTS.md"), "SRC-V2").unwrap();
+        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &untrusted());
+        assert!(scoped.documents[0].content.contains("SRC-V2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_corrupt_store_does_not_block_agents_but_blocks_gated_rules() {
+        let dir = temp_dir("corrupt-store-default");
+        std::fs::create_dir_all(dir.join(".leveler/rules")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "ROOT").unwrap();
+        std::fs::write(dir.join(".leveler/rules/style.md"), "GATED").unwrap();
         let home = std::env::temp_dir().join(format!(
             "leveler-rules-corrupt-{}-{}",
             std::process::id(),
@@ -2222,26 +2218,54 @@ mod tests {
         std::fs::write(home.join("definition-trust.yaml"), "!! not yaml !!").unwrap();
         let view = DefinitionTrustView::load(&home, Some(&dir));
         let loaded = load_rules(&dir, &view);
-        assert!(loaded.documents.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.documents.len(), 1, "{loaded:?}");
+        assert_eq!(loaded.documents[0].source, "AGENTS.md");
         assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
+        assert_eq!(loaded.untrusted[0].display, ".leveler/rules/style.md");
         assert_eq!(loaded.untrusted[0].state, "store_unavailable");
-        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &view);
-        assert!(scoped.documents.is_empty(), "{scoped:?}");
-        assert_eq!(scoped.untrusted.len(), 1, "{scoped:?}");
-        assert_eq!(scoped.untrusted[0].state, "store_unavailable");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn an_unapproved_nested_rule_scopes_nothing() {
-        let dir = temp_dir("unapproved-nested");
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/AGENTS.md"), "NESTED-EVIL").unwrap();
-        let scoped = scoped_rule_sources(&dir, &["src/lib.rs".to_string()], &untrusted());
-        assert!(scoped.documents.is_empty(), "{scoped:?}");
-        assert_eq!(scoped.untrusted.len(), 1);
-        assert_eq!(scoped.untrusted[0].display, "src/AGENTS.md");
+    fn an_unapproved_rule_file_is_not_delivered() {
+        let dir = temp_dir("unapproved-rule-file");
+        std::fs::create_dir_all(dir.join(".leveler/rules")).unwrap();
+        std::fs::write(dir.join(".leveler/rules/secret.md"), "EVIL-MARKER").unwrap();
+        let loaded = load_rules(&dir, &untrusted());
+        assert!(loaded.documents.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.untrusted.len(), 1, "{loaded:?}");
+        assert_eq!(loaded.untrusted[0].state, "unapproved");
+        let plan = plan_rule_delivery(&dir, &RuleDeliveryPolicy::default(), &untrusted());
+        assert!(plan.documents.is_empty());
+        assert_eq!(plan.report.untrusted.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_changed_rule_file_stays_out_until_the_new_bytes_are_approved() {
+        let dir = temp_dir("changed-rule-file");
+        std::fs::create_dir_all(dir.join(".leveler/rules")).unwrap();
+        std::fs::write(dir.join(".leveler/rules/style.md"), "APPROVED-A").unwrap();
+        let first = trust_all(&dir);
+        assert!(
+            load_rules(&dir, &first).documents[0]
+                .content
+                .contains("APPROVED-A")
+        );
+        std::fs::write(dir.join(".leveler/rules/style.md"), "APPROVED-B").unwrap();
+        let loaded = load_rules(&dir, &first);
+        assert!(
+            loaded.documents.is_empty(),
+            "changed bytes must not load: {loaded:?}"
+        );
+        assert_eq!(loaded.untrusted[0].state, "changed");
+        let second = trust_all(&dir);
+        assert!(
+            load_rules(&dir, &second).documents[0]
+                .content
+                .contains("APPROVED-B")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

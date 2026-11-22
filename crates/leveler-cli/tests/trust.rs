@@ -251,11 +251,12 @@ fn a_repo_with_no_gated_files_has_nothing_to_trust() {
 fn project_definitions_are_inert_until_exact_bytes_are_approved() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
-    write(&repo.path().join("AGENTS.md"), "RULE-ONE\n");
+    std::fs::create_dir_all(repo.path().join(".leveler/rules")).unwrap();
+    write(&repo.path().join(".leveler/rules/rule.md"), "RULE-ONE\n");
 
     let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
     assert!(ok, "{out}");
-    assert!(out.contains("AGENTS.md"), "{out}");
+    assert!(out.contains(".leveler/rules/rule.md"), "{out}");
     assert!(out.contains("new (ignored)"), "{out}");
 
     let (ok, out) = run(home.path(), repo.path(), &["trust", "allow", "--yes"]);
@@ -268,11 +269,15 @@ fn project_definitions_are_inert_until_exact_bytes_are_approved() {
 
     // A changed file is no longer admitted, and the diff is against the exact
     // bytes the human approved, not against HEAD or the current file.
-    write(&repo.path().join("AGENTS.md"), "RULE-TWO\n");
+    write(&repo.path().join(".leveler/rules/rule.md"), "RULE-TWO\n");
     let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
     assert!(ok, "{out}");
     assert!(out.contains("changed since approval"), "{out}");
-    let (ok, out) = run(home.path(), repo.path(), &["trust", "diff", "AGENTS.md"]);
+    let (ok, out) = run(
+        home.path(),
+        repo.path(),
+        &["trust", "diff", ".leveler/rules/rule.md"],
+    );
     assert!(ok, "{out}");
     assert!(out.contains("- RULE-ONE"), "{out}");
     assert!(out.contains("+ RULE-TWO"), "{out}");
@@ -280,7 +285,7 @@ fn project_definitions_are_inert_until_exact_bytes_are_approved() {
     let (ok, out) = run(
         home.path(),
         repo.path(),
-        &["trust", "revoke-definition", "AGENTS.md"],
+        &["trust", "revoke-definition", ".leveler/rules/rule.md"],
     );
     assert!(ok, "{out}");
     let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
@@ -289,10 +294,46 @@ fn project_definitions_are_inert_until_exact_bytes_are_approved() {
 }
 
 #[test]
+fn agents_md_is_default_project_context_not_a_trust_item() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(&repo.path().join("AGENTS.md"), "DEFAULT-ROOT\n");
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    write(&repo.path().join("src/AGENTS.md"), "DEFAULT-NESTED\n");
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("Project instructions (loaded by default; no approval)"),
+        "{out}"
+    );
+    assert!(out.contains("AGENTS.md"), "{out}");
+    assert!(out.contains("src/AGENTS.md"), "{out}");
+    assert!(out.contains("loaded by default"), "{out}");
+    assert!(
+        !out.contains("new (ignored)") && !out.contains("not trusted"),
+        "AGENTS.md must not be a pending trust item: {out}"
+    );
+
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "allow", "--yes"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("nothing to trust"), "{out}");
+    assert!(!out.contains("definition(s)"), "{out}");
+
+    // Changing it never creates a pending trust item.
+    write(&repo.path().join("AGENTS.md"), "DEFAULT-ROOT-V2\n");
+    let (ok, out) = run(home.path(), repo.path(), &["trust", "show"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("loaded by default"), "{out}");
+    assert!(!out.contains("changed since approval"), "{out}");
+}
+
+#[test]
 fn a_corrupt_definition_store_is_reported_and_nothing_is_approved() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
-    write(&repo.path().join("AGENTS.md"), "RULE\n");
+    std::fs::create_dir_all(repo.path().join(".leveler/rules")).unwrap();
+    write(&repo.path().join(".leveler/rules/rule.md"), "RULE\n");
     write(
         &home.path().join("definition-trust.yaml"),
         "!! not yaml !!\n",
@@ -326,7 +367,8 @@ fn a_different_store_root_cannot_approve_this_projects_definitions() {
     let real_home = tempfile::tempdir().unwrap();
     let other_home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
-    write(&repo.path().join("AGENTS.md"), "RULE\n");
+    std::fs::create_dir_all(repo.path().join(".leveler/rules")).unwrap();
+    write(&repo.path().join(".leveler/rules/rule.md"), "RULE\n");
 
     let (ok, out) = run(other_home.path(), repo.path(), &["trust", "allow", "--yes"]);
     assert!(ok, "{out}");
@@ -335,7 +377,8 @@ fn a_different_store_root_cannot_approve_this_projects_definitions() {
         "the store it wrote must be named: {out}"
     );
 
-    let identity = DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap();
+    let identity =
+        DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/rule.md").unwrap();
     let digest = DefinitionIdentity::single_digest(b"RULE\n");
     assert_eq!(
         DefinitionTrustView::load(real_home.path(), Some(repo.path())).check(&identity, &digest),

@@ -25,7 +25,7 @@ use leveler_execution::command::{CommandRunner, ProcessRequest};
 use leveler_execution::risk::WriteScope;
 use tokio_util::sync::CancellationToken;
 
-const AGENTS: &str = "EVIL-SELF-APPROVAL-MARKER\n";
+const RULE: &str = "EVIL-SELF-APPROVAL-MARKER\n";
 
 fn evidence_dir(base: &Path) -> PathBuf {
     std::env::var_os("LEVELER_CANARY_EVIDENCE")
@@ -40,8 +40,9 @@ fn record(evidence: &Path, label: &str, body: &str) {
 
 fn view_state(home: &Path, workspace: &Path) -> String {
     use leveler_definition_trust::{DefinitionIdentity, DefinitionKind, DefinitionTrustView};
-    let identity = DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap();
-    let digest = DefinitionIdentity::single_digest(AGENTS.as_bytes());
+    let identity =
+        DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/rule.md").unwrap();
+    let digest = DefinitionIdentity::single_digest(RULE.as_bytes());
     DefinitionTrustView::load(home, Some(workspace))
         .check(&identity, &digest)
         .audit_state()
@@ -58,9 +59,9 @@ async fn a_confined_cli_approval_does_not_reach_the_runtime_store() {
     let _ = std::fs::remove_dir_all(&base);
     let workspace = base.join("workspace");
     let home = base.join("home");
-    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(workspace.join(".leveler/rules")).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(workspace.join("AGENTS.md"), AGENTS).unwrap();
+    std::fs::write(workspace.join(".leveler/rules/rule.md"), RULE).unwrap();
     let evidence = evidence_dir(&base);
     // The candidate under test can be the debug test binary or the release
     // artifact; both are the same source. The sealed store boundary does not

@@ -662,7 +662,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn identity() -> DefinitionIdentity {
-        DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap()
+        DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/rule.md").unwrap()
     }
 
     fn request(body: &str) -> ApprovalRequest {
@@ -765,7 +765,8 @@ mod tests {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         let other =
-            DefinitionIdentity::project(DefinitionKind::NestedAgents, "src/AGENTS.md").unwrap();
+            DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/other.md")
+                .unwrap();
         approve(
             home.path(),
             project.path(),

@@ -615,13 +615,13 @@ async fn resume_rebuilds_rules_and_does_not_promote_legacy_system_text() {
 }
 
 #[tokio::test]
-async fn resume_does_not_admit_an_unapproved_rule() {
-    let dir = workspace("openai-resume-untrusted");
+async fn resume_loads_agents_project_instructions_by_default() {
+    let dir = workspace("openai-resume-default-agents");
     write(
         dir.path(),
         "AGENTS.md",
         "# Rule
-UNAPPROVED_RESUME_RULE
+DEFAULT_RESUME_RULE
 ",
     );
     let server = MockServer::start_one(openai_text("done")).await;
@@ -651,15 +651,15 @@ UNAPPROVED_RESUME_RULE
     let bodies = bodies(&server).await;
     let system = openai_system(&bodies[0]);
     assert!(
-        !system.contains("UNAPPROVED_RESUME_RULE"),
-        "a resumed turn must not admit an unapproved rule: {system}"
+        system.contains("DEFAULT_RESUME_RULE"),
+        "a resumed turn loads AGENTS.md by default: {system}"
     );
     assert!(
-        system.contains("NOT trusted"),
-        "the model is told the rule was refused: {system}"
+        !system.contains("NOT trusted"),
+        "AGENTS.md is not a trust-gated definition: {system}"
     );
     assert!(!system.contains("STALE_LEGACY_SYSTEM_TEXT"));
-    assert_only_system_carries(&bodies[0], "NOT trusted");
+    assert_only_system_carries(&bodies[0], "DEFAULT_RESUME_RULE");
 }
 
 #[tokio::test]

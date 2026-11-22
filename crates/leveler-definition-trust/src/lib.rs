@@ -1,11 +1,13 @@
 //! Trusted definition admission.
 //!
-//! Project instruction files (`AGENTS.md` at any depth, `.leveler/instructions.md`,
-//! `.leveler/rules/*.md`), declarative agents (`agent.yaml` + `instructions.md`)
-//! and skills (`SKILL.md`) are *authority-bearing*: the harness puts them into
-//! the model's control context. A sandboxed shell may be able to create such a
-//! file in a workspace (Windows cannot name-fence a path that does not exist,
-//! and creation of a missing `.leveler` directory is possible on every backend
+//! `AGENTS.md` at any depth is standard coding-agent project context: it is
+//! loaded by default in every mode and is not a trust item. Gated definitions
+//! are `.leveler/instructions.md`, `.leveler/rules/*.md`, declarative agents
+//! (`agent.yaml` + `instructions.md`) and skills (`SKILL.md`); the harness puts
+//! them into the model's control context only after a human approves their
+//! exact bytes. A sandboxed shell may be able to create such a file in a
+//! workspace (Windows cannot name-fence a path that does not exist, and
+//! creation of a missing `.leveler` directory is possible on every backend
 //! that binds only existing protected paths). File existence therefore cannot
 //! be the trust signal.
 //!
@@ -50,7 +52,7 @@ pub const STORE_VERSION: u32 = 1;
 /// The store file name under the Leveler home.
 pub const STORE_FILE_NAME: &str = "definition-trust.yaml";
 
-/// What kind of authority-bearing definition this is.
+/// What kind of definition this identity names.
 ///
 /// The kind is an audit label; identity lives in [`DefinitionIdentity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -99,7 +101,20 @@ impl DefinitionKind {
     /// definition configures a child execution with its own tool surface, so
     /// it keeps requiring the persistent human approval even in Full.
     pub fn is_full_adoptable(self) -> bool {
-        !matches!(self, Self::Agent)
+        !matches!(self, Self::Agent | Self::RootAgents | Self::NestedAgents)
+    }
+
+    /// Whether this kind is project instruction loaded without a trust
+    /// approval.
+    ///
+    /// `AGENTS.md` is the standard coding-agent instruction entry point: it is
+    /// project context, not an executable definition. It still goes through
+    /// the same bounded, symlink-safe rule reader and structured error path;
+    /// only the human approval gate is removed. Skills, `.leveler/rules/*.md`,
+    /// `.leveler/instructions.md` and declarative agents keep their existing
+    /// approval policy.
+    pub fn is_default_loaded(self) -> bool {
+        matches!(self, Self::RootAgents | Self::NestedAgents)
     }
 }
 

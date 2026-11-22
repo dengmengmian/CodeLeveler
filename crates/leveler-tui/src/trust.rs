@@ -134,9 +134,21 @@ impl TrustRow {
     }
 }
 
+/// One `AGENTS.md` that the harness loads without approval. It is shown as a
+/// project-context status, never as a trust row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionStatus {
+    pub display: String,
+    pub loaded: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct TrustState {
     pub rows: Vec<TrustRow>,
+    /// Project instruction files, in display order. Not selectable and never
+    /// approvable: they are default context.
+    pub instructions: Vec<InstructionStatus>,
     pub selected: usize,
     pub filter: TrustFilter,
     pub detail_open: bool,
@@ -227,9 +239,21 @@ pub fn refresh(state: &mut AppState) {
         .rows
         .get(state.trust.selected)
         .map(|row| row.identity().id.clone());
+    let mut instructions: Vec<InstructionStatus> = Vec::new();
     let mut rows: Vec<TrustRow> = discover(&roots)
         .into_iter()
-        .map(|candidate| {
+        .filter_map(|candidate| {
+            if candidate.identity.kind.is_default_loaded() {
+                instructions.push(InstructionStatus {
+                    display: candidate.identity.display.clone(),
+                    loaded: candidate.digest.is_some(),
+                    error: candidate.read_error.clone(),
+                });
+                return None;
+            }
+            Some((candidate,))
+        })
+        .map(|(candidate,)| {
             let state = row_state(&view, &candidate);
             let unreadable = candidate.read_error.clone();
             let location = Some(candidate.primary_path.clone());
@@ -254,6 +278,8 @@ pub fn refresh(state: &mut AppState) {
             }
         })
         .collect();
+    instructions.sort_by(|left, right| left.display.cmp(&right.display));
+    state.trust.instructions = instructions;
     rows.sort_by(|left, right| {
         (left.section as u8, left.display()).cmp(&(right.section as u8, right.display()))
     });
@@ -574,6 +600,7 @@ fn state_label(state: &DefinitionTrust, t: &UiText) -> &'static str {
         DefinitionTrust::Trusted { .. }
         | DefinitionTrust::SessionTrusted { .. }
         | DefinitionTrust::FullAdopted
+        | DefinitionTrust::DefaultLoaded
         | DefinitionTrust::Builtin => t.trust.state_trusted,
         DefinitionTrust::Unapproved => t.trust.state_unapproved,
         DefinitionTrust::Changed { .. } => t.trust.state_changed,
@@ -586,6 +613,7 @@ fn state_marker(state: &DefinitionTrust) -> &'static str {
         DefinitionTrust::Trusted { .. }
         | DefinitionTrust::SessionTrusted { .. }
         | DefinitionTrust::FullAdopted
+        | DefinitionTrust::DefaultLoaded
         | DefinitionTrust::Builtin => "✓",
         DefinitionTrust::Unapproved => "○",
         DefinitionTrust::Changed { .. } => "!",
@@ -628,6 +656,7 @@ fn row_status_style(state: &DefinitionTrust, theme: &Theme) -> Style {
         DefinitionTrust::Trusted { .. }
         | DefinitionTrust::SessionTrusted { .. }
         | DefinitionTrust::FullAdopted
+        | DefinitionTrust::DefaultLoaded
         | DefinitionTrust::Builtin => Style::default().fg(theme.status.success),
         DefinitionTrust::Unapproved => Style::default().fg(theme.text.muted),
         DefinitionTrust::Changed { .. } => Style::default().fg(theme.status.warning),
@@ -682,6 +711,45 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
             format!("✓ {notice}"),
             Style::default().fg(theme.status.success),
         )));
+    }
+    lines.push(Line::from(Span::styled(
+        t.trust.section_instructions_default,
+        Style::default()
+            .fg(theme.accent.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if state.trust.instructions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", t.trust.instruction_missing),
+            Style::default().fg(theme.text.muted),
+        )));
+    } else {
+        for instruction in &state.trust.instructions {
+            if instruction.loaded {
+                lines.push(Line::from(vec![
+                    Span::styled("  ✓ ", Style::default().fg(theme.status.success)),
+                    Span::styled(safe(&instruction.display), Style::default()),
+                    Span::styled(
+                        format!("  {}", t.trust.instruction_loaded),
+                        Style::default().fg(theme.text.muted),
+                    ),
+                ]));
+            } else {
+                let error = instruction
+                    .error
+                    .as_deref()
+                    .map(safe)
+                    .unwrap_or_else(|| t.trust.instruction_unreadable.to_string());
+                lines.push(Line::from(vec![
+                    Span::styled("  × ", Style::default().fg(theme.status.error)),
+                    Span::styled(safe(&instruction.display), Style::default()),
+                    Span::styled(
+                        format!("  {}: {error}", t.trust.instruction_unreadable),
+                        Style::default().fg(theme.status.warning),
+                    ),
+                ]));
+            }
+        }
     }
     lines.push(Line::default());
     let rows = filtered_rows(state);
@@ -933,11 +1001,21 @@ mod tests {
         let mut state = app(&repo, &store);
         refresh(&mut state);
         assert!(
-            state
+            !state
                 .trust
                 .rows
                 .iter()
-                .any(|row| row.display() == "AGENTS.md" && row.is_pending())
+                .any(|row| row.display() == "AGENTS.md"),
+            "AGENTS.md is default project context, never a trust item"
+        );
+        assert!(
+            state
+                .trust
+                .instructions
+                .iter()
+                .any(|item| item.display == "AGENTS.md" && item.loaded),
+            "the page reports AGENTS.md as loaded: {:?}",
+            state.trust.instructions
         );
         let skill_index = filtered_rows(&state)
             .iter()
@@ -977,25 +1055,25 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let store = root.path().join("home");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("AGENTS.md"), "OLD\n").unwrap();
+        std::fs::create_dir_all(repo.join(".leveler/rules")).unwrap();
+        std::fs::write(repo.join(".leveler/rules/rule.md"), "OLD\n").unwrap();
         let mut state = app(&repo, &store);
         refresh(&mut state);
         state.trust.selected = filtered_rows(&state)
             .iter()
-            .position(|row| row.display() == "AGENTS.md")
+            .position(|row| row.display() == ".leveler/rules/rule.md")
             .unwrap();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE),
         );
-        std::fs::write(repo.join("AGENTS.md"), "NEW\n").unwrap();
+        std::fs::write(repo.join(".leveler/rules/rule.md"), "NEW\n").unwrap();
         refresh(&mut state);
         let row = state
             .trust
             .rows
             .iter()
-            .find(|row| row.display() == "AGENTS.md")
+            .find(|row| row.display() == ".leveler/rules/rule.md")
             .unwrap();
         assert!(matches!(row.state, DefinitionTrust::Changed { .. }));
         state.trust.detail_open = true;
@@ -1016,7 +1094,7 @@ mod tests {
                 .trust
                 .rows
                 .iter()
-                .find(|row| row.display() == "AGENTS.md")
+                .find(|row| row.display() == ".leveler/rules/rule.md")
                 .unwrap()
                 .state,
             DefinitionTrust::Unapproved
@@ -1029,7 +1107,6 @@ mod tests {
         let repo = root.path().join("repo");
         let store = root.path().join("home");
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("AGENTS.md"), "ROOT\n").unwrap();
         write_skill(&repo, "demo", "DEMO");
         let mut state = app(&repo, &store);
         refresh(&mut state);

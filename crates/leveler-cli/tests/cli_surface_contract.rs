@@ -182,9 +182,10 @@ fn trace_refuses_cleanly_when_this_repository_has_no_sessions() {
 
 #[test]
 fn a_group_command_without_its_subcommand_prints_usage() {
-    // `models` and `model` are groups: clap exits 2 with the usage text. That is
-    // the contract a script sees, so it is asserted rather than assumed.
-    for args in [["models"], ["model"]] {
+    // `models`, `model` and `theme` are groups: clap exits 2 with the usage
+    // text. That is the contract a script sees, so it is asserted rather than
+    // assumed.
+    for args in [["models"], ["model"], ["theme"]] {
         let home = scratch("group");
         let output = leveler(&home, &args);
         let rendered = text(&output);

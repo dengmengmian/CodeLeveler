@@ -346,9 +346,10 @@ pub fn agents_check(
     )
 }
 
-/// Every authority-bearing definition with its trust state. A definition that
-/// exists but is not approved is a First-Class warning: the user must know why
-/// project rules or an agent did not take effect.
+/// Every definition with its trust state. `AGENTS.md` is reported as default
+/// project context; a gated definition that exists but is not approved is a
+/// First-Class warning: the user must know why a rule, agent or skill did not
+/// take effect.
 pub fn definitions_check(
     roots: &leveler_definition_trust::DiscoveryRoots,
     trust: &leveler_definition_trust::DefinitionTrustView,
@@ -360,12 +361,25 @@ pub fn definitions_check(
             finding_id::DEFINITIONS_TRUST,
             None,
             DiagnosticCategory::Configuration,
-            vec!["no authority-bearing definitions on disk".into()],
+            vec!["no definitions on disk".into()],
         );
     }
     let mut pending = Vec::new();
     let mut store_unavailable = false;
+    let mut default_loaded = 0usize;
     for candidate in &candidates {
+        if candidate.identity.kind.is_default_loaded() {
+            if candidate.digest.is_some() {
+                default_loaded += 1;
+            } else {
+                pending.push(format!(
+                    "{} [{}] unreadable",
+                    candidate.identity.display,
+                    candidate.identity.kind.as_str()
+                ));
+            }
+            continue;
+        }
         let Some(digest) = &candidate.digest else {
             pending.push(format!(
                 "{} [{}] unreadable",
@@ -377,6 +391,7 @@ pub fn definitions_check(
         match trust.check(&candidate.identity, digest) {
             DefinitionTrust::Trusted { .. }
             | DefinitionTrust::Builtin
+            | DefinitionTrust::DefaultLoaded
             | DefinitionTrust::SessionTrusted { .. }
             | DefinitionTrust::FullAdopted => {}
             DefinitionTrust::Unapproved => pending.push(format!(
@@ -405,7 +420,11 @@ pub fn definitions_check(
             finding_id::DEFINITIONS_TRUST,
             None,
             DiagnosticCategory::Configuration,
-            vec![format!("{} definition(s), all trusted", candidates.len())],
+            vec![format!(
+                "{} gated definition(s), all trusted; {} project instruction file(s) loaded by default",
+                candidates.len() - default_loaded,
+                default_loaded
+            )],
         );
     }
     let mut evidence = vec![format!(

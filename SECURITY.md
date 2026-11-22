@@ -85,14 +85,31 @@ open is not trusted. `leveler trust show` reports the current state and
 The global `~/.leveler/hooks.yaml` and `~/.leveler/permissions.yaml` are your
 own files, outside any repository, and are not gated.
 
-## Project definitions are inert until trusted
+## AGENTS.md is default context; other definitions are inert until trusted
 
-Authority-bearing definitions are gated independently of the executable config
-above. This covers `<repo>/AGENTS.md`, every nested `AGENTS.md`,
-`.leveler/instructions.md`, `.leveler/rules/*.md`, declarative agents under
-`.leveler/agents`, skills under `.leveler/skills` and the compatible project
-roots (`.codex/skills`, `.agents/skills`, `.claude/skills`), plus the user-wide
-agent and skill roots (including `~/.leveler/agents` and `~/.leveler/skills`).
+`AGENTS.md` at any depth is the standard coding-agent project instruction entry
+point. It is loaded by default in Auto, Restricted, and Full, with no human
+trust approval: for a new project, the first creation, a content edit, a
+`git pull`, a config change, a session resume, or a nested directory scope. The
+current applicable bytes are read at the normal turn/context boundary.
+
+`AGENTS.md` is project **context**, never an authorization. Its content cannot
+grant shell, network, filesystem or external-path permissions; change the
+permission mode; write, approve, or revoke a trust record; bypass an approval;
+or make another definition trusted. Those paths are structural: default-loaded
+kinds are resolved before the trust store is consulted, and neither the
+permission profile nor the sandbox reads project rules. The loader still
+enforces the structured-read boundary — regular file, valid UTF-8, contained
+path, no symlink or path escape — and reports an unreadable or invalid file as
+a diagnostic instead of turning it into authority. Existing trust records for
+`AGENTS.md` remain readable and are left intact, but they are not consulted.
+
+The remaining authority-bearing definitions are gated independently of the
+executable config above. This covers `.leveler/instructions.md`,
+`.leveler/rules/*.md`, declarative agents under `.leveler/agents`, skills under
+`.leveler/skills` and the compatible project roots (`.codex/skills`,
+`.agents/skills`, `.claude/skills`), plus the user-wide agent and skill roots
+(including `~/.leveler/agents` and `~/.leveler/skills`).
 
 The gate is content-addressed, not path-addressed. A definition is admitted only
 when a human approved the exact bytes on disk:
@@ -101,10 +118,10 @@ when a human approved the exact bytes on disk:
   relative path) and to the SHA-256 of its content. For an agent, both
   `agent.yaml` and `instructions.md` contribute to one composite digest, so a
   trusted manifest with an edited instructions file is not trusted.
-- A file that exists but was never approved, or whose bytes changed after
-  approval, is **not** put into the model's control context. It is not treated
-  as an absent rule: the next turn receives a runtime-fact diagnostic naming the
-  path and the typed state (`unapproved` or `changed`).
+- A gated definition that exists but was never approved, or whose bytes changed
+  after approval, is **not** put into the model's control context. It is not
+  treated as an absent rule: the next turn receives a runtime-fact diagnostic
+  naming the path and the typed state (`unapproved` or `changed`).
 - A missing, corrupt, or future-schema trust store fails closed. A store that
   lives inside the repository is refused entirely, because that repository's
   own sandboxed execution could rewrite it.
@@ -131,14 +148,15 @@ when a human approved the exact bytes on disk:
   session. The tool call keeps its identity and continues after the decision;
   the turn, goal and plan are not restarted.
 - FullAccess adopts only what the **session creation baseline** captured, and
-  only for rule/skill content. The baseline is taken when this process creates
-  the session, before the first model call or tool execution. An agent-authored
-  edit therefore never equals its baseline entry, and a session resumed in a
-  new process has no credible baseline at all, so Full adopts nothing there
-  without a persistent approval. Adoption writes no store record, and switching
-  back to a non-Full mode stops it immediately. Declarative agent definitions
-  are never auto-adopted; their child tool surface still needs a persistent
-  approval.
+  only for gated rule/skill content. The baseline is taken when this process
+  creates the session, before the first model call or tool execution. An
+  agent-authored edit therefore never equals its baseline entry, and a session
+  resumed in a new process has no credible baseline at all, so Full adopts
+  nothing there without a persistent approval. `AGENTS.md` is outside this
+  baseline because it is default project context; declarative agent definitions
+  are never auto-adopted, and their child tool surface still needs a persistent
+  approval. Adoption writes no store record, and switching back to a non-Full
+  mode stops it immediately.
 - A corrupt, future-schema, or inside-project store fails the whole
   `leveler trust` approval or revocation transaction before the separate
   executable-config store is touched. A missing store is the normal first-run
@@ -161,8 +179,10 @@ model from reading an unapproved file through an ordinary tool and being
 influenced by its text; that is the general prompt-injection boundary of tool
 output, not an admission of the file as a trusted definition. It also does not
 change the OS write boundary: on Windows a confined shell can still create a
-previously missing `AGENTS.md` or a missing `.leveler` tree. Such a file is
-created but not admitted; the two facts are reported separately.
+previously missing `AGENTS.md`, and that file will be read as project context
+on the next turn. A previously missing `.leveler` tree can likewise be created,
+but its definitions are not admitted without approval. The two facts are
+reported separately.
 
 **FullAccess is a grant of the user's own authority, not a definition
 approval.** A FullAccess agent can write any user file, including the trust
@@ -255,9 +275,10 @@ closed instead of being truncated or returned unverified.
 (the admission gate above) is the release contract on every platform. Windows
 still lacks a name-based creation filter for an unprivileged token, so a
 confined shell can physically create a previously missing `AGENTS.md` or
-`.leveler` tree. Such a file is not admitted; the two facts are reported
-separately and the OS limitation is not claimed fixed. Existing protected
-objects remain write/delete/rename-fenced.
+`.leveler` tree. A new `AGENTS.md` is loaded as project context on the next
+turn; a new `.leveler` definition is created but not admitted. The two facts are
+reported separately and the OS limitation is not claimed fixed. Existing
+protected objects remain write/delete/rename-fenced.
 
 ## Approval, rules and resource boundaries
 
@@ -332,10 +353,12 @@ oversights. Reports that only restate them will be closed as known.
   held by the trusted runtime denies delete, rename and replace. A protected
   path that does not exist yet has no object for either mechanism: NTFS has no
   name-based creation filter for an unprivileged token, so a confined shell can
-  still create a new `AGENTS.md`, or a wholly missing `.leveler` tree. The
+  still create a new `AGENTS.md`, or a wholly missing `.leveler` tree. A new
+  `AGENTS.md` becomes project context on the next turn; it still cannot grant
+  execution authority. A new `.leveler` definition is not admitted, and the
   definition-writing tools and their consent remain the authority on such a
-  path, and the gap is tracked as an open platform limitation rather than
-  claimed closed.
+  path. The gap is tracked as an open platform limitation rather than claimed
+  closed.
 
 ## Resource grants
 

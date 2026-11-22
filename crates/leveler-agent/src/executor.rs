@@ -2899,7 +2899,7 @@ impl Executor {
                 status = status.as_str()
             );
             diagnostics.push(format!(
-                "The trusted-definition store is unavailable ({}), so NO project definition                  was loaded this turn. This fails closed; fix the store before relying on                  project rules.",
+                "The trusted-definition store is unavailable ({}), so gated project definitions are NOT loaded this turn. AGENTS.md project instructions still follow the default-load policy. Gated definitions fail closed; fix the store before relying on them.",
                 status.as_str()
             ));
         }
@@ -5098,7 +5098,8 @@ mod authority_classification {
     #[test]
     fn a_child_cannot_reload_an_unapproved_rule() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "CHILD-EVIL-RULE").unwrap();
+        std::fs::create_dir_all(dir.path().join(".leveler/rules")).unwrap();
+        std::fs::write(dir.path().join(".leveler/rules/evil.md"), "CHILD-EVIL-RULE").unwrap();
         let loaded = leveler_context::load_rules(
             dir.path(),
             &leveler_definition_trust::DefinitionTrustView::deny_all(),

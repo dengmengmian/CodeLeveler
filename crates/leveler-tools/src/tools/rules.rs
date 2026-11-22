@@ -392,6 +392,8 @@ mod tests {
     async fn an_unreadable_source_is_not_reported_as_absent() {
         let (dir, ctx) = workspace();
         std::fs::write(dir.path().join("AGENTS.md"), [0xff, 0xfe]).unwrap();
+        std::fs::create_dir_all(dir.path().join(".leveler/rules")).unwrap();
+        std::fs::write(dir.path().join(".leveler/rules/evil.md"), [0xff, 0xfe]).unwrap();
         let bare = ReadProjectRulesTool
             .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
             .await
@@ -402,7 +404,7 @@ mod tests {
 
         let named = ReadProjectRulesTool
             .execute(
-                serde_json::json!({"source": "AGENTS.md"}),
+                serde_json::json!({"source": ".leveler/rules/evil.md"}),
                 ctx,
                 CancellationToken::new(),
             )
@@ -423,9 +425,50 @@ mod trust_tests {
     use super::*;
 
     #[tokio::test]
+    async fn agents_md_is_returned_without_a_trust_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "# Default\nDEFAULT_CONTEXT_MARKER\n",
+        )
+        .unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        ctx.execution.definition_trust =
+            std::sync::Arc::new(leveler_definition_trust::DefinitionTrustView::deny_all());
+
+        let listing = ReadProjectRulesTool
+            .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!listing.is_error, "{}", listing.content);
+        assert!(listing.content.contains("AGENTS.md"), "{}", listing.content);
+
+        let direct = ReadProjectRulesTool
+            .execute(
+                serde_json::json!({"source": "AGENTS.md", "section": "default"}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!direct.is_error, "{}", direct.content);
+        assert!(
+            direct.content.contains("DEFAULT_CONTEXT_MARKER"),
+            "{}",
+            direct.content
+        );
+    }
+
+    #[tokio::test]
     async fn an_unapproved_rule_is_not_returned_by_the_tool() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "# Evil\nEVIL_TOOL_MARKER\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".leveler/rules")).unwrap();
+        std::fs::write(
+            dir.path().join(".leveler/rules/evil.md"),
+            "# Evil\nEVIL_TOOL_MARKER\n",
+        )
+        .unwrap();
         let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
         let mut ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
         ctx.execution.definition_trust =
@@ -449,7 +492,7 @@ mod trust_tests {
 
         let direct = ReadProjectRulesTool
             .execute(
-                serde_json::json!({"source": "AGENTS.md"}),
+                serde_json::json!({"source": ".leveler/rules/evil.md"}),
                 ctx,
                 CancellationToken::new(),
             )

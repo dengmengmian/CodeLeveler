@@ -335,8 +335,8 @@ mod tests {
     use crate::DefinitionKind;
     use tempfile::tempdir;
 
-    fn rule(rel: &str) -> DefinitionIdentity {
-        DefinitionIdentity::project(DefinitionKind::RootAgents, rel).unwrap()
+    fn rule(_rel: &str) -> DefinitionIdentity {
+        DefinitionIdentity::project(DefinitionKind::RuleFile, ".leveler/rules/base.md").unwrap()
     }
 
     fn skill(name: &str) -> DefinitionIdentity {
@@ -433,7 +433,8 @@ mod tests {
     #[test]
     fn capturing_a_project_baseline_skips_agent_definitions() {
         let project = tempdir().unwrap();
-        std::fs::write(project.path().join("AGENTS.md"), "root").unwrap();
+        std::fs::create_dir_all(project.path().join(".leveler/rules")).unwrap();
+        std::fs::write(project.path().join(".leveler/rules/base.md"), "root").unwrap();
         std::fs::create_dir_all(project.path().join(".leveler/agents/x")).unwrap();
         std::fs::write(
             project.path().join(".leveler/agents/x/agent.yaml"),

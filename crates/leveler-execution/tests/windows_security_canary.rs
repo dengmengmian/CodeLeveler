@@ -705,13 +705,13 @@ async fn the_definition_trust_store_is_unreachable_for_a_confined_shell() {
     let _ = std::fs::remove_dir_all(&trust_home);
 }
 
-/// TD-02 / TD-03: a confined shell can create the file (the OS gap) but the
-/// trust gate refuses its bytes until a human approves them; approval admits
-/// exactly those bytes, and a later confined edit invalidates it. This is the
-/// Property A / Property B split observed on a real NTFS tree.
+/// TD-02 / TD-03: a confined shell can create `AGENTS.md` (the OS gap).
+/// Under the default-context policy its bytes are delivered as project
+/// instructions, never as execution authority, and a legacy trust record is
+/// neither required nor consulted. Nested AGENTS.md follows the same rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real Windows OS security canary; needs leveler-confine.exe and a scratch workspace"]
-async fn a_shell_created_agents_md_is_created_but_not_admitted() {
+async fn a_shell_created_agents_md_is_default_project_context() {
     use leveler_definition_trust::{
         ApprovalSurface, DefinitionTrustView, approve, discover_project,
     };
@@ -728,7 +728,8 @@ async fn a_shell_created_agents_md_is_created_but_not_admitted() {
     let _ = std::fs::remove_dir_all(&trust_home);
     std::fs::create_dir_all(&trust_home).unwrap();
 
-    // Root AGENTS.md: OS creation succeeds, admission does not.
+    // Root AGENTS.md: OS creation succeeds, and the current bytes load as
+    // project context without a trust decision.
     std::fs::remove_file(canary.root.join("AGENTS.md")).unwrap();
     canary.run("td02-create", "echo FORGED> AGENTS.md").await;
     let created = canary.read("AGENTS.md");
@@ -745,16 +746,20 @@ async fn a_shell_created_agents_md_is_created_but_not_admitted() {
         &leveler_definition_trust::DefinitionIdentity::single_digest(&probe_bytes),
     );
     assert!(
-        !decision.admits(),
-        "fresh store must not admit: {decision:?} status={:?}",
+        matches!(
+            decision,
+            leveler_definition_trust::DefinitionTrust::DefaultLoaded
+        ),
+        "AGENTS.md is default context: {decision:?} status={:?}",
         view.status()
     );
-    let unapproved = leveler_context::load_rules(&canary.root, &view);
-    assert!(unapproved.documents.is_empty(), "{unapproved:?}");
-    assert_eq!(unapproved.untrusted.len(), 1, "{unapproved:?}");
-    assert_eq!(unapproved.untrusted[0].state, "unapproved");
+    let loaded = leveler_context::load_rules(&canary.root, &view);
+    assert_eq!(loaded.documents.len(), 1, "{loaded:?}");
+    assert!(loaded.documents[0].content.contains("FORGED"));
+    assert!(loaded.untrusted.is_empty(), "{loaded:?}");
 
-    // Exact-byte approval admits the current content.
+    // Legacy AGENTS.md trust records remain readable and do not change the
+    // default-context result.
     let requests: Vec<_> = discover_project(&canary.root)
         .iter()
         .filter_map(|candidate| candidate.approval_request().ok())
@@ -765,10 +770,9 @@ async fn a_shell_created_agents_md_is_created_but_not_admitted() {
     assert_eq!(approved.documents.len(), 1, "{approved:?}");
     assert!(approved.documents[0].content.contains("FORGED"));
 
-    // A later edit changes the bytes; the old approval no longer covers them.
-    // The confined append is denied by the OS boundary (the file now exists and
-    // is Medium), so the edit is made by the trusted host, which is exactly the
-    // case the content digest must catch.
+    // A later edit changes the bytes. The confined append is denied by the OS
+    // boundary (the file now exists and is Medium), so the edit is made by the
+    // trusted host; the next normal read still delivers the current bytes.
     canary
         .run("td02-append-denied", "echo MORE>> AGENTS.md")
         .await;
@@ -780,8 +784,9 @@ MORE
     )
     .unwrap();
     let changed = leveler_context::load_rules(&canary.root, &approved_view);
-    assert!(changed.documents.is_empty(), "{changed:?}");
-    assert_eq!(changed.untrusted[0].state, "changed");
+    assert_eq!(changed.documents.len(), 1, "{changed:?}");
+    assert!(changed.documents[0].content.contains("MORE"));
+    assert!(changed.untrusted.is_empty(), "{changed:?}");
 
     // A nested AGENTS.md in a directory that did not exist at approval time:
     // same two properties at depth, with no prior record to be "changed".
@@ -798,30 +803,31 @@ MORE
         &["src/new/lib.rs".to_string()],
         &approved_view,
     );
-    assert!(nested.documents.is_empty(), "{nested:?}");
-    assert_eq!(nested.untrusted[0].state, "unapproved");
+    assert_eq!(nested.documents.len(), 1, "{nested:?}");
+    assert!(nested.documents[0].content.contains("NESTED-FORGED"));
+    assert!(nested.untrusted.is_empty(), "{nested:?}");
 
     canary.record(
         "TD-02",
         if created.is_some()
-            && unapproved.documents.is_empty()
+            && loaded.documents.len() == 1
             && approved.documents.len() == 1
-            && changed.documents.is_empty()
+            && changed.documents.len() == 1
         {
             "PASS"
         } else {
             "FAIL"
         },
-        "root AGENTS.md: created by Low shell; not admitted; admitted after exact-byte approval; changed bytes not admitted",
+        "root AGENTS.md: created by Low shell; loaded as default project context; legacy approval does not change it; edited bytes load at the next read",
     );
     canary.record(
         "TD-03",
-        if nested_created.is_some() && nested.documents.is_empty() {
+        if nested_created.is_some() && nested.documents.len() == 1 {
             "PASS"
         } else {
             "FAIL"
         },
-        "nested AGENTS.md: created by Low shell; not admitted by the scoped loader",
+        "nested AGENTS.md: created by Low shell; loaded as scoped project context",
     );
     let mut report = String::from("id,verdict,detail\n");
     for (id, verdict, detail) in &canary.results {

@@ -383,6 +383,7 @@ fn ui_state(state: &DefinitionTrust) -> UiDefinitionTrustState {
         DefinitionTrust::StoreUnavailable { .. } => UiDefinitionTrustState::StoreUnavailable,
         DefinitionTrust::Trusted { .. }
         | DefinitionTrust::Builtin
+        | DefinitionTrust::DefaultLoaded
         | DefinitionTrust::FullAdopted => UiDefinitionTrustState::Other,
     }
 }

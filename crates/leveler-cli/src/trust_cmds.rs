@@ -5,9 +5,13 @@
 //! - in-repo executable configuration (`.leveler/hooks.yaml`,
 //!   `.leveler/permissions.yaml`, and a `.leveler/config.yaml` that raises the
 //!   default mode), which can run commands or grant standing approval;
-//! - authority-bearing definitions (`AGENTS.md` at any depth, `.leveler`
-//!   instructions/rules, declarative agents and skills), which the harness puts
-//!   into the model's control context.
+//! - gated definitions (`.leveler` instructions/rules, declarative agents and
+//!   skills), which the harness puts into the model's control context only
+//!   after a human approves their exact bytes.
+//!
+//! `AGENTS.md` at any depth is standard project context and is loaded by
+//! default in every mode; it is reported separately and never appears as a
+//! pending trust item.
 //!
 //! Trust is content-addressed: approving records the digest of the exact bytes
 //! the person was shown. Any later edit invalidates it. The agent has no trust
@@ -69,6 +73,37 @@ impl DefinitionState {
     }
 }
 
+/// One `AGENTS.md` as project context. It has no trust state.
+#[derive(Debug, Clone)]
+struct InstructionRow {
+    display: String,
+    loaded: bool,
+    error: Option<String>,
+}
+
+fn instruction_rows(home: &Path, repo: &Path) -> Vec<InstructionRow> {
+    let environment = leveler_core::environment();
+    let roots = DiscoveryRoots::resolve(environment, Some(repo.to_path_buf()));
+    let view = DefinitionTrustView::load(home, Some(repo));
+    let mut rows: Vec<InstructionRow> = discover(&roots)
+        .into_iter()
+        .filter(|candidate| candidate.identity.kind.is_default_loaded())
+        .map(|candidate| {
+            let loaded = candidate
+                .digest
+                .as_deref()
+                .is_some_and(|digest| view.check(&candidate.identity, digest).admits());
+            InstructionRow {
+                display: candidate.identity.display,
+                loaded,
+                error: candidate.read_error,
+            }
+        })
+        .collect();
+    rows.sort_by(|left, right| left.display.cmp(&right.display));
+    rows
+}
+
 /// One discovered definition with its trust state.
 #[derive(Debug, Clone)]
 struct DefinitionRow {
@@ -84,6 +119,9 @@ fn definition_rows(home: &Path, repo: &Path) -> Vec<DefinitionRow> {
     let view = DefinitionTrustView::load(home, Some(repo));
     discover(&roots)
         .into_iter()
+        // AGENTS.md is default project context, not a trust object. It never
+        // appears as a pending or approved item in the trust inventory.
+        .filter(|candidate| !candidate.identity.kind.is_default_loaded())
         .map(|candidate| {
             let state = match &candidate.digest {
                 None => DefinitionState::Unreadable {
@@ -107,10 +145,12 @@ fn definition_rows(home: &Path, repo: &Path) -> Vec<DefinitionRow> {
                     DefinitionTrust::StoreUnavailable { status } => DefinitionState::Unreadable {
                         error: format!("trust store unavailable ({})", status.as_str()),
                     },
-                    DefinitionTrust::Builtin => DefinitionState::Trusted {
-                        digest: digest.clone(),
-                        version: 0,
-                    },
+                    DefinitionTrust::Builtin | DefinitionTrust::DefaultLoaded => {
+                        DefinitionState::Trusted {
+                            digest: digest.clone(),
+                            version: 0,
+                        }
+                    }
                     // The CLI reads the persistent store without a session
                     // overlay; these cannot occur here. Map them to the state
                     // their admission means rather than inventing an approval.
@@ -508,11 +548,10 @@ fn print_unified_diff(old: &str, new: &str) {
     }
 }
 
-/// Ignored in-repo config as display paths, for the TUI boot notice.
-///
-/// Definitions are deliberately absent: an untrusted skill or AGENTS.md is
-/// skipped silently at startup. The one lightweight AGENTS.md hint is
-/// [`definition_trust_notice`], printed once per project by the launcher.
+/// Ignored in-repo executable config as display paths, for the TUI boot
+/// notice. Definitions are deliberately absent: unapproved skills are skipped
+/// silently at startup, and `AGENTS.md` is default project context rather than
+/// a trust object.
 pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<String> {
     let home = leveler_home();
     leveler_execution::untrusted_project_files(&home, repo_root)
@@ -529,9 +568,10 @@ pub(crate) fn untrusted_config_display(repo_root: &std::path::Path) -> Vec<Strin
         .collect()
 }
 
-/// A store the gate cannot use is not a quiet skip: no project definition can
-/// be admitted until it is repaired. Printed on every launch (it is a
-/// configuration failure, not a one-time hint).
+/// A store the gate cannot use is not a quiet skip: definitions that need
+/// approval cannot be admitted until it is repaired. `AGENTS.md` still loads
+/// by default. Printed on every launch (it is a configuration failure, not a
+/// one-time hint).
 pub(crate) fn definition_trust_store_warning(repo_root: &std::path::Path) -> Option<String> {
     definition_trust_store_warning_in(&leveler_home(), repo_root)
 }
@@ -546,103 +586,10 @@ fn definition_trust_store_warning_in(home: &Path, repo_root: &std::path::Path) -
     )
     .then(|| {
         format!(
-            "⚠ 定义信任库不可用（{}）；本轮不会加载任何项目定义。运行 leveler doctor 查看。",
+            "⚠ 定义信任库不可用（{}）；需要授权的定义本轮不会加载（AGENTS.md 仍按默认策略加载）。运行 leveler doctor 查看。",
             status.as_str()
         )
     })
-}
-
-/// The one lightweight startup hint for an untrusted root `AGENTS.md`.
-///
-/// Shown once per (project, exact digest) on this machine: a marker under the
-/// Leveler home records the canonical project domain and the digest, so a
-/// session resume, TUI redraw or relaunch of the same bytes does not repeat it,
-/// while a later content change is a new fact worth one notice. FullAccess
-/// adopts the session baseline and suppresses the hint entirely. A store/config
-/// failure is not hidden by this quiet path; `leveler doctor` and `/trust`
-/// still report it.
-pub(crate) fn definition_trust_notice(
-    repo_root: &std::path::Path,
-    full_access: bool,
-) -> Option<String> {
-    definition_trust_notice_in(&leveler_home(), repo_root, full_access)
-}
-
-fn definition_trust_notice_in(
-    home: &Path,
-    repo_root: &std::path::Path,
-    full_access: bool,
-) -> Option<String> {
-    if full_access {
-        return None;
-    }
-    // Only the root AGENTS.md matters for this hint. Hashing every skill in
-    // the project just to announce one file would be a startup regression.
-    let path = repo_root.join("AGENTS.md");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        // A missing file is not a hint. An existing but unreadable one is an
-        // error path; say so rather than hiding it behind the quiet default.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            return Some(format!(
-                "⚠ 无法读取项目指令 AGENTS.md（{error}）；其内容不会进入模型上下文。"
-            ));
-        }
-    };
-    let identity = leveler_definition_trust::DefinitionIdentity::project(
-        leveler_definition_trust::DefinitionKind::RootAgents,
-        "AGENTS.md",
-    )?;
-    let digest = leveler_definition_trust::DefinitionIdentity::single_digest(&bytes);
-    let view = DefinitionTrustView::load(home, Some(repo_root));
-    let state = match view.check(&identity, &digest) {
-        DefinitionTrust::Unapproved => DefinitionState::Unapproved {
-            digest: Some(digest.clone()),
-        },
-        DefinitionTrust::Changed { approved_digest } => DefinitionState::Changed {
-            digest: digest.clone(),
-            approved: approved_digest,
-        },
-        // Trusted, a session/full admission that cannot occur on this surface,
-        // or a store the separate warning already explains.
-        _ => return None,
-    };
-    // One notice per (project, exact root-AGENTS digest). The first appearance
-    // and a later content change are different facts; a resume, a redraw or a
-    // relaunch of the same bytes is not.
-    let domain = leveler_definition_trust::project_domain(repo_root);
-    let marker = home.join("state").join("trust-notice-seen");
-    let key = format!("{domain}\t{digest}");
-    let already = std::fs::read_to_string(&marker)
-        .ok()
-        .is_some_and(|seen| seen.lines().any(|line| line == key));
-    if already {
-        return None;
-    }
-    if let Some(parent) = marker.parent()
-        && std::fs::create_dir_all(parent).is_ok()
-    {
-        use std::io::Write as _;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        if let Ok(mut file) = options.open(&marker) {
-            let _ = writeln!(file, "{key}");
-        }
-    }
-    let display = identity.display;
-    let message = match state {
-        DefinitionState::Changed { .. } => {
-            format!("ℹ 项目指令 {display} 内容已变化，输入 /trust 查看差异并重新信任。")
-        }
-        _ => format!("ℹ 项目指令 {display} 尚未信任，输入 /trust 可管理。"),
-    };
-    Some(message)
 }
 
 /// The startup notice names config files that are ignored. An untrusted
@@ -708,6 +655,36 @@ fn print_status(home: &std::path::Path, repo: &std::path::Path) {
                 short(&digest),
                 purpose(&relative)
             ),
+        }
+    }
+    println!();
+    println!(
+        "{}",
+        Line::heading("Project instructions (loaded by default; no approval)")
+    );
+    let instructions = instruction_rows(home, repo);
+    if instructions.is_empty() {
+        println!("  (none found)");
+    }
+    for instruction in instructions {
+        if instruction.loaded {
+            println!(
+                "  {}  {}",
+                sanitize_line(&instruction.display),
+                Line::ok("loaded by default")
+            );
+        } else {
+            println!(
+                "  {}  {}: {}",
+                sanitize_line(&instruction.display),
+                Line::warn("unreadable"),
+                sanitize_line(
+                    instruction
+                        .error
+                        .as_deref()
+                        .unwrap_or("the file could not be read")
+                )
+            );
         }
     }
     println!();
@@ -907,44 +884,6 @@ mod tests {
             }
         }
         out
-    }
-
-    #[test]
-    fn the_agents_hint_is_once_per_digest_and_returns_on_a_change() {
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("AGENTS.md"), "ONE\n").unwrap();
-        let first = definition_trust_notice_in(home.path(), repo.path(), false).unwrap();
-        assert!(first.contains("尚未信任"), "{first}");
-        assert!(
-            definition_trust_notice_in(home.path(), repo.path(), false).is_none(),
-            "the same bytes must not be announced twice"
-        );
-        // Approve the first version, then edit it: the new digest is `changed`
-        // and gets one fresh hint.
-        let row = definition_rows(home.path(), repo.path())
-            .into_iter()
-            .find(|row| row.display == "AGENTS.md")
-            .unwrap();
-        approve(
-            home.path(),
-            repo.path(),
-            &[row.candidate.approval_request().unwrap()],
-            ApprovalSurface::Cli,
-        )
-        .unwrap();
-        std::fs::write(repo.path().join("AGENTS.md"), "TWO\n").unwrap();
-        let changed = definition_trust_notice_in(home.path(), repo.path(), false).unwrap();
-        assert!(changed.contains("内容已变化"), "{changed}");
-        assert!(
-            definition_trust_notice_in(home.path(), repo.path(), false).is_none(),
-            "the changed digest is announced once"
-        );
-        std::fs::write(repo.path().join("AGENTS.md"), "THREE\n").unwrap();
-        assert!(
-            definition_trust_notice_in(home.path(), repo.path(), true).is_none(),
-            "FullAccess suppresses the hint"
-        );
     }
 
     #[test]

@@ -73,16 +73,18 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
     let agents_id = DefinitionIdentity::project(DefinitionKind::RootAgents, "AGENTS.md").unwrap();
     let skill_id =
         DefinitionIdentity::project(DefinitionKind::Skill, ".leveler/skills/demo").unwrap();
+    // AGENTS.md is ordinary project context: default-loaded, outside the
+    // Full baseline and outside the persistent trust store.
     assert_eq!(
         view.check(&agents_id, &agents_digest),
-        DefinitionTrust::FullAdopted
+        DefinitionTrust::DefaultLoaded
     );
     assert_eq!(
         view.check(&skill_id, &skill_digest),
         DefinitionTrust::FullAdopted
     );
-    // The rule loader uses the same view: the baseline AGENTS.md is actually
-    // delivered as project instruction, not merely reported as admitted.
+    // The rule loader uses the same view: the AGENTS.md is actually delivered
+    // as project instruction, not merely reported as admitted.
     let loaded = leveler_context::load_rules(&repo, &view);
     assert!(
         loaded
@@ -108,7 +110,8 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
         DefinitionTrust::Unapproved
     );
 
-    // An edit after the baseline is not the adopted content.
+    // AGENTS.md edits are project context, not trust state: the current
+    // applicable bytes load at the next read regardless of the Full baseline.
     std::fs::write(&agents, "AGENT WROTE THIS\n").unwrap();
     let edited = digest_of(&agents);
     assert_ne!(edited, agents_digest);
@@ -126,18 +129,18 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
         .unwrap();
     assert_eq!(
         (*engine.factory.tool_context.execution.definition_trust).check(&agents_id, &edited),
-        DefinitionTrust::Unapproved
+        DefinitionTrust::DefaultLoaded
     );
     let loaded = leveler_context::load_rules(
         &repo,
         &engine.factory.tool_context.execution.definition_trust,
     );
     assert!(
-        !loaded
+        loaded
             .documents
             .iter()
-            .any(|rule| rule.source == "AGENTS.md"),
-        "an agent edit after the baseline must not be delivered as authority"
+            .any(|rule| rule.source == "AGENTS.md" && rule.content.contains("AGENT WROTE THIS")),
+        "the current AGENTS.md must be delivered as project context"
     );
 
     // Leaving Full stops adoption; the persistent store was never written.
@@ -156,7 +159,7 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
         .unwrap();
     assert_eq!(
         (*engine.factory.tool_context.execution.definition_trust).check(&agents_id, &agents_digest),
-        DefinitionTrust::Unapproved
+        DefinitionTrust::DefaultLoaded
     );
     assert_eq!(
         leveler_definition_trust::DefinitionTrustStore::load(&home).status(),
@@ -181,9 +184,15 @@ async fn full_adopts_the_creation_baseline_and_never_promotes_later_edits() {
         )
         .await
         .unwrap();
+    let resumed_view = (*engine.factory.tool_context.execution.definition_trust).clone();
     assert_eq!(
-        (*engine.factory.tool_context.execution.definition_trust).check(&skill_id, &skill_digest),
+        resumed_view.check(&skill_id, &skill_digest),
         DefinitionTrust::Unapproved,
         "a resumed session has no credible Full baseline"
+    );
+    assert_eq!(
+        resumed_view.check(&agents_id, &edited),
+        DefinitionTrust::DefaultLoaded,
+        "AGENTS.md is default project context and does not depend on session provenance"
     );
 }
