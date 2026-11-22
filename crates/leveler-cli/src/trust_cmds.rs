@@ -205,11 +205,17 @@ pub(crate) fn cmd_trust(
             match revoke_definition(&home, &repo, &row.candidate.identity) {
                 Ok(true) => println!(
                     "{}",
-                    Line::ok(&format!("revoked approval for `{}`", row.display))
+                    Line::ok(&format!(
+                        "revoked approval for `{}`",
+                        sanitize_line(&row.display)
+                    ))
                 ),
                 Ok(false) => println!(
                     "{}",
-                    Line::warn(&format!("`{}` had no approval", row.display))
+                    Line::warn(&format!(
+                        "`{}` had no approval",
+                        sanitize_line(&row.display)
+                    ))
                 ),
                 Err(error) => {
                     println!("{}", Line::fail(&error.to_string()));
@@ -293,7 +299,12 @@ pub(crate) fn cmd_trust(
                 println!("{}", Line::heading("Untrusted definitions"));
                 for row in &pending_definitions {
                     let digest = row.state.current_digest().map(short).unwrap_or_default();
-                    println!("  {}  [{}] {}", row.display, row.kind, row.state.label());
+                    println!(
+                        "  {}  [{}] {}",
+                        sanitize_line(&row.display),
+                        sanitize_line(row.kind),
+                        row.state.label()
+                    );
                     if !digest.is_empty() {
                         println!("    sha256:{digest}");
                     }
@@ -389,7 +400,12 @@ fn print_unreadable(rows: &[&DefinitionRow]) {
         let DefinitionState::Unreadable { error } = &row.state else {
             continue;
         };
-        println!("  {}  [{}] {}", row.display, row.kind, error);
+        println!(
+            "  {}  [{}] {}",
+            sanitize_line(&row.display),
+            sanitize_line(row.kind),
+            sanitize_line(error)
+        );
     }
     println!();
 }
@@ -436,7 +452,10 @@ fn print_definition_diff(home: &Path, repo: &Path, path: &str) {
             };
             println!(
                 "{}",
-                Line::heading(&format!("Diff for `{}` (approved → current)", row.display))
+                Line::heading(&format!(
+                    "Diff for `{}` (approved → current)",
+                    sanitize_line(&row.display)
+                ))
             );
             print_unified_diff(
                 &String::from_utf8_lossy(&old),
@@ -452,7 +471,7 @@ fn print_definition_diff(home: &Path, repo: &Path, path: &str) {
                 "{}",
                 Line::warn(&format!(
                     "`{}` has no approved version; current content follows",
-                    row.display
+                    sanitize_line(&row.display)
                 ))
             );
             for (index, line) in String::from_utf8_lossy(&current).lines().enumerate() {
@@ -466,7 +485,11 @@ fn print_definition_diff(home: &Path, repo: &Path, path: &str) {
         DefinitionState::Unreadable { error } => {
             println!(
                 "{}",
-                Line::fail(&format!("`{}` is unreadable: {error}", row.display))
+                Line::fail(&format!(
+                    "`{}` is unreadable: {}",
+                    sanitize_line(&row.display),
+                    sanitize_line(error)
+                ))
             );
         }
     }
@@ -695,11 +718,13 @@ fn print_status(home: &std::path::Path, repo: &std::path::Path) {
         return;
     }
     for row in rows {
+        let display = sanitize_line(&row.display);
+        let kind = sanitize_line(row.kind);
         match row.state {
             DefinitionState::Trusted { digest, version } => println!(
                 "  {}\n    [{}] {} sha256:{} (approval v{version})",
-                row.display,
-                row.kind,
+                display,
+                kind,
                 Line::ok("trusted"),
                 short(&digest)
             ),
@@ -709,8 +734,8 @@ fn print_status(home: &std::path::Path, repo: &std::path::Path) {
                     .unwrap_or_default();
                 println!(
                     "  {}\n    [{}] {}{digest} — approve with `leveler trust`",
-                    row.display,
-                    row.kind,
+                    display,
+                    kind,
                     Line::warn("new (ignored)")
                 );
             }
@@ -719,18 +744,19 @@ fn print_status(home: &std::path::Path, repo: &std::path::Path) {
                 ref approved,
             } => println!(
                 "  {}\n    [{}] {} sha256:{} (approved sha256:{}) — `leveler trust diff {}`",
-                row.display,
-                row.kind,
+                display,
+                kind,
                 Line::warn(row.state.label()),
                 short(digest),
                 short(approved),
-                row.display
+                display
             ),
             DefinitionState::Unreadable { error } => println!(
-                "  {}\n    [{}] {} {error}",
-                row.display,
-                row.kind,
-                Line::warn("unreadable")
+                "  {}\n    [{}] {} {}",
+                display,
+                kind,
+                Line::warn("unreadable"),
+                sanitize_line(&error)
             ),
         }
     }
