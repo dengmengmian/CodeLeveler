@@ -505,7 +505,8 @@ fn ret(value: u32) -> libc::sock_filter {
 
 #[cfg(target_arch = "x86_64")]
 const fn native_arch() -> u32 {
-    libc::AUDIT_ARCH_X86_64
+    // AUDIT_ARCH_X86_64; the pinned libc does not export it.
+    0xC000_003E
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1925,5 +1926,16 @@ mod tests {
             })
             .count();
         assert_eq!(io_uring, 1);
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn native_arch_is_the_linux_audit_arch() {
+        // linux/audit.h: AUDIT_ARCH_<arch> = EM_<arch> | 64BIT | LE.
+        const AUDIT_64BIT_LE: u32 = 0xC000_0000;
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(native_arch(), AUDIT_64BIT_LE | libc::EM_X86_64 as u32);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(native_arch(), AUDIT_64BIT_LE | libc::EM_AARCH64 as u32);
     }
 }
