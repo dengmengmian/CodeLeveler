@@ -485,6 +485,23 @@ pub async fn resolve_git_grant_with_environment(
         bindings,
     }))
 }
+
+/// Whether a command could consume a stored remote credential.
+///
+/// Admission asks this only after [`resolve_git_grant_with_environment`]
+/// failed. At that point the request's real bindings are unknown, so the
+/// profile's blanket Auto cannot stand for a command that may reach a
+/// remote: "unresolved" is not "no credential". A resolved local Git read
+/// (`git status`, `git diff`) cannot use one and keeps the profile decision.
+pub fn git_command_may_use_a_credential(program: &str, args: &[String]) -> bool {
+    let effects = crate::executed_commands(program, args).git_effects();
+    effects.any_git
+        && (effects.unresolved
+            || effects.explicit_remote
+            || effects.effects.remote_read
+            || effects.effects.remote_write)
+}
+
 fn push_binding(bindings: &mut Vec<GrantBinding>, binding: GrantBinding) {
     if !bindings.contains(&binding) {
         bindings.push(binding);
@@ -945,6 +962,40 @@ mod tests {
             assert!(
                 got.is_none(),
                 "a dangerous sibling must keep exact-call approval: {script}"
+            );
+        }
+    }
+
+    /// Admission's fallback after a failed resolution: remote-reaching Git
+    /// counts as credential-capable, local Git does not.
+    #[test]
+    fn credential_capable_git_is_recognized_without_a_resolution() {
+        let argv = |program: &str, script: &str| {
+            (
+                program.to_string(),
+                vec!["-c".to_string(), script.to_string()],
+            )
+        };
+        for (program, args) in [
+            argv("sh", "git fetch https://example.com/private.git"),
+            argv("sh", "git push origin main"),
+            argv("sh", "git ls-remote origin"),
+            argv("sh", "git -C . fetch origin"),
+            argv("sh", "git fetch --upload-pack=./helper origin"),
+        ] {
+            assert!(
+                git_command_may_use_a_credential(&program, &args),
+                "{args:?} may reach a remote"
+            );
+        }
+        for (program, args) in [
+            argv("sh", "git status"),
+            argv("sh", "git log --oneline -5"),
+            argv("sh", "cargo test"),
+        ] {
+            assert!(
+                !git_command_may_use_a_credential(&program, &args),
+                "{args:?} cannot use a remote credential"
             );
         }
     }

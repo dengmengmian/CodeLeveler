@@ -880,12 +880,27 @@ impl Executor {
                 }
                 Ok(_) => requirement,
                 Err(reason) => {
-                    tracing::debug!(
-                        tool = %call.name,
-                        %reason,
-                        "credential requirement unresolved; keeping the profile decision"
-                    );
-                    requirement
+                    // An unresolved request is not evidence of "no stored
+                    // credential". A command that may reach a remote keeps
+                    // the decision this phase exists to make; only a resolved
+                    // local Git read can fall back to the profile's Auto.
+                    if program.as_deref().is_some_and(|program| {
+                        leveler_execution::git_command_may_use_a_credential(program, &args)
+                    }) {
+                        tracing::debug!(
+                            tool = %call.name,
+                            %reason,
+                            "credential requirement unresolved; asking instead of allowing"
+                        );
+                        Requirement::NeedApproval
+                    } else {
+                        tracing::debug!(
+                            tool = %call.name,
+                            %reason,
+                            "credential requirement unresolved; keeping the profile decision"
+                        );
+                        requirement
+                    }
                 }
             }
         } else {
@@ -4123,6 +4138,66 @@ mod authorize_tests {
             PolicyResolution::Ask(_) => {}
             other => panic!(
                 "an explicit URL with a stored credential must ask before it uses it: {other:?}"
+            ),
+        }
+    }
+
+    /// When the host cannot resolve what a credential-capable Git command
+    /// would touch, admission must not fall back to the profile's blanket
+    /// Auto. A non-repository workspace makes the identity query fail
+    /// (`git config --local` has no local scope there), which used to leave
+    /// `git fetch <url>` allowed under Assisted even though the destination
+    /// may have a stored credential. "Unresolvable" is not "no credential".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresolvable_credential_capable_git_command_asks() {
+        use leveler_core::EnvSnapshot;
+        use leveler_execution::PolicyResolution;
+        use std::ffi::OsString;
+
+        // Deliberately NOT a repository: the host-side grant resolution fails
+        // here, so the decision has to come from the failure path alone.
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[credential]\n\
+             \thelper = \"!f() { echo username=leveler-test; echo password=s3cret; }; f\"\n",
+        )
+        .unwrap();
+        let mut vars: Vec<(OsString, OsString)> = Vec::new();
+        if let Some(path) = leveler_core::environment().var_os_case_insensitive("PATH") {
+            vars.push((OsString::from("PATH"), path));
+        }
+        vars.push((
+            OsString::from("HOME"),
+            OsString::from(home.path().as_os_str()),
+        ));
+        let env = EnvSnapshot::new(vars, home.path().to_path_buf(), home.path().to_path_buf());
+
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let tool_context =
+            ToolContext::with_environment(workspace, PermissionProfile::Assisted, Arc::new(env));
+        let exec = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        );
+
+        match resolve(
+            &exec,
+            &call(
+                "shell_command",
+                serde_json::json!({"cmd": "git fetch https://example.com/private.git"}),
+            ),
+        )
+        .await
+        {
+            PolicyResolution::Ask(_) => {}
+            other => panic!(
+                "an unresolvable credential-capable Git command must ask, not allow: {other:?}"
             ),
         }
     }

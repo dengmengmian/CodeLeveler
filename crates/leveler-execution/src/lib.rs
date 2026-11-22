@@ -117,9 +117,9 @@ pub use workspace::{Workspace, WorkspaceError, is_sensitive_file_name};
 #[cfg(windows)]
 pub use resource_identity::filesystem_resource_from_raw_handle;
 pub use resource_identity::{
-    filesystem_resource_from_metadata, resolve_filesystem_resource, resolve_git_grant,
-    resolve_git_grant_with_environment, resolve_project_identity,
-    resolve_project_identity_with_environment,
+    filesystem_resource_from_metadata, git_command_may_use_a_credential,
+    resolve_filesystem_resource, resolve_git_grant, resolve_git_grant_with_environment,
+    resolve_project_identity, resolve_project_identity_with_environment,
 };
 
 pub mod process_identity;
