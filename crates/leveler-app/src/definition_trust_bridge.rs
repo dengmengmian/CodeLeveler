@@ -56,15 +56,21 @@ pub(crate) fn resolve_definition_trust(
     session_id: Option<&SessionId>,
     decision: DefinitionTrustDecision,
 ) -> Result<(), leveler_client_protocol::ClientError> {
+    // The answer must name the session it is for. A request id alone is not
+    // enough: a client attached to another session must not be able to settle
+    // a waiter it was never shown.
+    let Some(session_id) = session_id else {
+        return Err(leveler_client_protocol::ClientError::Runtime(
+            "definition-trust decision requires a session".to_string(),
+        ));
+    };
     let entry = {
         let mut map = pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match map.get(request_id) {
             Some(entry) => {
-                if let Some(session_id) = session_id
-                    && &entry.session_id != session_id
-                {
+                if &entry.session_id != session_id {
                     return Err(leveler_client_protocol::ClientError::Runtime(format!(
                         "definition-trust request {} belongs to another session",
                         request_id.as_str()
@@ -504,7 +510,14 @@ mod tests {
         let RuntimeEvent::DefinitionTrustRequested { request: shown } = event else {
             panic!("expected a trust request");
         };
-        resolve_definition_trust(&pending, &shown.id, None, DefinitionTrustDecision::Deny).unwrap();
+        let session = SessionId::new("session-a");
+        resolve_definition_trust(
+            &pending,
+            &shown.id,
+            Some(&session),
+            DefinitionTrustDecision::Deny,
+        )
+        .unwrap();
         assert_eq!(
             decide.await.unwrap(),
             DefinitionTrustAuthorizationOutcome::Denied
@@ -558,10 +571,11 @@ mod tests {
         else {
             panic!("expected a trust request");
         };
+        let session = SessionId::new("session-a");
         resolve_definition_trust(
             &pending,
             &request.id,
-            None,
+            Some(&session),
             DefinitionTrustDecision::TrustCurrentVersion,
         )
         .unwrap();
@@ -609,10 +623,11 @@ mod tests {
             "---\nname: demo\ndescription: Demo.\n---\n\nCHANGED\n",
         )
         .unwrap();
+        let session = SessionId::new("session-a");
         resolve_definition_trust(
             &pending,
             &request.id,
-            None,
+            Some(&session),
             DefinitionTrustDecision::TrustCurrentVersion,
         )
         .unwrap();
