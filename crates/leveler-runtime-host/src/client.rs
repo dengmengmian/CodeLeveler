@@ -31,6 +31,11 @@ const DEFAULT_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const READY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(unix, windows))]
 const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Settle time before the deciding probe after two handshake closes: long
+/// enough for a dead listener's queued connection to drain, short enough that
+/// a genuine pre-token runtime is still identified promptly.
+#[cfg(any(unix, windows))]
+const PEER_CLOSE_SETTLE: Duration = Duration::from_millis(25);
 #[cfg(any(unix, windows))]
 const HANDOVER_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(any(unix, windows))]
@@ -226,26 +231,38 @@ pub(super) async fn probe_endpoint_as(
             // A peer that closes the handshake may be a live pre-token runtime
             // that cannot decode it, or a current runtime that died while this
             // call was in flight. One close cannot tell them apart: an
-            // accepted-then-killed listener produces the same EOF. Only a peer
-            // that accepts a second connection proves it is still alive and
-            // therefore that the close is a capability statement.
-            match tokio::time::timeout(timeout, connect()).await {
-                Ok(Ok(client)) => Ok(EndpointProbe::Ready(client)),
-                Ok(Err(TransportError::PeerClosed)) => {
-                    Err(TransportError::PredatesAccessToken(path.to_path_buf()))
+            // accepted-then-killed listener produces the same EOF, and a
+            // connection already queued in its backlog can close the same way.
+            // A live pre-token runtime keeps accepting and closing; a dead
+            // listener drains its backlog once. So require a third close after
+            // a settle wait before reading the sequence as a capability
+            // statement.
+            let mut closes = 1u8;
+            loop {
+                if closes >= 2 {
+                    tokio::time::sleep(PEER_CLOSE_SETTLE).await;
                 }
-                Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
-                    // The listener is gone: the first close was a runtime
-                    // dying, not a runtime that refuses the handshake.
-                    Ok(EndpointProbe::Absent)
+                match tokio::time::timeout(timeout, connect()).await {
+                    Ok(Ok(client)) => return Ok(EndpointProbe::Ready(client)),
+                    Ok(Err(TransportError::PeerClosed)) => {
+                        closes += 1;
+                        if closes >= 3 {
+                            return Err(TransportError::PredatesAccessToken(path.to_path_buf()));
+                        }
+                    }
+                    Ok(Err(TransportError::Io(error))) if endpoint_unavailable(&error) => {
+                        // The listener is gone: the earlier closes were a
+                        // runtime dying, not a runtime refusing the handshake.
+                        return Ok(EndpointProbe::Absent);
+                    }
+                    Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => {
+                        return Ok(EndpointProbe::NoAnswer {
+                            timeout: Duration::from_millis(timeout_ms),
+                        });
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Ok(EndpointProbe::NoAnswer { timeout }),
                 }
-                Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => {
-                    Ok(EndpointProbe::NoAnswer {
-                        timeout: Duration::from_millis(timeout_ms),
-                    })
-                }
-                Ok(Err(error)) => Err(error),
-                Err(_) => Ok(EndpointProbe::NoAnswer { timeout }),
             }
         }
         Ok(Err(TransportError::NoAnswer { timeout_ms, .. })) => Ok(EndpointProbe::NoAnswer {
@@ -1337,7 +1354,7 @@ fn legacy_runtime_refusal(
         }
     }
     let reason = format!(
-        "the previous runtime at {} predates the access token required for authenticated \
+        "the previous runtime at {} predates the access token and does not support atomic \
          retirement; let it finish its work and exit normally, then restart this build",
         socket_path.display()
     );
@@ -2666,7 +2683,7 @@ mod generation_attach_tests {
             }) => {
                 assert_eq!(reported, &socket);
                 assert!(
-                    reason.contains("required for authenticated retirement"),
+                    reason.contains("does not support atomic retirement"),
                     "{reason}"
                 );
                 assert!(reason.contains("predates the access token"), "{reason}");

@@ -1413,26 +1413,32 @@ mod transport {
     #[cfg(unix)]
     impl Drop for LocalSocketServer {
         fn drop(&mut self) {
-            let metadata = match std::fs::symlink_metadata(&self.path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            // Unlink and release the single-owner lock before the slower field
+            // teardown. A caller that observes the lock free must also observe
+            // that this endpoint is gone; releasing the lock only when the
+            // `_lock` field drops left a window in which the next bind saw the
+            // lock held after this server had already stopped serving.
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(metadata)
+                    if metadata.file_type().is_socket()
+                        && metadata.dev() == self.socket_device
+                        && metadata.ino() == self.socket_inode =>
+                {
+                    if let Err(error) = std::fs::remove_file(&self.path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(%error, path = %self.path.display(), "failed to remove local socket");
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(path = %self.path.display(), "local socket path was replaced; preserving replacement");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     tracing::warn!(%error, path = %self.path.display(), "failed to inspect local socket");
-                    return;
                 }
-            };
-            if !metadata.file_type().is_socket()
-                || metadata.dev() != self.socket_device
-                || metadata.ino() != self.socket_inode
-            {
-                tracing::warn!(path = %self.path.display(), "local socket path was replaced; preserving replacement");
-                return;
             }
-            if let Err(error) = std::fs::remove_file(&self.path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(%error, path = %self.path.display(), "failed to remove local socket");
-            }
+            let _ = fs2::FileExt::unlock(&self._lock);
         }
     }
 
