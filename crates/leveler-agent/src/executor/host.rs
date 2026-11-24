@@ -3769,9 +3769,10 @@ mod authorize_tests {
         .with_approver(approver)
     }
 
-    /// The effect-oriented Auto: ordinary programs are not inspected; only a
-    /// directly visible irreversible effect asks. `sudo` is NOT such an
-    /// effect — the OS owns its own authorization prompt.
+    /// The effect-oriented Auto: ordinary programs are not inspected; a
+    /// directly visible irreversible effect asks, and a request for OS
+    /// privilege (`sudo`/`su`/`doas`) is its own boundary ask because the
+    /// runtime cannot grant that authority.
     #[tokio::test]
     async fn effect_auto_allows_scripts_and_asks_only_for_direct_irreversible_effects() {
         let dir = tempfile::tempdir().unwrap();
@@ -3787,7 +3788,6 @@ mod authorize_tests {
             "npm run build",
             "cargo test",
             "rm -rf target",
-            "sudo -n true",
             "git status",
             "git push origin main",
             "web_search --query rust",
@@ -3804,6 +3804,7 @@ mod authorize_tests {
             ("git reset --hard", "irreversible.git_history"),
             ("git clean -fd", "irreversible.git_history"),
             ("psql -c 'DROP TABLE users'", "irreversible.persistent_data"),
+            ("sudo -n true", "boundary.privilege_escalation"),
         ] {
             let action = call("shell_command", serde_json::json!({"cmd": command}));
             match resolve(&exec, &action).await {

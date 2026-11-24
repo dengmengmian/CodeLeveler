@@ -630,11 +630,12 @@ async fn legacy_auto_still_asks_for_privilege_escalation() {
     cancel(&client, &session_id).await;
 }
 
-/// V2 Auto: the `sudo` wrapper alone is not an irreversible effect, so it is
-/// ordinary work. A directly identifiable deletion of real data is what asks,
-/// even when it is wrapped.
+/// V2 Auto: the `sudo` wrapper requests OS privilege the runtime cannot grant,
+/// so it is a boundary question even when the wrapped command does nothing.
+/// A directly identifiable deletion of real data is what asks, even when it is
+/// wrapped.
 #[tokio::test]
-async fn effect_auto_does_not_ask_for_sudo_alone() {
+async fn effect_auto_asks_for_sudo_alone() {
     let server = MockServer::start(vec![
         tool_call_sse(
             "run_command",
@@ -652,25 +653,19 @@ async fn effect_auto_does_not_ask_for_sudo_alone() {
     )
     .await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut terminal = false;
-    while tokio::time::Instant::now() < deadline && !terminal {
-        match events.recv().await {
-            Ok(RuntimeEvent::ApprovalRequested { request }) => {
-                panic!("V2 Auto must not ask for the sudo wrapper alone: {request:?}")
-            }
-            Ok(RuntimeEvent::TurnCompleted)
-            | Ok(RuntimeEvent::TurnCompletedWithWarnings { .. })
-            | Ok(RuntimeEvent::TurnAnswered)
-            | Ok(RuntimeEvent::TurnCancelled)
-            | Ok(RuntimeEvent::TurnFailed { .. })
-            | Ok(RuntimeEvent::TurnIncomplete { .. })
-            | Ok(RuntimeEvent::TurnTruncated { .. }) => terminal = true,
-            Ok(_) => {}
-            Err(error) => panic!("session event stream closed: {error}"),
-        }
-    }
-    assert!(terminal, "the sudo echo turn never reached a terminal");
+    let approval = await_approval(&mut events).await;
+    assert_eq!(
+        approval.reason_code.as_deref(),
+        Some("boundary.privilege_escalation"),
+        "{approval:?}"
+    );
+    client
+        .send(ClientCommand::ApprovalDecision {
+            request_id: approval.id,
+            decision: ApprovalDecision::Deny,
+        })
+        .await
+        .unwrap();
     cancel(&client, &session_id).await;
 }
 
