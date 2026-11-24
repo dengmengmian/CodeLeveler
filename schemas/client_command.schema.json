@@ -579,6 +579,39 @@
       }
     },
     {
+      "description": "Resolve a pending definition-trust request raised by a running tool.\n\nThis answers \"may this exact definition content be used\", not \"may this action run\". `session_id` binds the answer to the session that owns the waiter; a runtime that has no live waiter refuses rather than guessing.",
+      "type": "object",
+      "required": [
+        "decision",
+        "request_id",
+        "type"
+      ],
+      "properties": {
+        "decision": {
+          "$ref": "#/definitions/DefinitionTrustDecision"
+        },
+        "request_id": {
+          "$ref": "#/definitions/DefinitionTrustRequestId"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "definition_trust_decision"
+          ]
+        }
+      }
+    },
+    {
       "description": "Answer a pending clarification (spec §35). An empty answer means \"skip\".",
       "type": "object",
       "required": [
@@ -2141,6 +2174,13 @@
         "name": {
           "type": "string"
         },
+        "preview_path": {
+          "description": "Local processed PNG (`{sha256}.png` under the media store) a terminal may read for a pixel preview. Never shown and never sent as text. Absent for clients that do not have the file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sha256": {
           "description": "Content-address of the processed bytes in the media store.",
           "type": "string"
@@ -2149,6 +2189,13 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "source_path": {
+          "description": "Original file the user attached. Clipboard and pasted bytes have none. The composer preview is the only surface that shows it; the sentence the model reads stays `[图片 #N]`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "width": {
           "type": [
@@ -2170,6 +2217,36 @@
     },
     "CommandId": {
       "description": "Identifies a client command, used as an idempotency key: a command may be delivered more than once (at-least-once), so the same id must not run the action twice.",
+      "type": "string"
+    },
+    "DefinitionTrustDecision": {
+      "description": "The human's answer.",
+      "oneOf": [
+        {
+          "description": "Admit this exact content for the current session only.",
+          "type": "string",
+          "enum": [
+            "allow_once"
+          ]
+        },
+        {
+          "description": "Persist a human approval for this exact content, then use it.",
+          "type": "string",
+          "enum": [
+            "trust_current_version"
+          ]
+        },
+        {
+          "description": "Do not use it.",
+          "type": "string",
+          "enum": [
+            "deny"
+          ]
+        }
+      ]
+    },
+    "DefinitionTrustRequestId": {
+      "description": "Identifies one mid-turn request to admit untrusted definition content. Distinct from [`ApprovalId`]: it resolves a trust decision, never a permission grant.",
       "type": "string"
     },
     "McpNameRef": {

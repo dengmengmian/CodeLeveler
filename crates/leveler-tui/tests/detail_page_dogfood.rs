@@ -53,6 +53,21 @@ fn render_text(state: &mut AppState, w: u16, h: u16) -> String {
     out
 }
 
+/// Text between the modal side borders. A page assertion reads that column.
+fn modal_body(line: &str) -> &str {
+    let Some(start) = line.find('│') else {
+        return line;
+    };
+    let rest = &line[start + '│'.len_utf8()..];
+    let end = rest.rfind('│').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Columns of padding before the first visible glyph, inside the card.
+fn gutter_of(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ').count()
+}
+
 fn stop_button(text: &str, row_label: Option<&str>) -> (u16, u16) {
     text.lines()
         .enumerate()
@@ -293,39 +308,76 @@ fn dogfood_background_task_detail_page() {
 
     let before = render_text(&mut s, 90, 24);
     println!("--- BACKGROUND TASK (running) ---\n{before}");
-    // One safe margin for the whole page: the nav glyph, the rule above it and
-    // the body all start in the same column, and the nav never sits on the
-    // terminal edge.
-    let header = before.lines().next().expect("a header row");
+    // The title and the body share one content column; the host rule spans the
+    // whole inner width, one column to the left of that content.
+    let nav_at = before
+        .lines()
+        .position(|line| line.contains("Background Task"))
+        .expect("a title row");
+    let header = before.lines().nth(nav_at).unwrap();
+    assert!(
+        header.contains("Background Task") && header.contains("[×]") && !header.contains("← "),
+        "the card names the task once: {header}\n{before}"
+    );
+    let title_col = unicode_width::UnicodeWidthStr::width(
+        &header[..header.find("Background Task").expect("title")],
+    );
+    let rule = before.lines().nth(nav_at + 1).unwrap();
+    let rule_at = rule.find('─').expect("a rule under the header");
+    let rule_end = rule.rfind('│').expect("the card's right border");
+    assert!(
+        rule[rule_at..rule_end].chars().all(|c| c == '─'),
+        "the host rule fills the inner width: {rule:?}\n{before}"
+    );
+    let object = before
+        .lines()
+        .find(|line| line.contains("make up") && !line.contains('$'))
+        .expect("the command is the page object");
+    let object_col =
+        unicode_width::UnicodeWidthStr::width(&object[..object.find("make up").expect("object")]);
     assert_eq!(
-        header.find('←'),
-        Some(2),
-        "nav shares the page's content gutter: {before}"
+        object_col, title_col,
+        "object on the content gutter: {object}"
     );
-    assert!(
-        before.lines().nth(1).is_some_and(|l| l.starts_with("  ─")),
-        "the rule under the header shares that gutter: {before}"
+    let lines: Vec<&str> = before.lines().map(modal_body).collect();
+    // The hosted card's one content gutter is two columns.
+    let gutter = 2;
+    let command_title = lines
+        .iter()
+        .copied()
+        .find(|line| line.contains("命令"))
+        .expect("section title");
+    assert_eq!(
+        gutter_of(command_title),
+        gutter,
+        "section title on the gutter: {command_title}"
     );
-    assert!(
-        before.contains("  make up"),
-        "object on the gutter: {before}"
+    let command = lines
+        .iter()
+        .copied()
+        .find(|line| line.contains("$ make up"))
+        .expect("command body");
+    assert_eq!(
+        gutter_of(command),
+        gutter + 2,
+        "command body indented: {command}"
     );
-    assert!(
-        before.contains("  命令"),
-        "section title on the gutter: {before}"
+    let output_title = lines
+        .iter()
+        .copied()
+        .find(|line| line.trim() == "输出")
+        .expect("output section");
+    assert_eq!(
+        gutter_of(output_title),
+        gutter,
+        "output section: {output_title}"
     );
-    assert!(
-        before.contains("    $ make up"),
-        "command body indented: {before}"
-    );
-    assert!(
-        before.contains("  输出"),
-        "output section present: {before}"
-    );
-    assert!(
-        before.contains("    server listening on :3000"),
-        "live output rendered: {before}"
-    );
+    let live = lines
+        .iter()
+        .copied()
+        .find(|line| line.contains("server listening on :3000"))
+        .expect("live output");
+    assert_eq!(gutter_of(live), gutter + 2, "live output indented: {live}");
     assert!(before.contains("● 运行中"), "status glyph: {before}");
     assert!(before.contains("x 停止"), "running page can stop: {before}");
 
@@ -446,7 +498,25 @@ fn dogfood_sub_agent_detail_page() {
 
     let running = render_text(&mut s, 90, 40);
     println!("--- SUB-AGENT (running) ---\n{running}");
-    assert!(running.contains("  Euclid"), "{running}");
+    let title_line = running
+        .lines()
+        .find(|line| line.contains("Sub-agent"))
+        .expect("the card names the child");
+    let name_line = running
+        .lines()
+        .find(|line| line.contains("Euclid"))
+        .expect("the child name");
+    let title_col = unicode_width::UnicodeWidthStr::width(
+        &title_line[..title_line.find("Sub-agent").expect("title")],
+    );
+    let name_col = unicode_width::UnicodeWidthStr::width(
+        &name_line[..name_line.find("Euclid").expect("name")],
+    );
+    assert_eq!(
+        name_col, title_col,
+        "the child name sits on the card's content gutter:\n{running}"
+    );
+    assert!(name_line.trim_start().contains("Euclid"), "{name_line}");
     assert!(running.contains("● 运行中"), "{running}");
     assert!(running.contains("读取 6 次"), "{running}");
     assert!(running.contains("执行了 9 个命令"), "{running}");

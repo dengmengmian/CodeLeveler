@@ -815,12 +815,18 @@ impl CodingRuntime {
         session_id: &SessionId,
         fallback_objective: &str,
     ) -> Result<ResumeLineage, EngineError> {
-        let turns = self
+        let mut turns = self
             .engine
             .stores
             .turns
             .list_for_session(session_id)
             .await?;
+        let log = EventLog::new(self.engine.stores.events.as_ref(), session_id.clone());
+        let cuts = log.conversation_cuts().await?;
+        let discarded = log.discarded_conversation_turns(&cuts).await?;
+        if !discarded.is_empty() {
+            turns.retain(|turn| !discarded.contains(&turn.id));
+        }
         let mut resolved = None;
         let mut legacy_continuation_ids = Vec::new();
         for turn in turns.iter().rev() {
@@ -2816,9 +2822,20 @@ impl CodingRuntime {
         &self,
         session_id: &SessionId,
         expected_goal: Option<&leveler_core::GoalId>,
-        allow_committed: bool,
+        require_committed: bool,
     ) -> Result<Option<UncommittedDelivery>, EngineError> {
-        let rows = self.engine.stores.events.load(session_id).await?;
+        let mut rows = self.engine.stores.events.load(session_id).await?;
+        let cuts = leveler_engine::ConversationCuts::from_events(&rows)?;
+        let discarded = cuts.discarded_turns(&rows)?;
+        if !cuts.is_empty() {
+            rows.retain(|row| {
+                !cuts.discards(row.sequence)
+                    && row
+                        .turn_id
+                        .as_ref()
+                        .is_none_or(|id| !discarded.contains(id))
+            });
+        }
         let Some(at) = rows
             .iter()
             .rposition(|row| row.event_type == "delivery_committed")
@@ -2828,10 +2845,10 @@ impl CodingRuntime {
         let delivery = &rows[at];
         // A task terminal after the delivery means the delivery was already
         // committed. Recovery normally has nothing left to do, but a client
-        // that missed the final frame may still ask: `allow_committed` reads
+        // that missed the final frame may still ask: `require_committed` reads
         // the same delivery back for replay without appending anything.
-        if !allow_committed
-            && rows[at + 1..]
+        if require_committed
+            != rows[at + 1..]
                 .iter()
                 .any(|row| row.event_type == "task_finished")
         {
@@ -2869,11 +2886,9 @@ impl CodingRuntime {
             .turns
             .list_for_session(session_id)
             .await?;
-        let Some(newest) = turns
-            .iter()
-            .rev()
-            .find(|turn| turn.kind == "user" || turn.kind == "chat")
-        else {
+        let Some(newest) = turns.iter().rev().find(|turn| {
+            (turn.kind == "user" || turn.kind == "chat") && !discarded.contains(&turn.id)
+        }) else {
             return Ok(None);
         };
         if newest.id != turn_id {
@@ -2980,19 +2995,6 @@ impl CodingRuntime {
             return Ok(None);
         };
         if delivery.turn_open {
-            return Ok(None);
-        }
-        let rows = self.engine.stores.events.load(session_id).await?;
-        let Some(at) = rows
-            .iter()
-            .rposition(|row| row.event_type == "delivery_committed")
-        else {
-            return Ok(None);
-        };
-        if !rows[at + 1..]
-            .iter()
-            .any(|row| row.event_type == "task_finished")
-        {
             return Ok(None);
         }
         Ok(Some(delivery))
@@ -3927,21 +3929,25 @@ impl CodingRuntime {
             .turns
             .list_for_session(session_id)
             .await?;
-        let Some(turn) = turns
+        let mut interrupted = turns
             .iter()
             .rev()
-            .find(|turn| turn.status == "running" || turn.status == "interrupted")
-        else {
+            .filter(|turn| turn.status == "running" || turn.status == "interrupted");
+        if interrupted.clone().next().is_none() {
+            return Ok(());
+        }
+        let rows = self.engine.stores.events.load(session_id).await?;
+        let cuts = leveler_engine::ConversationCuts::from_events(&rows)?;
+        let discarded = cuts.discarded_turns(&rows)?;
+        let Some(turn) = interrupted.find(|turn| !discarded.contains(&turn.id)) else {
             return Ok(());
         };
         let turn_id = TurnId::new(turn.id.clone());
-        let rows = self.engine.stores.events.load(session_id).await?;
         let mut started: Vec<Started> = Vec::new();
         let mut finished: Vec<Finished> = Vec::new();
-        for row in rows
-            .iter()
-            .filter(|row| row.turn_id.as_deref() == Some(turn.id.as_str()))
-        {
+        for row in rows.iter().filter(|row| {
+            row.turn_id.as_deref() == Some(turn.id.as_str()) && !cuts.discards(row.sequence)
+        }) {
             match EngineEvent::from_payload(&row.payload) {
                 // Delegated calls have their own transcript path; the parent
                 // turn's messages are the subject here.

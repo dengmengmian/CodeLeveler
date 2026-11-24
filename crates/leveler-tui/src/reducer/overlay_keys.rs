@@ -200,6 +200,30 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 state.overlay = Some(Overlay::Clarification(ov));
                 Vec::new()
             }
+            ClarificationOutcome::SwitchToChat => {
+                if !state.runtime_connected {
+                    state.overlay = Some(Overlay::Clarification(ov));
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Error,
+                        message: state.t().interaction_held_offline.to_string(),
+                    });
+                    return Vec::new();
+                }
+                state.workbench_focus = crate::state::WorkbenchFocus::Input;
+                // The question is durable. Ending the task closes it so
+                // the runtime can accept a new conversation message.
+                let cancel = ClientCommand::CancelTask {
+                    session_id: state.session_id.clone(),
+                };
+                return vec![if state.collaboration == "chat" {
+                    Effect::Send(cancel)
+                } else {
+                    Effect::SendThen {
+                        command: super::submit::change_collaboration(state, "chat"),
+                        then: cancel,
+                    }
+                }];
+            }
             ClarificationOutcome::Answer(answer) => {
                 let restore = PendingInteraction::Clarification(ov.request);
                 let command_id = take_or_new_command_id(state, &restore);

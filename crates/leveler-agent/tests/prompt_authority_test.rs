@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use leveler_agent::{Executor, NoopSink, TranscriptSink};
+use leveler_agent::{AgentEvent, Executor, NoopSink, TranscriptSink};
 use leveler_core::{RequestId, ToolCallId};
 use leveler_execution::{PermissionProfile, Workspace};
 use leveler_model::{
@@ -132,6 +132,42 @@ fn executor(root: &std::path::Path, script: Arc<Script>) -> Executor {
     .with_delegation(false)
 }
 
+/// Like [`executor`], but with an isolated `LEVELER_HOME` so durable skill
+/// preferences cannot leak in from the developer machine.
+fn executor_with_home(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    script: Arc<Script>,
+) -> Executor {
+    let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+        [
+            (
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.as_os_str().to_os_string(),
+            ),
+            (
+                std::ffi::OsString::from("HOME"),
+                home.as_os_str().to_os_string(),
+            ),
+        ],
+        root.to_path_buf(),
+        std::env::temp_dir(),
+    ));
+    Executor::new(
+        script,
+        Arc::new(leveler_tools::default_registry()),
+        ToolContext::with_environment(
+            Workspace::new(root).unwrap(),
+            PermissionProfile::Assisted,
+            environment,
+        )
+        .trust_all_definitions_for_tests(),
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_delegation(false)
+}
+
 struct Saved(Arc<Mutex<Vec<Message>>>);
 
 #[async_trait]
@@ -229,6 +265,188 @@ async fn a_named_skill_is_a_procedure_not_a_contract() {
     assert_ne!(index.authority, skill.authority);
 }
 
+/// `/name [args]` is the same explicit user procedure as `$name`, carried by
+/// the registry instead of a second loader. The typed message stays intact:
+/// the slash token and its arguments are what the model reads as the request,
+/// and the verified body is added beside it.
+#[tokio::test]
+async fn a_slash_named_skill_is_an_explicit_procedure_and_keeps_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\nargument-hint: \"<env>\"\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    executor(dir.path(), script.clone())
+        .run(
+            "/demo staging",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert_eq!(skill.authority, PromptAuthority::UserSelectedProcedure);
+    assert_eq!(
+        skill.source,
+        PromptSource::Skill {
+            names: vec!["demo".into()]
+        }
+    );
+    assert!(skill.text.contains("SKILL_BODY_SENTINEL"));
+    let user = request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("the user message is preserved");
+    assert!(
+        user.text_content().contains("/demo staging"),
+        "the slash command and its arguments are the user's request, not a \
+         rewritten `$name`: {}",
+        user.text_content()
+    );
+}
+
+/// A disabled Skill named with `/` is refused in the turn context, and its
+/// package never reaches the model.
+#[tokio::test]
+async fn a_disabled_slash_skill_is_refused_and_its_body_is_not_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let preferences = home.path().join("state/skills.toml");
+    std::fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+    std::fs::write(
+        &preferences,
+        format!(
+            "[projects]\n\"{}\" = [\"demo\"]\n",
+            leveler_skills::project_key(dir.path())
+        ),
+    )
+    .unwrap();
+
+    let script = Script::new(vec![answer("done")]);
+    executor_with_home(dir.path(), home.path(), script.clone())
+        .run(
+            "/demo staging",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert!(!skill.text.contains("SKILL_BODY_SENTINEL"));
+    assert!(
+        skill.text.contains("disabled"),
+        "the refusal must name the reason: {}",
+        skill.text
+    );
+}
+
+/// An unapproved package is reported as untrusted rather than loaded or
+/// silently treated as prose.
+#[tokio::test]
+async fn an_untrusted_slash_skill_is_refused_and_its_body_is_not_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let environment = std::sync::Arc::new(leveler_core::EnvSnapshot::new(
+        [(
+            std::ffi::OsString::from("LEVELER_HOME"),
+            home.path().as_os_str().to_os_string(),
+        )],
+        dir.path().to_path_buf(),
+        std::env::temp_dir(),
+    ));
+    let script = Script::new(vec![answer("done")]);
+    Executor::new(
+        script.clone(),
+        Arc::new(leveler_tools::default_registry()),
+        ToolContext::with_environment(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+            environment,
+        ),
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_delegation(false)
+    .run(
+        "/demo staging",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert!(!skill.text.contains("SKILL_BODY_SENTINEL"));
+    assert!(
+        skill.text.contains("not trusted"),
+        "the refusal must name the trust gate: {}",
+        skill.text
+    );
+}
+
+/// `disable-model-invocation` hides a Skill from model discovery but an
+/// explicit `/name` is still the user's decision, so its procedure loads.
+#[tokio::test]
+async fn a_model_hidden_skill_still_loads_through_slash() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\ndisable-model-invocation: true\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    executor(dir.path(), script.clone())
+        .run(
+            "/demo",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert!(skill.text.contains("SKILL_BODY_SENTINEL"));
+    if let Some(index) = request
+        .control_context
+        .blocks
+        .iter()
+        .find(|segment| segment.name == "skill_index")
+    {
+        assert!(
+            !index.text.contains("demo"),
+            "the model index must not name a model-hidden skill: {}",
+            index.text
+        );
+    }
+}
+
 /// Full removes approval, not the user's explicit instruction. A `$name` in
 /// the request is authority, so its procedure is injected even while the
 /// optional Skills pack is still undisclosed; the index and `load_skill`
@@ -290,6 +508,69 @@ async fn full_access_still_injects_a_named_skill_before_its_pack_is_enabled() {
     );
 }
 
+/// A leading `/name` is the user's own command, so the procedure is injected
+/// whenever the host has the Skills pack, even before the pack is disclosed on
+/// the model's tool surface. Only `$mention` stays exposure-gated: the user
+/// typed the slash, the model did not choose it.
+#[tokio::test]
+async fn an_explicit_slash_skill_reaches_the_model_before_its_pack_is_enabled() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\nargument-hint: \"<env>\"\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let available = vec![CapabilityId::Skills];
+    let disclosure =
+        Arc::new(CapabilityDisclosure::new(available, vec![CapabilityId::Skills], vec![]).unwrap());
+    assert!(
+        !disclosure.exposed(CapabilityId::Skills),
+        "fixture: the pack must still be undisclosed"
+    );
+    Executor::new(
+        script.clone(),
+        Arc::new(leveler_tools::default_registry()),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        )
+        .trust_all_definitions_for_tests(),
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_delegation(false)
+    .with_capabilities(Some(disclosure))
+    .run(
+        "/demo staging",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert!(
+        skill.text.contains("SKILL_BODY_SENTINEL"),
+        "the user's explicit procedure must reach the model: {}",
+        skill.text
+    );
+    let user = request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .expect("the user message is preserved");
+    assert!(user.text_content().contains("/demo staging"));
+    assert!(
+        !request.tools.iter().any(|tool| tool.name == "load_skill"),
+        "injection is not disclosure: the pack's tools stay on demand"
+    );
+}
+
 #[tokio::test]
 async fn a_named_skill_cannot_widen_authority_outside_full_access() {
     use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
@@ -334,6 +615,149 @@ async fn a_named_skill_cannot_widen_authority_outside_full_access() {
             .any(|block| block.name == "selected_skills"),
         "a mention is user intent, not Skills permission; outside Full the pack stays closed"
     );
+}
+
+#[tokio::test]
+async fn a_user_slash_skill_loads_in_an_idle_assisted_turn() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    use leveler_definition_trust::{ApprovalRequest, ApprovalSurface, DefinitionIdentity};
+    use leveler_skills::{SkillDeliveryFailure, SkillDeliverySurface, SkillScope, SkillSource};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    for (name, body) in [
+        ("fanui", "FANUI_PROCEDURE_SENTINEL"),
+        ("other", "OTHER_PROCEDURE_SENTINEL"),
+    ] {
+        let package_dir = home.path().join(".codex/skills").join(name);
+        std::fs::create_dir_all(package_dir.join("docs")).unwrap();
+        let skill_path = package_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_path,
+            format!("---\nname: {name}\ndescription: Review a rendered interface.\n---\n{body}\n\nRead docs/review.md for the review workflow.\n"),
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("docs/review.md"), "Review workflow.").unwrap();
+        let package = leveler_definition_trust::read_skill_package(&skill_path).unwrap();
+        let identity = DefinitionIdentity::user_skill("codex", name).unwrap();
+        leveler_definition_trust::approve(
+            home.path(),
+            workspace.path(),
+            &[ApprovalRequest::skill_package(identity, &package)],
+            ApprovalSurface::Cli,
+        )
+        .unwrap();
+    }
+
+    let script = Script::new(vec![answer("done"), answer("done")]);
+    let environment = Arc::new(leveler_core::EnvSnapshot::new(
+        [
+            (
+                "LEVELER_HOME".into(),
+                home.path().as_os_str().to_os_string(),
+            ),
+            ("HOME".into(), home.path().as_os_str().to_os_string()),
+        ],
+        workspace.path().to_path_buf(),
+        std::env::temp_dir(),
+    ));
+    let capabilities = Arc::new(
+        CapabilityDisclosure::new(
+            vec![CapabilityId::Skills],
+            vec![CapabilityId::Skills],
+            vec![],
+        )
+        .unwrap(),
+    );
+    assert!(capabilities.available(CapabilityId::Skills));
+    assert!(!capabilities.exposed(CapabilityId::Skills));
+    let executor = Executor::new(
+        script.clone(),
+        Arc::new(leveler_tools::default_registry()),
+        ToolContext::with_environment(
+            Workspace::new(workspace.path()).unwrap(),
+            PermissionProfile::Assisted,
+            environment,
+        ),
+        ModelRef::new("mock", "m"),
+        4,
+    )
+    .with_capabilities(Some(capabilities))
+    .with_delegation(false);
+
+    for (input, surface) in [
+        ("/fanui 看下", SkillDeliverySurface::Slash),
+        ("/fanui 看下 $other", SkillDeliverySurface::Mixed),
+    ] {
+        let mut audits = Vec::new();
+        executor
+            .run_conversation(
+                Vec::new(),
+                vec![ContentPart::Text { text: input.into() }],
+                &mut |event| {
+                    if let AgentEvent::SkillDelivery { audit } = event {
+                        audits.push(audit);
+                    }
+                },
+                &mut NoopSink,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let [audit] = audits.as_slice() else {
+            panic!("expected one delivery audit for {input}: {audits:?}");
+        };
+        assert_eq!(audit.surface, surface);
+        assert_eq!(audit.blocked, None, "{input}: {audit:?}");
+        let fanui = audit
+            .entries
+            .iter()
+            .find(|entry| entry.name == "fanui")
+            .unwrap();
+        assert_eq!(fanui.requested_as, "/fanui");
+        assert_eq!(fanui.scope, Some(SkillScope::User));
+        assert_eq!(fanui.source, Some(SkillSource::Codex));
+        assert!(fanui.loaded());
+
+        let request = script.requests.lock().unwrap().remove(0);
+        let skill = block(&request, "selected_skills");
+        assert_eq!(
+            skill.source,
+            PromptSource::Skill {
+                names: vec!["fanui".into()]
+            }
+        );
+        assert_eq!(skill.authority, PromptAuthority::UserSelectedProcedure);
+        assert!(skill.text.contains("FANUI_PROCEDURE_SENTINEL"));
+        assert!(!skill.text.contains("OTHER_PROCEDURE_SENTINEL"));
+        assert_eq!(audit.injected_bytes, skill.text.len());
+        assert!(!request.tools.iter().any(|tool| tool.name == "load_skill"));
+        assert!(
+            !request
+                .control_context
+                .blocks
+                .iter()
+                .any(|block| block.name == "skill_index")
+        );
+        let user = request
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .unwrap();
+        assert_eq!(user.text_content(), input);
+        if surface == SkillDeliverySurface::Mixed {
+            let other = audit
+                .entries
+                .iter()
+                .find(|entry| entry.name == "other")
+                .unwrap();
+            assert_eq!(other.requested_as, "$other");
+            assert_eq!(
+                other.failure,
+                Some(SkillDeliveryFailure::CapabilityUnavailable)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -516,6 +940,127 @@ async fn a_compaction_summary_stays_advisory() {
                 |segment| segment.authority != PromptAuthority::AdvisoryContext
                     || segment.source != PromptSource::CompactionSummary
             )
+    );
+}
+
+/// Resume rebuilds the turn control from the objective instead of trusting
+/// stored rows, so an explicit `/name` is delivered again on the continued
+/// turn with the procedure body, and the prior transcript stays intact.
+#[tokio::test]
+async fn resume_redelivers_an_explicit_slash_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let prior = vec![
+        Message::text(Role::User, "/demo staging"),
+        Message::text(Role::Assistant, "interrupted before finishing"),
+    ];
+    executor(dir.path(), script.clone())
+        .resume(prior, &mut |_| {}, &mut NoopSink, CancellationToken::new())
+        .await
+        .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    let skill = block(&request, "selected_skills");
+    assert_eq!(skill.authority, PromptAuthority::UserSelectedProcedure);
+    assert_eq!(
+        skill.source,
+        PromptSource::Skill {
+            names: vec!["demo".into()]
+        }
+    );
+    assert!(skill.text.contains("SKILL_BODY_SENTINEL"));
+    assert!(
+        request
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("/demo staging")),
+        "the resumed transcript keeps the original request"
+    );
+    assert!(
+        request
+            .messages
+            .iter()
+            .all(|message| message.role != Role::System),
+        "the procedure is control context, not a replay of stored systems"
+    );
+}
+
+/// Folding the transcript cannot drop a user-selected procedure: the skill
+/// block is rebuilt control context on the folded request, while the summary
+/// it replaces stays advisory.
+#[tokio::test]
+async fn a_slash_skill_survives_context_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("input.txt"), "evidence").unwrap();
+    let script = Script::new(vec![read("input.txt"), answer("done")]);
+    let policy = leveler_agent::coding::policy::ResolvedContextPolicy {
+        pressure_threshold: 100,
+        retention: leveler_agent::coding::policy::ContextRetentionPolicy {
+            keep_recent_messages: 3,
+            keep_recent_tokens: 1000,
+        },
+        ..Default::default()
+    };
+    let prior: Vec<_> = (0..12)
+        .map(|i| {
+            Message::text(
+                if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                format!("OLD_HISTORY_SENTINEL_{i} {}", "history ".repeat(60)),
+            )
+        })
+        .collect();
+    executor(dir.path(), script.clone())
+        .with_context_policy(policy)
+        .run_conversation(
+            prior,
+            vec![ContentPart::Text {
+                text: "/demo staging".into(),
+            }],
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let requests = script.requests.lock().unwrap();
+    let first = requests.first().expect("first request");
+    assert!(
+        block(first, "selected_skills")
+            .text
+            .contains("SKILL_BODY_SENTINEL")
+    );
+    let last = requests.last().expect("folded request");
+    assert!(
+        last.projection
+            .as_ref()
+            .expect("production projection")
+            .transcript_authority()
+            .iter()
+            .any(|item| item.source == PromptSource::CompactionSummary),
+        "the test must actually fold the transcript"
+    );
+    let skill = block(last, "selected_skills");
+    assert_eq!(skill.authority, PromptAuthority::UserSelectedProcedure);
+    assert!(
+        skill.text.contains("SKILL_BODY_SENTINEL"),
+        "compaction cannot drop the selected procedure"
     );
 }
 
@@ -957,4 +1502,339 @@ async fn an_unreadable_scoped_rule_pauses_only_the_edit_that_needs_it() {
     );
     assert!(!dir.path().join("src/fresh.rs").exists());
     assert!(dir.path().join("answers/answer.txt").is_file());
+}
+
+/// The turn-start delivery audit names what was selected and loaded, with
+/// sizes and provenance, and never copies the procedure body.
+#[tokio::test]
+async fn a_slash_skill_turn_records_its_delivery_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let mut events = Vec::new();
+    executor(dir.path(), script)
+        .run(
+            "/demo staging",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SkillDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn records a skill delivery audit");
+    assert_eq!(audit.surface, leveler_skills::SkillDeliverySurface::Slash);
+    assert_eq!(audit.entries.len(), 1, "{audit:?}");
+    assert_eq!(audit.entries[0].name, "demo");
+    assert_eq!(audit.entries[0].requested_as, "/demo");
+    assert_eq!(
+        audit.entries[0].scope,
+        Some(leveler_skills::SkillScope::Project)
+    );
+    assert!(audit.entries[0].loaded());
+    assert!(audit.entries[0].bytes > 0);
+    assert!(audit.injected_bytes > 0);
+    let serialized = serde_json::to_string(audit).unwrap();
+    assert!(
+        !serialized.contains("SKILL_BODY_SENTINEL"),
+        "the audit must not carry the procedure body: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn a_slash_skill_reads_only_its_requested_reference_in_that_turn() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    use leveler_definition_trust::{
+        ApprovalRequest, ApprovalSurface, DefinitionIdentity, DefinitionKind,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let skill = dir.path().join(".leveler/skills/demo");
+    let refs = skill.join("references");
+    std::fs::create_dir_all(&refs).unwrap();
+    let body = skill.join("SKILL.md");
+    std::fs::write(&body, "---\nname: demo\ndescription: Demo.\ndisable-model-invocation: true\n---\nPROCEDURE_SENTINEL\n").unwrap();
+    let path = refs.join("chosen.md");
+    std::fs::write(&path, "CHOSEN_SENTINEL\nsecond line\n").unwrap();
+    std::fs::write(refs.join("other.md"), "OTHER_SENTINEL\n".repeat(3000)).unwrap();
+    let package = leveler_definition_trust::read_skill_package(&body).unwrap();
+    let identity =
+        DefinitionIdentity::project(DefinitionKind::Skill, ".leveler/skills/demo").unwrap();
+    leveler_definition_trust::approve(
+        home.path(),
+        dir.path(),
+        &[ApprovalRequest::skill_package(identity, &package)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+
+    let script = Script::new(vec![
+        read(path.to_str().unwrap()),
+        answer("first done"),
+        read(path.to_str().unwrap()),
+        answer("second done"),
+    ]);
+    let capabilities =
+        Arc::new(CapabilityDisclosure::new(vec![CapabilityId::Skills], vec![], vec![]).unwrap());
+    let executor = executor_with_home(dir.path(), home.path(), script.clone())
+        .with_capabilities(Some(capabilities));
+    for prompt in ["/demo", "ordinary question"] {
+        executor
+            .run(prompt, &mut |_| {}, &mut NoopSink, CancellationToken::new())
+            .await
+            .unwrap();
+    }
+    let requests = script.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let selected = block(&requests[0], "selected_skills").text.as_str();
+    assert!(selected.contains("PROCEDURE_SENTINEL"));
+    assert!(selected.contains("references/chosen.md"));
+    assert!(!selected.contains("CHOSEN_SENTINEL"));
+    assert!(!selected.contains("OTHER_SENTINEL"));
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "load_skill")
+    );
+    let tool_result = |i: usize| {
+        requests[i]
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|part| match part {
+                ContentPart::ToolResult { result } => Some(result.content.as_str()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(
+        tool_result(1).contains("CHOSEN_SENTINEL"),
+        "{}",
+        tool_result(1)
+    );
+    assert!(!tool_result(1).contains("OTHER_SENTINEL"));
+    assert!(
+        tool_result(3).contains("approval-bound"),
+        "{}",
+        tool_result(3)
+    );
+    assert!(!tool_result(3).contains("CHOSEN_SENTINEL"));
+}
+
+#[tokio::test]
+async fn a_dollar_mention_turn_records_the_mention_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let mut events = Vec::new();
+    executor(dir.path(), script)
+        .run(
+            "use $demo now",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SkillDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn records a skill delivery audit");
+    assert_eq!(audit.surface, leveler_skills::SkillDeliverySurface::Mention);
+    assert_eq!(audit.entries.len(), 1, "{audit:?}");
+    assert_eq!(audit.entries[0].requested_as, "$demo");
+    assert!(audit.entries[0].loaded());
+}
+
+/// A refused selection is distinguishable from a loaded one, and the body is
+/// absent from both the prompt and the audit.
+#[tokio::test]
+async fn a_disabled_slash_skill_is_audited_as_failed_without_the_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let preferences = home.path().join("state/skills.toml");
+    std::fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+    std::fs::write(
+        &preferences,
+        format!(
+            "[projects]\n\"{}\" = [\"demo\"]\n",
+            leveler_skills::project_key(dir.path())
+        ),
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let mut events = Vec::new();
+    executor_with_home(dir.path(), home.path(), script)
+        .run(
+            "/demo staging",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SkillDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn records a skill delivery audit");
+    assert_eq!(audit.entries.len(), 1, "{audit:?}");
+    assert_eq!(
+        audit.entries[0].failure,
+        Some(leveler_skills::SkillDeliveryFailure::Disabled)
+    );
+    assert_eq!(audit.entries[0].bytes, 0);
+    // The refusal notice is delivered, but the procedure body is not.
+    assert!(audit.injected_bytes > 0);
+    assert!(
+        !serde_json::to_string(audit)
+            .unwrap()
+            .contains("SKILL_BODY_SENTINEL")
+    );
+}
+
+/// A turn with no explicit selection still reports what the index made
+/// discoverable, so "nothing selected" is not confused with "nothing existed".
+#[tokio::test]
+async fn an_ordinary_turn_audits_discovery_without_a_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let script = Script::new(vec![answer("done")]);
+    let mut events = Vec::new();
+    executor(dir.path(), script)
+        .run(
+            "say hello",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SkillDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn records a skill delivery audit");
+    assert_eq!(
+        audit.surface,
+        leveler_skills::SkillDeliverySurface::IndexOnly
+    );
+    assert!(audit.entries.is_empty(), "{audit:?}");
+    assert!(audit.discovered >= 1);
+    assert!(audit.index_bytes > 0);
+    assert_eq!(audit.injected_bytes, 0);
+}
+
+#[tokio::test]
+async fn an_ordinary_turn_does_not_report_undisclosed_skills_as_blocked() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    let dir = tempfile::tempdir().unwrap();
+    let capability = Arc::new(
+        CapabilityDisclosure::new(
+            vec![CapabilityId::Skills],
+            vec![CapabilityId::Skills],
+            vec![],
+        )
+        .unwrap(),
+    );
+    let script = Script::new(vec![answer("done")]);
+    let mut events = Vec::new();
+    executor(dir.path(), script)
+        .with_capabilities(Some(capability))
+        .run(
+            "say hello",
+            &mut |event| events.push(event),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let audit = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SkillDelivery { audit } => Some(audit),
+            _ => None,
+        })
+        .expect("the turn records a skill delivery audit");
+    assert_eq!(*audit, leveler_skills::SkillDeliveryAudit::default());
+}
+
+#[tokio::test]
+async fn a_delegated_task_cannot_invoke_a_user_only_slash_skill() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".leveler/skills/demo");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo\ndescription: Demo procedure.\ndisable-model-invocation: true\n---\nSKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+    let capability = Arc::new(
+        CapabilityDisclosure::new(
+            vec![CapabilityId::Skills],
+            vec![CapabilityId::Skills],
+            vec![CapabilityId::Skills],
+        )
+        .unwrap(),
+    );
+    let script = Script::new(vec![answer("done")]);
+    executor(dir.path(), script.clone())
+        .with_depth(1)
+        .with_capabilities(Some(capability))
+        .run(
+            "/demo staging",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let request = script.requests.lock().unwrap().remove(0);
+    assert!(
+        !request
+            .control_context
+            .blocks
+            .iter()
+            .any(|block| block.name == "selected_skills")
+    );
 }

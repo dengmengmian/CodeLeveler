@@ -190,6 +190,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         state.conv.rect = None;
         state.conv.scroll_bottom_rect = None;
         state.review_hits.clear();
+        state.sent_image_hits.clear();
+        state.sent_image_hover = None;
+        state.conv.reply_copy.reset_hits();
         return;
     }
 
@@ -210,8 +213,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if let Some(anchor) = reading {
         crate::conversation::interaction::restore_reading_anchor(state, Some(anchor));
     }
-    let theme = &state.theme;
-
     let (all, _hits, _commands, _anchor, item_spans, sources, copy) =
         state.conversation_build(width);
     // Plain text only backs mouse selection / clipboard. Rebuild it from this
@@ -255,6 +256,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ));
         }
     }
+    crate::image_preview::publish_sent_chip_hits(
+        state,
+        &item_spans,
+        scroll,
+        content,
+        total,
+        height,
+    );
 
     // Only the visible window is cloned + highlighted; the rest stays in the Rc.
     let mut lines: Vec<Line> = all
@@ -274,6 +283,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // A jumped-to search result highlights its query inside the located
     // entry. Style-only, over the same window, so it cannot re-wrap a line.
     crate::find::highlight::paint(state, &item_spans, &sources, scroll, &mut lines);
+
+    super::reply_copy::paint(state, &item_spans, content, scroll, &mut lines);
+    let theme = &state.theme;
 
     // Selection is an explicit user act and owns the ink on the rows it
     // covers, so it is applied after the decorative rail highlight.

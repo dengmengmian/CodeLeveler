@@ -341,7 +341,6 @@ fn spawn_auxiliary_assist(
             assists.finish(&session_id, kind, generation);
             return;
         }
-        assists.finish(&session_id, kind, generation);
         let event = match kind {
             AssistKind::PromptSuggestion => RuntimeEvent::PromptSuggestion {
                 text: generated.text,
@@ -366,7 +365,12 @@ fn spawn_auxiliary_assist(
                 RuntimeEvent::AwaySummary { text }
             }
         };
-        let _ = events.send(event);
+        let publish =
+            assists.is_current(&session_id, kind, generation) && !active.is_running(&session_id);
+        assists.finish(&session_id, kind, generation);
+        if publish {
+            let _ = events.send(event);
+        }
     });
 }
 
@@ -374,11 +378,21 @@ fn spawn_auxiliary_assist(
 /// nothing to attach a review to.
 async fn settled_turn_id(app: &Arc<Application>, session_id: &SessionId) -> Option<String> {
     let db = app.open_database().await.ok()?;
-    TurnRepository::new(&db)
-        .latest_settled(session_id)
+    let turns = TurnRepository::new(&db);
+    let latest = turns.latest_settled(session_id).await.ok()??;
+    let log = leveler_engine::EventLog::new(&db, session_id.clone());
+    let cuts = log.conversation_cuts().await.ok()?;
+    let discarded = log.discarded_conversation_turns(&cuts).await.ok()?;
+    if !discarded.contains(&latest.id) {
+        return Some(latest.id);
+    }
+    turns
+        .list(session_id)
         .await
-        .ok()
-        .flatten()
+        .ok()?
+        .into_iter()
+        .rev()
+        .find(|turn| turn.status != "running" && !discarded.contains(&turn.id))
         .map(|turn| turn.id)
 }
 
@@ -3487,14 +3501,13 @@ impl InProcessRuntimeClient {
     /// transcript, silently wiping the whole conversation.
     async fn checkpoint_before_turn(&self, session_id: &SessionId, label: &str) {
         let loaded = match self.app.open_database().await {
-            Ok(db) => MessageRepository::new(&db)
-                .count(session_id)
+            Ok(db) => db
+                .conversation_checkpoint_boundary(session_id)
                 .await
-                .map(|n| n as usize)
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };
-        let Some(ordinal) = checkpoint_ordinal(loaded) else {
+        let Ok((ordinal, event_cursor)) = loaded else {
             tracing::warn!(
                 session_id = %session_id.as_str(),
                 "skipping checkpoint: transcript length unavailable (a 0-ordinal \
@@ -3506,7 +3519,7 @@ impl InProcessRuntimeClient {
         let checkpoint = UiCheckpoint {
             id: CheckpointId::generate(),
             label,
-            ordinal: ordinal as u32,
+            ordinal,
         };
         // Capture the workspace too (git repos only), so restoring the
         // checkpoint rolls back the files the turn changed — including
@@ -3521,8 +3534,14 @@ impl InProcessRuntimeClient {
                 }
             },
         };
-        self.checkpoints
-            .record(session_id, checkpoint.clone(), snapshot);
+        self.checkpoints.record(
+            session_id,
+            crate::checkpoints::Checkpoint {
+                view: checkpoint.clone(),
+                event_cursor,
+                workspace: snapshot,
+            },
+        );
         let _ = self
             .events_for(session_id)
             .send(RuntimeEvent::CheckpointCreated { checkpoint });
@@ -4949,13 +4968,6 @@ impl InProcessRuntimeClient {
         self.checkpoints.drop_session(session_id);
     }
 
-    /// After restore to `ordinal`, drop later checkpoints (and their snapshots)
-    /// so the UI cannot re-restore a point that no longer exists in the transcript.
-    fn prune_checkpoints_after_restore(&self, session_id: &SessionId, restored_ordinal: u32) {
-        self.checkpoints
-            .prune_after_restore(session_id, restored_ordinal);
-    }
-
     /// Name a placeholder interactive session after its first real message:
     /// the sidebars (desktop + TUI resume) show the display title, and a wall of
     /// "interactive session" rows is unreadable. Only a session with no title
@@ -5639,6 +5651,27 @@ impl InProcessRuntimeClient {
         // a model that cannot read an image is told so, never handed the text
         // with the picture removed.
         self.refuse_unreadable_images(&model, &attachments).await?;
+        // An explicit `/name` for an untrusted Skill is the user asking for
+        // that procedure, not a blank cheque. Ordinary modes ask here, before
+        // any message row is staged; FullAccess never prompts. The approval
+        // lands in this session's trust overlay, which the turn's executor
+        // reads through the same registry.
+        let trust_cancel = CancellationToken::new();
+        let trust_authorizer = self.definition_trust_authorizer(
+            &session_id,
+            self.events_for(&session_id),
+            trust_cancel,
+            config.mode,
+        );
+        self.app
+            .authorize_explicit_skill(
+                &session_id,
+                &content,
+                config.mode,
+                trust_authorizer.as_ref(),
+            )
+            .await
+            .map_err(ClientError::Runtime)?;
         let seed_message_id = seed_input_id.as_deref().map(MessageId::new);
         let cancel = self
             .stage_turn(
@@ -6937,102 +6970,103 @@ impl InProcessRuntimeClient {
         checkpoint_id: CheckpointId,
     ) -> Result<(), ClientError> {
         let admission = self.admit_context_op(&session_id, "恢复检查点")?;
-        let ordinal = self.checkpoints.ordinal_of(&session_id, &checkpoint_id);
-        if let Some(ordinal) = ordinal {
-            // A failed truncate means the conversation did NOT roll
-            // back; the user must know rather than see a fake restore.
-            match self.truncate_messages(&session_id, ordinal as usize).await {
-                Ok(()) => {
-                    // Cut post-checkpoint Plan/Evidence/Progress so
-                    // resume does not inherit work after the restore point.
-                    if let Err(error) = self.reset_task_epoch(&session_id).await {
-                        self.notify_error(
-                            &session_id,
-                            format!("对话已回滚,但任务状态重置失败: {error}"),
-                        );
-                    }
-                    self.drop_btw_thread(&session_id);
-                    // Roll the workspace back to the checkpoint's
-                    // snapshot (git repos). A failure is surfaced —
-                    // the transcript rolled back but files did not.
-                    let snapshot = self.checkpoints.snapshot_of(&checkpoint_id);
-                    // What the user is told once it is done. Every failure
-                    // path already speaks; a COMPLETE restore said nothing at
-                    // all, so the screen simply went blank — no checkpoint
-                    // named, no word on whether the files had moved.
-                    let mut landed = Some(format!(
-                        "已回退到检查点 #{ordinal} · 对话与工作区已回到该处"
-                    ));
-                    match snapshot {
-                        Some(snapshot) => {
-                            if let Err(error) = leveler_execution::WorkspaceSnapshot::restore(
-                                self.app
-                                    .layout
-                                    .require_workspace()
-                                    .map_err(|error| ClientError::Runtime(error.to_string()))?,
-                                &snapshot,
-                            )
-                            .await
-                            {
-                                landed = None;
-                                self.notify_error(
-                                    &session_id,
-                                    format!("对话已回滚,但工作区文件回滚失败: {error}"),
-                                );
-                            } else {
-                                let event = match compute_diff(
-                                    self.app
-                                        .layout
-                                        .require_workspace()
-                                        .map_err(|error| ClientError::Runtime(error.to_string()))?,
-                                    true,
-                                ) {
-                                    Ok(diff) => RuntimeEvent::DiffUpdated {
-                                        query_id: None,
-                                        diff,
-                                    },
-                                    Err(error) => RuntimeEvent::DiffFailed {
-                                        query_id: None,
-                                        message: error.to_string(),
-                                    },
-                                };
-                                let _ = self.events_for(&session_id).send(event);
-                            }
-                        }
-                        None => {
-                            landed = Some(format!(
-                                "已回退到检查点 #{ordinal} · 对话已回退;工作区非 git 仓库,文件未回滚"
-                            ));
-                        }
-                    }
-                    // Discard checkpoints that pointed past the restore.
-                    self.prune_checkpoints_after_restore(&session_id, ordinal);
-                    if let Ok(session) = self.snapshot(&session_id).await {
-                        let _ = self
-                            .events_for(&session_id)
-                            .send(RuntimeEvent::SessionOpened { session });
-                    }
-                    // After the snapshot: it replaces the client's view, and a
-                    // notification sent before it would be cleared with the
-                    // rest of the old session state.
-                    if let Some(message) = landed {
-                        let _ = self
-                            .events_for(&session_id)
-                            .send(RuntimeEvent::Notification {
-                                level: NotificationLevel::Info,
-                                message,
-                            });
-                    }
-                }
-                Err(error) => self.notify_error(&session_id, format!("恢复检查点失败: {error}")),
-            }
-        } else {
-            self.notify_error(
-                &session_id,
-                "未找到该检查点（可能已被清空、压缩或更早的回滚移除）".to_string(),
-            );
-        }
+        let result = self.restore_checkpoint(&session_id, &checkpoint_id).await;
         self.active.finish(&admission);
+        if let Err(error) = result {
+            self.notify_error(&session_id, error);
+        }
+        Ok(())
+    }
+
+    async fn restore_checkpoint(
+        &self,
+        session_id: &SessionId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<(), String> {
+        let Some(checkpoint) = self.checkpoints.get(session_id, checkpoint_id) else {
+            return Err("未找到该检查点（可能已被清空、压缩或更早的回滚移除）".into());
+        };
+        let workspace = checkpoint
+            .workspace
+            .as_ref()
+            .map(|_| self.app.layout.require_workspace())
+            .transpose()
+            .map_err(|error| format!("恢复检查点失败: {error}"))?;
+        let ordinal = checkpoint.view.ordinal;
+        let commit = async {
+            let db = self.app.open_database().await?;
+            let mut events = vec![
+                leveler_engine::EngineEvent::CheckpointRestored {
+                    checkpoint_id: checkpoint_id.clone(),
+                    through_sequence: checkpoint.event_cursor,
+                }
+                .to_row()?,
+            ];
+            events.extend(epoch_event_rows(Vec::new(), u64::from(ordinal))?);
+            db.restore_context_epoch(
+                session_id,
+                ordinal,
+                checkpoint.event_cursor,
+                &events,
+                leveler_core::now(),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        commit
+            .await
+            .map_err(|error| format!("恢复检查点失败: {error}"))?;
+
+        self.checkpoints
+            .prune_after_restore(session_id, checkpoint_id);
+        self.auxiliary_assists.cancel(session_id);
+        self.drop_btw_thread(session_id);
+        self.live_views.clear(session_id);
+        let events = self.events_for(session_id);
+
+        // The conversation cut has committed. Report any independent workspace
+        // failure, and publish the committed conversation in either case.
+        let workspace_result = match (workspace, checkpoint.workspace) {
+            (Some(workspace), Some(snapshot)) => {
+                match leveler_execution::WorkspaceSnapshot::restore(workspace, &snapshot).await {
+                    Ok(()) => {
+                        let _ = events.send(match compute_diff(workspace, true) {
+                            Ok(diff) => RuntimeEvent::DiffUpdated {
+                                query_id: None,
+                                diff,
+                            },
+                            Err(error) => RuntimeEvent::DiffFailed {
+                                query_id: None,
+                                message: error.to_string(),
+                            },
+                        });
+                        Ok(format!(
+                            "已回退到检查点 #{ordinal} · 对话与工作区已回到该处"
+                        ))
+                    }
+                    Err(error) => Err(format!("对话已回滚,但工作区文件回滚失败: {error}")),
+                }
+            }
+            _ => Ok(format!(
+                "已回退到检查点 #{ordinal} · 对话已回退;工作区非 git 仓库,文件未回滚"
+            )),
+        };
+        match self.snapshot(session_id).await {
+            Ok(session) => {
+                let _ = events.send(RuntimeEvent::SessionOpened { session });
+            }
+            Err(error) => {
+                let workspace_error = workspace_result
+                    .as_ref()
+                    .err()
+                    .map(|message| format!("{message}。"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{workspace_error}对话已回滚,但无法刷新会话: {error}"
+                ));
+            }
+        }
+        self.notify_info(session_id, workspace_result?);
         Ok(())
     }
     /// Compact the session's context off the request path, owning the
@@ -7144,6 +7178,8 @@ impl InProcessRuntimeClient {
                     sha256: stored.sha256,
                     width: Some(stored.width),
                     height: Some(stored.height),
+                    source_path: None,
+                    preview_path: Some(stored.path.to_string_lossy().into_owned()),
                 }),
                 Err(MediaError::Unsupported(_)) => {
                     let mime = mime_from_name(&name);
@@ -7157,6 +7193,8 @@ impl InProcessRuntimeClient {
                             sha256,
                             width: None,
                             height: None,
+                            source_path: None,
+                            preview_path: None,
                         }),
                         Err(error) => Err(error.to_string()),
                     }
@@ -7572,6 +7610,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                                     sha256: stored.sha256,
                                     width: Some(stored.width),
                                     height: Some(stored.height),
+                                    source_path: Some(path),
+                                    preview_path: Some(stored.path.to_string_lossy().into_owned()),
                                 },
                             });
                         }
@@ -7609,6 +7649,8 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             sha256: stored.sha256,
                             width: Some(stored.width),
                             height: Some(stored.height),
+                            source_path: None,
+                            preview_path: Some(stored.path.to_string_lossy().into_owned()),
                         })
                     })();
                     match result {
@@ -7722,6 +7764,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .active
                     .observe_steering(&session_id, || publisher.subscribe())
                     .map_or((None, None), |(gate, events)| (Some(gate), Some(events)));
+                // A steer is appended as plain text and never rebuilds the
+                // turn's skill injection. Decide that refusal before taking
+                // the admission lock: it reads the skill registry, and holding
+                // the lock across that read would change when the executor can
+                // collect pending input at a round boundary.
+                let mid_turn_skill_refusal = admission
+                    .as_ref()
+                    .and_then(|_| self.app.mid_turn_skill_refusal(&content));
                 let admission_guard = if let Some(gate) = &admission {
                     let guard = gate.admission_closed.lock().await;
                     if *guard {
@@ -7790,6 +7840,18 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         })
                     })
                     .transpose()?;
+                // A steer is appended as plain text and never rebuilds the
+                // turn's skill injection. Refuse a `/name` or `$name` skill
+                // request here, before any journal row exists, so no client
+                // can turn it into a normal instruction by accident.
+                // Refuse only once this text is confirmed to append to a
+                // running turn: when admission closed, the fallthrough below
+                // starts a fresh turn, which loads skills normally.
+                if admission_guard.is_some()
+                    && let Some(reason) = mid_turn_skill_refusal
+                {
+                    return Err(ClientError::Runtime(reason));
+                }
                 let row = self
                     .admit_input(&session_id, &id, &content, window.as_ref())
                     .await?;
@@ -11309,13 +11371,6 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>, input_id: Option<&str>) ->
     })
 }
 
-/// The ordinal a new checkpoint records, or `None` to skip creating one.
-/// A load failure must NEVER fall back to 0: restoring a 0-ordinal checkpoint
-/// truncates the whole transcript.
-fn checkpoint_ordinal(loaded: Result<usize, String>) -> Option<usize> {
-    loaded.ok()
-}
-
 /// Take the cancellation handle of one running child or tool call, if it is
 /// still running.
 fn take_cancel(
@@ -11519,28 +11574,6 @@ mod child_cancel_tests {
             "an ended child is not running"
         );
         assert!(take_cancel(&children, &SessionId::new("other"), "c1").is_none());
-    }
-}
-
-#[cfg(test)]
-mod checkpoint_ordinal_tests {
-    use super::checkpoint_ordinal;
-
-    #[test]
-    fn load_failure_skips_the_checkpoint_instead_of_recording_zero() {
-        assert_eq!(
-            checkpoint_ordinal(Err("db unavailable".to_string())),
-            None,
-            "a failed transcript load must skip the checkpoint — a 0-ordinal \
-             fallback wipes the conversation on restore"
-        );
-    }
-
-    #[test]
-    fn successful_load_records_the_transcript_length() {
-        assert_eq!(checkpoint_ordinal(Ok(7)), Some(7));
-        // An actually-empty transcript is a legitimate ordinal 0.
-        assert_eq!(checkpoint_ordinal(Ok(0)), Some(0));
     }
 }
 

@@ -790,6 +790,8 @@ mod tests {
                         sha256: "hash".into(),
                         width: Some(1),
                         height: Some(1),
+                        source_path: None,
+                        preview_path: None,
                     });
                     s.composer.insert_image_token();
                     let draft = s.composer.canonical_text();

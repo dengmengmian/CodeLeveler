@@ -129,7 +129,7 @@ fn token_affixes(template: &str) -> (&str, &str) {
 /// Byte spans of every well-formed image token in `s`, with the number each
 /// carries, in buffer order. Text that merely looks like the start of one is
 /// skipped, not guessed at.
-fn scan_image_tokens(s: &str, template: &str) -> Vec<(std::ops::Range<usize>, usize)> {
+pub(crate) fn scan_image_tokens(s: &str, template: &str) -> Vec<(std::ops::Range<usize>, usize)> {
     let (prefix, suffix) = token_affixes(template);
     if prefix.is_empty() {
         return Vec::new();
@@ -1047,7 +1047,7 @@ impl Composer {
     }
 
     /// Byte spans and numbers of the tokens, in buffer order.
-    fn image_tokens(&self) -> Vec<(std::ops::Range<usize>, usize)> {
+    pub(crate) fn image_token_spans(&self) -> Vec<(std::ops::Range<usize>, usize)> {
         scan_image_tokens(&self.buffer, &self.image_token)
     }
 
@@ -1058,7 +1058,7 @@ impl Composer {
         self.begin_edit();
         let at = byte_of_grapheme(&self.buffer, self.cursor);
         let index = self
-            .image_tokens()
+            .image_token_spans()
             .iter()
             .filter(|(range, _)| range.end <= at)
             .count();
@@ -1072,7 +1072,11 @@ impl Composer {
     /// Remove the `ordinal`-th token (1-based) and the space it brought with
     /// it, then renumber what is left.
     pub fn remove_image_token(&mut self, ordinal: usize) {
-        let Some((range, _)) = self.image_tokens().get(ordinal.wrapping_sub(1)).cloned() else {
+        let Some((range, _)) = self
+            .image_token_spans()
+            .get(ordinal.wrapping_sub(1))
+            .cloned()
+        else {
             return;
         };
         self.begin_edit();
@@ -1108,7 +1112,7 @@ impl Composer {
         let mut keep = Vec::new();
         let mut seen = Vec::new();
         let mut drop: Vec<std::ops::Range<usize>> = Vec::new();
-        for (range, number) in self.image_tokens() {
+        for (range, number) in self.image_token_spans() {
             let index = number.wrapping_sub(1);
             if number == 0 || number > staged || seen.contains(&index) {
                 drop.push(range);
@@ -1142,7 +1146,7 @@ impl Composer {
     /// the user left it — the numbers can change width (9 → 10), and a cursor
     /// that ended up inside a token is put just after it.
     fn renumber_image_tokens(&mut self) {
-        let tokens = self.image_tokens();
+        let tokens = self.image_token_spans();
         if tokens.is_empty() {
             return;
         }
@@ -1188,7 +1192,7 @@ impl Composer {
         if by == 0 {
             return;
         }
-        let tokens = self.image_tokens();
+        let tokens = self.image_token_spans();
         let mut out = String::with_capacity(self.buffer.len());
         let mut last = 0usize;
         for (range, number) in &tokens {
@@ -1227,7 +1231,7 @@ impl Composer {
 
     fn editable_token_ranges(&self) -> Vec<std::ops::Range<usize>> {
         let mut ranges: Vec<_> = self
-            .image_tokens()
+            .image_token_spans()
             .into_iter()
             .map(|(range, _)| range)
             .collect();
@@ -1687,6 +1691,8 @@ mod edit_history_tests {
             sha256: "hash".into(),
             width: Some(1),
             height: Some(1),
+            source_path: None,
+            preview_path: None,
         };
         let mut c = Composer::new();
         c.set_edit_attachments(&[]);

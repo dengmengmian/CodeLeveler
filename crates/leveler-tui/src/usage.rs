@@ -111,21 +111,15 @@ pub fn section_lines(state: &AppState, width: usize, theme: &Theme) -> Vec<Line<
     let heading = Style::default().fg(theme.text.secondary);
     let label = Style::default().fg(theme.text.secondary);
     let value = Style::default().fg(theme.text.primary);
-    let dim = Style::default().fg(theme.text.muted);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let scope = scope_label(u, state.usage.scope);
-    // The heading names the section AND the range: one scope per line, so the
-    // figures under it can never be read as belonging to another window.
-    let title = format!("{} · {scope}", u.section);
-    let hint = format!("   {}", u.scope_hint);
-    let title_width = unicode_width::UnicodeWidthStr::width(title.as_str())
-        + unicode_width::UnicodeWidthStr::width(hint.as_str());
-    let mut heading_line = vec![Span::styled(title, heading)];
-    if title_width <= width {
-        heading_line.push(Span::styled(hint, dim));
-    }
-    lines.push(Line::from(heading_line));
+    // The heading names the section and the range. The keys that change the
+    // range live in the card footer, not on this line.
+    lines.push(Line::from(Span::styled(
+        format!("{} · {scope}", u.section),
+        heading,
+    )));
 
     let Some(report) = state.usage.report_for_current_scope() else {
         // No answer for THIS scope yet. That is not "empty" and not `0`: either

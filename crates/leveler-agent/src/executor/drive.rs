@@ -189,6 +189,8 @@ pub(crate) fn finalization_point(
 /// now because the kernel, not this code, owns the iteration.
 pub(crate) struct Drive<'a> {
     executor: &'a Executor,
+    /// Isolated tool authority for this drive's selected skill versions.
+    tool_context: leveler_tools::ToolContext,
     observer: &'a mut (dyn FnMut(AgentEvent) + Send),
     sink: &'a mut dyn TranscriptSink,
     /// Active objective used for this drive (host-pinned).
@@ -896,6 +898,7 @@ impl Executor {
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
         aborted: &mut AbortedFacts,
+        references: Vec<leveler_skills::SkillReferenceGrant>,
     ) -> Result<AgentOutcome, DriveAborted> {
         // A host catalog that is already reachable is part of the FIRST
         // request's surface. Absorbing it only from round two meant the opening
@@ -1093,8 +1096,14 @@ impl Executor {
             .map(Message::text_content)
             .filter(|text| !text.trim().is_empty())
             .unwrap_or_else(|| objective.latest_instruction().to_string());
+        let mut bound_references = self.agent_skill_references.clone();
+        bound_references.extend(references);
         let mut harness = Drive {
             executor: self,
+            tool_context: self
+                .tool_context
+                .clone()
+                .with_skill_references(bound_references),
             observer,
             sink,
             tools,
@@ -3272,7 +3281,7 @@ impl Drive<'_> {
                 "skills_guidance" | "multi_agent_guidance" | "host_interaction_guidance"
             )
         });
-        let extra = self
+        let (extra, _skill_audit, references) = self
             .executor
             .turn_control_context_inner(request, request, false, None);
         optional.extend(extra.blocks.into_iter().filter(|segment| {
@@ -3288,6 +3297,11 @@ impl Drive<'_> {
                 .iter()
                 .any(|current| current.name == segment.name)
             {
+                if segment.name == "selected_skills" {
+                    for grant in &references {
+                        self.tool_context.bind_skill_references(grant.clone());
+                    }
+                }
                 self.control_context.blocks.push(segment);
             }
         }
@@ -7491,7 +7505,7 @@ impl AgentHarness for Drive<'_> {
             // Build the effective context: turn grants from
             // request_permissions, plus this call's own escalation.
             let ctx = apply_turn_grants(
-                self.executor.tool_context.clone(),
+                self.tool_context.clone(),
                 self.turn_grants.merge(call_grants),
             );
             // Full epoch path set so tools count "new" files correctly

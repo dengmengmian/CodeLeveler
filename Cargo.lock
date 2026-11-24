@@ -2257,6 +2257,7 @@ dependencies = [
  "leveler-lifecycle",
  "leveler-model",
  "leveler-provider",
+ "leveler-skills",
  "leveler-storage",
  "leveler-test-support",
  "serde",
@@ -2542,6 +2543,7 @@ dependencies = [
  "serde",
  "serde_yaml_ng",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

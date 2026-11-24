@@ -52,6 +52,16 @@ pub struct AttachmentRef {
     pub sha256: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Original file the user attached. Clipboard and pasted bytes have none.
+    /// The composer preview is the only surface that shows it; the sentence
+    /// the model reads stays `[图片 #N]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// Local processed PNG (`{sha256}.png` under the media store) a terminal
+    /// may read for a pixel preview. Never shown and never sent as text.
+    /// Absent for clients that do not have the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_path: Option<String>,
 }
 
 impl AttachmentRef {
@@ -98,7 +108,28 @@ mod tests {
             sha256: "abc".to_string(),
             width,
             height,
+            source_path: None,
+            preview_path: None,
         }
+    }
+
+    #[test]
+    fn paths_are_optional_and_stay_out_of_the_summary() {
+        let mut with_paths = attachment(186_368, Some(1280), Some(720));
+        with_paths.source_path = Some("/Users/secret/shot.png".into());
+        with_paths.preview_path = Some("/tmp/state/media/abc.png".into());
+        let summary = with_paths.summary();
+        assert_eq!(summary, "preview.png · PNG · 1280×720 · 182 KB");
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("media"));
+
+        let old: AttachmentRef = serde_json::from_str(
+            r#"{"id":"a1","kind":"image","name":"preview.png","mime_type":"image/png","size_bytes":512,"sha256":"abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.source_path, None);
+        assert_eq!(old.preview_path, None);
+        assert_eq!(old.summary(), "preview.png · PNG · 512 B");
     }
 
     #[test]

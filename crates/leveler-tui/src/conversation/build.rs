@@ -524,6 +524,18 @@ fn build_conversation(
                 _ => unreachable!("non-cacheable item handled above"),
             }
         }
+        let body_end = out.len();
+        if body_end > before_item
+            && matches!(item, TranscriptItem::Assistant(block) if block.is_copyable_reply())
+        {
+            for line in super::reply_copy::rows(width, theme, t) {
+                out.push(line);
+                copy.push(crate::selection::PlainRow {
+                    skip: true,
+                    ..Default::default()
+                });
+            }
+        }
         // The item produced nothing (an all-Silent tool group): take the
         // separator back so no hole is left behind.
         let invisible = out.len() == before_item;
@@ -541,7 +553,7 @@ fn build_conversation(
                 item: first_item,
                 call,
                 start: before_item,
-                end: out.len(),
+                end: body_end,
             });
         }
         // One span per consumed item. A sub-agent run (or any future multi-item

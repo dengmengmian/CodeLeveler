@@ -61,12 +61,58 @@ POST_RELEASE_SCHEMA (all fields optional; a missing field is NOT_VERIFIED):
         {"metric": "TUI first frame", "previous": "492 ms", "current": "638 ms",
          "delta": "+29.7%", "verdict": "REGRESSED"}
       ]
-    }
+    },
+    "quality_closure": {
+      "generated_at": "2026-11-22T12:00:00Z",
+      "phases": [
+        {"phase": "A", "area": "release identity and L4 accounting",
+         "status": "PASS", "evidence": "docs/dev/.../phase-a-audit.md"}
+      ]
+    },
+    "platform_matrix": [
+      {"platform": "macOS arm64", "host": "Apple M3, Darwin 25.6.0",
+       "status": "PASS", "package_sha256": "9e9b...", "binary_sha256": "5022...",
+       "detail": "published payload, fresh install, real provider turn",
+       "evidence": "docs/dev/.../evidence/macos-arm64/result.json"}
+    ],
+    "performance_ab": {
+      "classification": "NO_SIGNIFICANT_DIFFERENCE",
+      "method": "interleaved A1 B1 B2 A2 A3 B3, same cases/model/config",
+      "summary": "wall_p50 26.4 s -> 26.8 s (+1.5%)",
+      "rows": [
+        {"metric": "wall p50", "v027": "26.4 s", "v028": "26.8 s",
+         "delta": "+1.5%", "verdict": "UNCHANGED"}
+      ],
+      "attribution": ["rounds unchanged", "per-round latency +1.2%"],
+      "uncertainty": "provider-side model revision is not pinnable"
+    },
+    "coverage_closure": {
+      "declared_gaps_total": 50,
+      "gaps_closed_by_this_closure": 6,
+      "gaps_still_external": 44,
+      "partial": [{"feature": "cli.run", "status": "PARTIAL", "detail": "..."}],
+      "unverified": [{"feature": "tui.slash.fork", "status": "UNVERIFIED", "detail": "..."}]
+    },
+    "flake": {
+      "test": "an_exit_racing_a_steer_keeps_the_result_and_the_message",
+      "status": "FLAKY_UNRESOLVED", "runs": 200,
+      "failures": 0, "conclusion": "not reproduced under load"
+    },
+    "fixes": [
+      {"id": "F1", "severity": "medium", "root_cause": "...",
+       "fix": "...", "commit": "abc1234", "tests": "cargo test ...",
+       "affects_published": false}
+    ],
+    "residual_risks": [
+      {"risk": "Windows runtime unverified", "severity": "high",
+       "evidence": "no Windows host", "impact": "...", "next_action": "..."}
+    ]
   }
 
 `performance` is operator-recorded measurement of the two released artifacts,
 not a gate verdict; the page labels it as such so it can never be read as the
-gate's own comparison.
+gate's own comparison. The post-release closure sections are rendered only from
+the fields present; a missing field is NOT_VERIFIED, never an inferred PASS.
 """
 
 from __future__ import annotations
@@ -553,6 +599,29 @@ def artifact_rows(record):
     return rows
 
 
+def closure_records(record):
+    """Post-release closure evidence, with absent sections left absent.
+
+    Every value here is recorded by the closure run; a missing section is
+    NOT_VERIFIED, never an implied pass.
+    """
+    post = record.get("post_release") or {}
+    closure = post.get("quality_closure")
+    phases = closure.get("phases") if isinstance(closure, dict) else None
+    return {
+        "phases": phases or [],
+        "overall_status": closure.get("overall_status") if isinstance(closure, dict) else None,
+        "overall_note": closure.get("overall_note") if isinstance(closure, dict) else None,
+        "evidence_links": (closure.get("evidence_links") if isinstance(closure, dict) else None) or [],
+        "platforms": post.get("platform_matrix") or [],
+        "ab": post.get("performance_ab") or {},
+        "coverage": post.get("coverage_closure") or {},
+        "flake": post.get("flake") or {},
+        "fixes": post.get("fixes") or [],
+        "risks": post.get("residual_risks") or [],
+    }
+
+
 def summary_cards(record):
     layers = {row["layer"]: row for row in layer_rows(record)}
     cases = dogfood_case_totals(record)
@@ -571,7 +640,17 @@ def summary_cards(record):
     build = stages.get("1", {}).get("status", NOT_VERIFIED)
     tests = stages.get("2", {}).get("status", NOT_VERIFIED)
     cross = dig(record, "remote", "assets", default=[]) or []
-    return [
+    closure = closure_records(record)
+    platforms = closure["platforms"]
+    platform_pass = [p for p in platforms if str(p.get("status")).upper() == "PASS"]
+    platform_blocked = [
+        p
+        for p in platforms
+        if "BLOCKED" in str(p.get("status")).upper()
+        or "NOT_RUN" in str(p.get("status")).upper()
+    ]
+    ab = closure["ab"]
+    cards = [
         ("Build & static", build, "stage 1 · dogfood L0"),
         ("Unit / integration", tests, "stage 2 · dogfood L1/L2"),
         (
@@ -622,6 +701,26 @@ def summary_cards(record):
             text(soak.get("short_note"), "run %s" % text(soak.get("run_id"))) if soak else "not recorded",
         ),
     ]
+    if platforms:
+        cards.append(
+            (
+                "Platform acceptance",
+                "PASS"
+                if len(platform_pass) == len(platforms)
+                else ("BLOCKED" if platform_blocked else "PARTIAL"),
+                "%d/%d platform(s) PASS, %d blocked"
+                % (len(platform_pass), len(platforms), len(platform_blocked)),
+            )
+        )
+    if ab:
+        cards.append(
+            (
+                "Published A/B performance",
+                text(ab.get("classification")),
+                text(ab.get("summary"), "no summary recorded"),
+            )
+        )
+    return cards
 
 
 # ── html ────────────────────────────────────────────────────────────────────
@@ -633,15 +732,33 @@ def esc(value):
 
 def status_class(value):
     word = str(value).upper()
-    if word.startswith("PASS") or word in ("RELEASED", "VERIFIED", "IMPROVED", "UNCHANGED"):
+    if word.startswith("PASS") or word in (
+        "RELEASED",
+        "VERIFIED",
+        "CLOSED",
+        "IMPROVED",
+        "UNCHANGED",
+        "CONFIRMED_IMPROVEMENT",
+        "NO_SIGNIFICANT_DIFFERENCE",
+    ):
         return "ok"
     if (
         word.startswith("WARN")
         or word.startswith("IN PROGRESS")
-        or word in ("PARTIAL", "NOT_COMPARABLE", "UNPROVEN", "SKIPPED")
+        or word in (
+            "PARTIAL",
+            "NOT_COMPARABLE",
+            "UNPROVEN",
+            "SKIPPED",
+            "BLOCKED_ENVIRONMENT",
+            "NOT_RUN",
+            "FLAKY_UNRESOLVED",
+            "INCONCLUSIVE",
+            "CONDITIONAL_CLOSED",
+        )
     ):
         return "warn"
-    if word.startswith("FAIL") or word in ("BLOCKED", "REGRESSED"):
+    if word.startswith("FAIL") or word in ("BLOCKED", "REGRESSED", "CONFIRMED_REGRESSION"):
         return "bad"
     return "muted"
 
@@ -1072,6 +1189,234 @@ def render_version(record):
             table(
                 ["Check", "Status", "Evidence"],
                 [(esc(a), ("badge", b[0]), esc(c)) for a, b, c in post_checks],
+            )
+        )
+
+    # Post-release quality closure. These sections exist only when the closure
+    # recorded evidence; they never restate the release gate as if it were
+    # re-run, and they never turn BLOCKED into PASS.
+    closure = closure_records(record)
+    if closure["phases"] or closure["overall_status"]:
+        parts.append("<h2>Post-release quality closure</h2>")
+        if closure["overall_status"]:
+            parts.append(
+                "<p><b>Post-release quality status:</b> %s</p>"
+                % badge(closure["overall_status"])
+            )
+        if closure["overall_note"]:
+            parts.append('<p class="note">%s</p>' % esc(text(closure["overall_note"])))
+        generated = (post.get("quality_closure") or {}).get("generated_at")
+        if generated:
+            parts.append('<p class="note">Closure evidence recorded %s. The original release verdict is unchanged.</p>' % esc(text(generated)))
+        if closure["phases"]:
+            parts.append(
+                table(
+                    ["Phase", "Area", "Status", "Evidence"],
+                    [
+                        (
+                            esc(text(phase.get("phase"))),
+                            esc(text(phase.get("area"))),
+                            ("badge", phase.get("status")),
+                            esc(text(phase.get("evidence"))),
+                        )
+                        for phase in closure["phases"]
+                    ],
+                )
+            )
+        if closure["evidence_links"]:
+            parts.append("<h3>Closure evidence</h3>")
+            parts.append(
+                "<ul>%s</ul>"
+                % "".join(
+                    '<li><a href="%s">%s</a></li>'
+                    % (esc(text(link.get("path"))), esc(text(link.get("label"))))
+                    for link in closure["evidence_links"]
+                    if link.get("path")
+                )
+            )
+
+    if closure["platforms"]:
+        parts.append("<h2>Platform acceptance matrix</h2>")
+        parts.append(
+            table(
+                ["Platform", "Host", "Status", "Package / binary SHA-256", "Detail"],
+                [
+                    (
+                        esc(text(row.get("platform"))),
+                        esc(text(row.get("host"))),
+                        ("badge", row.get("status")),
+                        "<code>%s</code><br><code>%s</code>"
+                        % (
+                            esc(text(row.get("package_sha256"))),
+                            esc(text(row.get("binary_sha256"))),
+                        ),
+                        esc(text(row.get("detail"))),
+                    )
+                    for row in closure["platforms"]
+                ],
+            )
+        )
+        parts.append(
+            '<p class="note">A platform with any BLOCKED, NOT_RUN or failed check is not a '
+            "platform PASS. Cross-compilation, CI and emulation are not substitutes for a "
+            "native run.</p>"
+        )
+        evidence_rows = [
+            (esc(text(row.get("platform"))), esc(text(row.get("evidence"))))
+            for row in closure["platforms"]
+            if row.get("evidence")
+        ]
+        if evidence_rows:
+            parts.append(table(["Platform", "Evidence"], evidence_rows))
+
+    ab = closure["ab"]
+    if ab:
+        parts.append("<h2>Published-binary performance comparison</h2>")
+        parts.append(
+            "<p><b>Classification:</b> %s</p>" % badge(ab.get("classification"))
+        )
+        if ab.get("method"):
+            parts.append('<p class="note">%s</p>' % esc(text(ab.get("method"))))
+        if ab.get("summary"):
+            parts.append("<p>%s</p>" % esc(text(ab.get("summary"))))
+        ab_rows = ab.get("rows") or []
+        if ab_rows:
+            parts.append(
+                table(
+                    ["Metric", "v1.0.27", "v1.0.28", "Delta", "Verdict"],
+                    [
+                        (
+                            esc(text(row.get("metric"))),
+                            esc(text(row.get("v027"))),
+                            esc(text(row.get("v028"))),
+                            esc(text(row.get("delta"))),
+                            ("badge", row.get("verdict")),
+                        )
+                        for row in ab_rows
+                    ],
+                )
+            )
+        attribution = ab.get("attribution") or []
+        if attribution:
+            parts.append("<h3>Attribution</h3><ul>%s</ul>" % "".join(
+                "<li>%s</li>" % esc(item) for item in attribution
+            ))
+        if ab.get("uncertainty"):
+            parts.append('<p class="note">Uncertainty: %s</p>' % esc(text(ab.get("uncertainty"))))
+
+    coverage_closure = closure["coverage"]
+    if coverage_closure:
+        parts.append("<h2>Coverage closure</h2>")
+        counts = [
+            ("Declared gaps in the original release", coverage_closure.get("declared_gaps_total")),
+            ("Gaps closed by this closure", coverage_closure.get("gaps_closed_by_this_closure")),
+            ("Gaps still external or unverified", coverage_closure.get("gaps_still_external")),
+        ]
+        parts.append(
+            table(
+                ["Measure", "Value"],
+                [(esc(label), esc(text(value))) for label, value in counts if value is not None],
+            )
+        )
+        closed = coverage_closure.get("closed") or []
+        if closed:
+            parts.append("<h3>Gaps closed with new coverage</h3>")
+            parts.append(
+                table(
+                    ["Feature", "New evidence", "Status"],
+                    [
+                        (
+                            esc(text(row.get("feature"))),
+                            esc(text(row.get("test"))),
+                            ("badge", row.get("status")),
+                        )
+                        for row in closed
+                    ],
+                )
+            )
+        for label, key in (("Partial", "partial"), ("Unverified", "unverified"), ("External", "external")):
+            rows = coverage_closure.get(key) or []
+            if rows:
+                parts.append("<h3>%s</h3>" % esc(label))
+                parts.append(
+                    table(
+                        ["Feature", "Status", "Detail"],
+                        [
+                            (
+                                esc(text(row.get("feature"))),
+                                ("badge", row.get("status")),
+                                esc(text(row.get("detail"))),
+                            )
+                            for row in rows
+                        ],
+                    )
+                )
+        parts.append(
+            '<p class="note">New tests close a coverage gap going forward. They do not '
+            "retroactively change what the published v1.0.28 package was verified to do.</p>"
+        )
+
+    flake = closure["flake"]
+    if flake:
+        parts.append("<h2>Flake investigation</h2>")
+        parts.append(
+            table(
+                ["Test", "Status", "Runs", "Failures", "Conclusion"],
+                [
+                    (
+                        "<code>%s</code>" % esc(text(flake.get("test"))),
+                        ("badge", flake.get("status")),
+                        esc(text(flake.get("runs"))),
+                        esc(text(flake.get("failures"))),
+                        esc(text(flake.get("conclusion"))),
+                    )
+                ],
+            )
+        )
+        if flake.get("evidence"):
+            parts.append('<p class="note">Evidence: %s</p>' % esc(text(flake.get("evidence"))))
+
+    fixes = closure["fixes"]
+    if fixes:
+        parts.append("<h2>Confirmed defects and fixes</h2>")
+        parts.append(
+            table(
+                ["ID", "Severity", "Root cause", "Fix", "Tests", "Commit", "Affects published"],
+                [
+                    (
+                        esc(text(row.get("id"))),
+                        esc(text(row.get("severity"))),
+                        esc(text(row.get("root_cause"))),
+                        esc(text(row.get("fix"))),
+                        esc(text(row.get("tests"))),
+                        "<code>%s</code>" % esc(text(row.get("commit"))),
+                        esc(text(row.get("affects_published"))),
+                    )
+                    for row in fixes
+                ],
+            )
+        )
+        parts.append(
+            '<p class="note">A fix is verified on the candidate tree, not on the published '
+            "binary. The published package keeps its original verification result.</p>"
+        )
+
+    risks = closure["risks"]
+    if risks:
+        parts.append("<h2>Residual risks</h2>")
+        parts.append(
+            table(
+                ["Risk", "Severity", "Evidence", "Impact", "Next action"],
+                [
+                    (
+                        esc(text(row.get("risk"))),
+                        esc(text(row.get("severity"))),
+                        esc(text(row.get("evidence"))),
+                        esc(text(row.get("impact"))),
+                        esc(text(row.get("next_action"))),
+                    )
+                    for row in risks
+                ],
             )
         )
 

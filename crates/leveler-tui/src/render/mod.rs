@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::screen::Screen;
@@ -65,7 +65,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         ActivityKind::BackgroundTask => t.activity_title_background,
         ActivityKind::ChildAgent => t.activity_title_child,
     };
-    let mut layout = crate::secondary::layout(area, 0);
+    let mut layout = crate::secondary::page_layout(state, area, 0);
     let stop = match &id {
         crate::activity::ActivityId::Background(task_id)
             if state
@@ -98,13 +98,15 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         hint: &hint,
     };
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let offset = state
         .activity_view
         .scroll
         .min(state.activity_view.max_scroll);
+    let total = lines.len();
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
     frame.render_widget(Paragraph::new(visible), body);
+    crate::render::paint_scrollbar(frame, body, total, offset, &state.theme);
     if let Some((rect, task_id)) = stop {
         render_background_stop(frame, rect, &task_id, state);
     }
@@ -119,9 +121,9 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.activity_esc,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let lines = vec![Line::from(Span::styled(
         t.activity_stale.to_string(),
         Style::default().fg(state.theme.text.muted),
@@ -153,6 +155,17 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
 /// tail instead of an empty screen.
 fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
+    let page_title = state
+        .output_view
+        .as_ref()
+        .map(|view| {
+            if view.title.trim().is_empty() {
+                t.output_screen_title.to_string()
+            } else {
+                format!("{} · {}", t.output_screen_title, view.title)
+            }
+        })
+        .unwrap_or_else(|| t.output_screen_title.to_string());
     let page_data = state.output_view.as_ref().map(|view| {
         let rows_label = view
             .total_rows()
@@ -163,11 +176,29 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         } else {
             t.output_screen_paused
         };
-        match view.completeness.label(t) {
-            Some(completeness) => format!("{completeness} · {rows_label} · {follow}"),
-            None => format!("{rows_label} · {follow}"),
+        let mut facts = Vec::new();
+        if let Some(completeness) = view.completeness.label(t) {
+            facts.push(completeness.to_string());
         }
+        facts.push(rows_label);
+        facts.push(follow.to_string());
+        if let Some(exit) = view.meta.exit_code {
+            facts.push(t.user_shell_exit_code.replacen("{}", &exit.to_string(), 1));
+        }
+        if let Some(duration_ms) = view.meta.duration_ms {
+            facts.push(crate::status_line::fmt_elapsed(duration_ms / 1000));
+        }
+        if view.meta.has_stderr {
+            facts.push(t.output_screen_stderr_present.to_string());
+        }
+        facts.join(" · ")
     });
+    let body_facts = page_data.clone();
+    let body_command = state
+        .output_view
+        .as_ref()
+        .map(|view| view.title.clone())
+        .filter(|title| !title.trim().is_empty());
     // Copy feedback is otherwise painted only on the Conversation strip; a
     // secondary page must still say whether the clipboard write happened.
     let (status_text, status_color) = match state.notification.as_ref() {
@@ -183,26 +214,86 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         None => (page_data, state.theme.text.muted),
     };
     let page = crate::secondary::SecondaryPage {
-        title: t.output_screen_title,
+        title: &page_title,
         status: status_text
             .map(|status| vec![Span::styled(status, Style::default().fg(status_color))])
             .unwrap_or_default(),
         hint: t.output_screen_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
+    // The hosted card's title row names the group, not the command. Keep the
+    // source identity and execution facts inside the body, above the window,
+    // without turning the output itself into a second metadata document.
+    let mut content_area = body;
+    if state.output_view.is_some() && body.height >= 4 {
+        let meta_rows = 3u16;
+        let command = body_command.clone().unwrap_or_default();
+        let command_line = format!(
+            "{}  {}",
+            t.output_screen_command,
+            crate::render::truncate_display(&command, body.width.saturating_sub(8) as usize)
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::render::truncate_display(&command_line, body.width as usize),
+                Style::default()
+                    .fg(state.theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect { height: 1, ..body },
+        );
+        let facts = body_facts.clone().unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::render::truncate_display(&facts, body.width as usize),
+                Style::default().fg(state.theme.text.muted),
+            ))),
+            Rect {
+                y: body.y + 1,
+                height: 1,
+                ..body
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(body.width as usize),
+                Style::default().fg(state.theme.border.subtle),
+            ))),
+            Rect {
+                y: body.y + 2,
+                height: 1,
+                ..body
+            },
+        );
+        content_area = Rect {
+            y: body.y + meta_rows,
+            height: body.height.saturating_sub(meta_rows),
+            ..body
+        };
+    }
     let Some(view) = state.output_view.as_mut() else {
+        let line = Line::from(Span::styled(
+            t.output_screen_no_view.to_string(),
+            Style::default().fg(state.theme.text.muted),
+        ));
+        frame.render_widget(Paragraph::new(line), content_area);
         return;
     };
-    let width = body.width as usize;
-    view.rect = Some((body.x, body.y, body.width, body.height));
+    let width = content_area.width as usize;
+    view.rect = Some((
+        content_area.x,
+        content_area.y,
+        content_area.width,
+        content_area.height,
+    ));
     state.output_rect = view.rect;
-    let height = body.height as usize;
+    let height = content_area.height as usize;
     view.sync_geometry(height);
     if view
         .index
@@ -215,7 +306,7 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             t.output_screen_reflow.to_string(),
             Style::default().fg(state.theme.text.muted),
         ));
-        frame.render_widget(Paragraph::new(line), body);
+        frame.render_widget(Paragraph::new(line), content_area);
         return;
     }
     if let Some(error) = view.error.clone().filter(|_| view.index.is_none()) {
@@ -233,7 +324,7 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 error,
                 Style::default().fg(state.theme.status.error),
             ));
-            frame.render_widget(Paragraph::new(line), body);
+            frame.render_widget(Paragraph::new(line), content_area);
             return;
         }
     };
@@ -242,7 +333,7 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             t.output_screen_empty.to_string(),
             Style::default().fg(state.theme.text.muted),
         ));
-        frame.render_widget(Paragraph::new(line), body);
+        frame.render_widget(Paragraph::new(line), content_area);
         return;
     }
     let selection = view.selection.clone();
@@ -263,7 +354,7 @@ fn render_output_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             )
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(Paragraph::new(lines), content_area);
 }
 
 fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -282,40 +373,50 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         )],
         hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
 
-    // One list, one detail, one rule between — the split the Diff page uses.
-    // The list yields to the body before its own floor does: a viewport too
-    // narrow for both panes gives every column it has to the one that is
-    // always there, rather than pushing the detail pane past the right margin.
-    let list_width = ((body.width as usize) * 40 / 100)
-        .clamp(12, 64)
-        .min(body.width.saturating_sub(1) as usize) as u16;
-    let list_area = Rect {
-        width: list_width,
-        ..body
+    const TEAM_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Horizontal,
+        primary_pct: 38,
+        primary_min: 18,
+        detail_min: 28,
+        min_dual_width: 72,
+        min_dual_height: 8,
     };
-    let detail_area = Rect {
-        x: body.x + list_width + 1,
-        width: body.width.saturating_sub(list_width + 1),
-        ..body
+    let single_focus = if state.page_focus == crate::layout::SplitFocus::Detail {
+        crate::layout::SplitFocus::Detail
+    } else {
+        crate::layout::SplitFocus::Primary
     };
+    let split = crate::layout::split_pane(body, TEAM_SPLIT)
+        .unwrap_or_else(|| crate::layout::single_pane(body, single_focus));
+    state.page_split = Some(crate::state::PageSplit {
+        screen: Screen::Team,
+        layout: split,
+    });
+    let list_area = split.primary;
+    let detail_area = split.detail;
 
     state.screen_rows.clear();
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut row_starts: Vec<(usize, String)> = Vec::new();
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
     if state.team.children.is_empty() {
-        lines.push(Line::from(Span::styled(
-            t.team_page_empty.to_string(),
-            Style::default().fg(theme.text.muted),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.team_page_empty,
+                detail: None,
+            },
+            theme,
+            list_area.width as usize,
+        ));
     }
     let selected = state.team_selected.clone();
     let rows = crate::multi_agent::roster_rows(&state.team, state.elapsed_secs, t);
@@ -324,56 +425,43 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             continue;
         };
         let on = selected.as_deref() == Some(child.id.as_str());
-        row_starts.push((lines.len(), child.id.clone()));
-        let marker = if on { "› " } else { "  " };
-        let mut head = vec![
-            Span::styled(marker, Style::default().fg(theme.accent.primary)),
-            Span::styled(row.label.clone(), Style::default().fg(theme.text.primary)),
-        ];
-        if let Some(meta) = row.meta.as_deref().filter(|m| !m.is_empty()) {
-            head.push(Span::styled(
-                format!("  · {meta}"),
-                Style::default().fg(theme.text.muted),
-            ));
+        let (glyph, tone) = match row.tone {
+            crate::multi_agent::RosterTone::Active => ("●", crate::render::RowTone::Info),
+            crate::multi_agent::RosterTone::Done => ("✓", crate::render::RowTone::Success),
+            crate::multi_agent::RosterTone::Failed => ("✗", crate::render::RowTone::Error),
+            crate::multi_agent::RosterTone::Unconfirmed => ("!", crate::render::RowTone::Warning),
+        };
+        let mut list_row = crate::render::ListRow::new(row.label.clone())
+            .status(glyph, tone)
+            .description(row.activity.clone());
+        if let Some(meta) = row.meta.as_deref().filter(|meta| !meta.is_empty()) {
+            list_row = list_row.meta(meta);
         }
-        lines.push(Line::from(head));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(
-                row.activity.clone(),
-                Style::default().fg(theme.text.secondary),
-            ),
-        ]));
+        let focused = !split.dual || state.page_focus == crate::layout::SplitFocus::Primary;
+        let paint = crate::render::row_paint(state, &child.id, on, focused);
+        let row_lines =
+            crate::render::list_row_lines(&list_row, paint, theme, list_area.width as usize);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key: child.id.clone(),
+        });
+        lines.extend(row_lines);
     }
-
-    // Keep the selection visible without a second scroll owner: the offset is
-    // derived from the selection, so a resize can never strand the row.
-    let visible = list_area.height as usize;
-    let selected_line = selected.as_deref().and_then(|id| {
-        row_starts
-            .iter()
-            .find(|(_, row_id)| row_id == id)
-            .map(|(line, _)| *line)
-    });
-    let max_offset = lines.len().saturating_sub(visible);
-    let offset = selected_line
-        .map(|line| line.saturating_sub(visible.saturating_sub(2)))
-        .unwrap_or(0)
-        .min(max_offset);
-    for (line, id) in &row_starts {
-        if *line >= offset && *line + 1 < offset + visible {
-            state.screen_rows.push((
-                Rect {
-                    y: list_area.y + (*line - offset) as u16,
-                    height: 2,
-                    x: list_area.x,
-                    width: list_area.width,
-                },
-                id.clone(),
-            ));
-        }
+    let selected_line = selected
+        .as_deref()
+        .and_then(|id| hits.iter().find(|hit| hit.key == id).map(|hit| hit.line));
+    if list_area.width > 0 && list_area.height > 0 {
+        crate::render::render_list_rows_with_spans(
+            frame,
+            list_area,
+            lines,
+            &hits,
+            selected_line.unwrap_or(0),
+            theme,
+            &mut state.screen_rows,
+        );
     }
-    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), list_area);
 
     // The inspector for the selected child. `inspector_rows` is the one reader
     // of a child's loaded contribution, and this page is where it belongs.
@@ -397,10 +485,23 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Style::default().fg(theme.text.muted),
         ))),
     }
-    frame.render_widget(
-        Paragraph::new(body_lines).wrap(Wrap { trim: false }),
-        detail_area,
-    );
+    if detail_area.width > 0 && detail_area.height > 0 {
+        let detail: Vec<Line<'static>> = body_lines
+            .into_iter()
+            .flat_map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                crate::render::wrap(&text, detail_area.width as usize)
+                    .into_iter()
+                    .map(|row| {
+                        Line::from(Span::styled(row, Style::default().fg(theme.text.primary)))
+                    })
+            })
+            .collect();
+        let max = detail.len().saturating_sub(detail_area.height as usize);
+        state.page_scroll = state.page_scroll.min(max);
+        crate::render::render_pane_at_offset(frame, detail_area, detail, state.page_scroll, theme);
+    }
+    crate::render::paint_split_divider(frame, &split, theme);
 }
 
 fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -422,41 +523,40 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         )],
         hint: &hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
 
+    const BACKGROUND_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Vertical,
+        primary_pct: 33,
+        primary_min: 1,
+        detail_min: 2,
+        min_dual_width: 1,
+        min_dual_height: 4,
+    };
+    let single_focus = match state.background_list_focus {
+        crate::activity::BackgroundPane::List => crate::layout::SplitFocus::Primary,
+        crate::activity::BackgroundPane::Output => crate::layout::SplitFocus::Detail,
+    };
+    let split = crate::layout::split_pane(body, BACKGROUND_SPLIT)
+        .unwrap_or_else(|| crate::layout::single_pane(body, single_focus));
+    state.page_split = Some(crate::state::PageSplit {
+        screen: Screen::ActivityList,
+        layout: split,
+    });
+    let list_area = split.primary;
+    let detail_area = split.detail;
     let BackgroundListBody {
         lines,
         selected_line,
         task_rows,
-    } = background_list_body(state, &list, body.width as usize, theme, t);
-
-    // The list is capped to a third of the pane (min 3 rows) so the live log
-    // keeps most of the space; the remainder is the selected task's detail.
-    let list_height = (lines.len() as u16)
-        .min((body.height / 3).max(3))
-        .min(body.height.saturating_sub(4))
-        .max(1);
-    let list_area = Rect {
-        height: list_height,
-        ..body
-    };
-    let rule_area = Rect {
-        y: body.y + list_height,
-        height: body.height.saturating_sub(list_height).min(1),
-        ..body
-    };
-    let detail_area = Rect {
-        y: body.y + list_height + rule_area.height,
-        height: body.height.saturating_sub(list_height + rule_area.height),
-        ..body
-    };
+    } = background_list_body(state, &list, list_area.width.max(1) as usize, theme, t);
 
     // Keep the selection visible without a second scroll owner: the offset is
     // derived from the selection, so the list needs no scroll state and a
@@ -466,36 +566,33 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         .map(|line| line.saturating_sub(list_area.height.saturating_sub(1) as usize))
         .unwrap_or(0)
         .min(max_offset);
-    state.background_list_rect = Some(list_area);
-    for (line, id) in task_rows {
-        if line >= offset && line < offset + list_area.height as usize {
-            state.background_list_hits.push((
-                Rect {
-                    y: list_area.y + (line - offset) as u16,
-                    height: 1,
-                    ..list_area
-                },
-                id,
-            ));
+    if list_area.width > 0 && list_area.height > 0 {
+        state.background_list_rect = Some(list_area);
+        for (line, id) in task_rows {
+            if line >= offset && line < offset + list_area.height as usize {
+                state.background_list_hits.push((
+                    Rect {
+                        y: list_area.y + (line - offset) as u16,
+                        height: 1,
+                        ..list_area
+                    },
+                    id,
+                ));
+            }
         }
-    }
-    let visible: Vec<Line<'static>> = lines
-        .into_iter()
-        .skip(offset)
-        .take(list_area.height as usize)
-        .collect();
-    frame.render_widget(Paragraph::new(visible), list_area);
-
-    if rule_area.height > 0 {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "─".repeat(rule_area.width as usize),
-                Style::default().fg(theme.border.normal),
-            ))),
-            rule_area,
-        );
+        let list_total = lines.len();
+        let visible: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(offset)
+            .take(list_area.height as usize)
+            .collect();
+        frame.render_widget(Paragraph::new(visible), list_area);
+        paint_scrollbar(frame, list_area, list_total, offset, theme);
+    } else {
+        state.background_list_rect = None;
     }
 
+    crate::render::paint_split_divider(frame, &split, theme);
     if detail_area.height == 0 {
         return;
     }
@@ -547,6 +644,7 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         ..detail_area
     };
     state.background_output_rect = Some(output_area);
+    let bar_theme = theme.clone();
     crate::activity::sync_background_task_view(
         state,
         &task_id,
@@ -554,12 +652,15 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         output_area.height as usize,
     );
     let view = crate::activity::background_task_view(state, &task_id);
+    let total = detail.len();
+    let offset = view.scroll.min(view.max_scroll);
     let visible: Vec<Line<'static>> = detail
         .into_iter()
-        .skip(view.scroll.min(view.max_scroll))
+        .skip(offset)
         .take(output_area.height as usize)
         .collect();
     frame.render_widget(Paragraph::new(visible), output_area);
+    crate::render::paint_scrollbar(frame, output_area, total, offset, &bar_theme);
     if let Some(rect) = stop_rect {
         render_background_stop(frame, rect, &task_id, state);
     }
@@ -567,7 +668,7 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
 
 /// The page's footer hint, which follows the pane that owns ↑/↓ and names the
 /// follow chip while the output has the keys.
-fn background_page_hint(
+pub(crate) fn background_page_hint(
     state: &AppState,
     list: &crate::activity::BackgroundJobList,
     t: &crate::i18n::UiText,
@@ -627,6 +728,41 @@ fn background_stop_rect(row: Rect, t: &crate::i18n::UiText) -> Option<Rect> {
     })
 }
 
+/// The stop control lives on the card footer once the page no longer owns
+/// a footer row of its own.
+fn paint_activity_stop_on_footer(
+    frame: &mut Frame,
+    state: &mut AppState,
+    geom: &crate::workspace::FrameGeom,
+) {
+    if geom.footer.height == 0 || state.active_screen != Screen::Activity {
+        return;
+    }
+    let Some(crate::activity::ActivityId::Background(id)) = state.activity_open.clone() else {
+        return;
+    };
+    let running = state
+        .background_task_labels
+        .get(&id)
+        .is_some_and(|task| task.is_running());
+    if !running {
+        return;
+    }
+    let width = unicode_width::UnicodeWidthStr::width(state.t().background_stop_button) as u16;
+    let pad = crate::secondary::card_gutter(geom.footer.width);
+    let row = crate::layout::horizontal_inset(geom.footer, pad);
+    if row.height == 0 || row.width < width {
+        return;
+    }
+    let rect = Rect {
+        x: row.right() - width,
+        y: row.y,
+        width,
+        height: 1,
+    };
+    render_background_stop(frame, rect, &id, state);
+}
+
 fn render_background_stop(frame: &mut Frame, rect: Rect, task_id: &str, state: &mut AppState) {
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -655,56 +791,50 @@ fn background_list_body(
     let mut selected_line = None;
     let mut task_rows = Vec::new();
     let selected = state.background_list_selected.as_deref();
+    let focused = state.background_list_focus == crate::activity::BackgroundPane::List;
     if list.is_empty() {
-        lines.push(Line::from(Span::styled(
-            t.background_list_empty.to_string(),
-            Style::default().fg(theme.text.muted),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.background_list_empty,
+                detail: None,
+            },
+            theme,
+            width,
+        ));
         return BackgroundListBody {
             lines,
             selected_line,
             task_rows,
         };
     }
-    if !list.running.is_empty() {
-        lines.push(section_line(
-            &format!("{} · {}", t.background_list_running, list.running.len()),
-            theme,
-        ));
-        for summary in &list.running {
-            let on = selected == Some(summary.id.as_key());
-            if on {
-                selected_line = Some(lines.len());
-            }
-            task_rows.push((lines.len(), summary.id.as_key().to_string()));
-            lines.push(background_list_row(
-                summary,
-                exit_code_for(state, summary.id.as_key()),
-                on,
-                width,
-                theme,
-            ));
+    for (title, summaries) in [
+        (t.background_list_running, &list.running),
+        (t.background_list_finished, &list.finished),
+    ] {
+        if summaries.is_empty() {
+            continue;
         }
-    }
-    if !list.finished.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(section_line(
-            &format!("{} · {}", t.background_list_finished, list.finished.len()),
+        lines.push(crate::render::section_header_line(
+            title,
+            Some(summaries.len()),
+            None,
             theme,
+            width,
         ));
-        for summary in &list.finished {
+        for summary in summaries {
+            let key = summary.id.as_key().to_string();
             let on = selected == Some(summary.id.as_key());
             if on {
                 selected_line = Some(lines.len());
             }
-            task_rows.push((lines.len(), summary.id.as_key().to_string()));
-            lines.push(background_list_row(
-                summary,
-                exit_code_for(state, summary.id.as_key()),
-                on,
-                width,
-                theme,
-            ));
+            let paint = crate::render::row_paint(state, &key, on, focused);
+            let row = background_list_row(summary, exit_code_for(state, &key), paint, width, theme);
+            for line in row {
+                let line_index = lines.len();
+                task_rows.push((line_index, key.clone()));
+                lines.push(line);
+            }
         }
     }
     BackgroundListBody {
@@ -714,9 +844,37 @@ fn background_list_body(
     }
 }
 
-/// One job row: `→ ● label … duration`. The glyph carries the status ink, the
-/// duration is right-aligned in muted grey, and the label truncates first so a
-/// long command can never push the duration off the edge.
+/// One job row in the shared list grammar. The status glyph carries the state
+/// ink, the duration/exit code is the right meta, and the label yields first.
+fn background_list_row(
+    summary: &crate::activity::ActivitySummary,
+    exit_code: Option<i32>,
+    paint: crate::render::RowPaint,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    use crate::activity::ActivityStatus;
+    let dur = crate::activity::duration_text(summary);
+    let meta = match exit_code {
+        Some(code) => format!("EXIT {code}  {dur}"),
+        None => dur,
+    };
+    let tone = match summary.status {
+        ActivityStatus::Running | ActivityStatus::Waiting => crate::render::RowTone::Info,
+        ActivityStatus::Completed => crate::render::RowTone::Success,
+        ActivityStatus::Failed => crate::render::RowTone::Error,
+        ActivityStatus::Stopped => crate::render::RowTone::Muted,
+        ActivityStatus::Interrupted
+        | ActivityStatus::Unreported
+        | ActivityStatus::Lost
+        | ActivityStatus::Conflict => crate::render::RowTone::Warning,
+    };
+    let row = crate::render::ListRow::new(truncate_display(&summary.title, width))
+        .status(crate::activity::activity_glyph(summary.status), tone)
+        .meta(meta);
+    crate::render::list_row_lines(&row, paint, theme, width)
+}
+
 /// A terminal task's exit code, read from the projection the detail pane also
 /// reads. `None` while running and for a stop the runtime reported as `Killed`
 /// without a code.
@@ -727,61 +885,11 @@ fn exit_code_for(state: &AppState, task_id: &str) -> Option<i32> {
         .and_then(|chrome| chrome.exit_code)
 }
 
-fn background_list_row(
-    summary: &crate::activity::ActivitySummary,
-    exit_code: Option<i32>,
-    selected: bool,
-    width: usize,
-    theme: &Theme,
-) -> Line<'static> {
-    use crate::activity::ActivityStatus;
-    let indent = crate::layout::DETAIL_BODY_INDENT;
-    let prefix = if selected { "→ " } else { "  " };
-    let glyph = crate::activity::activity_glyph(summary.status);
-    let dur = crate::activity::duration_text(summary);
-    // The shell's own "EXIT n" word, so a failure's code is visible without
-    // opening the detail; the label truncation accounts for its width.
-    let meta = match exit_code {
-        Some(code) => format!("EXIT {code}  {dur}"),
-        None => dur,
-    };
-    let accent = Style::default().fg(theme.accent.primary);
-    let glyph_style = match summary.status {
-        ActivityStatus::Running | ActivityStatus::Waiting => accent,
-        ActivityStatus::Completed => Style::default().fg(theme.status.success),
-        ActivityStatus::Failed => Style::default().fg(theme.status.error),
-        ActivityStatus::Stopped => Style::default().fg(theme.text.muted),
-        ActivityStatus::Interrupted
-        | ActivityStatus::Unreported
-        | ActivityStatus::Lost
-        | ActivityStatus::Conflict => Style::default().fg(theme.status.warning),
-    };
-    let label_style = Style::default().fg(if selected {
-        theme.text.primary
-    } else {
-        theme.text.secondary
-    });
-    let head = format!("{indent}{prefix}{glyph} ");
-    let head_w = unicode_width::UnicodeWidthStr::width(head.as_str());
-    let dur_w = unicode_width::UnicodeWidthStr::width(meta.as_str());
-    const GAP: usize = 2;
-    let label_budget = width.saturating_sub(head_w + GAP + dur_w).max(4);
-    let label = truncate_display(&summary.title, label_budget);
-    let label_w = unicode_width::UnicodeWidthStr::width(label.as_str());
-    let pad = width.saturating_sub(head_w + label_w + dur_w);
-    Line::from(vec![
-        Span::styled(head, glyph_style),
-        Span::styled(label, label_style),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(meta, Style::default().fg(theme.text.muted)),
-    ])
-}
-
 /// The Detail Page's interaction hint. Every Detail Page reads `Esc 返回`; a
 /// task the runtime can still stop adds `x 停止`; the background follow chip
 /// lives here rather than in the body so it never scrolls away from the output
 /// it describes.
-fn activity_footer_hint(
+pub(crate) fn activity_footer_hint(
     state: &AppState,
     id: &crate::activity::ActivityId,
     summary: &crate::activity::ActivitySummary,
@@ -1312,14 +1420,16 @@ pub use transcript_lines::{
 
 pub(crate) use panes::pad_line_to_width;
 pub(crate) use panes::{
-    list_scroll_offset, render_list_focused, render_list_rows, render_rows_at_offset,
-    render_scrolled,
+    KeyValueRow, ListRow, ListStateBlock, ListStateKind, RowHitSpec, RowPaint, RowTone,
+    key_value_lines, list_row_lines, list_scroll_offset, list_state_lines, paint_scrollbar,
+    paint_split_divider, render_list_focused, render_list_rows, render_list_rows_with_spans,
+    render_pane_at_offset, render_rows_at_offset, render_scrolled, row_paint, section_header_line,
 };
 pub(crate) use text::{pad_display, sanitize_terminal_line, truncate_display, wrap};
 
 pub(crate) use footer::{
     COMPOSER_MAX_ROWS, SHELL_COMPLETION_MAX_ROWS, composer_box_lines, composer_visible_rows,
-    render_attachments, render_shell_completion, render_slash_popup,
+    publish_image_chip_hits, render_attachments, render_shell_completion, render_slash_popup,
 };
 use screens::{
     render_diff_screen, render_foreign_sessions_screen, render_help_screen, render_sessions_screen,
@@ -1336,12 +1446,35 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     state.background_list_hits.clear();
     // Every page republishes its own row hits, so a page that publishes none
     // leaves none behind: a click can only ever land on what this frame drew.
+    if let Some(previous) = state.page_split.take()
+        && previous.screen != state.active_screen
+    {
+        state.page_focus = crate::layout::SplitFocus::Primary;
+        state.page_scroll = 0;
+    }
     state.screen_rows.clear();
+    if state
+        .list_hover
+        .as_ref()
+        .is_some_and(|hover| hover.screen != state.active_screen)
+    {
+        state.list_hover = None;
+    }
     state.back_hit = None;
+    state.modal_chrome = false;
+    state.modal_named = false;
+    // Keep the last page hint for one frame: geometry is computed before the
+    // page draws, and the footer height must not collapse to a single row on
+    // every frame just because this frame's hint has not been collected yet.
+    // The page overwrites it during the same draw.
+    state.workspace_hits = crate::workspace::Hits::default();
     state.background_list_rect = None;
     state.background_output_rect = None;
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
+        // A vanished frame still has to release a Kitty placement. Cells
+        // cannot erase one.
+        crate::image_preview::paint(frame, state);
         return;
     }
     state.theme.paint_canvas(frame, area);
@@ -1354,6 +1487,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         } else {
             crate::workbench::render_workbench(frame, state);
         }
+        // On the transcript, under a later panel. Closed previews still run
+        // so a Kitty placement is deleted; cells cannot erase one.
+        crate::image_preview::paint(frame, state);
         // A `/update` in flight owns the foreground until it finishes; drawn
         // over the workbench so the user can still see the task behind it.
         if let Some(view) = &state.update {
@@ -1367,15 +1503,27 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         if state.active_screen == Screen::Memory && state.overlay.is_none() {
             crate::memory::render_overlay(frame, area, state);
         }
+        // Conversation keeps the inline decision card drawn by the workbench.
+        // Memory is an independent host, so its decisions use the framed
+        // secondary form. A side thread does not host a main-surface decision:
+        // the overlay waits for the user to return, exactly as it did before.
+        if state.active_screen == Screen::Memory
+            && let Some(overlay) = &state.overlay
+        {
+            state.list_hover = None;
+            crate::overlay::render_modal_overlay(frame, area, overlay, &state.theme, state.locale);
+        }
         return;
     }
 
-    // Non-conversation screens own their own chrome over the full area — the
-    // shared Secondary Surface shell, or the legacy app frame for views that do
-    // not fit it yet. No composer: these views answer every key themselves
-    // (Esc, x, j/k), so an input box here would take a whole typed task with no
-    // echo and no submit. The draft is kept and comes back with the
-    // conversation.
+    // Every other screen is a modal over the live workbench. The page keeps
+    // its own body and paints into the modal's content rect. The draft, the
+    // transcript scroll and the running turn stay on the workbench underneath.
+    crate::workbench::render_workbench(frame, state);
+    let geom = crate::workspace::frame_geom_for(state, area);
+    crate::workspace::paint(frame, state, &geom);
+    state.screen_rows.clear();
+    let area = geom.content;
     match state.active_screen {
         Screen::Conversation => unreachable!(),
         Screen::Memory => unreachable!("memory renders as an overlay over the conversation"),
@@ -1401,12 +1549,33 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Context => crate::context::render_stats_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
         Screen::Trust => crate::trust::render_screen(frame, area, state),
+        Screen::Skills => crate::skills::render_screen(frame, area, state),
+        Screen::Agents => crate::agents_view::render_screen(frame, area, state),
         Screen::Schedules => crate::schedules::render_screen(frame, area, state),
         Screen::Output => render_output_screen(frame, area, state),
     }
+    crate::workspace::paint_footer(frame, state, &geom);
+    paint_activity_stop_on_footer(frame, state, &geom);
     if let Some(overlay) = &state.overlay {
-        crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);
+        state.list_hover = None;
+        crate::overlay::render_modal_overlay(frame, area, overlay, &state.theme, state.locale);
     }
+    // A modal covers the transcript. Release a preview the previous frame placed.
+    crate::image_preview::paint(frame, state);
+}
+
+fn latest_plan(state: &AppState) -> Option<&leveler_client_protocol::UiPlan> {
+    state.plan.as_ref().or_else(|| {
+        state
+            .transcript
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                crate::transcript::TranscriptItem::Plan(plan) => Some(plan),
+                _ => None,
+            })
+    })
 }
 
 fn render_goal_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -1416,54 +1585,68 @@ fn render_goal_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.goal_detail_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
-    let lines = goal_detail_lines(state.active_goal.as_ref(), body.width as usize, theme, t);
+    let lines = goal_detail_lines(
+        state.active_goal.as_ref(),
+        latest_plan(state),
+        body.width as usize,
+        theme,
+        t,
+    );
     render_scrolled(frame, body, state, lines);
 }
 
 fn goal_detail_lines(
     goal: Option<&crate::active_goal::ActiveGoal>,
+    plan: Option<&leveler_client_protocol::UiPlan>,
     width: usize,
     theme: &Theme,
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
     let Some(goal) = goal else {
         return vec![Line::from(Span::styled(
-            t.activity_stale.to_string(),
+            t.goal_detail_empty.to_string(),
             Style::default().fg(theme.text.muted),
         ))];
     };
-    let (phase, color) = match goal.phase() {
-        crate::active_goal::GoalPhase::Running => (t.goal_phase_running, theme.status.running),
-        crate::active_goal::GoalPhase::Paused => (t.goal_phase_paused, theme.status.warning),
-        crate::active_goal::GoalPhase::Resuming => (t.goal_phase_resuming, theme.status.info),
-        crate::active_goal::GoalPhase::Completed => (t.goal_phase_completed, theme.status.success),
-        crate::active_goal::GoalPhase::Failed => (t.goal_phase_failed, theme.status.error),
+    let now = std::time::Instant::now();
+    let phase_label = match goal.phase() {
+        crate::active_goal::GoalPhase::Running => t.goal_phase_running,
+        crate::active_goal::GoalPhase::Paused => t.goal_phase_paused,
+        crate::active_goal::GoalPhase::Resuming => t.goal_phase_resuming,
+        crate::active_goal::GoalPhase::Completed => t.goal_phase_completed,
+        crate::active_goal::GoalPhase::Failed => t.goal_phase_failed,
     };
-    let elapsed =
-        crate::status_line::fmt_elapsed(goal.elapsed_at(std::time::Instant::now()).as_secs());
+    let phase_tone = match goal.phase() {
+        crate::active_goal::GoalPhase::Running => crate::render::RowTone::Info,
+        crate::active_goal::GoalPhase::Paused => crate::render::RowTone::Warning,
+        crate::active_goal::GoalPhase::Resuming => crate::render::RowTone::Info,
+        crate::active_goal::GoalPhase::Completed => crate::render::RowTone::Success,
+        crate::active_goal::GoalPhase::Failed => crate::render::RowTone::Error,
+    };
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{} {phase}", goal.phase().glyph()),
-                Style::default().fg(color),
-            ),
-            Span::styled(
-                format!(" · {} {elapsed}", t.background_meta_elapsed),
-                Style::default().fg(theme.text.muted),
-            ),
-        ]),
-        Line::from(""),
+        crate::render::section_header_line(
+            t.goal_detail_objective_section,
+            None,
+            None,
+            theme,
+            width,
+        ),
+        Line::default(),
     ];
-    let safe_objective = goal
-        .objective()
+    let objective = if goal.objective().trim().is_empty() {
+        goal.title()
+    } else {
+        goal.objective()
+    };
+    let safe_objective = objective
         .split('\n')
         .map(sanitize_terminal_line)
         .collect::<Vec<_>>()
@@ -1473,6 +1656,61 @@ fn goal_detail_lines(
             .into_iter()
             .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.text.primary)))),
     );
+    lines.push(Line::default());
+    lines.push(crate::render::section_header_line(
+        t.goal_detail_status_section,
+        None,
+        None,
+        theme,
+        width,
+    ));
+    lines.extend(crate::render::key_value_lines(
+        &[
+            crate::render::KeyValueRow::new(t.goal_detail_status_label, phase_label)
+                .tone(phase_tone),
+            crate::render::KeyValueRow::new(
+                t.goal_detail_elapsed_label,
+                crate::status_line::fmt_elapsed(goal.elapsed_at(now).as_secs()),
+            ),
+        ],
+        width,
+        theme,
+    ));
+    if let Some(plan) = plan.filter(|plan| !plan.steps.is_empty()) {
+        let (done, total) = crate::workbench::plan_done_total(plan);
+        lines.push(Line::default());
+        lines.push(crate::render::section_header_line(
+            t.goal_detail_plan_section,
+            None,
+            None,
+            theme,
+            width,
+        ));
+        let progress = if matches!(
+            goal.phase(),
+            crate::active_goal::GoalPhase::Running | crate::active_goal::GoalPhase::Resuming
+        ) {
+            t.plan_n_done
+                .replace("{done}", &done.to_string())
+                .replace("{total}", &total.to_string())
+        } else {
+            t.plan_last_recorded
+                .replace("{done}", &done.to_string())
+                .replace("{total}", &total.to_string())
+        };
+        lines.push(Line::from(Span::styled(
+            progress,
+            Style::default().fg(theme.text.secondary),
+        )));
+        lines.push(Line::default());
+        lines.extend(plan_steps_lines(plan, width, theme, t));
+        if let Some(history) = crate::workbench::plan_history_label(plan, t) {
+            lines.push(Line::from(Span::styled(
+                history,
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+    }
     lines
 }
 
@@ -1490,9 +1728,9 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.issue_page_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let body = layout.content;
     state.issue_row_hits.clear();
     if body.width == 0 || body.height == 0 {
@@ -1568,78 +1806,66 @@ fn issue_page_view(
         rows: Vec::new(),
     };
     if issues.is_empty() {
-        view.lines.push(Line::from(Span::styled(
-            t.issue_page_empty.to_string(),
-            Style::default().fg(theme.text.muted),
-        )));
+        view.lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.issue_page_empty,
+                detail: None,
+            },
+            theme,
+            width,
+        ));
         return view;
     }
-    let error = Style::default().fg(theme.status.error);
-    let warning = Style::default().fg(theme.status.warning);
     let selected = state.issue_selected.as_deref();
-    let indent = crate::layout::DETAIL_BODY_INDENT;
+    const ISSUE_DETAIL_INDENT: usize = 6;
     for issue in issues {
         let expanded = crate::issue::is_expanded(state, &issue.key);
-        let (glyph, ink) = match issue.kind {
-            crate::issue::IssueKind::TurnFailure => ("✕", error),
-            crate::issue::IssueKind::RuntimeVersion => ("⟳", warning),
+        let (glyph, tone) = match issue.kind {
+            crate::issue::IssueKind::TurnFailure => ("✕", crate::render::RowTone::Error),
+            crate::issue::IssueKind::RuntimeVersion => ("⟳", crate::render::RowTone::Warning),
         };
-        let cursor = if selected == Some(issue.key.as_str()) {
-            Span::styled("→ ", Style::default().fg(theme.text.secondary))
-        } else {
-            Span::raw("  ")
-        };
-        let chevron = if expanded {
-            Span::styled("▾ ", Style::default().fg(theme.text.secondary))
-        } else {
-            Span::styled("▸ ", Style::default().fg(theme.text.secondary))
-        };
-        let marker_w = 4; // cursor + chevron
-        let spans = vec![
-            cursor,
-            chevron,
-            Span::styled(
-                format!(
-                    "{glyph} {}  ",
-                    truncate_display(&issue.label, width.saturating_sub(marker_w + 2))
-                ),
-                ink,
-            ),
-        ];
+        let is_selected = selected == Some(issue.key.as_str());
+        let row = crate::render::ListRow::new(issue.label.clone())
+            .status(glyph, tone)
+            .fold(expanded);
+        let paint = crate::render::row_paint(state, &issue.key, is_selected, true);
+        let row_lines = crate::render::list_row_lines(&row, paint, theme, width);
         view.rows.push((view.lines.len(), issue.key.clone()));
-        view.lines.push(Line::from(spans));
+        view.lines.extend(row_lines);
         if !expanded {
             view.lines.push(Line::from(""));
             continue;
         }
+        let indent = " ".repeat(ISSUE_DETAIL_INDENT);
+        let mut detail_lines = Vec::new();
         match issue.kind {
             crate::issue::IssueKind::TurnFailure => {
                 if let Some(meta) = &issue.meta {
-                    view.lines.push(Line::from(Span::styled(
-                        format!("{indent}{meta}"),
-                        Style::default().fg(theme.text.muted),
-                    )));
+                    detail_lines.push(format!("{indent}{meta}"));
                 }
                 if let Some(detail) = &issue.detail {
-                    // The failure block's own safe technical detail, line for line.
                     for row in detail.lines() {
-                        view.lines.push(Line::from(Span::styled(
-                            format!("{indent}{row}"),
-                            Style::default().fg(theme.text.muted),
-                        )));
+                        detail_lines.push(format!("{indent}{row}"));
                     }
                 }
             }
             crate::issue::IssueKind::RuntimeVersion => {
                 if let Some(meta) = &issue.meta {
-                    view.lines.push(Line::from(Span::styled(
-                        format!("{indent}{meta}"),
-                        Style::default().fg(theme.text.muted),
-                    )));
+                    detail_lines.push(format!("{indent}{meta}"));
                 }
             }
         }
-        view.lines.push(Line::from(""));
+        for line in detail_lines {
+            view.rows.push((view.lines.len(), issue.key.clone()));
+            view.lines.push(Line::from(Span::styled(
+                crate::render::text::truncate_display(
+                    &crate::render::text::sanitize_terminal_line(&line),
+                    width,
+                ),
+                Style::default().fg(theme.text.muted),
+            )));
+        }
     }
     view
 }
@@ -1655,22 +1881,218 @@ fn render_review_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.review.report_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
     let theme = &state.theme;
     let lines = match &state.review_report {
-        Some(report) => review_report_lines(report, body.width as usize, theme, t),
+        Some(report) => review_page_lines(report, body.width as usize, theme, t),
         None => vec![Line::from(Span::styled(
-            "…",
+            t.workspace.review_empty.to_string(),
             Style::default().fg(theme.text.secondary),
         ))],
     };
     render_scrolled(frame, body, state, lines);
+}
+
+/// The independent Review page: the same durable report as the inline
+/// conversation message, with its existing section headings promoted to the
+/// shared Section rule and a real count where the report owns one. The inline
+/// composition is deliberately not changed by this projection.
+fn review_page_lines(
+    report: &leveler_client_protocol::UiReviewReport,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let generated = review_report_lines(report, width, theme, t);
+    let section_labels = [
+        t.review.investigations_section,
+        t.review.verdict_section,
+        t.review.coverage_section,
+        t.review.limitations_section,
+        t.review.findings_section,
+        t.review.candidates_section,
+        t.review.report_section,
+        t.review.final_message_section,
+    ];
+    let body_at = generated
+        .iter()
+        .position(|line| {
+            let plain: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            section_labels.contains(&plain.trim())
+        })
+        .unwrap_or(generated.len());
+    let mut lines = review_page_meta_lines(report, width, theme, t);
+    if body_at < generated.len() {
+        lines.push(Line::default());
+        lines.extend(generated.into_iter().skip(body_at));
+    }
+    let formal_count = report
+        .findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.disposition,
+                None | Some(leveler_client_protocol::UiReviewFindingDisposition::Adopted)
+            )
+        })
+        .count();
+    let candidate_count = report.findings.len().saturating_sub(formal_count);
+    let sections: [(&str, Option<usize>); 8] = [
+        (
+            t.review.investigations_section,
+            Some(report.summary.investigations.len()),
+        ),
+        (t.review.verdict_section, None),
+        (
+            t.review.coverage_section,
+            Some(report.verdict.coverage.len()),
+        ),
+        (
+            t.review.limitations_section,
+            Some(report.verdict.limitations.len()),
+        ),
+        (t.review.findings_section, Some(formal_count)),
+        (t.review.candidates_section, Some(candidate_count)),
+        (t.review.report_section, None),
+        (t.review.final_message_section, None),
+    ];
+    for line in &mut lines {
+        let plain: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let plain = plain.trim();
+        if let Some((label, count)) = sections.iter().find(|(label, _)| *label == plain) {
+            *line = crate::render::section_header_line(label, *count, None, theme, width);
+        }
+    }
+    lines
+}
+
+fn review_page_meta_lines(
+    report: &leveler_client_protocol::UiReviewReport,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let summary = &report.summary;
+    let mut rows = vec![
+        crate::render::KeyValueRow::new(
+            t.review.status,
+            crate::render::transcript_lines::review_status_label(summary.status, t),
+        )
+        .tone(crate::render::RowTone::Accent),
+        crate::render::KeyValueRow::new(
+            t.review.scope,
+            crate::render::transcript_lines::review_scope_label(&summary.scope, t),
+        ),
+        crate::render::KeyValueRow::new(t.review.focus, summary.focus.clone()),
+        crate::render::KeyValueRow::new(t.review.id, summary.id.clone()),
+        crate::render::KeyValueRow::new(
+            t.review.time,
+            format!(
+                "{} → {}",
+                summary.created_at,
+                summary.finished_at.as_deref().unwrap_or("-")
+            ),
+        ),
+        crate::render::KeyValueRow::new(
+            t.review.findings_section,
+            crate::review_result::counts_line(summary, t),
+        ),
+    ];
+    if !summary.model.is_empty() {
+        let usage = t
+            .review
+            .usage
+            .replacen("{}", &summary.usage.input_tokens.to_string(), 1)
+            .replacen("{}", &summary.usage.output_tokens.to_string(), 1)
+            .replacen("{}", &summary.usage.cached_input_tokens.to_string(), 1);
+        rows.push(crate::render::KeyValueRow::new(
+            t.review.model,
+            format!("{} · {usage}", summary.model),
+        ));
+    }
+    if let Some(workspace) = &report.object.workspace {
+        rows.push(crate::render::KeyValueRow::new(
+            "workspace",
+            workspace.clone(),
+        ));
+    }
+    if let Some(head) = &report.object.head {
+        let revision = report.object.revision.as_deref().unwrap_or("-");
+        rows.push(crate::render::KeyValueRow::new(
+            "HEAD",
+            format!("{head} · {revision} · dirty={}", report.object.dirty),
+        ));
+    }
+    rows.push(crate::render::KeyValueRow::new(
+        t.review.report_section,
+        t.review
+            .report_revision
+            .replacen("{}", &summary.report_revision.to_string(), 1)
+            .replacen("{}", &summary.report_evidence_revision.to_string(), 1),
+    ));
+    if summary.object_changed {
+        rows.push(
+            crate::render::KeyValueRow::new("!", t.review.object_changed)
+                .tone(crate::render::RowTone::Warning),
+        );
+    }
+    if summary.modified_source {
+        rows.push(
+            crate::render::KeyValueRow::new("!", t.review.modified_source)
+                .tone(crate::render::RowTone::Error),
+        );
+    }
+    match summary.report_source {
+        leveler_client_protocol::UiReviewReportSource::Submitted => {}
+        leveler_client_protocol::UiReviewReportSource::None => {
+            rows.push(
+                crate::render::KeyValueRow::new("!", t.review.report_source_none)
+                    .tone(crate::render::RowTone::Warning),
+            );
+        }
+        leveler_client_protocol::UiReviewReportSource::Legacy => {
+            rows.push(
+                crate::render::KeyValueRow::new("!", t.review.report_source_legacy)
+                    .tone(crate::render::RowTone::Warning),
+            );
+        }
+    }
+    if summary.report_stale {
+        rows.push(
+            crate::render::KeyValueRow::new("!", t.review.report_stale)
+                .tone(crate::render::RowTone::Warning),
+        );
+    }
+    if let Some(detail) = summary
+        .failure
+        .as_deref()
+        .or(summary.stop_detail.as_deref())
+        .filter(|detail| !detail.trim().is_empty())
+    {
+        rows.push(
+            crate::render::KeyValueRow::new("!", detail.trim())
+                .tone(crate::render::RowTone::Warning),
+        );
+    }
+    let mut lines = crate::render::key_value_lines(&rows, width, theme);
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines
 }
 
 /// Build the report body from the durable review row. The same lines serve the
@@ -2192,26 +2614,16 @@ fn render_plan_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.plan_detail_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
-    let plan = state.plan.as_ref().or_else(|| {
-        state
-            .transcript
-            .items()
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                crate::transcript::TranscriptItem::Plan(plan) => Some(plan),
-                _ => None,
-            })
-    });
-    let lines = plan_detail_lines(plan, body.width as usize, theme, t);
+    let plan = latest_plan(state);
+    let lines = plan_detail_lines(plan, body.width as usize, theme, t, state.is_busy());
     render_scrolled(frame, body, state, lines);
 }
 
@@ -2220,38 +2632,65 @@ fn plan_detail_lines(
     width: usize,
     theme: &Theme,
     t: &crate::i18n::UiText,
+    live: bool,
 ) -> Vec<Line<'static>> {
     let Some(plan) = plan else {
         return vec![Line::from(Span::styled(
-            t.activity_stale.to_string(),
+            t.plan_detail_empty.to_string(),
             Style::default().fg(theme.text.muted),
         ))];
     };
+    if plan.steps.is_empty() {
+        return vec![Line::from(Span::styled(
+            t.plan_detail_empty.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+    }
     let (done, total) = crate::workbench::plan_done_total(plan);
-    let summary = t
-        .plan_n_done
-        .replace("{done}", &done.to_string())
-        .replace("{total}", &total.to_string());
-    let summary = match crate::workbench::plan_history_label(plan, t) {
-        Some(history) => format!("{summary} · {history}"),
-        None => summary,
+    let progress = if live || plan.state == leveler_client_protocol::UiPlanState::Completed {
+        t.plan_n_done
+            .replace("{done}", &done.to_string())
+            .replace("{total}", &total.to_string())
+    } else {
+        t.plan_last_recorded
+            .replace("{done}", &done.to_string())
+            .replace("{total}", &total.to_string())
     };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            summary,
-            Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = vec![crate::render::section_header_line(
+        &format!("{} · {progress}", t.active_plan),
+        None,
+        None,
+        theme,
+        width,
+    )];
+    lines.push(Line::default());
+    lines.extend(plan_steps_lines(plan, width, theme, t));
+    if let Some(history) = crate::workbench::plan_history_label(plan, t) {
+        lines.push(Line::from(Span::styled(
+            history,
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    lines
+}
+
+/// The plan's ordered steps with their typed status, shared by the Plan page
+/// and the Goal detail's plan projection. Every step is painted; a long
+/// description wraps under its prefix instead of being truncated.
+fn plan_steps_lines(
+    plan: &leveler_client_protocol::UiPlan,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     for step in &plan.steps {
         let prefix = format!(
             "{} {}. ",
             crate::plan_cell::plan_glyph(step.status),
             step.index + 1
         );
-        let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
         let text_width = width.saturating_sub(prefix_width).max(1);
         let wrapped = wrap(&step.description, text_width);
         let glyph_style = match step.status {
@@ -2272,15 +2711,16 @@ fn plan_detail_lines(
                 Style::default().fg(theme.text.muted)
             }
         };
-        let text_style = if matches!(
-            step.status,
-            leveler_client_protocol::PlanStepStatus::Running
-                | leveler_client_protocol::PlanStepStatus::Failed
-        ) {
-            Style::default().fg(theme.text.primary)
-        } else {
-            Style::default().fg(theme.text.secondary)
+        let text_style = match step.status {
+            leveler_client_protocol::PlanStepStatus::Running => Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+            leveler_client_protocol::PlanStepStatus::Failed => {
+                Style::default().fg(theme.text.primary)
+            }
+            _ => Style::default().fg(theme.text.secondary),
         };
+        let mut painted = 0;
         for (index, row) in wrapped.into_iter().enumerate() {
             if index == 0 {
                 lines.push(Line::from(vec![
@@ -2293,6 +2733,16 @@ fn plan_detail_lines(
                     Span::styled(row, text_style),
                 ]));
             }
+            painted += 1;
+        }
+        if painted == 0 {
+            lines.push(Line::from(Span::styled(prefix, glyph_style)));
+        }
+        if step.status == leveler_client_protocol::PlanStepStatus::Running {
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", " ".repeat(prefix_width), t.plan_detail_current),
+                Style::default().fg(theme.text.muted),
+            )));
         }
     }
     lines
@@ -2514,6 +2964,7 @@ mod tests {
                 done,
                 rendered: done.then(|| crate::markdown::MdDoc::parse(text)),
                 kind: crate::transcript::AssistantKind::Final,
+                reply_phase: Default::default(),
             };
             let (full, stable) = assistant_split(&block, &theme, width);
             let upto = if done { full.len() } else { stable };
@@ -2549,6 +3000,7 @@ mod tests {
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(final_text)),
             kind: crate::transcript::AssistantKind::Final,
+            reply_phase: Default::default(),
         };
         let full: Vec<String> = assistant_split(&done, &theme, 40)
             .0
@@ -2579,6 +3031,7 @@ mod tests {
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(final_text)),
             kind: crate::transcript::AssistantKind::Final,
+            reply_phase: Default::default(),
         };
         let full: Vec<String> = assistant_split(&done, &theme, 40)
             .0
@@ -2605,6 +3058,7 @@ mod tests {
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(final_text)),
             kind: crate::transcript::AssistantKind::Final,
+            reply_phase: Default::default(),
         };
         let full: Vec<String> = assistant_split(&done, &theme, 40)
             .0
@@ -2747,6 +3201,46 @@ mod tests {
         )
     }
 
+    /// Rows inside the hosted card, excluding the border. A full-frame read
+    /// also contains the workbench, and that chrome has its own `│`.
+    fn card_rows(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        let buf = terminal.backend().buffer();
+        let geom = crate::workspace::frame_geom(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            state.active_screen,
+        );
+        let x0 = geom.popup.x.saturating_add(1);
+        let x1 = geom
+            .popup
+            .x
+            .saturating_add(geom.popup.width)
+            .saturating_sub(1);
+        let mut rows = Vec::new();
+        for y in geom.popup.y..geom.popup.y.saturating_add(geom.popup.height) {
+            let mut line = String::new();
+            let mut x = x0;
+            while x < x1.min(buf.area.width) {
+                let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+                let width = sym.width().max(1) as u16;
+                if x.saturating_add(width) > x1 {
+                    break;
+                }
+                line.push_str(sym);
+                x += width;
+            }
+            rows.push(line.trim_end().to_string());
+        }
+        rows
+    }
+
     fn render_text(state: &mut AppState, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2765,9 +3259,45 @@ mod tests {
         out
     }
 
-    /// A full-screen view answers every keystroke itself — Esc backs out,
-    /// j/k scroll — so nothing typed reaches the composer. An overlay already
-    /// takes the composer's slot for this reason.
+    /// Text between the modal's side borders. A page assertion reads that
+    /// column, not the dimmed conversation beside the popup.
+    fn modal_body(line: &str) -> &str {
+        let Some(start) = line.find('│') else {
+            return line;
+        };
+        let rest = &line[start + '│'.len_utf8()..];
+        let end = rest.rfind('│').unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    fn nav_column(line: &str) -> Option<usize> {
+        let byte = line.find('←')?;
+        Some(unicode_width::UnicodeWidthStr::width(&line[..byte]))
+    }
+
+    fn nav_column_for(width: u16, height: u16) -> usize {
+        let geom = crate::workspace::frame_geom(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            Screen::Activity,
+        );
+        if geom.title_row.height > 0 {
+            // A border title starts after `┌─ `.
+            geom.popup.x as usize + 3
+        } else {
+            // Borderless pages draw their own full-page shell, whose margin is
+            // the Secondary padding, not the hosted card gutter.
+            geom.content.x as usize + crate::secondary::padding_x(geom.content.width) as usize
+        }
+    }
+
+    /// A hosted page answers every keystroke itself — Esc backs out, j/k
+    /// scroll — so the card must not paint a composer. The dimmed workbench
+    /// outside the card may still show the draft; keys do not reach it.
     #[test]
     fn a_full_screen_view_does_not_draw_an_input_it_will_not_accept() {
         for screen in [
@@ -2782,9 +3312,13 @@ mod tests {
             state.composer.replace("DRAFTMARKER");
             state.active_screen = screen;
             let text = render_text(&mut state, 80, 30);
+            let inside = text
+                .lines()
+                .filter(|line| line.contains('│') || line.contains('┌') || line.contains('└'))
+                .any(|line| modal_body(line).contains("DRAFTMARKER"));
             assert!(
-                !text.contains("DRAFTMARKER"),
-                "{screen:?} draws a composer that swallows every key:\n{text}"
+                !inside,
+                "{screen:?} draws a composer inside the card:\n{text}"
             );
         }
     }
@@ -2815,29 +3349,53 @@ mod tests {
         let buf = terminal.backend().buffer();
         let mut found = false;
         for y in 0..buf.area.height {
-            let row: String = (0..buf.area.width)
-                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
-                .collect();
-            if let Some(byte) = row.find("new_name") {
+            let (text, columns) = row_columns(buf, y);
+            if let Some(byte) = text.find("new_name") {
                 found = true;
-                let col = UnicodeWidthStr::width(&row[..byte]);
-                let bg = buf.cell((col as u16, y)).map(|c| c.bg);
+                let col = column_at(&columns, byte);
+                let bg = buf.cell((col, y)).map(|c| c.bg);
                 assert_eq!(
                     bg,
                     Some(Theme::dark().diff.added_inline_bg),
-                    "the changed token keeps the shared inline band: {row:?}"
+                    "the changed token keeps the shared inline band: {text:?} col {col}"
                 );
             }
-            if let Some(byte) = row.find("+ new_name") {
-                let col = UnicodeWidthStr::width(&row[..byte]);
+            if let Some(byte) = text.find("+ new_name") {
+                let col = column_at(&columns, byte);
                 assert_eq!(
-                    buf.cell((col as u16, y)).map(|c| c.bg),
+                    buf.cell((col, y)).map(|c| c.bg),
                     Some(Theme::dark().diff.added_bg),
-                    "the row band reaches the marker: {row:?}"
+                    "the row band reaches the marker: {text:?} col {col}"
                 );
             }
         }
         assert!(found, "the add row is painted on the Diff page");
+    }
+
+    /// Display columns of one buffer row. A wide glyph occupies two cells;
+    /// concatenating every cell's symbol and then measuring it lands past
+    /// the glyph whenever the conversation beside the card is CJK.
+    fn row_columns(buf: &ratatui::buffer::Buffer, y: u16) -> (String, Vec<(usize, u16)>) {
+        let mut text = String::new();
+        let mut columns = Vec::new();
+        let mut x = 0u16;
+        while x < buf.area.width {
+            let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+            let width = sym.width().max(1) as u16;
+            columns.push((text.len(), x));
+            text.push_str(sym);
+            x += width;
+        }
+        (text, columns)
+    }
+
+    fn column_at(columns: &[(usize, u16)], byte: usize) -> u16 {
+        columns
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= byte)
+            .map(|(_, col)| *col)
+            .unwrap_or(0)
     }
 
     /// An empty output section is still a section: the muted state sits at the
@@ -2851,11 +3409,20 @@ mod tests {
         );
         state.activity_open = Some(crate::activity::ActivityId::Background("bg-empty".into()));
         state.active_screen = Screen::Activity;
-        let text = render_text(&mut state, 90, 24);
-        assert!(text.contains("  输出"), "section present: {text}");
-        assert!(
-            text.lines().any(|l| l.trim_end() == "    暂无输出"),
-            "empty state is indented under its section:\n{text}"
+        let rows = card_rows(&mut state, 90, 24);
+        let section = rows
+            .iter()
+            .find(|line| line.contains('输') && line.contains('出') && !line.contains("暂无"))
+            .unwrap_or_else(|| panic!("section present:\n{rows:?}"));
+        let gutter = section.find("输出").expect("section title");
+        let empty = rows
+            .iter()
+            .find(|line| line.contains("暂无输出"))
+            .expect("empty state");
+        assert_eq!(
+            empty.find("暂无输出"),
+            Some(gutter + crate::layout::DETAIL_BODY_INDENT.len()),
+            "empty state is indented under its section:\n{rows:?}"
         );
     }
 
@@ -3149,25 +3716,50 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let header = lines
             .iter()
+            .copied()
             .find(|l| l.contains("Background Task"))
             .expect("identity header");
-        // The nav sits ON the page's safe margin, not on the terminal edge:
-        // header, rule, body and footer all start in the same column.
+        // A bordered card names the page and paints `[×]`. The title, the
+        // rule and the body share one gutter; a section body is one indent
+        // deeper. There is no `←` on this row.
+        let body = modal_body(header);
+        assert!(body.contains("[×]"), "close on the title row: {header}");
+        assert!(!body.contains("←"), "no second back glyph: {header}");
+        let byte = header.find("Background Task").expect("title");
         assert_eq!(
-            header.find('←'),
-            Some(crate::secondary::padding_x(90) as usize),
-            "back nav shares the content gutter: {header:?}"
+            unicode_width::UnicodeWidthStr::width(&header[..byte]),
+            nav_column_for(90, 30),
+            "title shares the card title gutter: {header:?}"
         );
-        for expected in [
-            "  cargo test --workspace",
-            "  命令",
-            "    $ cargo test --workspace",
-            "  输出",
-            "    Compiling leveler-tui",
+        let geom = crate::workspace::frame_geom(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 90,
+                height: 30,
+            },
+            Screen::Activity,
+        );
+        let x0 = geom.popup.x.saturating_add(1) as usize;
+        let content_col = geom.content.x as usize
+            + crate::secondary::card_gutter(geom.content.width) as usize
+            - x0;
+        let rows = card_rows(&mut state, 90, 30);
+        for (needle, indent) in [
+            ("cargo test --workspace", 0),
+            ("命令", 0),
+            ("$ cargo test --workspace", 2),
+            ("输出", 0),
+            ("Compiling leveler-tui", 2),
         ] {
-            assert!(
-                lines.iter().any(|l| l.trim_end() == expected),
-                "missing {expected:?} in:\n{text}"
+            let line = rows
+                .iter()
+                .find(|l| l.contains(needle) && !l.contains('×'))
+                .unwrap_or_else(|| panic!("missing {needle:?} in:\n{rows:?}"));
+            assert_eq!(
+                line.find(needle),
+                Some(content_col + indent),
+                "{needle:?} off the gutter in {line:?}"
             );
         }
     }
@@ -3273,14 +3865,31 @@ mod tests {
         let mut state = running_child_with_activity();
         for (w, h) in [(100u16, 40u16), (40, 12), (80, 24), (30, 8)] {
             let text = render_text(&mut state, w, h);
-            // The nav shares the page's safe margin at every size, so it is
-            // always visible and never the thing that gets clipped.
-            let nav = text.lines().next().unwrap_or("");
-            assert_eq!(
-                nav.find('←'),
-                Some(crate::secondary::padding_x(w) as usize),
-                "w={w}: nav off the content gutter:\n{text}"
-            );
+            // A short frame has no card chrome, so the page's own `←` is the
+            // gutter. A card names the page at that same gutter and puts `[×]`
+            // on the row.
+            let borderless = h < 12;
+            if borderless {
+                let nav = text.lines().find(|line| line.contains('←')).unwrap_or("");
+                assert_eq!(
+                    nav_column(nav),
+                    Some(nav_column_for(w, h)),
+                    "w={w}: nav off the content gutter:\n{text}"
+                );
+            } else {
+                let line = text
+                    .lines()
+                    .find(|line| line.contains("Sub-agent"))
+                    .unwrap_or("");
+                let byte = line.find("Sub-agent").unwrap_or(0);
+                let col = unicode_width::UnicodeWidthStr::width(&line[..byte]);
+                assert_eq!(
+                    col,
+                    nav_column_for(w, h),
+                    "w={w}: title off the content gutter:\n{text}"
+                );
+                assert!(text.contains("[×]"), "w={w}: no close:\n{text}");
+            }
             assert!(
                 text.contains("Sub-agent"),
                 "w={w}: page identity survives resize:\n{text}"
@@ -3406,7 +4015,8 @@ mod tests {
         // The activity rows carry a status glyph and a user-language label.
         let row = |needle: &str| {
             text.lines()
-                .filter(|l| l.starts_with("  ") && l.contains(needle))
+                .map(modal_body)
+                .filter(|l| l.contains(needle))
                 .find(|l| {
                     let g = l.trim_start().chars().next();
                     matches!(g, Some('✓') | Some('●') | Some('·'))

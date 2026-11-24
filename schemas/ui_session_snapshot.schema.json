@@ -349,6 +349,13 @@
         "name": {
           "type": "string"
         },
+        "preview_path": {
+          "description": "Local processed PNG (`{sha256}.png` under the media store) a terminal may read for a pixel preview. Never shown and never sent as text. Absent for clients that do not have the file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "sha256": {
           "description": "Content-address of the processed bytes in the media store.",
           "type": "string"
@@ -357,6 +364,13 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        },
+        "source_path": {
+          "description": "Original file the user attached. Clipboard and pasted bytes have none. The composer preview is the only surface that shows it; the sentence the model reads stays `[图片 #N]`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "width": {
           "type": [
@@ -723,6 +737,10 @@
           ]
         }
       ]
+    },
+    "DefinitionTrustRequestId": {
+      "description": "Identifies one mid-turn request to admit untrusted definition content. Distinct from [`ApprovalId`]: it resolves a trust decision, never a permission grant.",
+      "type": "string"
     },
     "DiagnosticCategory": {
       "description": "The area a finding belongs to. The overview groups findings by this value.",
@@ -2297,6 +2315,44 @@
               "type": "string",
               "enum": [
                 "approval_resolved"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A running tool needs the user to admit untrusted definition content before it can continue.",
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiDefinitionTrustRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "definition_trust_requested"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A pending definition-trust request was resolved (by any client, a turn cancellation, or a disconnect). Clients dismiss the matching prompt.",
+          "type": "object",
+          "required": [
+            "id",
+            "type"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/DefinitionTrustRequestId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "definition_trust_resolved"
               ]
             }
           }
@@ -4519,6 +4575,25 @@
               "type": "string",
               "enum": [
                 "notification"
+              ]
+            }
+          }
+        },
+        {
+          "description": "What this turn's message selected and whether each Skill package was loaded into the turn context. Emitted once at turn start; the durable record is the engine's skill-delivery audit event.",
+          "type": "object",
+          "required": [
+            "delivery",
+            "type"
+          ],
+          "properties": {
+            "delivery": {
+              "$ref": "#/definitions/UiSkillDelivery"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "skill_delivery"
               ]
             }
           }
@@ -7127,6 +7202,123 @@
         }
       }
     },
+    "UiDefinitionTrustRequest": {
+      "description": "One untrusted definition a running tool wants to use.",
+      "type": "object",
+      "required": [
+        "call_id",
+        "current_content",
+        "current_digest",
+        "display",
+        "id",
+        "identity",
+        "kind",
+        "location",
+        "scope",
+        "session_id",
+        "source",
+        "state"
+      ],
+      "properties": {
+        "approved_content": {
+          "description": "The approved snapshot, when one exists and is readable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approved_digest": {
+          "description": "The digest the persistent record covers, when `state` is `changed`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "call_id": {
+          "description": "The tool call whose execution is paused for this decision.",
+          "type": "string"
+        },
+        "content_truncated": {
+          "description": "Whether either preview omitted content.",
+          "default": false,
+          "type": "boolean"
+        },
+        "current_content": {
+          "description": "Exact current content, framed for a package. Bounded by the runtime.",
+          "type": "string"
+        },
+        "current_digest": {
+          "description": "Digest of `current_content`.",
+          "type": "string"
+        },
+        "display": {
+          "description": "Human-facing label, e.g. `.agents/skills/design`.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/DefinitionTrustRequestId"
+        },
+        "identity": {
+          "description": "Stable store key, e.g. `skill:.agents/skills/design`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`skill`, `root_agents`, `agent`, ...",
+          "type": "string"
+        },
+        "location": {
+          "description": "Absolute package directory or primary file.",
+          "type": "string"
+        },
+        "scope": {
+          "description": "`project` or `user`.",
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "source": {
+          "description": "Ecosystem label (`CodeLeveler`, `Codex compatible`, ...).",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/definitions/UiDefinitionTrustState"
+        }
+      }
+    },
+    "UiDefinitionTrustState": {
+      "description": "Where one definition stands with the persistent store, as a client shows it.",
+      "oneOf": [
+        {
+          "description": "No approval record for these bytes.",
+          "type": "string",
+          "enum": [
+            "unapproved"
+          ]
+        },
+        {
+          "description": "A record exists, but it covers different bytes.",
+          "type": "string",
+          "enum": [
+            "changed"
+          ]
+        },
+        {
+          "description": "The store itself is unusable; nothing can be admitted.",
+          "type": "string",
+          "enum": [
+            "store_unavailable"
+          ]
+        },
+        {
+          "description": "The refusal's state is one this client does not need to distinguish, such as a built-in that should never be asked about.",
+          "type": "string",
+          "enum": [
+            "other"
+          ]
+        }
+      ]
+    },
     "UiDiff": {
       "description": "A summary of working-tree changes.",
       "type": "object",
@@ -8489,6 +8681,24 @@
               "type": "string",
               "enum": [
                 "clarification"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "request",
+            "type"
+          ],
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UiDefinitionTrustRequest"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "definition_trust"
               ]
             }
           }
@@ -10440,6 +10650,119 @@
           "$ref": "#/definitions/UiAgentSource"
         }
       }
+    },
+    "UiSkillDelivery": {
+      "description": "The live projection of a turn's skill delivery. The durable audit is the engine event; this is the compact fact a client shows while the turn runs. It carries no procedure body.",
+      "type": "object",
+      "properties": {
+        "blocked": {
+          "description": "Set when the host refused the whole delivery.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiSkillDeliveryFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiSkillDeliveryEntry"
+          }
+        }
+      }
+    },
+    "UiSkillDeliveryEntry": {
+      "description": "One skill the user's message selected this turn.",
+      "type": "object",
+      "required": [
+        "bytes",
+        "name",
+        "requested_as"
+      ],
+      "properties": {
+        "bytes": {
+          "description": "Procedure body bytes; zero when nothing was loaded.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "failure": {
+          "description": "`None` means the package was loaded into the turn context.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiSkillDeliveryFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "requested_as": {
+          "description": "The token the user typed (`/deploy`, `$deploy`, or both).",
+          "type": "string"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiSkillScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiSkillSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "UiSkillDeliveryFailure": {
+      "description": "Why a selected skill did not reach the turn context. Stable wire codes; the display copy is the client's.",
+      "type": "string",
+      "enum": [
+        "not_found",
+        "invalid",
+        "disabled",
+        "untrusted",
+        "user_invocation_disabled",
+        "model_invocation_disabled",
+        "read",
+        "shadowed",
+        "capability_unavailable"
+      ]
+    },
+    "UiSkillScope": {
+      "description": "Where a skill lives.",
+      "type": "string",
+      "enum": [
+        "project",
+        "user",
+        "builtin"
+      ]
+    },
+    "UiSkillSource": {
+      "description": "Which ecosystem's package format a skill follows.",
+      "type": "string",
+      "enum": [
+        "native",
+        "codex",
+        "agent_skills",
+        "claude",
+        "builtin"
+      ]
     },
     "UiTaskDeclaration": {
       "description": "A task's own terminal declaration, projected from its durable TaskFinished stop. This is not verification evidence and does not replace session lifecycle.",

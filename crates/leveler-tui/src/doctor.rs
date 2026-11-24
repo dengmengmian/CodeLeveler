@@ -58,6 +58,10 @@ pub struct DoctorState {
     pub selected: Option<String>,
     /// The evidence/action panel for the selected finding is open.
     pub detail_open: bool,
+    /// Independent reading offset for the evidence/action panel.
+    pub detail_scroll: usize,
+    /// Last painted evidence panel, for pointer routing.
+    pub detail_rect: Option<Rect>,
 }
 
 impl DoctorState {
@@ -86,6 +90,8 @@ pub fn open(state: &mut AppState) -> Vec<Effect> {
     state.screen_scroll = 0;
     state.detail_return = None;
     state.doctor.detail_open = true;
+    state.doctor.detail_scroll = 0;
+    state.doctor.detail_rect = None;
     ensure_selection(state);
     reload(state)
 }
@@ -433,6 +439,16 @@ fn status_style(state: &AppState, status: DiagnosticStatus) -> Style {
     Style::default().fg(color)
 }
 
+fn status_tone(status: DiagnosticStatus) -> crate::render::RowTone {
+    match status {
+        DiagnosticStatus::Pass => crate::render::RowTone::Success,
+        DiagnosticStatus::Warn => crate::render::RowTone::Warning,
+        DiagnosticStatus::Fail => crate::render::RowTone::Error,
+        DiagnosticStatus::Unknown | DiagnosticStatus::NotChecked => crate::render::RowTone::Info,
+        DiagnosticStatus::NotApplicable => crate::render::RowTone::Muted,
+    }
+}
+
 fn status_label(state: &AppState, status: DiagnosticStatus) -> &'static str {
     state.t().doctor_page.status_title(status)
 }
@@ -471,6 +487,7 @@ fn move_selection(state: &mut AppState, delta: isize) {
         (current + delta as usize).min(findings.len() - 1)
     };
     state.doctor.selected = Some(findings[next].key());
+    state.doctor.detail_scroll = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +510,42 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             move_selection(state, 1);
             Vec::new()
         }
+        KeyCode::PageDown
+            if state.doctor.detail_open
+                && key
+                    .modifiers
+                    .intersects(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            state.doctor.detail_scroll = state.doctor.detail_scroll.saturating_add(10);
+            Vec::new()
+        }
+        KeyCode::PageUp
+            if state.doctor.detail_open
+                && key
+                    .modifiers
+                    .intersects(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            state.doctor.detail_scroll = state.doctor.detail_scroll.saturating_sub(10);
+            Vec::new()
+        }
+        KeyCode::Home
+            if state.doctor.detail_open
+                && key
+                    .modifiers
+                    .intersects(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            state.doctor.detail_scroll = 0;
+            Vec::new()
+        }
+        KeyCode::End
+            if state.doctor.detail_open
+                && key
+                    .modifiers
+                    .intersects(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            state.doctor.detail_scroll = usize::MAX;
+            Vec::new()
+        }
         KeyCode::PageDown => {
             move_selection(state, 10);
             Vec::new()
@@ -503,6 +556,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Enter => {
             state.doctor.detail_open = !state.doctor.detail_open;
+            state.doctor.detail_scroll = 0;
             Vec::new()
         }
         KeyCode::Char('r') | KeyCode::Char('R') => reload(state),
@@ -511,6 +565,23 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 }
 
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    let point = (mouse.column, mouse.row).into();
+    if state
+        .doctor
+        .detail_rect
+        .is_some_and(|rect| rect.contains(point))
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.doctor.detail_scroll = state.doctor.detail_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                state.doctor.detail_scroll = state.doctor.detail_scroll.saturating_add(3);
+            }
+            _ => {}
+        }
+        return Vec::new();
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             move_selection(state, -1);
@@ -521,7 +592,6 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             Vec::new()
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            let point = (mouse.column, mouse.row).into();
             if let Some((_, key)) = state
                 .screen_rows
                 .iter()
@@ -601,52 +671,18 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status,
         hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let body = layout.content;
     state.screen_rows.clear();
+    state.doctor.detail_rect = None;
     if body.width == 0 || body.height == 0 {
         return;
     }
 
     let findings = all_findings(state);
     let t = &state.t().doctor_page;
-    let mut lines: Vec<(Line<'static>, Option<String>)> = Vec::new();
-
-    // Overview: every category, even an empty one, so "never checked" is
-    // visible rather than absent.
-    lines.push((
-        Line::from(Span::styled(
-            t.overview.to_string(),
-            Style::default()
-                .fg(state.theme.text.muted)
-                .add_modifier(Modifier::BOLD),
-        )),
-        None,
-    ));
-    for category in CATEGORIES {
-        let status = category_status_of(&findings, category);
-        let (word, style) = match status {
-            Some(status) => (status_label(state, status), status_style(state, status)),
-            None => (
-                t.status_not_checked,
-                Style::default().fg(state.theme.text.muted),
-            ),
-        };
-        lines.push((
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}", pad_display(t.category_title(category), 18)),
-                    Style::default().fg(state.theme.text.primary),
-                ),
-                Span::styled(word.to_string(), style),
-            ]),
-            None,
-        ));
-    }
-    lines.push((Line::default(), None));
-
     let problems = findings
         .iter()
         .filter(|finding| finding.status.is_problem())
@@ -678,17 +714,80 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             t.issue_count.replacen("{}", &problems.to_string(), 1)
         )
     };
-    lines.push((
-        Line::from(Span::styled(
-            heading,
-            Style::default()
-                .fg(state.theme.text.muted)
-                .add_modifier(Modifier::BOLD),
-        )),
+
+    let detail_height = if state.doctor.detail_open {
+        (body.height / 2).max(4).min(body.height.saturating_sub(3))
+    } else {
+        0
+    };
+    let list_height = body.height.saturating_sub(detail_height);
+    let list_area = Rect {
+        height: list_height,
+        ..body
+    };
+
+    // The overview is a fixed diagnostic header, not the first slice of the
+    // findings scroll. A selected row far down the list must not hide whether
+    // the whole environment passed. On a short body the eight-category grid
+    // collapses to the same real summary line, leaving the list usable.
+    let mut overview: Vec<Line<'static>> = vec![crate::render::section_header_line(
+        t.overview,
+        Some(CATEGORIES.len()),
         None,
+        &state.theme,
+        body.width as usize,
+    )];
+    overview.push(Line::from(Span::styled(
+        heading.clone(),
+        Style::default().fg(state.theme.text.muted),
+    )));
+    if list_height >= 12 {
+        for category in CATEGORIES {
+            let status = category_status_of(&findings, category);
+            let (word, style) = match status {
+                Some(status) => (status_label(state, status), status_style(state, status)),
+                None => (
+                    t.status_not_checked,
+                    Style::default().fg(state.theme.text.muted),
+                ),
+            };
+            overview.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}", pad_display(t.category_title(category), 18)),
+                    Style::default().fg(state.theme.text.primary),
+                ),
+                Span::styled(word.to_string(), style),
+            ]));
+        }
+    }
+    overview.push(crate::render::section_header_line(
+        t.checks_section,
+        Some(findings.len()),
+        None,
+        &state.theme,
+        body.width as usize,
     ));
+    let overview_height = overview
+        .len()
+        .min(list_height.saturating_sub(1) as usize)
+        .min(list_height as usize);
+    let shown_overview: Vec<Line<'static>> = overview.into_iter().take(overview_height).collect();
+    frame.render_widget(
+        Paragraph::new(shown_overview),
+        Rect {
+            height: overview_height as u16,
+            ..list_area
+        },
+    );
+
+    let findings_area = Rect {
+        y: list_area.y + overview_height as u16,
+        height: list_area.height.saturating_sub(overview_height as u16),
+        ..list_area
+    };
+    let mut finding_lines: Vec<(Line<'static>, Option<String>)> = Vec::new();
     if findings.is_empty() {
-        lines.push((
+        finding_lines.push((
             Line::from(Span::styled(
                 t.empty.to_string(),
                 Style::default().fg(state.theme.text.muted),
@@ -712,7 +811,7 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             .as_deref()
             .map(|subject| format!(" · {subject}"))
             .unwrap_or_default();
-        lines.push((
+        finding_lines.push((
             Line::from(vec![
                 Span::styled(
                     format!("{marker} "),
@@ -731,38 +830,29 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Some(key),
         ));
     }
-
-    let detail_height = if state.doctor.detail_open {
-        (body.height / 2).max(4).min(body.height.saturating_sub(3))
-    } else {
-        0
-    };
-    let list_height = body.height.saturating_sub(detail_height);
-    let list_area = Rect {
-        height: list_height,
-        ..body
-    };
     let selected_line = state.doctor.selected.as_deref().and_then(|selected| {
-        lines
+        finding_lines
             .iter()
             .position(|(_, key)| key.as_deref() == Some(selected))
     });
-    let max_offset = lines.len().saturating_sub(list_area.height as usize);
+    let max_offset = finding_lines
+        .len()
+        .saturating_sub(findings_area.height as usize);
     let offset = selected_line
-        .map(|line| line.saturating_sub(list_area.height.saturating_sub(1) as usize))
+        .map(|line| line.saturating_sub(findings_area.height.saturating_sub(1) as usize))
         .unwrap_or(0)
         .min(max_offset);
-    let visible: Vec<Line<'static>> = lines
+    let visible: Vec<Line<'static>> = finding_lines
         .drain(..)
         .enumerate()
-        .filter(|(index, _)| *index >= offset && *index < offset + list_area.height as usize)
+        .filter(|(index, _)| *index >= offset && *index < offset + findings_area.height as usize)
         .map(|(index, (line, key))| {
             if let Some(key) = key {
                 state.screen_rows.push((
                     Rect {
-                        y: list_area.y + (index - offset) as u16,
+                        y: findings_area.y + (index - offset) as u16,
                         height: 1,
-                        ..list_area
+                        ..findings_area
                     },
                     key,
                 ));
@@ -770,7 +860,7 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             line
         })
         .collect();
-    frame.render_widget(Paragraph::new(visible), list_area);
+    frame.render_widget(Paragraph::new(visible), findings_area);
 
     if detail_height == 0 {
         return;
@@ -792,6 +882,7 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         height: body.height.saturating_sub(list_height + rule_area.height),
         ..body
     };
+    state.doctor.detail_rect = Some(detail_area);
     let Some(finding) = findings
         .iter()
         .find(|finding| Some(finding.key().as_str()) == state.doctor.selected.as_deref())
@@ -799,22 +890,12 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     else {
         return;
     };
-    let mut detail = vec![Line::from(vec![
-        Span::styled(
-            state.t().doctor_page.finding_title(&finding.id).to_string(),
-            Style::default()
-                .fg(state.theme.text.primary)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "  {} · {}",
-                state.t().doctor_page.status_title(finding.status),
-                state.t().doctor_page.category_title(finding.category)
-            ),
-            status_style(state, finding.status),
-        ),
-    ])];
+    let mut detail = vec![Line::from(Span::styled(
+        state.t().doctor_page.finding_title(&finding.id).to_string(),
+        Style::default()
+            .fg(state.theme.text.primary)
+            .add_modifier(Modifier::BOLD),
+    ))];
     if let Some(subject) = &finding.subject {
         detail.push(Line::from(Span::styled(
             crate::render::text::sanitize_ui_text(&format!("{subject}  ·  {}", finding.key())),
@@ -826,13 +907,29 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Style::default().fg(state.theme.text.muted),
         )));
     }
+    detail.extend(crate::render::key_value_lines(
+        &[
+            crate::render::KeyValueRow::new(
+                state.t().doctor_page.status_label,
+                state.t().doctor_page.status_title(finding.status),
+            )
+            .tone(status_tone(finding.status)),
+            crate::render::KeyValueRow::new(
+                state.t().doctor_page.category_label,
+                state.t().doctor_page.category_title(finding.category),
+            ),
+        ],
+        detail_area.width as usize,
+        &state.theme,
+    ));
     detail.push(Line::default());
-    detail.push(Line::from(Span::styled(
-        state.t().doctor_page.evidence.to_string(),
-        Style::default()
-            .fg(state.theme.text.muted)
-            .add_modifier(Modifier::BOLD),
-    )));
+    detail.push(crate::render::section_header_line(
+        state.t().doctor_page.evidence,
+        None,
+        None,
+        &state.theme,
+        detail_area.width as usize,
+    ));
     for evidence in &finding.evidence {
         for line in
             crate::render::text::wrap(&format!("  · {evidence}"), detail_area.width as usize)
@@ -852,7 +949,15 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Style::default().fg(state.theme.accent.primary),
         )));
     }
-    frame.render_widget(Paragraph::new(detail), detail_area);
+    let max = detail.len().saturating_sub(detail_area.height as usize);
+    state.doctor.detail_scroll = state.doctor.detail_scroll.min(max);
+    crate::render::render_pane_at_offset(
+        frame,
+        detail_area,
+        detail,
+        state.doctor.detail_scroll,
+        &state.theme,
+    );
 }
 
 fn fmt_stamp(raw: &str) -> String {

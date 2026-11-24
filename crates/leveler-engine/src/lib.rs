@@ -32,8 +32,8 @@ pub use event::{
 pub use leveler_lifecycle::{TaskOutcome, TurnOutcome};
 pub use log::{
     AcknowledgedCall, BackgroundTaskFact, BackgroundTaskTerminal, ClarificationSettlement,
-    DanglingCall, EventLog, FinishedChildFact, PendingClarification, SettledClarification,
-    SnapshotView,
+    ConversationCuts, DanglingCall, EventLog, FinishedChildFact, PendingClarification,
+    SettledClarification, SnapshotView,
 };
 pub use ports::{
     ChildToolEvent, EventBarrier, ExecutionFence, GoalBinder, LostChild, LostChildNote,

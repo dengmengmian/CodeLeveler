@@ -24,6 +24,7 @@ impl AgentDefinition {
             capability: self.capability.as_str().to_string(),
             reasoning_effort: self.reasoning_effort.map(|e| e.as_wire().to_string()),
             skills: self.skills.clone(),
+            skill_reference_versions: Default::default(),
             write_roots: self.write_roots.clone(),
             max_duration_secs: self.max_duration_secs,
             // The rendered brief is set by the spawn path, which has the bound

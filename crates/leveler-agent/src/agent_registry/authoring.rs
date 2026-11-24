@@ -62,17 +62,26 @@ fn roots_for(context: &ToolContext) -> AgentRoots {
 /// The resolved skill registry in the tool's own environment, so an agent
 /// definition is validated against the skills the runtime will actually load.
 fn skill_registry_for(context: &ToolContext) -> leveler_skills::SkillRegistry {
-    let roots = context
+    let project = context
         .execution
         .workspace
         .as_ref()
-        .map(|workspace| {
-            leveler_skills::SkillRoots::for_project_in(workspace.root(), &|k| {
+        .map(|workspace| workspace.root());
+    let roots = project
+        .map(|root| {
+            leveler_skills::SkillRoots::for_project_in(root, &|k| {
                 context.execution.environment.var_os(k)
             })
         })
         .unwrap_or_else(leveler_skills::SkillRoots::empty);
-    leveler_skills::SkillRegistry::load(&roots, &trust_for(context))
+    leveler_skills::SkillRegistry::load(
+        &roots,
+        &trust_for(context),
+        &leveler_skills::PreferencesState::load(
+            &leveler_core::LevelerHome::resolve(&context.execution.environment),
+            project,
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]

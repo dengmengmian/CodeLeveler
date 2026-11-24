@@ -35,6 +35,84 @@ fn decode_row(row: &EventRecord) -> Result<EngineEvent, EngineError> {
     })
 }
 
+const CHECKPOINT_RESTORED: &str = "checkpoint_restored";
+
+/// The abandoned event ranges of a conversation. Raw execution evidence is
+/// still authoritative for side effects and recovery; this cut controls which
+/// of those facts may describe or rebuild the active transcript.
+#[derive(Default)]
+pub struct ConversationCuts {
+    abandoned: Vec<std::ops::RangeInclusive<i64>>,
+}
+
+impl ConversationCuts {
+    pub fn from_events(rows: &[EventRecord]) -> Result<Self, EngineError> {
+        let mut cuts = Self::default();
+        for row in rows
+            .iter()
+            .filter(|row| row.event_type == CHECKPOINT_RESTORED)
+        {
+            let invalid_cut = || {
+                EngineError::Corrupt(format!(
+                    "invalid checkpoint restore boundary: session {} sequence {}",
+                    row.session_id, row.sequence
+                ))
+            };
+            let EngineEvent::CheckpointRestored {
+                through_sequence, ..
+            } = decode_row(row)?
+            else {
+                return Err(invalid_cut());
+            };
+            if !(0..row.sequence).contains(&through_sequence) {
+                return Err(invalid_cut());
+            }
+            let start = through_sequence + 1;
+            let index = cuts.abandoned.partition_point(|range| *range.end() < start);
+            let start = cuts
+                .abandoned
+                .get(index)
+                .map_or(start, |range| start.min(*range.start()));
+            cuts.abandoned.truncate(index);
+            cuts.abandoned.push(start..=row.sequence);
+        }
+        Ok(cuts)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.abandoned.is_empty()
+    }
+
+    pub fn discards(&self, sequence: i64) -> bool {
+        let index = self
+            .abandoned
+            .partition_point(|range| *range.end() < sequence);
+        self.abandoned
+            .get(index)
+            .is_some_and(|range| range.contains(&sequence))
+    }
+
+    /// Turn identities whose start belongs to the discarded branch.
+    pub fn discarded_turns(
+        &self,
+        rows: &[EventRecord],
+    ) -> Result<std::collections::HashSet<String>, EngineError> {
+        if self.is_empty() {
+            return Ok(Default::default());
+        }
+        rows.iter()
+            .filter(|row| row.event_type == "turn_started" && self.discards(row.sequence))
+            .map(|row| match decode_row(row)? {
+                EngineEvent::TurnStarted { turn_id, .. } => Ok(turn_id.into_inner()),
+                _ => Err(EngineError::Corrupt(format!(
+                    "invalid turn start: session {} sequence {}",
+                    row.session_id, row.sequence
+                ))),
+            })
+            .collect()
+    }
+}
+
 /// Sequenced, persist-before-forward event sink for one session. Depends on the
 /// [`EventStore`] port, not a concrete database, so it can be exercised against
 /// an in-memory store without SQLite.
@@ -47,6 +125,32 @@ pub struct EventLog<'a> {
 }
 
 impl<'a> EventLog<'a> {
+    /// Load only the typed restore markers; normal replay readers can apply
+    /// their ranges without decoding the tool and model payloads in between.
+    pub async fn conversation_cuts(&self) -> Result<ConversationCuts, EngineError> {
+        let rows = self
+            .store
+            .load_by_types(&self.session_id, &[CHECKPOINT_RESTORED])
+            .await?;
+        ConversationCuts::from_events(&rows)
+    }
+
+    /// Turn identities whose start belongs to the discarded branch. A turn
+    /// cannot rejoin that branch through a later event with a higher sequence.
+    pub async fn discarded_conversation_turns(
+        &self,
+        cuts: &ConversationCuts,
+    ) -> Result<std::collections::HashSet<String>, EngineError> {
+        if cuts.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows = self
+            .store
+            .load_by_types(&self.session_id, &["turn_started"])
+            .await?;
+        cuts.discarded_turns(&rows)
+    }
+
     pub fn new(store: &'a dyn EventStore, session_id: SessionId) -> Self {
         Self {
             store,
@@ -556,7 +660,6 @@ impl<'a> EventLog<'a> {
             recorded_answer,
             outcome: decision.label(),
             result_text,
-            close_tool_call: true,
         };
         self.write_clarification_terminal(id, terminal).await
     }
@@ -564,9 +667,8 @@ impl<'a> EventLog<'a> {
     /// Invalidate a pending request because its logical task was cancelled.
     ///
     /// Cancellation is a real terminal, not silence: the request stops being
-    /// pending, no client can answer it into a continuation, and the log says
-    /// who ended it. No tool result is invented — the turn that asked is not
-    /// going to consume one.
+    /// pending and no client can answer it into a continuation. Close the
+    /// question tool too: its only effect was to wait for this decision.
     pub async fn cancel_clarification(
         &self,
         id: &leveler_core::ClarificationId,
@@ -577,7 +679,6 @@ impl<'a> EventLog<'a> {
                 recorded_answer: String::new(),
                 outcome: "cancelled",
                 result_text: String::new(),
-                close_tool_call: false,
             },
         )
         .await
@@ -611,15 +712,21 @@ impl<'a> EventLog<'a> {
             answer: terminal.recorded_answer,
             outcome: settled.outcome.clone(),
         }];
-        if terminal.close_tool_call && !request.call_id.is_empty() && !request.tool.is_empty() {
+        if !request.call_id.is_empty() && !request.tool.is_empty() {
+            let cancelled =
+                terminal.outcome == leveler_execution::ClarifyOutcome::Cancelled.label();
+            // A cancel is a known terminal, without a user answer or an unknown
+            // side effect that would require manual crash reconciliation.
+            let preview = if cancelled {
+                "The clarification was cancelled without a user answer.".to_string()
+            } else {
+                settled.result_text.clone()
+            };
             events.push(EngineEvent::ToolCallFinished {
                 call_id: request.call_id.clone(),
                 name: request.tool.clone(),
-                is_error: false,
-                // The user's decision IS the result; the recovery path replays
-                // it verbatim instead of treating the question as a side effect
-                // whose output was lost.
-                preview: settled.result_text.clone(),
+                is_error: cancelled,
+                preview,
                 agent_id: None,
                 applied_diff: None,
                 exit_code: None,
@@ -999,7 +1106,6 @@ struct ClarificationTerminal {
     recorded_answer: String,
     outcome: &'static str,
     result_text: String,
-    close_tool_call: bool,
 }
 
 #[cfg(test)]
@@ -1009,6 +1115,53 @@ mod tests {
         Database, EventRepository, MemoryEventStore, SessionRecord, SessionRepository,
         TurnRepository,
     };
+
+    #[tokio::test]
+    async fn checkpoint_cuts_keep_replacement_epochs_and_preserve_raw_recovery_evidence() {
+        let store = MemoryEventStore::new();
+        let id = SessionId::generate();
+        let log = EventLog::new(&store, id.clone());
+        for sequence in 1..=11 {
+            let event = match sequence {
+                6 | 10 => EngineEvent::CheckpointRestored {
+                    checkpoint_id: leveler_core::CheckpointId::generate(),
+                    through_sequence: if sequence == 6 { 2 } else { 8 },
+                },
+                4 => EngineEvent::ToolCallStarted {
+                    call_id: "old-call".into(),
+                    name: "run_command".into(),
+                    arguments: "{}".into(),
+                    parallel: false,
+                    risk: None,
+                    agent_id: None,
+                    model_step: None,
+                },
+                _ => EngineEvent::AssistantMessage {
+                    text: sequence.to_string(),
+                    reasoning: Vec::new(),
+                },
+            };
+            log.append(None, event, &mut |_| {}).await.unwrap();
+        }
+
+        let cuts = log.conversation_cuts().await.unwrap();
+        let rows = store.load(&id).await.unwrap();
+        assert_eq!(rows.len(), 11, "audit sequences survive both cuts");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| !cuts.discards(row.sequence))
+                .map(|row| row.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 7, 8, 11],
+        );
+        let dangling = log.dangling_tool_calls().await.unwrap();
+        assert_eq!(
+            dangling.len(),
+            1,
+            "a cut does not acknowledge an unknown effect"
+        );
+        assert_eq!(dangling[0].call_id, "old-call");
+    }
 
     #[tokio::test]
     async fn event_log_works_over_the_memory_store_without_sqlite() {
@@ -2552,8 +2705,8 @@ mod tests {
     }
 
     /// Cancelling the task invalidates its question: a terminal is written so
-    /// no late answer can reopen a continuation, and no tool result is
-    /// invented for a turn that will never consume one.
+    /// no late answer can reopen a continuation and recovery knows the
+    /// question tool ended without a user answer.
     #[tokio::test]
     async fn a_cancelled_task_invalidates_its_pending_question() {
         let store = MemoryEventStore::new();
@@ -2598,10 +2751,12 @@ mod tests {
                 if outcome == "cancelled" && answer.is_empty()
         )));
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, EngineEvent::ToolCallFinished { .. })),
-            "a cancelled question has no tool result: {events:?}"
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::ToolCallFinished { call_id, is_error: true, preview, .. }
+                    if call_id == "call-1" && preview.contains("cancelled without a user answer")
+            )),
+            "the question tool must also be settled: {events:?}"
         );
     }
 

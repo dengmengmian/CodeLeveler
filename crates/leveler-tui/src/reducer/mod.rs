@@ -11,6 +11,7 @@ use leveler_client_protocol::{
 use crate::action::{Action, Effect, EffectCompletion};
 use crate::btw::SurfaceFocus;
 use crate::conversation::interaction::{self, Hit};
+use crate::conversation::reply_copy;
 use crate::exit::{ExitContinueBlock, ExitImpact};
 use crate::overlay::Overlay;
 use crate::overlay::exit_confirm::{
@@ -385,6 +386,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 image.reset();
             }
             state.size = (cols, rows);
+            state.conv.reply_copy.reset_hits();
             if state.active_screen == Screen::Output {
                 request_output_index(state)
             } else {
@@ -503,6 +505,14 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 Ok(report) => state.clean.finished(report),
                 Err(message) => state.clean.failed(message),
             }
+            Vec::new()
+        }
+        Action::ReplyCopied {
+            session_id,
+            target,
+            result,
+        } => {
+            reply_copy::finish(state, session_id, target, result);
             Vec::new()
         }
         Action::UserShellOutputCopied(result) => {
@@ -1174,15 +1184,79 @@ fn snapshot_awaits_interaction(
 /// every other page shares: the wheel scrolls the body under the pointer, and
 /// a click selects the row under it. Both are the page's own actions — the
 /// same ones its keyboard bindings run — so the two inputs cannot diverge.
+fn pane_mouse(state: &mut AppState, mouse: MouseEvent) -> Option<Vec<Effect>> {
+    let split = state.page_split?;
+    if split.screen != state.active_screen || split.screen == Screen::ActivityList {
+        return None;
+    }
+    let point = (mouse.column, mouse.row).into();
+    let moving = matches!(mouse.kind, MouseEventKind::Moved);
+    if split.layout.detail.width > 0
+        && split.layout.detail.height > 0
+        && split.layout.detail.contains(point)
+    {
+        // Hover belongs to the row under the pointer, not to keyboard focus.
+        // Only a click or a wheel notch hands the detail pane the keys.
+        if moving {
+            state.list_hover = None;
+            return Some(Vec::new());
+        }
+        state.page_focus = crate::layout::SplitFocus::Detail;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.page_scroll = state.page_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                state.page_scroll = state.page_scroll.saturating_add(3);
+            }
+            _ => {}
+        }
+        return Some(Vec::new());
+    }
+    if split.layout.primary.width > 0
+        && split.layout.primary.height > 0
+        && split.layout.primary.contains(point)
+    {
+        if !moving {
+            state.page_focus = crate::layout::SplitFocus::Primary;
+        }
+        // A move still falls through to the page's row hit map so hover can
+        // follow the row without taking keyboard focus from the detail.
+        return None;
+    }
+    if split.layout.dual
+        && split.layout.divider.width > 0
+        && split.layout.divider.height > 0
+        && split.layout.divider.contains(point)
+    {
+        if moving {
+            state.list_hover = None;
+        }
+        return Some(Vec::new());
+    }
+    None
+}
+
 fn screen_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    let point = (mouse.column, mouse.row).into();
+    let hit = state
+        .screen_rows
+        .iter()
+        .find(|(rect, _)| rect.contains(point))
+        .map(|(_, key)| key.clone());
+    if matches!(mouse.kind, MouseEventKind::Moved) {
+        state.list_hover = hit.map(|key| crate::state::ListHover {
+            screen: state.active_screen,
+            key,
+        });
+        return Vec::new();
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            let point = (mouse.column, mouse.row).into();
-            let hit = state
-                .screen_rows
-                .iter()
-                .find(|(rect, _)| rect.contains(point))
-                .map(|(_, key)| key.clone());
+            state.list_hover = hit.clone().map(|key| crate::state::ListHover {
+                screen: state.active_screen,
+                key,
+            });
             match hit {
                 Some(key) => screen_nav::select_row(state, &key),
                 None => Vec::new(),
@@ -1237,9 +1311,48 @@ fn btw_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
 /// when mouse capture is not fully exclusive.
 fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    // A secondary-page overlay owns the foreground. It is keyboard-only for
+    // now, but the pointer must still be consumed here: a click, wheel or hover
+    // must never reach the page underneath a pending decision. The
+    // Conversation's inline decision card keeps its existing pointer behavior,
+    // including while the side thread is the focused surface.
+    if state.overlay.is_some() && state.active_screen != Screen::Conversation {
+        return Vec::new();
+    }
+    // Any pointer event ends the just-inserted preview. Movement also retargets
+    // the chip under the pointer; a click keeps the hover the last move set.
+    state.image_post_insert = None;
+    if matches!(mouse.kind, MouseEventKind::Moved)
+        && !matches!(state.active_screen, Screen::Conversation | Screen::Memory)
+    {
+        // Every modal page republishes hover from its own hit map; a move that
+        // lands on no row must clear the previous row first.
+        state.list_hover = None;
+    }
+    if matches!(mouse.kind, MouseEventKind::Moved) {
+        let on_composer = state
+            .image_chip_hits
+            .iter()
+            .find(|hit| hit.row == mouse.row && (hit.x0..hit.x1).contains(&mouse.column));
+        if let Some(hit) = on_composer {
+            state.image_hover = Some(hit.index);
+            state.sent_image_hover = None;
+        } else if let Some(hit) = state
+            .sent_image_hits
+            .iter()
+            .find(|hit| hit.row == mouse.row && (hit.x0..hit.x1).contains(&mouse.column))
+        {
+            state.sent_image_hover = Some((hit.item, hit.index));
+            state.image_hover = None;
+        } else {
+            state.image_hover = None;
+            state.sent_image_hover = None;
+        }
+    }
     // The side thread owns the viewport. Its wheel and its back glyph must not
     // fall through to the main transcript, whose last rect still overlaps.
-    if state.surface == SurfaceFocus::Btw && state.active_screen == Screen::Conversation {
+    if state.surface == crate::btw::SurfaceFocus::Btw && state.active_screen == Screen::Conversation
+    {
         return btw_mouse(state, mouse);
     }
     // An approval or clarification sits in the composer slot and asks about the
@@ -1258,6 +1371,9 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             state.disarm_ctrlc();
             clear_quit_confirm_notification(state);
             state.workbench_focus = WorkbenchFocus::Conversation;
+            // The wheel moves the chip out from under a stationary pointer.
+            state.image_hover = None;
+            state.sent_image_hover = None;
             interaction::clear_selection_drag(state);
             state.conv.selection.clear();
             let delta = if mouse.kind == MouseEventKind::ScrollUp {
@@ -1278,7 +1394,15 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
         return Vec::new();
     }
-    if !state.completion.open
+    // A modal owns the pointer. Tab and close hits are the chrome; a click
+    // outside is one Esc. Workbench controls painted underneath (shell stop,
+    // completion, pending steer) must not see the same event.
+    let hosted = crate::workspace::hosts(state.active_screen);
+    if hosted && let Some(effects) = crate::workspace::chrome_mouse(state, mouse) {
+        return effects;
+    }
+    if !hosted
+        && !state.completion.open
         && let Some(effects) = crate::pending_steer::mouse(state, mouse)
     {
         return effects;
@@ -1286,7 +1410,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 
     // The completion menu owns the pointer over itself: wheel moves the
     // selection, movement highlights, a click accepts (never executes).
-    if state.completion.open {
+    if !hosted && state.completion.open {
         let point = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -1330,7 +1454,8 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 
     // Clickable background control on the fixed live-activity row. The same
     // execution changes owner; this never spawns a second command.
-    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    if !hosted
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && point_in_rect(mouse.column, mouse.row, state.shell_live_background_rect)
         && let Some(shell) = state.running_user_shell()
     {
@@ -1342,7 +1467,8 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     }
 
     // Clickable stop on the fixed live-activity row.
-    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    if !hosted
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && point_in_rect(mouse.column, mouse.row, state.shell_live_stop_rect)
         && let Some(shell) = state.running_user_shell()
     {
@@ -1383,6 +1509,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     {
         return screen_nav::back(state);
     }
+    // A P3 detail pane owns pointer hover/click/wheel inside its own rect.
+    // Clicks never select a list row through the detail; the divider is inert.
+    if let Some(effects) = pane_mouse(state, mouse) {
+        return effects;
+    }
     if state.active_screen == Screen::Tasks {
         return crate::tasks::handle_mouse(state, mouse);
     }
@@ -1403,13 +1534,25 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     }
     if state.active_screen == Screen::ActivityList {
         let point = (mouse.column, mouse.row).into();
+        let list_hit = state
+            .background_list_hits
+            .iter()
+            .find(|(rect, _)| rect.contains(point))
+            .map(|(_, id)| id.clone());
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            state.list_hover = list_hit.map(|key| crate::state::ListHover {
+                screen: Screen::ActivityList,
+                key,
+            });
+            return Vec::new();
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            if let Some((_, id)) = state
-                .background_list_hits
-                .iter()
-                .find(|(rect, _)| rect.contains(point))
-            {
-                state.background_list_selected = Some(id.clone());
+            if let Some(id) = list_hit {
+                state.list_hover = Some(crate::state::ListHover {
+                    screen: Screen::ActivityList,
+                    key: id.clone(),
+                });
+                state.background_list_selected = Some(id);
                 crate::activity::focus_background_list(state);
             } else if state
                 .background_output_rect
@@ -1443,16 +1586,25 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         return Vec::new();
     }
     if state.active_screen == Screen::Issue {
+        let hit = state
+            .issue_row_hits
+            .iter()
+            .find(|(row, x0, x1, _)| *row == mouse.row && (*x0..*x1).contains(&mouse.column))
+            .cloned();
         match mouse.kind {
+            MouseEventKind::Moved => {
+                state.list_hover = hit.map(|(_, _, _, key)| crate::state::ListHover {
+                    screen: Screen::Issue,
+                    key,
+                });
+                return Vec::new();
+            }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, _, _, key)) = state
-                    .issue_row_hits
-                    .iter()
-                    .find(|(row, x0, x1, _)| {
-                        *row == mouse.row && (*x0..*x1).contains(&mouse.column)
-                    })
-                    .cloned()
-                {
+                if let Some((_, _, _, key)) = hit {
+                    state.list_hover = Some(crate::state::ListHover {
+                        screen: Screen::Issue,
+                        key: key.clone(),
+                    });
                     state.issue_selected = Some(key);
                     crate::issue::toggle_expanded(state);
                 }
@@ -1522,6 +1674,10 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         .copied();
     if matches!(mouse.kind, MouseEventKind::Moved) {
         state.pending_hover = pending_hit.and_then(|hit| hit.index);
+        state
+            .conv
+            .reply_copy
+            .observe_pointer(mouse.column, mouse.row);
         return Vec::new();
     }
     if let (MouseEventKind::Down(MouseButton::Left), Some(hit)) = (mouse.kind, pending_hit) {
@@ -1591,18 +1747,23 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         // Wheel scrolls Conversation (never over Input — keeps history focus).
         MouseEventKind::ScrollUp if over_conv || over_jump => {
             state.workbench_focus = WorkbenchFocus::Conversation;
+            state.image_hover = None;
+            state.sent_image_hover = None;
             interaction::clear_selection_drag(state);
             state.conv.selection.clear();
             interaction::scroll_by(state, -3);
         }
         MouseEventKind::ScrollDown if over_conv || over_jump => {
             state.workbench_focus = WorkbenchFocus::Conversation;
+            state.image_hover = None;
+            state.sent_image_hover = None;
             interaction::clear_selection_drag(state);
             state.conv.selection.clear();
             interaction::scroll_by(state, 3);
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {}
         MouseEventKind::Down(MouseButton::Left) => {
+            state.conv.reply_copy.clear_focus();
             // Jump-to-bottom only when not mid-selection; badge is hidden during
             // an active selection so hit-testing is usually empty anyway.
             if over_jump && !state.conv.selection.is_active() {
@@ -1667,6 +1828,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 return Vec::new();
             }
             if over_conv {
+                if let Some(target) = state.conv.reply_copy.hit(mouse.column, mouse.row) {
+                    interaction::clear_selection_drag(state);
+                    state.conv.selection.clear();
+                    return reply_copy::request(state, target);
+                }
                 state.workbench_focus = WorkbenchFocus::Conversation;
                 // Pin the viewport exactly where it is painted so agent
                 // streaming cannot yank us to the bottom AND the hit test
@@ -1845,9 +2011,24 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 
 /// Content width of the full-output page at the current terminal size.
 pub(crate) fn output_view_width(state: &AppState) -> usize {
-    let cols = state.size.0;
-    let pad = crate::secondary::padding_x(cols);
-    cols.saturating_sub(pad.saturating_mul(2)).max(1) as usize
+    // The full-output page is a hosted card tab. Its index must be built for
+    // the page body the renderer actually paints, not for the terminal minus a
+    // plain Secondary padding: the card border, tabs and page gutter are also
+    // part of the one geometry chain.
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: state.size.0,
+        height: state.size.1,
+    };
+    let geom = crate::workspace::frame_geom(area, Screen::Output);
+    let pad = crate::secondary::card_gutter(geom.content.width);
+    let width = if geom.content == geom.popup {
+        geom.content.width
+    } else {
+        geom.content.width.saturating_sub(pad.saturating_mul(2))
+    };
+    width.max(1) as usize
 }
 
 /// Ask the edge to (re)build the output index at the current width. The
@@ -1882,12 +2063,18 @@ fn request_output_index(state: &mut AppState) -> Vec<Effect> {
 /// its normal fold instead.
 fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
     use crate::transcript::TranscriptItem;
-    let (command, retained, truncated, full_output) = match state.transcript.items().get(item) {
+    let (command, retained, truncated, full_output, meta) = match state.transcript.items().get(item)
+    {
         Some(TranscriptItem::UserShell(shell)) if shell.needs_output_page() => (
             shell.command.clone(),
             shell.output.clone(),
             shell.output_truncated,
             shell.full_output.clone(),
+            crate::output_view::OutputMeta {
+                exit_code: shell.exit_code,
+                duration_ms: shell.duration_ms,
+                has_stderr: shell.output_marks.iter().any(|mark| mark.stderr),
+            },
         ),
         _ => return None,
     };
@@ -1940,6 +2127,7 @@ fn open_output_view(state: &mut AppState, item: usize) -> Option<Vec<Effect>> {
     let effect_source = source.clone();
     let mut view = crate::output_view::OutputView::new(source, title, width);
     view.completeness = completeness;
+    view.meta = meta;
     view.generation = 1;
     state.output_view = Some(view);
     state.active_screen = Screen::Output;
@@ -2264,7 +2452,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // overlay gate and before the main cancel path, so one keystroke can never
     // act on two surfaces. This is the whole reason `/btw` needs a surface:
     // without it, Esc/Ctrl+C fell through to the main run's cancellation.
-    if state.surface == SurfaceFocus::Btw {
+    if state.surface == crate::btw::SurfaceFocus::Btw {
         if key.code == KeyCode::Esc {
             leave_btw(state);
             return Vec::new();
@@ -2302,7 +2490,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let btw = state.surface == SurfaceFocus::Btw;
+    let btw = state.surface == crate::btw::SurfaceFocus::Btw;
     if !btw && let Some(effects) = crate::pending_steer::key(state, key) {
         return effects;
     }
@@ -2577,6 +2765,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
     }
 
+    let focused_reply = if !btw && state.workbench_focus == WorkbenchFocus::Conversation {
+        state.conv.reply_copy.focused()
+    } else {
+        None
+    };
     match key.code {
         // Side thread: its own conversation scrolls with the shared scroll keys;
         // an empty composer means the user is reading, not editing.
@@ -2639,13 +2832,21 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             let text = state.composer.text();
             let token = text.split_whitespace().next().unwrap_or(text);
             // Primary or alias counts as exact so `/mode` runs permission,
-            // not the highlighted `/model` completion.
-            let exact = crate::screen::is_exact_slash_token(token);
+            // not the highlighted `/model` completion. An exact Skill name
+            // is the same contract: the typed `/deploy` runs, a partial
+            // `/dep` only completes.
+            let exact = crate::screen::is_exact_slash_or_skill_token(state, token);
             if !exact {
                 complete_slash(state);
                 return Vec::new();
             }
             return submit(state);
+        }
+        KeyCode::Enter if focused_reply.is_some() => {
+            return reply_copy::request(state, focused_reply.expect("checked above"));
+        }
+        KeyCode::Esc if focused_reply.is_some() && !state.is_busy() => {
+            state.conv.reply_copy.clear_focus();
         }
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Activity => {
             return crate::activity::open_selected(state);
@@ -2771,6 +2972,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // A live running command earns a stop right after the transcript's
         // scroll, so the contextual `x` is reachable without the mouse.
         KeyCode::Tab if !btw => {
+            if state.workbench_focus == WorkbenchFocus::Conversation
+                && state.conv.reply_copy.advance_focus()
+            {
+                return Vec::new();
+            }
             // Tab moves the workbench focus; an output window's reading keys
             // belong to the record and are released with it.
             state.shell_output_focus = None;
@@ -3375,7 +3581,7 @@ fn request_cancel(state: &mut AppState) -> Vec<Effect> {
 /// own draft becomes the live composer, so one composer implementation serves
 /// both surfaces without leaking text across them.
 pub(super) fn enter_btw(state: &mut AppState) {
-    if state.surface == SurfaceFocus::Btw {
+    if state.surface == crate::btw::SurfaceFocus::Btw {
         return;
     }
     std::mem::swap(&mut state.composer, &mut state.btw.draft);
@@ -4518,22 +4724,21 @@ mod final_nav_tests {
             .id
             .as_key()
             .to_string();
-        // Locate the second row through the actual painted text.
-        let buffer = terminal.backend().buffer();
-        let y = (0..24)
-            .find(|y| {
-                (0..80)
-                    .map(|x| buffer[(x, *y)].symbol())
-                    .collect::<String>()
-                    .contains(&second)
-            })
-            .unwrap();
+        // The card is inset, so a hardcoded column can miss it. The hit
+        // rects are the ones the page published for this frame.
+        let list_hit = s
+            .background_list_hits
+            .iter()
+            .find(|(_, id)| id == &second)
+            .map(|(rect, _)| *rect)
+            .expect("the second job is painted");
+        let output = s.background_output_rect.expect("the log pane is painted");
         handle_mouse(
             &mut s,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 5,
-                row: y,
+                column: list_hit.x,
+                row: list_hit.y,
                 modifiers: KeyModifiers::NONE,
             },
         );
@@ -4542,8 +4747,8 @@ mod final_nav_tests {
             &mut s,
             MouseEvent {
                 kind: MouseEventKind::ScrollUp,
-                column: 5,
-                row: y,
+                column: list_hit.x,
+                row: list_hit.y,
                 modifiers: KeyModifiers::NONE,
             },
         );
@@ -4552,8 +4757,8 @@ mod final_nav_tests {
             &mut s,
             MouseEvent {
                 kind: MouseEventKind::ScrollUp,
-                column: 5,
-                row: 15,
+                column: output.x,
+                row: output.y,
                 modifiers: KeyModifiers::NONE,
             },
         );

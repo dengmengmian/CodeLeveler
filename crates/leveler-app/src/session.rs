@@ -67,6 +67,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
         // JSONL consumer must be able to join it to the turn without opening
         // the event store; the CLI renderer already knows this event.
         EngineEvent::RuleDelivery { audit } => AgentEvent::RuleDelivery { audit },
+        EngineEvent::SkillDelivery { audit } => AgentEvent::SkillDelivery { audit },
         EngineEvent::ToolCallStarted {
             call_id,
             name,

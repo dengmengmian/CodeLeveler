@@ -80,6 +80,54 @@ pub enum DefinitionTrustAuthorizationOutcome {
     Failed(String),
 }
 
+/// Frame the exact skill package for display and report its digest.
+///
+/// The decision binds every package file, so the digest is over the complete
+/// package even when the preview handed to the human is truncated.
+pub fn skill_package_preview(location: &std::path::Path) -> Result<(String, String, bool), String> {
+    let package = leveler_definition_trust::read_skill_package(&location.join("SKILL.md"))?;
+    let digest = leveler_definition_trust::DefinitionIdentity::skill_package_digest(&package);
+    let mut out = String::new();
+    let mut truncated = false;
+    for part in package {
+        let framed = format!(
+            "--- {} ---\n{}{}",
+            part.relative,
+            String::from_utf8_lossy(&part.bytes),
+            if part.bytes.ends_with(b"\n") {
+                ""
+            } else {
+                "\n"
+            }
+        );
+        let remaining = MAX_AUTHORIZATION_PREVIEW_BYTES.saturating_sub(out.len());
+        if framed.len() > remaining {
+            truncated = true;
+            let mut end = remaining.min(framed.len());
+            while !framed.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&framed[..end]);
+            out.push_str("\n… (preview truncated; the approval binds every package file)\n");
+            break;
+        }
+        out.push_str(&framed);
+    }
+    Ok((out, digest, truncated))
+}
+
+/// Bound a previously approved body to the same preview budget.
+pub fn bounded_preview(text: &str) -> String {
+    if text.len() <= MAX_AUTHORIZATION_PREVIEW_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_AUTHORIZATION_PREVIEW_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… (preview truncated)\n", &text[..end])
+}
+
 impl DefinitionTrustAuthorizationOutcome {
     /// Whether the caller may retry the load against the same trust view.
     pub fn admits(&self) -> bool {

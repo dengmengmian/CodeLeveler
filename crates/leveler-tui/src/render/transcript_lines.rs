@@ -368,14 +368,28 @@ pub(crate) fn push_user_turn(
 /// The prompt body's visual rows and their soft-wrap joiners. Shared by the
 /// painter and the copy policy so the two cannot drift.
 fn user_wrapped(text: &str, width: usize) -> Vec<(String, Option<String>)> {
-    let inner = user_prompt_width(width)
-        .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
-        .max(1);
+    let inner = user_prompt_inner_width(width);
     let mut wrapped = crate::render::text::wrap_with_joiners(text, inner);
     if wrapped.is_empty() {
         wrapped.push((String::new(), None));
     }
     wrapped
+}
+
+fn user_prompt_inner_width(content_width: usize) -> usize {
+    user_prompt_width(content_width)
+        .saturating_sub(USER_PROMPT_GUTTER + USER_PROMPT_RIGHT_PAD)
+        .max(1)
+}
+
+/// Sanitized body text and the byte span of each visual row [`push_user_turn`]
+/// paints. The spans are into the returned text, which is what the viewport
+/// wraps, so a chip hit lands on the cells of that row.
+pub(crate) fn user_body_spans(
+    text: &str,
+    content_width: usize,
+) -> (std::borrow::Cow<'_, str>, Vec<std::ops::Range<usize>>) {
+    crate::render::text::wrap_row_spans(text, user_prompt_inner_width(content_width))
 }
 
 /// Copy policy for [`push_user_turn`]: the marker gutter is decoration and
@@ -2773,6 +2787,7 @@ mod tests {
             done: true,
             rendered: Some(crate::markdown::MdDoc::parse(text)),
             kind,
+            reply_phase: Default::default(),
         }
     }
 

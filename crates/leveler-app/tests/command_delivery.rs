@@ -2387,3 +2387,385 @@ async fn delivered_unarchive_restores_a_stored_session_body() {
         "unarchive restored the session to the default list"
     );
 }
+
+/// A checkpoint must cut both the active messages and the history replayed
+/// over them. Then a new turn and a new client both see that same prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_restore_keeps_one_conversation_through_resync_and_resume() {
+    use leveler_client_protocol::UiSessionSnapshot;
+    use leveler_test_support::{MockResponse, MockServer};
+
+    fn answer(content: &str) -> MockResponse {
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+        });
+        MockResponse::sse(&[&chunk.to_string()])
+    }
+
+    fn texts(snapshot: &UiSessionSnapshot) -> Vec<&str> {
+        snapshot
+            .messages
+            .iter()
+            .map(|msg| msg.text.as_str())
+            .collect()
+    }
+
+    fn replies(entries: &[leveler_client_protocol::UiHistoryEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                RuntimeEvent::AssistantTextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn next(
+        events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+        accepts: impl Fn(&RuntimeEvent) -> bool,
+    ) -> RuntimeEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if accepts(&event) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("expected runtime event")
+    }
+
+    let second_answer = Arc::new(tokio::sync::Notify::new());
+    let server = MockServer::start(vec![
+        answer("retained answer"),
+        MockResponse::GatedSse {
+            first: "data: {\"choices\":[{\"delta\":{\"content\":\"abandoned answer\"}}]}\n\n"
+                .into(),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            release: second_answer.clone(),
+        },
+        answer("replacement answer"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &server.base_url());
+    let layout = || {
+        Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        )
+    };
+    let runtime = |app| {
+        InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+    };
+    let app = Arc::new(Application::assemble(layout()).unwrap());
+    let client = runtime(app.clone());
+    let opened = client
+        .create_session(CreateSessionRequest {
+            request_id: None,
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "restore history".into(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let id = opened.session.id;
+    let mut events = client.subscribe_session(&id);
+    let submit = |content: &str| ClientCommand::SubmitMessage {
+        session_id: id.clone(),
+        content: content.into(),
+        attachments: vec![],
+    };
+    client.send(submit("retained question")).await.unwrap();
+    next(&mut events, |event| {
+        matches!(event, RuntimeEvent::TurnAnswered)
+    })
+    .await;
+    let early_checkpoint = client.snapshot(&id).await.unwrap().checkpoints[0]
+        .id
+        .clone();
+    client.send(submit("abandoned question")).await.unwrap();
+    next(&mut events, |event| {
+        matches!(event, RuntimeEvent::AssistantTextDelta { delta, .. } if delta == "abandoned answer")
+    }).await;
+    let busy_restore = client
+        .send(ClientCommand::RestoreCheckpoint {
+            session_id: id.clone(),
+            checkpoint_id: early_checkpoint,
+        })
+        .await;
+    second_answer.notify_one();
+    assert!(
+        busy_restore.is_err(),
+        "a live turn must keep its transcript lease"
+    );
+    next(&mut events, |event| {
+        matches!(event, RuntimeEvent::TurnAnswered)
+    })
+    .await;
+    let before = client.snapshot(&id).await.unwrap();
+    assert_eq!(
+        texts(&before),
+        [
+            "retained question",
+            "retained answer",
+            "abandoned question",
+            "abandoned answer"
+        ]
+    );
+    let checkpoint = before.checkpoints.last().unwrap();
+    assert_eq!(checkpoint.ordinal, 2);
+    let db = app.open_database().await.unwrap();
+    // Model the durable side of a turn interrupted after a tool result was
+    // recorded in the event log, but before its message exchange was saved.
+    // Ordinary continuation repairs this gap. A checkpoint abandons the turn.
+    let interrupted = TurnRepository::new(&db)
+        .start(&id, "chat", None, leveler_core::now())
+        .await
+        .unwrap();
+    let interrupted = leveler_core::TurnId::new(interrupted.id);
+    let event_repo = leveler_storage::EventRepository::new(&db);
+    for event in [
+        leveler_engine::EngineEvent::TurnStarted {
+            turn_id: interrupted.clone(),
+            kind: leveler_engine::TurnKind::Chat,
+        },
+        leveler_engine::EngineEvent::ToolCallStarted {
+            call_id: "abandoned-tool".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"ignored-fixture.txt"}"#.into(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(1),
+        },
+        leveler_engine::EngineEvent::ToolCallFinished {
+            call_id: "abandoned-tool".into(),
+            name: "read_file".into(),
+            is_error: false,
+            preview: "abandoned tool result".into(),
+            agent_id: None,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+    ] {
+        let (tag, payload) = event.to_row().unwrap();
+        event_repo
+            .append(&id, Some(&interrupted), &tag, &payload, leveler_core::now())
+            .await
+            .unwrap();
+    }
+    TurnRepository::new(&db)
+        .finish(&interrupted, "interrupted", leveler_core::now())
+        .await
+        .unwrap();
+    client
+        .send(ClientCommand::RestoreCheckpoint {
+            session_id: id.clone(),
+            checkpoint_id: checkpoint.id.clone(),
+        })
+        .await
+        .unwrap();
+    let RuntimeEvent::SessionOpened { session: restored } = next(&mut events, |event| {
+        matches!(event, RuntimeEvent::SessionOpened { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(restored.id, id);
+    assert_eq!(texts(&restored), ["retained question", "retained answer"]);
+    assert_eq!(
+        restored
+            .messages
+            .iter()
+            .map(|msg| msg.ordinal)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1)]
+    );
+    let rows = leveler_storage::MessageRepository::new(&db)
+        .load(&id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "durable transcript after restore: {rows:?}");
+    let history = restored.history.expect("restored runtime history");
+    assert_eq!(
+        replies(&history.entries),
+        ["retained answer"],
+        "history must honor the checkpoint"
+    );
+    let replay = app
+        .resume_session(
+            &id,
+            Arc::new(leveler_execution::AutoApprove),
+            &mut |_| {},
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.final_text, "retained answer");
+    assert_eq!(
+        server.request_count(),
+        2,
+        "a committed answer never drives the model again"
+    );
+
+    // A delayed event recording for the old turn is still a journal fact.
+    // Its association with that abandoned turn must survive sequence advance.
+    let (tag, payload) = (leveler_engine::EngineEvent::AssistantMessage {
+        text: "abandoned late answer".into(),
+        reasoning: Vec::new(),
+    })
+    .to_row()
+    .unwrap();
+    event_repo
+        .append(&id, Some(&interrupted), &tag, &payload, leveler_core::now())
+        .await
+        .unwrap();
+    client.send(submit("replacement question")).await.unwrap();
+    next(&mut events, |event| {
+        matches!(event, RuntimeEvent::TurnAnswered)
+    })
+    .await;
+    let requests = server.request_bodies().await;
+    let request: serde_json::Value = serde_json::from_str(requests.last().unwrap()).unwrap();
+    assert!(
+        !request["messages"].to_string().contains("abandoned-tool"),
+        "crash repair must not reappend an exchange from a rolled-back turn"
+    );
+    let messages = request["messages"].as_array().unwrap();
+    let context: Vec<_> = messages
+        .iter()
+        .filter(|msg| msg["role"] != "system")
+        .filter_map(|msg| msg["content"].as_str())
+        .collect();
+    assert!(context.contains(&"retained question"), "{context:?}");
+    assert!(context.contains(&"retained answer"), "{context:?}");
+    assert!(context.contains(&"replacement question"), "{context:?}");
+    assert!(
+        !context.iter().any(|text| text.contains("abandoned")),
+        "{context:?}"
+    );
+
+    drop(events);
+    drop(client);
+    drop(db);
+    drop(app);
+    let resumed = runtime(Arc::new(Application::assemble(layout()).unwrap()));
+    let snapshot = resumed.snapshot(&id).await.unwrap();
+    assert_eq!(
+        texts(&snapshot),
+        [
+            "retained question",
+            "retained answer",
+            "replacement question",
+            "replacement answer"
+        ]
+    );
+    let mut events = resumed.subscribe_session(&id);
+    let query = CommandId::generate();
+    resumed
+        .send(ClientCommand::QuerySessionHistory {
+            session_id: id.clone(),
+            query_id: Some(query.clone()),
+        })
+        .await
+        .unwrap();
+    let RuntimeEvent::SessionHistoryLoaded { entries, .. } = next(&mut events, |event| {
+        matches!(event, RuntimeEvent::SessionHistoryLoaded { query_id: Some(actual), .. } if actual == &query)
+    }).await else {
+        unreachable!()
+    };
+    assert_eq!(replies(&entries), ["retained answer", "replacement answer"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_restore_failure_keeps_messages_and_can_retry() {
+    let (tmp, app, client, id) = build_client().await;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: id.clone(),
+            content: "input to retain on failure".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    settle_background_turns(&app, &client, &[&id]).await;
+    let db = app.open_database().await.unwrap();
+    let messages = leveler_storage::MessageRepository::new(&db);
+    let before = messages.load(&id).await.unwrap();
+    assert!(!before.is_empty());
+    let snapshot = client.snapshot(&id).await.unwrap();
+    let checkpoint_id = snapshot.checkpoints.first().unwrap().id.clone();
+    assert_eq!(snapshot.checkpoints[0].ordinal, 0);
+
+    let fault = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(
+            Layout::from_parts(
+                tmp.path().to_path_buf(),
+                tmp.path().join("configs"),
+                tmp.path().join("state"),
+            )
+            .database_path(),
+        ),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER restore_fault BEFORE INSERT ON events \
+         WHEN NEW.type = 'context_snapshot' \
+         BEGIN SELECT RAISE(ABORT, 'restore fixture failure'); END",
+    )
+    .execute(&fault)
+    .await
+    .unwrap();
+    let restore = || ClientCommand::RestoreCheckpoint {
+        session_id: id.clone(),
+        checkpoint_id: checkpoint_id.clone(),
+    };
+    let mut events = client.subscribe_session(&id);
+    client.send(restore()).await.unwrap();
+    assert_eq!(
+        messages.load(&id).await.unwrap(),
+        before,
+        "the transcript must survive a failed epoch write"
+    );
+    let failed: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(
+        failed.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Notification {
+                level: leveler_client_protocol::NotificationLevel::Error,
+                ..
+            }
+        )),
+        "{failed:?}"
+    );
+    assert!(
+        !failed
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SessionOpened { .. })),
+        "{failed:?}"
+    );
+    sqlx::query("DROP TRIGGER restore_fault")
+        .execute(&fault)
+        .await
+        .unwrap();
+    client.send(restore()).await.unwrap();
+    assert!(messages.load(&id).await.unwrap().is_empty());
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(event, RuntimeEvent::SessionOpened { session } if session.messages.is_empty())
+    }));
+}

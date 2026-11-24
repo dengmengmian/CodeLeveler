@@ -261,7 +261,7 @@ pub fn compose(summary: &UiReviewSummary, report: Option<&UiReviewReport>, t: &U
     out
 }
 
-fn counts_line(summary: &UiReviewSummary, t: &UiText) -> String {
+pub(crate) fn counts_line(summary: &UiReviewSummary, t: &UiText) -> String {
     let review = &t.review;
     let counts = &summary.counts;
     let mut facts = format!(

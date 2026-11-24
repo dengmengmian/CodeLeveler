@@ -12,7 +12,7 @@ use leveler_client_protocol::{
     MessageId, RuntimeEvent, UiHistoryEntry, UiMessage, UiReviewReport, UiReviewSummary, UiRole,
 };
 use leveler_core::{SessionId, Timestamp, TurnId};
-use leveler_engine::{EngineEvent, TurnUsage};
+use leveler_engine::{EngineEvent, EventLog, TurnUsage};
 use leveler_model::{ContentPart, Message, RuntimeNoticeKind, TranscriptOrigin};
 use leveler_storage::{
     Database, EventRepository, MessageRepository, ModelRequestRepository, ReviewRepository,
@@ -64,7 +64,22 @@ pub async fn load_session_history(
     session_id: &SessionId,
 ) -> Result<(Vec<UiHistoryEntry>, u32), AppError> {
     let repository = EventRepository::new(db);
-    let headers = repository.headers(session_id).await?;
+    let mut headers = repository.headers(session_id).await?;
+    let log = EventLog::new(db, session_id.clone());
+    let cuts = log
+        .conversation_cuts()
+        .await
+        .map_err(|error| AppError::Engine(error.to_string()))?;
+    let restored = !cuts.is_empty();
+    let discarded = log
+        .discarded_conversation_turns(&cuts)
+        .await
+        .map_err(|error| AppError::Engine(error.to_string()))?;
+    if restored {
+        // Bound the replay only after cutting the abandoned ranges, so their
+        // turns do not count against the retained conversation's history.
+        headers.retain(|header| !cuts.discards(header.sequence));
+    }
     let has_turns = headers
         .iter()
         .any(|header| header.event_type == "turn_started");
@@ -136,12 +151,29 @@ pub async fn load_session_history(
         Some(first) => {
             let since = (omitted_before_load > 0 && parse_time(&first.created_at).is_some())
                 .then_some(first.created_at.as_str());
-            (
+            let records = if restored {
+                let start = headers.partition_point(|header| header.sequence < first.sequence);
+                let mut records = Vec::new();
+                for range in
+                    headers[start..].chunk_by(|left, right| left.sequence + 1 == right.sequence)
+                {
+                    records.extend(
+                        repository
+                            .load_window(
+                                session_id,
+                                range[0].sequence,
+                                range[range.len() - 1].sequence,
+                            )
+                            .await?,
+                    );
+                }
+                records
+            } else {
                 repository
                     .load_after(session_id, first.sequence - 1)
-                    .await?,
-                since,
-            )
+                    .await?
+            };
+            (records, since)
         }
         None => (Vec::new(), None),
     };
@@ -166,6 +198,13 @@ pub async fn load_session_history(
         }
     }
     for record in &records {
+        if record
+            .turn_id
+            .as_ref()
+            .is_some_and(|id| discarded.contains(id))
+        {
+            continue;
+        }
         let mut event = EngineEvent::from_payload(&record.payload).map_err(|e| {
             AppError::Engine(format!(
                 "corrupt authoritative event: session {} sequence {} type '{}': {e}",
@@ -188,6 +227,17 @@ pub async fn load_session_history(
     // every turn is still durable in its write-ahead turn row, which no epoch
     // cut touches, so re-project it here.
     let rebuild = rebuildable_turn_inputs(&events, db, session_id).await?;
+    let retained_turns: HashSet<String> = if restored {
+        events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                EngineEvent::TurnStarted { turn_id, .. } => Some(turn_id.to_string()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let raw_messages: Vec<(Option<Timestamp>, Fact)> = MessageRepository::new(db)
         .load_timed_since(session_id, since)
         .await
@@ -279,6 +329,9 @@ pub async fn load_session_history(
         .await
         .map_err(AppError::from)?
     {
+        if restored && !retained_turns.contains(&recap.turn_id) {
+            continue;
+        }
         let at = parse_time(&recap.created_at);
         if let (Some(cutoff), Some(at)) = (since.and_then(parse_time), at)
             && at < cutoff

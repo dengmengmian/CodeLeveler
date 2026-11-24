@@ -33,7 +33,27 @@ use crate::event_repo::EVENT_SCHEMA_VERSION;
 /// exactly the shape `EngineEvent::to_row` produces.
 pub type EpochEventRow = (String, String);
 
+enum TranscriptCut<'a> {
+    Replace(&'a [String]),
+    RetainPrefix { ordinal: u32, event_cursor: i64 },
+}
+
 impl Database {
+    /// Read both positions from one SQLite snapshot.
+    pub async fn conversation_checkpoint_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(u32, i64), StorageError> {
+        Ok(sqlx::query_as(
+            "SELECT
+             (SELECT COUNT(*) FROM session_messages WHERE session_id = ?1),
+             (SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1)",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     /// Atomically: replace the session transcript with `replacement_payloads`
     /// (ordinals from 0), append `epoch_events` in order (contiguous
     /// sequences assigned in-transaction), and delete the session's derived
@@ -45,6 +65,44 @@ impl Database {
         epoch_events: &[EpochEventRow],
         now: Timestamp,
     ) -> Result<(), StorageError> {
+        self.commit_context_cut(
+            session_id,
+            TranscriptCut::Replace(replacement_payloads),
+            epoch_events,
+            now,
+        )
+        .await
+    }
+
+    /// Preserve the checkpoint prefix and its row identities, committing the
+    /// conversation cut and its corresponding epoch events together.
+    pub async fn restore_context_epoch(
+        &self,
+        session_id: &SessionId,
+        ordinal: u32,
+        event_cursor: i64,
+        epoch_events: &[EpochEventRow],
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        self.commit_context_cut(
+            session_id,
+            TranscriptCut::RetainPrefix {
+                ordinal,
+                event_cursor,
+            },
+            epoch_events,
+            now,
+        )
+        .await
+    }
+
+    async fn commit_context_cut(
+        &self,
+        session_id: &SessionId,
+        cut: TranscriptCut<'_>,
+        epoch_events: &[EpochEventRow],
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
         let ts = now.to_rfc3339();
         // IMMEDIATE: take the write lock at BEGIN so the read-then-write
         // event sequencing below cannot hit the non-waitable upgrade deadlock.
@@ -53,11 +111,54 @@ impl Database {
         // here must leave the pre-compact transcript intact (SQLite rollback).
         leveler_core::test_crash::point("before_context_epoch_cut");
 
-        // 1. Replace the transcript (same shape as MessageRepository::replace_all).
-        sqlx::query("DELETE FROM session_messages WHERE session_id = ?1")
-            .bind(session_id.as_str())
-            .execute(&mut *tx)
-            .await?;
+        let (retain, replacement_payloads, cursor) = match cut {
+            TranscriptCut::Replace(payloads) => (None, payloads, None),
+            TranscriptCut::RetainPrefix {
+                ordinal,
+                event_cursor,
+            } => {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+                )
+                .bind(session_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+                let sequence: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1",
+                )
+                .bind(session_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+                let running: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM turns WHERE session_id = ?1 AND status = 'running')",
+                )
+                .bind(session_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+                if running {
+                    // The runtime's local lease excludes a live turn here, and
+                    // the durable guard also covers a WAL admission that has
+                    // not reached TurnStarted or that another boot still owns.
+                    return Err(StorageError::InvalidData(
+                        "a running turn still owns this conversation".into(),
+                    ));
+                }
+                if i64::from(ordinal) > count || !(0..=sequence).contains(&event_cursor) {
+                    return Err(StorageError::InvalidData(
+                        "checkpoint lies outside the current session".into(),
+                    ));
+                }
+                (Some(ordinal), &[][..], Some(event_cursor))
+            }
+        };
+
+        sqlx::query(
+            "DELETE FROM session_messages WHERE session_id = ?1 AND (?2 IS NULL OR ordinal >= ?2)",
+        )
+        .bind(session_id.as_str())
+        .bind(retain)
+        .execute(&mut *tx)
+        .await?;
         for (ordinal, payload) in replacement_payloads.iter().enumerate() {
             let redacted = crate::redact_json_payload_for_session(
                 "session message",
@@ -101,11 +202,16 @@ impl Database {
             .await?;
         }
 
-        // 3. Invalidate the derived checkpoints of the destroyed epoch.
-        sqlx::query("DELETE FROM goal_checkpoints WHERE session_id = ?1")
-            .bind(session_id.as_str())
-            .execute(&mut *tx)
-            .await?;
+        // Derived checkpoints on the discarded suffix could otherwise become
+        // eligible again when the new branch reuses their message ordinals.
+        sqlx::query(
+            "DELETE FROM goal_checkpoints
+             WHERE session_id = ?1 AND (?2 IS NULL OR event_cursor > ?2)",
+        )
+        .bind(session_id.as_str())
+        .bind(cursor)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         // C3: the new epoch (transcript + epoch events) is durable; the reaper
@@ -123,6 +229,37 @@ mod tests {
     };
     use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
     use leveler_lifecycle::{CheckpointReason, GoalCheckpoint};
+
+    #[tokio::test]
+    async fn a_checkpoint_reads_both_positions_and_refuses_unavailable_storage() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (session, _) = seeded(&db).await;
+        assert_eq!(
+            db.conversation_checkpoint_boundary(&session).await.unwrap(),
+            (2, 0)
+        );
+        db.pool().close().await;
+        assert!(db.conversation_checkpoint_boundary(&session).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_running_wal_row_protects_the_conversation_before_turn_started() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (session, _) = seeded(&db).await;
+        let original = MessageRepository::new(&db).load(&session).await.unwrap();
+        crate::TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let result = db
+            .restore_context_epoch(&session, 0, 0, &[], leveler_core::now())
+            .await;
+        assert!(matches!(result, Err(crate::StorageError::InvalidData(_))));
+        assert_eq!(
+            MessageRepository::new(&db).load(&session).await.unwrap(),
+            original
+        );
+    }
 
     async fn seeded(db: &Database) -> (SessionId, leveler_core::GoalId) {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());

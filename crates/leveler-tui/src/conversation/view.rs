@@ -162,6 +162,7 @@ pub struct ConversationView {
     pub scroll_bottom_rect: Option<(u16, u16, u16, u16)>,
     /// Text selection (mouse drag copy).
     pub selection: crate::selection::TextSelection,
+    pub(crate) reply_copy: super::reply_copy::ReplyCopyView,
     /// Edge auto-scroll while dragging a selection: `-1` up, `0` none, `1` down.
     pub selection_edge_dir: i8,
     /// Consecutive edge-scroll ticks (accelerates step size).
@@ -212,6 +213,7 @@ impl Default for ConversationView {
             rect: None,
             scroll_bottom_rect: None,
             selection: crate::selection::TextSelection::default(),
+            reply_copy: Default::default(),
             selection_edge_dir: 0,
             selection_edge_streak: 0,
             selection_last_mouse: None,

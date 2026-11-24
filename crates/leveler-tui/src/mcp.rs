@@ -371,7 +371,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     if state.mcp.confirm_remove.is_some() {
         return handle_confirm_key(state, key);
     }
-    if state.mcp.detail_open {
+    if state.page_focus == crate::layout::SplitFocus::Detail || state.mcp.detail_open {
         return handle_detail_key(state, key);
     }
     handle_list_key(state, key)
@@ -434,6 +434,8 @@ fn handle_list_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             KeyCode::Enter => {
                 if selected_server(state).is_some() {
                     state.mcp.detail_open = true;
+                    state.page_focus = crate::layout::SplitFocus::Detail;
+                    state.page_scroll = 0;
                     state.mcp.tool_scroll = 0;
                 }
                 Vec::new()
@@ -474,6 +476,7 @@ fn handle_detail_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     match key.code {
         KeyCode::Esc => {
             state.mcp.detail_open = false;
+            state.page_focus = crate::layout::SplitFocus::Primary;
             state.mcp.tool_scroll = 0;
             Vec::new()
         }
@@ -1047,6 +1050,22 @@ fn pop_char(text: &mut String) {
 
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     match mouse.kind {
+        MouseEventKind::Moved => {
+            if state.mcp.form.is_some() || state.mcp.confirm_remove.is_some() {
+                state.list_hover = None;
+                return Vec::new();
+            }
+            let point = (mouse.column, mouse.row).into();
+            state.list_hover = state
+                .screen_rows
+                .iter()
+                .find(|(rect, _)| rect.contains(point))
+                .map(|(_, key)| crate::state::ListHover {
+                    screen: crate::screen::Screen::Mcp,
+                    key: key.clone(),
+                });
+            Vec::new()
+        }
         MouseEventKind::ScrollUp => {
             if state.mcp.detail_open {
                 state.mcp.tool_scroll = state.mcp.tool_scroll.saturating_sub(3);
@@ -1075,6 +1094,10 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             {
                 // A row click selects; Enter is this page's one detail binding,
                 // the same rule every secondary page shares.
+                state.list_hover = Some(crate::state::ListHover {
+                    screen: crate::screen::Screen::Mcp,
+                    key: key.clone(),
+                });
                 state.mcp.selected = Some(key.clone());
                 state.mcp.detail_open = false;
             }
@@ -1123,15 +1146,6 @@ fn admission_label(state: &AppState, value: McpToolAdmission) -> &'static str {
     }
 }
 
-fn pad(text: &str, width: usize) -> String {
-    let used = UnicodeWidthStr::width(text);
-    let mut out = text.to_string();
-    for _ in used..width {
-        out.push(' ');
-    }
-    out
-}
-
 pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = &state.t().mcp_page;
     let hint = if state.mcp.form.is_some() {
@@ -1146,25 +1160,37 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint,
     };
-    let layout = crate::secondary::layout(area, 2);
+    let layout = crate::secondary::page_layout(state, area, 2);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     if state.mcp.form.is_some() {
         render_form(frame, layout.content, state);
         return;
     }
     render_filter(frame, layout.composer, state);
-    let list_visible = layout.content.width >= 80 || !state.mcp.detail_open;
-    if list_visible {
-        render_list(frame, layout.content, state);
-    }
-    if state.mcp.detail_open || layout.content.width >= 80 {
-        render_detail(frame, layout.content, state, !list_visible);
-    }
-    if !list_visible {
-        // The list did not paint rows: its hit targets must not stay live.
+    const MCP_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Horizontal,
+        primary_pct: 40,
+        primary_min: 22,
+        detail_min: 30,
+        min_dual_width: 76,
+        min_dual_height: 8,
+    };
+    let split = crate::layout::split_pane(layout.content, MCP_SPLIT)
+        .unwrap_or_else(|| crate::layout::single_pane(layout.content, state.page_focus));
+    state.page_split = Some(crate::state::PageSplit {
+        screen: crate::screen::Screen::Mcp,
+        layout: split,
+    });
+    if split.primary.width > 0 && split.primary.height > 0 {
+        render_list(frame, split.primary, state);
+    } else {
         state.screen_rows.clear();
     }
+    if split.detail.width > 0 && split.detail.height > 0 {
+        render_detail(frame, split.detail, state);
+    }
+    crate::render::paint_split_divider(frame, &split, &state.theme);
     if state.mcp.confirm_remove.is_some() {
         render_confirm(frame, layout.content, state);
     }
@@ -1244,75 +1270,96 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let list_area = if area.width >= 80 {
-        Rect {
-            width: area.width * 44 / 100,
-            ..area
-        }
-    } else {
-        area
-    };
+    let list_area = area;
     let visible = visible_servers(state);
     if visible.is_empty() {
-        let message = if state.mcp.servers.is_empty() {
-            t.no_servers
+        let block = if let Some(error) = &state.mcp.error {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Error,
+                message: error,
+                detail: None,
+            }
+        } else if state.mcp.checking() {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Loading,
+                message: t.pending,
+                detail: None,
+            }
         } else {
-            t.no_matches
+            crate::render::ListStateBlock {
+                kind: if state.mcp.servers.is_empty() {
+                    crate::render::ListStateKind::Empty
+                } else {
+                    crate::render::ListStateKind::FilterEmpty
+                },
+                message: if state.mcp.servers.is_empty() {
+                    t.no_servers
+                } else {
+                    t.no_matches
+                },
+                detail: None,
+            }
         };
-        frame.render_widget(
-            Paragraph::new(crate::render::text::sanitize_terminal_line(message))
-                .style(Style::default().fg(theme.text.muted)),
-            list_area,
-        );
+        let lines = crate::render::list_state_lines(block, &theme, list_area.width as usize);
+        frame.render_widget(Paragraph::new(lines), list_area);
         return;
     }
-    let name_width = visible
-        .iter()
-        .map(|server| UnicodeWidthStr::width(server.name.as_str()))
-        .max()
-        .unwrap_or(0)
-        .min(list_area.width.saturating_sub(18) as usize);
     let mut lines = Vec::new();
-    let mut rows = Vec::new();
+    let mut rows: Vec<crate::render::RowHitSpec> = Vec::new();
     let mut focus = 0;
     for server in &visible {
         let selected = state.mcp.selected.as_deref() == Some(server.name.as_str());
         if selected {
             focus = lines.len();
         }
-        rows.push((lines.len(), server.name.clone()));
-        let badge = format!("[{}]", state_label(state, server.state));
+        let (glyph, tone) = mcp_state_glyph(server.state);
         let tools = match server.state {
             McpConnectionState::Connected => {
                 format!("{} {}", server.tool_count.unwrap_or(0), t.tools_suffix)
             }
             _ => server.transport.label().to_string(),
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " }.to_string(),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(
-                pad(&badge, 15),
-                Style::default().fg(state_color(state, server.state)),
-            ),
-            Span::styled(
-                format!("{}  ", pad(&server.name, name_width.max(1))),
-                Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(tools, Style::default().fg(theme.text.muted)),
-        ]));
+        let row = crate::render::ListRow::new(server.name.clone())
+            .status(glyph, tone)
+            .meta(state_label(state, server.state))
+            .description(tools);
+        let paint = crate::render::row_paint(
+            state,
+            &server.name,
+            selected,
+            state.page_focus == crate::layout::SplitFocus::Primary,
+        );
+        let row_lines =
+            crate::render::list_row_lines(&row, paint, &theme, list_area.width as usize);
+        rows.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key: server.name.clone(),
+        });
+        lines.extend(row_lines);
     }
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(frame, list_area, lines, &rows, focus, &theme, &mut hits);
-    state.screen_rows = hits;
+    crate::render::render_list_rows_with_spans(
+        frame,
+        list_area,
+        lines,
+        &rows,
+        focus,
+        &theme,
+        &mut state.screen_rows,
+    );
+}
+
+fn mcp_state_glyph(value: McpConnectionState) -> (&'static str, crate::render::RowTone) {
+    match value {
+        McpConnectionState::Connected => ("●", crate::render::RowTone::Success),
+        McpConnectionState::Failed => ("×", crate::render::RowTone::Error),
+        McpConnectionState::Degraded | McpConnectionState::NotConnected => {
+            ("!", crate::render::RowTone::Warning)
+        }
+        McpConnectionState::Connecting => ("…", crate::render::RowTone::Info),
+        McpConnectionState::Disabled => ("○", crate::render::RowTone::Muted),
+        McpConnectionState::Unknown => ("?", crate::render::RowTone::Muted),
+    }
 }
 
 fn push_field(
@@ -1330,18 +1377,10 @@ fn push_field(
     ]));
 }
 
-fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState, full: bool) {
+fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = &state.t().mcp_page;
     let theme = state.theme.clone();
-    let detail_area = if area.width >= 80 && !full {
-        Rect {
-            x: area.x + area.width * 44 / 100 + 1,
-            width: area.width - area.width * 44 / 100 - 1,
-            ..area
-        }
-    } else {
-        area
-    };
+    let detail_area = area;
     if detail_area.width == 0 || detail_area.height == 0 {
         return;
     }
@@ -1435,8 +1474,7 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState, full: bool
                 Style::default().fg(theme.text.muted),
             )));
         }
-        let skip = state.mcp.tool_scroll.min(server.tools.len());
-        for tool in server.tools.iter().skip(skip) {
+        for tool in server.tools.iter() {
             lines.push(Line::default());
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1486,7 +1524,9 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState, full: bool
             )));
         }
     }
-    frame.render_widget(Paragraph::new(lines), detail_area);
+    let max = lines.len().saturating_sub(detail_area.height as usize);
+    state.page_scroll = state.page_scroll.min(max);
+    crate::render::render_pane_at_offset(frame, detail_area, lines, state.page_scroll, &theme);
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, state: &AppState) {

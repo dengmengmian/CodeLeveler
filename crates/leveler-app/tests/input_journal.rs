@@ -982,3 +982,148 @@ async fn a_cancelled_append_is_settled_and_never_resurrects() {
     assert_eq!(cancelled[0].id, id);
     assert_eq!(cancelled[0].kind, Some(UiMessageKind::CancelledInput));
 }
+
+/// A project skill whose exact package bytes the human approved. Approving
+/// needs the same store root the app resolves, which `isolate_global_config`
+/// pins to `LEVELER_HOME`.
+fn approve_project_skill(project: &std::path::Path, name: &str) {
+    let dir = project.join(".leveler/skills").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: {name} procedure.\n---\n\n{name}-procedure-body-marker\n"
+        ),
+    )
+    .unwrap();
+    let store = std::path::PathBuf::from(std::env::var("LEVELER_HOME").unwrap());
+    let package = leveler_definition_trust::read_skill_package(&dir.join("SKILL.md")).unwrap();
+    let identity = leveler_definition_trust::DefinitionIdentity::project(
+        leveler_definition_trust::DefinitionKind::Skill,
+        &format!(".leveler/skills/{name}"),
+    )
+    .unwrap();
+    leveler_definition_trust::approve(
+        &store,
+        project,
+        &[leveler_definition_trust::ApprovalRequest::skill_package(
+            identity, &package,
+        )],
+        leveler_definition_trust::ApprovalSurface::Tui,
+    )
+    .unwrap();
+}
+
+async fn steer_mid_turn(
+    harness: &Harness,
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    content: &str,
+    id: &MessageId,
+) -> leveler_client_protocol::ClientError {
+    harness
+        .client
+        .send(ClientCommand::SubmitMessage {
+            session_id: harness.session.clone(),
+            content: "ordinary question".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            events.recv().await.unwrap(),
+            RuntimeEvent::AssistantTextDelta { .. }
+        ) {}
+    })
+    .await
+    .expect("the answer started streaming");
+    harness
+        .client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: harness.session.clone(),
+            content: content.into(),
+            message_id: Some(id.clone()),
+        })
+        .await
+        .unwrap_err()
+}
+
+async fn assert_not_journaled(harness: &Harness, id: &MessageId) {
+    let db = harness.app.open_database().await.unwrap();
+    let row = leveler_storage::SessionInputRepository::new(&db)
+        .load(&harness.session, id.as_str())
+        .await
+        .unwrap();
+    assert!(
+        row.is_none(),
+        "a refused skill request must not be journaled: {row:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mid_turn_slash_skill_request_is_refused_before_it_is_journaled() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = harness(vec![
+        MockResponse::GatedSse {
+            first: "data: {\"choices\":[{\"delta\":{\"content\":\"initial answer\"}}]}\n\n".into(),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            release: release.clone(),
+        },
+        text("revised answer"),
+    ])
+    .await;
+    approve_project_skill(harness._tmp.path(), "deploy");
+    let mut events = harness.client.subscribe();
+    let id = MessageId::new("mid-turn-slash-skill");
+    let error = steer_mid_turn(&harness, &mut events, "/deploy staging", &id).await;
+    let shown = error.to_string();
+    assert!(
+        shown.contains("/deploy") && shown.contains("任务运行中"),
+        "the refusal must name the request and the reason: {shown}"
+    );
+    assert_not_journaled(&harness, &id).await;
+    release.notify_one();
+    wait_for_terminal(&mut events).await;
+    let requests = harness._server.request_bodies().await;
+    assert!(
+        requests
+            .iter()
+            .all(|body| !body.contains("deploy-procedure-body-marker")),
+        "the skill body must never be delivered as a plain append"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mid_turn_dollar_skill_mention_is_refused_before_it_is_journaled() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = harness(vec![
+        MockResponse::GatedSse {
+            first: "data: {\"choices\":[{\"delta\":{\"content\":\"initial answer\"}}]}\n\n".into(),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            release: release.clone(),
+        },
+        text("revised answer"),
+    ])
+    .await;
+    approve_project_skill(harness._tmp.path(), "deploy");
+    let mut events = harness.client.subscribe();
+    let id = MessageId::new("mid-turn-dollar-skill");
+    let error = steer_mid_turn(&harness, &mut events, "please apply $deploy now", &id).await;
+    let shown = error.to_string();
+    assert!(
+        shown.contains("$deploy") && shown.contains("任务运行中"),
+        "the refusal must name the mention and the reason: {shown}"
+    );
+    assert_not_journaled(&harness, &id).await;
+    release.notify_one();
+    wait_for_terminal(&mut events).await;
+    let requests = harness._server.request_bodies().await;
+    assert!(
+        requests
+            .iter()
+            .all(|body| !body.contains("deploy-procedure-body-marker")),
+        "the skill body must never be delivered as a plain append"
+    );
+}

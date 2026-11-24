@@ -445,15 +445,25 @@ fn the_usage_section_renders_the_runtimes_report() {
     deliver_usage(&mut s, &id, report(UiUsageScope::Session, 3, 12_000, 1_500));
 
     let text = screen(&mut s);
-    assert!(text.contains("上下文与用量"), "{text}");
-    assert!(text.contains("模型用量 · 本会话"), "{text}");
-    assert!(text.contains("Total tokens"), "{text}");
+    // The host titles the group on the border and identifies the page by its
+    // tab; the old full title is not painted on the title row.
     assert!(
         text.lines()
-            .any(|line| line.contains("Total tokens") && line.contains("13,500")),
+            .any(|line| line.contains("检查") && line.contains("[×]")),
+        "{text}"
+    );
+    assert!(text.contains("[上下文]"), "{text}");
+    assert!(text.contains("模型用量 · 本会话"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.contains("合计") && line.contains("13,500")),
         "total: {text}"
     );
-    assert!(text.contains("Requests"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.contains("请求") && !line.contains("合计")),
+        "requests: {text}"
+    );
     assert!(text.contains("输入"), "{text}");
     assert!(
         text.contains("缓存输入 6,000"),
@@ -577,7 +587,7 @@ fn a_replayed_answer_is_never_applied_twice() {
     let text = screen(&mut s);
     assert!(
         text.lines()
-            .any(|line| line.contains("Total tokens") && line.trim_end().ends_with("11")),
+            .any(|line| line.contains("合计") && line.contains(" 11")),
         "first answer stands: {text}"
     );
     assert!(!text.contains("99"));

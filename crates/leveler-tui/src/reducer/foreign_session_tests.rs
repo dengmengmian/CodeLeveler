@@ -239,6 +239,39 @@ fn discovery_fills_only_the_open_pickers_list_and_failure_is_not_empty() {
 }
 
 #[test]
+fn a_refreshed_list_keeps_the_selected_source_not_its_old_index() {
+    let mut s = state(crate::i18n::Locale::Zh);
+    open_picker(&mut s, UiForeignTool::ClaudeCode);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ForeignSessionList {
+            tool: UiForeignTool::ClaudeCode,
+            sessions: vec![source("claude-1", "First"), source("claude-2", "Second")],
+            error: None,
+        }),
+    );
+    reduce(&mut s, Action::Key(key(KeyCode::Down)));
+    assert_eq!(s.foreign_sessions.selected, 1);
+    // The runtime reorders the same two sessions. The row under the cursor
+    // must still be claude-2, not whatever now sits at index 1.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ForeignSessionList {
+            tool: UiForeignTool::ClaudeCode,
+            sessions: vec![source("claude-2", "Second"), source("claude-1", "First")],
+            error: None,
+        }),
+    );
+    assert_eq!(
+        s.foreign_sessions
+            .sessions
+            .get(s.foreign_sessions.selected)
+            .map(|session| session.native_id.as_str()),
+        Some("claude-2")
+    );
+}
+
+#[test]
 fn enter_imports_the_selected_source_once_and_escape_leaves() {
     let mut s = state(crate::i18n::Locale::Zh);
     open_picker(&mut s, UiForeignTool::ClaudeCode);

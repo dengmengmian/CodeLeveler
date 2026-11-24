@@ -1188,6 +1188,8 @@ mod tests {
             sha256: "a".repeat(64),
             width: Some(4),
             height: Some(3),
+            source_path: None,
+            preview_path: None,
         };
         assert!(
             validate_command(

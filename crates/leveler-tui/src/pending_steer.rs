@@ -500,14 +500,14 @@ pub(crate) fn render_compact(frame: &mut Frame, area: Rect, state: &mut AppState
 
 pub(crate) fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     let page = crate::secondary::SecondaryPage {
         title: t.steer_title,
         status: crate::secondary::main_status_spans(state, area.width.into()),
         hint: t.steer_hint,
     };
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     if layout.content.is_empty() {
         return;
     }

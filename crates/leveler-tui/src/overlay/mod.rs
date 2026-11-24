@@ -484,6 +484,236 @@ fn cursor_in_window(
     }
 }
 
+fn selection_overlay(overlay: &Overlay) -> bool {
+    matches!(
+        overlay,
+        Overlay::ModelPicker(_)
+            | Overlay::DefaultModelPicker(_)
+            | Overlay::ModePicker(_)
+            | Overlay::ThemePicker(_)
+            | Overlay::CollabPicker(_)
+            | Overlay::UnsupportedMedia(_)
+            | Overlay::CheckpointPicker(_)
+            | Overlay::ConfirmCheckpointRestore(_)
+            | Overlay::ConfirmSessionDelete(_)
+            | Overlay::ConfirmSchedule(_)
+            | Overlay::ConfirmRecovery(_)
+            | Overlay::ThinkingPicker(_)
+            | Overlay::ReviewScopePicker(_)
+            | Overlay::ConfirmExit(_)
+    )
+}
+
+fn line_plain(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Remove `chars` characters from the front of a styled line, keeping every
+/// remaining span's style. The frame names the decision, so a body row that
+/// repeated that name would print the same heading twice on a secondary page.
+fn strip_line_prefix(line: &mut Line<'static>, chars: usize) {
+    let mut left = chars;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    for span in line.spans.drain(..) {
+        if left == 0 {
+            spans.push(span);
+            continue;
+        }
+        let count = span.content.chars().count();
+        if count <= left {
+            left -= count;
+            continue;
+        }
+        let rest: String = span.content.chars().skip(left).collect();
+        left = 0;
+        spans.push(Span::styled(rest, span.style));
+    }
+    line.spans = spans;
+}
+
+fn is_rule_line(line: &Line<'static>) -> bool {
+    let plain: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let plain = plain.trim();
+    !plain.is_empty() && plain.chars().all(|ch| ch == '\u{2500}')
+}
+
+/// Project the inline content into the framed secondary-page form.
+///
+/// The inline form owns a boundary rule and, for a picker, its title; the frame
+/// draws both. Removing only those two rows leaves the decision itself byte for
+/// byte the same, including the focused option and its pinned key hint.
+fn modal_content(
+    overlay: &Overlay,
+    theme: &Theme,
+    inner_width: usize,
+    locale: crate::i18n::Locale,
+) -> OverlayContent {
+    let mut content = content(overlay, theme, inner_width, locale);
+    let mut drop = usize::from(content.lines.first().is_some_and(is_rule_line));
+    if selection_overlay(overlay)
+        && content.lines.get(drop).is_some_and(|line| {
+            let plain: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            plain.trim() == content.title.trim()
+        })
+    {
+        drop += 1;
+    }
+    if drop == 0 {
+        return content;
+    }
+    content.lines.drain(..drop);
+    content.cursor = content
+        .cursor
+        .map(|(row, col)| (row.saturating_sub(drop), col));
+    content.cursor_row = content.cursor_row.map(|row| row.saturating_sub(drop));
+    content.focus_block = content
+        .focus_block
+        .map(|(lo, hi)| (lo.saturating_sub(drop), hi.saturating_sub(drop)));
+    if matches!(overlay, Overlay::Clarification(_)) {
+        // The prompt row opens with its own `◇ 需要澄清` label. The frame now
+        // carries that identity, so strip only the label and keep the live
+        // question itself untouched.
+        let marker = format!("◇ {}", content.title);
+        if let Some(line) = content
+            .lines
+            .iter_mut()
+            .find(|line| line_plain(line).starts_with(&marker))
+        {
+            strip_line_prefix(line, marker.chars().count());
+            while line
+                .spans
+                .first()
+                .is_some_and(|span| span.content.starts_with(' '))
+            {
+                strip_line_prefix(line, 1);
+            }
+        }
+    }
+    content
+}
+
+/// Draw an overlay opened from a secondary page as an opaque framed modal.
+///
+/// The conversation's inline decision card is intentionally a different host:
+/// it stays in the composer slot and keeps its existing chrome. This frame is
+/// only used when the overlay sits over an independent page, so the page
+/// behind it cannot be scrolled or selected through the decision.
+pub fn render_modal_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    overlay: &Overlay,
+    theme: &Theme,
+    locale: crate::i18n::Locale,
+) {
+    if area.width < 4 || area.height == 0 {
+        return;
+    }
+    // Below three rows the page has no room for a border. Do not leave a
+    // keyboard-owning overlay invisible: keep its identity and focused row in
+    // the host's own rows instead.
+    if area.height < 3 {
+        let compact_width = area.width.saturating_sub(2).max(1);
+        let content = modal_content(overlay, theme, compact_width as usize, locale);
+        let title = truncate_display(&content.title, area.width as usize);
+        let first = content
+            .lines
+            .iter()
+            .find(|line| !line_plain(line).trim().is_empty());
+        frame.render_widget(ratatui::widgets::Clear, area);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
+        if area.height == 1 {
+            let first_plain = first.map(line_plain).unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                truncate_display(&format!("{title} · {first_plain}"), area.width as usize),
+                Style::default()
+                    .fg(theme.accent.primary)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.accent.primary)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            if let Some(line) = first {
+                lines.push(line.clone());
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let width = area
+        .width
+        .saturating_sub(4)
+        .min(100)
+        .max(area.width.min(20));
+    let inner_width = width.saturating_sub(2).max(1);
+    let content = modal_content(overlay, theme, inner_width as usize, locale);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = (content.lines.len() as u16)
+        .saturating_add(2)
+        .min(max_height)
+        .max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(theme.border.normal))
+        .style(Style::default().bg(theme.surface.elevated));
+    let title = truncate_display(&content.title, width.saturating_sub(4) as usize);
+    let block = block.title(Span::styled(
+        format!(" {title} "),
+        Style::default()
+            .fg(theme.accent.primary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(block, popup);
+    let inner = Rect {
+        x: popup.x + 1,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let total = content.lines.len();
+    let window = overlay_window(
+        total,
+        inner.height as usize,
+        content.cursor_row,
+        content.focus_block,
+        content.tail_pin,
+    );
+    let lines = visible_lines(&content.lines, total, inner.height as usize, window);
+    frame.render_widget(Paragraph::new(lines), inner);
+    if let Some((row, col)) = cursor_in_window(content.cursor, total, inner.height as usize, window)
+    {
+        let x = inner.x.saturating_add(col as u16);
+        let y = inner.y.saturating_add(row as u16);
+        if x < inner.x.saturating_add(inner.width) {
+            frame.set_cursor_position(ratatui::layout::Position::new(x, y));
+        }
+    }
+}
+
 /// Draw the active overlay centered over `area` (modal form, used on
 /// non-conversation screens).
 pub fn render_overlay(
@@ -950,7 +1180,9 @@ fn clarification_content(
             }
             let line = lines.len();
             lines.push(Line::from(spans));
-            if let Some(col) = row.caret_col {
+            if let Some(col) = row.caret_col
+                && !active.on_chat_row()
+            {
                 cursor_at = Some((line, col));
                 cursor_row = Some(line);
             }
@@ -961,7 +1193,7 @@ fn clarification_content(
             Some(crate::overlay::clarification::Answer::Picks(picks)) => picks.first().copied(),
             _ => None,
         };
-        let total = active.options.len() + usize::from(active.allow_other);
+        let total = active.rows();
         for (i, option) in active.options.iter().enumerate() {
             let focused = i == active.cursor;
             let state = active
@@ -1007,36 +1239,75 @@ fn clarification_content(
                 .iter()
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
-            let label_style = if focused {
-                Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text.primary)
-            };
             let row = lines.len();
             let mut spans = prefix;
-            spans.push(Span::styled(format!("{} ", t.clarify_other), label_style));
-            // The typed answer stays on its row whether or not the cursor is on
-            // it. A list row shows the row the insertion point is on, so the
-            // text is visible where it is being written.
             let (field, caret) = active.field_cursor();
-            let typed_at = prefix_w + UnicodeWidthStr::width(t.clarify_other) + 1;
-            let avail = width.saturating_sub(typed_at).max(8);
+            let avail = width.saturating_sub(prefix_w).max(1);
             let (rows, caret_row) = wrap_with_caret(field, caret, avail, 0, 0);
             let shown = rows.get(caret_row);
             let caret_col = shown.and_then(|row| row.caret_col);
-            spans.push(Span::styled(
-                shown.map(|row| row.text.clone()).unwrap_or_default(),
-                Style::default().fg(theme.text.primary),
-            ));
+            if field.is_empty() {
+                spans.push(Span::styled(
+                    crate::render::text::truncate_display(t.clarify_other, avail),
+                    Style::default().fg(theme.text.muted),
+                ));
+            } else if let Some(shown) = shown {
+                spans.push(Span::styled(
+                    shown.text.clone(),
+                    Style::default().fg(theme.text.primary),
+                ));
+            }
             if focused {
-                cursor_at = Some((row, typed_at + caret_col.unwrap_or(0)));
+                cursor_at = Some((row, prefix_w + caret_col.unwrap_or(0)));
                 cursor_row = Some(row);
             }
             lines.push(Line::from(spans));
             option_rows.push((row, row));
         }
+    }
+
+    if active.kind != ClarificationQuestionKind::Text {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(width.max(1)),
+            Style::default().fg(theme.border.normal),
+        )));
+    }
+    let focused = active.on_chat_row();
+    let prefix = if active.kind == ClarificationQuestionKind::Text {
+        vec![if focused {
+            Span::styled(
+                format!("{} ", crate::presentation::tokens::FOCUS_CURSOR),
+                Style::default().fg(theme.accent.primary),
+            )
+        } else {
+            Span::raw("  ")
+        }]
+    } else {
+        option_prefix_spans(
+            active.rows() - 1,
+            active.rows(),
+            focused,
+            crate::presentation::tokens::FOCUS_CURSOR,
+            active.is_multi().then_some("   "),
+            theme,
+        )
+    };
+    let mut label_style = Style::default().fg(theme.text.primary);
+    if focused {
+        label_style = label_style.add_modifier(Modifier::BOLD);
+        cursor_row = Some(lines.len());
+    }
+    let start = lines.len();
+    push_wrapped_row(
+        &mut lines,
+        prefix,
+        t.clarify_direct_chat,
+        label_style,
+        None,
+        width,
+    );
+    if active.kind != ClarificationQuestionKind::Text || focused {
+        option_rows.push((start, lines.len() - 1));
     }
 
     // The hint (with any blocking notice) is chrome: it stays pinned while the
@@ -1063,7 +1334,9 @@ fn clarification_content(
     // the hint must not advertise them. The keyboard contract is unchanged —
     // only the hint text is.
     let single = ov.len() <= 1;
-    let hint = if active.kind == ClarificationQuestionKind::Text || active.on_other_row() {
+    let hint = if active.on_chat_row() {
+        t.clarify_direct_chat_hint
+    } else if active.typing() {
         if single {
             t.clarify_nav_hint_text_single
         } else {
@@ -1189,8 +1462,10 @@ fn selection_content_with_extra(
         };
         // A searchable list types digits into the query, so it stays
         // unnumbered; every other picker numbers its rows from the count so a
-        // two-digit row never shifts the label.
-        let number = if model.is_searchable() {
+        // two-digit row never shifts the label. A destructive confirmation
+        // also stays unnumbered: it disables digit quick-select, so a painted
+        // number would be a dead affordance.
+        let number = if model.is_searchable() || !model.digits_select() {
             String::new()
         } else {
             format!("{} ", option_number(pos, total))
@@ -2100,7 +2375,10 @@ mod layout_tests {
     #[test]
     fn the_other_row_is_numbered_like_an_option() {
         let rows = clarification_rows(&single_choice(&["Go", "Python"]));
-        assert!(rows.iter().any(|r| r.contains("  3. 其他…")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("  3. 自己输入…")),
+            "{rows:#?}"
+        );
     }
 
     // ── I-01 · Focused item is always visible ──────────────────────────────

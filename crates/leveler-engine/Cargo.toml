@@ -10,6 +10,7 @@ description = "The persistent task/turn engine: session, task and turn lifecycle
 
 [dependencies]
 leveler-context = { workspace = true }
+leveler-skills = { workspace = true }
 leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-execution = { workspace = true }

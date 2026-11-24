@@ -180,6 +180,10 @@ impl Executor {
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
             &self.definition_trust(),
+            &leveler_skills::PreferencesState::load(
+                &leveler_core::LevelerHome::resolve(environment),
+                Some(root),
+            ),
         );
         let mut skills = Vec::new();
         let mut unavailable = Vec::new();
@@ -217,6 +221,15 @@ impl Executor {
         let brief = render_brief(def, &skills);
         let mut snapshot = def.snapshot();
         snapshot.brief = Some(brief.clone());
+        snapshot.skill_reference_versions = skills
+            .iter()
+            .filter_map(|skill| {
+                skill
+                    .reference_grant
+                    .as_ref()
+                    .map(|grant| (skill.name.clone(), grant.digest().to_owned()))
+            })
+            .collect();
         Ok(SpawnAdmission {
             profile,
             spec: ChildSpawnSpec {

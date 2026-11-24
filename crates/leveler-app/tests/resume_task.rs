@@ -639,6 +639,8 @@ async fn continuation_with_attachment_keeps_ordinary_content_validation() {
         sha256: "not-imported".into(),
         width: Some(1),
         height: Some(1),
+        source_path: None,
+        preview_path: None,
     };
     let error = client
         .send(ClientCommand::SubmitMessage {

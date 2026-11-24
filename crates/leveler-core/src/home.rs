@@ -97,6 +97,15 @@ impl LevelerHome {
         self.state_dir().join("schedules.db")
     }
 
+    /// Per-user skill activation preferences (`state/skills.toml`).
+    ///
+    /// User-global and workspace-independent: a Skill keeps its identity across
+    /// projects, so disabling it here must not need a workspace. Written by
+    /// `leveler-skills`; deliberately not part of `config.toml`.
+    pub fn skills_preferences_file(&self) -> PathBuf {
+        self.state_dir().join("skills.toml")
+    }
+
     /// Durable state for the source with no primary workspace.
     pub fn no_workspace_state_dir(&self) -> PathBuf {
         self.state_dir().join("no-workspace")

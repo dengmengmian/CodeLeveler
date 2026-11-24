@@ -194,6 +194,13 @@ class Screen:
                     self._state = "osc"
                     i += 1
                     continue
+                if ch == "_" or ch == "P":
+                    # APC (Kitty graphics) and DCS carry device payloads. A
+                    # terminal consumes them; printing them as text would
+                    # corrupt the row under the composer.
+                    self._state = "apc"
+                    i += 1
+                    continue
                 # Two-byte escape (e.g. ESC ( B, ESC 7)
                 self._state = "text"
                 i += 1
@@ -206,6 +213,17 @@ class Screen:
                 i += 1
                 continue
             if self._state == "osc_esc":
+                self._state = "text"
+                i += 1
+                continue
+            if self._state == "apc":
+                if ch == "\x07":
+                    self._state = "text"
+                elif ch == "\x1b":
+                    self._state = "apc_esc"
+                i += 1
+                continue
+            if self._state == "apc_esc":
                 self._state = "text"
                 i += 1
                 continue

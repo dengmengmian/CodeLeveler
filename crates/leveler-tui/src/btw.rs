@@ -218,7 +218,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
             state.t().btw_footer_hint
         },
     };
-    let layout = crate::secondary::layout(area, composer_rows);
+    let layout = btw_layout(area, composer_rows);
     crate::secondary::draw_header(frame, state, &layout, &page);
 
     let lines = body_lines(state, layout.content.width as usize);
@@ -231,19 +231,85 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         state.input_rect = Some((composer.x, composer.y, composer.width, composer.height));
         let (box_lines, (cx, cy)) =
             crate::render::composer_box_lines(state, composer.width as usize);
-        let shown: Vec<Line> = box_lines
-            .into_iter()
-            .take(composer.height as usize)
-            .collect();
+        // The compact form gives the composer one row. That row is the input
+        // row, not the box's top border: a box fragment with no room for the
+        // text would hide the field the surface exists to offer.
+        let input_only = area.height < 8 && composer.height == 1 && box_lines.len() >= 2;
+        let shown: Vec<Line> = if input_only {
+            box_lines.into_iter().skip(1).take(1).collect()
+        } else {
+            box_lines
+                .into_iter()
+                .take(composer.height as usize)
+                .collect()
+        };
         frame.render_widget(Paragraph::new(shown), composer);
         let x = composer.x + cx;
-        let y = composer.y + cy;
+        let y = composer.y + if input_only { cy.saturating_sub(1) } else { cy };
         if x < composer.x + composer.width && y < composer.y + composer.height {
             frame.set_cursor_position(ratatui::layout::Position::new(x, y));
         }
     }
 
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
+}
+
+/// Split the side surface, keeping its own input usable on a terminal too
+/// short for the full shell.
+///
+/// The shared shell spends four rows on chrome before the body and two after
+/// it; below eight rows that leaves no place for both the answer and the one
+/// composer. The compact form keeps the input and the Escape footer, drops
+/// the two rules first, then the identity row, and only then gives up answer
+/// rows. It never draws a zero-height body in a slot that still advertises
+/// content.
+fn btw_layout(area: Rect, composer_rows: u16) -> crate::secondary::SecondaryLayout {
+    if area.height >= 8 {
+        return crate::secondary::layout(area, composer_rows);
+    }
+    let pad = crate::secondary::padding_x(area.width);
+    let inset = |r: Rect| crate::layout::horizontal_inset(r, pad);
+    let header_h = u16::from(area.height >= 4);
+    let footer_h = u16::from(area.height >= 2);
+    let remaining = area
+        .height
+        .saturating_sub(header_h)
+        .saturating_sub(footer_h);
+    let composer_h = if area.height >= 3 {
+        composer_rows.min(remaining.saturating_sub(1))
+    } else {
+        composer_rows.min(remaining)
+    };
+    let content_h = remaining.saturating_sub(composer_h);
+    crate::secondary::SecondaryLayout {
+        header: inset(Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: header_h,
+        }),
+        rule_top: Rect::default(),
+        content: inset(Rect {
+            x: area.x,
+            y: area.y + header_h,
+            width: area.width,
+            height: content_h,
+        }),
+        composer: inset(Rect {
+            x: area.x,
+            y: area.y + header_h + content_h,
+            width: area.width,
+            height: composer_h,
+        }),
+        rule_bottom: Rect::default(),
+        footer: inset(Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(footer_h),
+            width: area.width,
+            height: footer_h,
+        }),
+        center_footer: false,
+    }
 }
 
 /// Role marker for a user turn.

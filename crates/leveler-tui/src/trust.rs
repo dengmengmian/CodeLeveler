@@ -524,7 +524,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<crate::action::Eff
             let len = filtered_len(state);
             state.trust.selected = (state.trust.selected + 10).min(len.saturating_sub(1));
         }
-        KeyCode::Tab => {
+        KeyCode::Char('f') | KeyCode::Tab => {
             state.trust.filter = state.trust.filter.next();
             state.trust.selected = 0;
         }
@@ -587,6 +587,13 @@ pub fn wheel(state: &mut AppState, notches: isize) {
 }
 
 pub fn select_row(state: &mut AppState, key: &str) {
+    if let Some(index) = filtered_rows(state)
+        .iter()
+        .position(|row| row.identity().id == key)
+    {
+        state.trust.selected = index;
+        return;
+    }
     if let Ok(index) = key.parse::<usize>() {
         let len = filtered_len(state);
         if len > 0 {
@@ -641,9 +648,9 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             t.trust.hint_list
         },
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     if state.trust.detail_open {
         render_detail(frame, layout.content, state);
     } else {
@@ -651,22 +658,23 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
 }
 
-fn row_status_style(state: &DefinitionTrust, theme: &Theme) -> Style {
+fn row_status_tone(state: &DefinitionTrust) -> crate::render::RowTone {
     match state {
         DefinitionTrust::Trusted { .. }
         | DefinitionTrust::SessionTrusted { .. }
         | DefinitionTrust::FullAdopted
         | DefinitionTrust::DefaultLoaded
-        | DefinitionTrust::Builtin => Style::default().fg(theme.status.success),
-        DefinitionTrust::Unapproved => Style::default().fg(theme.text.muted),
-        DefinitionTrust::Changed { .. } => Style::default().fg(theme.status.warning),
-        DefinitionTrust::StoreUnavailable { .. } => Style::default().fg(theme.status.error),
+        | DefinitionTrust::Builtin => crate::render::RowTone::Success,
+        DefinitionTrust::Unapproved => crate::render::RowTone::Muted,
+        DefinitionTrust::Changed { .. } => crate::render::RowTone::Warning,
+        DefinitionTrust::StoreUnavailable { .. } => crate::render::RowTone::Error,
     }
 }
 
 fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let theme = &state.theme;
+    let width = area.width as usize;
     let project = state
         .trust
         .project
@@ -674,8 +682,6 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .map(|path| safe(&path.display().to_string()))
         .unwrap_or_default();
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut row_lines: Vec<(usize, String)> = Vec::new();
-    let mut focus: Option<usize> = None;
     lines.push(Line::from(vec![
         Span::styled(
             format!("{}: ", t.trust.project),
@@ -702,128 +708,166 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
         )));
     }
     if let Some(error) = &state.trust.error {
-        lines.push(Line::from(Span::styled(
-            format!("⚠ {error}"),
-            Style::default().fg(theme.status.error),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Error,
+                message: error,
+                detail: None,
+            },
+            theme,
+            width,
+        ));
     } else if let Some(notice) = &state.trust.notice {
         lines.push(Line::from(Span::styled(
             format!("✓ {notice}"),
             Style::default().fg(theme.status.success),
         )));
     }
-    lines.push(Line::from(Span::styled(
+    lines.push(crate::render::section_header_line(
         t.trust.section_instructions_default,
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD),
-    )));
+        Some(state.trust.instructions.len()),
+        None,
+        theme,
+        width,
+    ));
     if state.trust.instructions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", t.trust.instruction_missing),
-            Style::default().fg(theme.text.muted),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.trust.instruction_missing,
+                detail: None,
+            },
+            theme,
+            width,
+        ));
     } else {
         for instruction in &state.trust.instructions {
-            if instruction.loaded {
-                lines.push(Line::from(vec![
-                    Span::styled("  ✓ ", Style::default().fg(theme.status.success)),
-                    Span::styled(safe(&instruction.display), Style::default()),
-                    Span::styled(
-                        format!("  {}", t.trust.instruction_loaded),
-                        Style::default().fg(theme.text.muted),
-                    ),
-                ]));
+            let (glyph, tone, meta) = if instruction.loaded {
+                (
+                    "✓",
+                    crate::render::RowTone::Success,
+                    t.trust.instruction_loaded.to_string(),
+                )
             } else {
                 let error = instruction
                     .error
                     .as_deref()
                     .map(safe)
                     .unwrap_or_else(|| t.trust.instruction_unreadable.to_string());
-                lines.push(Line::from(vec![
-                    Span::styled("  × ", Style::default().fg(theme.status.error)),
-                    Span::styled(safe(&instruction.display), Style::default()),
-                    Span::styled(
-                        format!("  {}: {error}", t.trust.instruction_unreadable),
-                        Style::default().fg(theme.status.warning),
-                    ),
-                ]));
-            }
+                (
+                    "×",
+                    crate::render::RowTone::Error,
+                    format!("{}: {error}", t.trust.instruction_unreadable),
+                )
+            };
+            let row = crate::render::ListRow::new(safe(&instruction.display))
+                .status(glyph, tone)
+                .meta(meta);
+            let row_lines = crate::render::list_row_lines(
+                &row,
+                crate::render::RowPaint::default(),
+                theme,
+                width,
+            );
+            lines.extend(row_lines);
         }
     }
     lines.push(Line::default());
+
     let rows = filtered_rows(state);
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            t.trust.empty,
-            Style::default().fg(theme.text.muted),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: if state.trust.filter == TrustFilter::All {
+                    crate::render::ListStateKind::Empty
+                } else {
+                    crate::render::ListStateKind::FilterEmpty
+                },
+                message: if state.trust.filter == TrustFilter::All {
+                    t.trust.empty
+                } else {
+                    t.trust.empty_filter
+                },
+                detail: None,
+            },
+            theme,
+            width,
+        ));
     }
     let mut last_section: Option<TrustSection> = None;
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
+    let mut focus: Option<usize> = None;
     for (index, row) in rows.iter().enumerate() {
         if last_section != Some(row.section) {
-            if last_section.is_some() {
-                lines.push(Line::default());
+            let label = row.section.label(t);
+            if !label.is_empty() {
+                let count = rows
+                    .iter()
+                    .filter(|other| other.section == row.section)
+                    .count();
+                lines.push(crate::render::section_header_line(
+                    label,
+                    Some(count),
+                    None,
+                    theme,
+                    width,
+                ));
             }
-            lines.push(Line::from(Span::styled(
-                row.section.label(t),
-                Style::default()
-                    .fg(theme.accent.primary)
-                    .add_modifier(Modifier::BOLD),
-            )));
             last_section = Some(row.section);
         }
         let selected = index == state.trust.selected;
-        let marker = if state.trust.marked.contains(&row.identity().id) {
+        let marked = state.trust.marked.contains(&row.identity().id);
+        let marker = if marked {
             "●"
         } else {
             state_marker(&row.state)
         };
+        let tone = if marked {
+            crate::render::RowTone::Accent
+        } else {
+            row_status_tone(&row.state)
+        };
         let label = state_label(&row.state, t);
-        let mut spans = vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(format!("{marker} "), row_status_style(&row.state, theme)),
-            Span::styled(
-                safe(row.display()),
-                if selected {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
-        ];
-        if let Some(digest) = row.digest() {
-            spans.push(Span::styled(
-                format!("  {}", short_digest(digest)),
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-        spans.push(Span::styled("  ", Style::default()));
-        spans.push(Span::styled(label, row_status_style(&row.state, theme)));
+        let mut description = row.digest().map(short_digest).unwrap_or_default();
         if row.unreadable.is_some() {
-            spans.push(Span::styled(
-                format!("  ({})", t.trust.state_unreadable),
-                Style::default().fg(theme.status.warning),
-            ));
+            if !description.is_empty() {
+                description.push_str("  ");
+            }
+            description.push_str(&format!("({})", t.trust.state_unreadable));
         }
-        row_lines.push((lines.len(), index.to_string()));
+        let mut list_row = crate::render::ListRow::new(safe(row.display()))
+            .status(marker, tone)
+            .meta(label);
+        if !description.is_empty() {
+            list_row = list_row.description(description);
+        }
+        let key = row.identity().id.clone();
+        let paint = crate::render::row_paint(state, &key, selected, true);
+        let row_lines = crate::render::list_row_lines(&list_row, paint, theme, width);
         if selected {
             focus = Some(lines.len());
         }
-        lines.push(Line::from(spans));
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
     }
     match focus {
-        Some(focus) => {
-            let mut hits = Vec::new();
-            crate::render::render_list_rows(
-                frame, area, lines, &row_lines, focus, theme, &mut hits,
-            );
-            state.screen_rows = hits;
+        Some(focus) => crate::render::render_list_rows_with_spans(
+            frame,
+            area,
+            lines,
+            &hits,
+            focus,
+            theme,
+            &mut state.screen_rows,
+        ),
+        None => {
+            state.screen_rows.clear();
+            crate::render::render_scrolled(frame, area, state, lines);
         }
-        None => crate::render::render_scrolled(frame, area, state, lines),
     }
 }
 

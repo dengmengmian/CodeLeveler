@@ -38,7 +38,7 @@ pub(crate) fn ensure_materializable(
         leveler_core::SECRET_PLACEHOLDER
     ))
 }
-pub(crate) use reader::{Clip, ReadError, ReadWindow, WorkspaceReader};
+pub(crate) use reader::{BoundedRead, Clip, ReadError, ReadWindow, WorkspaceReader};
 pub(crate) use search::{DirEntry, GrepQuery, SearchError, WorkspaceSearch};
 
 pub(crate) fn cwd_approval_reason(

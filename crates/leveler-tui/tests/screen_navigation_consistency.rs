@@ -178,30 +178,40 @@ fn a_trace_opened_from_the_conversation_returns_to_the_conversation() {
     assert_eq!(s.active_screen, Screen::Conversation);
 }
 
-// ---- 2. Every page publishes the `←` it paints ------------------------------
+// ---- 2. Every hosted card publishes its close glyph -------------------------
 
-/// A page that draws a `←` in its header must publish it as a hit target, and
-/// clicking it must run the same one-level back as Esc.
+/// The card's `[×]` is the back control. Clicking it leaves the page, the same
+/// one-level back as Esc. A hosted page does not also paint `← title`.
 #[test]
 fn every_page_that_paints_a_back_glyph_publishes_its_hit() {
     for (screen, label) in pages_with_a_back_glyph() {
         let mut s = opened();
         seed(&mut s, screen);
         let page = Page::of(&mut s, 120, 30);
+        let row = close_row(&page.lines);
         assert!(
-            page.row(0).contains('←'),
-            "{label}: page paints no back glyph: {:?}",
-            page.row(0)
+            row != usize::MAX,
+            "{label}: page paints no close glyph:\n{}",
+            page.lines.join("\n")
+        );
+        assert!(
+            page.lines.iter().all(|line| !line.contains("← ")),
+            "{label}: the card still paints a back title:\n{}",
+            page.lines.join("\n")
         );
         let hit = s
             .back_hit
-            .unwrap_or_else(|| panic!("{label}: ← is painted but not published as a hit"));
-        assert_eq!(hit.0, 0, "{label}: the nav lives on the header row");
+            .unwrap_or_else(|| panic!("{label}: [×] is painted but not published as a hit"));
+        assert_eq!(
+            hit.0 as usize, row,
+            "{label}: the hit is the close row, not the terminal edge"
+        );
+        assert_eq!(hit.2 - hit.1, 3, "{label}: the hit is the close glyph");
         let before = s.active_screen;
         reduce(&mut s, click(hit.1, hit.0));
         assert_ne!(
             s.active_screen, before,
-            "{label}: clicking ← must leave the page (one level back)"
+            "{label}: clicking [×] must leave the page (one level back)"
         );
     }
 }
@@ -265,28 +275,28 @@ fn a_header_back_leaves_one_inner_level_like_esc() {
     }
 }
 
-/// The published hit is the painted glyph + title, never the whole header row:
-/// the right half belongs to the status, so a click there must not navigate.
+/// The back hit is the `[×]` only. The tab name sits to its left, and a click
+/// on the name does not have to be the back control.
 #[test]
 fn the_back_hit_covers_the_painted_title_only() {
     let mut s = opened();
     seed(&mut s, Screen::Plan);
     let page = Page::of(&mut s, 120, 30);
-    let (row, x0, x1) = s.back_hit.expect("plan publishes its ← hit");
-    assert!(
-        (x1 - x0) < 120,
-        "the hit must not span the whole row (got {x0}..{x1})"
-    );
-    // Columns, not bytes: the title is CJK, so the byte offset of its end is
-    // not the column the glyph ends on.
+    let (row, x0, x1) = s.back_hit.expect("plan publishes its close hit");
+    assert_eq!(x1 - x0, 3, "the hit is [×], not the row");
     let header = page.row(row as usize);
-    let title_end = header
-        .find("计划")
-        .map(|byte| UnicodeWidthStr::width(&header[..byte + "计划".len()]))
-        .unwrap_or(0);
+    assert!(header.contains("[×]"), "close is on the hit row: {header}");
     assert!(
-        x1 as usize >= title_end,
-        "the hit covers the painted title (hit ends {x1}, title ends {title_end})"
+        header.contains("运行时"),
+        "the title row names the group: {header}"
+    );
+    let tab_row = page.row(row as usize + 1);
+    let title_at = tab_row.find("计划").expect("the plan tab is on the card");
+    let title_col = UnicodeWidthStr::width(&tab_row[..title_at]);
+    let title_end = title_col + UnicodeWidthStr::width("计划");
+    assert!(
+        title_end <= x0 as usize,
+        "the close hit must not cover the tab (title ends {title_end}, hit {x0}..{x1})"
     );
 }
 
@@ -358,53 +368,57 @@ fn the_issue_page_keyboard_expands_the_same_row_a_click_does() {
     assert_eq!(s.active_screen, Screen::Issue);
 }
 
-// ---- 5. One safe content rect for header, rules, body and footer ------------
+// ---- 5. One card: close glyph, no second title, nothing past the terminal ----
 
-/// The shell's safe horizontal margin, as the product specifies it: two
-/// columns from 80 up, one in the 40–79 band, none below. Spelled out here on
-/// purpose — it is the user-facing contract, not a call into the code under
-/// test, so changing it has to be argued for rather than absorbed.
-fn gutter(width: u16) -> usize {
-    match width {
-        w if w >= 80 => 2,
-        w if w >= 40 => 1,
-        _ => 0,
-    }
+/// Text between the modal side borders. A borderless frame (a very short
+/// terminal) is the page itself.
+fn modal_body(line: &str) -> &str {
+    let Some(start) = line.find('│') else {
+        return line;
+    };
+    let rest = &line[start + '│'.len_utf8()..];
+    let end = rest.rfind('│').unwrap_or(rest.len());
+    &rest[..end]
 }
 
-/// Header, both rules and the body all start on the same column, and the
-/// page's own rows never run past the right margin. Without this the chrome
-/// drifts from the content it frames — the header inset, the rule full-bleed.
+/// The page column only. The dimmed conversation beside the popup is not the
+/// page, and its ghost text must not decide whether two pages match.
+fn page_column(page: &Page) -> Vec<String> {
+    page.lines
+        .iter()
+        .map(|line| modal_body(line).trim_end().to_string())
+        .collect()
+}
+
+fn close_row(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .position(|line| line.contains("[×]"))
+        .unwrap_or(usize::MAX)
+}
+
+/// Every hosted card is one frame: a close glyph, no second `← title`, and
+/// nothing drawn past the terminal.
 #[test]
 fn every_page_keeps_its_chrome_on_one_content_rect() {
     for (screen, label) in pages_with_a_back_glyph() {
         let mut s = opened();
         seed(&mut s, screen);
         let page = Page::of(&mut s, 120, 30);
-        let left = gutter(120);
-        let right = 120 - left as u16;
-
-        let nav = page.row(0);
-        assert_eq!(
-            nav.find('←'),
-            Some(left),
-            "{label}: the nav is not on the safe margin: {nav:?}"
-        );
-        let rule = page.lines.get(1).map(String::as_str).unwrap_or("");
         assert!(
-            rule.starts_with(&" ".repeat(left)) && rule[left..].starts_with('─'),
-            "{label}: the top rule is not on the safe margin: {rule:?}"
+            close_row(&page.lines) != usize::MAX,
+            "{label}: no close glyph"
         );
         assert!(
-            !rule.starts_with('─'),
-            "{label}: the top rule runs out to the terminal edge: {rule:?}"
+            page.lines.iter().all(|line| !line.contains("← ")),
+            "{label}: still paints a back title:\n{}",
+            page.lines.join("\n")
         );
-
         for (index, line) in page.non_empty() {
             let width = UnicodeWidthStr::width(line);
             assert!(
-                width <= right as usize,
-                "{label}: row {index} overran the safe margin ({width} > {right}): {line:?}"
+                width <= 120,
+                "{label}: row {index} overran the terminal ({width} > 120): {line:?}"
             );
         }
     }
@@ -414,21 +428,32 @@ fn every_page_keeps_its_chrome_on_one_content_rect() {
 /// instead of paying for a gutter it cannot afford.
 #[test]
 fn the_safe_margin_follows_the_terminal_width() {
-    for (width, expected) in [(120u16, 2usize), (80, 2), (60, 1), (40, 1), (24, 0)] {
+    for width in [120u16, 80, 60, 40, 24] {
         let mut s = opened();
         seed(&mut s, Screen::Plan);
         let page = Page::of(&mut s, width, 20);
-        assert_eq!(
-            page.row(0).find('←'),
-            Some(expected),
-            "w={width}: nav margin: {:?}",
-            page.row(0)
-        );
-        let rule = page.row(1);
         assert!(
-            rule.starts_with(&" ".repeat(expected)) && rule[expected..].starts_with('─'),
-            "w={width}: rule margin: {rule:?}"
+            close_row(&page.lines) != usize::MAX,
+            "w={width}: no close glyph:\n{}",
+            page.lines.join("\n")
         );
+        assert!(
+            page.lines
+                .iter()
+                .any(|line| modal_body(line).contains("计划")),
+            "w={width}: the plan tab is missing:\n{}",
+            page.lines.join("\n")
+        );
+        assert!(
+            page.lines.iter().all(|line| !line.contains("← ")),
+            "w={width}: still paints a back title"
+        );
+        for (index, line) in page.non_empty() {
+            assert!(
+                UnicodeWidthStr::width(line) <= width as usize,
+                "w={width}: row {index} overran the terminal: {line:?}"
+            );
+        }
     }
 }
 
@@ -446,10 +471,10 @@ fn every_page_renders_at_every_supported_width() {
                     s.active_screen = screen;
                 }
                 let page = Page::of(&mut s, width, 14);
-                let nav = page.row(0);
                 assert!(
-                    nav.contains('←'),
-                    "{label} @{width} (seeded={seed_data}): no way back: {nav:?}"
+                    page.lines.iter().any(|line| line.contains("[×]")),
+                    "{label} @{width} (seeded={seed_data}): no way back:\n{}",
+                    page.lines.join("\n")
                 );
                 for (index, line) in page.non_empty() {
                     assert!(
@@ -479,8 +504,9 @@ fn a_row_click_selects_the_row_under_the_pointer() {
         let hits = s.screen_rows.clone();
         assert!(
             hits.len() > target,
-            "{label}: the fixture painted {} rows, need > {target}",
-            hits.len()
+            "{label}: the fixture painted {} rows, need > {target}:\n{}",
+            hits.len(),
+            Page::of(&mut s, 100, 20).lines.join("\n")
         );
         let (rect, _) = hits[target];
 
@@ -502,6 +528,26 @@ fn a_row_click_selects_the_row_under_the_pointer() {
     }
 }
 
+/// A two-line object is one click target. The description line under a
+/// session belongs to the same stable object as its title.
+#[test]
+fn clicking_a_second_line_selects_the_same_logical_row() {
+    let mut s = opened();
+    seed(&mut s, Screen::Sessions);
+    let _ = Page::of(&mut s, 100, 20);
+    let target = 2usize;
+    let (rect, key) = s.screen_rows[target].clone();
+    assert!(rect.height >= 2, "Sessions row is not two lines: {rect:?}");
+    reduce(&mut s, click(rect.x + 1, rect.y + rect.height - 1));
+    assert_eq!(s.sessions_selected, target, "clicked {key}");
+    assert_eq!(
+        s.sessions
+            .get(s.sessions_selected)
+            .map(|session| session.id.to_string()),
+        Some(key)
+    );
+}
+
 /// A wheel notch over a page moves the same cursor the arrow keys move: one
 /// row for a list, so the wheel and the keyboard cannot disagree.
 #[test]
@@ -511,13 +557,14 @@ fn a_wheel_notch_moves_the_same_cursor_the_keys_move() {
         seed(&mut keyboard, screen);
         let _ = Page::of(&mut keyboard, 100, 20);
         reduce(&mut keyboard, key(KeyCode::Down));
-        let by_key = Page::of(&mut keyboard, 100, 20).lines;
+        let by_key = page_column(&Page::of(&mut keyboard, 100, 20));
 
         let mut wheeled = opened();
         seed(&mut wheeled, screen);
         let _ = Page::of(&mut wheeled, 100, 20);
-        reduce(&mut wheeled, wheel(50, 10, false));
-        let by_wheel = Page::of(&mut wheeled, 100, 20).lines;
+        let (rect, _) = wheeled.screen_rows[0];
+        reduce(&mut wheeled, wheel(rect.x.saturating_add(1), rect.y, false));
+        let by_wheel = page_column(&Page::of(&mut wheeled, 100, 20));
 
         assert_eq!(
             by_key, by_wheel,
@@ -536,7 +583,7 @@ fn the_issue_page_keeps_its_cursor_on_screen() {
     let cursor_row = |page: &Page| {
         page.lines
             .iter()
-            .position(|l| l.trim_start().starts_with("→"))
+            .position(|l| modal_body(l).trim_start().starts_with("❯"))
     };
     let page = Page::of(&mut s, 80, 10);
     assert!(
@@ -579,6 +626,8 @@ fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
         (Screen::Settings, "Settings"),
         (Screen::Context, "Context"),
         (Screen::Clean, "Clean"),
+        (Screen::Skills, "Skills"),
+        (Screen::Agents, "Agents"),
         (Screen::Tools, "Tools"),
         (Screen::Diff, "Diff"),
         (Screen::Trace, "Trace"),
@@ -749,4 +798,27 @@ fn seed(state: &mut AppState, screen: Screen) {
         _ => {}
     }
     state.active_screen = screen;
+}
+
+/// A list page's cursor must be reachable as a list, not only one row at a
+/// time: PageDown/PageUp move a pageful, Home/End go to the ends. A 10,000
+/// session list is unusable if reaching its last row needs 10,000 presses.
+#[test]
+fn list_pages_page_and_jump_by_the_same_keys() {
+    let mut s = opened();
+    seed(&mut s, Screen::Sessions);
+    let last = s.sessions.len() - 1;
+
+    reduce(&mut s, key(KeyCode::PageDown));
+    assert!(
+        s.sessions_selected >= 5,
+        "PageDown moves a pageful, not one row: {}",
+        s.sessions_selected
+    );
+    reduce(&mut s, key(KeyCode::End));
+    assert_eq!(s.sessions_selected, last, "End reaches the last row");
+    reduce(&mut s, key(KeyCode::Home));
+    assert_eq!(s.sessions_selected, 0, "Home returns to the first row");
+    reduce(&mut s, key(KeyCode::PageUp));
+    assert_eq!(s.sessions_selected, 0, "PageUp clamps at the first row");
 }

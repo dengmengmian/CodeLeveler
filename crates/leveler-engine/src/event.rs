@@ -375,6 +375,13 @@ pub enum EngineEvent {
     RuleDelivery {
         audit: leveler_context::RuleDeliveryAudit,
     },
+    /// Durable skill-delivery audit, emitted once at turn start. Records which
+    /// skills were discoverable, which the user selected, which package bodies
+    /// reached the turn context, and why a selection was refused. It is not a
+    /// receipt that the model followed a procedure.
+    SkillDelivery {
+        audit: leveler_skills::SkillDeliveryAudit,
+    },
     AssistantMessage {
         text: String,
         /// Displayable reasoning segments the model produced this round, each
@@ -765,6 +772,13 @@ pub enum EngineEvent {
         #[serde(default)]
         through_ordinal: Option<u64>,
     },
+    /// A conversation checkpoint retained the event prefix through this
+    /// session-local cursor. Later facts remain available to audit and
+    /// recovery, but are no longer part of this branch of the conversation.
+    CheckpointRestored {
+        checkpoint_id: leveler_core::CheckpointId,
+        through_sequence: i64,
+    },
     SubAgentStarted {
         id: String,
         nickname: String,
@@ -1117,11 +1131,13 @@ impl EngineEvent {
             | EngineEvent::ReasoningDelta { .. }
             | EngineEvent::ReasoningCompleted { .. }
             | EngineEvent::RuleDelivery { .. }
+            | EngineEvent::SkillDelivery { .. }
             | EngineEvent::AssistantMessage { .. }
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallFinished { .. }
             | EngineEvent::WorkspaceSnapshotCreated { .. }
             | EngineEvent::ContextSnapshot { .. }
+            | EngineEvent::CheckpointRestored { .. }
             | EngineEvent::SubAgentStarted { .. }
             | EngineEvent::SubAgentTranscriptAppended { .. }
             | EngineEvent::SubAgentInterrupted { .. }
@@ -1293,6 +1309,7 @@ impl EngineEvent {
             | EngineEvent::ReasoningDelta { .. }
             | EngineEvent::ReasoningCompleted { .. }
             | EngineEvent::RuleDelivery { .. }
+            | EngineEvent::SkillDelivery { .. }
             | EngineEvent::AssistantMessage { .. }
             | EngineEvent::ToolExecutionTiming { .. }
             | EngineEvent::ToolCallStarted { .. }
@@ -1336,7 +1353,8 @@ impl EngineEvent {
             | EngineEvent::ModelRetrying { .. }
             | EngineEvent::CommandProgress { .. }
             | EngineEvent::RetiredMemory { .. }
-            | EngineEvent::ContextUsage { .. } => return None,
+            | EngineEvent::ContextUsage { .. }
+            | EngineEvent::CheckpointRestored { .. } => return None,
         })
     }
 }
@@ -1822,6 +1840,37 @@ mod contract_tests {
         assert!(event.public_projection().is_none());
         let (tag, payload) = event.to_row().unwrap();
         assert_eq!(tag, "rule_delivery");
+        assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
+    }
+
+    /// The skill-delivery audit is durable local evidence: it replays exactly,
+    /// is never transient, and never enters a remote projection. Its entries
+    /// carry names, provenance, sizes, and stable codes — never a body.
+    #[test]
+    fn skill_delivery_audit_is_persisted_local_only_and_round_trips() {
+        let event = EngineEvent::SkillDelivery {
+            audit: leveler_skills::SkillDeliveryAudit {
+                surface: leveler_skills::SkillDeliverySurface::Slash,
+                discovered: 3,
+                index_bytes: 120,
+                entries: vec![leveler_skills::SkillDeliveryEntry {
+                    name: "deploy".to_string(),
+                    requested_as: "/deploy".to_string(),
+                    scope: Some(leveler_skills::SkillScope::Project),
+                    source: Some(leveler_skills::SkillSource::Native),
+                    bytes: 42,
+                    failure: Some(leveler_skills::SkillDeliveryFailure::Disabled),
+                }],
+                injected_bytes: 410,
+                blocked: None,
+                agent_use: leveler_skills::SkillUseEvidence::NotVerifiable,
+            },
+        };
+        assert!(!event.is_transient());
+        assert_eq!(event.data_class(), DataClass::LocalOnly);
+        assert!(event.public_projection().is_none());
+        let (tag, payload) = event.to_row().unwrap();
+        assert_eq!(tag, "skill_delivery");
         assert_eq!(EngineEvent::from_payload(&payload).unwrap(), event);
     }
 

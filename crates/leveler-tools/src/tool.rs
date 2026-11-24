@@ -214,6 +214,9 @@ pub struct ToolPolicy {
     /// after every tool call). Defaults to [`crate::registry::MAX_TOOL_OUTPUT`];
     /// a model with a smaller reliable context may configure less.
     pub tool_output_budget: usize,
+    /// Exact approved packages delivered to this drive. Dispatcher clones
+    /// share this authority so load_skill can bind a later read_file call.
+    skill_references: Arc<std::sync::Mutex<Vec<leveler_skills::SkillReferenceGrant>>>,
 }
 
 impl ToolPolicy {
@@ -501,6 +504,7 @@ impl ToolContext {
                 command_previously_modified: Arc::new(Vec::new()),
                 command_foreign_paths: Arc::new(Vec::new()),
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
+                skill_references: Arc::default(),
             },
             session_scope: None,
             tool_call_scope: None,
@@ -672,14 +676,55 @@ impl ToolContext {
         None
     }
 
+    /// Create a fresh set of reference bindings for one drive.
+    pub fn with_skill_references(
+        mut self,
+        grants: Vec<leveler_skills::SkillReferenceGrant>,
+    ) -> Self {
+        self.policy.skill_references = Arc::new(std::sync::Mutex::new(grants));
+        self
+    }
+
+    pub fn bind_skill_references(&self, grant: leveler_skills::SkillReferenceGrant) {
+        if let Ok(mut grants) = self.policy.skill_references.lock() {
+            grants.retain(|existing| existing != &grant);
+            grants.push(grant);
+        }
+    }
+
+    pub(crate) fn skill_reference_for_path(
+        &self,
+        path: &str,
+    ) -> Option<(leveler_skills::SkillReferenceGrant, String)> {
+        let raw = std::path::Path::new(path);
+        let absolute;
+        let path = if raw.is_absolute() {
+            raw
+        } else {
+            absolute = self.execution.workspace.as_ref()?.root().join(raw);
+            &absolute
+        };
+        let grants = self.policy.skill_references.lock().ok()?;
+        if grants.is_empty() {
+            return None;
+        }
+        let canonical = path.canonicalize().ok();
+        grants.iter().rev().find_map(|grant| {
+            grant
+                .reference_for_path(path)
+                .or_else(|| grant.reference_for_path(canonical.as_deref()?))
+                .map(|reference| (grant.clone(), reference.to_owned()))
+        })
+    }
+
     /// Whether `path` is skill instruction content that may only be admitted
     /// through the approval-bound package loader.
     ///
     /// `SKILL.md` and everything under a skill's `references/` tree are what the
     /// trust approval binds. Reading them by path would hand the model bytes
     /// that were not re-checked against the package digest, and would turn an
-    /// approved procedure into an unverified second-level read. `load_skill`
-    /// returns the verified text instead. Scripts and assets stay ordinary tool
+    /// approved procedure into an unverified second-level read. `read_file`
+    /// handles references bound to a delivered package separately. Scripts and assets stay ordinary tool
     /// resources; they are not instruction content.
     pub(crate) fn skill_content_read_denied(&self, path: &str) -> Option<String> {
         if self.policy.unrestricted_execution() {
@@ -749,8 +794,8 @@ impl ToolContext {
             {
                 return Some(format!(
                     "`{path}` is approval-bound skill instruction content. Read the skill by \
-                     name with `load_skill` so the package digest is verified; file tools cannot \
-                     serve an unverified second-level reference."
+                     name with `load_skill` or invoke it explicitly. Only reference files listed in the \
+                     loaded skill can be read through `read_file`."
                 ));
             }
         }

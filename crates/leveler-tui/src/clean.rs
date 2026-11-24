@@ -254,9 +254,9 @@ pub fn render_clean_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.clean.footer_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let body = layout.content;
 

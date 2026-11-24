@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::builtin;
 use crate::frontmatter;
 use crate::name;
+use crate::preferences::PreferencesState;
 use crate::render;
 
 /// Where a skill lives, in locality order. Project is the nearest scope, then
@@ -193,15 +194,6 @@ const USER_ROOTS: &[(SkillSource, &str)] = &[
     (SkillSource::Claude, ".claude/skills"),
 ];
 
-/// Longest reference text a single `load_skill` may hand to the model.
-///
-/// References are content-bound, so they are returned as verified text rather
-/// than as paths the model must re-read. The bound leaves room under the
-/// registry's 48 KiB tool-result cap for the skill body and its framing; a
-/// larger package fails closed with an actionable error instead of returning
-/// unverified bytes or a silently truncated procedure.
-const MAX_INLINE_REFERENCE_BYTES: usize = 32 * 1024;
-
 fn user_home<F>(var: &F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -233,14 +225,70 @@ pub struct UntrustedSkillSummary {
     pub source: SkillSource,
 }
 
-/// One verified reference file's text. The bytes were read and hashed as part of
-/// the package approval in the same pass that produced this value, so the model
-/// never receives text that a later edit could have swapped.
+/// Reference authority for the exact package version delivered to the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillReferenceContent {
-    /// Package-relative path (`references/guide.md`).
-    pub relative: String,
-    pub text: String,
+pub struct SkillReferenceGrant {
+    dir: PathBuf,
+    canonical_dir: PathBuf,
+    identity: DefinitionIdentity,
+    digest: String,
+    references: Vec<String>,
+}
+
+impl SkillReferenceGrant {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Only a path advertised by this package is eligible for a verified read.
+    pub fn reference_for_path(&self, requested: &Path) -> Option<&str> {
+        self.references.iter().find_map(|relative| {
+            (self.dir.join(relative) == requested || self.canonical_dir.join(relative) == requested)
+                .then_some(relative.as_str())
+        })
+    }
+
+    /// Verify and return the requested text from the same bytes that were hashed.
+    pub fn read_reference(
+        &self,
+        relative: &str,
+        trust: &DefinitionTrustView,
+    ) -> Result<Vec<u8>, String> {
+        if !self
+            .references
+            .iter()
+            .any(|reference| reference == relative)
+        {
+            return Err(format!(
+                "skill reference `{relative}` was not in the delivered package"
+            ));
+        }
+        let unreadable =
+            |error: String| format!("cannot read verified skill reference `{relative}`: {error}");
+        if self.dir.canonicalize().ok().as_ref() != Some(&self.canonical_dir) {
+            return Err(unreadable(
+                "the skill directory moved; invoke the skill again".into(),
+            ));
+        }
+        let package =
+            leveler_definition_trust::read_skill_package(&self.canonical_dir.join("SKILL.md"))
+                .map_err(unreadable)?;
+        let digest = DefinitionIdentity::skill_package_digest(&package);
+        if digest != self.digest {
+            return Err(unreadable(
+                "the package changed after loading; review and invoke the skill again".into(),
+            ));
+        }
+        let decision = trust.check(&self.identity, &digest);
+        if !decision.admits() {
+            return Err(unreadable("the package is no longer approved".into()));
+        }
+        package
+            .into_iter()
+            .find(|part| part.relative == relative)
+            .map(|part| part.bytes)
+            .ok_or_else(|| unreadable("the file is missing".into()))
+    }
 }
 
 /// A skill's full content, loaded on demand or turn-injected.
@@ -259,9 +307,8 @@ pub struct SkillDetail {
     pub scripts: Vec<String>,
     /// Paths relative to [`Self::dir`] under `references/` (and nested).
     pub references: Vec<String>,
-    /// Verified text of every reference file, in the same order as
-    /// [`Self::references`]. These are the bytes the trust approval bound.
-    pub reference_contents: Vec<SkillReferenceContent>,
+    /// The package version the host may serve references from during this turn.
+    pub reference_grant: Option<SkillReferenceGrant>,
     /// Other bundled files (not SKILL.md, not under scripts/ or references/).
     pub other_files: Vec<String>,
 }
@@ -276,7 +323,17 @@ pub struct SkillMentionResolution {
     /// `$name` tokens that matched a skill that exists but is unusable, with
     /// the reason. Kept apart from `unknown` so a broken package is diagnosable
     /// instead of looking like a typo.
-    pub invalid: Vec<(String, String)>,
+    pub invalid: Vec<SkillMentionFailure>,
+}
+
+/// One mentioned skill that exists but could not load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillMentionFailure {
+    pub name: String,
+    /// Human-readable reason, already rendered for the prompt.
+    pub reason: String,
+    /// Stable code for the durable delivery audit.
+    pub failure: crate::SkillDeliveryFailure,
 }
 
 impl SkillMentionResolution {
@@ -298,6 +355,25 @@ pub enum SkillLookupError {
         source: SkillSource,
         location: Option<PathBuf>,
         error: String,
+    },
+    /// The definition is present and trusted but the user turned it off.
+    Disabled {
+        name: String,
+        scope: SkillScope,
+        source: SkillSource,
+        reason: String,
+    },
+    /// The package opted out of model discovery and `load_skill`.
+    ModelInvocationDisabled {
+        name: String,
+        scope: SkillScope,
+        source: SkillSource,
+    },
+    /// The package opted out of explicit `/` and `$` invocation.
+    UserInvocationDisabled {
+        name: String,
+        scope: SkillScope,
+        source: SkillSource,
     },
     Read {
         name: String,
@@ -402,6 +478,33 @@ impl std::fmt::Display for SkillLookupError {
                 Ok(())
             }
             Self::Read { name, error } => write!(f, "skill `{name}` could not be read: {error}"),
+            Self::Disabled {
+                name,
+                scope,
+                source,
+                reason,
+            } => write!(
+                f,
+                "skill `{name}` ({source} · {scope}) is disabled: {reason}"
+            ),
+            Self::ModelInvocationDisabled {
+                name,
+                scope,
+                source,
+            } => write!(
+                f,
+                "skill `{name}` ({source} · {scope}) sets `disable-model-invocation`; the model \
+                 may not load it, but the user can invoke it explicitly"
+            ),
+            Self::UserInvocationDisabled {
+                name,
+                scope,
+                source,
+            } => write!(
+                f,
+                "skill `{name}` ({source} · {scope}) sets `user-invocable: false`; it cannot be \
+                 invoked with `/` or `$`"
+            ),
             Self::Untrusted {
                 name,
                 scope,
@@ -433,6 +536,11 @@ pub struct ShadowedSkill {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillState {
     Available,
+    /// The definition exists and is trusted, but the user disabled it.
+    /// The package stays on disk and remains visible for re-enabling.
+    Disabled {
+        reason: String,
+    },
     /// The definition exists but cannot be used; the reason is actionable.
     Invalid(String),
 }
@@ -447,6 +555,12 @@ pub struct SkillEntry {
     pub location: Option<PathBuf>,
     /// Present only for an available entry.
     pub description: Option<String>,
+    /// Optional display-only argument shape from `SKILL.md` frontmatter.
+    pub argument_hint: Option<String>,
+    /// Whether explicit `/` and `$` invocation is allowed.
+    pub user_invocable: bool,
+    /// Whether the model index and `load_skill` may use this Skill.
+    pub disable_model_invocation: bool,
     pub state: SkillState,
     pub shadowed: Vec<ShadowedSkill>,
 }
@@ -458,8 +572,15 @@ impl SkillEntry {
 
     pub fn invalid_reason(&self) -> Option<&str> {
         match &self.state {
-            SkillState::Available => None,
+            SkillState::Available | SkillState::Disabled { .. } => None,
             SkillState::Invalid(reason) => Some(reason),
+        }
+    }
+
+    pub fn disabled_reason(&self) -> Option<&str> {
+        match &self.state {
+            SkillState::Disabled { reason } => Some(reason),
+            SkillState::Available | SkillState::Invalid(_) => None,
         }
     }
 }
@@ -481,6 +602,9 @@ struct Candidate {
     source: SkillSource,
     location: Option<PathBuf>,
     description: Option<String>,
+    argument_hint: Option<String>,
+    user_invocable: bool,
+    disable_model_invocation: bool,
     error: Option<String>,
 }
 
@@ -498,6 +622,10 @@ pub struct SkillRegistry {
     untrusted_skills: Vec<UntrustedSkill>,
     /// The snapshot `load_skill` re-checks before returning a body.
     trust: DefinitionTrustView,
+    /// The user's enable/disable state that produced [`SkillState::Disabled`].
+    /// Retained so callers can distinguish "off by choice" from "broken" and
+    /// can surface a file-level preferences error.
+    preferences: PreferencesState,
 }
 
 impl Default for SkillRegistry {
@@ -508,6 +636,7 @@ impl Default for SkillRegistry {
             untrusted: Vec::new(),
             untrusted_skills: Vec::new(),
             trust: DefinitionTrustView::deny_all(),
+            preferences: PreferencesState::default(),
         }
     }
 }
@@ -527,7 +656,14 @@ impl SkillRegistry {
     /// Scan every root once. Never fails as a whole: a broken package becomes an
     /// invalid entry or a problem, not a failed start. A package the trust gate
     /// refuses is reported beside the entries and cannot shadow a trusted one.
-    pub fn load(roots: &SkillRoots, trust: &DefinitionTrustView) -> Self {
+    ///
+    /// `preferences` is explicit rather than defaulted: a caller that forgets
+    /// to pass the user's disable list must not silently re-enable everything.
+    pub fn load(
+        roots: &SkillRoots,
+        trust: &DefinitionTrustView,
+        preferences: &PreferencesState,
+    ) -> Self {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut problems: Vec<SkillProblem> = Vec::new();
         let mut untrusted: Vec<TrustAuditEntry> = Vec::new();
@@ -552,6 +688,9 @@ impl SkillRegistry {
                 source: SkillSource::Builtin,
                 location: None,
                 description: Some(skill.description.to_string()),
+                argument_hint: None,
+                user_invocable: true,
+                disable_model_invocation: false,
                 error: None,
             });
         }
@@ -568,18 +707,29 @@ impl SkillRegistry {
                         error: candidate.error,
                     });
                 }
-                _ => entries.push(SkillEntry {
-                    name: candidate.name,
-                    scope: candidate.scope,
-                    source: candidate.source,
-                    location: candidate.location,
-                    description: candidate.description,
-                    state: match candidate.error {
+                _ => {
+                    let state = match candidate.error {
                         Some(error) => SkillState::Invalid(error),
+                        None if preferences.is_disabled(candidate.scope, &candidate.name) => {
+                            SkillState::Disabled {
+                                reason: preferences.reason_for(candidate.scope, &candidate.name),
+                            }
+                        }
                         None => SkillState::Available,
-                    },
-                    shadowed: Vec::new(),
-                }),
+                    };
+                    entries.push(SkillEntry {
+                        name: candidate.name,
+                        scope: candidate.scope,
+                        source: candidate.source,
+                        location: candidate.location,
+                        description: candidate.description,
+                        argument_hint: candidate.argument_hint,
+                        user_invocable: candidate.user_invocable,
+                        disable_model_invocation: candidate.disable_model_invocation,
+                        state,
+                        shadowed: Vec::new(),
+                    });
+                }
             }
         }
         Self {
@@ -588,6 +738,7 @@ impl SkillRegistry {
             untrusted,
             untrusted_skills,
             trust: trust.clone(),
+            preferences: preferences.clone(),
         }
     }
 
@@ -616,6 +767,18 @@ impl SkillRegistry {
         &self.entries
     }
 
+    /// The preferences state this registry was built with. A file-level error
+    /// is surfaced by clients, separately from per-skill disabled states.
+    pub fn preferences(&self) -> &PreferencesState {
+        &self.preferences
+    }
+
+    /// A preferences file that could not be read. While this is `Some`, every
+    /// skill is fail-closed as disabled.
+    pub fn preferences_error(&self) -> Option<&str> {
+        self.preferences.error()
+    }
+
     pub fn problems(&self) -> &[SkillProblem] {
         &self.problems
     }
@@ -626,17 +789,26 @@ impl SkillRegistry {
 
     /// The index: names + descriptions of every usable skill.
     pub fn summaries(&self) -> Vec<SkillSummary> {
+        self.entries.iter().filter_map(summary_for).collect()
+    }
+
+    /// The model-facing index: usable skills that allow model discovery.
+    /// `disable-model-invocation: true` removes a Skill here and from the
+    /// `load_skill` tool, but leaves explicit user invocation available.
+    pub fn model_summaries(&self) -> Vec<SkillSummary> {
         self.entries
             .iter()
-            .filter_map(|entry| {
-                let description = entry.description.clone()?;
-                entry.is_available().then_some(SkillSummary {
-                    name: entry.name.clone(),
-                    description,
-                    scope: entry.scope,
-                    source: entry.source,
-                })
-            })
+            .filter(|entry| !entry.disable_model_invocation)
+            .filter_map(summary_for)
+            .collect()
+    }
+
+    /// The explicit-user index: usable skills that allow `/` and `$`.
+    pub fn user_summaries(&self) -> Vec<SkillSummary> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.user_invocable)
+            .filter_map(summary_for)
             .collect()
     }
 
@@ -693,6 +865,12 @@ impl SkillRegistry {
         };
         match &entry.state {
             SkillState::Available => Ok(entry),
+            SkillState::Disabled { reason } => Err(SkillLookupError::Disabled {
+                name: entry.name.clone(),
+                scope: entry.scope,
+                source: entry.source,
+                reason: reason.clone(),
+            }),
             SkillState::Invalid(error) => Err(SkillLookupError::Invalid {
                 name: entry.name.clone(),
                 scope: entry.scope,
@@ -703,9 +881,48 @@ impl SkillRegistry {
         }
     }
 
-    /// Read the full body and bundled files of the resolved winner.
+    /// Read the full body and bundled files of the resolved winner for the
+    /// **model** path (`load_skill`). A package with
+    /// `disable-model-invocation: true` is refused; the user can still invoke
+    /// it explicitly.
     pub fn load_skill(&self, name: &str) -> Result<SkillDetail, SkillLookupError> {
         let entry = self.resolve(name)?;
+        if entry.disable_model_invocation {
+            return Err(SkillLookupError::ModelInvocationDisabled {
+                name: entry.name.clone(),
+                scope: entry.scope,
+                source: entry.source,
+            });
+        }
+        self.load_entry(entry)
+    }
+
+    /// Read the full body for an explicit user invocation (`/name`, `$name`).
+    /// A package with `user-invocable: false` is refused; the model path is
+    /// checked separately by [`Self::load_skill`].
+    pub fn load_skill_explicit(&self, name: &str) -> Result<SkillDetail, SkillLookupError> {
+        let entry = self.resolve(name)?;
+        if !entry.user_invocable {
+            return Err(SkillLookupError::UserInvocationDisabled {
+                name: entry.name.clone(),
+                scope: entry.scope,
+                source: entry.source,
+            });
+        }
+        self.load_entry(entry)
+    }
+
+    /// Read the full body for display only (`skills show`, the Skills page).
+    ///
+    /// Invocation flags describe who may *run* a procedure; they must not hide
+    /// the package from the user's own inspection. Disabled, invalid, untrusted
+    /// and path checks still apply.
+    pub fn load_skill_for_inspection(&self, name: &str) -> Result<SkillDetail, SkillLookupError> {
+        let entry = self.resolve(name)?;
+        self.load_entry(entry)
+    }
+
+    fn load_entry(&self, entry: &SkillEntry) -> Result<SkillDetail, SkillLookupError> {
         if entry.source == SkillSource::Builtin {
             return builtin::detail(&entry.name).ok_or_else(|| SkillLookupError::Read {
                 name: entry.name.clone(),
@@ -730,16 +947,17 @@ impl SkillRegistry {
         )?;
         // Re-check the bytes actually about to be returned. A registry built
         // before an edit must not hand out content the approval never covered.
-        if let Some(identity) = identity_for(entry.scope, entry.source, &entry.name) {
-            let digest = DefinitionIdentity::skill_package_digest(&package);
-            let decision = self.trust.check(&identity, &digest);
+        let identity = identity_for(entry.scope, entry.source, &entry.name);
+        let digest = DefinitionIdentity::skill_package_digest(&package);
+        if let Some(identity) = identity.as_ref() {
+            let decision = self.trust.check(identity, &digest);
             if !decision.admits() {
                 let package = UntrustedSkill {
                     name: entry.name.clone(),
                     scope: entry.scope,
                     source: entry.source,
                     location: dir,
-                    identity: Some(identity),
+                    identity: Some(identity.clone()),
                     digest,
                     decision,
                 };
@@ -752,40 +970,31 @@ impl SkillRegistry {
                 });
             }
         }
-        let mut skill_body = None;
-        let mut references = Vec::new();
-        let mut reference_contents = Vec::new();
-        let mut inline_bytes = 0usize;
-        for part in package {
-            if part.relative == "SKILL.md" {
-                skill_body = Some(part.bytes);
-                continue;
-            }
-            inline_bytes = inline_bytes.saturating_add(part.bytes.len());
-            if inline_bytes > MAX_INLINE_REFERENCE_BYTES {
-                return Err(SkillLookupError::Read {
-                    name: entry.name.clone(),
-                    error: format!(
-                        "the skill's references exceed the {MAX_INLINE_REFERENCE_BYTES}-byte \
-                         verified-content budget; split the procedure or move non-instruction \
-                         assets out of `references/`"
-                    ),
-                });
-            }
-            let text = String::from_utf8(part.bytes).map_err(|_| SkillLookupError::Read {
+        let mut parts = package.into_iter();
+        let bytes = parts
+            .next()
+            .filter(|part| part.relative == "SKILL.md")
+            .ok_or_else(|| SkillLookupError::Read {
                 name: entry.name.clone(),
-                error: format!("{} is not valid UTF-8", part.relative),
+                error: "SKILL.md is missing from the approved package".to_string(),
+            })?
+            .bytes;
+        let references: Vec<String> = parts.map(|part| part.relative).collect();
+        let reference_grant = if references.is_empty() {
+            None
+        } else {
+            let canonical_dir = dir.canonicalize().map_err(|error| SkillLookupError::Read {
+                name: entry.name.clone(),
+                error: format!("skill directory: {error}"),
             })?;
-            references.push(part.relative.clone());
-            reference_contents.push(SkillReferenceContent {
-                relative: part.relative,
-                text,
-            });
-        }
-        let bytes = skill_body.ok_or_else(|| SkillLookupError::Read {
-            name: entry.name.clone(),
-            error: "SKILL.md is missing from the approved package".to_string(),
-        })?;
+            identity.map(|identity| SkillReferenceGrant {
+                dir: dir.clone(),
+                canonical_dir,
+                identity,
+                digest,
+                references: references.clone(),
+            })
+        };
         let content = String::from_utf8(bytes).map_err(|_| SkillLookupError::Read {
             name: entry.name.clone(),
             error: "SKILL.md is not valid UTF-8".to_string(),
@@ -804,7 +1013,7 @@ impl SkillRegistry {
             dir,
             scripts,
             references,
-            reference_contents,
+            reference_grant,
             other_files,
         })
     }
@@ -815,19 +1024,51 @@ impl SkillRegistry {
         let mut unknown = Vec::new();
         let mut invalid = Vec::new();
         for name in render::parse_skill_mentions(text) {
-            match self.load_skill(&name) {
-                Ok(detail) => loaded.push(detail),
-                Err(SkillLookupError::NotFound { name, .. }) => unknown.push(name),
-                Err(SkillLookupError::Invalid { name, error, .. })
-                | Err(SkillLookupError::Read { name, error }) => invalid.push((name, error)),
-                Err(SkillLookupError::Untrusted { name, state, .. }) => invalid.push((
+            let error = match self.load_skill_explicit(&name) {
+                Ok(detail) => {
+                    loaded.push(detail);
+                    continue;
+                }
+                Err(error) => error,
+            };
+            let failure = crate::audit::lookup_failure(&error);
+            let (name, reason) = match &error {
+                SkillLookupError::NotFound { name, .. } => {
+                    unknown.push(name.clone());
+                    continue;
+                }
+                SkillLookupError::Invalid { name, error, .. }
+                | SkillLookupError::Disabled {
+                    name,
+                    reason: error,
+                    ..
+                }
+                | SkillLookupError::Read { name, error } => (name.clone(), error.clone()),
+                SkillLookupError::UserInvocationDisabled { name, .. } => (
+                    name.clone(),
+                    "the package sets `user-invocable: false`; it cannot be invoked with `/` \
+                     or `$`"
+                        .to_string(),
+                ),
+                SkillLookupError::ModelInvocationDisabled { name, .. } => (
+                    name.clone(),
+                    "the package sets `disable-model-invocation`; the user can invoke it \
+                     explicitly, but the model may not load it"
+                        .to_string(),
+                ),
+                SkillLookupError::Untrusted { name, state, .. } => (
                     name.clone(),
                     format!(
                         "not trusted ({state}); call `load_skill(\"{name}\")` to ask the user to \
                          admit it, or the user can review it with /trust"
                     ),
-                )),
-            }
+                ),
+            };
+            invalid.push(SkillMentionFailure {
+                name,
+                reason,
+                failure,
+            });
         }
         SkillMentionResolution {
             loaded,
@@ -835,6 +1076,16 @@ impl SkillRegistry {
             invalid,
         }
     }
+}
+
+fn summary_for(entry: &SkillEntry) -> Option<SkillSummary> {
+    let description = entry.description.clone()?;
+    entry.is_available().then_some(SkillSummary {
+        name: entry.name.clone(),
+        description,
+        scope: entry.scope,
+        source: entry.source,
+    })
 }
 
 fn identity_for(scope: SkillScope, source: SkillSource, name: &str) -> Option<DefinitionIdentity> {
@@ -981,6 +1232,9 @@ fn read_candidate(
             source: root.source,
             location: Some(dir.to_path_buf()),
             description: None,
+            argument_hint: None,
+            user_invocable: true,
+            disable_model_invocation: false,
             error: Some(error),
         })
     };
@@ -1028,6 +1282,9 @@ fn read_candidate(
     let Some(description) = parsed.frontmatter.description() else {
         return invalid("SKILL.md needs a non-empty `description`".to_string());
     };
+    let argument_hint = parsed.frontmatter.argument_hint();
+    let user_invocable = parsed.frontmatter.user_invocable();
+    let disable_model_invocation = parsed.frontmatter.disable_model_invocation();
     CandidateRead::Candidate(Candidate {
         rank,
         name: name.to_string(),
@@ -1035,6 +1292,9 @@ fn read_candidate(
         source: root.source,
         location: Some(dir.to_path_buf()),
         description: Some(description),
+        argument_hint,
+        user_invocable,
+        disable_model_invocation,
         error: None,
     })
 }
@@ -1130,6 +1390,11 @@ pub fn discover(root: &Path) -> Vec<SkillSummary> {
     describe(root).summaries()
 }
 
+/// Discover skills the user may invoke with `/` or `$`.
+pub fn discover_user(root: &Path) -> Vec<SkillSummary> {
+    describe(root).user_summaries()
+}
+
 /// The full resolved registry for a project (the read model the CLI and TUI
 /// render, and the one `discover`/`load` are derived from).
 pub fn describe(root: &Path) -> SkillRegistry {
@@ -1141,6 +1406,7 @@ pub fn describe(root: &Path) -> SkillRegistry {
     SkillRegistry::load(
         &SkillRoots::for_project(root),
         &DefinitionTrustView::load(home.root(), Some(root)),
+        &crate::preferences::PreferencesState::load(&home, Some(root)),
     )
 }
 

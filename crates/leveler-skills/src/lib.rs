@@ -22,24 +22,39 @@
 //! the next resolve.
 #![forbid(unsafe_code)]
 
+mod audit;
 mod builtin;
+mod command;
 mod frontmatter;
 mod name;
+mod preferences;
 mod registry;
 mod render;
+mod reserved;
 mod store;
 
+pub use audit::{
+    SkillDeliveryAudit, SkillDeliveryEntry, SkillDeliveryFailure, SkillDeliverySurface,
+    SkillUseEvidence,
+};
 pub use builtin::is_builtin_name;
+pub use command::{
+    SkillCommand, SkillCommandCatalog, SkillCommandError, SkillCommandResolution,
+    leading_skill_token,
+};
 pub use name::{MAX_SKILL_NAME_LEN, is_mentionable, validate_read_name, validate_skill_name};
+pub use preferences::{PreferencesState, SkillPreferences, disabled_key, project_key};
 pub use registry::{
-    ShadowedSkill, SkillDetail, SkillEntry, SkillLookupError, SkillMentionResolution, SkillProblem,
-    SkillRegistry, SkillRoot, SkillRoots, SkillScope, SkillSource, SkillState, SkillSummary,
-    UntrustedSkill, UntrustedSkillSummary, describe, discover, load, resolve_mentions,
+    ShadowedSkill, SkillDetail, SkillEntry, SkillLookupError, SkillMentionFailure,
+    SkillMentionResolution, SkillProblem, SkillReferenceGrant, SkillRegistry, SkillRoot,
+    SkillRoots, SkillScope, SkillSource, SkillState, SkillSummary, UntrustedSkill,
+    UntrustedSkillSummary, describe, discover, discover_user, load, resolve_mentions,
 };
 pub use render::{
     MAX_SKILL_INDEX_BYTES, SKILLS_HOW_TO_USE, parse_skill_mentions, render_capped_index,
     render_capped_index_with_pending, render_index, render_skill_package, render_turn_injection,
 };
+pub use reserved::{RESERVED_SLASH_NAMES, is_reserved_slash_name};
 pub use store::{
     MAX_BODY_BYTES, MAX_BUNDLED_BYTES, MAX_BUNDLED_FILES, MAX_DESCRIPTION_CHARS, MAX_FILE_BYTES,
     SkillDraft, SkillFile, SkillStore, SkillStoreError,

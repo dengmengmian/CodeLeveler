@@ -122,6 +122,12 @@ impl SelectionModel {
         self
     }
 
+    /// Whether digits confirm a row. A destructive confirmation turns this
+    /// off, so the renderer must not paint numbered affordances it will ignore.
+    pub fn digits_select(&self) -> bool {
+        self.quick_select
+    }
+
     /// Force the initial cursor onto a specific option key (used for a
     /// safe-by-default focus). Falls back to the first enabled row.
     pub fn focus_key(mut self, key: &str) -> Self {

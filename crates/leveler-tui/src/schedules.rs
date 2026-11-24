@@ -904,7 +904,7 @@ fn send(state: &mut AppState, request: ScheduleRequest, slot: Slot) -> Effect {
     })
 }
 
-fn list_effect(state: &mut AppState) -> Effect {
+pub(crate) fn list_effect(state: &mut AppState) -> Effect {
     let filter = state.schedule.filter;
     send(
         state,
@@ -915,7 +915,7 @@ fn list_effect(state: &mut AppState) -> Effect {
     )
 }
 
-fn status_effect(state: &mut AppState) -> Effect {
+pub(crate) fn status_effect(state: &mut AppState) -> Effect {
     send(state, ScheduleRequest::Status, Slot::Status)
 }
 
@@ -1590,11 +1590,21 @@ pub fn apply_response(state: &mut AppState, query_id: &CommandId, response: Sche
             }
         }
         ScheduleResponse::List { schedules } => {
+            let selected_id = state
+                .schedule
+                .items
+                .get(state.schedule.selected)
+                .map(|view| view.id.clone());
             state.schedule.items = schedules;
             state.schedule.error = None;
-            if state.schedule.selected >= state.schedule.items.len() {
-                state.schedule.selected = state.schedule.items.len().saturating_sub(1);
-            }
+            state.schedule.selected = selected_id
+                .and_then(|id| state.schedule.items.iter().position(|view| view.id == id))
+                .unwrap_or_else(|| {
+                    state
+                        .schedule
+                        .selected
+                        .min(state.schedule.items.len().saturating_sub(1))
+                });
             state.schedule.last_refresh = Some(Instant::now());
         }
         ScheduleResponse::Show { schedule } => {
@@ -1754,6 +1764,10 @@ pub fn select_row(state: &mut AppState, key: &str) {
     if pane(state) != Pane::List {
         return;
     }
+    if let Some(index) = state.schedule.items.iter().position(|view| view.id == key) {
+        state.schedule.selected = index;
+        return;
+    }
     if let Ok(index) = key.parse::<usize>()
         && index < state.schedule.items.len()
     {
@@ -1793,9 +1807,9 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hint,
     };
     let footer_rows = hint.lines().count().max(1) as u16;
-    let layout = crate::secondary::layout_with_footer(area, 0, footer_rows);
+    let layout = crate::secondary::page_layout_with_footer(state, area, 0, footer_rows);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     match pane(state) {
         Pane::Form => render_form(frame, layout.content, state),
         Pane::Detail => render_detail(frame, layout.content, state),
@@ -1835,12 +1849,15 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let mut lines = vec![summary_line(state, width)];
     if let Some(error) = state.schedule.error.clone() {
-        push_wrapped(
-            &mut lines,
-            &error,
-            Style::default().fg(theme.status.error),
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Error,
+                message: &error,
+                detail: None,
+            },
+            &theme,
             width,
-        );
+        ));
     }
     if let Some(notice) = state.schedule.notice.clone() {
         push_wrapped(
@@ -1851,97 +1868,72 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
         );
     }
 
-    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
     let mut focus = lines.len();
     if state.schedule.items.is_empty() {
-        let text = if state.schedule.list_query.is_some() {
-            t.schedules.loading
-        } else {
-            t.schedules.empty
-        };
-        lines.push(Line::from(Span::styled(
-            text,
-            Style::default().fg(theme.text.muted),
-        )));
-    } else {
-        // Reserve the state column from the labels that actually occur, so the
-        // most important cell is never the one clipped at a normal width.
-        let state_w = std::iter::once(t.schedules.column_state)
-            .chain(
-                state
-                    .schedule
-                    .items
-                    .iter()
-                    .map(|view| schedule_state(view, &t.schedules)),
-            )
-            .map(unicode_width::UnicodeWidthStr::width)
-            .max()
-            .unwrap_or(0)
-            .clamp(6, 10);
-        let next_w = 16usize;
-        // marker + three separators + the two fixed columns
-        let fixed = 2 + 2 + 2 + 2 + next_w + state_w;
-        let flexible = width.saturating_sub(fixed);
-        let name_w = (flexible / 2).clamp(10, 32);
-        let rule_w = flexible.saturating_sub(name_w).clamp(10, 34);
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {}  {}  {}  {}",
-                crate::render::pad_display(t.schedules.column_name, name_w),
-                crate::render::pad_display(t.schedules.column_rule, rule_w),
-                crate::render::pad_display(t.schedules.column_next, next_w),
-                t.schedules.column_state,
-            ),
-            Style::default()
-                .fg(theme.text.muted)
-                .add_modifier(Modifier::BOLD),
-        )));
-        let selected = state.schedule.selected;
-        for (index, view) in state.schedule.items.iter().enumerate() {
-            let is_selected = index == selected;
-            rows.push((lines.len(), index.to_string()));
-            if is_selected {
-                focus = lines.len();
+        let block = if state.schedule.list_query.is_some() {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Loading,
+                message: t.schedules.loading,
+                detail: None,
             }
-            let marker = if is_selected { "› " } else { "  " };
-            let state_text = schedule_state(view, &t.schedules);
-            let style = Style::default().fg(if escape_state(view) {
-                theme.status.warning
-            } else if is_selected {
-                theme.accent.primary
-            } else {
-                theme.text.primary
-            });
-            let row = format!(
-                "{marker}{}  {}  {}  {state_text}",
-                crate::render::pad_display(
-                    &crate::render::truncate_display(&view.name, name_w),
-                    name_w
-                ),
-                crate::render::pad_display(
-                    &crate::render::truncate_display(
-                        &trigger_label(&view.trigger, &t.schedules),
-                        rule_w
-                    ),
-                    rule_w
-                ),
-                crate::render::pad_display(
-                    &crate::render::truncate_display(
-                        &fmt_optional_time(view.next_run_at.as_ref()),
-                        next_w
-                    ),
-                    next_w
-                ),
-            );
-            lines.push(Line::from(Span::styled(
-                crate::render::sanitize_terminal_line(&row),
-                style,
-            )));
-        }
+        } else {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: if state.schedule.filter == ScheduleFilter::All {
+                    t.schedules.empty
+                } else {
+                    t.schedules.empty_filter
+                },
+                detail: None,
+            }
+        };
+        lines.extend(crate::render::list_state_lines(block, &theme, width));
+        state.screen_rows.clear();
+        crate::render::render_scrolled(frame, area, state, lines);
+        return;
     }
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(frame, area, lines, &rows, focus, &theme, &mut hits);
-    state.screen_rows = hits;
+
+    let selected = state.schedule.selected;
+    for (index, view) in state.schedule.items.iter().enumerate() {
+        let is_selected = index == selected;
+        if is_selected {
+            focus = lines.len();
+        }
+        let state_text = schedule_state(view, &t.schedules);
+        let (glyph, tone) = if view.running {
+            ("●", crate::render::RowTone::Info)
+        } else if escape_state(view) {
+            ("!", crate::render::RowTone::Warning)
+        } else if !view.enabled {
+            ("○", crate::render::RowTone::Muted)
+        } else {
+            ("●", crate::render::RowTone::Success)
+        };
+        let next = fmt_optional_time(view.next_run_at.as_ref());
+        let description = format!("{} · {}", trigger_label(&view.trigger, &t.schedules), next);
+        let row = crate::render::ListRow::new(view.name.clone())
+            .status(glyph, tone)
+            .meta(state_text)
+            .description(description);
+        let paint = crate::render::row_paint(state, &view.id, is_selected, true);
+        let row_lines = crate::render::list_row_lines(&row, paint, &theme, width);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key: view.id.clone(),
+        });
+        lines.extend(row_lines);
+    }
+    crate::render::render_list_rows_with_spans(
+        frame,
+        area,
+        lines,
+        &hits,
+        focus,
+        &theme,
+        &mut state.screen_rows,
+    );
 }
 
 fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -2996,6 +2988,38 @@ mod tests {
         assert_eq!(state.schedule.selected, 0);
         assert!(state.schedule.detail.is_none());
         assert!(matches!(sent[0], ScheduleRequest::List { .. }));
+    }
+
+    #[test]
+    fn a_refreshed_list_keeps_the_selected_schedule_not_its_old_index() {
+        let mut state = state();
+        let _ = open(&mut state);
+        let query = state.schedule.list_query.clone().unwrap();
+        apply_response(
+            &mut state,
+            &query,
+            ScheduleResponse::List {
+                schedules: vec![view("a"), view("b")],
+            },
+        );
+        state.schedule.selected = 1;
+        let _ = list_effect(&mut state);
+        let query = state.schedule.list_query.clone().unwrap();
+        apply_response(
+            &mut state,
+            &query,
+            ScheduleResponse::List {
+                schedules: vec![view("b"), view("a")],
+            },
+        );
+        assert_eq!(
+            state
+                .schedule
+                .items
+                .get(state.schedule.selected)
+                .map(|view| view.id.as_str()),
+            Some("b")
+        );
     }
 
     #[test]

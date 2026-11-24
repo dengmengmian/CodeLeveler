@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Truncate a string to at most `max` display columns, adding an ellipsis.
@@ -148,6 +150,45 @@ pub(crate) fn wrap_with_joiners(text: &str, width: usize) -> Vec<(String, Option
     out
 }
 
+/// Byte spans of the rows [`wrap_with_joiners`] paints, into the sanitized text.
+///
+/// A soft-wrap joiner is not part of either row. An empty logical line is an
+/// empty span, so a chip can be hit on the row that actually draws it.
+pub(crate) fn wrap_row_spans(
+    text: &str,
+    width: usize,
+) -> (std::borrow::Cow<'_, str>, Vec<Range<usize>>) {
+    let source = sanitize_terminal_text(text);
+    let text = source.as_ref();
+    if text.is_empty() {
+        return (source, vec![0..0]);
+    }
+    let mut spans = Vec::new();
+    let mut line_at = 0usize;
+    for logical in text.split('\n') {
+        if logical.is_empty() {
+            spans.push(line_at..line_at);
+        } else {
+            let pieces = textwrap::wrap(logical, width);
+            let mut rest = logical;
+            let mut consumed = 0usize;
+            for piece in pieces {
+                let piece = piece.as_ref();
+                let start = rest.find(piece).unwrap_or(0);
+                let end = start.saturating_add(piece.len()).min(rest.len());
+                spans.push((line_at + consumed + start)..(line_at + consumed + end));
+                consumed += end;
+                rest = &rest[end..];
+            }
+        }
+        line_at += logical.len();
+        if line_at < text.len() {
+            line_at += 1;
+        }
+    }
+    (source, spans)
+}
+
 /// Take a display-width prefix of at most `room` cells; return (piece, rest).
 /// Used by the composer soft-wrap path so a long typed line becomes multiple
 /// visual rows instead of overflowing the box.
@@ -179,6 +220,10 @@ pub(crate) struct TextRow {
     /// Display column of the caret within the painted row — the indent the
     /// caller supplies is already counted — when the caret is on this row.
     pub(crate) caret_col: Option<usize>,
+    /// Byte range of `text` inside the buffer that was wrapped. The bounds are
+    /// char boundaries, so a chip can be hit-tested against the row it paints.
+    pub(crate) start_byte: usize,
+    pub(crate) end_byte: usize,
 }
 
 /// Wrap a text buffer into display rows and map the caret onto its row.
@@ -198,8 +243,10 @@ pub(crate) fn wrap_with_caret(
     let (caret_line, caret_col) = caret;
     let mut rows: Vec<TextRow> = Vec::new();
     let mut caret_row = 0usize;
+    let mut line_at = 0usize;
     for (index, line) in buffer.split('\n').enumerate() {
         let mut rest = line;
+        let mut consumed = 0usize;
         let mut first = true;
         // At least one visual row per logical line (empty line still paints).
         loop {
@@ -210,6 +257,7 @@ pub(crate) fn wrap_with_caret(
             };
             let room = avail.saturating_sub(indent).max(1);
             let start_col = UnicodeWidthStr::width(&line[..line.len() - rest.len()]);
+            let piece_start = line_at + consumed;
             let (piece, next) = if rest.is_empty() && first {
                 (String::new(), "")
             } else if rest.is_empty() {
@@ -217,6 +265,8 @@ pub(crate) fn wrap_with_caret(
             } else {
                 take_display_prefix(rest, room)
             };
+            let piece_end = piece_start + piece.len();
+            consumed = piece_end - line_at;
             // Map the caret onto display columns [start_col, start_col + w].
             let piece_w = UnicodeWidthStr::width(piece.as_str());
             let col = if index == caret_line
@@ -239,12 +289,19 @@ pub(crate) fn wrap_with_caret(
             rows.push(TextRow {
                 text: piece,
                 caret_col: col,
+                start_byte: piece_start,
+                end_byte: piece_end,
             });
             rest = next;
             first = false;
             if rest.is_empty() {
                 break;
             }
+        }
+        line_at += line.len();
+        if line_at < buffer.len() {
+            // The `\n` that `split` dropped. It is not part of either row.
+            line_at += 1;
         }
     }
     (rows, caret_row)
@@ -290,7 +347,7 @@ mod pad_tests {
 
 #[cfg(test)]
 mod wrap_joiner_tests {
-    use super::wrap_with_joiners;
+    use super::{wrap_row_spans, wrap_with_joiners};
 
     fn joined(text: &str, width: usize) -> String {
         let rows = wrap_with_joiners(text, width);
@@ -302,6 +359,23 @@ mod wrap_joiner_tests {
             out.push_str(row);
         }
         out
+    }
+
+    #[test]
+    fn row_spans_are_the_bytes_each_painted_row_came_from() {
+        for (text, width) in [
+            ("[图片 #1] hello", 80usize),
+            ("hello world again", 11),
+            ("这是一段会被自动换行的中文文本", 4),
+            ("a\n\nb", 10),
+        ] {
+            let (source, spans) = wrap_row_spans(text, width);
+            let rows = wrap_with_joiners(source.as_ref(), width);
+            assert_eq!(spans.len(), rows.len(), "{text:?}");
+            for (span, (piece, _)) in spans.iter().zip(rows) {
+                assert_eq!(&source[span.clone()], piece, "{text:?}");
+            }
+        }
     }
 
     #[test]

@@ -981,6 +981,10 @@ pub enum RuntimeEvent {
         level: NotificationLevel,
         message: String,
     },
+    /// What this turn's message selected and whether each Skill package was
+    /// loaded into the turn context. Emitted once at turn start; the durable
+    /// record is the engine's skill-delivery audit event.
+    SkillDelivery { delivery: crate::UiSkillDelivery },
     /// A background process task was started (`run_command` background=true).
     BackgroundTaskStarted {
         task_id: String,
@@ -1505,6 +1509,8 @@ mod tests {
                     sha256: "deadbeef".to_string(),
                     width: Some(100),
                     height: None,
+                    source_path: None,
+                    preview_path: None,
                 },
             },
             "attachment_added",
@@ -2203,6 +2209,26 @@ mod tests {
         assert_eq!(report.verdict, crate::UiReviewVerdict::default());
         assert_eq!(report.summary.conclusion, None);
         assert_eq!(report.report, "旧报告");
+    }
+
+    #[test]
+    fn skill_delivery_roundtrips() {
+        roundtrip(
+            RuntimeEvent::SkillDelivery {
+                delivery: crate::UiSkillDelivery {
+                    entries: vec![crate::UiSkillDeliveryEntry {
+                        name: "deploy".to_string(),
+                        requested_as: "/deploy".to_string(),
+                        scope: Some(crate::UiSkillScope::Project),
+                        source: Some(crate::UiSkillSource::Native),
+                        bytes: 2048,
+                        failure: Some(crate::UiSkillDeliveryFailure::Disabled),
+                    }],
+                    blocked: None,
+                },
+            },
+            "skill_delivery",
+        );
     }
 
     #[test]

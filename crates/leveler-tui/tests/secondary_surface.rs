@@ -67,12 +67,23 @@ fn col_of(line: &str, needle: &str) -> Option<usize> {
     line.find(needle).map(|b| line[..b].chars().count())
 }
 
+/// Text between the modal side borders. The page gutter is measured there.
+fn modal_body(line: &str) -> &str {
+    let Some(start) = line.find('│') else {
+        return line;
+    };
+    let rest = &line[start + '│'.len_utf8()..];
+    let end = rest.rfind('│').unwrap_or(rest.len());
+    &rest[..end]
+}
+
 /// The shell's safe horizontal margin, as the product specifies it: two
 /// columns from 80 up, one in the 40–79 band, none below — where every column
 /// is needed for the content and the nav to stay readable.
 ///
 /// Spelled out rather than read from the code under test: this is the
 /// user-facing contract, so a change to it should fail here and be argued for.
+/// `width` is the page column, not the terminal.
 fn gutter(width: u16) -> usize {
     match width {
         w if w >= 80 => 2,
@@ -247,32 +258,48 @@ fn secondary_pages_use_the_shared_shell() {
     let mut s = opened();
     s.active_screen = Screen::Help;
     let lines = frame(&mut s, 100, 24);
+    let nav_at = lines
+        .iter()
+        .position(|line| modal_body(line).contains("帮助"))
+        .expect("a title row");
+    let header = modal_body(&lines[nav_at]);
     assert!(
-        lines[0].contains("← ") && lines[0].contains("帮助"),
-        "identity header: {:?}",
-        lines[0]
-    );
-    assert!(!lines[0].contains("CodeLeveler"), "no stacked app header");
-    // The rule shares the header's and the body's safe margin.
-    assert!(
-        lines[1][gutter(100)..].starts_with('─'),
-        "rule under the header, on the page gutter: {:?}",
-        lines[1]
+        header.contains("帮助") && header.contains("[×]") && !header.contains("← "),
+        "identity header: {header:?}"
     );
     assert!(
-        !lines[1].starts_with('─'),
-        "the rule does not run out to the terminal edge: {:?}",
-        lines[1]
+        !header.contains("CodeLeveler"),
+        "no stacked app header on the page"
+    );
+    // One host rule spans the inner width under the title, inside the border.
+    // The page body starts on the next row; the rule does not add a second
+    // header or a page-edge ornament.
+    let rule = modal_body(&lines[nav_at + 1]);
+    assert!(
+        rule.starts_with('─') && rule.chars().all(|c| c == '─'),
+        "rule under the header: {rule:?}"
     );
     // Help now owns a search box, so its footer teaches searching rather than
     // plain scrolling.
+    let hint = footer_hint(&lines);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("Esc") && l.contains("搜索")),
-        "footer hint present:\n{}",
-        lines.join("\n")
+        hint.contains("Esc") && hint.contains("搜索"),
+        "footer hint present: {hint}"
     );
+}
+
+/// The footer wraps at the content width. Read the whole hint block so a key
+/// that lands on the second row is still checked against the same page state.
+fn footer_hint(lines: &[String]) -> String {
+    let end = lines
+        .iter()
+        .rposition(|line| line.contains("Esc"))
+        .expect("a footer with Esc");
+    let mut start = end;
+    while start > 0 && lines[start - 1].contains("·") {
+        start -= 1;
+    }
+    lines[start..=end].join(" ")
 }
 
 /// The Context footer lists only bindings this view really answers.
@@ -281,11 +308,7 @@ fn context_footer_lists_only_real_keys() {
     let mut s = opened();
     s.active_screen = Screen::Context;
     let lines = frame(&mut s, 100, 24);
-    let footer = lines
-        .iter()
-        .rev()
-        .find(|l| l.contains("Esc"))
-        .expect("footer hint");
+    let footer = footer_hint(&lines);
     assert!(
         footer.contains("Enter"),
         "Enter toggles disclosure: {footer}"

@@ -35,7 +35,9 @@ pub(super) fn touch_slash_filter(state: &mut AppState) {
     // ranges. A response that lands later is dropped by request identity.
     state.completion.reset_on_edit();
     crate::suggestion::dismiss(state);
-    if crate::screen::skill_mention_query(state).is_some() {
+    if crate::screen::skill_mention_query(state).is_some()
+        || crate::screen::composer_types_slash(state)
+    {
         refresh_skill_catalog(state);
     }
 }
@@ -110,18 +112,47 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
             let rest_expanded = expanded.strip_prefix('/').unwrap_or(expanded);
             return handle_slash(state, rest_expanded.trim());
         }
-        // Reserve unknown-command feedback for SINGLE-LINE command-shaped
-        // typos such as `/hlep`. Absolute paths (`/Users/...`), file names,
-        // and multiline slash-prefixed prose are ordinary messages.
-        if !command_text.contains('\n') && looks_like_unknown_slash_command(name) {
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: state.t().unknown_command_kept.replace("{name}", name),
-            });
-            return Vec::new();
+        // A known Skill is a real request: a usable one is sent as typed and
+        // the runtime injects its procedure; a refused one never becomes a
+        // model turn. Only an unknown name falls through to the typo warning.
+        match crate::skills::classify_slash_skill_request(state, command_text) {
+            crate::skills::SlashSkillRequest::Usable => {}
+            crate::skills::SlashSkillRequest::Refused(error) => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: skill_refusal_copy(state.t(), &error),
+                });
+                return Vec::new();
+            }
+            // Reserve unknown-command feedback for SINGLE-LINE command-shaped
+            // typos such as `/hlep`. Absolute paths (`/Users/...`), file
+            // names, and multiline slash-prefixed prose are ordinary messages.
+            crate::skills::SlashSkillRequest::NotASkill => {
+                if !command_text.contains('\n') && looks_like_unknown_slash_command(name) {
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Warning,
+                        message: state.t().unknown_command_kept.replace("{name}", name),
+                    });
+                    return Vec::new();
+                }
+            }
         }
     }
     if state.is_busy() {
+        // A Skill request is a procedure load, and a steer is appended as
+        // plain text at the next model round — the procedure would be
+        // silently lost. Refuse explicitly and leave the draft intact.
+        if let Some(request) = crate::skills::mid_turn_skill_request(state, command_text) {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state
+                    .t()
+                    .skills
+                    .invoke_mid_turn
+                    .replace("{request}", &request),
+            });
+            return Vec::new();
+        }
         // Images have no mid-turn delivery lane: a steer is text only, and
         // sending the text without them would detach the message from the
         // picture the user staged. Say so and leave the draft untouched.
@@ -214,6 +245,43 @@ fn looks_like_unknown_slash_command(name: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
 }
 
+/// One-line, localized reason for a refused `/skill`. The registry's own
+/// `Display` is precise but English and repeats the token; the notice keeps
+/// the product language and the specific state.
+fn skill_refusal_copy(
+    t: &crate::i18n::UiText,
+    error: &leveler_skills::SkillCommandError,
+) -> String {
+    use leveler_skills::SkillCommandError;
+    let (token, reason) = match error {
+        SkillCommandError::Unavailable { token, state, .. } => {
+            let reason = if let Some(reason) = state.strip_prefix("disabled:") {
+                format!("{} — {}", t.skills.status_disabled, reason.trim())
+            } else if let Some(reason) = state.strip_prefix("invalid:") {
+                format!("{} — {}", t.skills.status_invalid, reason.trim())
+            } else {
+                state.clone()
+            };
+            (token, reason)
+        }
+        SkillCommandError::UserInvocationDisabled { token, .. } => {
+            (token, t.skills.model_only.to_string())
+        }
+        SkillCommandError::Untrusted { token, state, .. } => {
+            (token, format!("{} — {state}", t.skills.status_untrusted))
+        }
+        SkillCommandError::Shadowed { token, .. } => (token, t.skills.shadowed.to_string()),
+        // Unknown and reserved names never reach this helper.
+        SkillCommandError::NotFound { token } | SkillCommandError::Reserved { token } => {
+            (token, String::new())
+        }
+    };
+    t.skills
+        .invoke_refused
+        .replace("{token}", &format!("/{}", token.trim_start_matches('/')))
+        .replace("{reason}", &reason)
+}
+
 /// Build and send the current composer message with its attachments, clearing
 /// both. Assumes vision gating has already passed.
 pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
@@ -223,7 +291,18 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     let content = state.composer.take();
     let attachments = std::mem::take(&mut state.pending_attachments);
     let shown = state.message_with_images(attachments.len(), &content);
-    state.transcript.push_user_if_new(shown);
+    state.transcript.push_user_if_new(shown.clone());
+    // The row keeps the chip only. These records are what a later hover
+    // previews, and they never go back into the sentence.
+    if !attachments.is_empty()
+        && let Some(item) = state.transcript.len().checked_sub(1)
+        && matches!(
+            state.transcript.items().get(item),
+            Some(crate::transcript::TranscriptItem::User(text)) if text == &shown
+        )
+    {
+        crate::image_preview::remember_sent_images(state, item, shown, attachments.clone());
+    }
     // Stage the turn's goal identity before it flips to Busy. In Goal mode
     // every turn belongs to the goal on screen; in Chat the runtime's own
     // structured intent decides whether this message re-enters a goal, and the
@@ -1758,6 +1837,10 @@ pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
         });
         return Vec::new();
     }
+    vec![Effect::Send(change_collaboration(state, collab))]
+}
+
+pub(super) fn change_collaboration(state: &mut AppState, collab: &str) -> ClientCommand {
     state.collaboration = collab.to_string();
     // `plan` is a runtime-derived read-only TOOL overlay: `collaboration=plan`
     // makes the runtime compute `read_only`. It does NOT change the permission
@@ -1771,30 +1854,20 @@ pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
         level: NotificationLevel::Info,
         message,
     });
-    vec![Effect::Send(ClientCommand::SetProductAxes {
+    ClientCommand::SetProductAxes {
         session_id: state.session_id.clone(),
         work_profile: "single".into(), // Legacy wire field; no product axis.
         collaboration: state.collaboration.clone(),
-    })]
-}
-
-/// Expand `~/…` repository display paths for filesystem discovery.
-fn skill_root(state: &AppState) -> Option<std::path::PathBuf> {
-    let raw = state.repository.as_deref()?;
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = leveler_core::environment()
-            .var_os("HOME")
-            .or_else(|| leveler_core::environment().var_os("USERPROFILE"))
-    {
-        return Some(std::path::PathBuf::from(home).join(rest));
     }
-    Some(std::path::PathBuf::from(raw))
 }
 
-/// Rescan project + user skills when the root changes (or first `$` keystroke).
+/// Rescan project + user skills when the root changes (or first `$` / `/`
+/// keystroke). Both completion surfaces come from the same resolved registry
+/// the runtime loads, so the menu and the loader cannot disagree.
 pub(super) fn refresh_skill_catalog(state: &mut AppState) {
-    let Some(root) = skill_root(state) else {
+    let Some(root) = crate::skills::repository_root(state) else {
         state.skill_catalog.clear();
+        state.skill_commands.clear();
         state.skill_catalog_root = None;
         return;
     };
@@ -1802,56 +1875,43 @@ pub(super) fn refresh_skill_catalog(state: &mut AppState) {
     if state.skill_catalog_root.as_deref() == Some(key.as_str()) {
         return;
     }
-    state.skill_catalog = leveler_skills::discover(&root)
+    let Some(registry) = crate::skills::registry_for(state) else {
+        state.skill_catalog.clear();
+        state.skill_commands.clear();
+        state.skill_catalog_root = None;
+        return;
+    };
+    state.skill_catalog = registry
+        .user_summaries()
         .into_iter()
-        // Keep only names a `$name` mention can spell.
-        .filter(|s| looks_like_unknown_slash_command(&s.name))
+        // Keep only names a `$name` mention can spell. `is_mentionable` allows
+        // uppercase external names; the old lowercase-only filter silently hid
+        // valid packages.
+        .filter(|s| leveler_skills::is_mentionable(&s.name))
         .map(|s| (s.name, s.description))
         .collect();
+    state.skill_commands = registry
+        .command_catalog(leveler_skills::RESERVED_SLASH_NAMES)
+        .commands;
     state.skill_catalog_root = Some(key);
 }
 
-/// `/skills` lists the resolved skill registry; `/skills <name>` shows one
-/// entry. Read-only, and local: it reads the same registry `$name` and
+/// `/skills` opens the Skills management page; `/skills <query>` opens it with
+/// the search applied. The page reads the same registry `$name` and
 /// `load_skill` use, so the listing cannot drift from what loads.
 fn skills_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let registry = match skill_root(state) {
-        Some(root) => leveler_skills::describe(&root),
-        None => leveler_skills::SkillRegistry::load(
-            &leveler_skills::SkillRoots::empty(),
-            &leveler_definition_trust::DefinitionTrustView::deny_all(),
-        ),
-    };
     let name = command.strip_prefix("skills").unwrap_or(command).trim();
-    let t = state.t();
-    let note = if name.is_empty() {
-        crate::skills_view::listing_note(&registry, t)
-    } else {
-        crate::skills_view::detail_note(&registry, name, t)
-    };
-    state.transcript.push_note(note);
-    Vec::new()
+    crate::skills::open(state, name)
 }
 
-/// `/agents` lists the agents this project resolves; `/agents <name>` shows one
-/// definition. Read-only: the TUI does not write agent files.
+/// `/agents` opens the extensions workspace on Agents; `/agents <name>` opens
+/// that definition. Read-only: the TUI does not write agent files.
 fn agents_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let name = command.strip_prefix("agents").unwrap_or(command).trim();
     if name.is_empty() || name == "list" {
-        let query_id = leveler_client_protocol::CommandId::generate();
-        state.agents_list_query = Some(query_id.clone());
-        return vec![Effect::Send(ClientCommand::ListAgents {
-            session_id: state.session_id.clone(),
-            query_id: Some(query_id),
-        })];
+        return crate::agents_view::open_list(state);
     }
-    let query_id = leveler_client_protocol::CommandId::generate();
-    state.agent_detail_query = Some(query_id.clone());
-    vec![Effect::Send(ClientCommand::GetAgent {
-        session_id: state.session_id.clone(),
-        name: name.to_string(),
-        query_id: Some(query_id),
-    })]
+    crate::agents_view::open_named(state, name)
 }
 
 /// `/goal <task>` starts a goal turn; `/goal status` and `/goal clear` manage it.

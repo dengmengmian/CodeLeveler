@@ -98,5 +98,471 @@
         "verdict": "MEASURED"
       }
     ]
+  },
+  "quality_closure": {
+    "generated_at": "2026-11-22T13:23:51Z",
+    "overall_status": "CONDITIONAL_CLOSED",
+    "overall_note": "Post-release closure of the published v1.0.28 package. The original release verdict (CONDITIONAL PASS, state RELEASED) is unchanged. No confirmed performance regression and no confirmed product defect were found, so no candidate-tree fix is claimed and no emergency v1.0.29 patch is recommended on defect grounds. Retained conditions: the 24-hour soak has not reached 24 hours; Windows, Linux and Intel macOS have no host; the published-binary A/B is INCONCLUSIVE; the historical steer/exit timeout is FLAKY_UNRESOLVED; and 35 of 50 declared gaps remain open.",
+    "phases": [
+      {
+        "phase": "A",
+        "area": "release identity, L3/L4 definitions, token accounting, gaps and warnings",
+        "status": "PASS",
+        "evidence": "docs/dev/v1.0.28-post-release/phase-a-audit.md"
+      },
+      {
+        "phase": "B",
+        "area": "published v1.0.27 vs v1.0.28 performance, interleaved A/B",
+        "status": "INCONCLUSIVE",
+        "evidence": "docs/releases/v1.0.28/closure/performance.md"
+      },
+      {
+        "phase": "C",
+        "area": "published-package platform acceptance",
+        "status": "PARTIAL",
+        "evidence": "docs/releases/v1.0.28/closure/platforms.md"
+      },
+      {
+        "phase": "D",
+        "area": "steer/exit flake investigation",
+        "status": "FLAKY_UNRESOLVED",
+        "evidence": "docs/dev/v1.0.28-post-release/phase-d-flake.md"
+      },
+      {
+        "phase": "E",
+        "area": "24-hour soak",
+        "status": "IN_PROGRESS",
+        "evidence": "docs/dev/v1.0.28-post-release/phase-e-soak.md"
+      },
+      {
+        "phase": "F",
+        "area": "declared-gap audit and offline closure",
+        "status": "PASS",
+        "evidence": "docs/dev/v1.0.28-post-release/phase-f-gap-map.md"
+      }
+    ],
+    "evidence_links": [
+      {
+        "label": "Closure index and retained conditions",
+        "path": "../../releases/v1.0.28/closure/README.md"
+      },
+      {
+        "label": "Phase A — release and L4 token audit",
+        "path": "../../dev/v1.0.28-post-release/phase-a-audit.md"
+      },
+      {
+        "label": "Phase B — published-binary A/B",
+        "path": "../../dev/v1.0.28-post-release/phase-b-performance.md"
+      },
+      {
+        "label": "Phase C — macOS acceptance evidence",
+        "path": "../../dev/v1.0.28-post-release/evidence/macos-arm64/README.md"
+      },
+      {
+        "label": "Phase D — flake stress evidence",
+        "path": "../../dev/v1.0.28-post-release/phase-d-flake.md"
+      },
+      {
+        "label": "Phase E — soak method and live run",
+        "path": "../../dev/v1.0.28-post-release/phase-e-soak.md"
+      },
+      {
+        "label": "Phase F — gap audit",
+        "path": "../../dev/v1.0.28-post-release/phase-f-gap-map.md"
+      },
+      {
+        "label": "Fix report",
+        "path": "../../releases/v1.0.28/closure/fixes.md"
+      }
+    ]
+  },
+  "platform_matrix": [
+    {
+      "platform": "macOS arm64",
+      "host": "Apple M4 Max, macOS 26.6.2, arm64",
+      "status": "PASS",
+      "package_sha256": "c4d2a1b8aef92d2b536f32d1b034a3322e88982f2994782119fc061a3e3ca5d5",
+      "binary_sha256": "5022619d7dda605cc8b57bcd7c5d3b27e409dd56460ccd516efb81592dc9615e",
+      "detail": "published payload, fresh isolated HOME, 34/34 checks: install, version, CLI surfaces, PTY TUI, provider, tool, sessions, Goal/Plan, background, permission boundary, error paths, upgrade from v1.0.27",
+      "evidence": "../../dev/v1.0.28-post-release/evidence/macos-arm64/result.json"
+    },
+    {
+      "platform": "macOS x86_64",
+      "host": "no Intel host attached",
+      "status": "BLOCKED_ENVIRONMENT",
+      "package_sha256": "3b8bb71267394cb6923a346e860b01b707f0b0ce333092d5b1e2f50b812edc1f",
+      "binary_sha256": "d4444279fba3760753a3b36e0ce1ee391d359be050a1d95e0f585df24d2a0417",
+      "detail": "published payload hash verified only; Rosetta smoke is not accepted as native; run accept_macos.py on a real Intel Mac",
+      "evidence": "docs/dev/v1.0.28-post-release/scripts/accept_macos.py"
+    },
+    {
+      "platform": "Linux x86_64",
+      "host": "no x86_64 Linux host",
+      "status": "BLOCKED_ENVIRONMENT",
+      "package_sha256": "2cd0dbbe4975e7e4afedee011c02b4ceef8273ae11f78719a8679c43bc3210b3",
+      "binary_sha256": "787e9cb3259ba2ebcdd790cc616cc6b6251fa72d6ad663700159fea4f51ed386",
+      "detail": "published payload hash verified only; run accept_linux.sh on a real host",
+      "evidence": "docs/dev/v1.0.28-post-release/scripts/accept_linux.sh"
+    },
+    {
+      "platform": "Windows x86_64",
+      "host": "no Windows host",
+      "status": "BLOCKED_ENVIRONMENT",
+      "package_sha256": "eeac133f12edadf25a0c696ac5babcebb8fdae4111440b72838cf9de3fef89b9",
+      "binary_sha256": "eb73498f8c3518b145fbc89f710d3b11d6d48b72c78f47aae7853beac7ec24e2",
+      "detail": "published payload hash verified only; run accept_windows.ps1 in non-elevated PowerShell 7 on a real host",
+      "evidence": "docs/dev/v1.0.28-post-release/scripts/accept_windows.ps1"
+    }
+  ],
+  "performance_ab": {
+    "classification": "INCONCLUSIVE",
+    "method": "six interleaved arms A1 B1 B2 A2 A3 B3 on the same host; 23 Release Lab L3 cases per arm; published v1.0.27 and v1.0.28 macOS arm64 binaries; identical config, model, thinking/reasoning max; fresh project per arm",
+    "summary": "Paired per-case wall +8.5% (95% CI -6.6% to +24.3%, p=0.68), rounds 0.0%, total tokens -1.9%. Quality veto: B3 had one incomplete case (98 vs 100). Not a confirmed regression and not proven parity.",
+    "rows": [
+      {
+        "metric": "wall, paired per-case median",
+        "v027": "baseline",
+        "v028": "+8.5%",
+        "delta": "95% CI -6.6%..+24.3%",
+        "verdict": "INCONCLUSIVE"
+      },
+      {
+        "metric": "rounds, paired per-case median",
+        "v027": "baseline",
+        "v028": "0.0%",
+        "delta": "95% CI -12.5%..+14.3%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "total tokens, paired per-case median",
+        "v027": "baseline",
+        "v028": "-1.9%",
+        "delta": "95% CI -5.8%..+6.2%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "input tokens, paired per-case median",
+        "v027": "baseline",
+        "v028": "-2.0%",
+        "delta": "95% CI -6.3%..+5.9%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "quality (cases passed / score)",
+        "v027": "69/69, 100",
+        "v028": "68/69, B3 98",
+        "delta": "one incomplete case",
+        "verdict": "QUALITY_VETO"
+      },
+      {
+        "metric": "wall p50, arm range",
+        "v027": "21.7-24.2 s",
+        "v028": "23.1-26.7 s",
+        "delta": "arms overlap",
+        "verdict": "NOT SEPARABLE"
+      },
+      {
+        "metric": "CLI startup p50",
+        "v027": "5.90 ms",
+        "v028": "5.81 ms",
+        "delta": "-1.5%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "TUI first paint p50",
+        "v027": "111 ms",
+        "v028": "110 ms",
+        "delta": "-0.9%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "one-turn reply wall p50",
+        "v027": "1.59 s",
+        "v028": "1.56 s",
+        "delta": "-1.9%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "--version peak RSS",
+        "v027": "14640 KiB",
+        "v028": "14512 KiB",
+        "delta": "-0.9%",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "TTFF p50 (median of arm p50s)",
+        "v027": "72 ms",
+        "v028": "75 ms",
+        "delta": "+4.2% (descriptive)",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "model time per case p50 (median of arm p50s)",
+        "v027": "20.4 s",
+        "v028": "22.8 s",
+        "delta": "+11.8% (descriptive)",
+        "verdict": "DESCRIPTIVE"
+      },
+      {
+        "metric": "cached input p50 (median of arm p50s)",
+        "v027": "103168",
+        "v028": "108160",
+        "delta": "90.5% vs 90.2% of input (descriptive)",
+        "verdict": "UNCHANGED"
+      },
+      {
+        "metric": "tool calls (69 case-runs)",
+        "v027": "1021",
+        "v028": "1135",
+        "delta": "+11.2% (descriptive)",
+        "verdict": "DESCRIPTIVE"
+      },
+      {
+        "metric": "recovery rounds (69 case-runs)",
+        "v027": "40",
+        "v028": "58",
+        "delta": "+18 (descriptive)",
+        "verdict": "DESCRIPTIVE"
+      }
+    ],
+    "attribution": [
+      "Wall decomposition: rounds 0.0%, per-round latency +6.0%.",
+      "Input per round +4.7%; total tokens slightly lower.",
+      "Tool calls 328-359 (A) vs 363-399 (B) per arm.",
+      "Per-case wall changes range from -33.1% to +66.2%; no single mechanism explains the point estimate."
+    ],
+    "uncertainty": "Provider taotoken.net exposes no pinnable server-side revision; A3/B3 ran under host load ~14-17 from another session; input is 98%+ cached so provider cache state can shift wall without a code change. TTFF/model-time/tool/recovery counters are descriptive and untested; CPU has no per-arm series."
+  },
+  "coverage_closure": {
+    "declared_gaps_total": 50,
+    "gaps_closed_by_this_closure": 15,
+    "gaps_still_external": 35,
+    "closed": [
+      {
+        "feature": "cli.agents.show",
+        "test": "crates/leveler-cli/tests/agents.rs:115",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.skills.show",
+        "test": "crates/leveler-cli/tests/skills.rs:145",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.permissions.clear",
+        "test": "crates/leveler-cli/tests/permissions.rs:20",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.theme",
+        "test": "crates/leveler-cli/tests/cli_surface_contract.rs:118,188",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.models.show",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:194",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.sessions.show",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:91",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.sessions.rename",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:129",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.sessions.delete",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:161",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.background.journal",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:331",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.schedule.resume",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:219",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.mcp",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:283",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.mcp.add",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:283",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.mcp.list",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:283",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.mcp.remove",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs:283",
+        "status": "CLOSED"
+      },
+      {
+        "feature": "cli.eval.trend",
+        "test": "crates/leveler-cli/tests/cli_state_contract.rs (eval_trend test)",
+        "status": "CLOSED"
+      }
+    ],
+    "partial": [
+      {
+        "feature": "cli.background",
+        "status": "PARTIAL",
+        "detail": "soak driver exercises background success/failure; not a CLI contract"
+      },
+      {
+        "feature": "cli.run",
+        "status": "PARTIAL",
+        "detail": "exercised throughout Phases B/C/E; no single missing contract"
+      },
+      {
+        "feature": "cli.serve",
+        "status": "PARTIAL",
+        "detail": "resident path exercised indirectly; no deterministic offline acceptance"
+      },
+      {
+        "feature": "permission.windows-write-confine",
+        "status": "PARTIAL",
+        "detail": "needs a real Windows host"
+      }
+    ],
+    "unverified": [
+      {
+        "feature": "tests.session-replay",
+        "status": "UNVERIFIED",
+        "detail": "corpus tests are #[ignore]d; not run in this closure"
+      },
+      {
+        "feature": "tui.slash.fork",
+        "status": "UNVERIFIED",
+        "detail": "needs a PTY fork flow; not run in this closure"
+      }
+    ],
+    "external": [
+      {
+        "feature": "cli.eval / cli.eval.ablate / cli.eval.compare / cli.login / cli.logout / cli.model.probe",
+        "status": "EXTERNAL",
+        "detail": "6 features need a real model run, provider credential flow or provider network; not counted as passing"
+      },
+      {
+        "feature": "install.homebrew / install.shell-script",
+        "status": "NOT_RUN",
+        "detail": "no local tap install or installer run; Phase C places the payload directly"
+      },
+      {
+        "feature": "TUI slash commands (attach, clean, context, doctor, export, remote, remote-loc, skills, theme, update)",
+        "status": "NOT_RUN",
+        "detail": "10 features need individual PTY contracts"
+      },
+      {
+        "feature": "cli.schedule.enable / .disable / .uninstall / .doctor",
+        "status": "NOT_RUN",
+        "detail": "4 features touch live launchd/Task Scheduler; historical E2E not re-executed"
+      },
+      {
+        "feature": "cli.desktop-bridge / cli.execution-host / cli.remote.*",
+        "status": "EXTERNAL",
+        "detail": "13 features need a second device/host, live daemon or desktop host"
+      }
+    ]
+  },
+  "flake": {
+    "test": "an_exit_racing_a_steer_keeps_the_result_and_the_message",
+    "status": "FLAKY_UNRESOLVED",
+    "runs": "1320 closure runs + 450 prior (200 isolated, 320 at concurrency 4, 800 at concurrency 8 with 8 CPU burners)",
+    "failures": "0 failures, 0 timeouts",
+    "conclusion": "The historical 20 s timeout did not reproduce and the original log was not retained. Code analysis found the steering/admission paths serialized by one mutex; no race was confirmed. No source change and no timeout increase.",
+    "evidence": "docs/dev/v1.0.28-post-release/phase-d-flake.md"
+  },
+  "fixes": [
+    {
+      "id": "none",
+      "severity": "none",
+      "root_cause": "No confirmed product defect in the published v1.0.28 package",
+      "fix": "No product fix. Three closure-harness defects were corrected in docs/dev scripts only (acceptance probe path premise; soak TUI language/composer predicate; soak process-count scope); see closure/fixes.md",
+      "commit": "—",
+      "tests": "published binary acceptance 34/34; flake 1320 runs; Phase A/B/F audits",
+      "affects_published": "no"
+    }
+  ],
+  "residual_risks": [
+    {
+      "risk": "Windows, Linux and Intel macOS runtime unverified",
+      "severity": "high",
+      "evidence": "no host attached; payload hashes verified only",
+      "impact": "platform-specific install, sandbox, scheduler and TUI behaviour is unknown",
+      "next_action": "run the provided acceptance scripts on real hosts"
+    },
+    {
+      "risk": "24-hour soak incomplete",
+      "severity": "high",
+      "evidence": "restarted 2026-11-22T13:15:52Z; target 2026-11-23T13:15:52Z",
+      "impact": "long-run leaks, rare stalls and TUI degradation are not characterized",
+      "next_action": "let the running soak finish and read result.json; do not mark PASS before 24 h"
+    },
+    {
+      "risk": "Published-binary A/B is inconclusive",
+      "severity": "medium",
+      "evidence": "paired wall +8.5%, 95% CI -6.6%..+24.3%, quality veto in B3",
+      "impact": "cannot separate a code effect from provider drift and host load",
+      "next_action": "repeat with a pinnable provider revision and longer interleaving"
+    },
+    {
+      "risk": "Steer/exit flake unresolved",
+      "severity": "medium",
+      "evidence": "0/1320 reproduction; original log lost",
+      "impact": "a rare CI timeout may recur",
+      "next_action": "keep the stress driver; capture the helper and event sequence on recurrence"
+    },
+    {
+      "risk": "35 declared gaps remain open",
+      "severity": "medium",
+      "evidence": "6 external, 2 installer, 10 TUI slash, 4 OS scheduler, 13 extended product",
+      "impact": "features without dedicated process-level coverage",
+      "next_action": "re-map the 15 closed entries in the next gate inventory; schedule the remaining groups"
+    },
+    {
+      "risk": "Restricted mode permits writes to shared temp",
+      "severity": "low",
+      "evidence": "WriteScope::Workspace includes /tmp; acceptance observed a /tmp write without approval",
+      "impact": "by design, but users may read 'write confined' as workspace-only; planted temp files are possible",
+      "next_action": "document the temp/cache roots in the user-facing permission description"
+    },
+    {
+      "risk": "15 gap-closure tests are uncommitted",
+      "severity": "low",
+      "evidence": "crates/leveler-cli/tests/cli_state_contract.rs is untracked and cli_surface_contract.rs is modified; no commit was authorized",
+      "impact": "the new process-level contracts do not yet run in the repository's regular regression",
+      "next_action": "commit the test additions after review; keep the real-process setup and assertions"
+    },
+    {
+      "risk": "Provider model revision is not pinnable",
+      "severity": "medium",
+      "evidence": "taotoken.net exposes no server-side revision",
+      "impact": "performance and quality comparisons cannot exclude provider drift",
+      "next_action": "record provider revision when available or use a pinned deployment"
+    }
+  ],
+  "soak": {
+    "status": "IN_PROGRESS",
+    "run_id": "pr28-soak-20261122T131552Z",
+    "code_sha": "5022619d7dda605cc8b57bcd7c5d3b27e409dd56460ccd516efb81592dc9615e",
+    "started_at": "2026-11-22T13:15:52Z",
+    "elapsed": "0h 07m",
+    "target": "24 h (ends 2026-11-23T13:15:52Z)",
+    "verdict": "IN_PROGRESS",
+    "headline": "24-hour Soak: IN_PROGRESS (not PASS)",
+    "short_note": "0h 07m of 24 h (0.6%); not PASS before the target",
+    "note": "Published v1.0.28 binary, real provider, live PTY TUI plus headless cycles: tool, Goal, background success/failure, abnormal kill + resume, compaction, steer, resource samples and heartbeat. A first run was stopped in cycle 0 (10 rows, all PASS) because its process counter matched unrelated host daemons; the counter is scoped to the lab and the run restarted. Cycle 0 of the current run: TUI start PASS (308 ms), tool/Goal/background/abnormal-exit/recovery/compaction PASS, scoped process count 5, heartbeat written. Host load 11.6/22.3/20.6 from an unrelated workspace test in another session. Authority: /tmp/pr28-soak/heartbeat.json during the run; result.json only if it completes."
   }
 }

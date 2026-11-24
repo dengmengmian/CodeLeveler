@@ -255,11 +255,13 @@ approval, exactly like a `SKILL.md` edit. References must be regular UTF-8
 files: a symlink inside `references/` makes the package invalid rather than
 letting the approved manifest name bytes that can change behind the digest.
 
-`load_skill` reads the package once, verifies the digest, and hands the model
-the verified reference text inline. The renderer no longer tells the model to
-`read_file` a reference path, and the file tools refuse a direct path read of
-`SKILL.md` or a reference in restricted modes; recursive search drops those
-paths from its results. The only verified channel is the package loader.
+`load_skill` and explicit skill invocations verify the package digest and
+deliver the procedure and a reference manifest. During that turn, `read_file`
+can page a listed reference using the exact package version delivered to the
+model. The host rechecks current approval and serves only bytes from the
+verified package. If the package changed, the read identifies the requested
+reference and fails. Ordinary path reads of `SKILL.md` and unbound references
+remain restricted, and recursive search drops those paths from its results.
 
 `scripts/` and other bundled files are ordinary tool resources, not approved
 instruction content. Approving a skill does not authorize executing its

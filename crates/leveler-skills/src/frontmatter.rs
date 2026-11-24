@@ -6,6 +6,11 @@
 
 use serde::Deserialize;
 
+/// Upper bound for a displayed argument hint. A hint is a one-line affordance,
+/// not instruction content: it is truncated rather than allowed to grow the
+/// completion row without bound.
+const MAX_ARGUMENT_HINT_CHARS: usize = 120;
+
 /// Frontmatter fields this runtime understands. Unknown keys (a compatible
 /// tool's extension fields) are ignored, so a package written elsewhere still
 /// loads.
@@ -13,6 +18,15 @@ use serde::Deserialize;
 pub struct Frontmatter {
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(rename = "argument-hint")]
+    pub argument_hint: Option<String>,
+    /// Whether `/` and `$` may invoke this Skill. Defaults to true.
+    #[serde(rename = "user-invocable")]
+    pub user_invocable: Option<bool>,
+    /// Whether the model may discover and `load_skill` this Skill. Defaults to
+    /// false, preserving the current model-discovery behavior.
+    #[serde(rename = "disable-model-invocation")]
+    pub disable_model_invocation: Option<bool>,
 }
 
 impl Frontmatter {
@@ -32,6 +46,36 @@ impl Frontmatter {
             .map(str::trim)
             .filter(|d| !d.is_empty())
             .map(|d| d.to_string())
+    }
+
+    /// The optional display-only argument hint, flattened to one bounded line.
+    ///
+    /// It never participates in parsing, permissions or loading: it only tells
+    /// the user what shape of arguments a procedure expects.
+    pub fn argument_hint(&self) -> Option<String> {
+        let hint = self.argument_hint.as_deref()?;
+        let mut line = String::new();
+        for character in hint.chars().take(MAX_ARGUMENT_HINT_CHARS) {
+            line.push(if character.is_control() || character.is_whitespace() {
+                ' '
+            } else {
+                character
+            });
+        }
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!collapsed.is_empty()).then_some(collapsed)
+    }
+
+    /// Explicit user invocation (`/name`, `$name`) is allowed unless the
+    /// package says otherwise.
+    pub fn user_invocable(&self) -> bool {
+        self.user_invocable.unwrap_or(true)
+    }
+
+    /// Model discovery and `load_skill` are allowed unless the package opts
+    /// out. The default preserves every Skill authored before this field.
+    pub fn disable_model_invocation(&self) -> bool {
+        self.disable_model_invocation.unwrap_or(false)
     }
 }
 
@@ -100,5 +144,36 @@ mod tests {
             parse("---\r\nname: deploy\r\ndescription: Ship it.\r\n---\r\n\r\nBody\r\n").unwrap();
         assert_eq!(parsed.frontmatter.name(), Some("deploy"));
         assert_eq!(parsed.body, "Body\n");
+    }
+
+    #[test]
+    fn argument_hint_is_one_bounded_line() {
+        let parsed = parse(
+            "---\nname: deploy\ndescription: Ship it.\nargument-hint: \"<env>\\n  [--force]\"\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.frontmatter.argument_hint().as_deref(),
+            Some("<env> [--force]")
+        );
+    }
+
+    #[test]
+    fn argument_hint_is_absent_without_the_key() {
+        let parsed = parse("---\nname: deploy\ndescription: Ship it.\n---\nbody\n").unwrap();
+        assert_eq!(parsed.frontmatter.argument_hint(), None);
+    }
+
+    #[test]
+    fn argument_hint_is_truncated_and_controls_are_stripped() {
+        let long = "x".repeat(200);
+        let parsed = parse(&format!(
+            "---\nname: deploy\ndescription: Ship it.\nargument-hint: \"{long}\"\n---\nbody\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.frontmatter.argument_hint().as_deref(),
+            Some("x".repeat(120).as_str())
+        );
     }
 }

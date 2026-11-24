@@ -568,8 +568,8 @@ fn renders_failed_tool_inline_and_tools_screen() {
     let tools = render_at(100, 24, &mut state);
     assert!(tools.contains("工具"), "tools screen title missing");
     assert!(
-        tools.contains("run_command · cargo test"),
-        "tools screen list should include the tool target"
+        tools.contains("run_command") && tools.contains("cargo test"),
+        "tools screen list should include the tool target: {tools}"
     );
     assert!(tools.contains("Esc 返回"), "tools screen footer missing");
 
@@ -1719,14 +1719,19 @@ fn diff_screen_chrome_follows_the_locale() {
         en.contains("Files") || en.contains("files"),
         "en file pane title is still Chinese:\n{en}"
     );
-    // The patch is not loaded, so the detail pane shows its reload hint.
+    // The patch is not loaded, so the detail pane says exactly that. There is
+    // no Ctrl+D reload: the screen does not answer that key.
     assert!(
         !en.contains("刷新以加载补丁"),
         "en reload hint is hardcoded Chinese:\n{en}"
     );
     assert!(
-        en.contains("Ctrl+D"),
-        "the key stays in both locales:\n{en}"
+        en.contains("Patch not loaded yet"),
+        "the detail pane states the missing patch:\n{en}"
+    );
+    assert!(
+        !en.contains("Ctrl+D"),
+        "the screen must not advertise a key it does not handle:\n{en}"
     );
 }
 

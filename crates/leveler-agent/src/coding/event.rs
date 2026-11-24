@@ -21,6 +21,7 @@ impl From<AgentEvent> for EngineEvent {
             A::ReasoningDelta(text) => EngineEvent::ReasoningDelta { text },
             A::ReasoningCompleted { elapsed_ms } => EngineEvent::ReasoningCompleted { elapsed_ms },
             A::RuleDelivery { audit } => EngineEvent::RuleDelivery { audit },
+            A::SkillDelivery { audit } => EngineEvent::SkillDelivery { audit },
             A::AssistantText { text, reasoning } => {
                 EngineEvent::AssistantMessage { text, reasoning }
             }

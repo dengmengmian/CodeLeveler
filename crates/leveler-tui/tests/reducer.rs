@@ -4107,7 +4107,22 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
     typed(&mut s, "/help");
     reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(s.active_screen, Screen::Help);
-    let frame = rendered(&mut s, 120, 80);
+    // The catalog is the help document. A modal viewport can put the last
+    // keyboard rows below the fold; selecting one scrolls it into the frame.
+    let entries = s.help.matches(s.t());
+    let catalog: String = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} ({}) {} {}",
+                entry.binding,
+                entry.aliases.join(", "),
+                entry.description,
+                entry.usage
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     for key_name in [
         "Ctrl+C",
         "Ctrl+V",
@@ -4118,10 +4133,20 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
         "Ctrl+Y",
     ] {
         assert!(
-            frame.contains(key_name),
-            "help must list {key_name}: {frame}"
+            catalog.contains(key_name),
+            "help must list {key_name}: {catalog}"
         );
     }
+    let index = entries
+        .iter()
+        .position(|entry| entry.binding.contains("Ctrl+D/T/S"))
+        .expect("Ctrl+D/T/S row");
+    s.help.selected = index;
+    let frame = rendered(&mut s, 120, 80);
+    assert!(
+        frame.contains("Ctrl+D/T/S"),
+        "the keyboard row paints once selected: {frame}"
+    );
     for closed in [
         // `/quit` is intentionally absent from this list: it is a live alias
         // of `/exit`, and Help now shows aliases on the command row.
@@ -4131,13 +4156,13 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
         "/skill ", "/plan",
     ] {
         assert!(
-            !frame.contains(closed),
-            "help still lists {closed}: {frame}"
+            !catalog.contains(closed),
+            "help still lists {closed}: {catalog}"
         );
     }
     assert!(
-        frame.contains("(/quit)"),
-        "the live alias of /exit is shown: {frame}"
+        catalog.contains("(/quit)") || frame.contains("(/quit)"),
+        "the live alias of /exit is shown: {catalog}"
     );
 }
 
@@ -5268,14 +5293,15 @@ fn diff_screen_page_keys_scroll_detail_and_selection_resets_it() {
         ],
     });
     s.active_screen = Screen::Diff;
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.page_focus, leveler_tui::layout::SplitFocus::Detail);
     reduce(&mut s, key(KeyCode::PageDown));
-    assert!(s.screen_scroll > 0, "PageDown scrolls the patch pane");
+    assert!(s.page_scroll > 0, "PageDown scrolls the focused patch pane");
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.page_focus, leveler_tui::layout::SplitFocus::Primary);
     reduce(&mut s, key(KeyCode::Down)); // select next file
     assert_eq!(s.diff_selected, 1);
-    assert_eq!(
-        s.screen_scroll, 0,
-        "switching files resets the patch scroll"
-    );
+    assert_eq!(s.page_scroll, 0, "switching files resets the patch scroll");
 }
 
 // ---- Phase 5: attachments + vision gating ----------------------------------
@@ -5290,6 +5316,8 @@ fn attachment(name: &str) -> leveler_client_protocol::AttachmentRef {
         sha256: "deadbeef".into(),
         width: Some(100),
         height: Some(80),
+        source_path: None,
+        preview_path: None,
     }
 }
 
@@ -5555,7 +5583,11 @@ fn plan_summary_opens_a_full_plan_page_with_keyboard_and_returns_with_esc() {
     assert_eq!(format!("{:?}", s.active_screen), "Plan");
 
     let detail = rendered(&mut s, 100, 30);
-    assert!(detail.contains("← 计划"), "{detail}");
+    assert!(
+        detail.contains("[×]") && detail.contains("计划"),
+        "{detail}"
+    );
+    assert!(!detail.contains("← 计划"), "{detail}");
     assert!(detail.contains("摸清现有报价模型"), "{detail}");
     assert!(detail.contains("设计完整语义模型"), "{detail}");
     assert!(detail.contains("写成正式设计文档"), "{detail}");
@@ -6334,6 +6366,8 @@ fn backspace_on_empty_composer_removes_last_attachment() {
         sha256: "x".into(),
         width: None,
         height: None,
+        source_path: None,
+        preview_path: None,
     };
     let mut s = state();
     for name in ["a", "b"] {
@@ -8825,9 +8859,11 @@ fn write_project_skill(root: &std::path::Path, name: &str, desc: &str) {
     approve_project(root);
 }
 
-/// Skills live in the `$` namespace only: `/<skill>` is not a second entry.
+/// A Skill is addressable by `/name [args]` exactly like a built-in command.
+/// The typed message is what the runtime receives; it resolves the procedure
+/// itself, so there is no second loader and no rewritten text.
 #[test]
-fn slash_skill_name_is_not_a_command() {
+fn slash_skill_name_is_an_explicit_command() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
@@ -8837,13 +8873,22 @@ fn slash_skill_name_is_not_a_command() {
     assert!(
         leveler_tui::screen::visible_slash_popup(&s)
             .iter()
-            .all(|(n, _)| n != "/code-review"),
-        "the / popup must not list skills"
+            .any(|(name, _)| name == "/code-review"),
+        "the / popup lists the skill beside built-in commands"
     );
     s.composer.replace("/code-review fix auth");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty(), "{effects:?}");
-    assert_eq!(s.composer.text(), "/code-review fix auth");
+    assert_eq!(
+        submitted_text(&effects).as_deref(),
+        Some("/code-review fix auth")
+    );
+    assert_eq!(
+        s.notification
+            .as_ref()
+            .map(|notice| notice.message.as_str()),
+        None,
+        "a usable skill is not a refusal"
+    );
 }
 
 #[test]
@@ -11839,18 +11884,6 @@ fn render_screen_text(s: &mut AppState) -> String {
 
 // ── Agent Extensibility: /agents and a child's agent identity ─────────────
 
-fn last_note(s: &AppState) -> String {
-    s.transcript
-        .items()
-        .iter()
-        .rev()
-        .find_map(|i| match i {
-            TranscriptItem::Note(t) => Some(t.clone()),
-            _ => None,
-        })
-        .expect("a transcript note")
-}
-
 fn agent_entry(
     name: &str,
     source: leveler_client_protocol::UiAgentSource,
@@ -11878,6 +11911,76 @@ fn agent_entry(
 }
 
 #[test]
+fn workspace_tabs_keep_a_running_turn_and_do_not_start_a_review() {
+    use leveler_client_protocol::RuntimeStatus;
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.composer.replace("unsent draft");
+    // Opening the page is not a submit: the unsent draft stays in the composer.
+    leveler_tui::skills::open(&mut s, "");
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Skills);
+    assert_eq!(s.composer.text(), "unsent draft");
+    assert_eq!(s.status, RuntimeStatus::Busy);
+
+    let _ = rendered(&mut s, 120, 36);
+    let agents = s
+        .workspace_hits
+        .tabs
+        .iter()
+        .find(|(_, screen)| *screen == leveler_tui::screen::Screen::Agents)
+        .expect("the extensions popup publishes an Agents tab")
+        .0;
+    reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: agents.x,
+            row: agents.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Agents);
+    reduce(&mut s, key(KeyCode::BackTab));
+    assert_eq!(
+        s.active_screen,
+        leveler_tui::screen::Screen::Agents,
+        "Shift+Tab stays the permission cycle"
+    );
+
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Skills);
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(
+        s.active_screen,
+        leveler_tui::screen::Screen::Mcp,
+        "Tab on Skills moves to the next extensions tab"
+    );
+    assert_eq!(s.composer.text(), "unsent draft");
+    assert_eq!(s.status, RuntimeStatus::Busy);
+
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Conversation);
+    assert_eq!(s.composer.text(), "unsent draft");
+    assert_eq!(s.status, RuntimeStatus::Busy);
+
+    s.active_screen = leveler_tui::screen::Screen::Diff;
+    s.diff_pending = true;
+    let effects = reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Review);
+    assert!(
+        effects.is_empty(),
+        "opening Review must not query: {effects:?}"
+    );
+    assert!(!s.live_review);
+    let frame = rendered(&mut s, 120, 36);
+    assert!(
+        frame.contains("还没有审查报告"),
+        "the review tab shows the empty state:\n{frame}"
+    );
+    assert!(frame.contains("差异") && frame.contains("审查"), "{frame}");
+}
+
+#[test]
 fn slash_agents_lists_and_slash_agents_name_inspects() {
     let mut s = opened();
     typed(&mut s, "/agents");
@@ -11898,6 +12001,7 @@ fn slash_agents_lists_and_slash_agents_name_inspects() {
         )),
         "effects={effects:?}"
     );
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Agents);
 }
 
 #[test]
@@ -11950,7 +12054,30 @@ fn an_unowned_agent_query_does_not_leak_into_the_tui() {
             problems: Vec::new(),
         }),
     );
-    assert!(last_note(&s).contains("owned"));
+    assert!(
+        s.agents_page
+            .entries
+            .iter()
+            .any(|entry| entry.name == "owned"),
+        "the page keeps the answer this client asked for"
+    );
+    assert!(
+        !s.agents_page
+            .entries
+            .iter()
+            .any(|entry| entry.name == "foreign"),
+        "a foreign query must not fill the page"
+    );
+    let notes_owned = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::Note(_)))
+        .count();
+    assert_eq!(
+        notes_owned, notes_before,
+        "the page is not a transcript note"
+    );
 }
 
 #[test]
@@ -11975,7 +12102,7 @@ fn an_unowned_unfinished_goals_query_does_not_replace_tui_state() {
 }
 
 #[test]
-fn slash_skills_reads_the_local_registry_without_a_round_trip() {
+fn slash_skills_opens_the_local_registry_page_without_a_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join(".leveler/skills/deploy");
     std::fs::create_dir_all(&dir).unwrap();
@@ -11991,19 +12118,395 @@ fn slash_skills_reads_the_local_registry_without_a_round_trip() {
     typed(&mut s, "/skills");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "the registry is local: {effects:?}");
-    let note = last_note(&s);
-    assert!(note.contains("$deploy"), "{note}");
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Skills);
+    let deploy = s
+        .skills_page
+        .rows
+        .iter()
+        .find(|row| row.name == "deploy")
+        .expect("the page lists the project skill");
+    assert_eq!(deploy.section, leveler_tui::skills::SkillSection::Available);
+    assert_eq!(deploy.advertised, "deploy");
+    assert_eq!(deploy.scope, Some(leveler_skills::SkillScope::Project));
     assert!(
-        !note.contains("BODY_MARKER"),
-        "the listing must stay metadata-only: {note}"
+        s.skills_page
+            .rows
+            .iter()
+            .all(|row| row.description.as_deref() != Some("BODY_MARKER")),
+        "the page is metadata-only"
     );
 
+    // Esc returns to the conversation; `/skills <query>` opens the page with
+    // the search applied.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Conversation);
     typed(&mut s, "/skills deploy");
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "{effects:?}");
-    let detail = last_note(&s);
-    assert!(detail.contains("Skill $deploy"), "{detail}");
-    assert!(!detail.contains("BODY_MARKER"), "{detail}");
+    assert_eq!(s.active_screen, leveler_tui::screen::Screen::Skills);
+    assert_eq!(s.skills_page.query, "deploy");
+}
+
+/// A click selects the row under the pointer. Search and filters compress the
+/// list, so the row a person sees is not at its unfiltered position; the page
+/// must publish the visible row's own identity instead of its list index.
+#[test]
+fn clicking_a_filtered_skill_row_selects_the_row_under_the_pointer() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    for name in ["build", "deploy", "deploy-notes", "lint"] {
+        write_slash_skill_fixture(project.path(), name, "", "BODY");
+    }
+    approve_into(home.path(), project.path());
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    typed(&mut s, "/skills");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    // Only the two deploy rows match; the clicked one sits at list offset 2
+    // but at visible position 1.
+    reduce(&mut s, key(KeyCode::Char('s')));
+    typed(&mut s, "deploy");
+    reduce(&mut s, key(KeyCode::Enter));
+    let visible: Vec<_> = {
+        let page = &s.skills_page;
+        let needle = page.query.trim().to_lowercase();
+        page.rows
+            .iter()
+            .filter(|row| row.name.to_lowercase().contains(&needle))
+            .map(|row| row.name.clone())
+            .collect()
+    };
+    assert_eq!(
+        visible,
+        ["deploy", "deploy-notes"],
+        "the search view is the fixture"
+    );
+    assert_eq!(
+        s.skills_page
+            .rows
+            .iter()
+            .position(|row| row.name == "deploy-notes"),
+        Some(2),
+        "the row's list offset differs from its visible position"
+    );
+
+    let text = rendered(&mut s, 100, 30);
+    let row = text
+        .lines()
+        .position(|line| line.contains("/deploy-notes"))
+        .expect("the filtered row is painted") as u16;
+    let (column, row) = s
+        .screen_rows
+        .iter()
+        .find(|(rect, _)| rect.y == row)
+        .map(|(rect, _)| (rect.x.saturating_add(2), rect.y))
+        .unwrap_or_else(|| panic!("the painted row publishes no hit:\n{text}"));
+    let effects = reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(
+        visible.get(s.skills_page.selected).map(String::as_str),
+        Some("deploy-notes"),
+        "the click landed on a different visible row (selected {})",
+        s.skills_page.selected
+    );
+}
+
+/// The wheel is the list's selection movement and, once the detail is open,
+/// its own document scroll — the same split every secondary page uses.
+#[test]
+fn the_wheel_moves_the_skill_list_and_scrolls_the_open_detail() {
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    for name in ["alpha", "beta"] {
+        write_slash_skill_fixture(project.path(), name, "", "BODY");
+    }
+    approve_into(home.path(), project.path());
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    typed(&mut s, "/skills");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    let wheel = |kind| {
+        Action::Mouse(MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        })
+    };
+    reduce(&mut s, wheel(MouseEventKind::ScrollDown));
+    reduce(&mut s, wheel(MouseEventKind::ScrollDown));
+    assert_eq!(s.skills_page.selected, 2, "one notch is one row");
+    assert_eq!(
+        s.skills_page
+            .rows
+            .iter()
+            .filter(|row| row.name == "beta")
+            .map(|row| row.name.as_str())
+            .next(),
+        Some("beta")
+    );
+    assert_eq!(s.screen_scroll, 0, "a list notch is not a document scroll");
+
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(s.skills_page.detail_open);
+    reduce(&mut s, wheel(MouseEventKind::ScrollDown));
+    reduce(&mut s, wheel(MouseEventKind::ScrollDown));
+    assert_eq!(s.screen_scroll, 6, "a detail notch scrolls three lines");
+    reduce(&mut s, wheel(MouseEventKind::ScrollUp));
+    assert_eq!(s.screen_scroll, 3);
+}
+
+fn approve_into(home: &Path, root: &Path) {
+    use leveler_definition_trust::{ApprovalSurface, approve, discover_project};
+    let requests: Vec<_> = discover_project(root)
+        .iter()
+        .filter_map(|candidate| candidate.approval_request().ok())
+        .collect();
+    if !requests.is_empty() {
+        approve(home, root, &requests, ApprovalSurface::Cli).expect("approve fixture");
+    }
+}
+
+/// Space on the page is a real durable toggle: the file is written, the page
+/// re-reads it, and the client-side catalog cache is invalidated so the `$`
+/// popup cannot keep offering a name the registry now refuses.
+#[test]
+fn toggling_a_skill_on_the_page_writes_preferences_and_reloads_the_registry() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = project.path().join(".leveler/skills/deploy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Ship safely.\n---\n\nBODY\n",
+    )
+    .unwrap();
+    approve_into(home.path(), project.path());
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+
+    typed(&mut s, "/skills");
+    reduce(&mut s, key(KeyCode::Enter));
+    let deploy = s
+        .skills_page
+        .rows
+        .iter()
+        .position(|row| row.name == "deploy")
+        .expect("deploy row");
+    s.skills_page.selected = deploy;
+    reduce(&mut s, key(KeyCode::Char(' ')));
+
+    let file = home.path().join("state/skills.toml");
+    let text = std::fs::read_to_string(&file).expect("preferences written");
+    assert!(
+        text.contains(&leveler_skills::project_key(project.path())),
+        "{text}"
+    );
+    assert!(text.contains("deploy"), "{text}");
+    let deploy = s
+        .skills_page
+        .rows
+        .iter()
+        .find(|row| row.name == "deploy")
+        .expect("deploy row after refresh");
+    assert_eq!(
+        deploy.section,
+        leveler_tui::skills::SkillSection::Disabled,
+        "the page must re-read the registry after the write"
+    );
+    assert!(
+        s.skill_catalog_root.is_none(),
+        "the $ catalog cache is stale"
+    );
+    assert!(s.skills_page.notice.is_some());
+
+    s.skills_page.selected = s
+        .skills_page
+        .rows
+        .iter()
+        .position(|row| row.name == "deploy")
+        .unwrap();
+    reduce(&mut s, key(KeyCode::Char(' ')));
+    let deploy = s
+        .skills_page
+        .rows
+        .iter()
+        .find(|row| row.name == "deploy")
+        .expect("deploy row after re-enable");
+    assert_eq!(deploy.section, leveler_tui::skills::SkillSection::Available);
+}
+
+/// A running turn keeps the procedure it already received; the page refuses
+/// the change instead of showing a state that is not in effect.
+#[test]
+fn toggling_a_skill_while_busy_is_refused_and_writes_nothing() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = project.path().join(".leveler/skills/deploy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Ship safely.\n---\n\nBODY\n",
+    )
+    .unwrap();
+    approve_into(home.path(), project.path());
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    typed(&mut s, "/skills");
+    reduce(&mut s, key(KeyCode::Enter));
+    s.status = RuntimeStatus::Busy;
+
+    reduce(&mut s, key(KeyCode::Char(' ')));
+    assert!(
+        !home.path().join("state/skills.toml").exists(),
+        "a busy turn must not change the durable preference"
+    );
+    assert_eq!(
+        s.skills_page
+            .rows
+            .iter()
+            .find(|row| row.name == "deploy")
+            .unwrap()
+            .section,
+        leveler_tui::skills::SkillSection::Available
+    );
+    assert!(s.skills_page.notice.is_some());
+}
+
+/// The page has a dedicated section for every state it can explain. A
+/// package the trust store refuses is not also a scan problem, and a real
+/// scan problem keeps the reason the reader opened the page to find.
+#[test]
+fn an_untrusted_skill_is_listed_once_and_a_scan_problem_keeps_its_reason() {
+    use leveler_tui::skills::SkillSection;
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(project.path(), "pending", "", "BODY_MARKER");
+    // A directory the registry refuses to read as a Skill at all.
+    let unusable = project.path().join(".leveler/skills/bad name");
+    std::fs::create_dir_all(&unusable).unwrap();
+    std::fs::write(
+        unusable.join("SKILL.md"),
+        "---\nname: bad\ndescription: x\n---\n\nBODY\n",
+    )
+    .unwrap();
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    typed(&mut s, "/skills");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    let pending: Vec<_> = s
+        .skills_page
+        .rows
+        .iter()
+        .filter(|row| row.name == "pending")
+        .collect();
+    assert_eq!(pending.len(), 1, "untrusted listed twice: {pending:#?}");
+    assert_eq!(pending[0].section, SkillSection::Untrusted);
+
+    let problems: Vec<_> = s
+        .skills_page
+        .rows
+        .iter()
+        .filter(|row| row.section == SkillSection::Problem)
+        .collect();
+    assert!(
+        problems.iter().all(|row| !row.name.ends_with("pending")),
+        "the untrusted section already explains /pending: {problems:#?}"
+    );
+    let unusable = problems
+        .iter()
+        .find(|row| row.name.ends_with("bad name"))
+        .expect("the unusable directory is a scan problem");
+    assert!(
+        unusable
+            .detail
+            .as_deref()
+            .is_some_and(|reason| reason.contains("whitespace")),
+        "the scan problem keeps its reason: {unusable:#?}"
+    );
+}
+
+/// Sections are state groups, not a by-product of registry order. A disabled
+/// project skill sits between two available sources there, which used to draw
+/// the "可用" header twice around "已禁用".
+#[test]
+fn skill_sections_stay_contiguous_when_a_project_skill_is_disabled() {
+    use leveler_tui::skills::SkillSection;
+
+    fn rank(section: SkillSection) -> u8 {
+        match section {
+            SkillSection::Available => 0,
+            SkillSection::Disabled => 1,
+            SkillSection::Untrusted => 2,
+            SkillSection::Invalid => 3,
+            SkillSection::Problem => 4,
+        }
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(project.path(), "deploy", "", "DEPLOY_BODY");
+    write_slash_skill_fixture(project.path(), "release-notes", "", "NOTES_BODY");
+    approve_into(home.path(), project.path());
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    typed(&mut s, "/skills");
+    reduce(&mut s, key(KeyCode::Enter));
+
+    let release = s
+        .skills_page
+        .rows
+        .iter()
+        .position(|row| row.name == "release-notes")
+        .expect("the fixture skill is listed");
+    s.skills_page.selected = release;
+    reduce(&mut s, key(KeyCode::Char(' ')));
+    let release = s
+        .skills_page
+        .rows
+        .iter()
+        .position(|row| row.name == "release-notes")
+        .expect("the toggled skill is still listed");
+    assert_eq!(
+        s.skills_page.rows[release].section,
+        SkillSection::Disabled,
+        "the page is the state authority after the toggle"
+    );
+
+    let sections: Vec<_> = s.skills_page.rows.iter().map(|row| row.section).collect();
+    let ranks: Vec<_> = sections.iter().copied().map(rank).collect();
+    assert!(
+        ranks.windows(2).all(|pair| pair[0] <= pair[1]),
+        "a section header would repeat: {sections:?}"
+    );
 }
 
 #[test]
@@ -12042,7 +12545,11 @@ fn the_agents_listing_names_source_class_and_what_is_wrong() {
             }],
         }),
     );
-    let note = last_note(&s);
+    let note = leveler_tui::agents_view::listing_note(
+        &s.agents_page.entries,
+        &s.agents_page.problems,
+        s.t(),
+    );
     assert!(note.contains("security-reviewer"), "{note}");
     assert!(
         note.contains("read_only") && note.contains("project"),
@@ -12052,6 +12559,13 @@ fn the_agents_listing_names_source_class_and_what_is_wrong() {
     assert!(note.contains("nowhere/big"), "{note}");
     assert!(note.contains("shadows builtin"), "{note}");
     assert!(note.contains("`worker` is a built-in agent"), "{note}");
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .all(|item| !matches!(item, TranscriptItem::Note(_))),
+        "the listing stays on the page"
+    );
 }
 
 #[test]
@@ -12077,7 +12591,13 @@ fn an_agent_detail_shows_its_bounds_and_instructions() {
             error: None,
         }),
     );
-    let note = last_note(&s);
+    let note = leveler_tui::agents_view::detail_note(
+        s.agents_page
+            .detail
+            .as_ref()
+            .expect("the page holds the detail"),
+        s.t(),
+    );
     for needle in [
         "frontend-worker",
         "scoped_writer",
@@ -12100,7 +12620,10 @@ fn an_agent_detail_shows_its_bounds_and_instructions() {
             error: Some("Agent \"nope\" not found.".into()),
         }),
     );
-    assert!(last_note(&s).contains("Agent \"nope\" not found."));
+    assert_eq!(
+        s.agents_page.error.as_deref(),
+        Some("Agent \"nope\" not found.")
+    );
 }
 
 #[test]
@@ -15208,7 +15731,8 @@ fn the_report_page_renders_findings_and_the_reviewer_report() {
     });
     s.active_screen = Screen::Review;
     let screen = rendered(&mut s, 110, 60);
-    assert!(screen.contains("审查报告"), "{screen}");
+    assert!(screen.contains("检查"), "{screen}");
+    assert!(screen.contains("审查"), "{screen}");
     assert!(screen.contains("结论"), "{screen}");
     assert!(screen.contains("发现问题"), "{screen}");
     assert!(screen.contains("覆盖"), "{screen}");
@@ -15231,9 +15755,13 @@ fn the_report_page_renders_findings_and_the_reviewer_report() {
         "the finding source names the investigation, not its raw id: {screen}"
     );
     assert!(!screen.contains("来源：agent-1"), "{screen}");
+    for _ in 0..20 {
+        reduce(&mut s, key(KeyCode::PageDown));
+    }
+    let bottom = rendered(&mut s, 110, 60);
     assert!(
-        screen.contains("审查完成：发现一个越权读取问题。"),
-        "{screen}"
+        bottom.contains("审查完成：发现一个越权读取问题。"),
+        "{bottom}"
     );
 }
 
@@ -17149,4 +17677,287 @@ fn trust_slash_opens_the_native_page_without_a_model_turn() {
     // Esc returns to the conversation; the draft is not consumed as input.
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+// ── Unified `/` completion and explicit Skill invocation ────────────────────
+
+fn write_slash_skill_fixture(project: &Path, name: &str, extra_frontmatter: &str, body: &str) {
+    let dir = project.join(".leveler/skills").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: Ship safely.\n{extra_frontmatter}---\n\n{body}\n"),
+    )
+    .unwrap();
+}
+
+fn notification_text(s: &AppState) -> String {
+    s.notification
+        .as_ref()
+        .map(|notice| notice.message.clone())
+        .unwrap_or_default()
+}
+
+fn submitted_text(effects: &[Effect]) -> Option<String> {
+    effects.iter().find_map(|effect| match effect {
+        Effect::Submit {
+            command: ClientCommand::SubmitMessage { content, .. },
+            ..
+        }
+        | Effect::Send(ClientCommand::SubmitMessage { content, .. }) => Some(content.clone()),
+        _ => None,
+    })
+}
+
+/// The `/` menu is ONE surface: built-in commands, then Skills that the
+/// runtime would actually load. A Skill row carries its argument hint and
+/// source so the reader can choose without opening `/skills`.
+#[test]
+fn slash_completion_lists_skills_in_one_menu_including_bare_slash() {
+    use leveler_tui::screen::{SlashCompletionKind, visible_slash_popup_rows};
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(
+        project.path(),
+        "deploy",
+        "argument-hint: <env>\n",
+        "BODY_MARKER",
+    );
+    approve_into(home.path(), project.path());
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+
+    // A bare `/` lists the quick built-ins and the invocable Skill together.
+    typed(&mut s, "/");
+    let rows = visible_slash_popup_rows(&s);
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .any(|row| row.name == "/model" && row.kind == SlashCompletionKind::Command),
+        "quick built-ins stay: {rows:?}"
+    );
+    let deploy = rows
+        .iter()
+        .find(|row| row.name == "/deploy")
+        .expect("bare / must list the project skill");
+    assert_eq!(deploy.kind, SlashCompletionKind::Skill);
+
+    // A prefix searches both namespaces in one list, built-ins first.
+    s.composer.replace("/dep");
+    let rows = visible_slash_popup_rows(&s);
+    let deploy = rows
+        .iter()
+        .find(|row| row.name == "/deploy")
+        .expect("the project skill is offered by its slash identity");
+    assert_eq!(deploy.kind, SlashCompletionKind::Skill);
+    assert!(deploy.description.contains("Ship safely"), "{deploy:?}");
+    assert!(deploy.description.contains("项目"), "{deploy:?}");
+    assert!(deploy.description.contains("<env>"), "{deploy:?}");
+    assert!(
+        !deploy.description.contains("BODY_MARKER"),
+        "the menu is metadata-only: {deploy:?}"
+    );
+
+    // Fuzzy: non-adjacent letters still find the Skill, and Tab completes it.
+    s.composer.replace("/dpl");
+    let rows = visible_slash_popup_rows(&s);
+    assert!(
+        rows.iter().any(|row| row.name == "/deploy"),
+        "fuzzy search must find the skill: {rows:?}"
+    );
+    reduce(&mut s, key(KeyCode::Tab));
+    assert!(
+        s.composer.text().starts_with("/deploy"),
+        "Tab completes the fuzzy hit: {:?}",
+        s.composer.text()
+    );
+}
+
+/// A usable Skill is an explicit request the runtime resolves; the client
+/// sends the typed message unchanged (the `/name` token and its arguments are
+/// part of the user's own words).
+#[test]
+fn a_skill_slash_command_is_sent_unchanged_for_runtime_injection() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(project.path(), "deploy", "", "BODY_MARKER");
+    approve_into(home.path(), project.path());
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+
+    typed(&mut s, "/deploy staging");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(submitted_text(&effects).as_deref(), Some("/deploy staging"));
+    assert!(s.composer.is_empty(), "a delivered message leaves the box");
+    assert!(notification_text(&s).is_empty(), "{:?}", s.notification);
+}
+
+/// A disabled definition never becomes a model message. The refusal names the
+/// reason and the draft survives so the user can edit or re-enable it.
+#[test]
+fn a_disabled_skill_slash_command_is_refused_locally_with_its_reason() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(project.path(), "deploy", "", "BODY_MARKER");
+    approve_into(home.path(), project.path());
+    let file = home.path().join("state/skills.toml");
+    let mut preferences =
+        match leveler_skills::PreferencesState::load_path(&file, Some(project.path())) {
+            leveler_skills::PreferencesState::Loaded { preferences, .. } => preferences,
+            other => panic!("fixture preferences: {other:?}"),
+        };
+    preferences
+        .set_disabled(
+            leveler_skills::SkillScope::Project,
+            "deploy",
+            Some(&leveler_skills::project_key(project.path())),
+            true,
+        )
+        .unwrap();
+    preferences.save(&file).unwrap();
+
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+
+    typed(&mut s, "/deploy staging");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "no turn may start: {effects:?}");
+    assert_eq!(s.composer.text(), "/deploy staging", "draft preserved");
+    let notice = notification_text(&s);
+    assert!(notice.contains("/deploy"), "{notice}");
+    assert!(
+        notice.contains("已禁用") || notice.contains("禁用"),
+        "the reason is stated: {notice}"
+    );
+}
+
+/// An untrusted package is a real definition: the explicit request reaches
+/// the runtime, whose trust surface asks about these exact bytes. A
+/// model-only package has no user lane, so it stays a local refusal.
+#[test]
+fn an_untrusted_skill_reaches_the_runtime_trust_surface_and_model_only_is_refused() {
+    let untrusted_project = tempfile::tempdir().unwrap();
+    let untrusted_home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(untrusted_project.path(), "deploy", "", "BODY_MARKER");
+
+    let mut s = opened();
+    s.repository = Some(untrusted_project.path().display().to_string());
+    s.skills_page.home_override = Some(untrusted_home.path().to_path_buf());
+    typed(&mut s, "/deploy");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        submitted_text(&effects).as_deref(),
+        Some("/deploy"),
+        "the runtime must be able to ask about the exact bytes"
+    );
+    assert!(s.composer.is_empty(), "a delivered message leaves the box");
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(
+        project.path(),
+        "secret-recipe",
+        "user-invocable: false\n",
+        "BODY_MARKER",
+    );
+    approve_into(home.path(), project.path());
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    typed(&mut s, "/secret-recipe");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.text(), "/secret-recipe");
+    assert!(
+        notification_text(&s).contains("仅模型可调用"),
+        "{}",
+        notification_text(&s)
+    );
+}
+
+/// A steer never carries a procedure. An untrusted Skill request while busy
+/// is refused with the draft kept, exactly like a usable one.
+#[test]
+fn an_untrusted_skill_request_while_busy_is_refused_and_the_draft_is_kept() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(project.path(), "deploy", "", "BODY_MARKER");
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    s.status = RuntimeStatus::Busy;
+
+    typed(&mut s, "/deploy staging");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "no steer may be sent: {effects:?}");
+    assert_eq!(s.composer.text(), "/deploy staging", "draft preserved");
+    assert!(
+        notification_text(&s).contains("/deploy"),
+        "{}",
+        notification_text(&s)
+    );
+}
+
+/// A running turn cannot receive a procedure: steering appends plain text at
+/// the next model round and never rebuilds the skill injection. Refuse
+/// explicitly instead of delivering `/deploy` as prose.
+#[test]
+fn a_skill_slash_command_while_busy_is_refused_and_the_draft_is_kept() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_slash_skill_fixture(project.path(), "deploy", "", "BODY_MARKER");
+    approve_into(home.path(), project.path());
+    let mut s = opened();
+    s.repository = Some(project.path().display().to_string());
+    s.skills_page.home_override = Some(home.path().to_path_buf());
+    s.status = RuntimeStatus::Busy;
+
+    typed(&mut s, "/deploy staging");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "no steer may be sent: {effects:?}");
+    assert_eq!(s.composer.text(), "/deploy staging", "draft preserved");
+    assert!(
+        notification_text(&s).contains("/deploy"),
+        "{}",
+        notification_text(&s)
+    );
+    assert!(
+        notification_text(&s).contains("草稿"),
+        "the refusal says the draft is preserved: {}",
+        notification_text(&s)
+    );
+
+    // The same gate covers a recognized `$skill` mention: text appended
+    // mid-turn is never run through mention resolution.
+    s.notification = None;
+    s.composer.replace("");
+    typed(&mut s, "please run $deploy now");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "no steer may be sent: {effects:?}");
+    assert_eq!(s.composer.text(), "please run $deploy now");
+    assert!(
+        notification_text(&s).contains("草稿"),
+        "{}",
+        notification_text(&s)
+    );
+}
+
+/// An unknown `/name` keeps the existing typo path: a warning, no turn, draft
+/// kept. It must not be mistaken for a Skill refusal with a fabricated reason.
+#[test]
+fn an_unknown_slash_name_stays_a_typo_and_never_starts_a_turn() {
+    let mut s = opened();
+    typed(&mut s, "/not-a-skill");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(s.composer.text(), "/not-a-skill");
+    assert!(
+        notification_text(&s).contains("not-a-skill"),
+        "{}",
+        notification_text(&s)
+    );
 }

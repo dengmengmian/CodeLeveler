@@ -167,6 +167,71 @@ fn answer_all(state: &mut AppState) -> String {
 }
 
 #[test]
+fn custom_answer_replaces_its_placeholder() {
+    let mut state = state();
+    open(
+        &mut state,
+        UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            "需要你的选择",
+            vec!["继续计划".into()],
+        ),
+    );
+    reduce(&mut state, key(KeyCode::Down));
+    assert!(rendered(&mut state, 100, 26).contains("自己输入…"));
+    reduce(&mut state, key(KeyCode::Char('改')));
+    let frame = rendered(&mut state, 100, 26);
+    assert!(frame.contains("2. 改"), "{frame}");
+    assert!(!frame.contains("自己输入…"), "{frame}");
+    reduce(&mut state, key(KeyCode::Backspace));
+    assert!(rendered(&mut state, 100, 26).contains("自己输入…"));
+}
+
+#[test]
+fn switch_to_direct_chat_keeps_the_draft_and_stops_the_question_turn() {
+    let mut state = state();
+    state.collaboration = "plan".into();
+    state.status = leveler_client_protocol::RuntimeStatus::Busy;
+    state.composer.replace("保留这份聊天草稿");
+    open(
+        &mut state,
+        UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            "需要你的选择",
+            vec!["继续计划".into()],
+        ),
+    );
+    reduce(&mut state, key(KeyCode::Down));
+    reduce(&mut state, key(KeyCode::Down));
+    let frame = rendered(&mut state, 100, 26);
+    assert!(frame.contains("3. 改为直接对话"), "{frame}");
+    assert!(frame.contains("结束当前任务"), "{frame}");
+    assert!(reduce(&mut state, key(KeyCode::Esc)).is_empty());
+    assert!(state.overlay.is_some());
+    assert_eq!(state.collaboration, "plan");
+    reduce(&mut state, key(KeyCode::Down));
+
+    let effects = reduce(&mut state, key(KeyCode::Enter));
+    let [
+        Effect::SendThen {
+            command: ClientCommand::SetProductAxes { collaboration, .. },
+            then: ClientCommand::CancelTask { .. },
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected acknowledgement of chat mode before task cancellation, got {effects:?}");
+    };
+    assert_eq!(collaboration, "chat");
+    assert_eq!(state.collaboration, "chat");
+    assert_eq!(state.composer.text(), "保留这份聊天草稿");
+    assert!(state.overlay.is_none());
+    assert_eq!(
+        state.workbench_focus,
+        leveler_tui::state::WorkbenchFocus::Input
+    );
+}
+
+#[test]
 fn a_multi_question_request_shows_tabs_with_current_and_pending_states() {
     let mut s = state();
     open(&mut s, three_questions());

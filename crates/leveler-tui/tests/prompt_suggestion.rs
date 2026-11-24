@@ -459,6 +459,8 @@ fn image_attachment() -> leveler_client_protocol::AttachmentRef {
         sha256: "0".repeat(64),
         width: Some(64),
         height: Some(64),
+        source_path: None,
+        preview_path: None,
     }
 }
 

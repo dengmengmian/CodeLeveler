@@ -542,7 +542,10 @@ fn the_header_goal_opens_its_full_multiline_objective_with_keyboard() {
     reduce(&mut state, key(KeyCode::Enter));
 
     let detail = rendered(&mut state, 80, 16);
-    assert!(detail.contains("当前目标"), "{detail}");
+    assert!(
+        detail.contains("[×]") && detail.contains("目标"),
+        "{detail}"
+    );
     assert!(detail.contains("重新设计报价模型"), "{detail}");
     assert!(
         detail.contains("完整目标详情第1行：保留全部约束和验收条件"),
@@ -579,7 +582,11 @@ fn clicking_the_header_goal_opens_the_same_detail_page() {
     );
 
     let detail = rendered(&mut state, 80, 12);
-    assert!(detail.contains("← 当前目标"), "{detail}");
+    assert!(
+        detail.contains("[×]") && detail.contains("目标"),
+        "{detail}"
+    );
+    assert!(!detail.contains("← 当前目标"), "{detail}");
     assert!(detail.contains("检查完整目标的点击入口"), "{detail}");
 }
 

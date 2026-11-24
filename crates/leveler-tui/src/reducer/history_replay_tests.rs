@@ -424,6 +424,28 @@ fn a_stale_or_foreign_history_answer_is_ignored() {
 }
 
 #[test]
+fn a_history_reply_from_before_an_empty_restore_cannot_reopen_the_old_turn() {
+    let mut s = state();
+    let effects = open(&mut s, vec![message(UiRole::User, "运行 soak")]);
+    let obsolete = history_query(&effects).expect("original history query");
+    let effects = open(&mut s, Vec::new());
+    assert!(history_query(&effects).is_none());
+    assert!(s.transcript.is_empty());
+    let restored_session = s.session_id.clone();
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: Some(obsolete),
+            session_id: restored_session,
+            entries: stopped_turn(),
+            omitted_turns: 0,
+        }),
+    );
+    assert!(s.transcript.is_empty(), "{:?}", s.transcript.items());
+}
+
+#[test]
 fn a_busy_session_keeps_its_live_view() {
     let mut s = state();
     let effects = open(&mut s, vec![message(UiRole::User, "运行 soak")]);

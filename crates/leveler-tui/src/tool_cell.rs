@@ -1,10 +1,10 @@
 //! Rendering for tool-call transcript cells and the Tools screen.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders};
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::{truncate_display, wrap};
@@ -64,6 +64,35 @@ pub(crate) fn call_status_mark(
     }
 }
 
+fn call_status_tone(block: &ToolCallBlock) -> (&'static str, crate::render::RowTone) {
+    let (glyph, _) = call_status_mark(block, &crate::theme::Theme::no_color());
+    if block.status == ToolStatus::Failed
+        && (is_guard_denied_name(&block.name) || is_goal_scope_refusal(block))
+    {
+        return (glyph, crate::render::RowTone::Warning);
+    }
+    let tone = match block.status {
+        ToolStatus::Running => crate::render::RowTone::Info,
+        ToolStatus::Ok
+            if block.name == "update_goal"
+                && crate::tool_taxonomy::update_goal_is_blocked(&block.arguments) =>
+        {
+            crate::render::RowTone::Warning
+        }
+        ToolStatus::Ok
+            if crate::tool_taxonomy::activity_class(&block.name)
+                == crate::tool_taxonomy::ActivityClass::Explore =>
+        {
+            crate::render::RowTone::Muted
+        }
+        ToolStatus::Ok => crate::render::RowTone::Success,
+        ToolStatus::Failed => crate::render::RowTone::Error,
+        ToolStatus::Cancelled => crate::render::RowTone::Muted,
+        ToolStatus::Unknown => crate::render::RowTone::Warning,
+    };
+    (glyph, tone)
+}
+
 /// Tools whose guard rejection is a neutral skip (closeout, loop-guard,
 /// skip-complete), not a real failure — shown with ⚠ instead of ✗.
 pub(crate) fn is_guard_denied_name(name: &str) -> bool {
@@ -89,7 +118,7 @@ pub(crate) fn guard_denial_note<'a>(name: &str, t: &'a crate::i18n::UiText) -> &
     }
 }
 
-fn tools_footer_hint(width: usize, t: &crate::i18n::UiText) -> String {
+pub(crate) fn tools_footer_hint(width: usize, t: &crate::i18n::UiText) -> String {
     let full = t.tools_footer_hint_full;
     let compact = t.tools_footer_hint_compact;
 
@@ -2069,9 +2098,9 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut App
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: &hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let area = layout.content;
     let filter = state.tools_screen.filter;
@@ -2082,24 +2111,55 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut App
         .filter(|b| filter.matches(b))
         .collect();
 
-    let [list_area, detail_area] =
-        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
-
+    const TOOLS_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Horizontal,
+        primary_pct: 40,
+        primary_min: 24,
+        detail_min: 30,
+        min_dual_width: 76,
+        min_dual_height: 8,
+    };
+    let split = crate::layout::split_pane(area, TOOLS_SPLIT)
+        .unwrap_or_else(|| crate::layout::single_pane(area, state.page_focus));
+    state.page_split = Some(crate::state::PageSplit {
+        screen: crate::screen::Screen::Tools,
+        layout: split,
+    });
+    let list_area = split.primary;
+    let detail_area = split.detail;
     let selected = state
         .tools_screen
         .selected
         .min(calls.len().saturating_sub(1));
     let mut rows: Vec<Line> = Vec::new();
-    if calls.is_empty() {
-        rows.push(Line::from(Span::styled(
-            t.tools_none,
-            Style::default().fg(theme.text.secondary),
-        )));
+    let mut row_hits: Vec<crate::render::RowHitSpec> = Vec::new();
+    let list_width = list_area.width.max(1) as usize;
+    if list_area.width > 0 && list_area.height > 0 {
+        rows.push(crate::render::section_header_line(
+            &format!("{} · {}", t.tools_col_tool, filter.label(t)),
+            Some(calls.len()),
+            None,
+            theme,
+            list_width,
+        ));
     }
-    let list_width = list_area.width.saturating_sub(2).max(1) as usize;
-    let mut row_hits: Vec<(usize, String)> = Vec::new();
+    if calls.is_empty() {
+        let block = crate::render::ListStateBlock {
+            kind: if filter == crate::screen::ToolFilter::All {
+                crate::render::ListStateKind::Empty
+            } else {
+                crate::render::ListStateKind::FilterEmpty
+            },
+            message: if filter == crate::screen::ToolFilter::All {
+                t.tools_none
+            } else {
+                t.tools_no_matches
+            },
+            detail: None,
+        };
+        rows.extend(crate::render::list_state_lines(block, theme, list_width));
+    }
     for (i, block) in calls.iter().enumerate() {
-        let cursor = if i == selected { "› " } else { "  " };
         let dur = block
             .duration_ms
             .map(|ms| format!("{ms}ms"))
@@ -2110,37 +2170,44 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut App
         } else {
             format!("{} · {target}", block.name)
         };
-        let dur_width = if dur.is_empty() {
-            0
-        } else {
-            UnicodeWidthStr::width(dur.as_str()) + 2
-        };
-        let label_width = list_width.saturating_sub(4 + dur_width).max(8);
-        rows.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
-            Span::styled(
-                format!("{} ", call_status_mark(block, theme).0),
-                Style::default().fg(call_status_mark(block, theme).1),
-            ),
-            Span::raw(truncate_display(&label, label_width)),
-            Span::styled(format!("  {dur}"), Style::default().fg(theme.text.muted)),
-        ]));
-        row_hits.push((rows.len() - 1, i.to_string()));
+        let (glyph, tone) = call_status_tone(block);
+        let list_row = crate::render::ListRow::new(label)
+            .status(glyph, tone)
+            .meta(dur);
+        let list_focused = !split.dual || state.page_focus == crate::layout::SplitFocus::Primary;
+        let paint = crate::render::row_paint(state, block.id.as_str(), i == selected, list_focused);
+        let row_lines = crate::render::list_row_lines(&list_row, paint, theme, list_width);
+        for line in row_lines {
+            let line_index = rows.len();
+            row_hits.push(crate::render::RowHitSpec {
+                line: line_index,
+                height: 1,
+                key: block.id.to_string(),
+            });
+            rows.push(line);
+        }
     }
-    let list_block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.border.normal))
-        .title(Span::styled(
-            format!(" {} · {} ", t.tools_col_tool, filter.label(t)),
-            Style::default().fg(theme.text.secondary),
-        ));
-    let list_inner = list_block.inner(list_area);
-    frame.render_widget(list_block, list_area);
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(
-        frame, list_inner, rows, &row_hits, selected, theme, &mut hits,
-    );
-    state.screen_rows = hits;
+    if list_area.width > 0 && list_area.height > 0 {
+        let focus = row_hits
+            .iter()
+            .find(|row| {
+                calls
+                    .get(selected)
+                    .is_some_and(|call| call.id.to_string() == row.key)
+            })
+            .map_or(0, |row| row.line);
+        crate::render::render_list_rows_with_spans(
+            frame,
+            list_area,
+            rows,
+            &row_hits,
+            focus,
+            theme,
+            &mut state.screen_rows,
+        );
+    } else {
+        state.screen_rows.clear();
+    }
 
     let mut detail: Vec<Line> = Vec::new();
     if let Some(block) = calls.get(selected) {
@@ -2196,7 +2263,12 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut App
     }
     // The bindings are the shell's footer now; the detail pane ends on its own
     // content rather than repeating them.
-    crate::render::render_scrolled(frame, detail_area, state, detail);
+    if detail_area.width > 0 && detail_area.height > 0 {
+        let max = detail.len().saturating_sub(detail_area.height as usize);
+        state.page_scroll = state.page_scroll.min(max);
+        crate::render::render_pane_at_offset(frame, detail_area, detail, state.page_scroll, theme);
+    }
+    crate::render::paint_split_divider(frame, &split, theme);
 }
 
 #[cfg(test)]

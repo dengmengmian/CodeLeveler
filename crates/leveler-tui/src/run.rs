@@ -43,6 +43,7 @@ enum DeliveryJob {
         session_id: SessionId,
         command: ClientCommand,
         expected_version: Option<i64>,
+        then: Option<ClientCommand>,
     },
     Submission {
         envelope: CommandEnvelope,
@@ -118,6 +119,9 @@ const CLEAN_UNAVAILABLE: &str = "storage cleanup host unavailable";
 pub enum TuiError {
     #[error("terminal io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Opening the session failed before any authoritative state was adopted.
+    #[error("could not read the session from the runtime")]
+    InitialSessionUnavailable,
 }
 
 /// Why the TUI event loop ended.
@@ -180,6 +184,12 @@ pub async fn run(
     }
 
     let mut events = client.subscribe_session(&state.session_id);
+    // Subscribe first so events that arrive during the snapshot can still be
+    // applied. A failed read cannot establish an empty session or crash window.
+    let snapshot = client.snapshot(&state.session_id).await.map_err(|error| {
+        tracing::warn!(%error, "could not read the initial session snapshot");
+        TuiError::InitialSessionUnavailable
+    })?;
     // When the broadcast channel closes, stop selecting on it so we don't
     // busy-spin on RecvError::Closed.
     let mut events_open = true;
@@ -207,42 +217,21 @@ pub async fn run(
                     session_id,
                     command,
                     expected_version,
+                    then,
                 } => {
-                    let client = Arc::clone(&delivery_client);
-                    let envelope = CommandEnvelope {
-                        command_id: leveler_client_protocol::CommandId::generate(),
-                        session_id: session_id.clone(),
+                    let completion = deliver_command(
+                        &delivery_client,
+                        session_id.clone(),
+                        command,
                         expected_version,
-                        issued_at: chrono::Utc::now().to_rfc3339(),
-                        command: command.clone(),
-                    };
-                    let mut attempt = tokio::spawn(async move { client.deliver(envelope).await });
-                    let answer = match tokio::time::timeout(DELIVERY_TIMEOUT, &mut attempt).await {
-                        Ok(joined) => delivery_answer(joined),
-                        Err(_) => DeliveryAnswer::None,
-                    };
-                    match answer {
-                        DeliveryAnswer::Delivered
-                            if matches!(command, ClientCommand::ManageSteer { .. }) =>
-                        {
-                            EffectCompletion::SteerCommandDelivered(command)
-                        }
-                        DeliveryAnswer::Delivered => EffectCompletion::CommandDelivered,
-                        DeliveryAnswer::Rejected { message, .. } => {
-                            EffectCompletion::CommandRejected {
-                                command,
-                                message,
-                                snapshot: snapshot_within(&delivery_client, &session_id).await,
-                            }
-                        }
-                        // A fresh id per issue never meets an unsettled receipt;
-                        // were it to, it is still no delivery this client saw.
-                        DeliveryAnswer::Unresolvable | DeliveryAnswer::None => {
-                            EffectCompletion::CommandUncertain {
-                                command,
-                                snapshot: snapshot_within(&delivery_client, &session_id).await,
-                            }
-                        }
+                    )
+                    .await;
+                    if matches!(completion, EffectCompletion::CommandDelivered)
+                        && let Some(then) = then
+                    {
+                        deliver_command(&delivery_client, session_id, then, None).await
+                    } else {
+                        completion
                     }
                 }
                 DeliveryJob::Submission { envelope } => {
@@ -303,13 +292,10 @@ pub async fn run(
     });
     // Opening the session can ask the runtime for more (its history), so the
     // effects are carried into the first loop pass instead of dropped.
-    let mut carried_effects: Vec<Effect> = Vec::new();
-    if let Ok(snapshot) = client.snapshot(&state.session_id).await {
-        carried_effects = reduce(
-            &mut state,
-            Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
-        );
-    }
+    let mut carried_effects = reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
 
     let mut term_events = TerminalInput::with_startup(startup_input);
     let mut tick = tokio::time::interval(BUSY_TICK);
@@ -560,6 +546,9 @@ pub async fn run(
         if expire_notification(&mut state, &mut note_shown, Instant::now()) {
             paint_now = true;
         }
+        if state.conv.reply_copy.expire_feedback(Instant::now()) {
+            paint_now = true;
+        }
 
         // End / Ctrl+End returns to the conversation's live edge.
         if state.jump_to_bottom {
@@ -633,6 +622,7 @@ pub async fn run(
         if let Some(image) = &mut state.welcome_image {
             image.retire();
         }
+        crate::image_preview::retire(&mut state);
         let _ = flush_welcome_cleanup(&mut stdout, &mut state);
         let _ = execute!(stdout, LeaveAlternateScreen);
     }
@@ -875,6 +865,44 @@ enum DeliveryAnswer {
     None,
 }
 
+async fn deliver_command(
+    delivery_client: &Arc<dyn InteractiveRuntimeClient>,
+    session_id: SessionId,
+    command: ClientCommand,
+    expected_version: Option<i64>,
+) -> EffectCompletion {
+    let client = Arc::clone(delivery_client);
+    let envelope = CommandEnvelope {
+        command_id: leveler_client_protocol::CommandId::generate(),
+        session_id: session_id.clone(),
+        expected_version,
+        issued_at: chrono::Utc::now().to_rfc3339(),
+        command: command.clone(),
+    };
+    let mut attempt = tokio::spawn(async move { client.deliver(envelope).await });
+    let answer = match tokio::time::timeout(DELIVERY_TIMEOUT, &mut attempt).await {
+        Ok(joined) => delivery_answer(joined),
+        Err(_) => DeliveryAnswer::None,
+    };
+    match answer {
+        DeliveryAnswer::Delivered if matches!(command, ClientCommand::ManageSteer { .. }) => {
+            EffectCompletion::SteerCommandDelivered(command)
+        }
+        DeliveryAnswer::Delivered => EffectCompletion::CommandDelivered,
+        DeliveryAnswer::Rejected { message, .. } => EffectCompletion::CommandRejected {
+            command,
+            message,
+            snapshot: snapshot_within(delivery_client, &session_id).await,
+        },
+        // A fresh id per issue never meets an unsettled receipt;
+        // were it to, it is still no delivery this client saw.
+        DeliveryAnswer::Unresolvable | DeliveryAnswer::None => EffectCompletion::CommandUncertain {
+            command,
+            snapshot: snapshot_within(delivery_client, &session_id).await,
+        },
+    }
+}
+
 fn delivery_answer(
     joined: Result<Result<(), ClientError>, tokio::task::JoinError>,
 ) -> DeliveryAnswer {
@@ -1111,7 +1139,12 @@ fn dispatch_effects(
 ) {
     for effect in effects {
         match effect {
-            Effect::Send(command) => {
+            command_effect @ (Effect::Send(_) | Effect::SendThen { .. }) => {
+                let (command, then) = match command_effect {
+                    Effect::Send(command) => (command, None),
+                    Effect::SendThen { command, then } => (command, Some(then)),
+                    _ => unreachable!(),
+                };
                 if !state.runtime_connected {
                     note_disconnected(state);
                     continue;
@@ -1138,6 +1171,7 @@ fn dispatch_effects(
                     session_id,
                     command,
                     expected_version,
+                    then,
                 });
             }
             // The reducer only emits this while the runtime is connected, and
@@ -1332,6 +1366,25 @@ fn dispatch_effects(
                             .send(Action::CleanRan(Err(CLEAN_UNAVAILABLE.to_string())));
                     }
                 }
+            }
+            Effect::CopyReply {
+                session_id,
+                target,
+                text,
+            } => {
+                let tx = completion_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        clipboard_result(&text).map(|(receipt, _)| receipt)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                    let _ = tx.send(Action::ReplyCopied {
+                        session_id,
+                        target,
+                        result,
+                    });
+                });
             }
             Effect::CopyUserShellOutput {
                 directory,
@@ -1652,10 +1705,11 @@ fn paint(
 /// Deletes Kitty image data by id. iTerm2 images are cell-anchored and are
 /// torn down with the alternate screen, so they yield no sequences.
 fn flush_welcome_cleanup(stdout: &mut Stdout, state: &mut AppState) -> io::Result<()> {
-    let Some(image) = &mut state.welcome_image else {
-        return Ok(());
-    };
-    let pending = image.take_cleanup();
+    let mut pending = Vec::new();
+    if let Some(image) = &mut state.welcome_image {
+        pending.extend(image.take_cleanup());
+    }
+    pending.extend(crate::image_preview::take_cleanup(state));
     if pending.is_empty() {
         return Ok(());
     }

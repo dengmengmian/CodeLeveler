@@ -88,6 +88,14 @@ pub enum Screen {
     /// digests, and the human-only approve/revoke actions. Reads the same
     /// store and discovery the CLI and the runtime use.
     Trust,
+    /// `/skills`: the resolved Skill registry, grouped by availability, with
+    /// search, detail and one durable action — enable/disable through
+    /// `state/skills.toml`. It reads the same registry the runtime and the
+    /// `$` popup use; it never scans or loads a package on its own.
+    Skills,
+    /// `/agents`: the agent registry inside the extensions workspace. Read-only.
+    /// Creating and editing agents stays a conversation task.
+    Agents,
 }
 
 /// Which section of the Context & Usage page an entry point reveals.
@@ -233,9 +241,10 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
-    // Read-only view of the resolved skill registry: `/skills` lists,
-    // `/skills <name>` inspects. Creating and editing skills is a conversation
-    // (skill-creator + save_skill/delete_skill) or Desktop task.
+    // The Skills management page: registry status, search, detail and durable
+    // enable/disable. `/skills <query>` opens it with the search applied.
+    // Creating and editing skills is a conversation (skill-creator +
+    // save_skill/delete_skill) or Desktop task.
     slash(
         "/skills",
         &[],
@@ -772,38 +781,78 @@ pub fn slash_commands_grouped(
         .collect()
 }
 
+/// How well `candidate` matches the typed `query`: `0` exact, `1` prefix,
+/// `2` substring, `3` non-contiguous subsequence. Case-insensitive; `None`
+/// means the row does not belong in the menu. Prefix hits still rank first so
+/// fuzzy search widens discovery without reordering the obvious answers.
+fn completion_match_rank(candidate: &str, query: &str) -> Option<u8> {
+    let candidate = candidate.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    if query.is_empty() || candidate == query {
+        return Some(0);
+    }
+    if candidate.starts_with(&query) {
+        return Some(1);
+    }
+    if candidate.contains(&query) {
+        return Some(2);
+    }
+    let mut chars = candidate.chars();
+    query
+        .chars()
+        .all(|needle| chars.any(|character| character == needle))
+        .then_some(3)
+}
+
+/// Menu order: exact and prefix hits keep the established registry order;
+/// substring and subsequence hits follow, best first. This widens discovery
+/// (typos like `/mdl`) without reshuffling the list a prefix already produced.
+fn completion_sort_class(rank: u8) -> u8 {
+    if rank <= 1 { 0 } else { rank }
+}
+
+/// The best rank over a command's primary name and its aliases.
+fn command_match_rank(def: &SlashDef, prefix: &str) -> Option<u8> {
+    let query = prefix.trim_start_matches('/');
+    std::iter::once(def.name)
+        .chain(def.aliases.iter().copied())
+        .filter_map(|token| completion_match_rank(token.trim_start_matches('/'), query))
+        .min()
+}
+
 /// Whether `def` belongs in the `/` popup for this typed `prefix`.
 pub(crate) fn include_in_slash_popup(def: &SlashDef, prefix: &str) -> bool {
     match def.visibility {
         SlashVisibility::Internal => false,
-        SlashVisibility::Quick => {
-            def.name.starts_with(prefix) || def.aliases.iter().any(|a| a.starts_with(prefix))
-        }
-        SlashVisibility::Searchable => {
-            prefix != "/"
-                && (def.name.starts_with(prefix)
-                    || def.aliases.iter().any(|a| a.starts_with(prefix)))
-        }
+        SlashVisibility::Quick => command_match_rank(def, prefix).is_some(),
+        SlashVisibility::Searchable => prefix != "/" && command_match_rank(def, prefix).is_some(),
     }
 }
 
-/// Slash commands whose primary name or alias starts with `prefix` (with `/`).
-/// Rows always use the **primary** name so Tab completes the canonical form.
-/// A bare `/` is the Quick list only; a longer prefix also searches the rest.
+/// Slash commands matching `prefix` (with `/`), best match first. Rows always
+/// use the **primary** name so Tab completes the canonical form. A bare `/` is
+/// the Quick list only; a longer prefix also searches the rest, by prefix and
+/// then by fuzzy subsequence.
 pub fn slash_matches(prefix: &str, t: &UiText) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(u8, (String, String))> = Vec::new();
     for d in SLASH_DEFS {
-        if include_in_slash_popup(d, prefix) {
-            out.push((d.name.to_string(), slash_popup_label(d.name, t).to_string()));
+        if let Some(rank) = command_match_rank(d, prefix)
+            && include_in_slash_popup(d, prefix)
+        {
+            out.push((
+                rank,
+                (d.name.to_string(), slash_popup_label(d.name, t).to_string()),
+            ));
         }
     }
-    out
+    out.sort_by_key(|(rank, _)| completion_sort_class(*rank));
+    out.into_iter().map(|(_, row)| row).collect()
 }
 
-/// The completion popup's entries for the current composer `text`, or empty when
-/// no popup should show. Single source of truth shared by the reducer (key
-/// handling / selection) and the renderer. Skills are not here: they are the
-/// `$` namespace ([`visible_skill_popup`]).
+/// The completion popup's built-in entries for the current composer `text`, or
+/// empty when no popup should show. Skills join the same surface through
+/// [`visible_slash_popup_rows`]; this function stays the built-in half so the
+/// command registry remains the only owner of command copy.
 pub fn slash_popup(text: &str, t: &UiText) -> Vec<(String, String)> {
     if !text.starts_with('/') || text.contains('\n') {
         return Vec::new();
@@ -817,19 +866,198 @@ pub fn slash_popup(text: &str, t: &UiText) -> Vec<(String, String)> {
     matches
 }
 
+/// Which namespace a `/` completion row came from. Presentation only: both
+/// kinds execute through the same submit path, and a Skill row still carries
+/// the user's literal `/name [args]` message to the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCompletionKind {
+    Command,
+    Skill,
+}
+
+/// One row of the unified `/` completion surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCompletion {
+    /// What Tab inserts, with its namespace prefix (`/name`, `$name`).
+    pub name: String,
+    pub description: String,
+    pub kind: SlashCompletionKind,
+}
+
+/// True while the composer's first token is being typed as a slash command.
+/// Drives the one-time registry scan that feeds both `/` and `$` completion.
+pub fn composer_types_slash(state: &crate::state::AppState) -> bool {
+    state.input_mode == crate::shell_mode::InputMode::Normal
+        && state.composer.text().trim_start().starts_with('/')
+}
+
+/// The Skill-name query being typed in the composer, or `None` for non-command
+/// text. A bare `/` yields an empty query: the same menu then lists every
+/// invocable Skill next to the quick built-ins.
+fn slash_skill_query(text: &str) -> Option<&str> {
+    if text.contains('\n') {
+        return None;
+    }
+    let rest = text.trim_start().strip_prefix('/')?;
+    Some(rest.split_whitespace().next().unwrap_or(""))
+}
+
+/// How well a Skill matches the typed `query` (without `/`), over every
+/// addressable spelling: bare advertised name, `scope:name`, registry name.
+fn skill_command_rank(command: &leveler_skills::SkillCommand, query: &str) -> Option<u8> {
+    [&command.advertised, &command.canonical, &command.name]
+        .into_iter()
+        .filter_map(|candidate| completion_match_rank(candidate, query))
+        .min()
+}
+
+/// One line of Skill metadata for the menu: what it does, where it comes from,
+/// and the argument shape the package advertises. Never the body.
+fn skill_completion_description(command: &leveler_skills::SkillCommand, t: &UiText) -> String {
+    // Provenance and the argument hint come first: the popup clips at its
+    // right edge, and a description that pushes them out of view would hide
+    // what the row can actually load.
+    let mut parts = vec![format!(
+        "{}·{}",
+        crate::skills::scope_label(command.scope, t),
+        command.source.label()
+    )];
+    if let Some(hint) = command
+        .argument_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+    {
+        parts.push(format!("{}: {hint}", t.skills.arguments));
+    }
+    let description = command.description.trim();
+    if !description.is_empty() {
+        parts.push(description.to_string());
+    }
+    parts.join(" · ")
+}
+
+/// The unified `/` completion: built-in commands first, then Skills the
+/// runtime would actually load — including on a bare `/`. Fuzzy matching is
+/// case-insensitive; exact and prefix hits rank ahead of substring and
+/// subsequence hits. Single source of truth shared by the reducer (selection /
+/// Tab) and the renderer.
+pub fn visible_slash_popup_rows(state: &crate::state::AppState) -> Vec<SlashCompletion> {
+    // Shell Mode owns the composer's completion surface.
+    if state.input_mode == crate::shell_mode::InputMode::Shell || state.slash_popup_dismissed {
+        return Vec::new();
+    }
+    let text = state.composer.text();
+    let query = slash_skill_query(text).unwrap_or("");
+    let mut rows: Vec<(u8, SlashCompletion)> = slash_popup(text, state.t())
+        .into_iter()
+        .map(|(name, description)| {
+            let rank = slash_def(&name)
+                .and_then(|def| command_match_rank(def, query))
+                .unwrap_or(0);
+            (
+                rank,
+                SlashCompletion {
+                    name,
+                    description,
+                    kind: SlashCompletionKind::Command,
+                },
+            )
+        })
+        .collect();
+    // The same menu holds both namespaces: the quick built-ins and every
+    // invocable Skill. Prefix hits outrank fuzzy ones; equal ranks keep the
+    // command registry order, then the Skill catalog order.
+    if let Some(query) = slash_skill_query(text) {
+        let t = state.t();
+        for command in &state.skill_commands {
+            if let Some(rank) = skill_command_rank(command, query) {
+                rows.push((
+                    rank,
+                    SlashCompletion {
+                        name: format!("/{}", command.advertised),
+                        description: skill_completion_description(command, t),
+                        kind: SlashCompletionKind::Skill,
+                    },
+                ));
+            }
+        }
+    }
+    rows.sort_by_key(|(rank, _)| completion_sort_class(*rank));
+    let mut rows: Vec<SlashCompletion> = rows.into_iter().map(|(_, row)| row).collect();
+    // Once a full command + argument is being typed, stop offering the popup.
+    if text.contains(' ') && rows.len() <= 1 {
+        rows.clear();
+    }
+    rows
+}
+
 /// True when `token` (with leading `/`) is a primary name or alias.
 pub fn is_exact_slash_token(token: &str) -> bool {
     all_slash_tokens().contains(&token)
 }
 
+/// True when `token` (with leading `/`) names an exact command *or* an exact
+/// Skill in the cached registry. Enter on a complete token executes it; on a
+/// partial one it only completes the highlighted row.
+pub fn is_exact_slash_or_skill_token(state: &crate::state::AppState, token: &str) -> bool {
+    if is_exact_slash_token(token) {
+        return true;
+    }
+    let Some(name) = token.strip_prefix('/') else {
+        return false;
+    };
+    state
+        .skill_commands
+        .iter()
+        .any(|command| command.advertised == name || command.canonical == name)
+}
+
 /// Like [`slash_popup`], but respects a user Esc-dismiss so the menu stays
 /// hidden until the composer text changes again.
 pub fn visible_slash_popup(state: &crate::state::AppState) -> Vec<(String, String)> {
-    // Shell Mode owns the composer's completion surface.
-    if state.input_mode == crate::shell_mode::InputMode::Shell || state.slash_popup_dismissed {
-        return Vec::new();
+    visible_slash_popup_rows(state)
+        .into_iter()
+        .map(|row| (row.name, row.description))
+        .collect()
+}
+
+/// The leading token the composer should paint in its namespace ink, with the
+/// namespace that owns it. Presentation only: execution still requires an
+/// exact token, so this is a hint about where the typing is going.
+pub fn highlighted_composer_command(
+    state: &crate::state::AppState,
+) -> Option<(std::ops::Range<usize>, SlashCompletionKind)> {
+    let text = state.composer.text();
+    if let Some(range) = highlighted_slash_command(text) {
+        return Some((range, SlashCompletionKind::Command));
     }
-    slash_popup(state.composer.text(), state.t())
+    // A Skill is recognized only when the cached registry says it exists; a
+    // stale cache can highlight a name that submit then refuses, never the
+    // other way around.
+    let first_line = text.split('\n').next()?;
+    let start = first_line.len() - first_line.trim_start().len();
+    let token = first_line[start..]
+        .strip_prefix('/')?
+        .split_whitespace()
+        .next()?;
+    if token.is_empty() {
+        return None;
+    }
+    let mut unique = None;
+    for command in &state.skill_commands {
+        if command.advertised == token || command.canonical == token {
+            return Some((start..start + 1 + token.len(), SlashCompletionKind::Skill));
+        }
+        let matches = command.advertised.starts_with(token) || command.canonical.starts_with(token);
+        if matches {
+            if unique.is_some() {
+                return None;
+            }
+            unique = Some(command);
+        }
+    }
+    unique.map(|_| (start..start + 1 + token.len(), SlashCompletionKind::Skill))
 }
 
 /// The whitespace-delimited token immediately before the composer cursor,
@@ -1344,20 +1572,87 @@ mod ghost_tests {
     }
 
     #[test]
-    fn slash_popup_never_lists_skills() {
+    fn bare_slash_lists_skills_in_the_same_menu() {
+        use leveler_skills::{SkillCommand, SkillScope, SkillSource};
         let mut s = skill_state(
             Locale::Zh,
             &[("release", "分阶段发布"), ("repo-lint", "检查")],
         );
-        for text in ["/", "/feat", "/repo"] {
-            s.composer.replace(text);
-            let rows = super::visible_slash_popup(&s);
-            assert!(
-                rows.iter()
-                    .all(|(n, _)| n != "/release" && n != "/repo-lint"),
-                "{text}: {rows:?}"
-            );
-        }
+        s.skill_commands = vec![
+            SkillCommand {
+                name: "release".into(),
+                scope: SkillScope::Project,
+                source: SkillSource::Native,
+                description: "分阶段发布".into(),
+                argument_hint: Some("<version>".into()),
+                advertised: "release".into(),
+                canonical: "project:release".into(),
+                mentionable: true,
+            },
+            SkillCommand {
+                name: "repo-lint".into(),
+                scope: SkillScope::User,
+                source: SkillSource::Claude,
+                description: "检查".into(),
+                argument_hint: None,
+                advertised: "repo-lint".into(),
+                canonical: "user:repo-lint".into(),
+                mentionable: true,
+            },
+        ];
+        // A bare `/` offers the quick built-ins and every invocable skill.
+        s.composer.replace("/");
+        let bare = super::visible_slash_popup_rows(&s);
+        assert!(
+            bare.iter()
+                .any(|row| row.name == "/release" && row.kind == super::SlashCompletionKind::Skill),
+            "bare / must list skills: {bare:?}"
+        );
+        assert!(bare.iter().any(|row| row.name == "/repo-lint"), "{bare:?}");
+        assert!(
+            bare.iter()
+                .any(|row| row.name == "/model" && row.kind == super::SlashCompletionKind::Command),
+            "the quick built-ins stay in the same menu: {bare:?}"
+        );
+        // A typed prefix searches both namespaces in the one menu.
+        s.composer.replace("/rel");
+        let rows = super::visible_slash_popup_rows(&s);
+        let release = rows
+            .iter()
+            .find(|row| row.name == "/release")
+            .expect("the project skill joins the same menu");
+        assert_eq!(release.kind, super::SlashCompletionKind::Skill);
+        assert!(release.description.contains("分阶段发布"), "{release:?}");
+        assert!(release.description.contains("项目"), "{release:?}");
+        assert!(release.description.contains("<version>"), "{release:?}");
+        // A built-in keeps the command namespace, and the other matching
+        // Skill keeps its own: one list, two kinds, no ambiguity.
+        let reload = rows
+            .iter()
+            .find(|row| row.name == "/reload")
+            .expect("/rel also reaches the built-in reload");
+        assert_eq!(reload.kind, super::SlashCompletionKind::Command);
+        let repo_lint = rows
+            .iter()
+            .find(|row| row.name == "/repo-lint")
+            .expect("/rel also reaches the fuzzy-matching user skill");
+        assert_eq!(repo_lint.kind, super::SlashCompletionKind::Skill);
+        // Fuzzy: non-contiguous letters find the skill, not only its prefix.
+        s.composer.replace("/rls");
+        let fuzzy = super::visible_slash_popup_rows(&s);
+        assert!(
+            fuzzy.iter().any(|row| row.name == "/release"),
+            "fuzzy search must find /release: {fuzzy:?}"
+        );
+        // And a fuzzy hit on a built-in command keeps its namespace.
+        s.composer.replace("/mdl");
+        let fuzzy_command = super::visible_slash_popup_rows(&s);
+        assert!(
+            fuzzy_command
+                .iter()
+                .any(|row| row.name == "/model" && row.kind == super::SlashCompletionKind::Command),
+            "fuzzy search must find /model: {fuzzy_command:?}"
+        );
     }
 
     #[test]
@@ -1593,6 +1888,8 @@ mod reachability_tests {
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Trust => Some("`/trust` — reducer/submit.rs"),
+            Screen::Skills => Some("`/skills` — reducer/submit.rs"),
+            Screen::Agents => Some("`/agents` — reducer/submit.rs"),
             Screen::Schedules => Some("`/schedules` — reducer/submit.rs"),
             Screen::Memory => Some("`/memory` — reducer/submit.rs"),
             Screen::Context => Some("`/context` / `/usage` — screen_nav::open_stats"),
@@ -1628,6 +1925,8 @@ mod reachability_tests {
             Screen::Memory,
             Screen::Clean,
             Screen::Trust,
+            Screen::Skills,
+            Screen::Agents,
             Screen::Output,
             Screen::PendingSteer,
         ];

@@ -29,7 +29,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
 
 use crate::action::Effect;
 use crate::state::AppState;
@@ -942,12 +941,16 @@ pub fn open_selected(state: &mut AppState) -> Vec<Effect> {
         // with another page's state.
         TaskKind::ScheduleDefinition | TaskKind::ScheduleRun => {
             state.tasks.detail_open = true;
+            state.page_focus = crate::layout::SplitFocus::Detail;
+            state.page_scroll = 0;
             return Vec::new();
         }
         _ => {}
     }
-    // Everything else has an authoritative fact panel; Enter toggles it.
-    state.tasks.detail_open = !state.tasks.detail_open;
+    // Everything else has an authoritative fact panel; Enter opens/focuses it.
+    state.tasks.detail_open = true;
+    state.page_focus = crate::layout::SplitFocus::Detail;
+    state.page_scroll = 0;
     Vec::new()
 }
 
@@ -1025,6 +1028,11 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // selection follows the nearest remaining row instead of becoming stale.
     ensure_selection(state);
     match key.code {
+        KeyCode::Esc if state.page_focus == crate::layout::SplitFocus::Detail => {
+            state.page_focus = crate::layout::SplitFocus::Primary;
+            state.tasks.detail_open = false;
+            Vec::new()
+        }
         KeyCode::Esc => {
             if state.tasks.detail_open {
                 state.tasks.detail_open = false;
@@ -1047,6 +1055,13 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::PageUp => {
             move_selection(state, -10);
+            Vec::new()
+        }
+        KeyCode::Tab if state.tasks.detail_open => {
+            state.page_focus = match state.page_focus {
+                crate::layout::SplitFocus::Primary => crate::layout::SplitFocus::Detail,
+                crate::layout::SplitFocus::Detail => crate::layout::SplitFocus::Primary,
+            };
             Vec::new()
         }
         KeyCode::Tab => {
@@ -1086,6 +1101,18 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 /// are published by the renderer from exactly what it painted.
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     match mouse.kind {
+        MouseEventKind::Moved => {
+            let point = (mouse.column, mouse.row).into();
+            state.list_hover = state
+                .screen_rows
+                .iter()
+                .find(|(rect, _)| rect.contains(point))
+                .map(|(_, key)| crate::state::ListHover {
+                    screen: crate::screen::Screen::Tasks,
+                    key: key.clone(),
+                });
+            Vec::new()
+        }
         MouseEventKind::ScrollUp => {
             move_selection(state, -1);
             Vec::new()
@@ -1105,6 +1132,12 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // The shared list rule: a click selects; Enter opens or
                 // toggles the detail. A second click on the same row must not
                 // change the frame.
+                state.list_hover = Some(crate::state::ListHover {
+                    screen: crate::screen::Screen::Tasks,
+                    key: key.clone(),
+                });
+                state.page_focus = crate::layout::SplitFocus::Primary;
+                state.page_scroll = 0;
                 state.tasks.selected = Some(key);
             }
             Vec::new()
@@ -1117,36 +1150,19 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn status_style(state: &AppState, status: TaskStatus) -> Style {
-    let theme = &state.theme;
-    let color = match status {
-        TaskStatus::Running => theme.status.running,
-        TaskStatus::Waiting | TaskStatus::Blocked | TaskStatus::Scheduled => theme.status.warning,
-        TaskStatus::Completed => theme.status.success,
-        TaskStatus::Failed => theme.status.error,
-        TaskStatus::Cancelled | TaskStatus::Interrupted | TaskStatus::Incomplete => {
-            theme.status.warning
+fn status_tone(status: TaskStatus) -> crate::render::RowTone {
+    match status {
+        TaskStatus::Running => crate::render::RowTone::Info,
+        TaskStatus::Waiting | TaskStatus::Blocked | TaskStatus::Scheduled => {
+            crate::render::RowTone::Warning
         }
-        TaskStatus::Unknown | TaskStatus::Idle => theme.text.muted,
-    };
-    Style::default().fg(color)
-}
-
-fn pad_display(text: &str, width: usize) -> String {
-    let used = UnicodeWidthStr::width(text);
-    let mut out = text.to_string();
-    for _ in used..width {
-        out.push(' ');
+        TaskStatus::Completed => crate::render::RowTone::Success,
+        TaskStatus::Failed => crate::render::RowTone::Error,
+        TaskStatus::Cancelled | TaskStatus::Interrupted | TaskStatus::Incomplete => {
+            crate::render::RowTone::Warning
+        }
+        TaskStatus::Unknown | TaskStatus::Idle => crate::render::RowTone::Muted,
     }
-    out
-}
-
-fn status_width(state: &AppState, rows: &[TaskRow]) -> usize {
-    rows.iter()
-        .map(|row| UnicodeWidthStr::width(row.status.label(state)))
-        .max()
-        .unwrap_or(0)
-        .clamp(4, 12)
 }
 
 fn group_title(group: TaskGroup, state: &AppState) -> &'static str {
@@ -1171,13 +1187,20 @@ fn body_lines(state: &AppState, rows: &[TaskRow], width: usize) -> Vec<BodyLine>
     let mut lines = Vec::new();
 
     if !state.runtime_connected {
-        lines.push(BodyLine {
-            line: Line::from(Span::styled(
-                t.disconnected.to_string(),
-                Style::default().fg(theme.status.warning),
-            )),
-            row_key: None,
-        });
+        for line in crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Partial,
+                message: t.disconnected,
+                detail: None,
+            },
+            theme,
+            width,
+        ) {
+            lines.push(BodyLine {
+                line,
+                row_key: None,
+            });
+        }
         lines.push(BodyLine {
             line: Line::default(),
             row_key: None,
@@ -1239,90 +1262,67 @@ fn body_lines(state: &AppState, rows: &[TaskRow], width: usize) -> Vec<BodyLine>
     }
 
     if rows.is_empty() {
-        let message = if state.tasks.section == TasksSection::Active {
-            t.empty_active
-        } else {
-            t.empty
+        let loading = state.tasks.index_pending || state.tasks.schedule_pending;
+        let block = crate::render::ListStateBlock {
+            kind: if loading {
+                crate::render::ListStateKind::Loading
+            } else {
+                crate::render::ListStateKind::Empty
+            },
+            message: if loading {
+                t.loading
+            } else if state.tasks.section == TasksSection::Active {
+                t.empty_active
+            } else {
+                t.empty
+            },
+            detail: None,
         };
-        lines.push(BodyLine {
-            line: Line::from(Span::styled(
-                message.to_string(),
-                Style::default().fg(theme.text.muted),
-            )),
-            row_key: None,
-        });
+        for line in crate::render::list_state_lines(block, theme, width) {
+            lines.push(BodyLine {
+                line,
+                row_key: None,
+            });
+        }
         return lines;
     }
 
-    let width_for_status = status_width(state, rows);
     let mut last_group = None;
     for row in rows {
         let group = row.group;
         if last_group != Some(group) {
-            if last_group.is_some() {
-                lines.push(BodyLine {
-                    line: Line::default(),
-                    row_key: None,
-                });
-            }
-            // A group header names its own size, like Grok Build's task
-            // pane: the reader can tell a full section from an empty one
-            // without counting rows.
             let count = rows.iter().filter(|row| row.group == group).count();
             lines.push(BodyLine {
-                line: Line::from(vec![
-                    Span::styled(
-                        group_title(group, state).to_string(),
-                        Style::default()
-                            .fg(theme.text.muted)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!(" {count}"), Style::default().fg(theme.text.muted)),
-                ]),
+                line: crate::render::section_header_line(
+                    group_title(group, state),
+                    Some(count),
+                    None,
+                    theme,
+                    width,
+                ),
                 row_key: None,
             });
             last_group = Some(group);
         }
         let selected = state.tasks.selected.as_deref() == Some(row.key.as_str());
-        let marker = if selected { "›" } else { " " };
-        let status = pad_display(row.status.label(state), width_for_status);
-        // title budget = total - marker(1) - gap(1) - glyph(1) - gap(1) -
-        // status(width) - gap(2) - kind label + gap. Keep it simple and let
-        // the renderer clip; this is a single-line row by design.
-        let title = crate::render::text::truncate_display(
-            &crate::render::text::sanitize_ui_text(&row.title),
-            width.saturating_sub(8),
-        );
-        let mut spans = vec![
-            Span::styled(
-                format!("{marker} "),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(
-                format!("{} ", row.status.glyph()),
-                status_style(state, row.status),
-            ),
-            Span::styled(status, status_style(state, row.status)),
-            Span::raw("  "),
-            Span::styled(title, Style::default().fg(theme.text.primary)),
-            Span::styled(
-                format!("  {}", row.kind.label(state)),
-                Style::default().fg(theme.text.muted),
-            ),
-        ];
+        let mut description = row.kind.label(state).to_string();
         if let Some(at) = row.at.as_deref() {
-            spans.push(Span::styled(
-                format!(
-                    "  {}",
-                    crate::render::text::sanitize_ui_text(&fmt_stamp(at))
-                ),
-                Style::default().fg(theme.text.muted),
-            ));
+            description.push_str(" · ");
+            description.push_str(&crate::render::text::sanitize_ui_text(&fmt_stamp(at)));
         }
-        lines.push(BodyLine {
-            line: Line::from(spans),
-            row_key: Some(row.key.clone()),
-        });
+        let list_row =
+            crate::render::ListRow::new(crate::render::text::sanitize_ui_text(&row.title))
+                .status(row.status.glyph(), status_tone(row.status))
+                .meta(row.status.label(state))
+                .description(description);
+        let paint = crate::render::row_paint(state, &row.key, selected, true);
+        let row_lines = crate::render::list_row_lines(&list_row, paint, theme, width);
+        for line in row_lines {
+            lines.push(BodyLine {
+                line,
+                row_key: Some(row.key.clone()),
+            });
+        }
     }
     let hidden = rows_hidden(state);
     if hidden > 0 {
@@ -1444,92 +1444,103 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status,
         hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let body = layout.content;
     state.screen_rows.clear();
     if body.width == 0 || body.height == 0 {
         return;
     }
+    const TASKS_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Vertical,
+        primary_pct: 70,
+        primary_min: 4,
+        detail_min: 4,
+        min_dual_width: 1,
+        min_dual_height: 10,
+    };
+    let detail_wanted =
+        state.tasks.detail_open || state.page_focus == crate::layout::SplitFocus::Detail;
+    let split = if detail_wanted {
+        crate::layout::split_pane(body, TASKS_SPLIT)
+            .unwrap_or_else(|| crate::layout::single_pane(body, crate::layout::SplitFocus::Detail))
+    } else {
+        crate::layout::single_pane(body, crate::layout::SplitFocus::Primary)
+    };
+    state.page_split = Some(crate::state::PageSplit {
+        screen: crate::screen::Screen::Tasks,
+        layout: split,
+    });
+    let list_area = split.primary;
+    let detail_area = split.detail;
 
     // A task that completed while the page was open leaves Active; the
     // selection moves to the nearest remaining row rather than dangling.
     ensure_selection(state);
     let rows = visible_rows(state);
-    let mut lines = body_lines(state, &rows, body.width as usize);
-    let selected_line = state.tasks.selected.as_deref().and_then(|selected| {
-        lines
-            .iter()
-            .position(|line| line.row_key.as_deref() == Some(selected))
-    });
 
-    // The list owns most of the pane when the fact panel is open; otherwise it
-    // owns all of it. No second scroll owner: the offset follows the selection.
-    let detail_height = if state.tasks.detail_open {
-        (body.height / 2).max(4).min(body.height.saturating_sub(3))
-    } else {
-        0
-    };
-    let list_height = body.height.saturating_sub(detail_height);
-    let list_area = Rect {
-        height: list_height,
-        ..body
-    };
-    let max_offset = lines.len().saturating_sub(list_area.height as usize);
-    let offset = selected_line
-        .map(|line| line.saturating_sub(list_area.height.saturating_sub(1) as usize))
-        .unwrap_or(0)
-        .min(max_offset);
-    let visible: Vec<Line<'static>> = lines
-        .drain(..)
-        .enumerate()
-        .filter(|(index, _)| *index >= offset && *index < offset + list_area.height as usize)
-        .map(|(index, body)| {
-            if let Some(key) = body.row_key {
-                state.screen_rows.push((
-                    Rect {
-                        y: list_area.y + (index - offset) as u16,
-                        height: 1,
-                        ..list_area
-                    },
-                    key,
-                ));
-            }
-            body.line
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(visible), list_area);
-
-    if detail_height == 0 {
-        return;
+    if list_area.width > 0 && list_area.height > 0 {
+        let mut lines = body_lines(state, &rows, list_area.width as usize);
+        let selected_line = state.tasks.selected.as_deref().and_then(|selected| {
+            lines
+                .iter()
+                .position(|line| line.row_key.as_deref() == Some(selected))
+        });
+        // No second scroll owner: the list offset follows the selection.
+        let max_offset = lines.len().saturating_sub(list_area.height as usize);
+        let offset = selected_line
+            .map(|line| line.saturating_sub(list_area.height.saturating_sub(1) as usize))
+            .unwrap_or(0)
+            .min(max_offset);
+        let visible: Vec<Line<'static>> = lines
+            .drain(..)
+            .enumerate()
+            .filter(|(index, _)| *index >= offset && *index < offset + list_area.height as usize)
+            .map(|(index, body)| {
+                if let Some(key) = body.row_key {
+                    let y = list_area.y + (index - offset) as u16;
+                    if let Some((rect, last_key)) = state.screen_rows.last_mut()
+                        && *last_key == key
+                        && rect.y + rect.height == y
+                    {
+                        rect.height = rect.height.saturating_add(1);
+                    } else {
+                        state.screen_rows.push((
+                            Rect {
+                                y,
+                                height: 1,
+                                ..list_area
+                            },
+                            key,
+                        ));
+                    }
+                }
+                body.line
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(visible), list_area);
     }
-    let rule_area = Rect {
-        y: body.y + list_height,
-        height: 1,
-        ..body
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(rule_area.width as usize),
-            Style::default().fg(state.theme.border.normal),
-        ))),
-        rule_area,
-    );
-    let detail_area = Rect {
-        y: rule_area.y + rule_area.height,
-        height: body.height.saturating_sub(list_height + rule_area.height),
-        ..body
-    };
-    if let Some(row) = rows
-        .iter()
-        .find(|row| Some(row.key.as_str()) == state.tasks.selected.as_deref())
+
+    if detail_area.width > 0
+        && detail_area.height > 0
+        && let Some(row) = rows
+            .iter()
+            .find(|row| Some(row.key.as_str()) == state.tasks.selected.as_deref())
     {
         let detail = detail_lines(state, row, detail_area.width as usize);
-        frame.render_widget(Paragraph::new(detail), detail_area);
+        let max = detail.len().saturating_sub(detail_area.height as usize);
+        state.page_scroll = state.page_scroll.min(max);
+        crate::render::render_pane_at_offset(
+            frame,
+            detail_area,
+            detail,
+            state.page_scroll,
+            &state.theme,
+        );
     }
+    crate::render::paint_split_divider(frame, &split, &state.theme);
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

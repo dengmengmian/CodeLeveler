@@ -89,6 +89,8 @@ fn attachment(sha256: &str) -> AttachmentRef {
         sha256: sha256.to_string(),
         width: Some(10),
         height: Some(10),
+        source_path: None,
+        preview_path: None,
     }
 }
 

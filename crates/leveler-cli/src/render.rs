@@ -251,6 +251,9 @@ fn render_event_text(event: AgentEvent) {
         // Durable local audit evidence. It has no presentation surface; the
         // event log keeps the typed fact for later inspection.
         AgentEvent::RuleDelivery { .. } => {}
+        // Durable local audit evidence; the status line and the event log carry
+        // it, not the answer stream.
+        AgentEvent::SkillDelivery { .. } => {}
         AgentEvent::Finished(_) => {}
     }
 }
@@ -365,6 +368,12 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         // turn without reading the local event store.
         AgentEvent::RuleDelivery { audit } => serde_json::json!({
             "type": "rule_delivery",
+            "audit": audit,
+        }),
+        // What the turn's message selected and whether each package loaded.
+        // Body-free by construction: names, provenance, sizes, stable codes.
+        AgentEvent::SkillDelivery { audit } => serde_json::json!({
+            "type": "skill_delivery",
             "audit": audit,
         }),
         AgentEvent::ToolCall {

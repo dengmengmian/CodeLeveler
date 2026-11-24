@@ -39,9 +39,10 @@ pub mod foreign_session;
 pub mod help;
 pub mod history_search;
 pub mod i18n;
+mod image_preview;
 mod input_guard;
 mod issue;
-mod layout;
+pub mod layout;
 pub mod markdown;
 pub mod mcp;
 pub mod memory;
@@ -74,7 +75,7 @@ pub(crate) mod shell_render;
 /// stopped growing" must describe the same bound the renderer paints.
 pub use shell_render::SHELL_OUTPUT_WINDOW_ROWS;
 pub mod settings;
-pub mod skills_view;
+pub mod skills;
 mod splash;
 pub mod state;
 mod status_line;
@@ -99,6 +100,7 @@ pub mod usage;
 mod ux_experiment;
 mod wait_status;
 mod workbench;
+pub(crate) mod workspace;
 
 mod run;
 

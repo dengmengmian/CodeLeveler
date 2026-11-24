@@ -136,7 +136,23 @@ impl WorkspaceReader {
             return Err(ReadError::IsDirectory);
         }
 
-        let mut reader = tokio::io::BufReader::new(file);
+        Self::read_window(
+            tokio::io::BufReader::new(file),
+            meta.len(),
+            window,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Apply the same window to bytes obtained through a verified content
+    /// reader. Keep paging and formatting identical to an ordinary file read.
+    pub(crate) async fn read_window(
+        mut reader: impl tokio::io::AsyncBufRead + Unpin,
+        file_bytes: u64,
+        window: ReadWindow,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedRead, ReadError> {
         let mut raw = Vec::new();
         let mut fingerprint = ContentFingerprint::default();
 
@@ -201,7 +217,7 @@ impl WorkspaceReader {
             observation: ReadObservation {
                 fingerprint: fingerprint.finish(),
                 total_lines,
-                file_bytes: meta.len(),
+                file_bytes,
             },
         })
     }

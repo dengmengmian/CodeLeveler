@@ -171,6 +171,8 @@ fn dogfood_pending_edit_preserves_text_and_attachment_drafts() {
                 sha256: "test-hash".into(),
                 width: Some(1),
                 height: Some(1),
+                source_path: None,
+                preview_path: None,
             });
         } else {
             s.composer.replace("existing draft");

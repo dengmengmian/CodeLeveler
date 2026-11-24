@@ -13,6 +13,7 @@ leveler-definition-trust = { workspace = true }
 leveler-core = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 leveler-definition-trust = { workspace = true, features = ["test-support"] }

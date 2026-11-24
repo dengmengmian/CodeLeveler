@@ -279,16 +279,39 @@ pub fn handle_mouse(
                 state.help.move_selection(1, t);
             }
         }
+        MouseEventKind::Moved => {
+            let point = (mouse.column, mouse.row).into();
+            state.list_hover = state
+                .screen_rows
+                .iter()
+                .find(|(rect, _)| rect.contains(point))
+                .map(|(_, key)| crate::state::ListHover {
+                    screen: crate::screen::Screen::Help,
+                    key: key.clone(),
+                });
+        }
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             let point = (mouse.column, mouse.row).into();
             if let Some((_, key)) = state
                 .screen_rows
                 .iter()
                 .find(|(rect, _)| rect.contains(point))
-                && let Ok(index) = key.parse::<usize>()
+                .cloned()
             {
+                state.list_hover = Some(crate::state::ListHover {
+                    screen: crate::screen::Screen::Help,
+                    key: key.clone(),
+                });
                 let t = state.t();
-                state.help.select(index, t);
+                let index = state
+                    .help
+                    .matches(t)
+                    .iter()
+                    .position(|entry| entry.binding == key)
+                    .or_else(|| key.parse::<usize>().ok());
+                if let Some(index) = index {
+                    state.help.select(index, t);
+                }
             }
         }
         _ => {}

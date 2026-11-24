@@ -177,6 +177,8 @@ fn unreadable_image() -> AttachmentRef {
         sha256: "0".repeat(64),
         width: Some(10),
         height: Some(10),
+        source_path: None,
+        preview_path: None,
     }
 }
 

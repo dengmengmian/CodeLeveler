@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use crate::render::render_scrolled;
 use crate::state::AppState;
@@ -21,9 +22,9 @@ pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.trace_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let area = layout.content;
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -31,21 +32,33 @@ pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
     lines.push(Line::from(""));
 
     let Some(loaded) = state.trace.loaded.as_ref() else {
-        let (message, color) = match &state.trace.error {
-            Some(error) => (error.as_str(), theme.status.error),
-            None => (t.trace_loading, theme.text.secondary),
+        let block = if let Some(error) = &state.trace.error {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Error,
+                message: error,
+                detail: None,
+            }
+        } else {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Loading,
+                message: t.trace_loading,
+                detail: None,
+            }
         };
-        lines.push(Line::from(Span::styled(
-            message.to_string(),
-            Style::default().fg(color),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            block,
+            theme,
+            area.width as usize,
+        ));
         render_scrolled(frame, area, state, lines);
         return;
     };
 
+    let mut hits = Vec::new();
+    let mut trace_lines_out = Vec::new();
     match state.trace.tab {
+        TraceTab::Trace => {}
         TraceTab::Overview => overview(&mut lines, state, loaded),
-        TraceTab::Trace => trace_lines(&mut lines, state, loaded),
         TraceTab::Requests => requests(&mut lines, state, loaded),
         TraceTab::Tools => tools(&mut lines, state, loaded),
         TraceTab::Agents => agents(&mut lines, state, loaded),
@@ -53,17 +66,70 @@ pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
     }
 
     if state.trace.tab == TraceTab::Trace {
-        // The request rows start under the tab line and its blank; the page's
-        // own title now lives in the shell's header, not in the body.
-        const HEADER_ROWS: usize = 2;
-        let focus = HEADER_ROWS.saturating_add(state.trace.selected);
-        let rows: Vec<(usize, String)> = (0..state.trace.filtered().len())
-            .map(|i| (HEADER_ROWS + i, i.to_string()))
-            .collect();
-        let mut hits = Vec::new();
-        crate::render::render_list_rows(frame, area, lines, &rows, focus, theme, &mut hits);
-        state.screen_rows = hits;
+        const TRACE_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+            axis: crate::layout::SplitAxis::Horizontal,
+            primary_pct: 45,
+            primary_min: 24,
+            detail_min: 30,
+            min_dual_width: 76,
+            min_dual_height: 8,
+        };
+        let remainder = Rect {
+            y: area.y.saturating_add(2),
+            height: area.height.saturating_sub(2),
+            ..area
+        };
+        let single_focus =
+            if state.trace.inspect || state.page_focus == crate::layout::SplitFocus::Detail {
+                crate::layout::SplitFocus::Detail
+            } else {
+                crate::layout::SplitFocus::Primary
+            };
+        let split = crate::layout::split_pane(remainder, TRACE_SPLIT)
+            .unwrap_or_else(|| crate::layout::single_pane(remainder, single_focus));
+        state.page_split = Some(crate::state::PageSplit {
+            screen: crate::screen::Screen::Trace,
+            layout: split,
+        });
+        if split.primary.width > 0 && split.primary.height > 0 {
+            trace_lines(
+                &mut trace_lines_out,
+                &mut hits,
+                state,
+                loaded,
+                split.primary.width as usize,
+            );
+            let focus = hits.get(state.trace.selected).map_or(0, |hit| hit.line);
+            crate::render::render_list_rows_with_spans(
+                frame,
+                split.primary,
+                trace_lines_out,
+                &hits,
+                focus,
+                theme,
+                &mut state.screen_rows,
+            );
+        } else {
+            state.screen_rows.clear();
+        }
+        if split.detail.width > 0 && split.detail.height > 0 {
+            let detail = trace_inspector_lines(state, split.detail.width as usize);
+            let max = detail.len().saturating_sub(split.detail.height as usize);
+            state.page_scroll = state.page_scroll.min(max);
+            crate::render::render_pane_at_offset(
+                frame,
+                split.detail,
+                detail,
+                state.page_scroll,
+                theme,
+            );
+        }
+        crate::render::paint_split_divider(frame, &split, theme);
+        let visible: Vec<Line<'static>> = lines.into_iter().take(2).collect();
+        frame.render_widget(Paragraph::new(visible), Rect { height: 2, ..area });
     } else {
+        state.page_split = None;
+        state.screen_rows.clear();
         render_scrolled(frame, area, state, lines);
     }
 }
@@ -226,27 +292,36 @@ fn overview(
 
 fn trace_lines(
     lines: &mut Vec<Line<'static>>,
+    hits: &mut Vec<crate::render::RowHitSpec>,
     state: &AppState,
     _loaded: &leveler_client_protocol::UiObservabilityLoaded,
+    width: usize,
 ) {
     let theme = &state.theme;
+    let t = state.t();
     let rows = state.trace.filtered();
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            state.t().trace_empty_window,
-            Style::default().fg(theme.text.secondary),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: if state.trace.filter == super::model::TraceFilter::All {
+                    crate::render::ListStateKind::Empty
+                } else {
+                    crate::render::ListStateKind::FilterEmpty
+                },
+                message: if state.trace.filter == super::model::TraceFilter::All {
+                    t.trace_empty_window
+                } else {
+                    t.trace_empty_filter
+                },
+                detail: None,
+            },
+            theme,
+            width,
+        ));
         return;
     }
     for (i, row) in rows.iter().enumerate() {
         let selected = i == state.trace.selected;
-        let style = if selected {
-            Style::default()
-                .fg(theme.accent.primary)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text.primary)
-        };
         let dur = row
             .duration_ms
             .map(|ms| {
@@ -257,34 +332,73 @@ fn trace_lines(
                 }
             })
             .unwrap_or_default();
-        let mark = if selected { ">" } else { " " };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{mark}#{:<5} {:<8} {:<16} {:<24} {dur}",
-                row.sequence,
-                row.class.tag(),
-                truncate(&row.title, 16),
-                truncate(&row.target, 24),
-            ),
-            style,
-        )));
-        if selected && state.trace.inspect {
-            for field in &row.fields {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}: {}", field.key, field.value),
-                    Style::default().fg(theme.text.secondary),
-                )));
-            }
+        let (glyph, tone) = match row.status.as_str() {
+            "fail" | "failed" | "error" => ("✗", crate::render::RowTone::Error),
+            "running" => ("●", crate::render::RowTone::Info),
+            "unknown" => ("?", crate::render::RowTone::Warning),
+            "ok" | "success" => ("✓", crate::render::RowTone::Success),
+            _ => ("·", crate::render::RowTone::Muted),
+        };
+        let title = format!("#{} {}", row.sequence, row.title);
+        let description = format!("{} · {}", row.class.tag(), row.target);
+        let list_row = crate::render::ListRow::new(title)
+            .status(glyph, tone)
+            .meta(dur)
+            .description(description);
+        let key = row.sequence.to_string();
+        let paint = crate::render::row_paint(state, &key, selected, true);
+        let row_lines = crate::render::list_row_lines(&list_row, paint, theme, width);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
+    }
+}
+
+fn trace_inspector_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let t = state.t();
+    let theme = &state.theme;
+    let Some(row) = state.trace.selected_row() else {
+        return crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.trace_empty_window,
+                detail: None,
+            },
+            theme,
+            width,
+        );
+    };
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("#{} {}", row.sequence, row.title),
+        Style::default()
+            .fg(theme.text.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("{} · {}", row.class.tag(), row.status),
+        Style::default().fg(theme.text.muted),
+    )));
+    for field in &row.fields {
+        let text = format!("{}: {}", field.key, field.value);
+        for piece in crate::render::wrap(&crate::render::text::sanitize_terminal_line(&text), width)
+        {
             lines.push(Line::from(Span::styled(
-                state
-                    .t()
-                    .trace_event_meta
-                    .replacen("{}", &row.event_type, 1)
-                    .replacen("{}", &row.created_at, 1),
-                Style::default().fg(theme.text.muted),
+                piece,
+                Style::default().fg(theme.text.secondary),
             )));
         }
     }
+    lines.push(Line::from(Span::styled(
+        t.trace_event_meta
+            .replacen("{}", &row.event_type, 1)
+            .replacen("{}", &row.created_at, 1),
+        Style::default().fg(theme.text.muted),
+    )));
+    lines
 }
 
 fn requests(

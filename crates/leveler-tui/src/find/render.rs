@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{FindHit, FindTab, turn_entries};
 use crate::i18n::UiText;
-use crate::render::{pad_line_to_width, truncate_display};
+use crate::render::truncate_display;
 use crate::state::AppState;
 
 pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -26,9 +26,9 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.find.hint,
     };
-    let layout = crate::secondary::layout(area, 1);
+    let layout = crate::secondary::page_layout(state, area, 1);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
 
     render_query(frame, layout.composer, state, t);
@@ -58,7 +58,7 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
     let mut focus = 0usize;
     if let Some(notice) = &state.find.notice {
         lines.push(Line::from(Span::styled(
@@ -69,16 +69,16 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     match state.find.tab {
         FindTab::Search => {
-            render_search_body(state, body_area, t, &mut lines, &mut rows, &mut focus)
+            render_search_body(state, body_area, t, &mut lines, &mut hits, &mut focus)
         }
-        FindTab::Turns => render_turns_body(state, t, body_area, &mut lines, &mut rows, &mut focus),
+        FindTab::Turns => render_turns_body(state, t, body_area, &mut lines, &mut hits, &mut focus),
     }
 
-    crate::render::render_list_rows(
+    crate::render::render_list_rows_with_spans(
         frame,
         body_area,
         lines,
-        &rows,
+        &hits,
         focus,
         theme,
         &mut state.screen_rows,
@@ -173,22 +173,38 @@ fn render_search_body(
     body: Rect,
     t: &UiText,
     lines: &mut Vec<Line<'static>>,
-    rows: &mut Vec<(usize, String)>,
+    hits: &mut Vec<crate::render::RowHitSpec>,
     focus: &mut usize,
 ) {
     let theme = &state.theme;
     let scanning = state.find.searching || state.find.artifacts_done < state.find.artifacts_total;
     if state.find.query.trim().is_empty() {
-        push_placeholder(lines, t.find.no_query, theme);
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.find.no_query,
+                detail: None,
+            },
+            theme,
+            body.width as usize,
+        ));
         return;
     }
     if state.find.hits.is_empty() {
-        let message = if scanning {
-            t.find.searching
+        let (kind, message) = if scanning {
+            (crate::render::ListStateKind::Loading, t.find.searching)
         } else {
-            t.find.no_results
+            (crate::render::ListStateKind::FilterEmpty, t.find.no_results)
         };
-        push_placeholder(lines, message, theme);
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind,
+                message,
+                detail: None,
+            },
+            theme,
+            body.width as usize,
+        ));
         return;
     }
     let body_width = body.width as usize;
@@ -197,18 +213,30 @@ fn render_search_body(
         if selected {
             *focus = lines.len();
         }
-        let header = lines.len();
-        lines.push(pad_line_to_width(
-            hit_header(hit, selected, t, theme),
-            body_width,
-        ));
-        rows.push((header, index.to_string()));
-        let body_line = lines.len();
-        lines.push(pad_line_to_width(
-            hit_body(hit, selected, theme),
-            body_width,
-        ));
-        rows.push((body_line, index.to_string()));
+        let mut title = String::new();
+        if hit.turn > 0 {
+            title.push_str(&format!("T{:02} · ", hit.turn));
+        }
+        title.push_str(hit.source.label(t));
+        let mut meta = String::new();
+        if let Some(artifact) = &hit.artifact {
+            meta = t
+                .find
+                .artifact_line
+                .replace("{}", &artifact.line.to_string());
+        }
+        let row = crate::render::ListRow::new(title)
+            .meta(meta)
+            .description_line(hit_body(hit, theme));
+        let key = index.to_string();
+        let paint = crate::render::row_paint(state, &key, selected, true);
+        let row_lines = crate::render::list_row_lines(&row, paint, theme, body_width);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
     }
     if state.find.capped {
         lines.push(Line::from(Span::styled(
@@ -223,56 +251,17 @@ fn render_search_body(
     }
 }
 
-fn hit_header(
-    hit: &FindHit,
-    selected: bool,
-    t: &UiText,
-    theme: &crate::theme::Theme,
-) -> Line<'static> {
-    let marker = if selected { "› " } else { "  " };
-    let head_style = if selected {
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.text.secondary)
-    };
-    let meta = Style::default().fg(theme.text.meta);
-    let mut spans = vec![Span::styled(marker, head_style)];
-    if hit.turn > 0 {
-        spans.push(Span::styled(format!("T{:02} · ", hit.turn), meta));
-    }
-    spans.push(Span::styled(hit.source.label(t), head_style));
-    if let Some(artifact) = &hit.artifact {
-        spans.push(Span::styled(
-            format!(
-                " · {}",
-                t.find
-                    .artifact_line
-                    .replace("{}", &artifact.line.to_string())
-            ),
-            meta,
-        ));
-    }
-    Line::from(spans)
-}
-
-fn hit_body(hit: &FindHit, selected: bool, theme: &crate::theme::Theme) -> Line<'static> {
-    let body_style = if selected {
-        Style::default().fg(theme.text.primary)
-    } else {
-        Style::default().fg(theme.text.secondary)
-    };
-    let marker = Style::default().fg(theme.text.subtle);
+fn hit_body(hit: &FindHit, theme: &crate::theme::Theme) -> Line<'static> {
+    let body_style = Style::default().fg(theme.text.secondary);
     let highlight = Style::default()
         .bg(theme.surface.selection)
         .fg(theme.accent.primary)
         .add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled("   ", marker)];
     let before = &hit.snippet[..hit.match_start.min(hit.snippet.len())];
     let match_end = hit.match_end.min(hit.snippet.len());
     let mid = &hit.snippet[hit.match_start.min(match_end)..match_end];
     let after = &hit.snippet[match_end..];
+    let mut spans = Vec::new();
     if !before.is_empty() {
         spans.push(Span::styled(before.to_string(), body_style));
     }
@@ -290,13 +279,21 @@ fn render_turns_body(
     t: &UiText,
     body: Rect,
     lines: &mut Vec<Line<'static>>,
-    rows: &mut Vec<(usize, String)>,
+    hits: &mut Vec<crate::render::RowHitSpec>,
     focus: &mut usize,
 ) {
     let theme = &state.theme;
     let turns = turn_entries(state);
     if turns.is_empty() {
-        push_placeholder(lines, t.find.no_turns, theme);
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.find.no_turns,
+                detail: None,
+            },
+            theme,
+            body.width as usize,
+        ));
         return;
     }
     let body_width = body.width as usize;
@@ -305,22 +302,6 @@ fn render_turns_body(
         if selected {
             *focus = lines.len();
         }
-        let header = lines.len();
-        let marker = if selected { "› " } else { "  " };
-        let head_style = if selected {
-            Style::default()
-                .fg(theme.accent.primary)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text.secondary)
-        };
-        let meta = Style::default().fg(theme.text.meta);
-        let mut spans = vec![Span::styled(marker, head_style)];
-        spans.push(Span::styled(
-            t.find.turn_title.replace("{}", &turn.ordinal.to_string()),
-            head_style,
-        ));
-        spans.push(Span::styled(" · ", meta));
         let status = if turn.running {
             t.find.turn_running.to_string()
         } else if let Some(status) = turn.status {
@@ -328,40 +309,26 @@ fn render_turns_body(
         } else {
             t.find.turn_no_status.to_string()
         };
-        spans.push(Span::styled(status, meta));
-        if let Some(secs) = turn.elapsed_secs {
-            spans.push(Span::styled(
-                format!(" · {}", crate::find::format_elapsed(secs)),
-                meta,
-            ));
-        }
-        lines.push(pad_line_to_width(Line::from(spans), body_width));
-        rows.push((header, index.to_string()));
-        let body_line = lines.len();
-        let preview = truncate_display(
-            &turn.preview.replace('\n', " "),
-            body_width.saturating_sub(3),
-        );
-        lines.push(pad_line_to_width(
-            Line::from(Span::styled(
-                format!("   {preview}"),
-                Style::default().fg(if selected {
-                    theme.text.primary
-                } else {
-                    theme.text.secondary
-                }),
-            )),
-            body_width,
-        ));
-        rows.push((body_line, index.to_string()));
+        let meta = if let Some(secs) = turn.elapsed_secs {
+            format!("{} · {}", status, crate::find::format_elapsed(secs))
+        } else {
+            status
+        };
+        let preview = turn.preview.replace('\n', " ");
+        let row =
+            crate::render::ListRow::new(t.find.turn_title.replace("{}", &turn.ordinal.to_string()))
+                .meta(meta)
+                .description(preview);
+        let key = index.to_string();
+        let paint = crate::render::row_paint(state, &key, selected, true);
+        let row_lines = crate::render::list_row_lines(&row, paint, theme, body_width);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
     }
-}
-
-fn push_placeholder(lines: &mut Vec<Line<'static>>, text: &str, theme: &crate::theme::Theme) {
-    lines.push(Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(theme.text.muted),
-    )));
 }
 
 #[cfg(test)]

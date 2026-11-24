@@ -824,6 +824,27 @@ impl EventBridge {
             // Durable local audit evidence. It has no presentation surface;
             // the event store keeps the typed fact for later inspection.
             EngineEvent::RuleDelivery { .. } => {}
+            // A turn with no explicit skill selection needs no client note;
+            // the index-only audit still lives in the event store.
+            EngineEvent::SkillDelivery { audit } => {
+                crate::skills::trace_delivery(&audit);
+                // A `$name` that loaded is already visible in the user's own
+                // message and needs no extra line. A slash invocation is an
+                // explicit command, and any refusal or host block must be
+                // reported regardless of surface.
+                let refused = audit.entries.iter().any(|entry| !entry.loaded());
+                let slash = matches!(
+                    audit.surface,
+                    leveler_skills::SkillDeliverySurface::Slash
+                        | leveler_skills::SkillDeliverySurface::Mixed
+                );
+                let slash_loaded = slash && audit.entries.iter().any(|entry| entry.loaded());
+                if refused || slash_loaded || audit.blocked.is_some() {
+                    let _ = self.events.send(RuntimeEvent::SkillDelivery {
+                        delivery: crate::skills::ui_delivery(&audit),
+                    });
+                }
+            }
             EngineEvent::RuntimeInjection { kind, .. } => {
                 // The ONE lifecycle opening that scopes the fold below: the
                 // harness re-drove a quiet round, so the next assistant text
@@ -1100,7 +1121,7 @@ impl EventBridge {
                     reason,
                 });
             }
-            EngineEvent::ContextSnapshot { .. } => {
+            EngineEvent::ContextSnapshot { .. } | EngineEvent::CheckpointRestored { .. } => {
                 // Engine durability metadata; no standalone UI cell.
             }
             EngineEvent::PlanUpdated {

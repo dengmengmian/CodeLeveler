@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_execution::RiskLevel;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
-use crate::workspace::{Clip, ReadError, ReadWindow, WorkspaceReader};
+use crate::workspace::{BoundedRead, Clip, ReadError, ReadWindow, WorkspaceReader};
 
 /// Bytes `render_line` adds around a line's own text: the right-aligned line
 /// number, the tab, and the newline. The reader charges this against the
@@ -104,6 +104,53 @@ impl Tool for ReadFileTool {
         if let Some(reason) = context.security_control_read_denied(&input.path) {
             return Ok(ToolOutput::error(reason));
         }
+        // Page at the budget the registry will enforce, less the room the
+        // marker needs. `saturating_sub` keeps a pathologically small budget
+        // from wrapping; the registry's own floor keeps it sane in practice.
+        let max_bytes = context
+            .policy
+            .tool_output_budget
+            .saturating_sub(MARKER_RESERVE)
+            .clamp(1, MAX_BYTES);
+        let window =
+            ReadWindow::rendered(input.start_line, input.end_line, max_bytes, line_overhead);
+
+        if let Some((grant, reference)) = context.skill_reference_for_path(&input.path) {
+            // Package approval admits instruction bytes, not a broader workspace read scope.
+            context
+                .execution_workspace()?
+                .resolve_for_read(&input.path)?;
+            let trust = super::skills::current_skill_trust(&context)?;
+            let checked =
+                tokio::task::spawn_blocking(move || grant.read_reference(&reference, &trust));
+            let bytes = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(ToolOutput::error("read_file cancelled")),
+                result = checked => match result {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(error)) => return Ok(ToolOutput::error(error)),
+                    Err(error) => return Err(ToolError::Io(error.to_string())),
+                }
+            };
+            return match WorkspaceReader::read_window(
+                bytes.as_slice(),
+                bytes.len() as u64,
+                window,
+                &cancellation,
+            )
+            .await
+            {
+                Ok(read) => Ok(ToolOutput::ok(render_result(read, max_bytes))),
+                Err(ReadError::Cancelled) => Ok(ToolOutput::error("read_file cancelled")),
+                Err(ReadError::Binary) => Ok(ToolOutput::error(
+                    "the verified skill reference contains NUL bytes",
+                )),
+                Err(error) => Err(ToolError::Io(format!(
+                    "verified skill reference: {error:?}"
+                ))),
+            };
+        }
+
         if let Some(reason) = context.skill_content_read_denied(&input.path) {
             return Ok(ToolOutput::error(reason));
         }
@@ -137,17 +184,6 @@ impl Tool for ReadFileTool {
             Ok(is_memory) => is_memory,
             Err(reason) => return Ok(ToolOutput::error(reason)),
         };
-
-        // Page at the budget the registry will enforce, less the room the
-        // marker needs. `saturating_sub` keeps a pathologically small budget
-        // from wrapping; the registry's own floor keeps it sane in practice.
-        let max_bytes = context
-            .policy
-            .tool_output_budget
-            .saturating_sub(MARKER_RESERVE)
-            .clamp(1, MAX_BYTES);
-        let window =
-            ReadWindow::rendered(input.start_line, input.end_line, max_bytes, line_overhead);
 
         let read = match WorkspaceReader::read(file, window, &cancellation).await {
             Ok(read) => read,
@@ -199,40 +235,44 @@ impl Tool for ReadFileTool {
             }
         }
 
-        let total_lines = read.observation.total_lines;
-        let mut out = String::new();
-        for (number, text) in &read.lines {
-            out.push_str(&render_line(*number, text));
-        }
-        match read.clip {
-            Clip::None => {
-                if read.lines.is_empty() {
-                    out.push_str(&format!(
-                        "(no lines in the requested range; the file has {total_lines} lines)\n"
-                    ));
-                }
-            }
-            Clip::AtLine { next_line } => {
-                out.push_str(&format!(
-                    "… [truncated: lines {}–{} of {total_lines} lines shown ({} bytes \
-                     / ~{} tokens total); continue with start_line={next_line}]\n",
-                    read.lines.first().map(|(n, _)| *n).unwrap_or(next_line),
-                    next_line.saturating_sub(1),
-                    read.observation.file_bytes,
-                    crate::registry::approx_tokens(read.observation.file_bytes as usize),
-                ));
-            }
-            Clip::InsideLine { line, line_bytes } => {
-                out.push_str(&format!(
-                    "… [truncated inside line {line} of {total_lines}: that single line is \
-                     {line_bytes} bytes, more than this call's {max_bytes}-byte result \
-                     budget]\n"
-                ));
-            }
-        }
-
-        Ok(ToolOutput::ok(out))
+        Ok(ToolOutput::ok(render_result(read, max_bytes)))
     }
+}
+
+fn render_result(read: BoundedRead, max_bytes: usize) -> String {
+    let total_lines = read.observation.total_lines;
+    let mut out = String::new();
+    for (number, text) in &read.lines {
+        out.push_str(&render_line(*number, text));
+    }
+    match read.clip {
+        Clip::None => {
+            if read.lines.is_empty() {
+                out.push_str(&format!(
+                    "(no lines in the requested range; the file has {total_lines} lines)\n"
+                ));
+            }
+        }
+        Clip::AtLine { next_line } => {
+            out.push_str(&format!(
+                "… [truncated: lines {}–{} of {total_lines} lines shown ({} bytes \
+                 / ~{} tokens total); continue with start_line={next_line}]\n",
+                read.lines.first().map(|(n, _)| *n).unwrap_or(next_line),
+                next_line.saturating_sub(1),
+                read.observation.file_bytes,
+                crate::registry::approx_tokens(read.observation.file_bytes as usize),
+            ));
+        }
+        Clip::InsideLine { line, line_bytes } => {
+            out.push_str(&format!(
+                "… [truncated inside line {line} of {total_lines}: that single line is \
+                 {line_bytes} bytes, more than this call's {max_bytes}-byte result \
+                 budget]\n"
+            ));
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]

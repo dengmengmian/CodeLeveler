@@ -10,6 +10,7 @@
 pub mod build;
 pub mod geometry;
 pub mod interaction;
+pub mod reply_copy;
 pub mod view;
 pub mod viewport;
 

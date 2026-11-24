@@ -58,6 +58,12 @@ pub(crate) fn padding_x(width: u16) -> u16 {
     }
 }
 
+/// Horizontal inset of a hosted card. The host's one content gutter is two
+/// columns; a page must not add a second page-level margin on top of it.
+pub(crate) fn card_gutter(width: u16) -> u16 {
+    if width >= 38 { 2 } else { 1 }
+}
+
 /// One Secondary Surface's identity and interaction contract.
 pub(crate) struct SecondaryPage<'a> {
     /// Left identity, e.g. `btw · 旁路线程`. Already localized.
@@ -78,6 +84,9 @@ pub(crate) struct SecondaryLayout {
     pub composer: Rect,
     pub rule_bottom: Rect,
     pub footer: Rect,
+    /// Center each footer hint. A hosted card does this; a full-viewport
+    /// surface (the side thread) stays left-aligned.
+    pub center_footer: bool,
 }
 
 /// Split `area` into the shared Secondary Surface slots, with one footer row.
@@ -99,11 +108,91 @@ pub(crate) fn layout_with_footer(
     composer_rows: u16,
     footer_rows: u16,
 ) -> SecondaryLayout {
-    let footer_rows = footer_rows.max(1);
+    split_layout(
+        area,
+        composer_rows,
+        footer_rows,
+        true,
+        false,
+        padding_x(area.width),
+    )
+}
+
+/// A hosted card paints one shortcut footer of its own. The page must not
+/// reserve a second hint row, or a `← title`, inside the body.
+fn hosted_card(state: &AppState) -> bool {
+    state.modal_named
+}
+
+/// Shell for a page drawn inside the hosted card.
+///
+/// When the card already named the page, the `← title` row and both rules
+/// are omitted and the hint is centered. A borderless frame still gets the
+/// full shell, because nothing else is drawing a way back.
+pub(crate) fn page_layout(state: &AppState, area: Rect, composer_rows: u16) -> SecondaryLayout {
+    page_layout_with_footer(state, area, composer_rows, 1)
+}
+
+/// [`page_layout`] with an explicit footer height.
+pub(crate) fn page_layout_with_footer(
+    state: &AppState,
+    area: Rect,
+    composer_rows: u16,
+    footer_rows: u16,
+) -> SecondaryLayout {
+    let footer_rows = if hosted_card(state) {
+        0
+    } else {
+        footer_rows.max(1)
+    };
+    let pad = if state.modal_chrome {
+        card_gutter(area.width)
+    } else {
+        padding_x(area.width)
+    };
+    split_layout(
+        area,
+        composer_rows,
+        footer_rows,
+        !state.modal_named,
+        state.modal_chrome,
+        pad,
+    )
+}
+
+fn split_layout(
+    area: Rect,
+    composer_rows: u16,
+    footer_rows: u16,
+    show_header: bool,
+    center_footer: bool,
+    pad: u16,
+) -> SecondaryLayout {
+    // Zero is a hosted card: the shared footer owns the hint, so this split
+    // must not keep a blank row for one.
+    let chrome = if show_header { 4 } else { 0 };
     let composer_rows = composer_rows.min(
         area.height
-            .saturating_sub(4 + footer_rows.saturating_sub(1)),
+            .saturating_sub(chrome + footer_rows.saturating_sub(1)),
     );
+    let inset = |r: Rect| crate::layout::horizontal_inset(r, pad);
+    if !show_header {
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(composer_rows),
+            Constraint::Length(footer_rows),
+        ])
+        .split(area);
+        return SecondaryLayout {
+            header: Rect::default(),
+            rule_top: Rect::default(),
+            content: inset(chunks[0]),
+            composer: inset(chunks[1]),
+            rule_bottom: Rect::default(),
+            footer: inset(chunks[2]),
+            center_footer,
+        };
+    }
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Length(1), // rule above the body
@@ -113,8 +202,6 @@ pub(crate) fn layout_with_footer(
         Constraint::Length(footer_rows),
     ])
     .split(area);
-    let pad = padding_x(area.width);
-    let inset = |r: Rect| crate::layout::horizontal_inset(r, pad);
     SecondaryLayout {
         header: inset(chunks[0]),
         rule_top: inset(chunks[1]),
@@ -122,6 +209,7 @@ pub(crate) fn layout_with_footer(
         composer: inset(chunks[3]),
         rule_bottom: inset(chunks[4]),
         footer: inset(chunks[5]),
+        center_footer,
     }
 }
 
@@ -143,8 +231,13 @@ pub(crate) fn draw_header(
     page: &SecondaryPage,
 ) -> Option<Rect> {
     let theme = &state.theme;
-    let back = paint_header(frame, l, page, theme);
-    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    // A hosted card already published the close glyph as the back hit.
+    // The title on that card is a name, not a second back control.
+    let plain = state.modal_chrome;
+    let back = paint_header(frame, l, page, theme, plain);
+    if !plain {
+        state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    }
     back
 }
 
@@ -156,6 +249,7 @@ fn paint_header(
     l: &SecondaryLayout,
     page: &SecondaryPage,
     theme: &Theme,
+    plain: bool,
 ) -> Option<Rect> {
     if l.header.height == 0 {
         return None;
@@ -168,26 +262,41 @@ fn paint_header(
         draw_rule(frame, l.rule_top, theme);
         return None;
     }
-    let left_text = format!("← {}", page.title);
+    // A hosted card draws `[×]` on this row. The name stays, the arrow and
+    // the turn status do not: both belong to the conversation, not the card.
+    let reserve = if plain { 4 } else { 0 };
+    let left_text = if plain {
+        page.title.to_string()
+    } else {
+        format!("← {}", page.title)
+    };
     // A status line can carry trailing padding; measure only what is visible so
     // padding never forces the whole status off the row.
     let right_plain: String = page.status.iter().map(|s| s.content.as_ref()).collect();
     let right_w = UnicodeWidthStr::width(right_plain.trim_end());
-    let right_visible = right_w > 0 && right_w <= inner.width as usize;
+    let right_visible = !plain && right_w > 0 && right_w + reserve <= inner.width as usize;
     // The parent status is the right anchor. It yields when the row cannot hold
     // identity + status with a gap; the identity alone tells the user where
-    // they are, which is the harder fact to recover.
+    // they are, which is the harder fact to recover. A hosted card reserves
+    // the close glyph instead of the status.
     let left_room = if right_visible {
         (inner.width as usize).saturating_sub(right_w + 1)
     } else {
-        inner.width as usize
+        (inner.width as usize).saturating_sub(reserve)
     };
     if left_room > 0 {
-        let left = Span::styled(
-            crate::render::truncate_display(&left_text, left_room),
+        let left_style = if plain {
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
             Style::default()
                 .fg(theme.accent.secondary)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(Modifier::BOLD)
+        };
+        let left = Span::styled(
+            crate::render::truncate_display(&left_text, left_room),
+            left_style,
         );
         frame.render_widget(
             Paragraph::new(Line::from(left)),
@@ -230,10 +339,16 @@ fn paint_header(
 /// fit, so they paint in full.
 pub(crate) fn draw_footer(
     frame: &mut Frame,
+    state: &mut AppState,
     l: &SecondaryLayout,
     page: &SecondaryPage,
-    theme: &Theme,
 ) {
+    // The card paints this hint once, under the body, with the tab key.
+    if hosted_card(state) {
+        state.card_hint = Some(page.hint.to_string());
+        return;
+    }
+    let theme = &state.theme;
     draw_rule(frame, l.rule_bottom, theme);
     if l.footer.height == 0 {
         return;
@@ -243,15 +358,20 @@ pub(crate) fn draw_footer(
         return;
     }
     let style = Style::default().fg(theme.text.muted);
+    let width = inner.width as usize;
     let rows: Vec<Line> = page
         .hint
         .lines()
         .take(inner.height as usize)
         .map(|row| {
-            Line::from(Span::styled(
-                crate::render::truncate_display(row, inner.width as usize),
-                style,
-            ))
+            let text = crate::render::truncate_display(row, width);
+            let shown = if l.center_footer {
+                let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str())) / 2;
+                format!("{}{text}", " ".repeat(pad))
+            } else {
+                text
+            };
+            Line::from(Span::styled(shown, style))
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), inner);

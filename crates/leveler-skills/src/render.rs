@@ -224,18 +224,16 @@ pub fn render_skill_package(detail: &SkillDetail) -> String {
             s.push_str(&format!("- `{p}` → `{}`\n", abs.display()));
         }
     }
-    if !detail.reference_contents.is_empty() {
+    if !detail.references.is_empty() {
         s.push_str(
             "\n## References (content approved with this skill)\n\
-             These files were read and hashed with `SKILL.md`; the text below is the \
-             approved version. Do not substitute a re-read of the package path for this \
-             content.\n",
+             Open only the files needed for the current task with `read_file` using \
+             the absolute paths below. The host verifies each read against this skill version.\n",
         );
-        for reference in &detail.reference_contents {
+        for relative in &detail.references {
             s.push_str(&format!(
-                "\n### `{}`\n\n{}\n",
-                reference.relative,
-                reference.text.trim_end()
+                "- `{relative}` → `{}`\n",
+                detail.dir.join(relative).display()
             ));
         }
     }
@@ -281,8 +279,8 @@ pub fn render_turn_injection(resolution: &SkillMentionResolution) -> Option<Stri
             "\nNamed skills that exist but cannot be loaded. Their contents are not \
              available:\n",
         );
-        for (name, reason) in &resolution.invalid {
-            s.push_str(&format!("- `${name}`: {reason}\n"));
+        for invalid in &resolution.invalid {
+            s.push_str(&format!("- `${}`: {}\n", invalid.name, invalid.reason));
         }
     }
     Some(s)
@@ -357,7 +355,7 @@ mod tests {
             body: "STEP 1: do the thing".into(),
             scripts: Vec::new(),
             references: Vec::new(),
-            reference_contents: Vec::new(),
+            reference_grant: None,
             other_files: Vec::new(),
         };
         let rendered = render_skill_package(&detail);

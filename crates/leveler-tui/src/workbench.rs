@@ -19,8 +19,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::{
-    COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
-    render_slash_popup,
+    COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, publish_image_chip_hits,
+    render_attachments, render_slash_popup,
 };
 use crate::screen::Screen;
 use crate::state::AppState;
@@ -1385,6 +1385,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &mut AppState) {
     state.input_rect = Some((area.x, area.y, area.width, area.height));
     let (lines, (cx, cy)) = composer_box_lines(state, area.width as usize);
     let (shown, skip) = clip_composer_box(lines, area.height as usize);
+    publish_image_chip_hits(state, area, skip);
     let cy = cy.saturating_sub(skip as u16);
     frame.render_widget(Paragraph::new(shown), area);
     // Cursor only when Input owns focus (Conversation focus is for scrolling).

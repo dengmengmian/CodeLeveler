@@ -537,8 +537,21 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         return handle_filter_key(state, key);
     }
     match key.code {
+        KeyCode::Esc if state.page_focus == crate::layout::SplitFocus::Detail => {
+            state.page_focus = crate::layout::SplitFocus::Primary;
+            state.settings.detail_open = false;
+            Vec::new()
+        }
         KeyCode::Esc => {
             close(state);
+            Vec::new()
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            state.page_focus = match state.page_focus {
+                crate::layout::SplitFocus::Primary => crate::layout::SplitFocus::Detail,
+                crate::layout::SplitFocus::Detail => crate::layout::SplitFocus::Primary,
+            };
+            state.settings.detail_open = state.page_focus == crate::layout::SplitFocus::Detail;
             Vec::new()
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -641,11 +654,13 @@ fn activate(state: &mut AppState) -> Vec<Effect> {
             })]
         }
         id if id.starts_with(PROVIDER_PREFIX) => {
-            state.settings.detail_open = !state.settings.detail_open;
+            state.page_focus = crate::layout::SplitFocus::Detail;
+            state.settings.detail_open = true;
             Vec::new()
         }
         _ => {
-            state.settings.detail_open = !state.settings.detail_open;
+            state.page_focus = crate::layout::SplitFocus::Detail;
+            state.settings.detail_open = true;
             Vec::new()
         }
     }
@@ -653,6 +668,18 @@ fn activate(state: &mut AppState) -> Vec<Effect> {
 
 pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     match mouse.kind {
+        MouseEventKind::Moved => {
+            let point = (mouse.column, mouse.row).into();
+            state.list_hover = state
+                .screen_rows
+                .iter()
+                .find(|(rect, _)| rect.contains(point))
+                .map(|(_, key)| crate::state::ListHover {
+                    screen: crate::screen::Screen::Settings,
+                    key: key.clone(),
+                });
+            Vec::new()
+        }
         MouseEventKind::ScrollUp => {
             move_selection(state, -1);
             Vec::new()
@@ -670,6 +697,12 @@ pub fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
             {
                 // A row click selects; Enter opens the editor or the detail,
                 // matching the rest of the secondary pages.
+                state.list_hover = Some(crate::state::ListHover {
+                    screen: crate::screen::Screen::Settings,
+                    key: key.clone(),
+                });
+                state.page_focus = crate::layout::SplitFocus::Primary;
+                state.page_scroll = 0;
                 state.settings.selected = Some(key.clone());
                 state.settings.detail_open = false;
             }
@@ -715,15 +748,6 @@ fn effect_label(state: &AppState, effect: UiSettingEffect) -> &'static str {
     }
 }
 
-fn pad(text: &str, width: usize) -> String {
-    let used = UnicodeWidthStr::width(text);
-    let mut out = text.to_string();
-    for _ in used..width {
-        out.push(' ');
-    }
-    out
-}
-
 pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = &state.t().settings_page;
     let page = crate::secondary::SecondaryPage {
@@ -731,20 +755,33 @@ pub fn render_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.footer,
     };
-    let layout = crate::secondary::layout(area, 2);
+    let layout = crate::secondary::page_layout(state, area, 2);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     render_filter(frame, layout.composer, state);
-    let list_visible = layout.content.width >= 90 || !state.settings.detail_open;
-    if list_visible {
-        render_list(frame, layout.content, state);
-    }
-    if state.settings.detail_open || layout.content.width >= 90 {
-        render_detail(frame, layout.content, state, !list_visible);
-    }
-    if !list_visible {
+    const SETTINGS_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Horizontal,
+        primary_pct: 44,
+        primary_min: 24,
+        detail_min: 34,
+        min_dual_width: 84,
+        min_dual_height: 8,
+    };
+    let split = crate::layout::split_pane(layout.content, SETTINGS_SPLIT)
+        .unwrap_or_else(|| crate::layout::single_pane(layout.content, state.page_focus));
+    state.page_split = Some(crate::state::PageSplit {
+        screen: crate::screen::Screen::Settings,
+        layout: split,
+    });
+    if split.primary.width > 0 && split.primary.height > 0 {
+        render_list(frame, split.primary, state);
+    } else {
         state.screen_rows.clear();
     }
+    if split.detail.width > 0 && split.detail.height > 0 {
+        render_detail(frame, split.detail, state);
+    }
+    crate::render::paint_split_divider(frame, &split, &state.theme);
 }
 
 fn render_filter(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -801,68 +838,71 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let list_area = if area.width >= 90 {
-        Rect {
-            width: area.width * 48 / 100,
-            ..area
-        }
-    } else {
-        area
-    };
+    let list_area = area;
     let rows = visible_rows(state);
     if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(crate::render::text::sanitize_terminal_line(t.no_matches))
-                .style(Style::default().fg(theme.text.muted)),
-            list_area,
-        );
+        let block = if let Some(error) = &state.settings.error {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Error,
+                message: error,
+                detail: None,
+            }
+        } else if state.settings.checking() || state.settings.pending_reload {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Loading,
+                message: t.loading,
+                detail: None,
+            }
+        } else {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::FilterEmpty,
+                message: t.no_matches,
+                detail: None,
+            }
+        };
+        let lines = crate::render::list_state_lines(block, &theme, list_area.width as usize);
+        frame.render_widget(Paragraph::new(lines), list_area);
         return;
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut hits: Vec<(usize, String)> = Vec::new();
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
     let mut focus = 0;
     let mut last_group: Option<SettingsGroup> = None;
     for row in &rows {
         if last_group != Some(row.group) {
-            if last_group.is_some() {
-                lines.push(Line::default());
-            }
-            lines.push(Line::from(Span::styled(
-                row.group.label(state).to_string(),
-                Style::default()
-                    .fg(theme.text.muted)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            let count = rows.iter().filter(|other| other.group == row.group).count();
+            lines.push(crate::render::section_header_line(
+                row.group.label(state),
+                Some(count),
+                None,
+                &theme,
+                list_area.width as usize,
+            ));
             last_group = Some(row.group);
         }
         let selected = state.settings.selected.as_deref() == Some(row.id.as_str());
         if selected {
             focus = lines.len();
         }
-        hits.push((lines.len(), row.id.clone()));
-        let value_width = (list_area.width as usize).saturating_sub(26).max(8);
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " }.to_string(),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(
-                format!("{}  ", pad(&row.label, 16)),
-                Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(
-                crate::render::text::truncate_display(&row.value, value_width),
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        let list_row =
+            crate::render::ListRow::new(crate::render::text::sanitize_terminal_line(&row.label))
+                .meta(crate::render::text::sanitize_terminal_line(&row.value));
+        let paint = crate::render::row_paint(
+            state,
+            &row.id,
+            selected,
+            state.page_focus == crate::layout::SplitFocus::Primary,
+        );
+        let row_lines =
+            crate::render::list_row_lines(&list_row, paint, &theme, list_area.width as usize);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key: row.id.clone(),
+        });
+        lines.extend(row_lines);
     }
-    crate::render::render_list_rows(
+    crate::render::render_list_rows_with_spans(
         frame,
         list_area,
         lines,
@@ -888,18 +928,10 @@ fn push_field(
     ]));
 }
 
-fn render_detail(frame: &mut Frame, area: Rect, state: &AppState, full: bool) {
+fn render_detail(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = &state.t().settings_page;
     let theme = state.theme.clone();
-    let detail_area = if area.width >= 90 && !full {
-        Rect {
-            x: area.x + area.width * 48 / 100 + 1,
-            width: area.width - area.width * 48 / 100 - 1,
-            ..area
-        }
-    } else {
-        area
-    };
+    let detail_area = area;
     if detail_area.width == 0 || detail_area.height == 0 {
         return;
     }
@@ -974,7 +1006,9 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &AppState, full: bool) {
             Style::default().fg(theme.text.muted),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), detail_area);
+    let max = lines.len().saturating_sub(detail_area.height as usize);
+    state.page_scroll = state.page_scroll.min(max);
+    crate::render::render_pane_at_offset(frame, detail_area, lines, state.page_scroll, &theme);
 }
 
 #[cfg(test)]

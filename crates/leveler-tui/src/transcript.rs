@@ -34,6 +34,16 @@ pub enum AssistantKind {
     Final,
 }
 
+/// The copy surface needs a runtime completion, even when a partial block
+/// has been frozen for display by a cancellation or a missing stream event.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyPhase {
+    #[default]
+    Unfinished,
+    MessageComplete,
+    Final,
+}
+
 /// A streaming assistant message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantBlock {
@@ -44,6 +54,16 @@ pub struct AssistantBlock {
     pub rendered: Option<MdDoc>,
     /// Progress vs. answer, assigned retroactively from event order.
     pub kind: AssistantKind,
+    pub(crate) reply_phase: ReplyPhase,
+}
+
+impl AssistantBlock {
+    pub(crate) fn is_copyable_reply(&self) -> bool {
+        self.done
+            && self.kind == AssistantKind::Final
+            && self.reply_phase == ReplyPhase::Final
+            && !self.text.trim().is_empty()
+    }
 }
 
 /// One model reasoning segment, presented as a Thought.
@@ -788,6 +808,7 @@ fn review_result_block(
             text: body,
             done: true,
             kind: AssistantKind::Final,
+            reply_phase: ReplyPhase::Unfinished,
         },
         summary,
         report: report.map(Box::new),
@@ -1075,6 +1096,17 @@ impl TranscriptState {
         if already_ended {
             return;
         }
+        if matches!(
+            status,
+            TurnEndStatus::Completed
+                | TurnEndStatus::CompletedPartiallyUnverified
+                | TurnEndStatus::CompletedWithWarnings
+                | TurnEndStatus::Answered
+                | TurnEndStatus::AnsweredUnregistered
+        ) {
+            self.settle_copyable_reply();
+        }
+        self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::TurnEnd(TurnEndBlock {
             status,
@@ -1088,6 +1120,31 @@ impl TranscriptState {
             output_tokens: receipt.output_tokens,
             cached_tokens: receipt.cached_tokens,
         }));
+    }
+
+    fn settle_copyable_reply(&mut self) {
+        let mut candidate = None;
+        for item in self.items.iter_mut().rev() {
+            match item {
+                TranscriptItem::TurnEnd(_) | TranscriptItem::User(_) => break,
+                // A delivery fact can precede later settlement narration.
+                // Its explicit answer still owns this turn's only actions.
+                TranscriptItem::Assistant(block) if block.reply_phase == ReplyPhase::Final => {
+                    return;
+                }
+                TranscriptItem::Assistant(block)
+                    if candidate.is_none()
+                        && block.kind == AssistantKind::Final
+                        && block.reply_phase == ReplyPhase::MessageComplete =>
+                {
+                    candidate = Some(block);
+                }
+                _ => {}
+            }
+        }
+        if let Some(block) = candidate {
+            block.reply_phase = ReplyPhase::Final;
+        }
     }
 
     /// Model steps in the turn that has not been closed yet.
@@ -1621,8 +1678,14 @@ impl TranscriptState {
             } else {
                 AssistantKind::Progress
             };
-            if block.kind != kind {
+            let phase = match (kind, block.reply_phase) {
+                (AssistantKind::Final, ReplyPhase::MessageComplete) => ReplyPhase::Final,
+                (AssistantKind::Progress, ReplyPhase::Final) => ReplyPhase::MessageComplete,
+                (_, phase) => phase,
+            };
+            if block.kind != kind || block.reply_phase != phase {
                 block.kind = kind;
+                block.reply_phase = phase;
                 changed = true;
             }
         }
@@ -1686,6 +1749,7 @@ impl TranscriptState {
                 done: false,
                 rendered: None,
                 kind: AssistantKind::Pending,
+                reply_phase: ReplyPhase::Unfinished,
             }));
         }
     }
@@ -1707,6 +1771,7 @@ impl TranscriptState {
         match self.assistant_mut(id) {
             Some(block) => {
                 block.text.push_str(delta);
+                block.reply_phase = ReplyPhase::Unfinished;
                 block.done = false;
                 block.rendered = None;
             }
@@ -1718,9 +1783,16 @@ impl TranscriptState {
                     done: false,
                     rendered: None,
                     kind: AssistantKind::Pending,
+                    reply_phase: ReplyPhase::Unfinished,
                 }));
             }
         }
+    }
+
+    /// A recorded new turn also ends any unclosed predecessor. Its uncommitted
+    /// narration must never become the answer to that new turn.
+    pub(crate) fn abandon_unsettled_reply(&mut self) {
+        self.decide_pending_assistants(AssistantKind::Progress);
     }
 
     /// Mark an assistant message complete and parse its markdown once.
@@ -1728,6 +1800,9 @@ impl TranscriptState {
         self.bump();
         if let Some(block) = self.assistant_mut(id) {
             block.done = true;
+            if block.reply_phase == ReplyPhase::Unfinished {
+                block.reply_phase = ReplyPhase::MessageComplete;
+            }
             block.rendered = Some(MdDoc::parse(&block.text));
         }
         // The answer closed: a review that settled while it streamed can take
@@ -2875,33 +2950,50 @@ impl TranscriptState {
         })
     }
 
-    /// Classify replayed history, where no live event order survives: inside
-    /// each user-delimited turn the LAST assistant message is the answer and
-    /// every earlier one was interim narration. Only touches still-unclassified
-    /// blocks, so replaying over a live transcript cannot demote an answer.
-    pub fn classify_replayed_history(&mut self) {
+    /// Snapshot-only history has role order but no turn outcome. A persisted
+    /// trailing answer in a busy turn needs the live terminal or durable
+    /// history before it can be copied.
+    pub fn classify_replayed_history(&mut self, tail_settled: bool) {
+        let mut settled = tail_settled;
         let mut answer_seen = false;
-        for index in (0..self.items.len()).rev() {
-            match &self.items[index] {
-                TranscriptItem::User(_) => answer_seen = false,
-                TranscriptItem::Assistant(block) if block.kind == AssistantKind::Pending => {
-                    // An empty message is not prose: it cannot be the answer,
-                    // and treating it as one hides the real answer before it.
-                    let kind = if answer_seen || block.text.trim().is_empty() {
-                        AssistantKind::Progress
-                    } else {
-                        AssistantKind::Final
-                    };
-                    if kind == AssistantKind::Final {
-                        answer_seen = true;
-                    }
-                    if let TranscriptItem::Assistant(block) = &mut self.items[index] {
-                        block.kind = kind;
-                    }
-                    self.version = self.version.wrapping_add(1);
+        for item in self.items.iter_mut().rev() {
+            match item {
+                TranscriptItem::User(_) => {
+                    settled = true;
+                    answer_seen = false;
                 }
-                TranscriptItem::Assistant(_) => answer_seen = true,
+                TranscriptItem::Assistant(block) if block.kind == AssistantKind::Pending => {
+                    if answer_seen || block.text.trim().is_empty() {
+                        block.kind = AssistantKind::Progress;
+                    } else {
+                        answer_seen = true;
+                        if settled {
+                            block.kind = AssistantKind::Final;
+                            if block.reply_phase == ReplyPhase::MessageComplete {
+                                block.reply_phase = ReplyPhase::Final;
+                            }
+                        }
+                    }
+                }
+                TranscriptItem::Assistant(block)
+                    if block.kind == AssistantKind::Final
+                        || block.reply_phase == ReplyPhase::MessageComplete =>
+                {
+                    answer_seen = true;
+                }
                 _ => {}
+            }
+        }
+        self.bump();
+    }
+
+    /// Some snapshot rows look like assistant prose on screen but do not
+    /// represent a final model message. Skip them in the snapshot classifier.
+    pub(crate) fn mark_snapshot_progress(&mut self, id: &MessageId, runtime_summary: bool) {
+        if let Some(block) = self.assistant_mut(id) {
+            block.kind = AssistantKind::Progress;
+            if runtime_summary {
+                block.reply_phase = ReplyPhase::Unfinished;
             }
         }
     }
@@ -4148,7 +4240,7 @@ mod tests {
             ],
             "restored messages arrive undecided"
         );
-        replayed.classify_replayed_history();
+        replayed.classify_replayed_history(true);
 
         assert_eq!(kinds(&live), kinds(&replayed));
         assert_eq!(
@@ -4282,7 +4374,7 @@ mod tests {
         say(&mut t, "m2", "改好了");
         t.push_user("第二个需求".into());
         say(&mut t, "m3", "又改好了");
-        t.classify_replayed_history();
+        t.classify_replayed_history(true);
         assert_eq!(
             kinds(&t),
             vec![
@@ -4300,7 +4392,7 @@ mod tests {
         say(&mut t, "m1", "答案");
         t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
         say(&mut t, "m2", "后续");
-        t.classify_replayed_history();
+        t.classify_replayed_history(true);
         assert_eq!(kinds(&t), vec![AssistantKind::Final, AssistantKind::Final]);
     }
 
@@ -4358,6 +4450,28 @@ mod tests {
                 AssistantKind::Progress
             ]
         );
+    }
+
+    #[test]
+    fn copy_keeps_the_delivery_when_settlement_narration_arrives_later() {
+        let mut t = TranscriptState::new();
+        let answer = "Report contents.";
+        say(&mut t, "delivery", answer);
+        t.commit_named_answer(answer);
+        say(&mut t, "progress", "Still recording settlement.");
+        t.push_turn_end(TurnEndStatus::Completed, 0, 1, None, None);
+
+        let replies: Vec<_> = t
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Assistant(block) if block.is_copyable_reply() => {
+                    Some(block.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, [answer]);
     }
 
     /// The turn-end classifier may already have run (history replay, a late
@@ -4421,7 +4535,7 @@ mod tests {
             "Implemented --doc-count; go test ./... exited 0.",
         );
         say(&mut t, "m2", "");
-        t.classify_replayed_history();
+        t.classify_replayed_history(true);
         assert_eq!(
             kinds(&t),
             vec![AssistantKind::Final, AssistantKind::Progress],

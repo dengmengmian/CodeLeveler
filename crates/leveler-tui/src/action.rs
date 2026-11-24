@@ -130,6 +130,12 @@ pub enum Action {
     /// A user-shell "Copy Output" finished: the delivery receipt and copied
     /// character count, or why the copy did not happen.
     UserShellOutputCopied(Result<(crate::clipboard::CopyReceipt, usize), String>),
+    /// A reply clipboard write finished.
+    ReplyCopied {
+        session_id: leveler_client_protocol::SessionId,
+        target: crate::conversation::reply_copy::ReplyTarget,
+        result: Result<crate::clipboard::CopyReceipt, String>,
+    },
     /// A complete output's index finished building. `result` is shared with
     /// the new [`crate::output_view::OutputView`]; the generation discards a
     /// result whose page was closed or whose width changed meanwhile.
@@ -198,6 +204,11 @@ pub struct CleanHost {
 pub enum Effect {
     /// Send a command to the runtime.
     Send(ClientCommand),
+    /// The second command is eligible only after the first is acknowledged.
+    SendThen {
+        command: ClientCommand,
+        then: ClientCommand,
+    },
     /// Deliver a turn input under the id the reducer minted for it and keeps
     /// in [`crate::state::AppState::pending_submissions`]. Retries reuse the id.
     Submit {
@@ -247,6 +258,12 @@ pub enum Effect {
         /// capture. The reducer never sends this when the retained text is
         /// itself a truncated tail.
         retained: String,
+    },
+    /// Copy one complete reply via the terminal's clipboard routes.
+    CopyReply {
+        session_id: leveler_client_protocol::SessionId,
+        target: crate::conversation::reply_copy::ReplyTarget,
+        text: String,
     },
     /// Build the row index for a complete output off the paint loop. The
     /// source is file-backed for a real capture; the result is bounded by the

@@ -47,6 +47,8 @@ api_key_env = "A2AGENT_API_KEY"
 - `Ctrl+R` 搜索输入历史，Enter 放回草稿，不会直接发送。
 - `Ctrl+Z` 撤销输入，`Ctrl+Shift+Z` 或 `Alt+Z` 重做。
 - 点击工具组查看执行详情，`Ctrl+O` 打开最新执行，`Ctrl+G` 跳到最终回答。
+- 输入 `/技能名` 启用 skill。CodeLeveler 交付流程正文和已校验的参考文件清单，执行时仅向模型返回所请求的参考文件内容。
+- 已完成的回复末尾提供 `[Copy Markdown]` 和 `[Copy Text]`，分别复制完整 Markdown 原文和纯文本。可以直接点击，也可以在对话区按 Tab 选择，再按 Enter 复制。
 - 空输入框输入 `!` 进入 Shell Mode，Tab 补全命令和路径。
 - `/output` 查看完整本地命令输出，`/copy output` 复制输出。
 - 文件编辑默认展开完整真实 Diff，点击编辑头行或按 `Ctrl+O` 折叠为一行 `+A/-R` 摘要。在 Diff 上拖选复制的是选中源码行（不含行号与 `+`/`-` 标记）；`/copy diff` 复制完整已应用补丁。

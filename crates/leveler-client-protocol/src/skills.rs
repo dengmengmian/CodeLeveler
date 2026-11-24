@@ -34,8 +34,11 @@ pub enum UiSkillSource {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UiSkillStatus {
-    /// Valid, and the directory resolves.
+    /// Valid, trusted, and enabled: the entry can be loaded.
     Available,
+    /// Valid and trusted, but the user disabled it; the package stays listed
+    /// so it can be re-enabled.
+    Disabled,
     /// The definition is broken; it cannot be loaded anywhere.
     Invalid,
 }
@@ -64,14 +67,27 @@ pub struct UiSkillEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     pub status: UiSkillStatus,
-    /// Why it is invalid.
+    /// Why it is disabled or invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Present only for an available entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Display-only argument shape from `SKILL.md` frontmatter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    /// Whether `/` and `$` may invoke this Skill.
+    #[serde(default = "default_true")]
+    pub user_invocable: bool,
+    /// Whether the model index and `load_skill` may use this Skill.
+    #[serde(default)]
+    pub disable_model_invocation: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shadowed: Vec<UiShadowedSkill>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Something under a skills directory that is not a loadable skill at all.
@@ -98,4 +114,52 @@ pub struct UiSkillDetail {
     pub references: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub other_files: Vec<String>,
+}
+
+/// Why a selected skill did not reach the turn context. Stable wire codes;
+/// the display copy is the client's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UiSkillDeliveryFailure {
+    NotFound,
+    Invalid,
+    Disabled,
+    Untrusted,
+    UserInvocationDisabled,
+    ModelInvocationDisabled,
+    Read,
+    Shadowed,
+    CapabilityUnavailable,
+}
+
+/// One skill the user's message selected this turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiSkillDeliveryEntry {
+    pub name: String,
+    /// The token the user typed (`/deploy`, `$deploy`, or both).
+    pub requested_as: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<UiSkillScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<UiSkillSource>,
+    /// Procedure body bytes; zero when nothing was loaded.
+    pub bytes: usize,
+    /// `None` means the package was loaded into the turn context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<UiSkillDeliveryFailure>,
+}
+
+/// The live projection of a turn's skill delivery. The durable audit is the
+/// engine event; this is the compact fact a client shows while the turn runs.
+/// It carries no procedure body.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiSkillDelivery {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<UiSkillDeliveryEntry>,
+    /// Set when the host refused the whole delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<UiSkillDeliveryFailure>,
 }

@@ -101,6 +101,16 @@ impl OutputCompleteness {
     }
 }
 
+/// Real execution facts carried from the shell record into the viewer header.
+/// They are deliberately a projection: the viewer never derives an exit code
+/// or duration from the output text.
+#[derive(Debug, Clone, Default)]
+pub struct OutputMeta {
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub has_stderr: bool,
+}
+
 /// A validated complete capture directory.
 #[derive(Debug, Clone)]
 pub struct Capture {
@@ -806,6 +816,8 @@ pub struct OutputView {
     /// Last painted body rect (x, y, w, h).
     pub rect: Option<(u16, u16, u16, u16)>,
     pub bytes: u64,
+    /// Execution facts carried from the source record; never inferred here.
+    pub meta: OutputMeta,
 }
 
 impl OutputView {
@@ -837,6 +849,7 @@ impl OutputView {
             anchor: None,
             rect: None,
             bytes,
+            meta: OutputMeta::default(),
         }
     }
 

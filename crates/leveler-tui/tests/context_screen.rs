@@ -1,6 +1,5 @@
-//! `/context` under the real ratatui renderer: the Context Map and the
-//! breakdown must both fit the pane at every width, and the layout must degrade
-//! from side-by-side to stacked without dropping a number.
+//! `/context` under the real ratatui renderer: the Context Map sits above the
+//! breakdown at every width, and neither pane drops a number.
 
 use leveler_client_protocol::SessionId;
 use leveler_model::{
@@ -119,31 +118,61 @@ fn the_pane_holds_at_every_width() {
         let text = screen_text(&mut s, w, h);
         assert!(text.contains("Breakdown"), "width {w}: missing breakdown");
         // No `Free` detail row: remaining capacity is the map's empty cells and
-        // the header's own ratio. The Usage section follows under its own rule.
+        // the header's own ratio. Usage is the next section of the same
+        // document. The map now sits above the breakdown, so on a short card
+        // that section is one scroll down rather than beside the glyphs.
         assert!(
             !text.contains("Free") && !text.contains("○ 可用"),
             "width {w}: the Free detail row is gone:\n{text}"
         );
-        assert!(text.contains("Usage"), "width {w}: missing usage section");
         assert!(text.contains("●"), "width {w}: missing map");
-        // No line may carry more cells than the pane (the renderer clips, so a
-        // silent overflow would be invisible without counting pre-render).
+        assert_fits(w, &text);
+        s.screen_scroll = 10_000;
+        let bottom = screen_text(&mut s, w, h);
         assert!(
-            text.lines()
-                .all(|l| unicode_width::UnicodeWidthStr::width(l) <= w as usize),
-            "width {w}: a line overflowed:\n{text}"
+            bottom.contains("Usage"),
+            "width {w}: usage left the document:\n{bottom}"
         );
+        assert_fits(w, &bottom);
     }
 }
 
-#[test]
-fn wide_panes_place_the_map_beside_the_breakdown() {
-    let mut s = opened(snapshot());
-    let text = screen_text(&mut s, 120, 30);
-    let first_map_row = text.lines().find(|l| l.contains('●')).expect("a map row");
+fn assert_fits(width: u16, text: &str) {
     assert!(
-        first_map_row.contains("Breakdown"),
-        "map and breakdown should share the first row on a wide pane: {first_map_row:?}"
+        text.lines()
+            .all(|l| unicode_width::UnicodeWidthStr::width(l) <= width as usize),
+        "width {width}: a line overflowed:\n{text}"
+    );
+}
+
+#[test]
+fn wide_panes_stack_the_map_over_the_breakdown() {
+    let mut s = opened(snapshot());
+    let text = screen_text(&mut s, 120, 40);
+    let model = text
+        .lines()
+        .find(|l| l.contains("deepseek"))
+        .expect("model");
+    assert!(
+        !model.contains("Input capacity"),
+        "the model keeps its own line: {model:?}"
+    );
+    let first_map_row = text.lines().position(|l| l.contains('●')).expect("map");
+    let breakdown_row = text
+        .lines()
+        .position(|l| l.contains("Breakdown"))
+        .expect("breakdown");
+    assert!(
+        breakdown_row > first_map_row,
+        "the map sits above the breakdown:\n{text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .nth(first_map_row)
+            .unwrap()
+            .contains("Breakdown"),
+        "a map row is only the map"
     );
 }
 
@@ -229,8 +258,8 @@ fn the_header_figure_is_the_sum_of_the_rows_it_prints() {
         "the header must print the snapshot's used figure: {header:?}"
     );
 
-    // Every top-level row, found by the label it prints. On a wide pane the
-    // map shares the row, so the line also carries `○` cells.
+    // Every top-level row, found by the label it prints. The map is its own
+    // block above these rows.
     let mut row_sum = 0u64;
     for (label, expected) in [
         ("Tool definitions", 9_300u64),

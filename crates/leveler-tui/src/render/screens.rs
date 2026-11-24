@@ -8,8 +8,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-use super::text::{sanitize_terminal_line, truncate_display, wrap};
-use super::{render_list_focused, render_scrolled};
+use super::render_list_focused;
+use super::text::{sanitize_terminal_line, wrap};
 
 pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if state.help.detail.is_some() {
@@ -22,9 +22,9 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.footer_list,
     };
-    let layout = crate::secondary::layout(area, 1);
+    let layout = crate::secondary::page_layout(state, area, 1);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let category = state
         .help
@@ -48,99 +48,80 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     frame.set_cursor_position((layout.composer.x + x as u16, layout.composer.y));
     let entries = state.help.matches(state.t());
     let mut lines = Vec::new();
-    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
     let mut focus = 0;
     let mut last_category: Option<crate::screen::SlashCategory> = None;
     let mut keys_started = false;
     for (index, entry) in entries.iter().enumerate() {
         if entry.is_key {
             if !keys_started {
-                lines.push(Line::from(Span::styled(
+                lines.push(crate::render::section_header_line(
                     t.key_bindings,
-                    Style::default()
-                        .fg(theme.text.muted)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                )));
+                    None,
+                    None,
+                    theme,
+                    layout.content.width as usize,
+                ));
                 keys_started = true;
             }
         } else if last_category != entry.category {
-            lines.push(Line::from(Span::styled(
+            lines.push(crate::render::section_header_line(
                 entry
                     .category
                     .map(|category| t.category_label(category))
                     .unwrap_or(t.all_categories),
-                Style::default()
-                    .fg(theme.text.muted)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            )));
+                None,
+                None,
+                theme,
+                layout.content.width as usize,
+            ));
             last_category = entry.category;
         }
         let selected = index == state.help.selected;
+        let mut title = entry.binding.clone();
+        if !entry.aliases.is_empty() {
+            title.push_str(&format!("  ({})", entry.aliases.join(", ")));
+        }
+        if state.is_busy() && entry.busy == Some(crate::screen::BusyPolicy::IdleOnly) {
+            title.push_str(&format!("  · {}", t.unavailable_busy));
+        }
+        title.push_str("  ");
+        title.push_str(&entry.description);
+        let row = crate::render::ListRow::new(title);
+        let key = entry.binding.clone();
+        let paint = crate::render::row_paint(state, &key, selected, true);
+        let row_lines =
+            crate::render::list_row_lines(&row, paint, theme, layout.content.width as usize);
         if selected {
             focus = lines.len();
         }
-        rows.push((lines.len(), index.to_string()));
-        let mut spans = vec![
-            Span::styled(
-                if selected { "› " } else { "  " }.to_string(),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::styled(
-                entry.binding.clone(),
-                Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(if selected {
-                        ratatui::style::Modifier::BOLD
-                    } else {
-                        ratatui::style::Modifier::empty()
-                    }),
-            ),
-        ];
-        if !entry.aliases.is_empty() {
-            spans.push(Span::styled(
-                format!("  ({})", entry.aliases.join(", ")),
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-        spans.push(Span::styled(
-            format!("  {}", entry.description),
-            Style::default().fg(theme.text.muted),
-        ));
-        if state.is_busy() && entry.busy == Some(crate::screen::BusyPolicy::IdleOnly) {
-            spans.push(Span::styled(
-                format!("  · {}", t.unavailable_busy),
-                Style::default().fg(theme.status.warning),
-            ));
-        }
-        for line in wrap(
-            &spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>(),
-            layout.content.width as usize,
-        ) {
-            // A wrapped row keeps the original style: plain text is rebuilt
-            // with the selected row's colour so the marker and the hint stay
-            // readable at every width.
-            lines.push(Line::from(Span::styled(
-                line,
-                Style::default().fg(if selected {
-                    theme.accent.primary
-                } else {
-                    theme.text.primary
-                }),
-            )));
-        }
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
     }
     if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            t.no_matches,
-            Style::default().fg(theme.text.muted),
-        )));
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::FilterEmpty,
+                message: t.no_matches,
+                detail: None,
+            },
+            theme,
+            layout.content.width as usize,
+        ));
     }
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(frame, layout.content, lines, &rows, focus, theme, &mut hits);
-    state.screen_rows = hits;
+    crate::render::render_list_rows_with_spans(
+        frame,
+        layout.content,
+        lines,
+        &hits,
+        focus,
+        theme,
+        &mut state.screen_rows,
+    );
 }
 
 fn push_help_field(lines: &mut Vec<Line<'static>>, theme: &Theme, label: &str, value: &str) {
@@ -160,9 +141,9 @@ fn render_help_detail(frame: &mut Frame, area: Rect, state: &mut AppState) {
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.footer_detail,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let Some(entry) = state.help.detail_entry(state.t()) else {
         return;
@@ -322,16 +303,30 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         status: crate::status_line::header_line(state, area.width as usize).spans,
         hint: t.diff_footer_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let area = layout.content;
-    // Wipe the whole split first so a shorter file/list can't leave ghosts
-    // from the previous selection or scroll position.
+    // Wipe the whole content rect first so a shorter file/list can't leave
+    // ghosts from the previous selection or scroll position.
     theme.paint_canvas(frame, area);
-    let [list_area, detail_area] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
+    const DIFF_SPLIT: crate::layout::SplitSpec = crate::layout::SplitSpec {
+        axis: crate::layout::SplitAxis::Horizontal,
+        primary_pct: 32,
+        primary_min: 22,
+        detail_min: 40,
+        min_dual_width: 78,
+        min_dual_height: 8,
+    };
+    let split = crate::layout::split_pane(area, DIFF_SPLIT)
+        .unwrap_or_else(|| crate::layout::single_pane(area, state.page_focus));
+    state.page_split = Some(crate::state::PageSplit {
+        screen: crate::screen::Screen::Diff,
+        layout: split,
+    });
+    let list_area = split.primary;
+    let detail_area = split.detail;
 
     let files = state
         .diff
@@ -340,130 +335,126 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         .unwrap_or(&[]);
     let selected = state.diff_selected.min(files.len().saturating_sub(1));
 
-    let list_block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(theme.border.normal))
-        .title(Span::styled(
+    if list_area.width > 0 && list_area.height > 0 {
+        let list_w = list_area.width as usize;
+        let mut rows: Vec<Line> = Vec::new();
+        let mut row_hits: Vec<crate::render::RowHitSpec> = Vec::new();
+        rows.push(crate::render::section_header_line(
             t.diff_files_pane,
-            Style::default().fg(theme.text.secondary),
+            Some(files.len()),
+            None,
+            theme,
+            list_w,
         ));
-    let list_inner = list_block.inner(list_area);
-    let list_w = list_inner.width as usize;
-
-    let mut rows: Vec<Line> = Vec::new();
-    let mut row_hits: Vec<(usize, String)> = Vec::new();
-    if files.is_empty() {
-        // Loading is not empty, and a failed read is not empty either. Saying
-        // "无改动" while a diff of thousands of files is still being computed —
-        // or when git could not be read at all — is a false claim about the
-        // workspace.
-        if let Some(error) = &state.diff_error {
-            rows.push(Line::from(Span::styled(
-                t.diff_failed,
-                Style::default().fg(theme.status.error),
-            )));
-            for piece in wrap(error, list_w.max(1)) {
-                rows.push(Line::from(Span::styled(
-                    piece,
-                    Style::default().fg(theme.text.secondary),
-                )));
-            }
-        } else {
-            let text = if state.diff_pending {
-                t.diff_loading
+        if files.is_empty() {
+            // Loading is not empty, and a failed read is not empty either.
+            let block = if let Some(error) = &state.diff_error {
+                crate::render::ListStateBlock {
+                    kind: crate::render::ListStateKind::Error,
+                    message: t.diff_failed,
+                    detail: Some(error),
+                }
+            } else if state.diff_pending {
+                crate::render::ListStateBlock {
+                    kind: crate::render::ListStateKind::Loading,
+                    message: t.diff_loading,
+                    detail: None,
+                }
             } else {
-                t.diff_empty
+                crate::render::ListStateBlock {
+                    kind: crate::render::ListStateKind::Empty,
+                    message: t.diff_empty,
+                    detail: None,
+                }
             };
-            rows.push(Line::from(Span::styled(
-                text,
-                Style::default().fg(theme.text.secondary),
-            )));
+            rows.extend(crate::render::list_state_lines(block, theme, list_w));
         }
-    }
-    for (i, f) in files.iter().enumerate() {
-        let cursor = if i == selected { "› " } else { "  " };
-        // Budget path + stats so long paths never spill past the pane edge.
-        let stats = format!("  +{} -{}", f.added, f.removed);
-        let stats_w = UnicodeWidthStr::width(stats.as_str());
-        let cursor_w = UnicodeWidthStr::width(cursor);
-        let path_budget = list_w.saturating_sub(cursor_w + stats_w).max(1);
-        let path = truncate_display(&f.path, path_budget);
-        rows.push(Line::from(vec![
-            Span::styled(
-                cursor.to_string(),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::raw(path),
-            Span::styled(
-                format!("  +{}", f.added),
-                Style::default().fg(theme.status.success),
-            ),
-            Span::styled(
-                format!(" -{}", f.removed),
-                Style::default().fg(theme.status.error),
-            ),
-        ]));
-        row_hits.push((rows.len() - 1, i.to_string()));
-    }
-    frame.render_widget(list_block, list_area);
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(
-        frame, list_inner, rows, &row_hits, selected, theme, &mut hits,
-    );
-    state.screen_rows = hits;
-
-    let mut detail: Vec<Line> = Vec::new();
-    if let Some(f) = files.get(selected) {
-        match &f.patch {
-            Some(patch) => {
-                // One paint path for every diff surface. The file list already
-                // names the file, so its header row would repeat it here; the
-                // list path still tells the painter which grammar to use.
-                let rows: Vec<crate::diff_view::DiffRow> = crate::diff_view::parse_diff_rows(patch)
-                    .into_iter()
-                    .filter(|row| !matches!(row, crate::diff_view::DiffRow::FileHeader { .. }))
-                    .collect();
-                let painted = crate::diff_view::paint_diff_rows(
-                    &rows,
-                    theme,
-                    detail_area.width as usize,
-                    &crate::diff_view::DiffPaintOptions {
-                        first_lead: "",
-                        rest_lead: "",
-                        line_numbers: true,
-                        fill_width: true,
-                        hunk_headers: true,
-                        patch_copy: false,
-                        language: Some(f.path.as_str()),
-                    },
-                    &|unchanged| match unchanged {
-                        Some(gap) => t.diff_unchanged_lines.replace("{}", &gap.to_string()),
-                        None => "⋯".to_string(),
-                    },
-                );
-                detail.extend(painted.into_iter().map(|row| row.line));
+        for (index, file) in files.iter().enumerate() {
+            let row = crate::render::ListRow::new(file.path.clone())
+                .meta(format!("+{} -{}", file.added, file.removed));
+            let focused = !split.dual || state.page_focus == crate::layout::SplitFocus::Primary;
+            let paint = crate::render::row_paint(state, &file.path, index == selected, focused);
+            let row_lines = crate::render::list_row_lines(&row, paint, theme, list_w);
+            for line in row_lines {
+                let line_index = rows.len();
+                row_hits.push(crate::render::RowHitSpec {
+                    line: line_index,
+                    height: 1,
+                    key: file.path.clone(),
+                });
+                rows.push(line);
             }
-            None => detail.push(Line::from(Span::styled(
-                t.diff_reload_hint,
-                Style::default().fg(theme.text.secondary),
-            ))),
         }
+        let focus = row_hits
+            .iter()
+            .position(|row| files.get(selected).is_some_and(|file| file.path == row.key))
+            .map_or(0, |index| row_hits[index].line);
+        crate::render::render_list_rows_with_spans(
+            frame,
+            list_area,
+            rows,
+            &row_hits,
+            focus,
+            theme,
+            &mut state.screen_rows,
+        );
     }
-    // The binding hints are the shell's footer now; the patch pane ends on its
-    // own content rather than repeating them.
-    render_scrolled(frame, detail_area, state, detail);
+
+    if detail_area.width > 0 && detail_area.height > 0 {
+        let mut detail: Vec<Line> = Vec::new();
+        if let Some(f) = files.get(selected) {
+            match &f.patch {
+                Some(patch) => {
+                    let rows: Vec<crate::diff_view::DiffRow> =
+                        crate::diff_view::parse_diff_rows(patch)
+                            .into_iter()
+                            .filter(|row| {
+                                !matches!(row, crate::diff_view::DiffRow::FileHeader { .. })
+                            })
+                            .collect();
+                    let painted = crate::diff_view::paint_diff_rows(
+                        &rows,
+                        theme,
+                        detail_area.width as usize,
+                        &crate::diff_view::DiffPaintOptions {
+                            first_lead: "",
+                            rest_lead: "",
+                            line_numbers: true,
+                            fill_width: true,
+                            hunk_headers: true,
+                            patch_copy: false,
+                            language: Some(f.path.as_str()),
+                        },
+                        &|unchanged| match unchanged {
+                            Some(gap) => t.diff_unchanged_lines.replace("{}", &gap.to_string()),
+                            None => "⋯".to_string(),
+                        },
+                    );
+                    detail.extend(painted.into_iter().map(|row| row.line));
+                }
+                None => detail.push(Line::from(Span::styled(
+                    t.diff_patch_pending,
+                    Style::default().fg(theme.text.secondary),
+                ))),
+            }
+        }
+        let max = detail.len().saturating_sub(detail_area.height as usize);
+        state.page_scroll = state.page_scroll.min(max);
+        crate::render::render_pane_at_offset(frame, detail_area, detail, state.page_scroll, theme);
+    }
+    crate::render::paint_split_divider(frame, &split, theme);
 }
 
-fn session_status_dot(status: &str, theme: &Theme) -> (&'static str, ratatui::style::Color) {
+fn session_status_dot(status: &str) -> (&'static str, crate::render::RowTone) {
     let s = status.to_ascii_lowercase();
     if s.contains("fail") || s.contains("error") {
-        ("●", theme.status.error)
+        ("●", crate::render::RowTone::Error)
     } else if s.contains("interrupt") || s.contains("cancel") {
-        ("●", theme.status.warning)
+        ("●", crate::render::RowTone::Warning)
     } else if s.contains("run") || s.contains("active") || s.contains("busy") {
-        ("●", theme.accent.primary)
+        ("●", crate::render::RowTone::Info)
     } else {
-        ("○", theme.text.secondary)
+        ("○", crate::render::RowTone::Muted)
     }
 }
 
@@ -474,10 +465,11 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.sessions_footer_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
+    let width = layout.content.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -486,32 +478,51 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
         Style::default().fg(theme.text.secondary),
     )));
     if let Some(error) = &state.sessions_error {
-        lines.push(Line::from(Span::styled(
-            error.clone(),
-            Style::default().fg(theme.status.error),
-        )));
-    } else if state.sessions_loading {
-        lines.push(Line::from(Span::styled(
-            t.sessions_loading,
-            Style::default().fg(theme.text.secondary),
-        )));
-    } else if state.sessions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            t.sessions_empty,
-            Style::default().fg(theme.text.secondary),
-        )));
-    }
-    let mut rows: Vec<(usize, String)> = Vec::new();
-    for (i, s) in state.sessions.iter().enumerate() {
-        // The row's key is its index: this page's cursor is positional, and a
-        // click selects the row that was painted, not a remembered one.
-        rows.push((lines.len(), i.to_string()));
-        let cursor = if i == state.sessions_selected {
-            "› "
+        let kind = if state.sessions.is_empty() {
+            crate::render::ListStateKind::Error
         } else {
-            "  "
+            crate::render::ListStateKind::Stale
         };
-        let (dot, color) = session_status_dot(&s.status, theme);
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind,
+                message: error,
+                detail: None,
+            },
+            theme,
+            width,
+        ));
+    } else if state.sessions_loading {
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Loading,
+                message: t.sessions_loading,
+                detail: None,
+            },
+            theme,
+            width,
+        ));
+    } else if state.sessions.is_empty() {
+        lines.extend(crate::render::list_state_lines(
+            crate::render::ListStateBlock {
+                kind: if state.all_sessions.is_empty() {
+                    crate::render::ListStateKind::Empty
+                } else {
+                    crate::render::ListStateKind::FilterEmpty
+                },
+                message: if state.all_sessions.is_empty() {
+                    t.sessions_empty
+                } else {
+                    t.sessions_empty_filter
+                },
+                detail: None,
+            },
+            theme,
+            width,
+        ));
+    }
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
+    for (i, s) in state.sessions.iter().enumerate() {
         // The wire status stays typed data; only the rendering is localized.
         // An unknown status is shown verbatim rather than guessed.
         let status = if s.status == "completed" {
@@ -529,34 +540,43 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut 
         } else {
             &s.status
         };
-        let goal = truncate_display(s.title.as_deref().unwrap_or(&s.goal), 40);
-        let archived = if s.archived {
-            format!(" [{}]", t.sessions_filter_archived)
+        let mut title = s.title.clone().unwrap_or_else(|| s.goal.clone());
+        if s.archived {
+            title.push_str(&format!(" [{}]", t.sessions_filter_archived));
+        }
+        let (dot, tone) = session_status_dot(&s.status);
+        let description = if s.model.is_empty() {
+            s.updated_at.clone()
         } else {
-            String::new()
+            format!("{} · {}", s.model, s.updated_at)
         };
-        lines.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
-            Span::styled(format!("{dot} "), Style::default().fg(color)),
-            Span::raw(format!("{goal}{archived}  ")),
-            Span::styled(
-                format!("[{status}] "),
-                Style::default().fg(theme.text.secondary),
-            ),
-            Span::styled(s.model.clone(), Style::default().fg(theme.text.secondary)),
-        ]));
+        let row = crate::render::ListRow::new(title)
+            .status(dot, tone)
+            .meta(status)
+            .description(description);
+        let key = s.id.to_string();
+        let paint = crate::render::row_paint(state, &key, i == state.sessions_selected, true);
+        let row_lines = crate::render::list_row_lines(&row, paint, theme, width);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
     }
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(
+    let focus = hits
+        .get(state.sessions_selected)
+        .map(|hit| hit.line)
+        .unwrap_or(0);
+    crate::render::render_list_rows_with_spans(
         frame,
         layout.content,
         lines,
-        &rows,
-        state.sessions_selected,
+        &hits,
+        focus,
         theme,
-        &mut hits,
+        &mut state.screen_rows,
     );
-    state.screen_rows = hits;
 }
 
 pub(super) fn render_foreign_sessions_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -570,48 +590,39 @@ pub(super) fn render_foreign_sessions_screen(frame: &mut Frame, area: Rect, stat
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: t.foreign_sessions_footer_hint,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::page_layout(state, area, 0);
     crate::secondary::draw_header(frame, state, &layout, &page);
-    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_footer(frame, state, &layout, &page);
     let theme = &state.theme;
     let width = layout.content.width.max(1) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut rows: Vec<(usize, String)> = Vec::new();
     if state.foreign_sessions.sessions.is_empty() {
         // Loading, a failed scan and a real empty result are three different
         // claims; only the last one may say "nothing found".
-        let (text, color) = if let Some(error) = &state.foreign_sessions.error {
-            (error.as_str(), theme.status.error)
+        let block = if let Some(error) = &state.foreign_sessions.error {
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Error,
+                message: error,
+                detail: None,
+            }
         } else if state.foreign_sessions.loading {
-            (t.foreign_sessions_loading, theme.text.secondary)
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Loading,
+                message: t.foreign_sessions_loading,
+                detail: None,
+            }
         } else {
-            (t.foreign_sessions_empty, theme.text.secondary)
+            crate::render::ListStateBlock {
+                kind: crate::render::ListStateKind::Empty,
+                message: t.foreign_sessions_empty,
+                detail: None,
+            }
         };
-        for piece in wrap(&sanitize_terminal_line(text), width) {
-            lines.push(Line::from(Span::styled(piece, Style::default().fg(color))));
-        }
+        lines.extend(crate::render::list_state_lines(block, theme, width));
     }
+    let mut hits: Vec<crate::render::RowHitSpec> = Vec::new();
     for (index, session) in state.foreign_sessions.sessions.iter().enumerate() {
-        let selected = index == state.foreign_sessions.selected;
-        // The row's key is its index: this page's cursor is positional, and a
-        // click selects the row that was painted.
-        rows.push((lines.len(), index.to_string()));
-        let cursor = if selected { "› " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(theme.accent.primary)),
-            Span::styled(
-                truncate_display(
-                    &sanitize_terminal_line(&session.title),
-                    width.saturating_sub(2),
-                ),
-                Style::default().fg(if selected {
-                    theme.accent.primary
-                } else {
-                    theme.text.primary
-                }),
-            ),
-        ]));
         // The source id stays on the row: it is the identity `/resume-* <id>`
         // takes, and the thing the person must not confuse with this native
         // session's own id.
@@ -624,19 +635,31 @@ pub(super) fn render_foreign_sessions_screen(frame: &mut Frame, area: Rect, stat
             meta.push_str(" · ⎇ ");
             meta.push_str(branch);
         }
-        let meta = sanitize_terminal_line(&meta);
-        lines.push(Line::from(Span::styled(
-            format!("  {}", truncate_display(&meta, width.saturating_sub(2))),
-            Style::default().fg(theme.text.secondary),
-        )));
+        let row = crate::render::ListRow::new(&session.title).description(meta);
+        let key = session.native_id.clone();
+        let paint =
+            crate::render::row_paint(state, &key, index == state.foreign_sessions.selected, true);
+        let row_lines = crate::render::list_row_lines(&row, paint, theme, width);
+        hits.push(crate::render::RowHitSpec {
+            line: lines.len(),
+            height: row_lines.len() as u16,
+            key,
+        });
+        lines.extend(row_lines);
     }
-    let focus = rows
+    let focus = hits
         .get(state.foreign_sessions.selected)
-        .map(|(line, _)| *line)
+        .map(|hit| hit.line)
         .unwrap_or(0);
-    let mut hits = Vec::new();
-    crate::render::render_list_rows(frame, layout.content, lines, &rows, focus, theme, &mut hits);
-    state.screen_rows = hits;
+    crate::render::render_list_rows_with_spans(
+        frame,
+        layout.content,
+        lines,
+        &hits,
+        focus,
+        theme,
+        &mut state.screen_rows,
+    );
 }
 
 #[cfg(test)]
@@ -716,7 +739,7 @@ mod search_tests {
         for (width, height) in [(80, 24), (28, 10), (18, 7)] {
             let text = help_text(&mut state, width, height);
             assert!(
-                text.contains("› Esc"),
+                text.contains("❯ Esc"),
                 "selected row missing at {width}x{height}: {text}"
             );
         }

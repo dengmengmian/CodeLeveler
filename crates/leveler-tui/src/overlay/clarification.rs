@@ -30,6 +30,7 @@ pub enum ClarificationOutcome {
     None,
     /// The interaction resolved. An empty string is an explicit skip.
     Answer(String),
+    SwitchToChat,
 }
 
 /// Why `Enter` did not confirm a multi-choice question.
@@ -58,7 +59,7 @@ pub(crate) struct Question {
     pub(crate) allow_other: bool,
     pub(crate) min_choices: u32,
     pub(crate) max_choices: Option<u32>,
-    /// Index into the rendered rows: the options, then the "其他…" row.
+    /// Index into the rendered rows, ending with the direct-chat action.
     pub(crate) cursor: usize,
     pub(crate) selected: Vec<bool>,
     /// The field this question is answered in. The composer's editor, not a
@@ -125,19 +126,27 @@ impl Question {
         }
     }
 
-    /// Rows in the option list, including the free-text row when offered.
+    /// Focusable rows, including the final direct-chat action.
     pub(crate) fn rows(&self) -> usize {
-        self.options.len() + usize::from(self.allow_other)
+        if self.kind == ClarificationQuestionKind::Text {
+            2 // The field and the direct-chat action.
+        } else {
+            self.options.len() + usize::from(self.allow_other) + 1
+        }
     }
 
-    /// Whether the cursor currently sits on the free-text "其他…" row.
+    pub(crate) fn on_chat_row(&self) -> bool {
+        self.cursor == self.rows() - 1
+    }
+
+    /// Whether the cursor currently sits on the free-text row.
     pub(crate) fn on_other_row(&self) -> bool {
-        self.allow_other && self.cursor >= self.options.len()
+        self.allow_other && self.cursor == self.options.len()
     }
 
     /// Whether typing goes into this question's text field.
     pub(crate) fn typing(&self) -> bool {
-        self.kind == ClarificationQuestionKind::Text || self.on_other_row()
+        (self.kind == ClarificationQuestionKind::Text && !self.on_chat_row()) || self.on_other_row()
     }
 
     pub(crate) fn is_multi(&self) -> bool {
@@ -167,15 +176,11 @@ impl Question {
     }
 
     fn move_cursor(&mut self, delta: isize) {
-        let rows = self.rows();
-        if rows == 0 {
-            return;
-        }
         // Arrows move the cursor even when the free-text row holds it: `typing`
         // decides where a character goes, not whether the user may leave. The
         // field keeps whatever was typed, and a row the arrows cannot leave is a
         // dead end in a list the user is meant to scan.
-        let rows = rows as isize;
+        let rows = self.rows() as isize;
         self.cursor = ((self.cursor as isize + delta).rem_euclid(rows)) as usize;
     }
 
@@ -297,6 +302,7 @@ impl ClarificationOverlay {
             return;
         };
         if question.kind == ClarificationQuestionKind::Text {
+            question.cursor = 0;
             question.text.insert_paste(s);
             return;
         }
@@ -321,6 +327,15 @@ impl ClarificationOverlay {
             return ClarificationOutcome::None;
         }
         match key.code {
+            KeyCode::Esc
+                if self
+                    .questions
+                    .get(self.active)
+                    .is_some_and(Question::on_chat_row) =>
+            {
+                self.mutate_active(|q| q.move_cursor(-1));
+                ClarificationOutcome::None
+            }
             KeyCode::Esc => ClarificationOutcome::Answer(String::new()),
             // Shift+Tab arrives as `BackTab` on most terminals and as
             // Tab+SHIFT on some; both mean "previous question".
@@ -379,6 +394,9 @@ impl ClarificationOverlay {
         let Some(q) = self.questions.get_mut(self.active) else {
             return ClarificationOutcome::Answer(String::new());
         };
+        if q.on_chat_row() {
+            return ClarificationOutcome::SwitchToChat;
+        }
         if q.typing() {
             // The editor may be holding a paste chip; the answer is the text it
             // stands for, never the chip.
@@ -554,8 +572,8 @@ mod tests {
         assert!(ov.questions()[0].allow_other);
         assert_eq!(
             ov.questions()[0].rows(),
-            3,
-            "two options plus the free-text row"
+            4,
+            "two options, the free-text row, and the direct-chat action"
         );
 
         let ov = multi_question(vec![question(

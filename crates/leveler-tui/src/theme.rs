@@ -98,10 +98,16 @@ pub enum ColorDepth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceColors {
     pub canvas: Color,
+    /// Opaque backdrop behind a Modal. Glyphs from the live workbench must
+    /// never show through this surface.
+    pub scrim: Color,
     pub panel: Color,
     pub elevated: Color,
     pub input: Color,
     pub selection: Color,
+    /// Quieter than selection: pointer hover, or a selected row in a list that
+    /// does not own the keyboard.
+    pub hover: Color,
     /// The user's own turn. Brighter than the canvas and the generic elevated
     /// surface so the prompt reads as a distinct card, but still well below
     /// primary ink: the card identifies the message, it does not compete with
@@ -354,10 +360,12 @@ fn map_theme_colors(theme: Theme, map: impl Fn(Color) -> Color) -> Theme {
         monochrome: theme.monochrome,
         surface: SurfaceColors {
             canvas: map(theme.surface.canvas),
+            scrim: map(theme.surface.scrim),
             panel: map(theme.surface.panel),
             elevated: map(theme.surface.elevated),
             input: map(theme.surface.input),
             selection: map(theme.surface.selection),
+            hover: map(theme.surface.hover),
             prompt: map(theme.surface.prompt),
         },
         text: TextColors {
@@ -682,10 +690,12 @@ impl Theme {
             monochrome: false,
             surface: SurfaceColors {
                 canvas: rgb(0x111315),
+                scrim: rgb(0x111315),
                 panel: rgb(0x171A1E),
                 elevated: rgb(0x1D2126),
                 input: rgb(0x15181C),
                 selection: rgb(0x253345),
+                hover: rgb(0x1F262E),
                 // The existing `panel` step: a quiet band just above the
                 // canvas, not a card competing with the prose.
                 prompt: rgb(0x171A1E),
@@ -778,10 +788,12 @@ impl Theme {
             monochrome: false,
             surface: SurfaceColors {
                 canvas: rgb(0xF7F8FA),
+                scrim: rgb(0xF7F8FA),
                 panel: rgb(0xFFFFFF),
                 elevated: rgb(0xF0F2F5),
                 input: rgb(0xFFFFFF),
                 selection: rgb(0xDCEBFF),
+                hover: rgb(0xEAF0F7),
                 // The light counterpart of the dark band: the existing panel
                 // step just above the canvas, never a highlight.
                 prompt: rgb(0xFFFFFF),
@@ -871,10 +883,12 @@ impl Theme {
             monochrome: false,
             surface: SurfaceColors {
                 canvas: rgb(0x000000),
+                scrim: rgb(0x000000),
                 panel: rgb(0x000000),
                 elevated: rgb(0x0A0A0A),
                 input: rgb(0x000000),
                 selection: rgb(0x003366),
+                hover: rgb(0x002244),
                 prompt: rgb(0x1A1A1A),
             },
             text: TextColors {
@@ -971,10 +985,12 @@ impl Theme {
     pub fn no_color() -> Self {
         let reset = SurfaceColors {
             canvas: Color::Reset,
+            scrim: Color::Reset,
             panel: Color::Reset,
             elevated: Color::Reset,
             input: Color::Reset,
             selection: Color::Reset,
+            hover: Color::Reset,
             prompt: Color::Reset,
         };
         Self {

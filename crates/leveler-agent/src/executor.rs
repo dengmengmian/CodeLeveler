@@ -118,6 +118,13 @@ struct SelectedSkills {
     text: String,
 }
 
+/// The turn's rendered skill injection plus its durable delivery audit.
+struct SkillTurnDelivery {
+    selected: Option<SelectedSkills>,
+    audit: leveler_skills::SkillDeliveryAudit,
+    references: Vec<leveler_skills::SkillReferenceGrant>,
+}
+
 /// Project rules as selected for one turn. Loaded once when the turn's control
 /// context is built, then reused for every round, so a rule edit takes effect
 /// on the NEXT turn and the cached request prefix stays stable. The audit is
@@ -180,6 +187,12 @@ pub enum AgentEvent {
     /// delivery outcome; not a receipt from the provider.
     RuleDelivery {
         audit: leveler_context::RuleDeliveryAudit,
+    },
+    /// The turn's skill delivery: what was discoverable, what the user
+    /// selected, what was loaded into the turn context, and every refusal.
+    /// Durable evidence of delivery, not proof the model followed a procedure.
+    SkillDelivery {
+        audit: leveler_skills::SkillDeliveryAudit,
     },
     /// The model produced assistant text this round (the whole message; also
     /// marks the end of any streamed deltas for the round). `reasoning`
@@ -1738,6 +1751,7 @@ pub struct Executor {
     /// A child spawned from a declarative agent: its instructions and bound
     /// skills, rendered into its system prompt. `None` for every other executor.
     agent_brief: Option<String>,
+    agent_skill_references: Vec<leveler_skills::SkillReferenceGrant>,
     /// Named-agent tool permission; the registry always retains actual handles.
     agent_tool_allowlist: Option<Arc<Vec<String>>>,
     /// The most a child spawned from a declarative agent may ever claim
@@ -1852,6 +1866,7 @@ impl Executor {
             agent_id: None,
             agent_roots: None,
             agent_brief: None,
+            agent_skill_references: Vec::new(),
             agent_tool_allowlist: None,
             write_roots: Vec::new(),
         }
@@ -2415,8 +2430,47 @@ impl Executor {
             }
             child.write_roots = agent.write_roots.clone();
         }
+        if let Some(agent) = &spec.agent {
+            child.agent_skill_references =
+                self.restore_skill_reference_grants(&agent.skill_reference_versions);
+        }
         child.agent_brief = brief;
         child
+    }
+
+    fn restore_skill_reference_grants(
+        &self,
+        versions: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<leveler_skills::SkillReferenceGrant> {
+        let Some(workspace) = self
+            .tool_context
+            .execution
+            .workspace
+            .as_ref()
+            .filter(|_| !versions.is_empty())
+        else {
+            return Vec::new();
+        };
+        let root = workspace.root();
+        let environment = &self.tool_context.execution.environment;
+        let registry = leveler_skills::SkillRegistry::load(
+            &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+            &self.definition_trust(),
+            &leveler_skills::PreferencesState::load(
+                &leveler_core::LevelerHome::resolve(environment),
+                Some(root),
+            ),
+        );
+        versions
+            .iter()
+            .filter_map(|(name, version)| {
+                registry
+                    .load_skill(name)
+                    .ok()?
+                    .reference_grant
+                    .filter(|grant| grant.digest() == version)
+            })
+            .collect()
     }
 
     /// Whether THIS executor may start a child. Depth owns the ordinary rule;
@@ -2587,6 +2641,7 @@ impl Executor {
             agent_id: None,
             agent_roots: None,
             agent_brief: None,
+            agent_skill_references: Vec::new(),
             agent_tool_allowlist: self.agent_tool_allowlist.clone(),
             write_roots: Vec::new(),
         }
@@ -3098,20 +3153,27 @@ impl Executor {
     ) -> ControlContext {
         let rules = self.rule_turn_context();
         self.turn_control_context_inner(request, procedure_request, continuing, Some(&rules))
+            .0
     }
 
-    /// Build the turn control once and hand back the rule-delivery audit for
-    /// the durable event. Rule loading stays here, at turn start.
+    /// Build the turn control once and hand back the rule- and skill-delivery
+    /// audits for the durable events. Both selections happen here, at turn
+    /// start.
     fn turn_control_context_with_rules(
         &self,
         request: &str,
         procedure_request: &str,
         continuing: bool,
-    ) -> (ControlContext, leveler_context::RuleDeliveryAudit) {
+    ) -> (
+        ControlContext,
+        leveler_context::RuleDeliveryAudit,
+        leveler_skills::SkillDeliveryAudit,
+        Vec<leveler_skills::SkillReferenceGrant>,
+    ) {
         let rules = self.rule_turn_context();
-        let control =
+        let (control, skill_audit, references) =
             self.turn_control_context_inner(request, procedure_request, continuing, Some(&rules));
-        (control, rules.audit)
+        (control, rules.audit, skill_audit, references)
     }
 
     pub(crate) fn measurement_control_context(
@@ -3129,9 +3191,24 @@ impl Executor {
         procedure_request: &str,
         continuing: bool,
         rules: Option<&RuleTurnContext>,
-    ) -> ControlContext {
+    ) -> (
+        ControlContext,
+        leveler_skills::SkillDeliveryAudit,
+        Vec<leveler_skills::SkillReferenceGrant>,
+    ) {
         let mut blocks = self.system_segments_with(request, rules);
-        if let Some(selected) = self.skill_turn_injection(procedure_request) {
+        // The index is computed first only so the delivery audit can record
+        // what was discoverable; the prompt block order is unchanged.
+        let index = self.skill_index_delivery();
+        let delivery = self.skill_turn_delivery(
+            procedure_request,
+            index
+                .as_ref()
+                .map(|(_, discovered)| *discovered)
+                .unwrap_or(0),
+            index.as_ref().map(|(text, _)| text.len()).unwrap_or(0),
+        );
+        if let Some(selected) = delivery.selected {
             blocks.push(PromptSegment::control(
                 "selected_skills",
                 PromptSource::Skill {
@@ -3143,7 +3220,7 @@ impl Executor {
                 selected.text,
             ));
         }
-        if let Some(text) = self.skill_index_injection() {
+        if let Some((text, _)) = index {
             blocks.push(PromptSegment::control(
                 "skill_index",
                 PromptSource::SkillCatalog,
@@ -3176,7 +3253,11 @@ impl Executor {
                  otherwise ask for more.",
             ));
         }
-        ControlContext { blocks }
+        (
+            ControlContext { blocks },
+            delivery.audit,
+            delivery.references,
+        )
     }
 
     pub fn with_commit_co_author(mut self, enabled: bool) -> Self {
@@ -3453,7 +3534,8 @@ impl Executor {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, DriveAborted> {
         let request = text_of(&content);
-        let (control, rule_audit) = self.turn_control_context_with_rules(&request, &request, false);
+        let (control, rule_audit, skill_audit, references) =
+            self.turn_control_context_with_rules(&request, &request, false);
         // depth 0 is a person. A child task is the parent agent's text.
         let origin = if self.depth == 0 {
             TranscriptOrigin::UserInput
@@ -3465,6 +3547,7 @@ impl Executor {
         let seed = vec![Message::from_parts(Role::User, content, Some(origin))];
         self.append_seed(sink, &seed[0]).await?;
         observer(AgentEvent::RuleDelivery { audit: rule_audit });
+        observer(AgentEvent::SkillDelivery { audit: skill_audit });
         let mut facts = AbortedFacts::default();
         self.drive(
             seed,
@@ -3474,6 +3557,7 @@ impl Executor {
             sink,
             cancellation,
             &mut facts,
+            references,
         )
         .await
     }
@@ -3493,7 +3577,10 @@ impl Executor {
     /// description only, so progressive disclosure still holds. Rebuilt each
     /// turn, so a skill created or edited between turns is visible on the next
     /// one, and bounded so a large library cannot crowd the conversation.
-    fn skill_index_injection(&self) -> Option<String> {
+    /// The catalog text and how many entries it advertised. The count is the
+    /// delivery audit's "discovered" fact; a capped index still advertised
+    /// that many entries to the model.
+    fn skill_index_delivery(&self) -> Option<(String, usize)> {
         // The catalog names skills `load_skill` can open. Without that tool
         // the names are not a capability this turn has.
         if !self.capability_exposed(crate::capability::CapabilityId::Skills, true) {
@@ -3505,51 +3592,185 @@ impl Executor {
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
             &self.definition_trust(),
+            &leveler_skills::PreferencesState::load(
+                &leveler_core::LevelerHome::resolve(environment),
+                Some(root),
+            ),
         );
+        let summaries = registry.model_summaries();
+        let untrusted = registry.untrusted_summaries();
+        let discovered = summaries.len() + untrusted.len();
         let index = leveler_skills::render_capped_index_with_pending(
-            &registry.summaries(),
-            &registry.untrusted_summaries(),
+            &summaries,
+            &untrusted,
             leveler_skills::MAX_SKILL_INDEX_BYTES,
         );
-        (!index.is_empty()).then_some(index)
+        (!index.is_empty()).then_some((index, discovered))
     }
 
-    /// Resolve `$name` mentions in the user request into a system injection block.
-    fn skill_turn_injection(&self, request: &str) -> Option<SelectedSkills> {
-        // A named skill is the user's explicit instruction, not model
-        // discovery, so its procedure is injected whenever the host has the
-        // pack. FullAccess removes the permission check but still discloses
-        // packs on demand, so it gates on availability; every other mode
-        // gates on exposure, because a `$mention` is user intent and must
-        // not widen the capability surface by itself.
-        let skills_available = match self.capabilities.as_ref() {
-            None => true,
-            Some(state) if self.tool_context.policy.unrestricted_execution() => {
-                state.available(crate::capability::CapabilityId::Skills)
-            }
-            Some(state) => state.exposed(crate::capability::CapabilityId::Skills),
+    /// Resolve `$name` mentions and a leading `/name [args]` into a system
+    /// injection block, and record what the delivery actually did.
+    fn skill_turn_delivery(
+        &self,
+        request: &str,
+        discovered: usize,
+        index_bytes: usize,
+    ) -> SkillTurnDelivery {
+        use leveler_skills::{SkillDeliveryFailure, SkillDeliverySurface};
+
+        let mut audit = leveler_skills::SkillDeliveryAudit::new();
+        audit.discover(discovered, index_bytes);
+        let mentioned = leveler_skills::parse_skill_mentions(request);
+        // A delegated task is model-authored even when its transport role is
+        // User. Its text cannot authorize an explicit user-only command.
+        let slash = (self.depth == 0)
+            .then(|| leveler_skills::leading_skill_token(request))
+            .flatten();
+        audit.surface = match (slash.is_some(), !mentioned.is_empty()) {
+            (true, true) => SkillDeliverySurface::Mixed,
+            (true, false) => SkillDeliverySurface::Slash,
+            (false, true) => SkillDeliverySurface::Mention,
+            (false, false) => SkillDeliverySurface::IndexOnly,
         };
-        if !skills_available {
-            return None;
+        let without_selection = |audit: leveler_skills::SkillDeliveryAudit| SkillTurnDelivery {
+            selected: None,
+            audit,
+            references: Vec::new(),
+        };
+        if audit.surface == SkillDeliverySurface::IndexOnly {
+            return without_selection(audit);
+        }
+        // Explicit slash commands use the host's Skills availability and
+        // still go through command resolution and package trust. Mention
+        // exposure is independent, including when both forms appear together.
+        use crate::capability::CapabilityId;
+        let available = self
+            .capabilities
+            .as_ref()
+            .is_none_or(|state| state.available(CapabilityId::Skills));
+        let mentions_allowed = if self.tool_context.policy.unrestricted_execution() {
+            available
+        } else {
+            self.capability_exposed(CapabilityId::Skills, true)
+        };
+        if !available || (slash.is_none() && !mentions_allowed) {
+            audit.block(SkillDeliveryFailure::CapabilityUnavailable);
+            return without_selection(audit);
         }
         // Built from this execution's own environment, so `$mention` and
         // `save_skill` agree about where the user's skills live.
-        let root = self.tool_context.execution.workspace.as_ref()?.root();
+        let Some(root) = self
+            .tool_context
+            .execution
+            .workspace
+            .as_ref()
+            .map(|w| w.root())
+        else {
+            return without_selection(audit);
+        };
         let environment = &self.tool_context.execution.environment;
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
             &self.definition_trust(),
+            &leveler_skills::PreferencesState::load(
+                &leveler_core::LevelerHome::resolve(environment),
+                Some(root),
+            ),
         );
-        let resolution = registry.resolve_mentions(request);
-        let text = leveler_skills::render_turn_injection(&resolution)?;
-        let mut names: Vec<String> = resolution
-            .loaded
-            .iter()
-            .map(|detail| detail.name.clone())
-            .collect();
-        names.extend(resolution.unknown.iter().cloned());
-        names.extend(resolution.invalid.iter().map(|(name, _)| name.clone()));
-        Some(SelectedSkills { names, text })
+        let mut resolution = if mentions_allowed {
+            registry.resolve_mentions(request)
+        } else {
+            for name in &mentioned {
+                audit.record_failure(
+                    &format!("${name}"),
+                    name,
+                    SkillDeliveryFailure::CapabilityUnavailable,
+                );
+            }
+            leveler_skills::SkillMentionResolution::default()
+        };
+        for name in &resolution.unknown {
+            audit.record_failure(&format!("${name}"), name, SkillDeliveryFailure::NotFound);
+        }
+        for invalid in &resolution.invalid {
+            audit.record_failure(
+                &format!("${}", invalid.name),
+                &invalid.name,
+                invalid.failure,
+            );
+        }
+        for detail in &resolution.loaded {
+            audit.record_loaded(&format!("${}", detail.name), detail);
+        }
+        // `/name [args]` is an explicit user invocation. The user message is
+        // left exactly as typed (including the slash and arguments); only the
+        // verified procedure body is added to the turn context. Resolution and
+        // loading go through the same registry as `$name` and `load_skill`.
+        if slash.is_some()
+            && let Some(command) =
+                registry.resolve_command_request(request, leveler_skills::RESERVED_SLASH_NAMES)
+        {
+            match (command.loaded, command.error) {
+                (Some(detail), _) => {
+                    audit.record_loaded(&command.token, &detail);
+                    if !resolution
+                        .loaded
+                        .iter()
+                        .any(|loaded| loaded.name == detail.name)
+                    {
+                        resolution.loaded.push(detail);
+                    }
+                }
+                (None, Some(error)) => {
+                    let name = command
+                        .command
+                        .as_ref()
+                        .map(|command| command.name.clone())
+                        .unwrap_or_else(|| command.token.trim_start_matches('/').to_string());
+                    let failure = command.failure.unwrap_or(SkillDeliveryFailure::Invalid);
+                    // The turn context must still tell the model why the
+                    // named procedure is absent, exactly as it did before the
+                    // audit existed.
+                    resolution
+                        .invalid
+                        .push(leveler_skills::SkillMentionFailure {
+                            name: name.clone(),
+                            reason: error,
+                            failure,
+                        });
+                    audit.record_failure(&command.token, &name, failure);
+                }
+                (None, None) => {}
+            }
+        }
+        let text = leveler_skills::render_turn_injection(&resolution);
+        audit.finish(text.as_deref());
+        if let Some(text) = text {
+            let mut names: Vec<String> = resolution
+                .loaded
+                .iter()
+                .map(|detail| detail.name.clone())
+                .collect();
+            names.extend(resolution.unknown.iter().cloned());
+            names.extend(
+                resolution
+                    .invalid
+                    .iter()
+                    .map(|invalid| invalid.name.clone()),
+            );
+            let references = resolution
+                .loaded
+                .into_iter()
+                .filter_map(|detail| detail.reference_grant)
+                .collect();
+            SkillTurnDelivery {
+                selected: Some(SelectedSkills { names, text }),
+                audit,
+                references,
+            }
+        } else {
+            without_selection(audit)
+        }
     }
 
     /// Continue a conversation: seed the model with the prior transcript plus a
@@ -3598,8 +3819,10 @@ impl Executor {
         // Persist only the new user message; prior + system are not re-stored.
         self.append_seed(sink, &user).await?;
 
-        let (control, rule_audit) = self.turn_control_context_with_rules(&request, &request, false);
+        let (control, rule_audit, skill_audit, references) =
+            self.turn_control_context_with_rules(&request, &request, false);
         observer(AgentEvent::RuleDelivery { audit: rule_audit });
+        observer(AgentEvent::SkillDelivery { audit: skill_audit });
         let mut seed = prior;
         seed.push(user);
         let mut facts = AbortedFacts::default();
@@ -3611,6 +3834,7 @@ impl Executor {
             sink,
             cancellation,
             &mut facts,
+            references,
         )
         .await
     }
@@ -3663,9 +3887,10 @@ impl Executor {
             .or_else(|| objective.amendments.last().map(String::as_str))
             .unwrap_or(&objective.text);
         let procedure_request = format!("{}\n{request}", objective.text);
-        let (control, rule_audit) =
+        let (control, rule_audit, skill_audit, references) =
             self.turn_control_context_with_rules(request, &procedure_request, true);
         observer(AgentEvent::RuleDelivery { audit: rule_audit });
+        observer(AgentEvent::SkillDelivery { audit: skill_audit });
         self.drive(
             prior,
             control,
@@ -3674,6 +3899,7 @@ impl Executor {
             sink,
             cancellation,
             &mut facts,
+            references,
         )
         .await
     }
@@ -5078,6 +5304,50 @@ mod authority_classification {
             leveler_model::ModelRef::new("mock", "m"),
             2,
         )
+    }
+
+    #[test]
+    fn a_restarted_child_rebinds_only_the_skill_version_it_started_with() {
+        let repo = tempfile::tempdir().unwrap();
+        let skill = repo.path().join(".leveler/skills/child-demo");
+        let body = skill.join("SKILL.md");
+        let reference = skill.join("references/guide.md");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::write(
+            &body,
+            "---\nname: child-demo\ndescription: Child procedure.\n---\nOriginal procedure.\n",
+        )
+        .unwrap();
+        std::fs::write(&reference, "Original reference.\n").unwrap();
+        let package = leveler_definition_trust::read_skill_package(&body).unwrap();
+        let mut spec = leveler_lifecycle::ChildSpawnSpec {
+            agent: Some(Box::new(leveler_lifecycle::ChildAgentSnapshot {
+                skill_reference_versions: [(
+                    "child-demo".into(),
+                    leveler_definition_trust::DefinitionIdentity::skill_package_digest(&package),
+                )]
+                .into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let parent = parent(repo.path());
+        let child = parent.child_for_spec(AgentRole::Default, &spec, None, None);
+        assert_eq!(child.agent_skill_references.len(), 1);
+
+        // Even a currently trusted newer package is not the version in the recorded brief.
+        std::fs::write(&reference, "New reference.\n").unwrap();
+        let child = parent.child_for_spec(AgentRole::Default, &spec, None, None);
+        assert!(child.agent_skill_references.is_empty());
+
+        // Old durable records have no version binding and cannot mint one from today's files.
+        spec.agent
+            .as_mut()
+            .unwrap()
+            .skill_reference_versions
+            .clear();
+        let child = parent.child_for_spec(AgentRole::Default, &spec, None, None);
+        assert!(child.agent_skill_references.is_empty());
     }
 
     #[test]

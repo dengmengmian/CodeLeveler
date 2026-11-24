@@ -100,8 +100,8 @@ pub use failure::{
 pub use foreign::{UiForeignOrigin, UiForeignSession, UiForeignTool};
 pub use goal_command::{GoalCommand, parse_goal_command};
 pub use skills::{
-    UiShadowedSkill, UiSkillDetail, UiSkillEntry, UiSkillProblem, UiSkillScope, UiSkillSource,
-    UiSkillStatus,
+    UiShadowedSkill, UiSkillDelivery, UiSkillDeliveryEntry, UiSkillDeliveryFailure, UiSkillDetail,
+    UiSkillEntry, UiSkillProblem, UiSkillScope, UiSkillSource, UiSkillStatus,
 };
 
 pub use command::SteerAction;

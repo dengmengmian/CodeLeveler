@@ -128,6 +128,69 @@ struct MdSpan {
     link: Option<String>,
 }
 
+/// Render authored Markdown as readable, unwrapped text for reply copy.
+/// Unlike the cell layout, this retains the parser's nesting and code spacing.
+pub(crate) fn reply_plain_text(markdown: &str) -> String {
+    fn separate(out: &mut String, lines: usize) {
+        if !out.is_empty() {
+            let trailing = out.bytes().rev().take_while(|byte| *byte == b'\n').count();
+            out.extend(std::iter::repeat_n('\n', lines.saturating_sub(trailing)));
+        }
+    }
+
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let mut out = String::with_capacity(markdown.len());
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut cells = 0;
+    for event in Parser::new_ext(markdown, options) {
+        match event {
+            Event::Text(text) | Event::Code(text) | Event::Html(text) => out.push_str(&text),
+            Event::SoftBreak | Event::HardBreak => out.push('\n'),
+            Event::Start(Tag::List(first)) => {
+                separate(&mut out, if lists.is_empty() { 2 } else { 1 });
+                lists.push(first);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+                separate(&mut out, if lists.is_empty() { 2 } else { 1 });
+            }
+            Event::Start(Tag::Item) => {
+                separate(&mut out, 1);
+                out.extend(std::iter::repeat_n(' ', lists.len().saturating_sub(1) * 2));
+                if let Some(Some(number)) = lists.last_mut() {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{number}. ");
+                    *number = number.saturating_add(1);
+                } else {
+                    out.push_str("• ");
+                }
+            }
+            Event::End(TagEnd::Item) => separate(&mut out, 1),
+            Event::TaskListMarker(checked) => out.push_str(if checked { "[x] " } else { "[ ] " }),
+            Event::Start(Tag::TableHead | Tag::TableRow) => cells = 0,
+            Event::Start(Tag::TableCell) => {
+                if cells > 0 {
+                    out.push('\t');
+                }
+                cells += 1;
+            }
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => out.push('\n'),
+            Event::Start(Tag::CodeBlock(_) | Tag::BlockQuote(_) | Tag::Table(_))
+            | Event::End(
+                TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::BlockQuote(_) | TagEnd::Table,
+            )
+            | Event::Rule => separate(&mut out, 2),
+            Event::End(TagEnd::Paragraph) => {
+                separate(&mut out, if lists.is_empty() { 2 } else { 1 })
+            }
+            _ => {}
+        }
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
 impl MdDoc {
     /// Parse markdown text into a document (done once per completed message).
     pub fn parse(text: &str) -> Self {

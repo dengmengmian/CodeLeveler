@@ -34,6 +34,63 @@ fn clear_resolved_version_notice(state: &mut AppState) {
     }
 }
 
+/// The compact note for what the turn's message selected. A refusal or a host
+/// block is a warning that names its reason; loaded skills are information.
+/// The full audit lives in the event store and the runtime log.
+fn apply_skill_delivery(state: &mut AppState, delivery: leveler_client_protocol::UiSkillDelivery) {
+    use leveler_client_protocol::UiSkillDeliveryFailure as Failure;
+    fn reason(skills: &crate::i18n::SkillsText, failure: Failure) -> &'static str {
+        match failure {
+            Failure::NotFound => skills.failure_not_found,
+            Failure::Invalid => skills.failure_invalid,
+            Failure::Disabled => skills.failure_disabled,
+            Failure::Untrusted => skills.failure_untrusted,
+            Failure::UserInvocationDisabled => skills.failure_user_invocation_disabled,
+            Failure::ModelInvocationDisabled => skills.failure_model_invocation_disabled,
+            Failure::Read => skills.failure_read,
+            Failure::Shadowed => skills.failure_shadowed,
+            Failure::CapabilityUnavailable => skills.failure_capability_unavailable,
+        }
+    }
+    let skills = &state.t().skills;
+    if let Some(blocked) = delivery.blocked {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: skills
+                .delivery_blocked
+                .replace("{reason}", reason(skills, blocked)),
+        });
+        return;
+    }
+    let mut parts = Vec::with_capacity(delivery.entries.len());
+    let mut warning = false;
+    for entry in &delivery.entries {
+        parts.push(match entry.failure {
+            None => skills
+                .delivery_loaded
+                .replace("{token}", &entry.requested_as),
+            Some(failure) => {
+                warning = true;
+                skills
+                    .delivery_failed
+                    .replace("{token}", &entry.requested_as)
+                    .replace("{reason}", reason(skills, failure))
+            }
+        });
+    }
+    if parts.is_empty() {
+        return;
+    }
+    state.notification = Some(Notification {
+        level: if warning {
+            NotificationLevel::Warning
+        } else {
+            NotificationLevel::Info
+        },
+        message: parts.join(" · "),
+    });
+}
+
 pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
     match event {
         RuntimeEvent::GlobalTasksLoaded {
@@ -287,6 +344,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let index = state.composer.insert_image_token();
             let index = index.min(state.pending_attachments.len());
             state.pending_attachments.insert(index, attachment);
+            // The chip just landed past the cursor's right edge (token, then a
+            // space). The preview stays until the cursor or the pointer moves.
+            state.image_hover = None;
+            state.image_post_insert = Some((index, state.composer.cursor()));
         }
         RuntimeEvent::AttachmentProcessingFailed { error, .. } => {
             state.notification = Some(Notification {
@@ -612,9 +673,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.turn_diff_files = Some(diff.files.len());
             state.diff_pending = false;
             state.diff_error = None;
-            if state.diff_selected >= diff.files.len() {
-                state.diff_selected = 0;
-            }
+            let selected_path = state
+                .diff
+                .as_ref()
+                .and_then(|old| old.files.get(state.diff_selected))
+                .map(|file| file.path.clone());
+            state.diff_selected = selected_path
+                .and_then(|path| diff.files.iter().position(|file| file.path == path))
+                .unwrap_or_else(|| state.diff_selected.min(diff.files.len().saturating_sub(1)));
             state.diff = Some(diff);
         }
         RuntimeEvent::DiffFailed { query_id, message } => {
@@ -654,6 +720,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::SessionList { sessions } => {
             state.sessions_loading = false;
+            state.sessions_known = true;
             state.sessions_error = None;
             // The list is the runtime's authoritative inventory, including
             // archived rows (marked, not hidden — archive never deletes).
@@ -1122,10 +1189,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 return;
             }
             state.agents_list_query = None;
-            let t = state.t();
-            state
-                .transcript
-                .push_note(crate::agents_view::listing_note(&agents, &problems, t));
+            crate::agents_view::apply_list(state, agents, problems);
         }
         RuntimeEvent::AgentLoaded {
             query_id,
@@ -1138,12 +1202,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 return;
             }
             state.agent_detail_query = None;
-            let note = match (agent, error) {
-                (Some(detail), _) => crate::agents_view::detail_note(&detail, state.t()),
-                (None, Some(error)) => error,
-                (None, None) => format!("Agent \"{name}\" not found."),
-            };
-            state.transcript.push_note(note);
+            crate::agents_view::apply_detail(state, &name, agent, error);
         }
         // The TUI has no agent mutation command. These acknowledgements belong
         // to the Web form that issued them, despite sharing the session stream.
@@ -1491,6 +1550,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.review_scope_query = None;
             super::overlay_keys::apply_review_scope_facts(state, &facts);
         }
+        RuntimeEvent::SkillDelivery { delivery } => apply_skill_delivery(state, delivery),
         RuntimeEvent::Notification { level, message } => {
             // Errors stick until Esc / next turn; also land in the transcript so
             // a glance away cannot lose them to the status TTL.
@@ -1809,12 +1869,27 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 return;
             }
             state.foreign_sessions.loading = false;
+            let selected_native = state
+                .foreign_sessions
+                .sessions
+                .get(state.foreign_sessions.selected)
+                .map(|session| session.native_id.clone());
             state.foreign_sessions.sessions = sessions;
             state.foreign_sessions.error = error;
-            state.foreign_sessions.selected = state
-                .foreign_sessions
-                .selected
-                .min(state.foreign_sessions.sessions.len().saturating_sub(1));
+            state.foreign_sessions.selected = selected_native
+                .and_then(|id| {
+                    state
+                        .foreign_sessions
+                        .sessions
+                        .iter()
+                        .position(|session| session.native_id == id)
+                })
+                .unwrap_or_else(|| {
+                    state
+                        .foreign_sessions
+                        .selected
+                        .min(state.foreign_sessions.sessions.len().saturating_sub(1))
+                });
         }
         RuntimeEvent::ForeignSessionImported {
             tool,
@@ -2698,6 +2773,7 @@ fn restore_history(
     for entry in entries {
         if entry.turn_start {
             scratch.transcript.finalize_in_flight();
+            scratch.transcript.abandon_unsettled_reply();
             start_turn(&mut scratch);
         }
         scratch.elapsed_secs = entry.turn_elapsed_ms / 1000;
@@ -2739,6 +2815,9 @@ fn restore_history(
         .cloned()
         .collect();
     state.transcript.replace_with(scratch.transcript);
+    crate::image_preview::forget_sent_images(state);
+    state.conv.reply_copy.reset_hits();
+    state.conv.reply_copy.clear_feedback();
     // `/find` reports this bound instead of implying that the loaded
     // transcript is the whole session.
     state.history_omitted_turns = omitted_turns;
@@ -2773,6 +2852,7 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
         // Skill slash catalog is rooted on the repo; drop cache so the next
         // `/` rescans project + user skills for the new workspace.
         state.skill_catalog.clear();
+        state.skill_commands.clear();
         state.skill_catalog_root = None;
     }
     state.snapshot_version = Some(session.last_sequence.unwrap_or(0));
@@ -3039,6 +3119,10 @@ fn apply_session_with(
     // waiting with no way to decide it. The live event stream stays the truth
     // for the queue; only what the view is built from is the snapshot's job.
     if adoption == TranscriptAdoption::Replace {
+        // Replies to the previous transcript's replay request cannot replace
+        // this snapshot. An empty checkpoint restore issues no new request,
+        // so it has to retire the old identity here as well.
+        state.history_query = None;
         if matches!(
             state.overlay,
             Some(Overlay::Approval(_))
@@ -3089,18 +3173,26 @@ fn apply_session_with(
             .is_some_and(|plan| plan.state == UiPlanState::Active))
     .then_some(session.plan)
     .flatten();
-    state.diff = session.diff.clone();
-    if state
+    let selected_path = state
         .diff
         .as_ref()
-        .is_none_or(|diff| state.diff_selected >= diff.files.len())
-    {
-        state.diff_selected = 0;
-    }
+        .and_then(|old| old.files.get(state.diff_selected))
+        .map(|file| file.path.clone());
+    state.diff = session.diff.clone();
+    state.diff_selected = selected_path
+        .and_then(|path| {
+            state
+                .diff
+                .as_ref()
+                .and_then(|diff| diff.files.iter().position(|file| file.path == path))
+        })
+        .unwrap_or_else(|| {
+            let len = state.diff.as_ref().map_or(0, |diff| diff.files.len());
+            state.diff_selected.min(len.saturating_sub(1))
+        });
     state.checkpoints = session.checkpoints.clone();
 
     if switching {
-        state.history_query = None;
         state.agents_list_query = None;
         state.agent_detail_query = None;
         state.child_contribution_query = None;
@@ -3182,6 +3274,9 @@ fn apply_session_with(
     // Rebuild the transcript from the session's persisted messages. Opening a
     // different session (or a lagged resync) replaces the current view.
     state.transcript.clear();
+    crate::image_preview::forget_sent_images(state);
+    state.conv.reply_copy.reset_hits();
+    state.conv.reply_copy.clear_feedback();
     // Any command row focus referred to a call in the transcript just dropped.
     state.command_selected = None;
     // Durable goal recaps (long-goal P3) interleave at the transcript
@@ -3189,6 +3284,7 @@ fn apply_session_with(
     // the recap. A recap without a usable position lands after the messages
     // — still history, never dropped.
     let mut recaps = session.recaps.iter().cloned().peekable();
+    let mut snapshot_assistant = None;
     for message in &session.messages {
         while let Some(next) = recaps.peek() {
             let due = matches!(
@@ -3211,6 +3307,7 @@ fn apply_session_with(
                     .transcript
                     .append_assistant(&message.id, &message.text);
                 state.transcript.finish_assistant(&message.id);
+                state.transcript.mark_snapshot_progress(&message.id, true);
             }
             // Written by the runtime into the model's context (a child's
             // settlement, a lost or resumed delegation), not typed by the user.
@@ -3248,15 +3345,24 @@ fn apply_session_with(
                     InputDelivery::Cancelled(String::new()),
                 );
             }
-            UiRole::User => state.transcript.push_user(message.text.clone()),
+            UiRole::User => {
+                snapshot_assistant = None;
+                state.transcript.push_user(message.text.clone());
+            }
             UiRole::Assistant => {
                 state.transcript.begin_assistant(message.id.clone());
                 state
                     .transcript
                     .append_assistant(&message.id, &message.text);
                 state.transcript.finish_assistant(&message.id);
+                snapshot_assistant = Some(&message.id);
             }
-            UiRole::System | UiRole::Tool => {}
+            UiRole::Tool => {
+                if let Some(id) = snapshot_assistant.take() {
+                    state.transcript.mark_snapshot_progress(id, false);
+                }
+            }
+            UiRole::System => {}
         }
     }
     for recap in recaps {
@@ -3265,7 +3371,19 @@ fn apply_session_with(
     // Replayed history carries no tool-call ordering, so the live classifier
     // never fires for it. Decide it from the turn shape instead, or every
     // restored answer would render as undecided (and therefore bounded) prose.
-    state.transcript.classify_replayed_history();
+    let tail_settled = !state.is_busy()
+        && matches!(session.status.as_str(), "idle" | "completed" | "answered")
+        && matches!(
+            session.task_status,
+            None | Some(
+                leveler_client_protocol::UiTaskStatus::Idle
+                    | leveler_client_protocol::UiTaskStatus::Completed
+                    | leveler_client_protocol::UiTaskStatus::Answered
+            )
+        )
+        && session.interrupted_tool_calls.is_empty()
+        && session.active_tools.is_empty();
+    state.transcript.classify_replayed_history(tail_settled);
     let restored_history = session
         .history
         .as_ref()

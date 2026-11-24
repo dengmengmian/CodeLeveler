@@ -62,15 +62,11 @@ impl Tool for LoadSkillTool {
         // already in the prompt.
         let registry = registry_for(&context)?;
         match registry.load_skill(&input.name) {
-            Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
-                &detail,
-            ))),
+            Ok(detail) => Ok(loaded_skill(&context, detail)),
             Err(leveler_skills::SkillLookupError::Untrusted { .. }) => {
                 let fresh = load_registry_for(&context)?;
                 match fresh.load_skill(&input.name) {
-                    Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
-                        &detail,
-                    ))),
+                    Ok(detail) => Ok(loaded_skill(&context, detail)),
                     // A package that exists but was never admitted is a human
                     // decision, not a typo. Ask the host's approval surface
                     // while this call is still the thing that is waiting; on
@@ -84,6 +80,14 @@ impl Tool for LoadSkillTool {
             Err(error) => Ok(ToolOutput::error(error.to_string())),
         }
     }
+}
+
+fn loaded_skill(context: &ToolContext, detail: leveler_skills::SkillDetail) -> ToolOutput {
+    let rendered = leveler_skills::render_skill_package(&detail);
+    if let Some(grant) = detail.reference_grant {
+        context.bind_skill_references(grant);
+    }
+    ToolOutput::ok(rendered)
 }
 
 impl LoadSkillTool {
@@ -133,7 +137,7 @@ impl LoadSkillTool {
             )));
         };
         let (current_content, current_digest, content_truncated) =
-            match skill_package_preview(&package.location) {
+            match crate::definition_trust::skill_package_preview(&package.location) {
                 Ok(preview) => preview,
                 Err(error) => {
                     return Ok(ToolOutput::error(format!(
@@ -153,7 +157,9 @@ impl LoadSkillTool {
                 let home = leveler_core::LevelerHome::resolve(&context.execution.environment);
                 leveler_definition_trust::read_snapshot(home.root(), digest)
             })
-            .map(|bytes| bounded_preview(&String::from_utf8_lossy(&bytes)));
+            .map(|bytes| {
+                crate::definition_trust::bounded_preview(&String::from_utf8_lossy(&bytes))
+            });
         let request = crate::definition_trust::DefinitionTrustAuthorizationRequest {
             call_id: context
                 .tool_call_scope
@@ -207,9 +213,7 @@ impl LoadSkillTool {
                 // the decision never covered.
                 let registry = load_registry_for(context)?;
                 match registry.load_skill(name) {
-                    Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
-                        &detail,
-                    ))),
+                    Ok(detail) => Ok(loaded_skill(context, detail)),
                     Err(error) => Ok(ToolOutput::error(format!(
                         "skill `{name}` was admitted, but its content could not be verified \
                          afterwards and was NOT loaded: {error}"
@@ -218,52 +222,6 @@ impl LoadSkillTool {
             }
         }
     }
-}
-
-/// Frame the exact package for display and report its digest. The preview is
-/// bounded; the digest is always over the complete package.
-fn skill_package_preview(location: &std::path::Path) -> Result<(String, String, bool), String> {
-    let package = leveler_definition_trust::read_skill_package(&location.join("SKILL.md"))?;
-    let digest = leveler_definition_trust::DefinitionIdentity::skill_package_digest(&package);
-    let mut out = String::new();
-    let mut truncated = false;
-    for part in package {
-        let framed = format!(
-            "--- {} ---\n{}{}",
-            part.relative,
-            String::from_utf8_lossy(&part.bytes),
-            if part.bytes.ends_with(b"\n") {
-                ""
-            } else {
-                "\n"
-            }
-        );
-        let remaining =
-            crate::definition_trust::MAX_AUTHORIZATION_PREVIEW_BYTES.saturating_sub(out.len());
-        if framed.len() > remaining {
-            truncated = true;
-            let mut end = remaining.min(framed.len());
-            while !framed.is_char_boundary(end) {
-                end -= 1;
-            }
-            out.push_str(&framed[..end]);
-            out.push_str("\n… (preview truncated; the approval binds every package file)\n");
-            break;
-        }
-        out.push_str(&framed);
-    }
-    Ok((out, digest, truncated))
-}
-
-fn bounded_preview(text: &str) -> String {
-    if text.len() <= crate::definition_trust::MAX_AUTHORIZATION_PREVIEW_BYTES {
-        return text.to_string();
-    }
-    let mut end = crate::definition_trust::MAX_AUTHORIZATION_PREVIEW_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n… (preview truncated)\n", &text[..end])
 }
 
 /// The scope a client may write a skill into. Mirrors the client protocol's
@@ -379,9 +337,14 @@ fn store_for(context: &ToolContext) -> Result<SkillStore, ToolError> {
 
 fn registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
     let root = context.require_workspace()?.root();
+    let environment = &context.execution.environment;
     Ok(SkillRegistry::load(
-        &SkillRoots::for_project_in(root, &|key| context.execution.environment.var_os(key)),
+        &SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
         context.execution.definition_trust.as_ref(),
+        &leveler_skills::PreferencesState::load(
+            &leveler_core::LevelerHome::resolve(environment),
+            Some(root),
+        ),
     ))
 }
 
@@ -391,14 +354,24 @@ fn registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
 fn load_registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
     let root = context.require_workspace()?.root();
     let home = leveler_core::LevelerHome::resolve(&context.execution.environment);
+    let trust = current_skill_trust(context)?;
+    Ok(SkillRegistry::load(
+        &SkillRoots::for_project_in(root, &|key| context.execution.environment.var_os(key)),
+        &trust,
+        &leveler_skills::PreferencesState::load(&home, Some(root)),
+    ))
+}
+
+pub(super) fn current_skill_trust(
+    context: &ToolContext,
+) -> Result<leveler_definition_trust::DefinitionTrustView, ToolError> {
+    let root = context.require_workspace()?.root();
+    let home = leveler_core::LevelerHome::resolve(&context.execution.environment);
     let mut trust = leveler_definition_trust::DefinitionTrustView::load(home.root(), Some(root));
     if let Some(session) = context.execution.definition_trust.session() {
         trust = trust.with_session(session.clone());
     }
-    Ok(SkillRegistry::load(
-        &SkillRoots::for_project_in(root, &|key| context.execution.environment.var_os(key)),
-        &trust,
-    ))
+    Ok(trust)
 }
 
 /// Validate a `save_skill` / `delete_skill` call before anyone is asked, and
@@ -551,6 +524,7 @@ fn save_preview(
 fn status_line(entry: &SkillEntry) -> String {
     match &entry.state {
         leveler_skills::SkillState::Available => "available".to_string(),
+        leveler_skills::SkillState::Disabled { reason } => format!("disabled: {reason}"),
         leveler_skills::SkillState::Invalid(reason) => format!("invalid: {reason}"),
     }
 }
@@ -950,7 +924,11 @@ mod trust_tests {
     async fn an_allow_once_decision_resumes_the_same_load() {
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        write_evil(dir.path());
+        let skill = write_evil(dir.path());
+        let references = skill.parent().unwrap().join("references");
+        std::fs::create_dir(&references).unwrap();
+        let reference = references.join("guide.md");
+        std::fs::write(&reference, "APPROVED LINE\n".repeat(5000)).unwrap();
         let session = Arc::new(SessionDefinitionTrust::unknown());
         let authorizer = Arc::new(FakeAuthorizer {
             session: session.clone(),
@@ -962,13 +940,50 @@ mod trust_tests {
         let out = LoadSkillTool
             .execute(
                 serde_json::json!({"name": "evil"}),
-                ctx,
+                ctx.clone(),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("EVIL_SKILL_BODY"), "{}", out.content);
+        assert!(
+            !out.content.contains("APPROVED LINE"),
+            "reference text must be on demand"
+        );
+        let read = super::super::ReadFileTool
+            .execute(
+                serde_json::json!({"path": reference, "start_line": 2, "end_line": 3}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!read.is_error, "{}", read.content);
+        assert_eq!(
+            read.content,
+            "     2\tAPPROVED LINE\n     3\tAPPROVED LINE\n"
+        );
+        std::fs::write(&reference, "CHANGED LINE").unwrap();
+        let changed = super::super::ReadFileTool
+            .execute(
+                serde_json::json!({"path": reference}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(changed.is_error, "{}", changed.content);
+        assert!(
+            changed.content.contains("package changed"),
+            "{}",
+            changed.content
+        );
+        assert!(
+            !changed.content.contains("CHANGED LINE"),
+            "{}",
+            changed.content
+        );
         let seen = authorizer.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(

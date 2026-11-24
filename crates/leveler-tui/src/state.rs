@@ -11,6 +11,7 @@ use leveler_client_protocol::{
 
 use crate::composer::Composer;
 use crate::i18n::{Locale, UiText};
+use crate::layout::{SplitFocus, SplitLayout};
 use crate::overlay::Overlay;
 use crate::screen::{Screen, ToolsScreenState};
 use crate::theme::Theme;
@@ -356,6 +357,23 @@ impl SessionFilter {
     }
 }
 
+/// A logical list object under the pointer. The screen is part of the value:
+/// the same row key on another page must not inherit the hover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListHover {
+    pub screen: Screen,
+    pub key: String,
+}
+
+/// The last split geometry a page painted. Mouse handling uses this exact
+/// rect, so a click can never be resolved against a layout the user cannot
+/// see. The host does not own it; every page republishes it each frame.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageSplit {
+    pub screen: Screen,
+    pub layout: SplitLayout,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub running: bool,
@@ -456,6 +474,12 @@ pub struct AppState {
     pub clean: crate::clean::CleanState,
     /// `/trust` page: discovered definitions, selection and previews.
     pub trust: crate::trust::TrustState,
+    /// `/skills` page: the resolved registry's rows, search/filter/detail and
+    /// the durable enable/disable action. The runtime still owns loading.
+    pub skills_page: crate::skills::SkillsState,
+    /// `/agents` page inside the extensions workspace. The runtime owns the
+    /// registry; this is the last projection this client asked for.
+    pub agents_page: crate::agents_view::AgentsPage,
     /// `/schedules`: a view over the runtime's scheduled-automation API. The
     /// page owns no definitions, runs or grants; it only holds their last
     /// authoritative projection and the query ids it is waiting on.
@@ -531,6 +555,29 @@ pub struct AppState {
     /// Agent-registry queries owned by this TUI. Responses traverse the
     /// shared session stream and must not render for another client.
     pub agents_list_query: Option<leveler_client_protocol::CommandId>,
+    /// Modal chrome hit targets from the last paint. Empty off a hosted page.
+    pub workspace_hits: crate::workspace::Hits,
+    /// Host chrome element under the pointer, from the last mouse move.
+    pub(crate) workspace_hover: Option<crate::workspace::WorkspaceHover>,
+    /// Logical list object under the pointer. The pair is cleared on every
+    /// other pointer event, so a row can never stay hovered after the list
+    /// scrolled away or its page closed.
+    pub(crate) list_hover: Option<ListHover>,
+    /// Content-internal split painted by the active page this frame.
+    pub(crate) page_split: Option<PageSplit>,
+    /// Which pane owns the keyboard on the active List+Detail/Split page.
+    pub page_focus: SplitFocus,
+    /// Shared detail offset for the active split page, clamped by its renderer.
+    pub page_scroll: usize,
+    /// The current frame is a bordered hosted card. Pages center their hint
+    /// and leave the close glyph as the back control.
+    pub(crate) modal_chrome: bool,
+    /// The card already named this page (a title row or sibling tabs), so the
+    /// page must not paint a second `← title`.
+    pub(crate) modal_named: bool,
+    /// The page's own shortcut line, stashed so the card can paint it once
+    /// in the shared footer. `None` until the page draws.
+    pub(crate) card_hint: Option<String>,
     pub agent_detail_query: Option<leveler_client_protocol::CommandId>,
     pub child_contribution_query: Option<leveler_client_protocol::CommandId>,
     pub diff_query: Option<leveler_client_protocol::CommandId>,
@@ -561,6 +608,23 @@ pub struct AppState {
 
     /// Attachments staged for the next message (spec §40).
     pub pending_attachments: Vec<AttachmentRef>,
+    /// Image chip under the pointer. Cleared when that chip is no longer painted.
+    pub(crate) image_hover: Option<usize>,
+    /// Index and composer grapheme of an image that was just inserted.
+    /// The overlay stays while the cursor is still that grapheme.
+    pub(crate) image_post_insert: Option<(usize, usize)>,
+    /// Last painted image-chip cells, for the next mouse move.
+    pub(crate) image_chip_hits: Vec<crate::image_preview::ChipHit>,
+    /// Images a sent user row still names, for this session only.
+    /// A rebuilt transcript has no attachment records, so the list is dropped
+    /// with that transcript. The row's text stays the chip, never a path.
+    pub(crate) sent_images: Vec<crate::image_preview::SentImageTurn>,
+    /// `(transcript item, image index)` of a sent chip under the pointer.
+    pub(crate) sent_image_hover: Option<(usize, usize)>,
+    /// Last painted sent-chip cells.
+    pub(crate) sent_image_hits: Vec<crate::image_preview::SentChipHit>,
+    /// Decoded preview and any Kitty delete the next flush must send.
+    pub(crate) image_preview_cache: Option<crate::image_preview::PreviewCache>,
     /// Whether the current model accepts images (from the snapshot, spec §42).
     pub vision: bool,
 
@@ -576,6 +640,9 @@ pub struct AppState {
     /// A `/sessions` read is outstanding. Distinguishes "loading" from the
     /// runtime's real empty inventory.
     pub sessions_loading: bool,
+    /// A session inventory has been requested or received. A later tab visit
+    /// does not ask again when the runtime's list is empty.
+    pub sessions_known: bool,
     /// Why the last `/sessions` read did not produce an inventory.
     pub sessions_error: Option<String>,
     /// `/resume-claude` / `/resume-codex`: the source picker's projection.
@@ -784,6 +851,11 @@ pub struct AppState {
     /// Discovered skills as slash entries: `(name, description)`.
     /// Refreshed when the repo changes or the user types `/`.
     pub skill_catalog: Vec<(String, String)>,
+    /// Skills addressable through the unified `/` completion, projected from
+    /// the same registry the runtime loads. Only available, user-invocable
+    /// entries: a refused request is diagnosed from a fresh registry at submit
+    /// time, so a stale hint can never authorize anything.
+    pub skill_commands: Vec<leveler_skills::SkillCommand>,
     /// Root path the catalog was built from (avoids re-scanning every keystroke).
     pub skill_catalog_root: Option<String>,
 
@@ -929,6 +1001,8 @@ impl AppState {
             context: crate::context::ContextView::default(),
             clean: crate::clean::CleanState::default(),
             trust: crate::trust::TrustState::default(),
+            skills_page: crate::skills::SkillsState::default(),
+            agents_page: crate::agents_view::AgentsPage::default(),
             schedule: crate::schedules::ScheduleState::default(),
             memory: crate::memory::MemoryState::default(),
             tasks: crate::tasks::TasksState::default(),
@@ -945,6 +1019,15 @@ impl AppState {
             turn_diff_files: None,
             history_query: None,
             agents_list_query: None,
+            workspace_hits: crate::workspace::Hits::default(),
+            workspace_hover: None,
+            list_hover: None,
+            page_split: None,
+            page_focus: SplitFocus::Primary,
+            page_scroll: 0,
+            modal_chrome: false,
+            modal_named: false,
+            card_hint: None,
             agent_detail_query: None,
             child_contribution_query: None,
             diff_query: None,
@@ -958,12 +1041,20 @@ impl AppState {
             execution_goal: None,
             collaboration: "chat".into(),
             pending_attachments: Vec::new(),
+            image_hover: None,
+            image_post_insert: None,
+            image_chip_hits: Vec::new(),
+            sent_images: Vec::new(),
+            sent_image_hover: None,
+            sent_image_hits: Vec::new(),
+            image_preview_cache: None,
             vision: false,
             sessions: Vec::new(),
             all_sessions: Vec::new(),
             sessions_filter: SessionFilter::default(),
             sessions_selected: 0,
             sessions_loading: false,
+            sessions_known: false,
             sessions_error: None,
             foreign_sessions: crate::foreign_session::ForeignSessionsView::default(),
             foreign_origin: None,
@@ -1048,6 +1139,7 @@ impl AppState {
             file_candidates: Vec::new(),
             file_index_requested: false,
             skill_catalog: Vec::new(),
+            skill_commands: Vec::new(),
             skill_catalog_root: None,
             repository: None,
             branch: None,
@@ -1211,6 +1303,19 @@ impl AppState {
     /// The composer draft path is `<state_dir>/draft.txt`, so its parent IS
     /// the authoritative state dir. This keeps the trust boundary in the UI
     /// without adding a second copy of the layout to `Boot`.
+    /// This session's processed images: `<state_dir>/media`.
+    ///
+    /// The composer draft is `<state_dir>/draft.txt`, so its parent is the
+    /// state directory the runtime stores media in. A host that did not pass
+    /// a draft path has no media directory the preview may open.
+    pub(crate) fn media_dir(&self) -> Option<std::path::PathBuf> {
+        self.boot
+            .draft_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.join("media"))
+    }
+
     pub fn shell_output_root(&self) -> Option<std::path::PathBuf> {
         if let Some(state_dir) = self.boot.draft_path.as_ref().and_then(|path| path.parent()) {
             return Some(state_dir.join("shell-output"));

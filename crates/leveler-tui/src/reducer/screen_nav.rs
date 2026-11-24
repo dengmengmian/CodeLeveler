@@ -30,7 +30,33 @@ fn scroll_screen_key(state: &mut AppState, key: &KeyEvent, line_keys: bool) -> b
             state.screen_scroll = state.screen_scroll.saturating_add(page_size(state));
             true
         }
+        KeyCode::Home if line_keys => {
+            state.screen_scroll = 0;
+            true
+        }
+        KeyCode::End if line_keys => {
+            state.screen_scroll = usize::MAX;
+            true
+        }
         _ => false,
+    }
+}
+
+/// Rows in a page's primary list, when the page has one.
+fn list_len(state: &AppState) -> Option<usize> {
+    match state.active_screen {
+        Screen::Sessions => Some(state.sessions.len()),
+        Screen::ForeignSessions => Some(state.foreign_sessions.sessions.len()),
+        Screen::Diff => Some(state.diff.as_ref().map(|d| d.files.len()).unwrap_or(0)),
+        Screen::Tools => Some(
+            state
+                .transcript
+                .tool_calls()
+                .into_iter()
+                .filter(|b| state.tools_screen.filter.matches(b))
+                .count(),
+        ),
+        _ => None,
     }
 }
 
@@ -38,17 +64,8 @@ fn scroll_screen_key(state: &mut AppState, key: &KeyEvent, line_keys: bool) -> b
 /// and wheel share it, so a page cannot have two different ideas of where its
 /// own list ends.
 pub(super) fn move_list_cursor(state: &mut AppState, delta: isize) {
-    let len = match state.active_screen {
-        Screen::Sessions => state.sessions.len(),
-        Screen::ForeignSessions => state.foreign_sessions.sessions.len(),
-        Screen::Diff => state.diff.as_ref().map(|d| d.files.len()).unwrap_or(0),
-        Screen::Tools => state
-            .transcript
-            .tool_calls()
-            .into_iter()
-            .filter(|b| state.tools_screen.filter.matches(b))
-            .count(),
-        _ => return,
+    let Some(len) = list_len(state) else {
+        return;
     };
     if len == 0 {
         return;
@@ -102,6 +119,8 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
         },
         Screen::Clean => state.clean.move_selection(notches),
         Screen::Trust => crate::trust::wheel(state, notches),
+        Screen::Skills => crate::skills::wheel(state, notches),
+        Screen::Agents => crate::agents_view::wheel(state, notches),
         Screen::Schedules => crate::schedules::wheel(state, notches),
         Screen::Memory => crate::memory::wheel(state, notches),
         Screen::Find => crate::find::wheel(state, notches),
@@ -131,31 +150,66 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
 pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
     match state.active_screen {
         // The child list is keyed by stable identity, not by position.
-        Screen::Team => state.team_selected = Some(key.to_string()),
+        Screen::Team => {
+            state.team_selected = Some(key.to_string());
+            state.page_focus = crate::layout::SplitFocus::Primary;
+            state.page_scroll = 0;
+        }
         Screen::Sessions => {
-            if let Ok(index) = key.parse::<usize>() {
+            if let Some(index) = state.sessions.iter().position(|s| s.id.as_str() == key) {
+                state.sessions_selected = index;
+            } else if let Ok(index) = key.parse::<usize>() {
                 state.sessions_selected = index;
             }
         }
         Screen::ForeignSessions => {
-            if let Ok(index) = key.parse::<usize>() {
+            if let Some(index) = state
+                .foreign_sessions
+                .sessions
+                .iter()
+                .position(|session| session.native_id == key)
+            {
+                state.foreign_sessions.selected = index;
+            } else if let Ok(index) = key.parse::<usize>() {
                 state.foreign_sessions.selected =
                     index.min(state.foreign_sessions.sessions.len().saturating_sub(1));
             }
         }
         Screen::Diff => {
-            if let Ok(index) = key.parse::<usize>() {
+            if let Some(index) = state
+                .diff
+                .as_ref()
+                .and_then(|diff| diff.files.iter().position(|file| file.path == key))
+            {
+                state.diff_selected = index;
+            } else if let Ok(index) = key.parse::<usize>() {
                 state.diff_selected = index;
             }
         }
         Screen::Tools => {
-            if let Ok(index) = key.parse::<usize>() {
+            let calls: Vec<_> = state
+                .transcript
+                .tool_calls()
+                .into_iter()
+                .filter(|block| state.tools_screen.filter.matches(block))
+                .collect();
+            if let Some(index) = calls.iter().position(|block| block.id.as_str() == key) {
+                state.tools_screen.selected = index;
+                state.screen_scroll = 0;
+            } else if let Ok(index) = key.parse::<usize>() {
                 state.tools_screen.selected = index;
                 state.screen_scroll = 0;
             }
         }
         Screen::Trace => {
-            if let Ok(index) = key.parse::<usize>() {
+            if let Some(index) = state
+                .trace
+                .filtered()
+                .iter()
+                .position(|row| row.sequence.to_string() == key)
+            {
+                state.trace.selected = index;
+            } else if let Ok(index) = key.parse::<usize>() {
                 state.trace.selected = index;
             }
         }
@@ -170,12 +224,21 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
             }
         }
         Screen::Trust => crate::trust::select_row(state, key),
+        Screen::Skills => crate::skills::select_row(state, key),
+        Screen::Agents => crate::agents_view::select_row(state, key),
         Screen::Schedules => crate::schedules::select_row(state, key),
         Screen::Memory => crate::memory::select_row(state, key),
         Screen::Find => crate::find::select_row(state, key),
         Screen::Help => {
-            if let Ok(index) = key.parse::<usize>() {
-                state.help.select(index, state.t());
+            let t = state.t();
+            let index = state
+                .help
+                .matches(t)
+                .iter()
+                .position(|entry| entry.binding == key)
+                .or_else(|| key.parse::<usize>().ok());
+            if let Some(index) = index {
+                state.help.select(index, t);
             }
         }
         _ => {}
@@ -186,45 +249,139 @@ pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
 /// Handle keys for a full-screen view (Tools today). Esc returns to the
 /// conversation.
 pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    if let Some(effects) = crate::workspace::chrome_key(state, &key) {
+        return effects;
+    }
+    if state.page_focus == crate::layout::SplitFocus::Detail
+        && matches!(
+            state.active_screen,
+            Screen::Diff
+                | Screen::Tools
+                | Screen::Settings
+                | Screen::Mcp
+                | Screen::Tasks
+                | Screen::Team
+                | Screen::Trace
+        )
+    {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.page_scroll = state.page_scroll.saturating_sub(1);
+                return Vec::new();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.page_scroll = state.page_scroll.saturating_add(1);
+                return Vec::new();
+            }
+            KeyCode::PageUp => {
+                state.page_scroll = state.page_scroll.saturating_sub(10);
+                return Vec::new();
+            }
+            KeyCode::PageDown => {
+                state.page_scroll = state.page_scroll.saturating_add(10);
+                return Vec::new();
+            }
+            KeyCode::Home => {
+                state.page_scroll = 0;
+                return Vec::new();
+            }
+            KeyCode::End => {
+                state.page_scroll = usize::MAX;
+                return Vec::new();
+            }
+            _ => {}
+        }
+    }
+    // A pageful, and the list's ends, for every cursor list. The detail pane
+    // handled its own PageUp/PageDown above; recording and document pages
+    // keep their own scroll keys.
+    if state.page_focus != crate::layout::SplitFocus::Detail
+        && matches!(
+            state.active_screen,
+            Screen::Sessions | Screen::ForeignSessions | Screen::Diff | Screen::Tools
+        )
+    {
+        match key.code {
+            KeyCode::PageUp => {
+                move_list_cursor(state, -10);
+                return Vec::new();
+            }
+            KeyCode::PageDown => {
+                move_list_cursor(state, 10);
+                return Vec::new();
+            }
+            KeyCode::Home => {
+                if let Some(len) = list_len(state) {
+                    move_list_cursor(state, -(len as isize));
+                }
+                return Vec::new();
+            }
+            KeyCode::End => {
+                if let Some(len) = list_len(state) {
+                    move_list_cursor(state, len as isize);
+                }
+                return Vec::new();
+            }
+            _ => {}
+        }
+    }
     match state.active_screen {
-        Screen::Tools => {
-            match key.code {
-                KeyCode::Esc => return back(state),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    move_list_cursor(state, -1);
-                    state.screen_scroll = 0;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    move_list_cursor(state, 1);
-                    state.screen_scroll = 0;
-                }
-                KeyCode::Tab | KeyCode::Char('f') => {
-                    state.tools_screen.cycle_filter();
-                    state.screen_scroll = 0;
-                }
-                // PageUp/PageDown scroll the detail pane.
-                _ => {
-                    scroll_screen_key(state, &key, false);
-                }
+        Screen::Tools => match key.code {
+            KeyCode::Esc if state.page_focus == crate::layout::SplitFocus::Detail => {
+                state.page_focus = crate::layout::SplitFocus::Primary;
             }
-        }
-        Screen::Diff => {
-            match key.code {
-                KeyCode::Esc => return back(state),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    move_list_cursor(state, -1);
-                    state.screen_scroll = 0;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    move_list_cursor(state, 1);
-                    state.screen_scroll = 0;
-                }
-                // PageUp/PageDown scroll the patch pane.
-                _ => {
-                    scroll_screen_key(state, &key, false);
-                }
+            KeyCode::Esc => return back(state),
+            KeyCode::Enter if state.page_focus == crate::layout::SplitFocus::Primary => {
+                state.page_focus = crate::layout::SplitFocus::Detail;
             }
-        }
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_list_cursor(state, -1);
+                state.page_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_list_cursor(state, 1);
+                state.page_scroll = 0;
+            }
+            KeyCode::PageUp => {
+                move_list_cursor(state, -10);
+                state.page_scroll = 0;
+            }
+            KeyCode::PageDown => {
+                move_list_cursor(state, 10);
+                state.page_scroll = 0;
+            }
+            KeyCode::Tab | KeyCode::Char('f') => {
+                state.tools_screen.cycle_filter();
+                state.page_scroll = 0;
+            }
+            _ => {}
+        },
+        Screen::Diff => match key.code {
+            KeyCode::Esc if state.page_focus == crate::layout::SplitFocus::Detail => {
+                state.page_focus = crate::layout::SplitFocus::Primary;
+            }
+            KeyCode::Esc => return back(state),
+            KeyCode::Enter if state.page_focus == crate::layout::SplitFocus::Primary => {
+                state.page_focus = crate::layout::SplitFocus::Detail;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_list_cursor(state, -1);
+                state.page_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_list_cursor(state, 1);
+                state.page_scroll = 0;
+            }
+            KeyCode::PageUp => {
+                move_list_cursor(state, -10);
+                state.page_scroll = 0;
+            }
+            KeyCode::PageDown => {
+                move_list_cursor(state, 10);
+                state.page_scroll = 0;
+            }
+            _ => {}
+        },
         Screen::Sessions => {
             match key.code {
                 KeyCode::Esc => return back(state),
@@ -358,9 +515,36 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             _ => {}
         },
         Screen::Team => match key.code {
+            KeyCode::Esc if state.page_focus == crate::layout::SplitFocus::Detail => {
+                state.page_focus = crate::layout::SplitFocus::Primary;
+            }
             KeyCode::Esc => return back(state),
-            KeyCode::Up | KeyCode::Char('k') => crate::multi_agent::select_team_delta(state, -1),
-            KeyCode::Down | KeyCode::Char('j') => crate::multi_agent::select_team_delta(state, 1),
+            KeyCode::Tab | KeyCode::BackTab => {
+                state.page_focus = match state.page_focus {
+                    crate::layout::SplitFocus::Primary => crate::layout::SplitFocus::Detail,
+                    crate::layout::SplitFocus::Detail => crate::layout::SplitFocus::Primary,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                crate::multi_agent::select_team_delta(state, -1);
+                state.page_focus = crate::layout::SplitFocus::Primary;
+                state.page_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                crate::multi_agent::select_team_delta(state, 1);
+                state.page_focus = crate::layout::SplitFocus::Primary;
+                state.page_scroll = 0;
+            }
+            KeyCode::PageUp => {
+                crate::multi_agent::select_team_delta(state, -10);
+                state.page_focus = crate::layout::SplitFocus::Primary;
+                state.page_scroll = 0;
+            }
+            KeyCode::PageDown => {
+                crate::multi_agent::select_team_delta(state, 10);
+                state.page_focus = crate::layout::SplitFocus::Primary;
+                state.page_scroll = 0;
+            }
             KeyCode::Enter => open_selected_child(state),
             // `x` stops exactly the selected running child, through the
             // runtime's own cancellation — never a PID.
@@ -451,29 +635,62 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         Screen::Mcp => return crate::mcp::handle_key(state, key),
         Screen::Settings => return crate::settings::handle_key(state, key),
         Screen::Trust => return crate::trust::handle_key(state, key),
+        Screen::Skills => return crate::skills::handle_key(state, key),
+        Screen::Agents => return crate::agents_view::handle_key(state, key),
         Screen::Tasks => return crate::tasks::handle_key(state, key),
         Screen::Trace => {
             use crate::observability::TraceTab;
             match key.code {
+                KeyCode::Esc if state.page_focus == crate::layout::SplitFocus::Detail => {
+                    state.page_focus = crate::layout::SplitFocus::Primary;
+                    state.trace.inspect = false;
+                }
                 KeyCode::Esc if state.trace.inspect => state.trace.inspect = false,
                 KeyCode::Esc => return back(state),
                 KeyCode::Left | KeyCode::BackTab => {
                     state.trace.tab = state.trace.tab.prev();
                     state.screen_scroll = 0;
+                    state.page_focus = crate::layout::SplitFocus::Primary;
+                    state.page_scroll = 0;
                 }
                 KeyCode::Right | KeyCode::Tab => {
                     state.trace.tab = state.trace.tab.next();
                     state.screen_scroll = 0;
+                    state.page_focus = crate::layout::SplitFocus::Primary;
+                    state.page_scroll = 0;
                 }
                 KeyCode::Char(c) if TraceTab::from_digit(c).is_some() => {
                     state.trace.tab = TraceTab::from_digit(c).unwrap();
                     state.screen_scroll = 0;
+                    state.page_focus = crate::layout::SplitFocus::Primary;
+                    state.page_scroll = 0;
                 }
-                KeyCode::Up | KeyCode::Char('k') => state.trace.move_sel(-1),
-                KeyCode::Down | KeyCode::Char('j') => state.trace.move_sel(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.trace.move_sel(-1);
+                    state.page_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.trace.move_sel(1);
+                    state.page_scroll = 0;
+                }
+                KeyCode::PageUp => {
+                    state.trace.move_sel(-10);
+                    state.page_scroll = 0;
+                }
+                KeyCode::PageDown => {
+                    state.trace.move_sel(10);
+                    state.page_scroll = 0;
+                }
                 KeyCode::Enter => {
-                    state.trace.inspect = !state.trace.inspect;
-                    if let Some(row) = state.trace.selected_row() {
+                    let opening = state.page_focus != crate::layout::SplitFocus::Detail;
+                    state.page_focus = if opening {
+                        crate::layout::SplitFocus::Detail
+                    } else {
+                        crate::layout::SplitFocus::Primary
+                    };
+                    state.trace.inspect = opening;
+                    state.page_scroll = 0;
+                    if opening && let Some(row) = state.trace.selected_row() {
                         let seq = row.sequence;
                         let sid = state
                             .trace
@@ -585,7 +802,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
 /// a detail opened from the jobs list returns to the list. A future detail
 /// page inherits the rule by publishing its `←` hit and reading the same
 /// field — there is no second navigation system.
-pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
+pub(crate) fn back(state: &mut AppState) -> Vec<Effect> {
     match state.active_screen {
         // An open issue row is the page's innermost level; the detail page
         // returns to whatever opened it.
@@ -634,6 +851,12 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
         Screen::Settings => crate::settings::close(state),
         Screen::Trust => {
             crate::trust::back(state);
+        }
+        Screen::Skills => {
+            crate::skills::back(state);
+        }
+        Screen::Agents => {
+            crate::agents_view::back(state);
         }
         Screen::Help => {
             if state.help.detail.is_some() {
@@ -960,6 +1183,7 @@ pub(super) fn open_sessions_screen(state: &mut AppState) -> Vec<Effect> {
         return Vec::new();
     }
     state.sessions_loading = true;
+    state.sessions_known = true;
     state.sessions_error = None;
     vec![Effect::Send(ClientCommand::RequestSessionListFor {
         requester_session_id: state.session_id.clone(),

@@ -42,6 +42,15 @@ const SLASH_POPUP_PAD_X: u16 = 1;
 const SLASH_COMMAND_COL: usize = 14;
 const SLASH_COL_GAP: usize = 1;
 const SLASH_POPUP_MAX_WIDTH: u16 = 46;
+/// A Skill row carries provenance and an argument hint before its
+/// description. The menu widens only when a Skill is actually listed; the
+/// built-in list keeps its historical width.
+const SKILL_POPUP_MAX_WIDTH: u16 = 72;
+/// Rows the `/` menu may show at once. The unified list puts the twelve quick
+/// built-ins before Skills, so a smaller fixed window hid every Skill on a
+/// bare `/` even on a tall terminal. The menu grows into the room above the
+/// composer up to this bound and scrolls beyond it.
+const SLASH_POPUP_MAX_ROWS: usize = 16;
 
 /// Columns after the popup border and inner padding.
 pub(crate) fn slash_popup_content_width(popup_width: u16) -> usize {
@@ -128,7 +137,12 @@ fn slash_popup_row(name: &str, desc: &str, content_w: usize, names: &[&str]) -> 
     clipped
 }
 
-fn slash_popup_geometry(transcript: Rect, composer: Rect, visible_rows: u16) -> (Rect, Rect, Rect) {
+fn slash_popup_geometry(
+    transcript: Rect,
+    composer: Rect,
+    visible_rows: u16,
+    max_width: u16,
+) -> (Rect, Rect, Rect) {
     let height = visible_rows.saturating_add(2);
     // The popup is anchored at the composer's left edge, so its width is bounded
     // by the room to the transcript's RIGHT edge — not by the transcript's own
@@ -136,7 +150,7 @@ fn slash_popup_geometry(transcript: Rect, composer: Rect, visible_rows: u16) -> 
     // and end past the buffer: on a 40-column terminal every `/command` panicked
     // in the buffer while painting its own menu.
     let available = transcript.right().saturating_sub(composer.x);
-    let width = SLASH_POPUP_MAX_WIDTH.min(available);
+    let width = max_width.min(available);
     if width < 4 {
         return (Rect::default(), Rect::default(), Rect::default());
     }
@@ -177,6 +191,14 @@ fn put_clipped(buf: &mut Buffer, x: u16, y: u16, text: &str, right: u16, style: 
     x.saturating_add(written).min(right)
 }
 
+/// How many rows of the menu fit above the composer: the space between the
+/// conversation and the composer, minus the popup's own border, bounded by
+/// [`SLASH_POPUP_MAX_ROWS`].
+fn slash_popup_visible_rows(transcript: Rect, composer: Rect, total: usize) -> usize {
+    let fit = composer.y.saturating_sub(transcript.y).saturating_sub(2) as usize;
+    total.min(fit.clamp(1, SLASH_POPUP_MAX_ROWS))
+}
+
 pub(crate) fn render_slash_popup(
     frame: &mut Frame,
     transcript: Rect,
@@ -189,14 +211,22 @@ pub(crate) fn render_slash_popup(
     }
     let theme = &state.theme;
     // Keep the highlighted row visible.
-    const MAX: usize = 8;
+    let visible = slash_popup_visible_rows(transcript, composer, matches.len());
     let sel = state.slash_selected.min(matches.len() - 1);
     let start = sel
-        .saturating_sub(MAX - 1)
-        .min(matches.len().saturating_sub(MAX));
-    let end = (start + MAX).min(matches.len());
+        .saturating_sub(visible - 1)
+        .min(matches.len().saturating_sub(visible));
+    let end = (start + visible).min(matches.len());
     let rows = (end - start) as u16;
-    let (popup, inner, content) = slash_popup_geometry(transcript, composer, rows);
+    let max_width = if matches
+        .iter()
+        .any(|row| row.kind == crate::screen::SlashCompletionKind::Skill)
+    {
+        SKILL_POPUP_MAX_WIDTH
+    } else {
+        SLASH_POPUP_MAX_WIDTH
+    };
+    let (popup, inner, content) = slash_popup_geometry(transcript, composer, rows, max_width);
     if popup.width == 0 || popup.height == 0 {
         return None;
     }
@@ -205,7 +235,7 @@ pub(crate) fn render_slash_popup(
         .border_style(Style::default().fg(theme.border.normal));
     let names: Vec<&str> = matches[start..end]
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|row| row.name.as_str())
         .collect();
     // Clear first: conversation CJK leaves 2-cell glyphs whose continuation
     // cells swallow the rest of a description (only the first ideograph
@@ -218,13 +248,18 @@ pub(crate) fn render_slash_popup(
     }
     let content_right = content.x.saturating_add(content.width);
     let buf = frame.buffer_mut();
-    for (row, (name, desc)) in matches[start..end].iter().enumerate() {
+    for (row, completion) in matches[start..end].iter().enumerate() {
         let y = content.y.saturating_add(row as u16);
         if y >= inner.y.saturating_add(inner.height) || y >= buf.area.height {
             break;
         }
         let selected = start + row == sel;
-        let cells = slash_popup_cells(name, desc, content.width as usize, &names);
+        let cells = slash_popup_cells(
+            &completion.name,
+            &completion.description,
+            content.width as usize,
+            &names,
+        );
         let (name_style, desc_style, pad_style) = if selected {
             (
                 Style::default()
@@ -237,10 +272,15 @@ pub(crate) fn render_slash_popup(
                 Style::default().bg(theme.surface.selection),
             )
         } else {
+            // Skill rows share the one menu but keep their own ink, so
+            // "a command I typed" and "a procedure the runtime will load"
+            // are distinguishable at a glance.
+            let name_ink = match completion.kind {
+                crate::screen::SlashCompletionKind::Command => theme.accent.primary,
+                crate::screen::SlashCompletionKind::Skill => theme.accent.secondary,
+            };
             (
-                Style::default()
-                    .fg(theme.accent.primary)
-                    .bg(theme.surface.elevated),
+                Style::default().fg(name_ink).bg(theme.surface.elevated),
                 Style::default()
                     .fg(theme.text.secondary)
                     .bg(theme.surface.elevated),
@@ -497,22 +537,32 @@ pub(crate) fn render_shell_completion(
     Some(popup)
 }
 
-/// Shared match list for slash / @file / $skill popups (name, description).
-fn slash_popup_match_rows(state: &AppState) -> Vec<(String, String)> {
+/// Shared match list for slash / @file / $skill popups.
+fn slash_popup_match_rows(state: &AppState) -> Vec<crate::screen::SlashCompletion> {
+    use crate::screen::{SlashCompletion, SlashCompletionKind};
     let files = crate::screen::visible_file_popup(state);
-    if files.is_empty() {
-        let skills = crate::screen::visible_skill_popup(state);
-        if skills.is_empty() {
-            crate::screen::visible_slash_popup(state)
-        } else {
-            skills
-        }
-    } else {
-        files
+    if !files.is_empty() {
+        return files
             .into_iter()
-            .map(|path| (format!("@{path}"), state.t().file_mention.to_string()))
-            .collect()
+            .map(|path| SlashCompletion {
+                name: format!("@{path}"),
+                description: state.t().file_mention.to_string(),
+                kind: SlashCompletionKind::Command,
+            })
+            .collect();
     }
+    let skills = crate::screen::visible_skill_popup(state);
+    if !skills.is_empty() {
+        return skills
+            .into_iter()
+            .map(|(name, description)| SlashCompletion {
+                name,
+                description,
+                kind: SlashCompletionKind::Skill,
+            })
+            .collect();
+    }
+    crate::screen::visible_slash_popup_rows(state)
 }
 
 /// One visual row of the soft-wrapped composer (prompt + text).
@@ -525,10 +575,11 @@ struct ComposerVisRow {
     /// the painted content area** — the wrapper's prompt indent is already
     /// counted, so the caller must not add the prompt width again.
     caret_col: Option<usize>,
-    /// Byte range of the leading slash command inside `text`, when this is the
-    /// buffer's first row and the whole token fits on it. Presentation only:
-    /// the row's characters are unchanged.
-    command: Option<std::ops::Range<usize>>,
+    /// Byte range of the leading slash command inside `text` plus the
+    /// namespace that owns it, when this is the buffer's first row and the
+    /// whole token fits on it. Presentation only: the row's characters are
+    /// unchanged.
+    command: Option<(std::ops::Range<usize>, crate::screen::SlashCompletionKind)>,
     /// Empty-buffer placeholder (visual only).
     placeholder: bool,
     /// Slash-arg ghost after caret (visual only).
@@ -537,6 +588,9 @@ struct ComposerVisRow {
     /// first row. DISPLAY ONLY — it is not in the composer, not in its
     /// canonical form, and adds no visual row.
     suggestion: Option<String>,
+    /// Byte range of `text` in the composer buffer.
+    start_byte: usize,
+    end_byte: usize,
 }
 
 /// Soft-wrap the composer buffer into visual rows for a content width of
@@ -560,7 +614,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
     // range they can actually paint. Shell Mode owns its text entirely, so a
     // `/` there is a path, not a command.
     let command = (state.input_mode == crate::shell_mode::InputMode::Normal)
-        .then(|| crate::screen::highlighted_slash_command(state.composer.text()))
+        .then(|| crate::screen::highlighted_composer_command(state))
         .flatten();
     let (rows, _) = wrap_with_caret(
         state.composer.text(),
@@ -599,7 +653,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             let command = first_row
                 .then_some(command.as_ref())
                 .flatten()
-                .filter(|range| range.end <= row.text.len())
+                .filter(|(range, _)| range.end <= row.text.len())
                 .cloned();
             ComposerVisRow {
                 prompt: if first_row { prompt } else { cont },
@@ -609,6 +663,8 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
                 command,
                 ghost,
                 suggestion,
+                start_byte: row.start_byte,
+                end_byte: row.end_byte,
             }
         })
         .collect();
@@ -623,6 +679,8 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
             command: None,
             ghost: None,
             suggestion: None,
+            start_byte: 0,
+            end_byte: 0,
         });
     }
 
@@ -721,19 +779,21 @@ pub(crate) fn composer_box_lines(
         match row
             .command
             .as_ref()
-            .filter(|range| range.end <= piece.len())
+            .filter(|(range, _)| range.end <= piece.len())
         {
-            Some(range) => {
+            Some((range, kind)) => {
                 let (before, rest) = piece.split_at(range.start);
                 let (command, argument) = rest.split_at(range.end - range.start);
                 if !before.is_empty() {
                     spans.push(Span::styled(before.to_string(), body));
                 }
+                let ink = match kind {
+                    crate::screen::SlashCompletionKind::Command => theme.plan.primary,
+                    crate::screen::SlashCompletionKind::Skill => theme.accent.secondary,
+                };
                 spans.push(Span::styled(
                     command.to_string(),
-                    Style::default()
-                        .fg(theme.plan.primary)
-                        .bg(theme.surface.input),
+                    Style::default().fg(ink).bg(theme.surface.input),
                 ));
                 if !argument.is_empty() {
                     spans.push(Span::styled(argument.to_string(), body));
@@ -843,6 +903,50 @@ pub(crate) fn composer_box_lines(
     let cx = caret_col.min((width.saturating_sub(1)) as u16);
     let cy = (1 + caret_row) as u16;
     (lines, (cx, cy))
+}
+
+/// Screen cells of each image chip in the composer box that was just measured.
+///
+/// `skipped` is how many leading box rows `clip_composer_box` dropped. A chip
+/// that scrolled out of the box is not hoverable. The cell after `]` is the
+/// trailing space, not part of the chip.
+pub(crate) fn publish_image_chip_hits(state: &mut AppState, area: Rect, skipped: usize) {
+    let pad = crate::layout::INPUT_INTERNAL_PADDING_X;
+    let inner = (area.width as usize).saturating_sub(2);
+    let content_w = inner.saturating_sub(pad as usize).max(1);
+    let (rows, _) = composer_visual_rows(state, content_w);
+    let origin_x = area.x.saturating_add(1).saturating_add(pad);
+    let mut slices = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let box_line = 1 + index;
+        if box_line < skipped {
+            continue;
+        }
+        let y = area.y.saturating_add((box_line - skipped) as u16);
+        if y >= area.y.saturating_add(area.height) {
+            continue;
+        }
+        slices.push(crate::image_preview::ChipSlice {
+            start_byte: row.start_byte,
+            end_byte: row.end_byte,
+            prompt_cols: UnicodeWidthStr::width(row.prompt),
+            row: y,
+        });
+    }
+    let tokens: Vec<std::ops::Range<usize>> = state
+        .composer
+        .image_token_spans()
+        .into_iter()
+        .map(|(range, _)| range)
+        .collect();
+    let hits = crate::image_preview::chip_hits(state.composer.text(), &tokens, &slices, origin_x);
+    if state
+        .image_hover
+        .is_some_and(|index| !hits.iter().any(|hit| hit.index == index))
+    {
+        state.image_hover = None;
+    }
+    state.image_chip_hits = hits;
 }
 
 /// Compact trust label on the composer bottom border — the runtime state chip.
@@ -1731,8 +1835,9 @@ mod slash_popup_layout_tests {
             })
             .unwrap();
         let matches = slash_popup_match_rows(&state);
-        let rows = matches.len().min(8) as u16;
-        let (popup, _inner, content) = slash_popup_geometry(transcript, composer, rows);
+        let rows = slash_popup_visible_rows(transcript, composer, matches.len()) as u16;
+        let (popup, _inner, content) =
+            slash_popup_geometry(transcript, composer, rows, SLASH_POPUP_MAX_WIDTH);
         (terminal.backend().buffer().clone(), popup, content)
     }
 
@@ -1766,8 +1871,9 @@ mod slash_popup_layout_tests {
                 })
                 .expect("painting the menu must not run past the buffer");
             let matches = slash_popup_match_rows(&state);
-            let rows = matches.len().min(8) as u16;
-            let (popup, inner, content) = slash_popup_geometry(transcript, composer, rows);
+            let rows = slash_popup_visible_rows(transcript, composer, matches.len()) as u16;
+            let (popup, inner, content) =
+                slash_popup_geometry(transcript, composer, rows, SLASH_POPUP_MAX_WIDTH);
             if popup.width == 0 {
                 continue;
             }
@@ -1785,6 +1891,60 @@ mod slash_popup_layout_tests {
                 "width {width}: content is inside the border"
             );
         }
+    }
+
+    /// The quick built-ins (twelve rows) precede Skills in the unified list,
+    /// so a fixed eight-row window hid every Skill on a bare `/` even on a
+    /// tall terminal. The menu must use the room it has.
+    #[test]
+    fn a_bare_slash_shows_skills_below_the_quick_commands() {
+        use leveler_skills::{SkillCommand, SkillScope, SkillSource};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = popup_state();
+        state.skill_commands = vec![SkillCommand {
+            name: "deploy".into(),
+            scope: SkillScope::Project,
+            source: SkillSource::Native,
+            description: "Ship safely.".into(),
+            argument_hint: None,
+            advertised: "deploy".into(),
+            canonical: "project:deploy".into(),
+            mentionable: true,
+        }];
+        state.composer.replace("/");
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 110,
+            height: 30,
+        };
+        let composer = Rect {
+            x: 2,
+            y: 32,
+            width: 106,
+            height: 4,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(110, 36)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render_slash_popup(frame, transcript, composer, &state);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let painted: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y, 0, buf.area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            painted.contains("/model"),
+            "the quick list stays: {painted}"
+        );
+        assert!(
+            painted.contains("/deploy"),
+            "a bare slash must show the callable Skills in the same menu: {painted}"
+        );
     }
 
     fn row_text(buf: &ratatui::buffer::Buffer, y: u16, x0: u16, x1: u16) -> String {

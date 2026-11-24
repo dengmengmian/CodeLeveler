@@ -10,14 +10,18 @@ use leveler_definition_trust::{
     ApprovalRequest, ApprovalSurface, DefinitionIdentity, DefinitionTrustView, approve,
 };
 use leveler_skills::{
-    SkillDraft, SkillFile, SkillLookupError, SkillRegistry, SkillRoot, SkillRoots, SkillScope,
-    SkillSource, SkillState, SkillStore,
+    PreferencesState, SkillDraft, SkillFile, SkillLookupError, SkillRegistry, SkillRoot,
+    SkillRoots, SkillScope, SkillSource, SkillState, SkillStore,
 };
 
 /// These tests exercise discovery, precedence and loading; the trust gate has
 /// its own tests, including real-store tests. Admit every definition here.
 fn load(roots: &SkillRoots) -> SkillRegistry {
-    SkillRegistry::load(roots, &DefinitionTrustView::trust_everything_for_tests())
+    SkillRegistry::load(
+        roots,
+        &DefinitionTrustView::trust_everything_for_tests(),
+        &PreferencesState::default(),
+    )
 }
 
 fn write_skill(root: &Path, relative: &str, name: &str, description: &str, body: &str) {
@@ -238,6 +242,152 @@ fn project_shadows_user_and_both_are_visible() {
     assert!(registry.load_skill("lint").unwrap().body.contains('P'));
 }
 
+/// An unapproved higher-precedence package is not a candidate, so the trusted
+/// lower copy owns the name. The untrusted bytes never load, and a qualified
+/// request for the refused scope is refused rather than redirected.
+#[test]
+fn an_untrusted_project_package_never_shadows_a_trusted_user_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let project_root = repo.join(".leveler/skills");
+    let user_root = tmp.path().join("home/.leveler/skills");
+    write_skill(
+        &project_root,
+        "release",
+        "release",
+        "Project release.",
+        "PROJECT-UNTRUSTED",
+    );
+    write_skill(
+        &user_root,
+        "release",
+        "release",
+        "User release.",
+        "USER-TRUSTED",
+    );
+    // Approve the user package only; the project package stays unapproved.
+    let store = tmp.path().join("store");
+    let package =
+        leveler_definition_trust::read_skill_package(&user_root.join("release/SKILL.md")).unwrap();
+    let identity = DefinitionIdentity::user_skill("leveler", "release").unwrap();
+    approve(
+        &store,
+        &repo,
+        &[ApprovalRequest::skill_package(identity, &package)],
+        ApprovalSurface::Cli,
+    )
+    .unwrap();
+    let mut roots = SkillRoots::empty();
+    roots.push(root(SkillScope::Project, SkillSource::Native, project_root));
+    roots.push(root(SkillScope::User, SkillSource::Native, user_root));
+    let view = DefinitionTrustView::load(&store, Some(&repo));
+    let registry = SkillRegistry::load(&roots, &view, &PreferencesState::default());
+
+    let entry = registry
+        .get("release")
+        .expect("the trusted user copy owns the name");
+    assert_eq!(entry.scope, SkillScope::User);
+    assert_eq!(entry.description.as_deref(), Some("User release."));
+    assert_eq!(
+        registry.untrusted_skill("release").map(|u| u.scope),
+        Some(SkillScope::Project)
+    );
+    let loaded = registry.load_skill("release").unwrap();
+    assert!(loaded.body.contains("USER-TRUSTED"));
+    assert!(!loaded.body.contains("PROJECT-UNTRUSTED"));
+    // Unqualified: the trusted owner. Qualified: the refused scope is named,
+    // never silently answered by the other copy.
+    assert_eq!(
+        registry
+            .resolve_command("/release", leveler_skills::RESERVED_SLASH_NAMES)
+            .unwrap()
+            .scope,
+        SkillScope::User
+    );
+    assert!(matches!(
+        registry.resolve_command("/project:release", leveler_skills::RESERVED_SLASH_NAMES),
+        Err(leveler_skills::SkillCommandError::Shadowed {
+            scope: SkillScope::Project,
+            ..
+        })
+    ));
+}
+
+/// A disabled winner refuses; the shadowed copy does not quietly become the
+/// answer just because it is enabled.
+#[test]
+fn a_disabled_winner_does_not_fall_back_to_a_shadowed_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let project_root = repo.join(".leveler/skills");
+    let user_root = tmp.path().join("home/.leveler/skills");
+    write_skill(
+        &project_root,
+        "release",
+        "release",
+        "Project release.",
+        "P.",
+    );
+    write_skill(&user_root, "release", "release", "User release.", "U.");
+    let prefs_path = tmp.path().join("skills.toml");
+    std::fs::write(
+        &prefs_path,
+        format!(
+            "[projects]\n\"{}\" = [\"release\"]\n",
+            leveler_skills::project_key(&repo)
+        ),
+    )
+    .unwrap();
+    let mut roots = SkillRoots::empty();
+    roots.push(root(SkillScope::Project, SkillSource::Native, project_root));
+    roots.push(root(SkillScope::User, SkillSource::Native, user_root));
+    let preferences = PreferencesState::load_path(&prefs_path, Some(&repo));
+    let registry = SkillRegistry::load(
+        &roots,
+        &DefinitionTrustView::trust_everything_for_tests(),
+        &preferences,
+    );
+    let entry = registry.get("release").unwrap();
+    assert_eq!(entry.scope, SkillScope::Project);
+    assert!(
+        matches!(entry.state, SkillState::Disabled { .. }),
+        "{entry:?}"
+    );
+    assert_eq!(entry.shadowed.len(), 1);
+    assert!(matches!(
+        registry.resolve_command("/release", leveler_skills::RESERVED_SLASH_NAMES),
+        Err(leveler_skills::SkillCommandError::Unavailable { ref state, .. })
+            if state.contains("disabled")
+    ));
+    assert!(matches!(
+        registry.load_skill("release"),
+        Err(SkillLookupError::Disabled { .. })
+    ));
+    let mentions = registry.resolve_mentions("$release");
+    assert!(mentions.loaded.is_empty());
+    assert!(mentions.invalid.iter().any(|entry| entry.name == "release"));
+}
+
+/// An invalid project package shadows the builtin; a broken higher copy never
+/// hands the model the shipped implementation instead.
+#[test]
+fn an_invalid_project_copy_does_not_fall_back_to_a_builtin() {
+    let fx = Fx::new();
+    write_raw(&fx.project, "skill-creator", b"---\nname: [broken\n---\n");
+    let registry = fx.registry();
+    let entry = registry.get("skill-creator").unwrap();
+    assert_eq!(entry.scope, SkillScope::Project);
+    assert!(matches!(entry.state, SkillState::Invalid(_)), "{entry:?}");
+    assert_eq!(entry.shadowed.len(), 1);
+    assert_eq!(entry.shadowed[0].scope, SkillScope::Builtin);
+    assert!(matches!(
+        registry.resolve_command("/skill-creator", leveler_skills::RESERVED_SLASH_NAMES),
+        Err(leveler_skills::SkillCommandError::Unavailable { ref state, .. })
+            if state.contains("invalid")
+    ));
+    assert!(registry.load_skill("skill-creator").is_err());
+}
+
 #[test]
 fn malformed_packages_are_invalid_with_a_reason() {
     let fx = Fx::new();
@@ -420,7 +570,7 @@ fn mentions_of_an_invalid_skill_are_reported_separately() {
     assert!(resolution.loaded.is_empty());
     assert!(resolution.unknown.is_empty());
     assert_eq!(resolution.invalid.len(), 1);
-    assert_eq!(resolution.invalid[0].0, "broken");
+    assert_eq!(resolution.invalid[0].name, "broken");
 }
 
 #[test]
@@ -666,7 +816,11 @@ fn an_unapproved_project_skill_is_not_available() {
         "EVIL-BODY",
     );
     let roots = SkillRoots::for_project(&project);
-    let registry = SkillRegistry::load(&roots, &DefinitionTrustView::deny_all());
+    let registry = SkillRegistry::load(
+        &roots,
+        &DefinitionTrustView::deny_all(),
+        &PreferencesState::default(),
+    );
     assert!(registry.get("evil").is_none(), "{:?}", registry.entries());
     assert_eq!(registry.untrusted().len(), 1, "{:?}", registry.untrusted());
     assert_eq!(registry.untrusted()[0].state, "unapproved");
@@ -716,7 +870,7 @@ fn a_changed_skill_body_is_refused_even_by_an_existing_registry() {
     .unwrap();
     let view = DefinitionTrustView::load(&store, Some(&project));
     let roots = SkillRoots::for_project(&project);
-    let registry = SkillRegistry::load(&roots, &view);
+    let registry = SkillRegistry::load(&roots, &view, &PreferencesState::default());
     assert!(registry.load_skill("helper").is_ok());
 
     std::fs::write(
@@ -734,7 +888,7 @@ TAMPERED
         Err(SkillLookupError::Untrusted { state, .. }) => assert_eq!(state, "changed"),
         other => panic!("changed bytes must be refused: {other:?}"),
     }
-    let fresh = SkillRegistry::load(&roots, &view);
+    let fresh = SkillRegistry::load(&roots, &view, &PreferencesState::default());
     assert!(fresh.get("helper").is_none());
     assert_eq!(fresh.untrusted()[0].state, "changed");
 }
@@ -769,26 +923,36 @@ fn an_approved_reference_is_returned_from_the_approved_bytes() {
     )
     .unwrap();
     let view = DefinitionTrustView::load(&store, Some(&project));
-    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
     let detail = registry.load_skill("guide").unwrap();
     assert_eq!(detail.references, vec!["references/step.md".to_string()]);
-    assert_eq!(detail.reference_contents.len(), 1);
-    assert_eq!(detail.reference_contents[0].text, "APPROVED-STEP\n");
-    let rendered = leveler_skills::render_skill_package(&detail);
-    assert!(rendered.contains("APPROVED-STEP"), "{rendered}");
-    assert!(
-        !rendered.contains("Read with `read_file`"),
-        "reference text must not be delegated to an unverified path read: {rendered}"
+    let grant = detail.reference_grant.as_ref().unwrap();
+    assert_eq!(
+        grant.read_reference("references/step.md", &view).unwrap(),
+        b"APPROVED-STEP\n"
     );
+    assert!(grant.read_reference("../SKILL.md", &view).is_err());
+    let rendered = leveler_skills::render_skill_package(&detail);
+    assert!(rendered.contains("references/step.md"), "{rendered}");
+    assert!(!rendered.contains("APPROVED-STEP"), "{rendered}");
 
     // A post-approval reference edit invalidates the whole package, not just
     // the file that was edited.
     std::fs::write(dir.join("references/step.md"), "TAMPERED-STEP\n").unwrap();
+    assert!(grant.read_reference("references/step.md", &view).is_err());
     match registry.load_skill("guide") {
         Err(SkillLookupError::Untrusted { state, .. }) => assert_eq!(state, "changed"),
         other => panic!("a changed reference must be refused: {other:?}"),
     }
-    let fresh = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let fresh = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
     assert!(fresh.get("guide").is_none());
     assert_eq!(fresh.untrusted()[0].state, "changed");
 }
@@ -823,7 +987,11 @@ fn a_new_reference_after_approval_is_not_admitted() {
     std::fs::create_dir_all(dir.join("references")).unwrap();
     std::fs::write(dir.join("references/new.md"), "NEW\n").unwrap();
     let view = DefinitionTrustView::load(&store, Some(&project));
-    let fresh = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let fresh = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
     assert!(fresh.get("guide").is_none());
     assert_eq!(fresh.untrusted()[0].state, "changed");
 }
@@ -849,6 +1017,7 @@ fn a_symlinked_reference_makes_the_skill_invalid() {
     let registry = SkillRegistry::load(
         &SkillRoots::for_project(&project),
         &DefinitionTrustView::trust_everything_for_tests(),
+        &PreferencesState::default(),
     );
     let entry = registry
         .get("guide")
@@ -899,7 +1068,11 @@ fn a_single_file_skill_approval_does_not_cover_the_package() {
     )
     .unwrap();
     let view = DefinitionTrustView::load(&store, Some(&project));
-    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
     assert!(registry.get("legacy").is_none());
     assert_eq!(registry.untrusted()[0].state, "changed");
     assert!(
@@ -943,7 +1116,11 @@ fn deleting_or_renaming_a_reference_invalidates_the_approval() {
         )
         .unwrap();
         let view = DefinitionTrustView::load(&store, Some(&project));
-        let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+        let registry = SkillRegistry::load(
+            &SkillRoots::for_project(&project),
+            &view,
+            &PreferencesState::default(),
+        );
         assert!(registry.load_skill("guide").is_ok());
         match mutation {
             "delete" => std::fs::remove_file(dir.join("references/step.md")).unwrap(),
@@ -964,7 +1141,7 @@ fn deleting_or_renaming_a_reference_invalidates_the_approval() {
 }
 
 #[test]
-fn a_reference_tree_over_the_inline_budget_fails_closed() {
+fn a_large_reference_tree_loads_without_inlining_its_contents() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("repo");
     write_skill(
@@ -992,13 +1169,18 @@ fn a_reference_tree_over_the_inline_budget_fails_closed() {
     )
     .unwrap();
     let view = DefinitionTrustView::load(&store, Some(&project));
-    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
-    match registry.load_skill("huge") {
-        Err(SkillLookupError::Read { error, .. }) => {
-            assert!(error.contains("verified-content budget"), "{error}");
-        }
-        other => panic!("an oversized reference tree must fail closed: {other:?}"),
-    }
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
+    let detail = registry
+        .load_skill("huge")
+        .expect("references are read on demand");
+    assert_eq!(detail.references, ["references/large.md"]);
+    let rendered = leveler_skills::render_skill_package(&detail);
+    assert!(rendered.contains("references/large.md"));
+    assert!(!rendered.contains(&"x".repeat(100)));
 }
 
 #[test]
@@ -1018,6 +1200,7 @@ fn a_non_utf8_reference_makes_the_skill_invalid() {
     let registry = SkillRegistry::load(
         &SkillRoots::for_project(&project),
         &DefinitionTrustView::trust_everything_for_tests(),
+        &PreferencesState::default(),
     );
     assert!(
         registry
@@ -1066,7 +1249,7 @@ fn an_untrusted_skill_does_not_shadow_a_trusted_lower_precedence_skill() {
         project.join(".leveler/skills"),
     ));
     roots.push(root(SkillScope::User, SkillSource::Native, user));
-    let registry = SkillRegistry::load(&roots, &view);
+    let registry = SkillRegistry::load(&roots, &view, &PreferencesState::default());
     let entry = registry.get("dup").expect("the user skill must be visible");
     assert_eq!(entry.source, SkillSource::Native);
     assert_eq!(entry.scope, SkillScope::User);
@@ -1087,7 +1270,11 @@ fn an_unapproved_user_skill_is_not_available() {
     );
     let mut roots = SkillRoots::empty();
     roots.push(root(SkillScope::User, SkillSource::Native, user));
-    let registry = SkillRegistry::load(&roots, &DefinitionTrustView::deny_all());
+    let registry = SkillRegistry::load(
+        &roots,
+        &DefinitionTrustView::deny_all(),
+        &PreferencesState::default(),
+    );
     assert!(
         registry.get("global-evil").is_none(),
         "{:?}",
@@ -1118,7 +1305,11 @@ fn full_adopts_the_creation_baseline_and_a_later_edit_is_untrusted() {
     );
     let view = DefinitionTrustView::load(&store, Some(&project))
         .with_session(std::sync::Arc::new(session));
-    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
     let loaded = registry.load_skill("demo").expect("baseline is adopted");
     assert!(loaded.body.contains("BASELINE BODY"));
     // Nothing was written to the persistent store.
@@ -1136,7 +1327,11 @@ fn full_adopts_the_creation_baseline_and_a_later_edit_is_untrusted() {
         "Demo.",
         "AGENT EDIT",
     );
-    let registry = SkillRegistry::load(&SkillRoots::for_project(&project), &view);
+    let registry = SkillRegistry::load(
+        &SkillRoots::for_project(&project),
+        &view,
+        &PreferencesState::default(),
+    );
     assert!(registry.get("demo").is_none());
     let Err(SkillLookupError::Untrusted { state, .. }) = registry.load_skill("demo") else {
         panic!("an edited definition must not be adopted");

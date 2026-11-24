@@ -12,7 +12,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use leveler_client_protocol::{MessageId, RuntimeEvent, SessionId, ToolCallId};
-use leveler_tui::action::Action;
+use leveler_tui::action::{Action, Effect};
 use leveler_tui::composer::Composer;
 use leveler_tui::conversation::sync_scroll;
 use leveler_tui::reducer::reduce;
@@ -1042,4 +1042,330 @@ fn shell_mode_enter_and_exit_clear_the_mode_chrome() {
         back.join("\n")
     );
     assert_no_control_cells(&back, "shell mode exit");
+}
+
+fn reply_rows(painted: &mut Painted) -> Vec<String> {
+    painted
+        .draw()
+        .into_iter()
+        .filter(|row| row.contains("◇ 回答"))
+        .collect()
+}
+
+fn copy_reply_at(painted: &mut Painted, row: usize, label: &str) -> String {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let rows = painted.rows();
+    let label_offset = rows[row].find(label).expect("painted copy action");
+    let column = UnicodeWidthStr::width(&rows[row][..label_offset]) as u16;
+    let mut effects = Vec::new();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        effects.extend(reduce(
+            &mut painted.state,
+            Action::Mouse(MouseEvent {
+                kind,
+                column,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            }),
+        ));
+    }
+    let [
+        Effect::CopyReply {
+            session_id,
+            target,
+            text,
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("expected one reply copy effect, got {effects:?}");
+    };
+    reduce(
+        &mut painted.state,
+        Action::ReplyCopied {
+            session_id: session_id.clone(),
+            target: target.clone(),
+            result: Ok(leveler_tui::clipboard::CopyReceipt {
+                delivery: leveler_tui::clipboard::Delivery::VerifiedNative,
+                routes: vec![leveler_tui::clipboard::ClipboardRoute::Native],
+                failures: Vec::new(),
+            }),
+        },
+    );
+    text.clone()
+}
+
+fn answer_events(id: &str, chunks: &[&str]) -> Vec<RuntimeEvent> {
+    let message_id = MessageId::new(id);
+    let mut events = vec![RuntimeEvent::AssistantMessageStarted {
+        message_id: message_id.clone(),
+    }];
+    events.extend(chunks.iter().map(|chunk| RuntimeEvent::AssistantTextDelta {
+        message_id: message_id.clone(),
+        delta: (*chunk).to_owned(),
+    }));
+    events.push(RuntimeEvent::AssistantMessageCompleted { message_id });
+    events
+}
+
+#[test]
+fn reply_copy_waits_for_turn_settlement_and_sits_below_all_body_blocks() {
+    let mut state = boot(100, 36);
+    for event in answer_events("progress", &["Progress prose."]) {
+        reduce(&mut state, Action::Runtime(event));
+    }
+    push_tool_group(&mut state);
+    for event in [
+        RuntimeEvent::ReasoningStarted,
+        RuntimeEvent::ReasoningDelta {
+            delta: "Reasoning sentinel".into(),
+        },
+        RuntimeEvent::ReasoningCompleted { elapsed_ms: 10 },
+    ] {
+        reduce(&mut state, Action::Runtime(event));
+    }
+    let mut painted = Painted::new(state, 100, 36);
+    let chunks = [
+        "## Heading\n\n- List entry\n\n| A | B |\n| --- | --- |\n| one | two |",
+        "\n\n```text\n  code body\n```\n\n| C | D |\n| --- | --- |\n| three | four |",
+        "\n\nBody tail.",
+    ];
+    let events = answer_events("reply", &chunks);
+    for event in events {
+        reduce(&mut painted.state, Action::Runtime(event));
+        assert!(reply_rows(&mut painted).is_empty());
+    }
+
+    reduce(
+        &mut painted.state,
+        Action::Runtime(RuntimeEvent::TurnAnswered),
+    );
+    let rows = painted.draw();
+    let tail = rows
+        .iter()
+        .position(|row| row.contains("Body tail."))
+        .unwrap();
+    let copy = rows.iter().position(|row| row.contains("◇ 回答")).unwrap();
+    assert!(tail < copy);
+    assert!(rows[copy].contains("[复制 Markdown]"));
+    assert!(rows[copy].contains("[复制文本]"));
+    assert_eq!(reply_rows(&mut painted).len(), 1);
+    assert_eq!(
+        copy_reply_at(&mut painted, copy, "[复制 Markdown]"),
+        chunks.concat()
+    );
+    let feedback = painted.draw();
+    assert!(feedback[copy].contains("[已复制]"), "{feedback:#?}");
+    // Feedback replaces the first label in place: the second action must keep
+    // its display column even though the replacement has a different byte
+    // length (`[已复制]` is wider in UTF-8 than `[复制 Markdown]` is).
+    let column = |row: &str| {
+        UnicodeWidthStr::width(&row[..row.find("[复制文本]").expect("painted text action")])
+    };
+    assert_eq!(column(&feedback[copy]), column(&rows[copy]));
+    assert_eq!(feedback[tail], rows[tail]);
+    let plain = copy_reply_at(&mut painted, copy, "[复制文本]");
+    for fragment in [
+        "Heading",
+        "List entry",
+        "one",
+        "two",
+        "  code body",
+        "three",
+        "four",
+        "Body tail.",
+    ] {
+        assert!(
+            plain.contains(fragment),
+            "{fragment:?} missing from {plain:?}"
+        );
+    }
+    for excluded in [
+        "##",
+        "```",
+        "---",
+        "复制文本",
+        "Progress prose",
+        "Reasoning sentinel",
+        "TOOL_PREVIEW_98765",
+    ] {
+        assert!(
+            !plain.contains(excluded),
+            "{excluded:?} included in {plain:?}"
+        );
+    }
+}
+
+#[test]
+fn reply_copy_actions_follow_the_ui_locale() {
+    let mut state = boot(100, 36);
+    state.locale = leveler_tui::Locale::En;
+    for event in answer_events("reply", &["English body."]) {
+        reduce(&mut state, Action::Runtime(event));
+    }
+    reduce(&mut state, Action::Runtime(RuntimeEvent::TurnAnswered));
+    let mut painted = Painted::new(state, 100, 36);
+    let rows = painted.draw();
+    let copy = rows
+        .iter()
+        .position(|row| row.contains("◇ answer"))
+        .unwrap_or_else(|| panic!("no English action row: {rows:#?}"));
+    assert!(rows[copy].contains("[Copy Markdown]"), "{rows:#?}");
+    assert!(rows[copy].contains("[Copy Text]"), "{rows:#?}");
+    assert_eq!(reply_rows(&mut painted).len(), 0);
+    let _ = copy_reply_at(&mut painted, copy, "[Copy Markdown]");
+    let feedback = painted.draw();
+    assert!(feedback[copy].contains("[Copied]"), "{feedback:#?}");
+}
+
+#[test]
+fn reply_copy_does_not_offer_cancelled_or_truncated_output() {
+    for end in [
+        RuntimeEvent::TurnCancelled,
+        RuntimeEvent::TurnTruncated {
+            error: "truncated".into(),
+        },
+    ] {
+        for message_finished in [false, true] {
+            let mut state = boot(100, 30);
+            let mut events = answer_events("partial", &["Only partial output."]);
+            if !message_finished {
+                events.pop();
+            }
+            for event in events {
+                reduce(&mut state, Action::Runtime(event));
+            }
+            reduce(&mut state, Action::Runtime(end.clone()));
+            assert!(reply_rows(&mut Painted::new(state, 100, 30)).is_empty());
+        }
+    }
+}
+
+#[test]
+fn reply_copy_requires_message_completion_even_on_a_successful_turn_terminal() {
+    let mut state = boot(100, 30);
+    let mut events = answer_events("unclosed", &["The stream was never closed."]);
+    events.pop();
+    for event in events {
+        reduce(&mut state, Action::Runtime(event));
+    }
+    reduce(&mut state, Action::Runtime(RuntimeEvent::TurnAnswered));
+    assert!(reply_rows(&mut Painted::new(state, 100, 30)).is_empty());
+}
+
+#[test]
+fn reply_copy_from_legacy_snapshot_keeps_older_replies_and_excludes_inflight_tail() {
+    let snapshot = serde_json::from_value(serde_json::json!({
+        "id": "render-truth", "goal": "legacy", "mode": "assisted", "status": "running",
+        "messages": [
+            {"id": "old-user", "role": "user", "text": "Earlier question"},
+            {"id": "old-answer", "role": "assistant", "text": "Earlier reply"},
+            {"id": "new-user", "role": "user", "text": "Active question"},
+            {"id": "new-progress", "role": "assistant", "text": "Still working"},
+            {"id": "steer", "role": "user", "kind": "delivered_input", "text": "Steering input"},
+            {"id": "new-answer", "role": "assistant", "text": "Streaming reply prefix"}
+        ]
+    }))
+    .unwrap();
+    let mut state = boot(100, 36);
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
+    let mut painted = Painted::new(state, 100, 36);
+    let rows = painted.draw();
+    let copies: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.contains("◇ 回答").then_some(index))
+        .collect();
+    assert_eq!(copies.len(), 1, "{rows:#?}");
+    assert_eq!(
+        copy_reply_at(&mut painted, copies[0], "[复制 Markdown]"),
+        "Earlier reply"
+    );
+}
+
+#[test]
+fn reply_copy_replays_goal_delivery_and_prior_replies_independently() {
+    use leveler_client_protocol::{
+        UiHistoryEntry, UiMessage, UiRole, UiSessionHistory, UiSessionSnapshot,
+    };
+
+    let user = |id, text: &str| RuntimeEvent::UserMessageAdded {
+        message: UiMessage {
+            id: MessageId::new(id),
+            role: UiRole::User,
+            text: text.into(),
+            ordinal: None,
+            kind: None,
+            images: 0,
+        },
+    };
+    let mut events = vec![user("u1", "First request")];
+    events.extend(answer_events("a1", &["First completed reply"]));
+    events.push(RuntimeEvent::TurnAnswered);
+    let goal_start = events.len();
+    events.push(user("u2", "Goal request"));
+    events.extend(answer_events("progress", &["Progress before delivery"]));
+    events.extend(answer_events(
+        "delivery",
+        &["Goal delivery (", "two pieces)"],
+    ));
+    events.push(RuntimeEvent::DeliveryCommitted {
+        text: "Goal delivery (two pieces)".into(),
+    });
+    events.extend(answer_events("settlement", &["Extra settlement narration"]));
+    events.push(RuntimeEvent::TurnCompleted);
+
+    let mut snapshot: UiSessionSnapshot = serde_json::from_value(serde_json::json!({
+        "id": "render-truth", "goal": "Goal fixture", "mode": "assisted", "status": "idle",
+        "collaboration": "goal", "messages": []
+    }))
+    .unwrap();
+    snapshot.history = Some(UiSessionHistory {
+        entries: events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| UiHistoryEntry {
+                turn_start: index == 0 || index == goal_start,
+                turn_elapsed_ms: 0,
+                event,
+            })
+            .collect(),
+        omitted_turns: 0,
+    });
+
+    let mut state = boot(100, 40);
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snapshot }),
+    );
+    let mut painted = Painted::new(state, 100, 40);
+    let rows = painted.draw();
+    let copy: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.contains("◇ 回答").then_some(index))
+        .collect();
+    assert_eq!(copy.len(), 2, "{rows:#?}");
+    assert!(
+        rows[copy[0] - 1].contains("First completed reply"),
+        "{rows:#?}"
+    );
+    assert!(
+        rows[copy[1] - 1].contains("Goal delivery (two pieces)"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        copy_reply_at(&mut painted, copy[0], "[复制 Markdown]"),
+        "First completed reply"
+    );
+    assert_eq!(
+        copy_reply_at(&mut painted, copy[1], "[复制 Markdown]"),
+        "Goal delivery (two pieces)"
+    );
 }

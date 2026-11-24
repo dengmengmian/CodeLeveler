@@ -51,6 +51,8 @@ configuration guidance, not a claim of live compatibility verification.
 - `Ctrl+R` searches input history. Enter restores an entry to the draft without sending it.
 - `Ctrl+Z` undoes input; `Ctrl+Shift+Z` or `Alt+Z` redoes it.
 - Click a tool group for details, use `Ctrl+O` for the latest execution, or `Ctrl+G` for the final answer.
+- Invoke a skill with `/name`. CodeLeveler loads its procedure and lists approved references. It sends reference text to the model as needed during the turn.
+- At the end of a completed reply, `[Copy Markdown]` copies the full original Markdown and `[Copy Text]` copies a plain-text version. Click either action, or press Tab from the conversation and Enter on the focused action.
 - Type `!` in an empty input to enter Shell Mode; Tab completes commands and paths.
 - `/output` opens full local command output; `/copy output` copies it.
 - An edit paints its complete applied diff by default; click its head row or press `Ctrl+O` to fold it to one `+A/-R` row. Dragging over the diff copies the selected source lines (no gutter, no `+`/`-` marker); `/copy diff` copies the complete applied patch instead.

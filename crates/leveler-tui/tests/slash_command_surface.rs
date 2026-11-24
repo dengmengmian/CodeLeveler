@@ -218,3 +218,35 @@ fn an_unknown_help_argument_is_not_silent() {
     assert_eq!(state.help.query, "not-a-command");
     assert!(state.notification.is_some(), "the miss must be explained");
 }
+
+/// The reserved-Skill-name list is the contract the runtime's leading-token
+/// parser uses. It must equal the client's command surface in both
+/// directions: a built-in missing from `RESERVED_SLASH_NAMES` could be
+/// captured by a Skill package, and a stale reserved name would make a
+/// perfectly ordinary Skill unreachable by its bare slash identity.
+#[test]
+fn reserved_skill_names_match_the_slash_surface_exactly() {
+    use std::collections::BTreeSet;
+
+    let surface: BTreeSet<&str> = SLASH_DEFS
+        .iter()
+        .flat_map(|def| {
+            std::iter::once(def.name.trim_start_matches('/')).chain(
+                def.aliases
+                    .iter()
+                    .map(|alias| alias.trim_start_matches('/')),
+            )
+        })
+        .collect();
+    let reserved: BTreeSet<&str> = leveler_skills::RESERVED_SLASH_NAMES
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        reserved,
+        surface,
+        "reserved names and SLASH_DEFS disagree; missing from reserved: {:?}, stale in reserved: {:?}",
+        surface.difference(&reserved).collect::<Vec<_>>(),
+        reserved.difference(&surface).collect::<Vec<_>>()
+    );
+}

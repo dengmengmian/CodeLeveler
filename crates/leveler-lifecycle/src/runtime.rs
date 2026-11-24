@@ -353,6 +353,9 @@ pub struct ChildAgentSnapshot {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Versions of bound skills whose references are read on demand.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub skill_reference_versions: std::collections::BTreeMap<String, String>,
     /// The most this child may ever claim, repository-relative.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_roots: Vec<String>,

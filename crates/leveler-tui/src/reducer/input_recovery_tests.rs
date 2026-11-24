@@ -76,6 +76,8 @@ fn input_recovery_undo_restores_the_original_attachment_identity() {
         sha256: "hash".into(),
         width: Some(1),
         height: Some(1),
+        source_path: None,
+        preview_path: None,
     };
     reduce(
         &mut s,
@@ -398,6 +400,8 @@ fn pending_edit_preserves_attachment_only_draft() {
         sha256: "hash".into(),
         width: Some(1),
         height: Some(1),
+        source_path: None,
+        preview_path: None,
     };
     s.pending_attachments.push(attachment.clone());
     s.pending_inputs
