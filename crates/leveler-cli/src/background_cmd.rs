@@ -76,7 +76,11 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
         BackgroundCommand::List { .. } | BackgroundCommand::Journal { .. } => None,
     };
     match (&command, runtime_task) {
-        (BackgroundCommand::Logs { task_id }, Some(blocker)) => {
+        // A hosted task's blocker is inventory, not a log carrier: the host
+        // list deliberately omits retained output, so this branch would report
+        // `(no output captured)` for a task whose host record has it. Read the
+        // hosted record below instead. Runtime-scoped tasks keep the fast path.
+        (BackgroundCommand::Logs { task_id }, Some(blocker)) if !task_id.starts_with("host-") => {
             print_log(task_id, &blocker.log_tail);
             return Ok(std::process::ExitCode::SUCCESS);
         }
