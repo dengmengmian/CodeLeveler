@@ -994,6 +994,7 @@ fn definition_hash(lab: &Path) -> Result<String, Fail> {
     // for a definition the lab would no longer accept.
     for relative in [
         "eval/pty",
+        "eval/permission",
         "eval/release_cases",
         "eval/rc_cases",
         "eval/scripts",

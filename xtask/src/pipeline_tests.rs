@@ -1768,6 +1768,31 @@ fn a_changed_lab_input_off_the_nine_file_list_invalidates_every_stage() {
 }
 
 #[test]
+fn a_changed_permission_harness_invalidates_every_stage() {
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    // The permission smoke is an L1 check with its own runner. A changed
+    // harness is a changed test, exactly like the PTY harness.
+    std::fs::create_dir_all(world.lab.join("eval/permission")).unwrap();
+    std::fs::write(
+        world.lab.join("eval/permission/smoke.py"),
+        "# changed permission harness\n",
+    )
+    .unwrap();
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("stage 1 build-static: REUSED"),
+        "a changed permission harness must invalidate stage 1: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stage 2 automated-tests: REUSED"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn a_crash_between_stages_is_recovered_by_resume() {
     let world = World::new();
     let (code, _) = world.publish_to_stage_3(&[]);
