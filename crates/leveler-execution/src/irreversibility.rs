@@ -1446,9 +1446,11 @@ mod tests {
             analyze_powershell_command(&f, "Get-ChildItem | Remove-Item").is_some(),
             "a piped delete consumes a target it did not name"
         );
+        // `del` reads a leading `/` argument as a switch, so a POSIX absolute
+        // path is not a valid cmd target on any host. A relative target is the
+        // portable form of the same command and resolves in the fixture cwd.
         assert!(
-            analyze_powershell_command(&f, &format!("cmd /C del /F /Q '{}'", victim.display()))
-                .is_some(),
+            analyze_powershell_command(&f, "cmd /C del /F /Q real.txt").is_some(),
             "a cmd wrapper inside PowerShell keeps the visible deletion"
         );
         // The outer shell wrapper (the shape `shell_command` produces on

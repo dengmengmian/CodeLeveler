@@ -3054,6 +3054,38 @@ fn slash_permission_argument_applies_and_rejects_unknown_values() {
 }
 
 #[test]
+fn slash_permission_contract_adopts_only_v2_and_keeps_the_tier() {
+    let mut s = opened();
+    let tier = s.mode;
+    typed(&mut s, "/permission-contract v2");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Send(ClientCommand::SetPermissionProfile {
+                mode,
+                contract: Some(leveler_client_protocol::PermissionContract::V2),
+                ..
+            })] if *mode == tier
+        ),
+        "{effects:?}"
+    );
+
+    // V1 cannot be selected through this command: the tier is unchanged and
+    // the only contract it adopts is V2, so a typo asks instead of mutating.
+    typed(&mut s, "/permission-contract v1");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty());
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|notice| notice.message.contains("/permission-contract")),
+        "{:?}",
+        s.notification
+    );
+}
+
+#[test]
 fn model_picker_confirm_switches_the_session() {
     let mut s = opened();
     typed(&mut s, "/model");

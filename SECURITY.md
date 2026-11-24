@@ -282,6 +282,33 @@ turn; a new `.leveler` definition is created but not admitted. The two facts are
 reported separately and the OS limitation is not claimed fixed. Existing
 protected objects remain write/delete/rename-fenced.
 
+## Permission contracts and tiers
+
+A session records the permission contract it was created under. The three UI
+tiers keep their names; their meaning depends on that contract.
+
+| Tier | V1 (legacy) | V2 |
+| --- | --- | --- |
+| Restricted (`request_approval`) | legacy RequestApproval: network and destructive/privileged actions ask, and destructive/privileged tools are refused | the previous Auto policy: ordinary work runs and the workspace write fence stays |
+| Auto (`assisted`) | legacy Auto: workspace write fence; dangerous commands, MCP, foreign writes, private network and credentials ask | effect-based: no workspace write fence; asks only for a directly identifiable irreversible effect in this call, plus the independent credential, private-network, ownership, rule and trust boundaries |
+| Full (`full_access`) | no CodeLeveler approval or sandbox; an explicit `--deny-network` still applies | unchanged |
+
+A new session with no project mode uses V2. A project config that declares a
+mode but predates V2 — no `permission_contract`, or a legacy `plan` /
+`workspace_write` mode — stays V1; a config that declares no mode at all leaves
+the new-session default in place. An untrusted config may tighten the default
+but never widen it. `/permission-contract v2` in the TUI or
+`--permission-contract v2` adopts V2 without changing the tier. A restored
+session keeps its recorded contract; a missing field reads as V1, never V2.
+
+EffectAuto asks for a directly identifiable irreversible effect: a real
+filesystem deletion, Git history or working-tree loss, disk or persistent-data
+destruction, a host shutdown or reboot, and an MCP tool whose typed annotation
+declares `destructiveHint`. A visible destructive action whose target cannot be
+resolved asks and names the object; scripts, builds and unknown programs are not
+traced, and "unknown" is not treated as "dangerous". A destructive MCP approval
+binds to the exact argument vector and never becomes a durable always rule.
+
 ## Approval, rules and resource boundaries
 
 An approval decides whether a call may run; it does not silently widen the

@@ -700,6 +700,18 @@
         "type"
       ],
       "properties": {
+        "contract": {
+          "description": "`None` keeps the session's stored contract. `Some(V2)` is an explicit adoption; changing the tier alone never adopts V2.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "$ref": "#/definitions/PermissionProfile"
         },
@@ -2490,6 +2502,14 @@
           "type": "string"
         }
       }
+    },
+    "PermissionContract": {
+      "description": "The permission contract a session was created under.\n\nThe three tier names did not change in V2, but their meanings did. A missing field on a persisted or wire value is V1: legacy data must never be read as V2.",
+      "type": "string",
+      "enum": [
+        "v1",
+        "v2"
+      ]
     },
     "PermissionProfile": {
       "type": "string",

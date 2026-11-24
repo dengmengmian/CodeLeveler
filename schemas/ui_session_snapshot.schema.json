@@ -191,6 +191,15 @@
         "$ref": "#/definitions/UiPendingInteraction"
       }
     },
+    "permission_contract": {
+      "description": "The contract the session runs under. An older runtime omits it and the client treats the omission as V1 — never as V2.",
+      "default": "v1",
+      "allOf": [
+        {
+          "$ref": "#/definitions/PermissionContract"
+        }
+      ]
+    },
     "plan": {
       "default": null,
       "anyOf": [
@@ -1690,6 +1699,14 @@
         "recovery",
         "system",
         "terminal"
+      ]
+    },
+    "PermissionContract": {
+      "description": "The permission contract a session was created under.\n\nThe three tier names did not change in V2, but their meanings did. A missing field on a persisted or wire value is V1: legacy data must never be read as V2.",
+      "type": "string",
+      "enum": [
+        "v1",
+        "v2"
       ]
     },
     "PermissionProfile": {
@@ -6625,6 +6642,13 @@
         "id": {
           "$ref": "#/definitions/ApprovalId"
         },
+        "reason_code": {
+          "description": "Stable machine-readable reason (`irreversible.*`, `boundary.*`). Clients display it and audits group by it; never inferred from prose.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "requires_human_consent": {
           "description": "A human-only consent operation offers Once and Deny exclusively.",
           "type": "boolean"
@@ -10311,6 +10335,15 @@
           "items": {
             "$ref": "#/definitions/UiPendingInteraction"
           }
+        },
+        "permission_contract": {
+          "description": "The contract the session runs under. An older runtime omits it and the client treats the omission as V1 — never as V2.",
+          "default": "v1",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PermissionContract"
+            }
+          ]
         },
         "plan": {
           "default": null,
