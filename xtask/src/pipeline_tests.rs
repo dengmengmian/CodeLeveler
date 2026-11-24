@@ -1640,6 +1640,45 @@ fn a_new_candidate_invalidates_the_stages_whose_inputs_changed() {
 }
 
 #[test]
+fn a_moved_candidate_does_not_continue_the_previous_run() {
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    // The transaction points at the run created for the old candidate. A moved
+    // candidate is different evidence, so the gate must not be asked to
+    // accumulate this candidate's layers in that directory.
+    let stale = world
+        .state()
+        .path_str("dogfood_run_id")
+        .unwrap_or_default()
+        .to_string();
+    assert!(stale.ends_with("bbbbbbbbbbbb"), "{stale}");
+    world.set(|script| {
+        script.head = "cccccccccccccccccccccccccccccccccccccccc".into();
+    });
+    let (code, rendered, log) = world.resume(&["--stop-after", "1"]);
+    assert_eq!(code, 0, "{rendered}");
+    let layer_calls: Vec<_> = log
+        .iter()
+        .filter(|spec| {
+            spec.args
+                .iter()
+                .any(|arg| arg == "eval/scripts/release_check.py")
+        })
+        .collect();
+    assert!(!layer_calls.is_empty(), "the gate ran");
+    for spec in layer_calls {
+        assert!(
+            !spec
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--run-id" && pair[1] == stale),
+            "a moved candidate must start a new lab run, not continue {stale}: {spec:?}"
+        );
+    }
+}
+
+#[test]
 fn a_changed_gate_definition_invalidates_every_stage() {
     let world = World::new();
     let (code, _) = world.publish_to_stage_3(&[]);

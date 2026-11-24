@@ -1167,6 +1167,7 @@ fn note_candidate_change(
     transaction.retry_count += 1;
     transaction.candidate_sha = new_sha.to_string();
     transaction.candidate_short = state::short_sha(new_sha);
+    transaction.clear_candidate_evidence();
     transaction.changed_paths = changed.clone();
     let note = format!(
         "candidate moved {} -> {} ({} changed path(s)); stages whose inputs changed are re-earned",
@@ -1745,6 +1746,32 @@ fn check_records_from_doc(doc: &Json, layer: &str) -> Vec<CheckRecord> {
     records
 }
 
+/// The lab run this candidate may continue, if the stored pointer still
+/// belongs to it.
+///
+/// `--run-id` makes the lab accumulate layers in one directory. That is only
+/// valid for the commit the run was created for: a resumed release may move
+/// the candidate, and a pointer left by the previous candidate would carry its
+/// layers into this one. The run id names the candidate's short SHA, and the
+/// run's own environment record is checked when it exists.
+fn continue_dogfood_run(context: &Context, transaction: &Transaction) -> Option<String> {
+    let id = transaction.dogfood_run_id.as_deref()?;
+    let short = state::short_sha(&transaction.candidate_sha);
+    let (_, stored_short) = id.rsplit_once('-')?;
+    if stored_short != short.as_str() {
+        return None;
+    }
+    let dir = state::lab_run_dir(&context.lab.root, state::RELEASE_RUN_KIND, id);
+    if let Ok(text) = std::fs::read_to_string(dir.join("environment.json"))
+        && let Ok(doc) = Json::parse(&text)
+        && let Some(sha) = doc.at("candidate").at("sha").as_str()
+        && sha != transaction.candidate_sha.as_str()
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 /// Run one or more dogfood layers and require every check the stage exists for.
 fn run_layers(
     context: &Context,
@@ -1766,11 +1793,12 @@ fn run_layers(
         println!("{note}");
         detail.push(note);
     }
+    let continued = continue_dogfood_run(context, transaction);
     let spec = dogfood_cmd(
         context,
         &transaction.candidate_sha,
         layers_requested,
-        transaction.dogfood_run_id.as_deref(),
+        continued.as_deref(),
     );
     let out = context.host.run(&spec)?;
     let text = format!("{}{}", out.stdout, out.stderr);

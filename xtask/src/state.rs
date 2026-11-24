@@ -606,6 +606,17 @@ impl Transaction {
         }
     }
 
+    /// Drop run pointers that belong to the candidate being replaced.
+    ///
+    /// A lab run and an RC run are evidence for one commit. Continuing either
+    /// across a candidate move would carry another commit's layers into this
+    /// candidate's qualification, so the moved transaction starts its evidence
+    /// over instead.
+    pub fn clear_candidate_evidence(&mut self) {
+        self.dogfood_run_id = None;
+        self.rc_run_id = None;
+    }
+
     /// The stage this transaction is actually at.
     ///
     /// `stage` records where the last attempt stopped, which is not the same
