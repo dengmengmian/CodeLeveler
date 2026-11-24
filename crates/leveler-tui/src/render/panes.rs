@@ -833,6 +833,51 @@ pub(crate) fn paint_scrollbar(
     }
 }
 
+/// Truncate or right-pad a line so its display width equals `width`. Every cell
+/// in the row is then owned by this frame's buffer.
+pub(crate) fn pad_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans {
+        if used >= width {
+            break;
+        }
+        let content = span.content.as_ref();
+        let sw = UnicodeWidthStr::width(content);
+        if used + sw <= width {
+            used += sw;
+            spans.push(span);
+            continue;
+        }
+        // Span overflows remaining room — keep a width-safe prefix (no ellipsis;
+        // the pane clips, it doesn't need a marker on every truncated row).
+        let room = width - used;
+        let mut piece = String::new();
+        let mut w = 0usize;
+        for ch in content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > room {
+                break;
+            }
+            piece.push(ch);
+            w += cw;
+        }
+        // If a wide char won't fit, leave the leftover as padding below.
+        if !piece.is_empty() {
+            spans.push(Span::styled(piece, span.style));
+            used += w;
+        }
+        break;
+    }
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    Line::from(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,49 +1111,4 @@ mod tests {
         assert_eq!(hits[0].0.height, 2);
         assert_eq!(hits[0].1, "row-1");
     }
-}
-
-/// Truncate or right-pad a line so its display width equals `width`. Every cell
-/// in the row is then owned by this frame's buffer.
-pub(crate) fn pad_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
-    if width == 0 {
-        return Line::from("");
-    }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-    for span in line.spans {
-        if used >= width {
-            break;
-        }
-        let content = span.content.as_ref();
-        let sw = UnicodeWidthStr::width(content);
-        if used + sw <= width {
-            used += sw;
-            spans.push(span);
-            continue;
-        }
-        // Span overflows remaining room — keep a width-safe prefix (no ellipsis;
-        // the pane clips, it doesn't need a marker on every truncated row).
-        let room = width - used;
-        let mut piece = String::new();
-        let mut w = 0usize;
-        for ch in content.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if w + cw > room {
-                break;
-            }
-            piece.push(ch);
-            w += cw;
-        }
-        // If a wide char won't fit, leave the leftover as padding below.
-        if !piece.is_empty() {
-            spans.push(Span::styled(piece, span.style));
-            used += w;
-        }
-        break;
-    }
-    if used < width {
-        spans.push(Span::raw(" ".repeat(width - used)));
-    }
-    Line::from(spans)
 }

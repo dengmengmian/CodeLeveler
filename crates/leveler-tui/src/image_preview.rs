@@ -557,7 +557,7 @@ pub(crate) fn paint_with(
         width: shown.width,
         height: shown.height,
         size_bytes: shown.size_bytes,
-        filename: &filename,
+        filename,
         number: shown.number,
         cell_aspect: aspect,
         copy,
@@ -1465,9 +1465,10 @@ mod tests {
     fn a_chip_hit_stops_at_the_closing_bracket() {
         let buffer = "[图片 #1] next";
         let token = buffer.find(']').unwrap() + 1;
+        let token_span = 0..token;
         let hits = chip_hits(
             buffer,
-            &[0..token],
+            std::slice::from_ref(&token_span),
             &[ChipSlice {
                 start_byte: 0,
                 end_byte: buffer.len(),
@@ -1836,12 +1837,11 @@ mod tests {
     }
 
     fn hover_sent(state: &mut AppState, item: usize) {
-        let hit = state
+        let hit = *state
             .sent_image_hits
             .iter()
             .find(|hit| hit.item == item)
-            .expect("sent chip")
-            .clone();
+            .expect("sent chip");
         reduce(
             state,
             Action::Mouse(MouseEvent {

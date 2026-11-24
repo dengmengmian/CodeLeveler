@@ -161,7 +161,8 @@ pub(crate) fn wrap_row_spans(
     let source = sanitize_terminal_text(text);
     let text = source.as_ref();
     if text.is_empty() {
-        return (source, vec![0..0]);
+        // One empty span: the row exists even when it draws no bytes.
+        return (source, std::iter::once(0..0).collect());
     }
     let mut spans = Vec::new();
     let mut line_at = 0usize;

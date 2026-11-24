@@ -1706,7 +1706,7 @@ mod tests {
         assert_eq!(geom.footer.height, 2, "grouped pages reserve two hint rows");
         assert_eq!(geom.title_row.y, geom.popup.y, "title sits on the border");
         assert!(geom.rule_row.y >= geom.tab_row.y);
-        assert!(geom.content.y >= geom.rule_row.y + 1);
+        assert!(geom.content.y > geom.rule_row.y);
         assert!(geom.content.y + geom.content.height <= geom.footer.y);
         assert!(geom.footer.y + geom.footer.height <= geom.popup.y + geom.popup.height);
     }
